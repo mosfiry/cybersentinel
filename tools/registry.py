@@ -3,12 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import os
 import subprocess
 import sys
 
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec"})
+DEFAULT_TOOL_TIMEOUT = 30
+TOOL_TIMEOUTS = {"run_project_tests": 65, "refresh_intel": 30}
+
+
+class ToolTimeout(TimeoutError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -130,11 +137,20 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)
-    return spec.handler(argument)
+    limit = timeout or TOOL_TIMEOUTS.get(name, DEFAULT_TOOL_TIMEOUT)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
+    future = executor.submit(spec.handler, argument)
+    try:
+        return future.result(timeout=limit)
+    except FutureTimeout as exc:
+        future.cancel()
+        raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)

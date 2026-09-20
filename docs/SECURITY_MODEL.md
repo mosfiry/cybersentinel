@@ -1,4 +1,4 @@
-# CyberSentinel X 4.5.0 — Security Model
+# CyberSentinel X 4.6.0 — Security Model
 
 ## Trust
 The local bridge authenticates the channel with `BRIDGE_TOKEN`; only requests that also carry the separate `OWNER_TOKEN` are instruction authority.

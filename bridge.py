@@ -5,6 +5,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from core.config import BRIDGE_HOST, BRIDGE_PORT, BRIDGE_TOKEN
 from core.engine import handle, status
+from core.lifecycle import get as get_lifecycle, request_cancel
+from core.db import events_for_request
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 
 ROOT = Path(__file__).resolve().parent
@@ -44,11 +46,30 @@ class Handler(BaseHTTPRequestHandler):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
             return self._send(200, status())
+        if self.path.startswith("/api/execution/"):
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            request_id = self.path[len("/api/execution/"):]
+            record = get_lifecycle(request_id)
+            if record is None:
+                return self._send(404, {"ok": False, "error": "unknown_request_id"})
+            return self._send(200, {"ok": True, "request_id": request_id, "lifecycle": record.__dict__, "events": events_for_request(request_id)})
         return self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
         if not self._bridge_auth():
             return self._send(401, {"ok": False, "error": "bridge authentication required"})
+        if self.path == "/api/cancel":
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                data = json.loads(self.rfile.read(n) or b"{}")
+                request_id = str(data.get("request_id", "")).strip()
+                if not request_id:
+                    return self._send(400, {"ok": False, "error": "request_id_required"})
+                record = request_cancel(request_id)
+                return self._send(200, {"ok": True, "request_id": request_id, "lifecycle": record.status, "cancel_requested": record.cancel_requested})
+            except ValueError:
+                return self._send(404, {"ok": False, "error": "unknown_request_id"})
         if self.path != "/api/command":
             return self._send(404, {"ok": False, "error": "not_found"})
         try:
@@ -59,8 +80,11 @@ class Handler(BaseHTTPRequestHandler):
             text = str(data.get("text", "")).strip()
             if not text:
                 return self._send(400, {"ok": False, "error": "text_required"})
+            request_id = str(data.get("request_id", self.headers.get("X-CyberSentinel-Request-ID", ""))).strip()
+            if request_id and (len(request_id) > 128 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in request_id)):
+                return self._send(400, {"ok": False, "error": "invalid_request_id"})
             owner_token = self.headers.get("X-CyberSentinel-Owner-Token", "")
-            return self._send(200, handle(text, source="web", presented_token=self.headers.get("X-CyberSentinel-Token"), owner_token=owner_token))
+            return self._send(200, handle(text, source="web", presented_token=self.headers.get("X-CyberSentinel-Token"), owner_token=owner_token, request_id=request_id or None))
         except Exception:
             return self._send(400, {"ok": False, "error": "invalid_request"})
 

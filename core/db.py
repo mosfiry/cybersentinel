@@ -36,6 +36,22 @@ CREATE TABLE IF NOT EXISTS intel (
 );
 CREATE INDEX IF NOT EXISTS idx_intel_collected ON intel(collected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_intel_severity ON intel(severity);
+
+CREATE TABLE IF NOT EXISTS executions (
+    request_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    plan_hash TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 1,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    final_result_json TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
 """
 
 def connect():
@@ -43,6 +59,10 @@ def connect():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    try:
+        con.execute("ALTER TABLE executions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     return con
 
 def add_event(kind, title, body, source, severity="info", trusted=False, metadata=None):
@@ -60,6 +80,13 @@ def recent(limit=50):
     with connect() as con:
         return [dict(r) for r in con.execute(
             "SELECT * FROM events ORDER BY id DESC LIMIT ?", (int(limit),)
+        )]
+
+def events_for_request(request_id, limit=500):
+    needle = f'"request_id": "{request_id}"'
+    with connect() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM events WHERE metadata_json LIKE ? ORDER BY id ASC LIMIT ?", (f"%{needle}%", int(limit))
         )]
 
 def counts():
