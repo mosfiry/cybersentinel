@@ -1356,7 +1356,7 @@ class TestIntegration:
         def fake_executor(command, *, owner_token, owner_session_id=None):
             return {"ok": True, "request_id": "req-1"}
         
-        loop = AgentLoop(FakeRouter(), fake_executor, max_steps=4)
+        loop = AgentLoop(FakeRouter(), fake_executor)
         
         # Run should use ContextEngine
         result = loop.run("conv-1", "test query", owner_token="test-token")

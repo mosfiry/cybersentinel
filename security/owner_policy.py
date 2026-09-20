@@ -1,14 +1,31 @@
 from __future__ import annotations
 import hashlib, hmac, json, os
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / 'security' / 'owner_policy.json'
 STATE_PATH = ROOT / 'security' / 'owner_policy_state.json'
 OWNER_PHRASE = os.getenv('CYBERSENTINEL_OWNER_PHRASE', 'Owner').strip()
 OWNER_TOKEN = os.getenv('OWNER_TOKEN', '').strip()
+
+
+@dataclass(frozen=True)
+class RuntimeLimitsConfig:
+    """Runtime limits configuration from Owner Policy."""
+    max_context_messages: int = 50
+    max_context_chars: int = 32000
+    max_result_chars: int = 4000
+    max_tool_calls: int = 10
+    max_execution_steps: int = 20
+    max_same_tool_calls: int = 5
+    max_execution_time_seconds: int = 300
+    max_pending_tasks: int = 10
+    max_retries: int = 3
+    max_total_output_chars: int = 8000
+
 
 @dataclass(frozen=True)
 class OwnerPolicy:
@@ -20,6 +37,7 @@ class OwnerPolicy:
     external_targets_require_scope: bool
     destructive_requires_approval: bool
     immutable: bool
+    runtime_limits: dict[str, Any] = field(default_factory=dict)
     latest_owner_instruction_is_current_policy: bool = True
     owner_instruction_precedence: str = 'latest_wins'
     owner_authority_level: str = 'highest_application_policy'
@@ -31,6 +49,24 @@ class OwnerPolicy:
 def load_policy() -> OwnerPolicy:
     raw = json.loads(POLICY_PATH.read_text(encoding='utf-8'))
     return OwnerPolicy(**raw)
+
+
+def get_runtime_limits() -> RuntimeLimitsConfig:
+    """Load runtime limits from Owner Policy."""
+    policy = load_policy()
+    limits_data = policy.runtime_limits or {}
+    return RuntimeLimitsConfig(
+        max_context_messages=limits_data.get("max_context_messages", 50),
+        max_context_chars=limits_data.get("max_context_chars", 32000),
+        max_result_chars=limits_data.get("max_result_chars", 4000),
+        max_tool_calls=limits_data.get("max_tool_calls", 10),
+        max_execution_steps=limits_data.get("max_execution_steps", 20),
+        max_same_tool_calls=limits_data.get("max_same_tool_calls", 5),
+        max_execution_time_seconds=limits_data.get("max_execution_time_seconds", 300),
+        max_pending_tasks=limits_data.get("max_pending_tasks", 10),
+        max_retries=limits_data.get("max_retries", 3),
+        max_total_output_chars=limits_data.get("max_total_output_chars", 8000),
+    )
 
 
 def policy_fingerprint() -> str:

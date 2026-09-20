@@ -99,11 +99,11 @@ class AgentLoop:
         normalized response
     """
 
-    def __init__(self, router, executor: Callable[..., dict[str, Any]], max_steps: int = 4):
+    def __init__(self, router, executor: Callable[..., dict[str, Any]], runtime_limits: RuntimeLimits | None = None):
         self.router = router
         self.executor = executor
-        self.max_steps = max_steps
-        self.runtime_limits = RuntimeLimits()
+        self.runtime_limits = runtime_limits or RuntimeLimits.from_owner_policy()
+        self.max_steps = self.runtime_limits.max_execution_steps
 
     def run(self, conversation_id: str, text: str, *, owner_token: str, owner_session_id: str | None = None) -> dict[str, Any]:
         """Run the agent loop with ContextEngine integration.

@@ -69,13 +69,30 @@ class RuntimeLimits:
     max_context_chars: int = 32000
     max_result_chars: int = 4000
     max_tool_calls: int = 10
-    max_execution_steps: int = 4
+    max_execution_steps: int = 20
+    max_same_tool_calls: int = 5
+    max_execution_time_seconds: int = 300
+    max_pending_tasks: int = 10
+    max_retries: int = 3
+    max_total_output_chars: int = 8000
     
     @classmethod
     def from_owner_policy(cls) -> RuntimeLimits:
         """Load limits from owner policy configuration."""
-        # For now, use defaults. Can be extended to load from policy.
-        return cls()
+        from security.owner_policy import get_runtime_limits
+        limits_config = get_runtime_limits()
+        return cls(
+            max_context_messages=limits_config.max_context_messages,
+            max_context_chars=limits_config.max_context_chars,
+            max_result_chars=limits_config.max_result_chars,
+            max_tool_calls=limits_config.max_tool_calls,
+            max_execution_steps=limits_config.max_execution_steps,
+            max_same_tool_calls=limits_config.max_same_tool_calls,
+            max_execution_time_seconds=limits_config.max_execution_time_seconds,
+            max_pending_tasks=limits_config.max_pending_tasks,
+            max_retries=limits_config.max_retries,
+            max_total_output_chars=limits_config.max_total_output_chars,
+        )
 
 
 # =============================================================================

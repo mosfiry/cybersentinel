@@ -50,7 +50,7 @@ def test_agent_loop_denies_unknown_tool_without_execution(monkeypatch, tmp_path)
 
     calls = []
     result = AgentLoop(BadRouter(), lambda *args, **kwargs: calls.append(1)).run("conv-2", "اختبر", owner_token="owner-secret",)
-    assert result["steps"] == 4
+    assert result["steps"] == 20
     assert not calls
     assert all(item["status"] == "denied" for item in result["activity"])
 
