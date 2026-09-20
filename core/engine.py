@@ -73,6 +73,13 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
             owner_reason = str(exc)
     else:
         owner_ok, owner_reason = verify_owner(text, owner_token)
+        if owner_ok:
+            auth_context = {
+                "owner_authenticated": True,
+                "owner_session_id": None,
+                "authentication_method": "owner_token",
+                "authenticated_at": None,
+            }
     auth_event = add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
     if not owner_ok:
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}

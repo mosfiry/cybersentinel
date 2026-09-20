@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from core.config import BRIDGE_HOST, BRIDGE_PORT, BRIDGE_TOKEN
 from core.engine import handle, status
 from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 from security.owner_policy import verify_owner
 from security.owner_session import create_owner_session
+from api.chat import chat, get_session, sse, stream
+from agent.loop import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 
 ROOT = Path(__file__).resolve().parent
@@ -37,11 +40,53 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"ok": False, "error": "not_found"})
         return self._send(200, p.read_bytes(), MIME[p.suffix])
 
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        if n > 32768:
+            raise ValueError("request_too_large")
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def _chat_auth(self):
+        return self.headers.get("X-CyberSentinel-Owner-Token", ""), self.headers.get("X-CyberSentinel-Owner-Session"), self.headers.get("X-CyberSentinel-Owner-Challenge")
+
+    def _send_sse(self, events):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for event in events:
+            self.wfile.write(sse(event))
+            self.wfile.flush()
+
     def do_GET(self):
         if self.path == "/api/health":
             return self._send(200, {"ok": True, "service": PRODUCT_NAME, "version": VERSION})
         if self.path == "/":
             return self._static("index.html")
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/tools":
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            return self._send(200, {"ok": True, "tools": tool_definitions()})
+        if parsed.path.startswith("/api/session/"):
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            session_id = parsed.path[len("/api/session/"):]
+            owner_ok, reason = verify_owner("Owner conversation session", self.headers.get("X-CyberSentinel-Owner-Token", ""))
+            if not owner_ok:
+                return self._send(403, {"ok": False, "error": reason})
+            value = get_session(session_id)
+            return self._send(200 if value else 404, {"ok": bool(value), "session": value} if value else {"ok": False, "error": "unknown_session"})
+        if parsed.path == "/api/chat/stream":
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            query = parse_qs(parsed.query)
+            payload = {"text": query.get("text", [""])[0], "conversation_id": query.get("conversation_id", [""])[0]}
+            owner_token, owner_session, owner_challenge = self._chat_auth()
+            if owner_session and owner_challenge:
+                payload["text"] = f"{owner_challenge} {payload['text']}"
+            return self._send_sse(stream(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge))
         if self.path.startswith("/static/"):
             return self._static(self.path[8:])
         if self.path == "/api/status":
@@ -78,6 +123,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, {"ok": True, "session": session})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
+        if self.path == "/api/chat":
+            try:
+                payload = self._read_json()
+                owner_token, owner_session, owner_challenge = self._chat_auth()
+                if owner_session and owner_challenge:
+                    payload["text"] = f"{owner_challenge} {str(payload.get('text', ''))}"
+                result = chat(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge)
+                return self._send(200, {"ok": True, **result})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+            except Exception:
+                return self._send(500, {"ok": False, "error": "chat_failed"})
         if self.path == "/api/cancel":
             try:
                 n = int(self.headers.get("Content-Length", "0"))

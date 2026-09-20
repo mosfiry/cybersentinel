@@ -60,6 +60,24 @@ CREATE TABLE IF NOT EXISTS reasoning_memory (
     critic_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_reasoning_memory_created ON reasoning_memory(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    owner_session_id TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_messages ON conversation_messages(conversation_id, id);
 """
 
 def connect():
@@ -172,3 +190,41 @@ def clear_database():
         con.execute("DELETE FROM events")
         con.execute("DELETE FROM intel")
         con.execute("DELETE FROM watches")
+
+def ensure_conversation(conversation_id, owner_session_id=""):
+    with connect() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO conversations(conversation_id,owner_session_id) VALUES(?,?)",
+            (str(conversation_id), str(owner_session_id or "")),
+        )
+        con.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?", (str(conversation_id),))
+
+def add_conversation_message(conversation_id, role, content, metadata=None):
+    import json
+    ensure_conversation(conversation_id)
+    with connect() as con:
+        cur = con.execute(
+            "INSERT INTO conversation_messages(conversation_id,role,content,metadata_json) VALUES(?,?,?,?)",
+            (str(conversation_id), str(role), str(content), json.dumps(metadata or {}, ensure_ascii=False)),
+        )
+        con.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?", (str(conversation_id),))
+        return cur.lastrowid
+
+def conversation_messages(conversation_id, limit=40):
+    import json
+    with connect() as con:
+        rows = con.execute(
+            "SELECT * FROM conversation_messages WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
+            (str(conversation_id), int(limit)),
+        ).fetchall()
+    result = []
+    for row in reversed(rows):
+        item = dict(row)
+        item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+        result.append(item)
+    return result
+
+def conversation_info(conversation_id):
+    with connect() as con:
+        row = con.execute("SELECT * FROM conversations WHERE conversation_id=?", (str(conversation_id),)).fetchone()
+    return dict(row) if row else None
