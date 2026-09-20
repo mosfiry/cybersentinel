@@ -12,5 +12,13 @@
   "owner_authority_level": "highest_application_policy",
   "external_content_authority": "none",
   "model_authority": "none",
-  "system_safety_boundary": "immutable"
+  "system_safety_boundary": "immutable",
+  "agent_limits": {
+    "max_steps": 4,
+    "max_tool_calls": 4,
+    "max_execution_time_seconds": 90,
+    "max_context_messages": 40,
+    "max_context_chars": 24000,
+    "max_result_chars": 12000
+  }
 }

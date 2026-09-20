@@ -3,7 +3,7 @@ import json
 
 import core.db as db
 import security.owner_policy as owner_policy
-from agent.loop import AgentLoop, tool_definitions
+from agent.loop import AgentLoop, RuntimeLimits, tool_definitions
 
 
 class FakeRouter:
@@ -64,3 +64,47 @@ def test_owner_token_method_is_recorded_in_execution_context(monkeypatch, tmp_pa
     result = handle("Owner status", source="test", owner_token="owner-secret", request_id="auth-context-1")
     assert result["execution_context"]["authentication_method"] == "owner_token"
     assert result["execution_context"]["owner_authenticated"] is True
+
+
+def test_runtime_returns_clarification_without_inventing_facts(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "clarification.sqlite3")
+
+    class ClarifyingRouter:
+        def chat(self, messages):
+            return {"content": json.dumps({"type": "clarification", "question": "ما عنوان المضيف المقصود؟"})}
+
+    result = AgentLoop(ClarifyingRouter(), lambda *args, **kwargs: {}).run("conv-clarify", "افحص الخادم", owner_token="owner-secret")
+    assert result["type"] == "clarification"
+    assert result["answer"] == "ما عنوان المضيف المقصود؟"
+    assert result["activity"] == []
+
+
+def test_runtime_enforces_policy_tool_call_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "limit.sqlite3")
+
+    class ToolRouter:
+        def chat(self, messages):
+            return {"content": json.dumps({"type": "tool_call", "name": "search", "arguments": {"query": "x"}})}
+
+    calls = []
+    result = AgentLoop(
+        ToolRouter(),
+        lambda *args, **kwargs: calls.append(1) or {"ok": True},
+        limits=RuntimeLimits(4, 1, 90, 40, 24000, 20),
+    ).run("conv-limit", "ابحث", owner_token="owner-secret")
+    assert result["type"] == "error"
+    assert result["error"] == "max_tool_calls"
+    assert len(calls) == 1
+
+
+def test_runtime_converts_provider_failure_to_safe_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "provider-error.sqlite3")
+
+    class BrokenRouter:
+        def chat(self, messages):
+            raise RuntimeError("secret provider detail must not escape")
+
+    result = AgentLoop(BrokenRouter(), lambda *args, **kwargs: {}).run("conv-error", "حلل", owner_token="owner-secret")
+    assert result["type"] == "error"
+    assert result["error"] == "provider_failure"
+    assert "secret provider detail" not in result["answer"]

@@ -26,6 +26,7 @@ class OwnerPolicy:
     external_content_authority: str = 'none'
     model_authority: str = 'none'
     system_safety_boundary: str = 'immutable'
+    agent_limits: dict = None
 
 
 def load_policy() -> OwnerPolicy:
@@ -122,3 +123,24 @@ def verify_owner(text: str, presented_token: str | None = None) -> tuple[bool, s
     if not policy.require_owner_token:
         return True, 'local-owner-channel'
     return True, 'owner-authenticated'
+
+
+def agent_runtime_limits() -> dict[str, int]:
+    """Return bounded Runtime limits from policy, never from model output."""
+    raw = load_policy().agent_limits or {}
+    defaults = {
+        'max_steps': 4,
+        'max_tool_calls': 4,
+        'max_execution_time_seconds': 90,
+        'max_context_messages': 40,
+        'max_context_chars': 24000,
+        'max_result_chars': 12000,
+    }
+    result = {}
+    for key, default in defaults.items():
+        try:
+            value = int(raw.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        result[key] = max(1, min(value, default if key != 'max_execution_time_seconds' else 900))
+    return result
