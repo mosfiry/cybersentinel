@@ -41,8 +41,8 @@ def status():
     }
 
 
-def execute(tool: str, argument: str | None = None):
-    return execute_tool(tool, argument)
+def execute(tool: str, argument: str | None = None, *, owner_authenticated: bool = False):
+    return execute_tool(tool, argument, owner_authenticated=owner_authenticated)
 
 
 def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None):
@@ -114,7 +114,7 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
             previous_evidence_hash = item_evidence["current_hash"]
             continue
         try:
-            result = execute(name, argument)
+            result = execute(name, argument, owner_authenticated=True)
             results.append({"tool": name, "argument": argument, "ok": True, "result": result})
             execution_event = add_event("execution", "Tool executed", name, source, "info", True, {"request_id": request_id, "tool": name, **provenance, "plan_hash": final_plan_hash, "parent_event": plan_event, "context": context.to_dict()})
             results[-1]["event_id"] = execution_event

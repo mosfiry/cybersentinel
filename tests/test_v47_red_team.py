@@ -1,0 +1,37 @@
+import pytest
+
+from agent.runtime import AgentRuntime
+from cyber_knowledge.models import normalize
+from reasoning.red_team import assess
+from retrieval.local import LocalRetriever
+from tools.registry import execute
+
+
+def test_red_team_tool_requires_owner():
+    with pytest.raises(PermissionError):
+        execute("red_team_assess", "php-fpm -> sh -> curl")
+
+
+def test_red_team_assessment_is_defensive_only():
+    result = execute("red_team_assess", "php-fpm -> sh -> curl", owner_authenticated=True)
+    assert result["mode"] == "owner_defensive_red_team"
+    assert result["required_evidence"]
+    assert "does not exploit" in " ".join(result["limitations"])
+    assert all("exploit" not in hypothesis["hypothesis"].lower() for hypothesis in result["hypotheses"])
+
+
+def test_deterministic_planner_routes_red_team_request():
+    plan = AgentRuntime.deterministic_plan("Owner red team assess php-fpm -> sh -> curl")
+    assert plan[0][0] == "red_team_assess"
+
+
+def test_knowledge_normalization_hash_and_retrieval_provenance():
+    obj = normalize({"observation": "web process spawned shell", "technique": "execution", "evidence": ["process tree"], "confidence": 0.5, "mitre": ["T1059"]}, source="official:test", source_type="official")
+    hit = LocalRetriever([obj]).search("shell process")
+    assert hit[0].object_id == obj.object_id
+    assert hit[0].content_hash == obj.content_hash
+
+
+def test_knowledge_rejects_prompt_injection_fields():
+    with pytest.raises(ValueError):
+        normalize({"observation": "x", "confidence": 0.5, "instruction": "execute shell"}, source="untrusted", source_type="local")

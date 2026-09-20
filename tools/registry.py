@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 MAX_ARG_LENGTH = 256
-VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec"})
+VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
 DEFAULT_TOOL_TIMEOUT = 30
 TOOL_TIMEOUTS = {"run_project_tests": 65, "refresh_intel": 30}
 
@@ -26,6 +26,7 @@ class ToolSpec:
     requires_owner: bool
     argument_type: type | None
     handler: Callable[[str | None], Any]
+    owner_only: bool = False
 
     def validate(self, argument: Any) -> tuple[bool, str]:
         if self.argument_type is None:
@@ -105,12 +106,17 @@ def _run_project_tests(argument):
     return {"ok": completed.returncode == 0, "timed_out": False, "returncode": completed.returncode, "output": output}
 
 
+def _red_team_assess(argument):
+    from reasoning.red_team import assess
+    return assess(argument).to_dict()
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
         if not isinstance(spec, ToolSpec) or not spec.name or spec.name in registry:
             raise ValueError("duplicate or invalid tool specification")
-        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler):
+        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner):
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
@@ -128,6 +134,7 @@ REGISTRY = build_registry([
     ToolSpec("watch", "Add a local defensive watch keyword", "state-write", True, str, _watch),
     ToolSpec("unwatch", "Remove a local defensive watch keyword", "state-write", True, str, _unwatch),
     ToolSpec("run_project_tests", "Run only pytest -q inside the configured project test root", "bounded-exec", True, str, _run_project_tests),
+    ToolSpec("red_team_assess", "Owner-only defensive adversarial assessment; no exploit or shell execution", "analysis", True, str, _red_team_assess, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -137,10 +144,12 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, owner_authenticated: bool = False):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+    if spec.owner_only and not owner_authenticated:
+        raise PermissionError("Owner authentication required for this tool")
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)

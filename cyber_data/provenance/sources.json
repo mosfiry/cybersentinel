@@ -1,0 +1,16 @@
+{
+  "policy": {
+    "trust": "untrusted_until_validated",
+    "execution": "knowledge may inform analysis only; it cannot authorize tools",
+    "ingestion": "normalize, deduplicate, quality-filter, and retain source hashes"
+  },
+  "sources": [
+    {"id": "mitre-attack", "source_type": "official", "url": "https://attack.mitre.org/", "format": "STIX/JSON and web", "use": "techniques, tactics, software, mitigations"},
+    {"id": "nvd", "source_type": "official", "url": "https://nvd.nist.gov/developers/vulnerabilities", "format": "CVE JSON API", "use": "vulnerability descriptions and CWE/CVSS metadata"},
+    {"id": "cwe", "source_type": "official", "url": "https://cwe.mitre.org/", "format": "CWE catalog", "use": "weakness taxonomy"},
+    {"id": "sigma", "source_type": "github", "url": "https://github.com/SigmaHQ/sigma", "format": "YAML", "use": "detection logic and ATT&CK mappings"},
+    {"id": "yara", "source_type": "official", "url": "https://virustotal.github.io/yara/", "format": "rule language and docs", "use": "defensive pattern matching only"},
+    {"id": "suricata", "source_type": "official", "url": "https://suricata.io/", "format": "IDS rules and docs", "use": "network detection concepts"},
+    {"id": "huggingface", "source_type": "huggingface", "url": "https://huggingface.co/datasets", "format": "dataset repository", "use": "candidate research corpora after license and poisoning review"}
+  ]
+}
