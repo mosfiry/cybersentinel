@@ -81,6 +81,17 @@ class OwnerSessionManager:
                 "authenticated_at": now.isoformat(),
             }
 
+    def is_active(self, session_id: str) -> bool:
+        """Return whether a session is present and unexpired; never grants a token-less task by itself."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            session = self._sessions.get(str(session_id or ""))
+            if session is None or session.used or session.expires_at <= now:
+                if session is not None:
+                    self._sessions.pop(str(session_id), None)
+                return False
+            return True
+
     def _purge(self, now: datetime) -> None:
         expired = [key for key, value in self._sessions.items() if value.expires_at <= now or value.used]
         for key in expired:

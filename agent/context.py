@@ -129,6 +129,7 @@ class ExecutionState:
     """Current execution context."""
     request_id: str
     conversation_id: str
+    task_id: str | None = None
     step: int = 0
     tool_calls_used: int = 0
     remaining_steps: int = 4
@@ -140,8 +141,10 @@ class ExecutionState:
         return cls(
             request_id=request_id,
             conversation_id=conversation_id,
+            task_id=None,
             step=0,
             tool_calls_used=0,
+            # Legacy factory compatibility; live task runtime supplies policy-derived remaining_steps explicitly.
             remaining_steps=4,
             provider=provider,
             model=model,
@@ -245,6 +248,23 @@ class ConversationMemoryProvider(MemoryProvider):
             if msg["role"] in {"user", "assistant"}
         ][:limit]
     
+    def available(self) -> bool:
+        return True
+
+
+class DurableMemoryProvider(MemoryProvider):
+    """Adapter from the persistent structured memory database to ContextEngine."""
+
+    def __init__(self, conversation_id: str):
+        self.conversation_id = conversation_id
+
+    def retrieve_relevant(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        from agent.memory import MemoryProvider as DurableProvider
+        return [
+            {"id": item.memory_id, "content": item.content, "memory_type": item.memory_type.value, "trust_classification": item.trust_classification.value, "provenance": item.provenance}
+            for item in DurableProvider.get_relevant_memory(self.conversation_id, query=query, limit=limit)
+        ]
+
     def available(self) -> bool:
         return True
 
@@ -500,8 +520,8 @@ class ContextBuilder:
                 continue
             
             memory_item = ContextItem(
-                role="system",
-                content=f"[Memory] {content}",
+                role="user",
+                content=f"[UNTRUSTED_MEMORY] {content}",
                 source=ContextSource.MEMORY,
                 trust_level=TrustLevel.UNTRUSTED_DATA,
                 metadata={"memory_id": item.get("id"), "priority": "low"},
@@ -527,8 +547,8 @@ class ContextBuilder:
                 continue
             
             knowledge_item = ContextItem(
-                role="system",
-                content=f"[Knowledge: {item.get('source', 'unknown')}] {content}",
+                role="user",
+                content=f"[UNTRUSTED_KNOWLEDGE:{item.get('source', 'unknown')}] {content}",
                 source=ContextSource.KNOWLEDGE,
                 trust_level=TrustLevel.UNTRUSTED_DATA,
                 metadata={
@@ -743,6 +763,7 @@ class ContextEngine:
         runtime_limits: RuntimeLimits | None = None,
         provider: str = "",
         model: str = "",
+        memory_provider: MemoryProvider | None = None,
     ) -> AgentContext:
         """Build context for a user request.
         
@@ -801,8 +822,8 @@ class ContextEngine:
             builder.add_conversation_history(conversation_messages)
         
         # 6. Memory Context
-        memory_provider = ConversationMemoryProvider(conversation_id)
-        builder.add_memory_context(memory_provider, user_text, limit=2)
+        memory_provider = memory_provider or DurableMemoryProvider(conversation_id)
+        builder.add_memory_context(memory_provider, user_text, limit=5)
         
         # 7. Knowledge Context
         knowledge_provider = KnowledgeProvider()

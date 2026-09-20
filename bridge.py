@@ -10,7 +10,8 @@ from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 from security.owner_policy import verify_owner
 from security.owner_session import create_owner_session
-from api.chat import chat, get_session, sse, stream
+from api.chat import chat, get_session, sse, stream, task_stream, create_task, resume_task, pause_task, cancel_task
+from agent.task_manager import TaskManager
 from agent.loop import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 
@@ -84,9 +85,27 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             payload = {"text": query.get("text", [""])[0], "conversation_id": query.get("conversation_id", [""])[0]}
             owner_token, owner_session, owner_challenge = self._chat_auth()
-            if owner_session and owner_challenge:
-                payload["text"] = f"{owner_challenge} {payload['text']}"
             return self._send_sse(stream(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge))
+        if parsed.path.startswith("/api/tasks/"):
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            owner_token, owner_session, _ = self._chat_auth()
+            owner_ok, reason = verify_owner("Owner task access", owner_token)
+            if not owner_ok:
+                return self._send(403, {"ok": False, "error": reason})
+            task_id = parsed.path[len("/api/tasks/"):]
+            if task_id.endswith("/stream"):
+                task_id = task_id[:-len("/stream")].rstrip("/")
+                task = TaskManager.get_task(task_id)
+                if task is None:
+                    return self._send(404, {"ok": False, "error": "unknown_task"})
+                return self._send_sse(task_stream(task_id, owner_token=owner_token, owner_session_id=owner_session))
+            task = TaskManager.get_task(task_id)
+            if task is None:
+                return self._send(404, {"ok": False, "error": "unknown_task"})
+            if owner_session and task.owner_session_id != owner_session:
+                return self._send(403, {"ok": False, "error": "task access denied"})
+            return self._send(200, {"ok": True, "task": task.to_dict()})
         if self.path.startswith("/static/"):
             return self._static(self.path[8:])
         if self.path == "/api/status":
@@ -127,8 +146,6 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 owner_token, owner_session, owner_challenge = self._chat_auth()
-                if owner_session and owner_challenge:
-                    payload["text"] = f"{owner_challenge} {str(payload.get('text', ''))}"
                 result = chat(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge)
                 return self._send(200, {"ok": True, **result})
             except PermissionError as exc:
@@ -137,6 +154,34 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"ok": False, "error": str(exc)})
             except Exception:
                 return self._send(500, {"ok": False, "error": "chat_failed"})
+        if self.path == "/api/tasks":
+            try:
+                payload = self._read_json()
+                owner_token, owner_session, _ = self._chat_auth()
+                owner_challenge = self.headers.get("X-CyberSentinel-Owner-Challenge")
+                result = create_task(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge, authentication_method="owner_session_challenge" if owner_session else "owner_token", run=bool(payload.get("run", True)))
+                return self._send(201, {"ok": True, **result})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, KeyError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if self.path.startswith("/api/tasks/"):
+            try:
+                task_id, action = self.path[len("/api/tasks/"):].split("/", 1)
+                owner_token, owner_session, _ = self._chat_auth()
+                if action == "resume":
+                    result = resume_task(task_id, owner_token=owner_token, owner_session_id=owner_session, run=True)
+                elif action == "pause":
+                    result = pause_task(task_id, owner_token=owner_token, owner_session_id=owner_session)
+                elif action == "cancel":
+                    result = cancel_task(task_id, owner_token=owner_token, owner_session_id=owner_session)
+                else:
+                    return self._send(404, {"ok": False, "error": "unknown_task_action"})
+                return self._send(200, {"ok": True, **result})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, KeyError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
         if self.path == "/api/cancel":
             try:
                 n = int(self.headers.get("Content-Length", "0"))

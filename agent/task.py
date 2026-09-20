@@ -1,12 +1,6 @@
-"""
-CyberSentinel X - Phase 5B: Task Management
-
-Task system for long-horizon conversational execution.
-"""
-
+"""Persistent task model for long-horizon CyberSentinel execution."""
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,7 +9,6 @@ from typing import Any
 
 
 class TaskStatus(Enum):
-    """Task execution states."""
     QUEUED = "queued"
     PLANNING = "planning"
     WAITING_FOR_TOOL = "waiting_for_tool"
@@ -24,13 +17,17 @@ class TaskStatus(Enum):
     PAUSED = "paused"
     CANCELLING = "cancelling"
     COMPLETED = "completed"
+    PARTIAL_SUCCESS = "partial_success"
+    NEEDS_INPUT = "needs_input"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
+TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.PARTIAL_SUCCESS, TaskStatus.NEEDS_INPUT, TaskStatus.FAILED, TaskStatus.CANCELLED})
+
+
 @dataclass
 class Task:
-    """Persistent task representation for long-horizon execution."""
     task_id: str
     conversation_id: str
     request_id: str
@@ -52,139 +49,69 @@ class Task:
     cancel_requested: bool = False
     pause_requested: bool = False
     resume_state: dict[str, Any] | None = None
-    
+    authentication_method: str = "owner_token"
+
     @classmethod
-    def create(
-        cls,
-        conversation_id: str,
-        request_id: str,
-        owner_session_id: str,
-        objective: str,
-        provider: str = "",
-        model: str = "",
-    ) -> Task:
-        """Create a new task."""
+    def create(cls, conversation_id: str, request_id: str, owner_session_id: str, objective: str, provider: str = "", model: str = "", authentication_method: str = "owner_token") -> "Task":
         now = datetime.now(timezone.utc).isoformat()
-        return cls(
-            task_id=uuid.uuid4().hex,
-            conversation_id=conversation_id,
-            request_id=request_id,
-            owner_session_id=owner_session_id,
-            status=TaskStatus.QUEUED,
-            created_at=now,
-            updated_at=now,
-            started_at=None,
-            finished_at=None,
-            current_step=0,
-            tool_calls=[],
-            retry_count=0,
-            provider=provider,
-            model=model,
-            objective=objective,
-            execution_state={},
-            result=None,
-            error=None,
-            cancel_requested=False,
-            pause_requested=False,
-            resume_state=None,
-        )
-    
+        return cls(uuid.uuid4().hex, conversation_id, request_id, owner_session_id, TaskStatus.QUEUED, now, now, objective=objective, provider=provider, model=model, authentication_method=authentication_method)
+
     def to_dict(self) -> dict[str, Any]:
-        """Convert task to dictionary for serialization."""
-        return {
-            "task_id": self.task_id,
-            "conversation_id": self.conversation_id,
-            "request_id": self.request_id,
-            "owner_session_id": self.owner_session_id,
-            "status": self.status.value,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "current_step": self.current_step,
-            "tool_calls": self.tool_calls,
-            "retry_count": self.retry_count,
-            "provider": self.provider,
-            "model": self.model,
-            "objective": self.objective,
-            "execution_state": self.execution_state,
-            "result": self.result,
-            "error": self.error,
-            "cancel_requested": self.cancel_requested,
-            "pause_requested": self.pause_requested,
-            "resume_state": self.resume_state,
-        }
-    
+        return {**self.__dict__, "status": self.status.value}
+
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Task:
-        """Create task from dictionary."""
+    def from_dict(cls, data: dict[str, Any]) -> "Task":
         data = data.copy()
         data["status"] = TaskStatus(data["status"])
+        data.setdefault("authentication_method", "owner_token")
         return cls(**data)
-    
+
     def update_status(self, new_status: TaskStatus) -> None:
-        """Update task status."""
         self.status = new_status
         self.updated_at = datetime.now(timezone.utc).isoformat()
-        
-        if new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        if new_status in TERMINAL_STATUSES:
             self.finished_at = self.updated_at
         elif new_status == TaskStatus.EXECUTING and self.started_at is None:
             self.started_at = self.updated_at
-    
-    def add_tool_call(self, tool_name: str, status: str, request_id: str | None = None) -> None:
-        """Record a tool call."""
-        self.tool_calls.append({
-            "tool_call_id": uuid.uuid4().hex,
-            "tool_name": tool_name,
-            "status": status,
-            "request_id": request_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+
+    def record_tool_call(self, tool_call_id: str, tool_name: str, status: str, *, request_id: str, owner_session_id: str, result: Any = None, argument: Any = None) -> bool:
+        """Append exactly once; returns False for a replayed call id."""
+        if tool_call_id and any(item.get("tool_call_id") == tool_call_id for item in self.tool_calls):
+            return False
+        self.tool_calls.append({"tool_call_id": tool_call_id or uuid.uuid4().hex, "task_id": self.task_id, "conversation_id": self.conversation_id, "tool_name": tool_name, "argument": argument, "status": status, "request_id": request_id, "owner_session_id": owner_session_id, "result": result, "timestamp": datetime.now(timezone.utc).isoformat()})
         self.updated_at = datetime.now(timezone.utc).isoformat()
-    
+        return True
+
+    def add_tool_call(self, tool_name: str, status: str, request_id: str | None = None) -> None:
+        self.record_tool_call(uuid.uuid4().hex, tool_name, status, request_id=request_id or self.request_id, owner_session_id=self.owner_session_id)
+
+    def has_tool_call(self, tool_call_id: str) -> bool:
+        return any(item.get("tool_call_id") == tool_call_id for item in self.tool_calls)
+
     def increment_step(self) -> None:
-        """Increment current step."""
         self.current_step += 1
         self.updated_at = datetime.now(timezone.utc).isoformat()
-    
+
     def increment_retry(self) -> None:
-        """Increment retry count."""
         self.retry_count += 1
         self.updated_at = datetime.now(timezone.utc).isoformat()
-    
+
     def request_cancel(self) -> None:
-        """Request task cancellation."""
         self.cancel_requested = True
         self.updated_at = datetime.now(timezone.utc).isoformat()
-    
+
     def request_pause(self) -> None:
-        """Request task pause."""
         self.pause_requested = True
         self.updated_at = datetime.now(timezone.utc).isoformat()
-    
+
     def save_resume_state(self, state: dict[str, Any]) -> None:
-        """Save state for resumption."""
         self.resume_state = state
         self.updated_at = datetime.now(timezone.utc).isoformat()
-    
+
     @property
     def is_active(self) -> bool:
-        """Check if task is still active."""
-        return self.status in (
-            TaskStatus.QUEUED,
-            TaskStatus.PLANNING,
-            TaskStatus.WAITING_FOR_TOOL,
-            TaskStatus.EXECUTING,
-            TaskStatus.WAITING_FOR_MODEL,
-            TaskStatus.PAUSED,
-        )
-    
+        return self.status not in TERMINAL_STATUSES
+
     @property
     def is_terminal(self) -> bool:
-        """Check if task has reached a terminal state."""
-        return self.status in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-        )
+        return self.status in TERMINAL_STATUSES
