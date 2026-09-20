@@ -23,24 +23,46 @@ class AgentRuntime:
     def deterministic_plan(text: str) -> list[str | list[str]]:
         t = text.casefold()
         tools: list[str | list[str]] = []
-        if any(x in t for x in ("red team", "red-team", "تحليل هجومي", "تقييم هجومي", "اختبار اختراق دفاعي")):
+        # Arabic and English patterns for red team assessment
+        if any(x in t for x in ("red team", "red-team", "red team assess",
+                                 "تحليل اختباري", "تقييم اختباري",
+                                 "اختبار اختراق دفاعي", "تقييم الاختراق")):
             tools.append(["red_team_assess", text.strip()])
-        if any(x in t for x in ("حدّث", "تحديث", "استخبارات", "threat", "intel", "cisa", "kev", "ثغرات")):
+        # Arabic and English patterns for threat intelligence
+        if any(x in t for x in ("حدث", "تحديث", "استخبارات",
+                                 "threat", "intel", "cisa", "kev", "تهديدات")):
             tools.append("refresh_intel")
-        if any(x in t for x in ("افحص الجهاز", "فحص الجهاز", "فحص محلي", "افحص النظام", "local check", "local security")):
+        # Arabic and English patterns for local security check
+        if any(x in t for x in ("افحص الجهاز",
+                                 "فحص الجهاز",
+                                 "فحص محلي",
+                                 "افحص النظام",
+                                 "local check", "local security")):
             tools.append("local_security_check")
-        if any(x in t for x in ("معلومات الجهاز", "system info", "معلومات النظام")):
+        # Arabic and English patterns for system info
+        if any(x in t for x in ("معلومات الجهاز",
+                                 "system info", "معلومات النظام")):
             tools.append("local_system_info")
-        if any(x in t for x in ("آخر الأحداث", "الاحداث", "الأحداث", "latest events")):
+        # Arabic and English patterns for latest events
+        if any(x in t for x in ("آخر الأحداث",
+                                 "الأحداث",
+                                 "الأحداث",
+                                 "latest events")):
             tools.append("status")
-        if any(x in t for x in ("آخر الثغرات", "أحدث الثغرات", "latest intel", "latest vulnerabilities")):
+        # Arabic and English patterns for latest intel
+        if any(x in t for x in ("آخر الاستخبارات",
+                                 "أحدث التهديدات",
+                                 "latest intel", "latest vulnerabilities")):
             tools.append("latest_intel")
-        if any(x in t for x in ("الحالة", "status", "كيف حال النظام")):
+        # Arabic and English patterns for status
+        if any(x in t for x in ("الحالة", "status",
+                                 "كيف حال النظام")):
             tools.append("status")
+        # Patterns for search, watch, unwatch
         for pattern, name in (
             (r"(?:ابحث عن|ابحث|بحث عن|search for|search)\s+(.+)", "search"),
             (r"(?:راقب|مراقبة|watch)\s+(.+)", "watch"),
-            (r"(?:أوقف مراقبة|الغاء مراقبة|unwatch)\s+(.+)", "unwatch"),
+            (r"(?:أوقف مراقبة|الغاء مراقب|unwatch)\s+(.+)", "unwatch"),
         ):
             match = re.search(pattern, text, re.I)
             if match:

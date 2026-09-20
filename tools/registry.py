@@ -68,8 +68,70 @@ def _system_info(_):
 
 
 def _search(argument):
-    from core.db import search_all
-    return search_all(argument or "", 50)
+    from search.service import search_service
+    from search.providers import SearchScope
+    from search.exceptions import SearchError, ProviderUnavailableError
+
+    query = argument or ""
+    scope = None  # Auto-select based on query
+
+    # Parse scope from argument if present
+    # Format: "scope:github query" or "scope:nvd CVE-2021-1234"
+    if ":" in query:
+        parts = query.split(":", 1)
+        scope_str = parts[0].lower()
+        query = parts[1].strip()
+
+        # Map scope string to SearchScope
+        scope_map = {
+            "local": SearchScope.LOCAL,
+            "github": SearchScope.GITHUB,
+            "nvd": SearchScope.NVD,
+            "cve": SearchScope.CVE,
+            "mitre": SearchScope.MITRE,
+            "web": SearchScope.WEB,
+        }
+        scope = scope_map.get(scope_str)
+
+    try:
+        response = search_service.search(
+            query=query,
+            scope=scope,
+            max_results=50,
+        )
+
+        # Format results for backward compatibility
+        results = {
+            "query": query,
+            "scope": scope.value if scope else None,
+            "total_results": response.total_results,
+            "results": [
+                {
+                    "id": r.result_id,
+                    "title": r.title,
+                    "content": r.content,
+                    "source": r.source,
+                    "source_type": r.source_type,
+                    "url": r.url,
+                    "provenance": r.provenance,
+                    "metadata": r.metadata,
+                }
+                for r in response.results
+            ],
+        }
+
+        if response.error:
+            results["error"] = response.error
+        if response.error_type:
+            results["error_type"] = response.error_type
+
+        return results
+    except ProviderUnavailableError as e:
+        return {"error": str(e), "error_type": "provider_unavailable", "query": query}
+    except SearchError as e:
+        return {"error": str(e), "error_type": e.error_type, "query": query}
+    except Exception as e:
+        return {"error": str(e), "error_type": "unknown", "query": query}
 
 
 def _watch(argument):
@@ -125,16 +187,16 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
 
 
 REGISTRY = build_registry([
-    ToolSpec("status", "Read service status and recent audit events", "read", True, None, _status),
-    ToolSpec("latest_intel", "Read collected threat intelligence", "read", True, None, _latest_intel),
-    ToolSpec("refresh_intel", "Collect defensive threat intelligence", "network-read", True, None, _refresh_intel),
-    ToolSpec("local_security_check", "Inspect local TCP listeners", "read", True, None, _local_security),
-    ToolSpec("local_system_info", "Read local system information", "read", True, None, _system_info),
-    ToolSpec("search", "Search local events and intelligence", "read", True, str, _search),
-    ToolSpec("watch", "Add a local defensive watch keyword", "state-write", True, str, _watch),
-    ToolSpec("unwatch", "Remove a local defensive watch keyword", "state-write", True, str, _unwatch),
-    ToolSpec("run_project_tests", "Run only pytest -q inside the configured project test root", "bounded-exec", True, str, _run_project_tests),
-    ToolSpec("red_team_assess", "Owner-only defensive adversarial assessment; no exploit or shell execution", "analysis", True, str, _red_team_assess, True),
+    ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status),
+    ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel),
+    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel),
+    ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security),
+    ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info),
+    ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search),
+    ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch),
+    ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch),
+    ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests),
+    ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)

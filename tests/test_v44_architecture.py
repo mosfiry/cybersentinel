@@ -41,7 +41,10 @@ def test_router_fails_over_and_records_first_failure():
 def test_registry_has_schema_and_per_tool_policy():
     assert REGISTRY["search"].risk_class == "read"
     assert REGISTRY["watch"].risk_class == "state-write"
-    assert set(execute("search", "CVE-2026")) == {"events", "intel"}
+    # Search now returns structured results from SearchService
+    result = execute("search", "CVE-2026")
+    assert "query" in result
+    assert "results" in result
 
 
 def test_prompt_injection_text_is_only_a_string_argument():
