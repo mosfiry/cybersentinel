@@ -8,6 +8,7 @@ from core.engine import handle, status
 from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 from security.owner_policy import verify_owner
+from security.owner_session import create_owner_session
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 
 ROOT = Path(__file__).resolve().parent
@@ -71,6 +72,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._bridge_auth():
             return self._send(401, {"ok": False, "error": "bridge authentication required"})
+        if self.path == "/api/owner/session":
+            try:
+                session = create_owner_session(self.headers.get("X-CyberSentinel-Owner-Token", ""))
+                return self._send(201, {"ok": True, "session": session})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
         if self.path == "/api/cancel":
             try:
                 n = int(self.headers.get("Content-Length", "0"))
@@ -96,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
             if request_id and (len(request_id) > 128 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in request_id)):
                 return self._send(400, {"ok": False, "error": "invalid_request_id"})
             owner_token = self.headers.get("X-CyberSentinel-Owner-Token", "")
-            return self._send(200, handle(text, source="web", presented_token=self.headers.get("X-CyberSentinel-Token"), owner_token=owner_token, request_id=request_id or None))
+            return self._send(200, handle(text, source="web", presented_token=self.headers.get("X-CyberSentinel-Token"), owner_token=owner_token, request_id=request_id or None, owner_session_id=self.headers.get("X-CyberSentinel-Owner-Session"), owner_challenge=self.headers.get("X-CyberSentinel-Owner-Challenge")))
         except Exception:
             return self._send(400, {"ok": False, "error": "invalid_request"})
 

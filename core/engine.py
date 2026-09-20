@@ -9,6 +9,7 @@ from agent.runtime import AgentRuntime
 from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
 from security.owner_policy import verify_owner, set_current_owner_instruction, load_state, load_policy, authority_snapshot
+from security.owner_session import consume_owner_challenge
 from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
@@ -47,7 +48,7 @@ def execute(tool: str, argument: str | None = None, *, owner_authenticated: bool
     return execute_tool(tool, argument, owner_authenticated=owner_authenticated)
 
 
-def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None):
+def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None, owner_session_id=None, owner_challenge=None):
     request_id = request_id or uuid.uuid4().hex
     lifecycle = begin_lifecycle(request_id, source)
     if lifecycle.status == "completed":
@@ -56,7 +57,22 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         return replay
     if not lifecycle.claimed or lifecycle.status != "created":
         return {"ok": False, "decision": "in_progress", "request_id": request_id, "lifecycle": lifecycle.status, "answer": "الطلب قيد التنفيذ أو يحتاج إلى recovery؛ لن تتم إعادة تنفيذه."}
-    owner_ok, owner_reason = verify_owner(text, owner_token)
+    owner_ok = False
+    owner_reason = "owner authentication required"
+    auth_context = {
+        "owner_authenticated": False,
+        "owner_session_id": None,
+        "authentication_method": "none",
+        "authenticated_at": None,
+    }
+    if owner_session_id or owner_challenge:
+        try:
+            auth_context = consume_owner_challenge(owner_session_id, owner_challenge, text)
+            owner_ok, owner_reason = True, "owner-session-challenge"
+        except PermissionError as exc:
+            owner_reason = str(exc)
+    else:
+        owner_ok, owner_reason = verify_owner(text, owner_token)
     auth_event = add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
     if not owner_ok:
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}
@@ -85,7 +101,7 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
     transition_lifecycle(request_id, "authorized", plan_hash=final_plan_hash)
     provenance = {"provider": planned.get("provider"), "model": planned.get("model"), "planner": planned.get("planner")}
     policy_snapshot = RUNTIME.status()["policy_fingerprint"]
-    context = ExecutionContext(request_id, True, "authenticated-owner", policy_snapshot, provenance["provider"], provenance["model"], authority_snapshot())
+    context = ExecutionContext(request_id, True, "authenticated-owner", policy_snapshot, provenance["provider"], provenance["model"], authority_snapshot(), auth_context["owner_session_id"], auth_context["authentication_method"], auth_context["authenticated_at"])
     plan_event = add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan, "plan_hash": final_plan_hash, "parent_event": policy_event, "context": context.to_dict()})
     chain = (f"request:{request_id}", f"auth:{auth_event}", f"policy:{policy_event}", f"plan:{plan_event}")
 
@@ -159,10 +175,10 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
     return response
 
 
-def handle(text, source="web", presented_token=None, owner_token=None, request_id=None):
+def handle(text, source="web", presented_token=None, owner_token=None, request_id=None, owner_session_id=None, owner_challenge=None):
     request_id = request_id or uuid.uuid4().hex
     try:
-        return _handle_once(text, source, presented_token, owner_token, request_id)
+        return _handle_once(text, source, presented_token, owner_token, request_id, owner_session_id, owner_challenge)
     except Exception as exc:
         error = str(exc)[:500]
         current = get_lifecycle(request_id)
