@@ -8,14 +8,15 @@ from .provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False):
+    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, priority: int = 100):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.failure_count = 0
         self.last_error = ""
-        self.capabilities = ProviderCapabilities(generate=True, stream=False, tool_calling=tool_calling, structured_output=tool_calling)
+        self.priority = priority
+        self.capabilities = ProviderCapabilities(generate=True, stream=streaming, tool_calling=tool_calling, structured_output=tool_calling)
 
     def status(self) -> dict:
         return {
@@ -25,6 +26,7 @@ class OpenAICompatibleProvider:
             "configured": bool(self.base_url and self.model),
             "failure_count": self.failure_count,
             "last_error": self.last_error,
+            "priority": self.priority,
             "capabilities": self.capabilities.__dict__.copy(),
         }
 

@@ -15,19 +15,24 @@ class ModelRouter:
     @classmethod
     def from_env(cls):
         providers = []
-        for name in ("LOCAL", "COLAB", "HF"):
+        for position, name in enumerate(("LOCAL", "COLAB", "HF")):
             base = os.getenv(f"{name}_LLM_BASE_URL", "").strip()
-            model = os.getenv(f"{name}_LLM_MODEL", "").strip()
+            default_model = "Qwen/Qwen3-Coder-Next" if name == "LOCAL" else ""
+            model = os.getenv(f"{name}_LLM_MODEL", default_model).strip()
             key = os.getenv(f"{name}_LLM_API_KEY", "").strip()
             if base and model:
                 native = os.getenv(f"{name}_LLM_TOOL_CALLING", "false").lower() == "true"
-                providers.append(OpenAICompatibleProvider(name.lower(), base, model, key, tool_calling=native))
+                streaming = os.getenv(f"{name}_LLM_STREAMING", "false").lower() == "true"
+                priority = int(os.getenv(f"{name}_LLM_PRIORITY", str(position * 100 + 10)))
+                providers.append(OpenAICompatibleProvider(name.lower(), base, model, key, tool_calling=native, streaming=streaming, priority=priority))
         base = os.getenv("LLM_BASE_URL", "").strip()
         model = os.getenv("LLM_MODEL", "").strip()
         key = os.getenv("LLM_API_KEY", "").strip()
         if base and model and not providers:
             native = os.getenv("LLM_TOOL_CALLING", "false").lower() == "true"
-            providers.append(OpenAICompatibleProvider("default", base, model, key, tool_calling=native))
+            streaming = os.getenv("LLM_STREAMING", "false").lower() == "true"
+            providers.append(OpenAICompatibleProvider("default", base, model, key, tool_calling=native, streaming=streaming, priority=1000))
+        providers.sort(key=lambda item: int(getattr(item, "priority", 100)))
         return cls(providers)
 
     def status(self):
@@ -38,7 +43,7 @@ class ModelRouter:
         value = getattr(provider, "capabilities", None)
         if isinstance(value, ProviderCapabilities):
             return value
-        return ProviderCapabilities(generate=callable(getattr(provider, "chat", None)), tool_calling=callable(getattr(provider, "tool_calling", None)))
+        return ProviderCapabilities(generate=callable(getattr(provider, "generate", None)) or callable(getattr(provider, "chat", None)), tool_calling=callable(getattr(provider, "tool_calling", None)))
 
     @staticmethod
     def _trusted(response: ProviderResponse, provider: Any, capability: str) -> dict[str, Any]:
