@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-MAX_ARG_LENGTH = 256
+from tools.registry import KNOWN_TOOLS, MAX_ARG_LENGTH, get_tool
+
 MAX_TOOLS_PER_PLAN = 8
 
 
@@ -13,21 +14,7 @@ class AuthorizationResult:
     reason: str
     name: str | None = None
     argument: str | None = None
-
-
-# The model may propose only these defensive tools. Execution remains in engine code.
-KNOWN_TOOLS = frozenset({
-    "status",
-    "latest_intel",
-    "refresh_intel",
-    "local_security_check",
-    "local_system_info",
-    "search",
-    "watch",
-    "unwatch",
-})
-
-_ARGUMENT_TOOLS = frozenset({"search", "watch", "unwatch"})
+    risk_class: str | None = None
 
 
 def authorize_tool(item: Any, *, owner_authenticated: bool = True, current_policy: str = "") -> AuthorizationResult:
@@ -43,15 +30,15 @@ def authorize_tool(item: Any, *, owner_authenticated: bool = True, current_polic
         name, argument = item
     if not isinstance(name, str) or name not in KNOWN_TOOLS:
         return AuthorizationResult(False, "unknown tool")
-    if name in _ARGUMENT_TOOLS:
-        if not isinstance(argument, str) or not argument.strip():
-            return AuthorizationResult(False, f"{name} requires a non-empty string argument")
+    spec = get_tool(name)
+    if spec is None or (spec.requires_owner and not owner_authenticated):
+        return AuthorizationResult(False, "tool requires authenticated Owner")
+    valid, reason = spec.validate(argument)
+    if not valid:
+        return AuthorizationResult(False, reason)
+    if isinstance(argument, str):
         argument = argument.strip()
-        if len(argument) > MAX_ARG_LENGTH:
-            return AuthorizationResult(False, "tool argument exceeds maximum length")
-    elif argument is not None:
-        return AuthorizationResult(False, f"{name} does not accept an argument")
-    return AuthorizationResult(True, "authorized", name, argument)
+    return AuthorizationResult(True, "authorized", name, argument, spec.risk_class)
 
 
 def authorize_plan(plan: Any, *, owner_authenticated: bool = True, current_policy: str = "") -> tuple[list[tuple[str, str | None]], list[str]]:

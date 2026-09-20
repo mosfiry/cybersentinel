@@ -1,7 +1,7 @@
 # Tool Model
 
-The tool registry is intentionally small and defensive. The current known tools are `status`, `latest_intel`, `refresh_intel`, `local_security_check`, `local_system_info`, `search`, `watch`, and `unwatch`.
+The tool registry in `tools/registry.py` is intentionally small and defensive. The current known tools are `status`, `latest_intel`, `refresh_intel`, `local_security_check`, `local_system_info`, `search`, `watch`, and `unwatch`. Each registry entry declares its description, risk class, Owner requirement, argument type, and handler.
 
 Only `search`, `watch`, and `unwatch` accept arguments, and each argument must be a non-empty string no longer than 256 characters. A plan may contain no more than eight tools. Unknown tools, unexpected arguments, null values, malformed arrays, and oversized strings are rejected by deterministic code before execution.
 
-The model is a planner, not an authorization authority. Tool execution is selected from the fixed Python implementation in `core/engine.py`; model output cannot create a new executable tool.
+The model is a planner, not an authorization authority. Tool execution is selected from the registry; model output cannot create a new executable tool. The engine no longer contains a second distributed tool dispatch table.

@@ -48,12 +48,13 @@ def connect():
 def add_event(kind, title, body, source, severity="info", trusted=False, metadata=None):
     payload = metadata if isinstance(metadata, str) else __import__("json").dumps(metadata or {}, ensure_ascii=False)
     with connect() as con:
-        con.execute(
+        cur = con.execute(
             """INSERT INTO events
                (kind,severity,title,body,source,trusted,metadata_json)
                VALUES(?,?,?,?,?,?,?)""",
             (kind, severity, title, body, source, int(trusted), payload),
         )
+        return cur.lastrowid
 
 def recent(limit=50):
     with connect() as con:
