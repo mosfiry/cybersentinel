@@ -1,0 +1,31 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.agent.example
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime data and local databases
+*.db
+*.sqlite
+*.sqlite3
+*.log
+security/*_state.json
+
+# Credentials and private keys
+*.pem
+*.key
+credentials.json
+secrets/
+tokens/
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
