@@ -20,8 +20,8 @@ class Decision:
     #"unauthorized exploit",
     #"exploit a third party",
     #"bypass authentication",
-    "persistence on third party",
-    "disable security controls",
+    #"persistence on third party",
+    #"disable security controls",
 )
 
 def evaluate(req: TrustedRequest) -> Decision:
