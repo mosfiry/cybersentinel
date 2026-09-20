@@ -1,11 +1,15 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
+
 from .trust import TrustedRequest, is_owner_instruction
+
 
 @dataclass(frozen=True)
 class Decision:
     allowed: bool
     reason: str
+
 
 # Explicitly disallowed because this project is a defensive agent, not an
 # unrestricted offensive execution framework.
@@ -24,11 +28,12 @@ BLOCKED_PATTERNS = (
     "disable security controls",
 )
 
+
 def evaluate(req: TrustedRequest) -> Decision:
     if not is_owner_instruction(req):
         return Decision(False, "الطلب ليس أمرًا موثوقًا من المالك.")
-    t = req.text.casefold()
+    text = req.text.casefold()
     for pattern in BLOCKED_PATTERNS:
-        if pattern.casefold() in t:
+        if pattern.casefold() in text:
             return Decision(False, "الطلب خارج حدود CyberSentinel الدفاعية المسموح بها.")
     return Decision(True, "owner-approved")
