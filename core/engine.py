@@ -13,9 +13,11 @@ from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
 from security.plan_integrity import plan_hash
+from .lifecycle import begin as begin_lifecycle, complete as complete_lifecycle, get as get_lifecycle, is_cancelled, recover_incomplete, transition as transition_lifecycle
 
 TOOLS = KNOWN_TOOLS
 RUNTIME = AgentRuntime()
+recover_incomplete()
 
 
 def status():
@@ -43,26 +45,42 @@ def execute(tool: str, argument: str | None = None):
     return execute_tool(tool, argument)
 
 
-def handle(text, source="web", presented_token=None, owner_token=None):
-    request_id = uuid.uuid4().hex
+def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None):
+    request_id = request_id or uuid.uuid4().hex
+    lifecycle = begin_lifecycle(request_id, source)
+    if lifecycle.status == "completed":
+        replay = dict(lifecycle.final_result or {"ok": False, "decision": "failed", "request_id": request_id})
+        replay["idempotent_replay"] = True
+        return replay
+    if not lifecycle.claimed or lifecycle.status != "created":
+        return {"ok": False, "decision": "in_progress", "request_id": request_id, "lifecycle": lifecycle.status, "answer": "الطلب قيد التنفيذ أو يحتاج إلى recovery؛ لن تتم إعادة تنفيذه."}
     owner_ok, owner_reason = verify_owner(text, owner_token)
     auth_event = add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
     if not owner_ok:
-        return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": []}
+        response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}
+        complete_lifecycle(request_id, response, success=False, error=owner_reason)
+        return response
     set_current_owner_instruction(text, source)
     req = owner_request(text, source)
     decision = evaluate(req)
     policy_event = add_event("policy", "Policy evaluation", decision.reason, source, "info" if decision.allowed else "warning", decision.allowed, {"request_id": request_id, "decision": "allow" if decision.allowed else "deny", "parent_event": auth_event})
     if not decision.allowed:
-        return {"ok": False, "decision": "deny", "request_id": request_id, "answer": decision.reason, "plan": [], "results": []}
+        response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": decision.reason, "plan": [], "results": [], "lifecycle": "completed"}
+        complete_lifecycle(request_id, response, success=False, error=decision.reason)
+        return response
 
     planned = RUNTIME.plan(text)
+    transition_lifecycle(request_id, "planned", provider=planned.get("provider", ""), model=planned.get("model", ""))
     authorized, errors = authorize_plan(planned["tools"], owner_authenticated=True)
     if errors:
         add_event("authorization", "Plan rejected", "; ".join(errors), source, "warning", True, {"request_id": request_id, "decision": "deny", "provider": planned.get("provider"), "model": planned.get("model")})
-        return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة: " + "; ".join(errors), "plan": [], "results": []}
+        response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة: " + "; ".join(errors), "plan": [], "results": [], "lifecycle": "completed"}
+        complete_lifecycle(request_id, response, success=False, error="; ".join(errors))
+        return response
     serial_plan = public_plan(authorized)
     final_plan_hash = plan_hash(serial_plan)
+    transition_lifecycle(request_id, "validated", plan_hash=final_plan_hash, provider=planned.get("provider", ""), model=planned.get("model", ""))
+    transition_lifecycle(request_id, "authorized", plan_hash=final_plan_hash)
     provenance = {"provider": planned.get("provider"), "model": planned.get("model"), "planner": planned.get("planner")}
     policy_snapshot = RUNTIME.status()["policy_fingerprint"]
     context = ExecutionContext(request_id, True, "authenticated-owner", policy_snapshot, provenance["provider"], provenance["model"])
@@ -73,6 +91,7 @@ def handle(text, source="web", presented_token=None, owner_token=None):
     authorization_records = []
     evidence = []
     previous_evidence_hash = ""
+    transition_lifecycle(request_id, "executing", plan_hash=final_plan_hash)
     for sequence, (name, argument) in enumerate(authorized, start=1):
         spec = get_tool(name)
         record = {"tool": name, "argument": argument, "risk_class": spec.risk_class, "owner_required": spec.requires_owner, "owner_authenticated": True, "policy_version": load_policy().version, "decision": "allow", "reason": "registry schema and Owner policy accepted", "plan_hash": final_plan_hash}
@@ -82,7 +101,18 @@ def handle(text, source="web", presented_token=None, owner_token=None):
             record["decision"] = "deny"
             record["reason"] = "plan integrity changed before execution"
             add_event("authorization", "Plan integrity failure", record["reason"], source, "warning", True, {"request_id": request_id, **record, "parent_event": plan_event})
-            return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة بسبب تغير سلامتها.", "plan": [], "results": [], "authorization": authorization_records}
+            response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة بسبب تغير سلامتها.", "plan": [], "results": [], "authorization": authorization_records, "lifecycle": "completed"}
+            complete_lifecycle(request_id, response, success=False, error=record["reason"])
+            return response
+        if is_cancelled(request_id):
+            error = "execution cancelled before tool start"
+            results.append({"tool": name, "argument": argument, "ok": False, "cancelled": True, "error": error})
+            execution_event = add_event("execution", "Tool execution cancelled", error, source, "warning", True, {"request_id": request_id, "tool": name, "plan_hash": final_plan_hash, "parent_event": plan_event})
+            results[-1]["event_id"] = execution_event
+            item_evidence = observed(f"{name} execution cancelled", name, {"request_id": request_id, "error": error}, 0, request_id=request_id, chain=chain + (f"execution:{execution_event}",), sequence=sequence, previous_hash=previous_evidence_hash)
+            evidence.append(item_evidence)
+            previous_evidence_hash = item_evidence["current_hash"]
+            continue
         try:
             result = execute(name, argument)
             results.append({"tool": name, "argument": argument, "ok": True, "result": result})
@@ -97,8 +127,10 @@ def handle(text, source="web", presented_token=None, owner_token=None):
             item_evidence = observed(f"{name} execution failed", name, {"request_id": request_id, "error": error}, 0, request_id=request_id, chain=chain + (f"execution:{execution_event}",), sequence=sequence, previous_hash=previous_evidence_hash)
         evidence.append(item_evidence)
         previous_evidence_hash = item_evidence["current_hash"]
+        if is_cancelled(request_id):
+            add_event("execution", "Cancellation observed", "cancellation requested after tool boundary", source, "warning", True, {"request_id": request_id, "tool": name, "parent_event": plan_event})
     response_event = add_event("response", "Defensive response", "request completed", source, "info", True, {"request_id": request_id, **provenance, "plan_hash": final_plan_hash, "result_count": len(results), "parent_event": plan_event})
-    return {
+    response = {
         "ok": True,
         "decision": "allow",
         "request_id": request_id,
@@ -112,7 +144,32 @@ def handle(text, source="web", presented_token=None, owner_token=None):
         "evidence": evidence,
         "execution_context": context.to_dict(),
         "evidence_chain": chain + (f"response:{response_event}",),
+        "lifecycle": "completed",
     }
+    cancelled = is_cancelled(request_id)
+    if cancelled:
+        response["cancelled"] = True
+        response["answer"] = "تم إيقاف التنفيذ عند أقرب حد آمن؛ النتائج السابقة موضحة كأدلة فاشلة أو ناجحة."
+    complete_lifecycle(request_id, response, success=not cancelled and all(item["ok"] for item in results), error="execution cancelled" if cancelled else ("one or more tools failed" if any(not item["ok"] for item in results) else ""))
+    return response
+
+
+def handle(text, source="web", presented_token=None, owner_token=None, request_id=None):
+    request_id = request_id or uuid.uuid4().hex
+    try:
+        return _handle_once(text, source, presented_token, owner_token, request_id)
+    except Exception as exc:
+        error = str(exc)[:500]
+        current = get_lifecycle(request_id)
+        if current and current.status != "completed":
+            try:
+                transition_lifecycle(request_id, "failed", error=error)
+                response = {"ok": False, "decision": "failed", "request_id": request_id, "lifecycle": "completed", "answer": "توقف التنفيذ بسبب خطأ مسجل.", "error": error, "plan": [], "results": []}
+                complete_lifecycle(request_id, response, success=False, error=error)
+                return response
+            except Exception:
+                pass
+        return {"ok": False, "decision": "failed", "request_id": request_id, "lifecycle": "unknown", "answer": "توقف التنفيذ قبل اكتمال سجل lifecycle.", "error": error, "plan": [], "results": []}
 
 
 def summarize(plan, results, planner, rationale):

@@ -1,6 +1,6 @@
-# CyberSentinel X 4.5.0
+# CyberSentinel X 4.6.0
 
-CyberSentinel X is a local, defensive cybersecurity agent for threat intelligence, local security checks, evidence, policy enforcement, and auditability. The model is a planner only; the registry and deterministic Python authorization code validate and execute the fixed defensive tools. V4.5 adds plan hashes, authorization decision records, and tamper-evident evidence.
+CyberSentinel X is a local, defensive cybersecurity agent for threat intelligence, local security checks, evidence, policy enforcement, and auditability. The model is a planner only; the registry and deterministic Python authorization code validate and execute the fixed defensive tools. V4.6 adds a persistent lifecycle, idempotency, bounded execution, cooperative cancellation, crash recovery, and request reconstruction.
 
 ## Quick start
 
