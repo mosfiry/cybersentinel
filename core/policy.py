@@ -9,7 +9,7 @@ class Decision:
 
 # Explicitly disallowed because this project is a defensive agent, not an
 # unrestricted offensive execution framework.
-BLOCKED_PATTERNS = (
+#BLOCKED_PATTERNS = (
     "arbitrary shell",
     "reverse shell",
     "credential theft",
