@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS executions (
     error TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
+
+CREATE TABLE IF NOT EXISTS reasoning_memory (
+    request_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    case_json TEXT NOT NULL,
+    critic_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_reasoning_memory_created ON reasoning_memory(created_at DESC);
 """
 
 def connect():
@@ -127,6 +135,25 @@ def intel_recent(limit=100):
         return [dict(r) for r in con.execute(
             "SELECT * FROM intel ORDER BY id DESC LIMIT ?", (int(limit),)
         )]
+
+def save_reasoning_memory(request_id, case, critic):
+    import json
+    with connect() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO reasoning_memory(request_id,case_json,critic_json) VALUES(?,?,?)",
+            (request_id, json.dumps(case, ensure_ascii=False), json.dumps(critic, ensure_ascii=False)),
+        )
+
+def reasoning_for_request(request_id):
+    import json
+    with connect() as con:
+        row = con.execute("SELECT * FROM reasoning_memory WHERE request_id=?", (request_id,)).fetchone()
+    if row is None:
+        return None
+    value = dict(row)
+    value["case"] = json.loads(value.pop("case_json"))
+    value["critic"] = json.loads(value.pop("critic_json"))
+    return value
 
 def add_watch(keyword):
     with connect() as con:
