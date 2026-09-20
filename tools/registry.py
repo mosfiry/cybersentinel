@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable
+from pathlib import Path
+import os
+import subprocess
+import sys
 
 MAX_ARG_LENGTH = 256
+VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec"})
 
 
 @dataclass(frozen=True)
@@ -71,16 +76,52 @@ def _unwatch(argument):
     return {"keyword": argument, "watches": watches()}
 
 
-REGISTRY: dict[str, ToolSpec] = {
-    "status": ToolSpec("status", "Read service status and recent audit events", "read", True, None, _status),
-    "latest_intel": ToolSpec("latest_intel", "Read collected threat intelligence", "read", True, None, _latest_intel),
-    "refresh_intel": ToolSpec("refresh_intel", "Collect defensive threat intelligence", "network-read", True, None, _refresh_intel),
-    "local_security_check": ToolSpec("local_security_check", "Inspect local TCP listeners", "read", True, None, _local_security),
-    "local_system_info": ToolSpec("local_system_info", "Read local system information", "read", True, None, _system_info),
-    "search": ToolSpec("search", "Search local events and intelligence", "read", True, str, _search),
-    "watch": ToolSpec("watch", "Add a local defensive watch keyword", "state-write", True, str, _watch),
-    "unwatch": ToolSpec("unwatch", "Remove a local defensive watch keyword", "state-write", True, str, _unwatch),
-}
+def _run_project_tests(argument):
+    root = Path(os.getenv("CYBERSENTINEL_TEST_ROOT", Path.cwd())).expanduser().resolve()
+    target = (root / (argument or ".")).resolve()
+    if root != target and root not in target.parents:
+        raise ValueError("project directory is outside the configured test root")
+    if not target.is_dir():
+        raise ValueError("project directory does not exist")
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q"],
+            cwd=target,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "timed_out": True, "returncode": None, "output": (exc.stdout or "")[-4000:]}
+    output = ((completed.stdout or "") + (completed.stderr or ""))[-4000:]
+    return {"ok": completed.returncode == 0, "timed_out": False, "returncode": completed.returncode, "output": output}
+
+
+def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
+    registry: dict[str, ToolSpec] = {}
+    for spec in specs:
+        if not isinstance(spec, ToolSpec) or not spec.name or spec.name in registry:
+            raise ValueError("duplicate or invalid tool specification")
+        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler):
+            raise ValueError(f"invalid registry metadata for {spec.name}")
+        if spec.argument_type not in (None, str):
+            raise ValueError(f"unsupported argument schema for {spec.name}")
+        registry[spec.name] = spec
+    return registry
+
+
+REGISTRY = build_registry([
+    ToolSpec("status", "Read service status and recent audit events", "read", True, None, _status),
+    ToolSpec("latest_intel", "Read collected threat intelligence", "read", True, None, _latest_intel),
+    ToolSpec("refresh_intel", "Collect defensive threat intelligence", "network-read", True, None, _refresh_intel),
+    ToolSpec("local_security_check", "Inspect local TCP listeners", "read", True, None, _local_security),
+    ToolSpec("local_system_info", "Read local system information", "read", True, None, _system_info),
+    ToolSpec("search", "Search local events and intelligence", "read", True, str, _search),
+    ToolSpec("watch", "Add a local defensive watch keyword", "state-write", True, str, _watch),
+    ToolSpec("unwatch", "Remove a local defensive watch keyword", "state-write", True, str, _unwatch),
+    ToolSpec("run_project_tests", "Run only pytest -q inside the configured project test root", "bounded-exec", True, str, _run_project_tests),
+])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
 

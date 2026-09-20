@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import json
 import uuid
-from .db import add_event, recent, counts, search_all, add_watch, remove_watch, watches
+from .db import add_event, recent, counts, watches
 from .policy import evaluate
 from .trust import owner_request
 from agent.runtime import AgentRuntime
 from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
-from security.owner_policy import verify_owner, set_current_owner_instruction, load_state
+from security.owner_policy import verify_owner, set_current_owner_instruction, load_state, load_policy
 from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
-from tools.registry import KNOWN_TOOLS, execute as execute_tool
+from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
+from security.plan_integrity import plan_hash
 
 TOOLS = KNOWN_TOOLS
 RUNTIME = AgentRuntime()
@@ -61,37 +62,50 @@ def handle(text, source="web", presented_token=None, owner_token=None):
         add_event("authorization", "Plan rejected", "; ".join(errors), source, "warning", True, {"request_id": request_id, "decision": "deny", "provider": planned.get("provider"), "model": planned.get("model")})
         return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة: " + "; ".join(errors), "plan": [], "results": []}
     serial_plan = public_plan(authorized)
+    final_plan_hash = plan_hash(serial_plan)
     provenance = {"provider": planned.get("provider"), "model": planned.get("model"), "planner": planned.get("planner")}
-    context = ExecutionContext(request_id, True, "authenticated-owner", RUNTIME.status()["policy_fingerprint"], provenance["provider"], provenance["model"])
-    plan_event = add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan, "parent_event": policy_event, "context": context.to_dict()})
+    policy_snapshot = RUNTIME.status()["policy_fingerprint"]
+    context = ExecutionContext(request_id, True, "authenticated-owner", policy_snapshot, provenance["provider"], provenance["model"])
+    plan_event = add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan, "plan_hash": final_plan_hash, "parent_event": policy_event, "context": context.to_dict()})
     chain = (f"request:{request_id}", f"auth:{auth_event}", f"policy:{policy_event}", f"plan:{plan_event}")
 
     results = []
-    for name, argument in authorized:
+    authorization_records = []
+    evidence = []
+    previous_evidence_hash = ""
+    for sequence, (name, argument) in enumerate(authorized, start=1):
+        spec = get_tool(name)
+        record = {"tool": name, "argument": argument, "risk_class": spec.risk_class, "owner_required": spec.requires_owner, "owner_authenticated": True, "policy_version": load_policy().version, "decision": "allow", "reason": "registry schema and Owner policy accepted", "plan_hash": final_plan_hash}
+        authorization_records.append(record)
+        add_event("authorization", "Tool authorization", name, source, "info", True, {"request_id": request_id, **record, "parent_event": plan_event})
+        if plan_hash(public_plan(authorized)) != final_plan_hash:
+            record["decision"] = "deny"
+            record["reason"] = "plan integrity changed before execution"
+            add_event("authorization", "Plan integrity failure", record["reason"], source, "warning", True, {"request_id": request_id, **record, "parent_event": plan_event})
+            return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة بسبب تغير سلامتها.", "plan": [], "results": [], "authorization": authorization_records}
         try:
             result = execute(name, argument)
             results.append({"tool": name, "argument": argument, "ok": True, "result": result})
-            execution_event = add_event("execution", "Tool executed", name, source, "info", True, {"request_id": request_id, "tool": name, **provenance, "parent_event": plan_event, "context": context.to_dict()})
+            execution_event = add_event("execution", "Tool executed", name, source, "info", True, {"request_id": request_id, "tool": name, **provenance, "plan_hash": final_plan_hash, "parent_event": plan_event, "context": context.to_dict()})
             results[-1]["event_id"] = execution_event
+            item_evidence = observed(f"{name} returned a result", name, {"request_id": request_id, "result": result}, 10, request_id=request_id, chain=chain + (f"execution:{execution_event}",), sequence=sequence, previous_hash=previous_evidence_hash)
         except Exception as exc:
             error = str(exc)
             results.append({"tool": name, "argument": argument, "ok": False, "error": error})
-            execution_event = add_event("execution", "Tool execution failed", error, source, "warning", True, {"request_id": request_id, "tool": name, "error": error, **provenance, "parent_event": plan_event, "context": context.to_dict()})
+            execution_event = add_event("execution", "Tool execution failed", error, source, "warning", True, {"request_id": request_id, "tool": name, "error": error, **provenance, "plan_hash": final_plan_hash, "parent_event": plan_event, "context": context.to_dict()})
             results[-1]["event_id"] = execution_event
-
-    evidence = []
-    for item in results:
-        if item["ok"]:
-            evidence.append(observed(f"{item['tool']} returned a result", item["tool"], {"request_id": request_id, "result": item["result"]}, 10, request_id=request_id, chain=chain + (f"execution:{item['event_id']}",)))
-        else:
-            evidence.append(observed(f"{item['tool']} execution failed", item["tool"], {"request_id": request_id, "error": item["error"]}, 0, request_id=request_id, chain=chain + (f"execution:{item['event_id']}",)))
-    response_event = add_event("response", "Defensive response", "request completed", source, "info", True, {"request_id": request_id, **provenance, "result_count": len(results), "parent_event": plan_event})
+            item_evidence = observed(f"{name} execution failed", name, {"request_id": request_id, "error": error}, 0, request_id=request_id, chain=chain + (f"execution:{execution_event}",), sequence=sequence, previous_hash=previous_evidence_hash)
+        evidence.append(item_evidence)
+        previous_evidence_hash = item_evidence["current_hash"]
+    response_event = add_event("response", "Defensive response", "request completed", source, "info", True, {"request_id": request_id, **provenance, "plan_hash": final_plan_hash, "result_count": len(results), "parent_event": plan_event})
     return {
         "ok": True,
         "decision": "allow",
         "request_id": request_id,
         "planner": planned.get("planner"),
         "provenance": provenance,
+        "plan_hash": final_plan_hash,
+        "authorization": authorization_records,
         "answer": summarize(serial_plan, results, planned.get("planner"), planned.get("rationale", "")),
         "plan": serial_plan,
         "results": results,
