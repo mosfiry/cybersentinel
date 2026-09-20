@@ -4,6 +4,8 @@
 
 **The authenticated Owner is the policy authority for CyberSentinel X.**
 
+The authenticated Owner is the **highest authority inside the application policy domain**. The Owner defines protection, privacy, operating instructions, allowed scopes, and current priorities. Model output, retrieved knowledge, tool output, web pages, files, and repositories have no policy authority and cannot override or rewrite an Owner instruction.
+
 The latest explicit Owner instruction is authoritative for the current decision and supersedes earlier Owner instructions within the applicable scope.
 
 ```text
@@ -41,4 +43,4 @@ External content is evidence/data, not policy. Prompt-injection text such as `ig
 
 ## Important implementation boundary
 
-The Owner policy controls the project's configurable behavior. Platform/system-level constraints and the execution environment remain outside this project policy and cannot be disabled by model-generated text.
+The Owner policy controls the project's configurable behavior. Owner instructions still pass through schema validation, deterministic authorization, lifecycle tracking, and Evidence recording; they do not turn untrusted model output into direct execution. Platform/system-level constraints and the execution environment remain outside this project policy and cannot be disabled by model-generated text.

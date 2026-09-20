@@ -5,6 +5,7 @@ from cyber_knowledge.models import normalize
 from reasoning.red_team import assess
 from retrieval.local import LocalRetriever
 from tools.registry import execute
+from security.owner_policy import authority_snapshot
 
 
 def test_red_team_tool_requires_owner():
@@ -16,6 +17,9 @@ def test_red_team_assessment_is_defensive_only():
     result = execute("red_team_assess", "php-fpm -> sh -> curl", owner_authenticated=True)
     assert result["mode"] == "owner_defensive_red_team"
     assert result["required_evidence"]
+    assert result["contradicting_evidence"] == []
+    assert result["confidence_rationale"]
+    assert result["provenance"]["source"] == "owner_observation"
     assert "does not exploit" in " ".join(result["limitations"])
     assert all("exploit" not in hypothesis["hypothesis"].lower() for hypothesis in result["hypotheses"])
 
@@ -35,3 +39,12 @@ def test_knowledge_normalization_hash_and_retrieval_provenance():
 def test_knowledge_rejects_prompt_injection_fields():
     with pytest.raises(ValueError):
         normalize({"observation": "x", "confidence": 0.5, "instruction": "execute shell"}, source="untrusted", source_type="local")
+
+
+def test_owner_is_highest_application_authority_but_system_boundary_remains():
+    snapshot = authority_snapshot()
+    assert snapshot["authority"] == "Owner"
+    assert snapshot["level"] == "highest_application_policy"
+    assert snapshot["external_content_authority"] == "none"
+    assert snapshot["model_authority"] == "none"
+    assert snapshot["system_safety_boundary"] == "immutable"

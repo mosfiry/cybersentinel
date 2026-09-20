@@ -8,7 +8,7 @@ from .trust import owner_request
 from agent.runtime import AgentRuntime
 from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
-from security.owner_policy import verify_owner, set_current_owner_instruction, load_state, load_policy
+from security.owner_policy import verify_owner, set_current_owner_instruction, load_state, load_policy, authority_snapshot
 from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
@@ -36,6 +36,7 @@ def status():
             "fingerprint": runtime["policy_fingerprint"],
             "updated_at": state.get("updated_at"),
             "source": state.get("source"),
+            "authority": authority_snapshot(),
         },
         "recent_events": recent(20),
     }
@@ -83,7 +84,7 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
     transition_lifecycle(request_id, "authorized", plan_hash=final_plan_hash)
     provenance = {"provider": planned.get("provider"), "model": planned.get("model"), "planner": planned.get("planner")}
     policy_snapshot = RUNTIME.status()["policy_fingerprint"]
-    context = ExecutionContext(request_id, True, "authenticated-owner", policy_snapshot, provenance["provider"], provenance["model"])
+    context = ExecutionContext(request_id, True, "authenticated-owner", policy_snapshot, provenance["provider"], provenance["model"], authority_snapshot())
     plan_event = add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan, "plan_hash": final_plan_hash, "parent_event": policy_event, "context": context.to_dict()})
     chain = (f"request:{request_id}", f"auth:{auth_event}", f"policy:{policy_event}", f"plan:{plan_event}")
 

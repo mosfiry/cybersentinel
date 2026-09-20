@@ -8,5 +8,9 @@
   "destructive_requires_approval": true,
   "immutable": false,
   "latest_owner_instruction_is_current_policy": true,
-  "owner_instruction_precedence": "latest_wins"
+  "owner_instruction_precedence": "latest_wins",
+  "owner_authority_level": "highest_application_policy",
+  "external_content_authority": "none",
+  "model_authority": "none",
+  "system_safety_boundary": "immutable"
 }
