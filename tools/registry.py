@@ -68,8 +68,70 @@ def _system_info(_):
 
 
 def _search(argument):
-    from core.db import search_all
-    return search_all(argument or "", 50)
+    from search.service import search_service
+    from search.providers import SearchScope
+    from search.exceptions import SearchError, ProviderUnavailableError
+
+    query = argument or ""
+    scope = None  # Auto-select based on query
+
+    # Parse scope from argument if present
+    # Format: "scope:github query" or "scope:nvd CVE-2021-1234"
+    if ":" in query:
+        parts = query.split(":", 1)
+        scope_str = parts[0].lower()
+        query = parts[1].strip()
+
+        # Map scope string to SearchScope
+        scope_map = {
+            "local": SearchScope.LOCAL,
+            "github": SearchScope.GITHUB,
+            "nvd": SearchScope.NVD,
+            "cve": SearchScope.CVE,
+            "mitre": SearchScope.MITRE,
+            "web": SearchScope.WEB,
+        }
+        scope = scope_map.get(scope_str)
+
+    try:
+        response = search_service.search(
+            query=query,
+            scope=scope,
+            max_results=50,
+        )
+
+        # Format results for backward compatibility
+        results = {
+            "query": query,
+            "scope": scope.value if scope else None,
+            "total_results": response.total_results,
+            "results": [
+                {
+                    "id": r.result_id,
+                    "title": r.title,
+                    "content": r.content,
+                    "source": r.source,
+                    "source_type": r.source_type,
+                    "url": r.url,
+                    "provenance": r.provenance,
+                    "metadata": r.metadata,
+                }
+                for r in response.results
+            ],
+        }
+
+        if response.error:
+            results["error"] = response.error
+        if response.error_type:
+            results["error_type"] = response.error_type
+
+        return results
+    except ProviderUnavailableError as e:
+        return {"error": str(e), "error_type": "provider_unavailable", "query": query}
+    except SearchError as e:
+        return {"error": str(e), "error_type": e.error_type, "query": query}
+    except Exception as e:
+        return {"error": str(e), "error_type": "unknown", "query": query}
 
 
 def _watch(argument):
