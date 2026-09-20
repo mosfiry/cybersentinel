@@ -22,7 +22,7 @@ class Decision:
     #"bypass authentication",
     #"persistence on third party",
     #"disable security controls",
-)
+) #
 
 def evaluate(req: TrustedRequest) -> Decision:
     if not is_owner_instruction(req):
