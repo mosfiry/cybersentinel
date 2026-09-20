@@ -44,8 +44,8 @@ def status():
     }
 
 
-def execute(tool: str, argument: str | None = None, *, owner_authenticated: bool = False):
-    return execute_tool(tool, argument, owner_authenticated=owner_authenticated)
+def execute(tool: str, argument: str | None = None, *, owner_authenticated: bool = False, scope_context: dict | None = None):
+    return execute_tool(tool, argument, owner_authenticated=owner_authenticated, scope_context=scope_context)
 
 
 def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None, owner_session_id=None, owner_challenge=None):

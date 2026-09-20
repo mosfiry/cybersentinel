@@ -27,11 +27,11 @@ class AgentTaskRuntime:
         self.limits = runtime_limits or RuntimeLimits.from_owner_policy()
 
     @staticmethod
-    def _default_executor(command: str, *, owner_token: str, owner_session_id: str | None = None) -> dict[str, Any]:
+    def _default_executor(command: str, *, owner_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None) -> dict[str, Any]:
         parts = command.split(" ", 2)
         name = parts[1] if len(parts) > 1 else ""
         argument = parts[2] if len(parts) > 2 else None
-        return {"ok": True, "result": execute_tool(name, argument, owner_authenticated=True)}
+        return {"ok": True, "result": execute_tool(name, argument, owner_authenticated=True, scope_context=scope_context)}
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
@@ -80,11 +80,19 @@ class AgentTaskRuntime:
             return "tool_calls", [ToolCall(value["name"], value.get("arguments") or {}, uuid.uuid4().hex)]
         return "final", content
 
-    def create_task(self, conversation_id: str, objective: str, *, owner_session_id: str = "", authentication_method: str = "owner_token") -> Task:
+    def create_task(self, conversation_id: str, objective: str, *, owner_session_id: str = "", authentication_method: str = "owner_token", scope_context: dict[str, Any] | None = None) -> Task:
+        if scope_context is not None:
+            required = {"program_id", "target_id", "scope_snapshot_id", "url"}
+            if not required.issubset(scope_context):
+                raise ValueError("incomplete_scope_context")
+            from security.scope_store import get_snapshot
+            snapshot = get_snapshot(scope_context["scope_snapshot_id"])
+            if snapshot is None or snapshot.authorization.program_id != scope_context["program_id"] or snapshot.target(scope_context["target_id"]) is None:
+                raise ValueError("invalid_scope_context")
         ensure_conversation(conversation_id, owner_session_id)
         request_id = uuid.uuid4().hex
         task = TaskManager.create_task(conversation_id, request_id, owner_session_id, objective, authentication_method=authentication_method)
-        task.execution_state = {"tool_results": [], "evidence_refs": [], "memory_refs": [], "objective": objective, "events": []}
+        task.execution_state = {"tool_results": [], "evidence_refs": [], "memory_refs": [], "objective": objective, "events": [], "scope_context": scope_context}
         self._event(task, "task.created", {"objective": objective, "authentication_method": authentication_method})
         objective_item = ConversationMemory.store_conversation_memory(conversation_id, objective, MemoryType.ACTIVE_OBJECTIVE, source="task", provenance=f"task:{task.task_id}")
         recent_item = ConversationMemory.store_conversation_memory(conversation_id, objective, MemoryType.RECENT, source="conversation", provenance="user_message")
@@ -155,6 +163,15 @@ class AgentTaskRuntime:
             valid, reason = False, "unknown tool argument"
         decision = authorize_tool(item, owner_authenticated=True)
         self._event(task, "tool.selected", {"tool": call.name, "tool_call_id": call.call_id})
+        if spec is not None and spec.scope_required:
+            scope_context = task.execution_state.get("scope_context")
+            if not isinstance(scope_context, dict):
+                valid, reason = False, "scope context required"
+            else:
+                from security.scope_resolver import resolve
+                scope_decision = resolve(scope_context["scope_snapshot_id"], scope_context["target_id"], scope_context["url"], method=scope_context.get("method", "GET"), expected_program_id=scope_context["program_id"], redirect_chain=scope_context.get("redirect_chain", []))
+                if not scope_decision.allowed:
+                    valid, reason = False, "scope denied: " + scope_decision.reason
         if not decision.allowed or not valid:
             result = {"ok": False, "error": decision.reason if not decision.allowed else reason}
             task.record_tool_call(call.call_id, call.name, "denied", request_id=task.request_id, owner_session_id=task.owner_session_id, result=result, argument=argument)
@@ -162,7 +179,11 @@ class AgentTaskRuntime:
             return result
         self._event(task, "tool.started", {"tool": call.name, "tool_call_id": call.call_id})
         try:
-            result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_token=owner_token, owner_session_id=owner_session_id)
+            scope_context = task.execution_state.get("scope_context")
+            if spec is not None and spec.scope_required:
+                result = {"ok": True, "result": execute_tool(call.name, argument, owner_authenticated=True, scope_context=scope_context)}
+            else:
+                result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_token=owner_token, owner_session_id=owner_session_id, scope_context=scope_context)
             result = result if isinstance(result, dict) else {"ok": True, "result": result}
             status = "completed" if result.get("ok", True) else "failed"
         except Exception as exc:

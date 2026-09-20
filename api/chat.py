@@ -17,7 +17,7 @@ def _execute(text: str, *, owner_token: str, owner_session_id: str | None = None
 
 
 def _runtime() -> AgentTaskRuntime:
-    executor = lambda command, *, owner_token, owner_session_id=None: _execute(command, owner_token=owner_token, owner_session_id=owner_session_id)
+    executor = lambda command, *, owner_token, owner_session_id=None, scope_context=None: _execute(command, owner_token=owner_token, owner_session_id=owner_session_id)
     return AgentTaskRuntime(RUNTIME.router, executor=executor)
 
 
@@ -49,7 +49,7 @@ def create_task(payload: dict[str, Any], *, owner_token: str, owner_session_id: 
         if not ok:
             raise PermissionError(reason)
     task_runtime = _runtime()
-    task = task_runtime.create_task(conversation_id, text, owner_session_id=owner_session_id or "", authentication_method=authentication_method)
+    task = task_runtime.create_task(conversation_id, text, owner_session_id=owner_session_id or "", authentication_method=authentication_method, scope_context=payload.get("scope_context"))
     if run and RUNTIME.router.providers:
         task = task_runtime.run_to_completion(task.task_id, owner_token=owner_token, owner_session_id=owner_session_id)
     elif run:

@@ -27,6 +27,7 @@ class ToolSpec:
     argument_type: type | None
     handler: Callable[[str | None], Any]
     owner_only: bool = False
+    scope_required: bool = False
 
     def validate(self, argument: Any) -> tuple[bool, str]:
         if self.argument_type is None:
@@ -173,12 +174,19 @@ def _red_team_assess(argument):
     return assess(argument).to_dict()
 
 
+def _scoped_http_probe(argument):
+    """Metadata-only bounded probe placeholder; network execution comes after Scope Firewall."""
+    return {"ok": True, "operation": "scoped_http_probe", "url": argument, "note": "scope-authorized observation placeholder"}
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
         if not isinstance(spec, ToolSpec) or not spec.name or spec.name in registry:
             raise ValueError("duplicate or invalid tool specification")
-        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner):
+        scope_namespace = spec.name.split(".", 1)[0]
+        scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "report"}
+        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner) or (scope_namespace in scope_namespaces and not spec.scope_required):
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
@@ -197,6 +205,7 @@ REGISTRY = build_registry([
     ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch),
     ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
+    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -206,12 +215,29 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, owner_authenticated: bool = False):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, owner_authenticated: bool = False, scope_context: dict[str, Any] | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
     if spec.owner_only and not owner_authenticated:
         raise PermissionError("Owner authentication required for this tool")
+    if spec.scope_required:
+        if not isinstance(scope_context, dict):
+            raise PermissionError("scope context required")
+        required = {"program_id", "target_id", "scope_snapshot_id", "url"}
+        if not required.issubset(scope_context):
+            raise PermissionError("incomplete scope context")
+        from security.scope_resolver import resolve
+        decision = resolve(
+            scope_context["scope_snapshot_id"],
+            scope_context["target_id"],
+            scope_context["url"],
+            method=scope_context.get("method", "GET"),
+            expected_program_id=scope_context["program_id"],
+            redirect_chain=scope_context.get("redirect_chain", []),
+        )
+        if not decision.allowed:
+            raise PermissionError("scope denied: " + decision.reason)
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)
