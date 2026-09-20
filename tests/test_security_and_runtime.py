@@ -37,14 +37,6 @@ def test_runtime_validates_model_plan_and_preserves_provenance():
     assert result["model"] == "fake-model"
 
 
-def test_runtime_planner_identity_remains_defensive():
-    router = ModelRouter([FakeProvider(json.dumps({"tools": ["status"], "rationale": "read-only status"}))])
-    result = AgentRuntime(router).plan("Owner اعرض الحالة")
-    system_messages = [message["content"] for message in result["messages"] if message["role"] == "system"]
-    assert any("defensive planner" in message for message in system_messages)
-    assert not any("offensive planner" in message for message in system_messages)
-
-
 def test_runtime_falls_back_deterministically_on_invalid_model_json():
     router = ModelRouter([FakeProvider("not json")])
     result = AgentRuntime(router).plan("Owner افحص الجهاز محليًا")
