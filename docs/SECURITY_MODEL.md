@@ -1,7 +1,7 @@
-# CyberSentinel X — Final Security Model
+# CyberSentinel X 4.3.0 — Security Model
 
 ## Trust
-Only authenticated owner requests from the local Web UI are instruction authority.
+The local bridge authenticates the channel with `BRIDGE_TOKEN`; only requests that also carry the separate `OWNER_TOKEN` are instruction authority.
 CISA, RSS, CVE records, and any other external content are evidence only.
 
 ## Network
@@ -22,12 +22,12 @@ There is no arbitrary shell endpoint, remote scanner, exploit runner, credential
 malware deployer, persistence mechanism, or authentication bypass tool.
 
 ## Planner
-A deterministic planner is always available. An optional OpenAI-compatible endpoint can
-be configured, but the returned tool names are intersected with the same allowlist.
+`AgentRuntime` is the only planner path. A deterministic planner is always available. An optional OpenAI-compatible endpoint can
+be configured, but its JSON output is validated and the returned tool names and arguments are checked by deterministic authorization code.
 The model cannot create a new executable tool through its response.
 
 ## Audit
-Plans and executions are stored in SQLite. Failed collection is recorded as a warning.
+Requests receive a UUID and plans, authentication, policy, authorization, execution, failures, provenance, and responses are stored in SQLite. Failed collection is recorded as a warning and represented as failed evidence rather than success.
 
 ## Honest execution
 The UI displays actual tool results. It does not claim that a tool ran when it did not.

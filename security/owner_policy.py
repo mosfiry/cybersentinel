@@ -95,6 +95,7 @@ def current_owner_policy_context() -> str:
 
 
 def verify_owner(text: str, presented_token: str | None = None) -> tuple[bool, str]:
+    """Verify Owner authority using OWNER_TOKEN only; bridge credentials are never accepted."""
     policy = load_policy()
     if policy.require_owner_token:
         if not OWNER_TOKEN or not presented_token or not hmac.compare_digest(OWNER_TOKEN, presented_token):
