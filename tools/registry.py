@@ -125,16 +125,16 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
 
 
 REGISTRY = build_registry([
-    ToolSpec("status", "Read service status and recent audit events", "read", True, None, _status),
-    ToolSpec("latest_intel", "Read collected threat intelligence", "read", True, None, _latest_intel),
-    ToolSpec("refresh_intel", "Collect defensive threat intelligence", "network-read", True, None, _refresh_intel),
-    ToolSpec("local_security_check", "Inspect local TCP listeners", "read", True, None, _local_security),
-    ToolSpec("local_system_info", "Read local system information", "read", True, None, _system_info),
-    ToolSpec("search", "Search local events and intelligence", "read", True, str, _search),
-    ToolSpec("watch", "Add a local defensive watch keyword", "state-write", True, str, _watch),
-    ToolSpec("unwatch", "Remove a local defensive watch keyword", "state-write", True, str, _unwatch),
-    ToolSpec("run_project_tests", "Run only pytest -q inside the configured project test root", "bounded-exec", True, str, _run_project_tests),
-    ToolSpec("red_team_assess", "Owner-only defensive adversarial assessment; no exploit or shell execution", "analysis", True, str, _red_team_assess, True),
+    ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status),
+    ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel),
+    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel),
+    ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security),
+    ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info),
+    ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search),
+    ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch),
+    ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch),
+    ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests),
+    ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
