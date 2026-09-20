@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CyberSentinel Knowledge Object",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["observation", "confidence"],
+  "properties": {
+    "observation": {"type": "string", "minLength": 1},
+    "technique": {"type": "string"},
+    "hypothesis": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "string"}},
+    "reasoning": {"type": "array", "items": {"type": "string"}},
+    "alternative_explanations": {"type": "array", "items": {"type": "string"}},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "date": {"type": "string"},
+    "mitre": {"type": "array", "items": {"type": "string"}},
+    "cwe": {"type": "array", "items": {"type": "string"}}
+  }
+}

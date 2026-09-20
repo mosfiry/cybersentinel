@@ -31,7 +31,7 @@ def authorize_tool(item: Any, *, owner_authenticated: bool = True, current_polic
     if not isinstance(name, str) or name not in KNOWN_TOOLS:
         return AuthorizationResult(False, "unknown tool")
     spec = get_tool(name)
-    if spec is None or (spec.requires_owner and not owner_authenticated):
+    if spec is None or (spec.requires_owner and not owner_authenticated) or (spec.owner_only and not owner_authenticated):
         return AuthorizationResult(False, "tool requires authenticated Owner")
     valid, reason = spec.validate(argument)
     if not valid:

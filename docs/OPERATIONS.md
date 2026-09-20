@@ -1,4 +1,4 @@
-# CyberSentinel X 4.6.0 — Local operation
+# CyberSentinel X 4.7.0 — Local operation
 
 1. Create `.env` from `.env.example`.
 2. Put two different strong random values in `BRIDGE_TOKEN` and `OWNER_TOKEN`.
