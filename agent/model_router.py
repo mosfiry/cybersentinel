@@ -33,7 +33,8 @@ class ModelRouter:
         errors = []
         for provider in self.providers:
             try:
-                return provider.chat(messages, temperature=temperature)
+                response = provider.chat(messages, temperature=temperature)
+                return {**response, "provider": provider.name, "model": provider.model}
             except Exception as exc:
                 errors.append(f"{provider.name}: {str(exc)[:200]}")
         if errors:

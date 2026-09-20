@@ -5,3 +5,5 @@ The tool registry in `tools/registry.py` is intentionally small and defensive. T
 Only `search`, `watch`, and `unwatch` accept arguments, and each argument must be a non-empty string no longer than 256 characters. A plan may contain no more than eight tools. Unknown tools, unexpected arguments, null values, malformed arrays, and oversized strings are rejected by deterministic code before execution.
 
 The model is a planner, not an authorization authority. Tool execution is selected from the registry; model output cannot create a new executable tool. The engine no longer contains a second distributed tool dispatch table.
+
+`run_project_tests` is deliberately bounded: its argument is a project directory confined below `CYBERSENTINEL_TEST_ROOT`, and the handler always runs `[sys.executable, "-m", "pytest", "-q"]` with a 60-second timeout and bounded output. It does not accept a command, executable, shell string, or arbitrary argv from the model.
