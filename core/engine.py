@@ -1,145 +1,139 @@
 from __future__ import annotations
-import json, re
+
+import json
+import uuid
 from .db import add_event, recent, counts, search_all, add_watch, remove_watch, watches
 from .policy import evaluate
 from .trust import owner_request
 from .intel import refresh_all, latest_intel
 from .local_defense import local_security_check, local_system_info
-from .llm import plan_with_llm, model_status
 from agent.runtime import AgentRuntime
-from security.owner_policy import verify_owner, set_current_owner_instruction, current_owner_policy_context, load_state
+from agent.evidence import observed
+from security.authorization import authorize_plan, public_plan
+from security.owner_policy import verify_owner, set_current_owner_instruction, load_state
+from .version import PRODUCT_NAME, VERSION
 
-TOOLS={"status","latest_intel","refresh_intel","local_security_check",
-       "local_system_info","search","watch","unwatch"}
-RUNTIME=AgentRuntime()
+TOOLS = {"status", "latest_intel", "refresh_intel", "local_security_check", "local_system_info", "search", "watch", "unwatch"}
+RUNTIME = AgentRuntime()
+
 
 def status():
+    runtime = RUNTIME.status()
+    state = load_state()
     return {
-        "service":"CyberSentinel X",
-        "version":"FINAL",
-        "online":True,
-        "event_counts":counts(),
-        "watch_count":len(watches()),
-        "watches":watches(),
-        "llm":model_status(),
-        "agent":RUNTIME.status(),
-        "owner_policy": {"fingerprint": RUNTIME.status()["policy_fingerprint"], "state": load_state(), "context": current_owner_policy_context()},
-        "recent_events":recent(20),
+        "service": PRODUCT_NAME,
+        "version": VERSION,
+        "online": True,
+        "event_counts": counts(),
+        "watch_count": len(watches()),
+        "watches": watches(),
+        "llm": runtime["models"],
+        "agent": runtime,
+        "owner_policy": {
+            "fingerprint": runtime["policy_fingerprint"],
+            "updated_at": state.get("updated_at"),
+            "source": state.get("source"),
+        },
+        "recent_events": recent(20),
     }
 
-def deterministic_plan(text):
-    t=text.casefold()
-    tools=[]
-    if any(x in t for x in ("حدّث","تحديث","استخبارات","threat","intel","cisa","kev","ثغرات")):
-        tools.append("refresh_intel")
-    if any(x in t for x in ("افحص الجهاز","فحص الجهاز","فحص محلي","افحص النظام","local check","local security")):
-        tools.append("local_security_check")
-    if any(x in t for x in ("معلومات الجهاز","system info","معلومات النظام")):
-        tools.append("local_system_info")
-    if any(x in t for x in ("آخر الأحداث","الاحداث","الأحداث","latest events")):
-        tools.append("status")
-    if any(x in t for x in ("آخر الثغرات","أحدث الثغرات","latest intel","latest vulnerabilities")):
-        tools.append("latest_intel")
-    if any(x in t for x in ("الحالة","status","كيف حال النظام")):
-        tools.append("status")
-    m=re.search(r"(?:ابحث عن|ابحث|بحث عن|search for|search)\s+(.+)",text,re.I)
-    if m: tools.append(("search",m.group(1).strip()))
-    m=re.search(r"(?:راقب|راقبة|watch)\s+(.+)",text,re.I)
-    if m: tools.append(("watch",m.group(1).strip()))
-    m=re.search(r"(?:أوقف مراقبة|الغاء مراقبة|unwatch)\s+(.+)",text,re.I)
-    if m: tools.append(("unwatch",m.group(1).strip()))
-    if not tools:
-        tools=["status"]
-    result=[]
-    seen=set()
-    for x in tools:
-        key=x if isinstance(x,str) else x[0]
-        if key not in seen:
-            result.append(x); seen.add(key)
-    return result
 
-def make_plan(text):
-    try:
-        p=plan_with_llm(text)
-        if p and p["tools"]:
-            return p["tools"],p["rationale"],"llm"
-    except Exception as exc:
-        add_event("planner","LLM planner unavailable",str(exc),"llm","warning",False)
-    return deterministic_plan(text),"Deterministic defensive planner","local"
+def execute(tool: str, argument: str | None = None):
+    if tool == "status":
+        return status()
+    if tool == "latest_intel":
+        return latest_intel(50)
+    if tool == "refresh_intel":
+        return refresh_all()
+    if tool == "local_security_check":
+        return local_security_check()
+    if tool == "local_system_info":
+        return local_system_info()
+    if tool == "search":
+        return search_all(argument or "", 50)
+    if tool == "watch":
+        add_watch(argument or "")
+        return {"keyword": argument, "watches": watches()}
+    if tool == "unwatch":
+        remove_watch(argument or "")
+        return {"keyword": argument, "watches": watches()}
+    raise ValueError("unknown tool")
 
-def execute(tool):
-    if tool=="status": return status()
-    if tool=="latest_intel": return latest_intel(50)
-    if tool=="refresh_intel": return refresh_all()
-    if tool=="local_security_check": return local_security_check()
-    if tool=="local_system_info": return local_system_info()
-    raise ValueError("tool requires argument")
 
-def handle(text,source="web",presented_token=None):
-    owner_ok, owner_reason = verify_owner(text, presented_token)
+def handle(text, source="web", presented_token=None, owner_token=None):
+    request_id = uuid.uuid4().hex
+    owner_ok, owner_reason = verify_owner(text, owner_token)
+    add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
     if not owner_ok:
-        add_event("command","Owner authentication failed",text,source,"warning",False,{"decision":"deny","reason":owner_reason})
-        return {"ok":False,"decision":"deny","answer":"مصادقة المالك مطلوبة.","plan":[],"results":[]}
-    # The authenticated Owner instruction is the authoritative policy context for this decision.
+        return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": []}
     set_current_owner_instruction(text, source)
-    req=owner_request(text,source)
-    decision=evaluate(req)
+    req = owner_request(text, source)
+    decision = evaluate(req)
+    add_event("policy", "Policy evaluation", decision.reason, source, "info" if decision.allowed else "warning", decision.allowed, {"request_id": request_id, "decision": "allow" if decision.allowed else "deny"})
     if not decision.allowed:
-        add_event("command","Command denied",text,source,"warning",True,{"decision":"deny"})
-        return {"ok":False,"decision":"deny","answer":decision.reason,"plan":[],"results":[]}
+        return {"ok": False, "decision": "deny", "request_id": request_id, "answer": decision.reason, "plan": [], "results": []}
 
-    plan,rationale,planner=make_plan(text)
-    serial_plan=[x if isinstance(x,str) else list(x) for x in plan]
-    add_event("plan","Defensive plan",json.dumps(serial_plan,ensure_ascii=False),
-              source,"info",True,{"planner":planner,"plan":serial_plan})
+    planned = RUNTIME.plan(text)
+    authorized, errors = authorize_plan(planned["tools"], owner_authenticated=True)
+    if errors:
+        add_event("authorization", "Plan rejected", "; ".join(errors), source, "warning", True, {"request_id": request_id, "decision": "deny", "provider": planned.get("provider"), "model": planned.get("model")})
+        return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة: " + "; ".join(errors), "plan": [], "results": []}
+    serial_plan = public_plan(authorized)
+    provenance = {"provider": planned.get("provider"), "model": planned.get("model"), "planner": planned.get("planner")}
+    add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan})
 
-    results=[]
-    for item in plan:
-        if isinstance(item,tuple):
-            name,arg=item
-            if name=="search":
-                results.append({"tool":"search","result":search_all(arg,50),"query":arg})
-            elif name=="watch":
-                add_watch(arg); results.append({"tool":"watch","result":{"keyword":arg,"watches":watches()}})
-            elif name=="unwatch":
-                remove_watch(arg); results.append({"tool":"unwatch","result":{"keyword":arg,"watches":watches()}})
-            continue
-        if item not in TOOLS:
-            continue
+    results = []
+    for name, argument in authorized:
         try:
-            results.append({"tool":item,"result":execute(item)})
+            result = execute(name, argument)
+            results.append({"tool": name, "argument": argument, "ok": True, "result": result})
+            add_event("execution", "Tool executed", name, source, "info", True, {"request_id": request_id, "tool": name, **provenance})
         except Exception as exc:
-            results.append({"tool":item,"error":str(exc)})
+            error = str(exc)
+            results.append({"tool": name, "argument": argument, "ok": False, "error": error})
+            add_event("execution", "Tool execution failed", error, source, "warning", True, {"request_id": request_id, "tool": name, "error": error, **provenance})
 
-    add_event("execution","Defensive plan executed",
-              json.dumps({"planner":planner,"plan":serial_plan,"result_count":len(results)},ensure_ascii=False),
-              source,"info",True,{"planner":planner,"plan":serial_plan})
+    evidence = []
+    for item in results:
+        if item["ok"]:
+            evidence.append(observed(f"{item['tool']} returned a result", item["tool"], {"request_id": request_id, "result": item["result"]}, 10))
+        else:
+            evidence.append(observed(f"{item['tool']} execution failed", item["tool"], {"request_id": request_id, "error": item["error"]}, 0))
+    add_event("response", "Defensive response", "request completed", source, "info", True, {"request_id": request_id, **provenance, "result_count": len(results)})
     return {
-        "ok":True,"decision":"allow","planner":planner,
-        "answer":summarize(plan,results,planner,rationale),
-        "plan":serial_plan,"results":results,
-        "evidence":[RUNTIME.verify_result("execution completed", "local-agent", {"planner":planner,"result_count":len(results)}, 10)]
+        "ok": True,
+        "decision": "allow",
+        "request_id": request_id,
+        "planner": planned.get("planner"),
+        "provenance": provenance,
+        "answer": summarize(serial_plan, results, planned.get("planner"), planned.get("rationale", "")),
+        "plan": serial_plan,
+        "results": results,
+        "evidence": evidence,
     }
 
-def summarize(plan,results,planner,rationale):
-    lines=[f"تم تنفيذ خطة دفاعية فعلية ({planner})."]
-    if rationale: lines.append("منطق التخطيط: "+rationale)
-    for r in results:
-        t=r["tool"]
-        if "error" in r:
-            lines.append(f"• {t}: فشل التنفيذ — {r['error']}")
-        elif t=="refresh_intel":
-            val=r["result"]; lines.append("• استخبارات التهديد: "+json.dumps(val.get("results",val),ensure_ascii=False))
-        elif t=="local_security_check":
-            lines.append(f"• الفحص المحلي: تم العثور على {r['result']['count']} TCP listener.")
-        elif t=="local_system_info":
-            lines.append(f"• النظام: {r['result'].get('platform')} / {r['result'].get('kernel')}")
-        elif t=="latest_intel":
-            lines.append(f"• أحدث بيانات الاستخبارات: {len(r['result'])} سجل.")
-        elif t=="status":
-            lines.append(f"• الحالة: ONLINE، الأحداث: {sum(r['result']['event_counts'].values())}.")
-        elif t=="search":
-            lines.append(f"• البحث عن «{r['query']}»: {len(r['result']['events'])} حدث و{len(r['result']['intel'])} سجل استخبارات.")
-        elif t in ("watch","unwatch"):
-            lines.append(f"• {t}: تم تحديث قائمة المراقبة.")
+
+def summarize(plan, results, planner, rationale):
+    lines = [f"تم تنفيذ خطة دفاعية فعلية ({planner})."]
+    if rationale:
+        lines.append("منطق التخطيط: " + rationale)
+    for item in results:
+        tool = item["tool"]
+        if not item["ok"]:
+            lines.append(f"• فشل تنفيذ {tool} — السبب: {item['error']}")
+        elif tool == "refresh_intel":
+            value = item["result"]
+            lines.append("• استخبارات التهديد: " + json.dumps(value.get("results", value), ensure_ascii=False))
+        elif tool == "local_security_check":
+            lines.append(f"• الفحص المحلي: تم العثور على {item['result']['count']} TCP listener.")
+        elif tool == "local_system_info":
+            lines.append(f"• النظام: {item['result'].get('platform')} / {item['result'].get('kernel')}")
+        elif tool == "latest_intel":
+            lines.append(f"• أحدث بيانات الاستخبارات: {len(item['result'])} سجل.")
+        elif tool == "status":
+            lines.append(f"• الحالة: ONLINE، الأحداث: {sum(item['result']['event_counts'].values())}.")
+        elif tool == "search":
+            lines.append(f"• البحث: {len(item['result']['events'])} حدث و{len(item['result']['intel'])} سجل استخبارات.")
+        elif tool in ("watch", "unwatch"):
+            lines.append(f"• {tool}: تم تحديث قائمة المراقبة.")
     return "\n".join(lines)
