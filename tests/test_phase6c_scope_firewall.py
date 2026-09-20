@@ -17,6 +17,8 @@ import security.scope_store as scope_store
 @pytest.fixture
 def snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
+    import security.owner_policy as owner_policy
+    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "scope-owner")
     init_scope_store()
     auth = ProgramAuthorization(
         program_id="program-1",
@@ -30,7 +32,7 @@ def snapshot(tmp_path, monkeypatch):
         rate_limits={"requests_per_minute": 2},
     )
     target = TargetIdentity("target-1", "program-1", "target.example.com", allowed_ports=(443,), allowed_paths=("/api",), excluded_paths=("/api/private",))
-    return save_snapshot(make_snapshot("snapshot-1", auth, [target]))
+    return save_snapshot(make_snapshot("snapshot-1", auth, [target]), owner_token="scope-owner")
 
 
 def context(url="https://target.example.com/api/v1"):
@@ -110,3 +112,12 @@ def test_registry_rejects_scoped_namespace_without_firewall_metadata():
     from tools.registry import ToolSpec, build_registry
     with pytest.raises(ValueError, match="invalid registry metadata"):
         build_registry([ToolSpec("recon.http_probe", "probe", "network-read", True, str, lambda value: value)])
+
+
+def test_scope_snapshot_write_requires_owner_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
+    init_scope_store()
+    auth = ProgramAuthorization("p-write", "test", "v1", "2026-09-21T00:00:00+00:00", ({"host": "target.example.com", "schemes": ["https"]},))
+    target = TargetIdentity("t-write", "p-write", "target.example.com")
+    with pytest.raises(PermissionError):
+        save_snapshot(make_snapshot("s-write", auth, [target]))

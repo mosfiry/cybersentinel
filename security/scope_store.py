@@ -42,7 +42,11 @@ def init_scope_store() -> None:
 init_scope_store()
 
 
-def save_snapshot(snapshot: ScopeSnapshot) -> ScopeSnapshot:
+def save_snapshot(snapshot: ScopeSnapshot, *, owner_token: str | None = None) -> ScopeSnapshot:
+    from .owner_policy import verify_owner
+    owner_ok, reason = verify_owner("Owner approve scope snapshot", owner_token)
+    if not owner_ok:
+        raise PermissionError(reason)
     payload = json.dumps(snapshot.to_dict(), ensure_ascii=False, sort_keys=True)
     with _LOCK, _connect() as conn:
         conn.execute("INSERT OR REPLACE INTO scope_snapshots(snapshot_id,program_id,scope_version,evidence_hash,snapshot_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", (snapshot.snapshot_id, snapshot.authorization.program_id, snapshot.authorization.scope_version, snapshot.authorization.evidence_hash, payload, snapshot.created_at, snapshot.expires_at))
