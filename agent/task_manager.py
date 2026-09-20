@@ -130,7 +130,7 @@ class TaskManager:
                         current_step, tool_calls, retry_count, provider, model,
                         objective, execution_state, result, error,
                         cancel_requested, pause_requested, resume_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     task.task_id,
                     task.conversation_id,
@@ -148,11 +148,11 @@ class TaskManager:
                     task.model,
                     task.objective,
                     json.dumps(task.execution_state),
-                    json.dumps(task.result) if task.result else None,
+                    json.dumps(task.result) if task.result is not None else None,
                     task.error,
                     1 if task.cancel_requested else 0,
                     1 if task.pause_requested else 0,
-                    json.dumps(task.resume_state) if task.resume_state else None,
+                    json.dumps(task.resume_state) if task.resume_state is not None else None,
                 ))
     
     @staticmethod
