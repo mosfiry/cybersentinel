@@ -6,4 +6,6 @@ The regression tests cover bridge/Owner credential separation, missing Owner aut
 
 V4.7 tests additionally verify that `red_team_assess` is inaccessible without Owner authentication, emits hypotheses and evidence requirements rather than attack instructions, rejects prompt-injection fields in knowledge objects, preserves source hashes during retrieval, and keeps external knowledge separate from authorization.
 
+V4.9 tests verify safe case generation from reference knowledge, deterministic critic findings, benchmark-gate rejection when unsupported claims increase, Owner-only reasoning-memory access, and persistence of the case/critic record without adding executable attack capabilities.
+
 For a local smoke test, configure separate `BRIDGE_TOKEN` and `OWNER_TOKEN`, run `python bridge.py`, request `/api/health`, then call `/api/status` with the bridge header and `/api/command` with both headers. Never place real credentials in GitHub Actions or source control.

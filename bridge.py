@@ -6,7 +6,8 @@ from pathlib import Path
 from core.config import BRIDGE_HOST, BRIDGE_PORT, BRIDGE_TOKEN
 from core.engine import handle, status
 from core.lifecycle import get as get_lifecycle, request_cancel
-from core.db import events_for_request
+from core.db import events_for_request, reasoning_for_request
+from security.owner_policy import verify_owner
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 
 ROOT = Path(__file__).resolve().parent
@@ -54,6 +55,17 @@ class Handler(BaseHTTPRequestHandler):
             if record is None:
                 return self._send(404, {"ok": False, "error": "unknown_request_id"})
             return self._send(200, {"ok": True, "request_id": request_id, "lifecycle": record.__dict__, "events": events_for_request(request_id)})
+        if self.path.startswith("/api/reasoning/"):
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            owner_ok, reason = verify_owner("Owner reasoning memory", self.headers.get("X-CyberSentinel-Owner-Token", ""))
+            if not owner_ok:
+                return self._send(403, {"ok": False, "error": reason})
+            request_id = self.path[len("/api/reasoning/"):]
+            memory = reasoning_for_request(request_id)
+            if memory is None:
+                return self._send(404, {"ok": False, "error": "unknown_reasoning_request"})
+            return self._send(200, {"ok": True, "request_id": request_id, "memory": memory})
         return self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):

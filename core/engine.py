@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from .db import add_event, recent, counts, watches
+from .db import add_event, recent, counts, watches, save_reasoning_memory
 from .policy import evaluate
 from .trust import owner_request
 from agent.runtime import AgentRuntime
@@ -14,6 +14,7 @@ from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
 from security.plan_integrity import plan_hash
 from .lifecycle import begin as begin_lifecycle, complete as complete_lifecycle, get as get_lifecycle, is_cancelled, recover_incomplete, transition as transition_lifecycle
+from evaluation.critic import critique
 
 TOOLS = KNOWN_TOOLS
 RUNTIME = AgentRuntime()
@@ -116,6 +117,9 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
             continue
         try:
             result = execute(name, argument, owner_authenticated=True)
+            if name == "red_team_assess" and isinstance(result, dict):
+                result["critic"] = critique(result).to_dict()
+                save_reasoning_memory(request_id, result, result["critic"])
             results.append({"tool": name, "argument": argument, "ok": True, "result": result})
             execution_event = add_event("execution", "Tool executed", name, source, "info", True, {"request_id": request_id, "tool": name, **provenance, "plan_hash": final_plan_hash, "parent_event": plan_event, "context": context.to_dict()})
             results[-1]["event_id"] = execution_event
