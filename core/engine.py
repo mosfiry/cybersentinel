@@ -5,15 +5,15 @@ import uuid
 from .db import add_event, recent, counts, search_all, add_watch, remove_watch, watches
 from .policy import evaluate
 from .trust import owner_request
-from .intel import refresh_all, latest_intel
-from .local_defense import local_security_check, local_system_info
 from agent.runtime import AgentRuntime
 from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
 from security.owner_policy import verify_owner, set_current_owner_instruction, load_state
 from .version import PRODUCT_NAME, VERSION
+from .context import ExecutionContext
+from tools.registry import KNOWN_TOOLS, execute as execute_tool
 
-TOOLS = {"status", "latest_intel", "refresh_intel", "local_security_check", "local_system_info", "search", "watch", "unwatch"}
+TOOLS = KNOWN_TOOLS
 RUNTIME = AgentRuntime()
 
 
@@ -39,37 +39,19 @@ def status():
 
 
 def execute(tool: str, argument: str | None = None):
-    if tool == "status":
-        return status()
-    if tool == "latest_intel":
-        return latest_intel(50)
-    if tool == "refresh_intel":
-        return refresh_all()
-    if tool == "local_security_check":
-        return local_security_check()
-    if tool == "local_system_info":
-        return local_system_info()
-    if tool == "search":
-        return search_all(argument or "", 50)
-    if tool == "watch":
-        add_watch(argument or "")
-        return {"keyword": argument, "watches": watches()}
-    if tool == "unwatch":
-        remove_watch(argument or "")
-        return {"keyword": argument, "watches": watches()}
-    raise ValueError("unknown tool")
+    return execute_tool(tool, argument)
 
 
 def handle(text, source="web", presented_token=None, owner_token=None):
     request_id = uuid.uuid4().hex
     owner_ok, owner_reason = verify_owner(text, owner_token)
-    add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
+    auth_event = add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
     if not owner_ok:
         return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": []}
     set_current_owner_instruction(text, source)
     req = owner_request(text, source)
     decision = evaluate(req)
-    add_event("policy", "Policy evaluation", decision.reason, source, "info" if decision.allowed else "warning", decision.allowed, {"request_id": request_id, "decision": "allow" if decision.allowed else "deny"})
+    policy_event = add_event("policy", "Policy evaluation", decision.reason, source, "info" if decision.allowed else "warning", decision.allowed, {"request_id": request_id, "decision": "allow" if decision.allowed else "deny", "parent_event": auth_event})
     if not decision.allowed:
         return {"ok": False, "decision": "deny", "request_id": request_id, "answer": decision.reason, "plan": [], "results": []}
 
@@ -80,26 +62,30 @@ def handle(text, source="web", presented_token=None, owner_token=None):
         return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة: " + "; ".join(errors), "plan": [], "results": []}
     serial_plan = public_plan(authorized)
     provenance = {"provider": planned.get("provider"), "model": planned.get("model"), "planner": planned.get("planner")}
-    add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan})
+    context = ExecutionContext(request_id, True, "authenticated-owner", RUNTIME.status()["policy_fingerprint"], provenance["provider"], provenance["model"])
+    plan_event = add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan, "parent_event": policy_event, "context": context.to_dict()})
+    chain = (f"request:{request_id}", f"auth:{auth_event}", f"policy:{policy_event}", f"plan:{plan_event}")
 
     results = []
     for name, argument in authorized:
         try:
             result = execute(name, argument)
             results.append({"tool": name, "argument": argument, "ok": True, "result": result})
-            add_event("execution", "Tool executed", name, source, "info", True, {"request_id": request_id, "tool": name, **provenance})
+            execution_event = add_event("execution", "Tool executed", name, source, "info", True, {"request_id": request_id, "tool": name, **provenance, "parent_event": plan_event, "context": context.to_dict()})
+            results[-1]["event_id"] = execution_event
         except Exception as exc:
             error = str(exc)
             results.append({"tool": name, "argument": argument, "ok": False, "error": error})
-            add_event("execution", "Tool execution failed", error, source, "warning", True, {"request_id": request_id, "tool": name, "error": error, **provenance})
+            execution_event = add_event("execution", "Tool execution failed", error, source, "warning", True, {"request_id": request_id, "tool": name, "error": error, **provenance, "parent_event": plan_event, "context": context.to_dict()})
+            results[-1]["event_id"] = execution_event
 
     evidence = []
     for item in results:
         if item["ok"]:
-            evidence.append(observed(f"{item['tool']} returned a result", item["tool"], {"request_id": request_id, "result": item["result"]}, 10))
+            evidence.append(observed(f"{item['tool']} returned a result", item["tool"], {"request_id": request_id, "result": item["result"]}, 10, request_id=request_id, chain=chain + (f"execution:{item['event_id']}",)))
         else:
-            evidence.append(observed(f"{item['tool']} execution failed", item["tool"], {"request_id": request_id, "error": item["error"]}, 0))
-    add_event("response", "Defensive response", "request completed", source, "info", True, {"request_id": request_id, **provenance, "result_count": len(results)})
+            evidence.append(observed(f"{item['tool']} execution failed", item["tool"], {"request_id": request_id, "error": item["error"]}, 0, request_id=request_id, chain=chain + (f"execution:{item['event_id']}",)))
+    response_event = add_event("response", "Defensive response", "request completed", source, "info", True, {"request_id": request_id, **provenance, "result_count": len(results), "parent_event": plan_event})
     return {
         "ok": True,
         "decision": "allow",
@@ -110,6 +96,8 @@ def handle(text, source="web", presented_token=None, owner_token=None):
         "plan": serial_plan,
         "results": results,
         "evidence": evidence,
+        "execution_context": context.to_dict(),
+        "evidence_chain": chain + (f"response:{response_event}",),
     }
 
 
