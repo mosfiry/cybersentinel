@@ -82,11 +82,15 @@ class OwnerSessionManager:
             }
 
     def is_active(self, session_id: str) -> bool:
-        """Return whether a session is present and unexpired; never grants a token-less task by itself."""
+        """Return whether the authenticated session is present and unexpired.
+
+        Challenge consumption is one-time, but the authenticated session remains
+        usable until expiry for task resume/pause/cancel authorization.
+        """
         now = datetime.now(timezone.utc)
         with self._lock:
             session = self._sessions.get(str(session_id or ""))
-            if session is None or session.used or session.expires_at <= now:
+            if session is None or session.expires_at <= now:
                 if session is not None:
                     self._sessions.pop(str(session_id), None)
                 return False
