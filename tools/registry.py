@@ -27,6 +27,13 @@ class ToolSpec:
     argument_type: type | None
     handler: Callable[[str | None], Any]
     owner_only: bool = False
+    network_required: bool = False
+    timeout: int = DEFAULT_TOOL_TIMEOUT
+    max_output: int = 12000
+    supports_streaming: bool = False
+    idempotent: bool = True
+    side_effects: bool = False
+    capabilities: tuple[str, ...] = ()
 
     def validate(self, argument: Any) -> tuple[bool, str]:
         if self.argument_type is None:
@@ -116,10 +123,12 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     for spec in specs:
         if not isinstance(spec, ToolSpec) or not spec.name or spec.name in registry:
             raise ValueError("duplicate or invalid tool specification")
-        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner):
+        if len(spec.name) > 96 or len(spec.description) > 512 or not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner):
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
+        if spec.timeout < 1 or spec.max_output < 1 or not isinstance(spec.capabilities, tuple):
+            raise ValueError(f"invalid limits for {spec.name}")
         registry[spec.name] = spec
     return registry
 

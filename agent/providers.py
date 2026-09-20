@@ -1,48 +1,68 @@
 from __future__ import annotations
 
 import json
-import urllib.error
 import urllib.request
+from typing import Any, Iterator
+
+from .provider_api import ProviderCapabilities, ProviderResponse, ToolCall, response_from_legacy
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, name: str, base_url: str, model: str, api_key: str = ""):
+    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, capabilities: ProviderCapabilities | None = None):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.failure_count = 0
         self.last_error = ""
+        self.capabilities = capabilities or ProviderCapabilities(generate=True, stream=False, tool_calling=False, structured_output=False)
 
     def status(self) -> dict:
-        return {
-            "name": self.name,
-            "model": self.model,
-            "base_url": self.base_url,
-            "configured": bool(self.base_url and self.model),
-            "failure_count": self.failure_count,
-            "last_error": self.last_error,
-        }
+        return {"name": self.name, "model": self.model, "base_url": self.base_url, "configured": bool(self.base_url and self.model), "failure_count": self.failure_count, "last_error": self.last_error, "capabilities": self.capabilities.__dict__.copy()}
 
-    def chat(self, messages: list[dict], temperature: float = 0, timeout: int = 90) -> dict:
-        payload = {"model": self.model, "messages": messages, "temperature": temperature}
-        req = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+    def _request(self, payload: dict[str, Any], timeout: int = 90) -> dict[str, Any]:
+        req = urllib.request.Request(self.base_url + "/chat/completions", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
         if self.api_key:
             req.add_header("Authorization", "Bearer " + self.api_key)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 data = json.loads(response.read().decode())
-            content = data["choices"][0]["message"]["content"]
-            if not isinstance(content, str):
-                raise ValueError("provider returned non-text content")
             self.last_error = ""
-            return {"content": content, "provider": self.name, "model": self.model}
+            return data
         except Exception as exc:
             self.failure_count += 1
             self.last_error = str(exc)[:500]
             raise
+
+    def _normalize(self, data: dict[str, Any], capability: str) -> ProviderResponse:
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        calls = []
+        for raw in message.get("tool_calls") or []:
+            function = raw.get("function") or {}
+            if not isinstance(function.get("name"), str):
+                continue
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            calls.append(ToolCall(function["name"], arguments if isinstance(arguments, dict) else {}, str(raw.get("id") or "")))
+        return ProviderResponse(str(message.get("content") or ""), calls, str((data.get("choices") or [{}])[0].get("finish_reason") or ("tool_calls" if calls else "stop")), self.name, self.model, data.get("usage") or {}, {}, capability)
+
+    def generate(self, messages: list[dict], temperature: float = 0, **kwargs: Any) -> ProviderResponse:
+        return self._normalize(self._request({"model": self.model, "messages": messages, "temperature": temperature, **kwargs}), "generate")
+
+    def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float = 0, **kwargs: Any) -> ProviderResponse:
+        if not self.capabilities.tool_calling:
+            raise NotImplementedError("native tool calling unavailable")
+        return self._normalize(self._request({"model": self.model, "messages": messages, "temperature": temperature, "tools": tools, **kwargs}), "tool_calling")
+
+    def stream(self, messages: list[dict], temperature: float = 0, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        if not self.capabilities.stream:
+            raise NotImplementedError("streaming unavailable")
+        raise NotImplementedError("OpenAI-compatible SSE streaming adapter unavailable")
+
+    def chat(self, messages: list[dict], temperature: float = 0, timeout: int = 90) -> dict:
+        response = self.generate(messages, temperature=temperature, timeout=timeout)
+        return response.public()
