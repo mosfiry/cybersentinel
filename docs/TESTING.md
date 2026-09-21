@@ -13,14 +13,14 @@ For a local smoke test, configure separate `BRIDGE_TOKEN` and `OWNER_TOKEN`, run
 
 ## Agent Core Fusion validation
 
-The adaptive-loop regression file is `tests/test_agent_adaptive_loop.py`. It covers successful observations that trigger replanning, contradictory evidence that weakens one hypothesis and activates another, low/medium/high/critical information-gain classification, typed knowledge retrieval and ContextEngine routing, knowledge-injection resistance, Owner/objective/scope immutability, malformed model proposals, crash recovery, idempotent completed actions, and multilingual natural-language entrypoints. The stable CVE fixture is loaded through `KnowledgeObject`, `TypedKnowledgeRetriever`, `KnowledgeProvider`, and `ContextEngine` rather than being asserted as an isolated JSON file.
+The adaptive-loop regression file is `tests/test_agent_adaptive_loop.py`. It covers successful observations that trigger replanning, contradictory evidence that weakens one hypothesis and activates another, low/medium/high/critical information-gain classification, typed knowledge retrieval and ContextEngine routing, knowledge-injection resistance, Owner/objective/scope immutability, malformed model proposals, crash recovery, idempotent completed actions, deterministic dead-loop detection, a persisted 21-turn retention trajectory, and multilingual natural-language entrypoints. The stable CVE fixture is loaded through `KnowledgeObject`, `TypedKnowledgeRetriever`, `KnowledgeProvider`, and `ContextEngine` rather than being asserted as an isolated JSON file.
 
 The complete validation command is:
 
 ```bash
 python -m compileall -q .
 python -m pytest -q
-python -m pytest tests/test_agent_adaptive_loop.py -q
+python -m pytest tests/test_agent_adaptive_loop.py -q  # 24 adaptive-loop tests, including dead-loop and 21-turn retention gates
 ```
 
 The automated audit command uses the existing configured provider route when environment variables are present. It records both a safe synthetic multi-replan trajectory and a real AgentCore mission; it does not silently convert a provider failure into a real-model success:

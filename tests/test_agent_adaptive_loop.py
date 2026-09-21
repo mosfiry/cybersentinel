@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import hashlib
 
 import pytest
 
@@ -174,6 +175,50 @@ def test_idempotent_completed_action_is_not_replayed(tmp_path):
     rt.store.save(loaded)
     rt.run_slice(mission.mission_id)
     assert len(calls) == 1
+
+
+def test_repeated_plan_and_action_is_detected_as_dead_loop(tmp_path):
+    def execute(mission, step, action_id):
+        raise AssertionError("dead-loop detection must run before tool execution")
+
+    rt = make_runtime(tmp_path, execute)
+    mission = rt.create("detect loop", "detect loop", initial_plan())
+    step = mission.current_plan_step
+    signature = hashlib.sha256(json.dumps({"plan": mission.plan.fingerprint, "step": step.step_id, "action": step.action}, sort_keys=True).encode()).hexdigest()
+    mission.progress["loop_signatures"] = {signature: 3}
+    rt.store.save(mission)
+    result = rt.run_to_completion(mission.mission_id, max_slices=10)
+
+    assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert "dead loop detected" in result.error
+    assert result.progress["loop_signatures"][signature] == 4
+
+
+def test_twenty_one_turn_trajectory_retains_observations_and_events(tmp_path):
+    turn_count = 21
+    steps = tuple(PlanStep(f"turn-{index}", f"turn {index}", action="status") for index in range(turn_count))
+
+    def execute(mission, step, action_id):
+        return {"success": True, "source": "retention-fixture", "criterion_id": step.step_id, "turn": mission.current_step}
+
+    rt = make_runtime(tmp_path, execute)
+    mission = rt.create(
+        "retain trajectory",
+        "retain trajectory",
+        Plan.initial("retain trajectory").replan(steps=steps, reason="retention test"),
+        max_iterations=turn_count + 5,
+    )
+    result = rt.run_to_completion(mission.mission_id, max_slices=turn_count + 5)
+
+    assert result.status is MissionStatus.GOAL_COMPLETED
+    assert len(result.observations) == turn_count
+    assert len(result.action_history) == turn_count
+    assert result.iteration_count >= turn_count
+    assert len(result.transitions) >= turn_count * 3
+    reloaded = rt.store.load(mission.mission_id)
+    assert reloaded is not None
+    assert len(reloaded.observations) == turn_count
+    assert len(reloaded.trajectory) >= turn_count * 3
 
 
 @pytest.mark.parametrize("text", ["حقق في الحادثة", "Investigate the incident", "حقق في the incident and CVE"])
