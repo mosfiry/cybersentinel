@@ -161,7 +161,7 @@ class AgentTaskRuntime:
         valid, reason = spec.validate(argument) if spec else (False, "unknown tool")
         if set(call.arguments) - {"query"}:
             valid, reason = False, "unknown tool argument"
-        decision = authorize_tool(item, owner_authenticated=True)
+        decision = authorize_tool(item)
         self._event(task, "tool.selected", {"tool": call.name, "tool_call_id": call.call_id})
         if spec is not None and spec.scope_required:
             scope_context = task.execution_state.get("scope_context")

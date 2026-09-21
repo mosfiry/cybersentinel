@@ -219,7 +219,7 @@ class AgentLoop:
             item = name if argument is None else [name, argument]
 
             # Structural preflight only. Real Owner authentication remains in the executor/core engine.
-            decision = authorize_tool(item, owner_authenticated=None)
+            decision = authorize_tool(item)
             if not decision.allowed:
                 result = {"ok": False, "error": decision.reason}
                 activity.append({

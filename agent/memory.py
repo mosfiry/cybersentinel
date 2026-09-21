@@ -51,6 +51,13 @@ class TrustClassification(Enum):
     UNTRUSTED_DATA = "untrusted_data"   # User input, tool results, external data
 
 
+class MemoryDomain(Enum):
+    CONVERSATION = "conversation"
+    RESEARCH = "research"
+    LEARNING = "learning"
+    TASK_STATE = "task_state"
+
+
 @dataclass(frozen=True)
 class MemoryItem:
     """Individual memory item with provenance."""
@@ -65,10 +72,16 @@ class MemoryItem:
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    domain: MemoryDomain = MemoryDomain.CONVERSATION
+    request_id: str = ""
 
     def __post_init__(self) -> None:
         if self.trust_classification is TrustClassification.AUTHORITATIVE:
             raise ValueError("memory cannot be authoritative; Owner Policy is not memory")
+        if self.domain.value in {"owner_policy", "authorization", "scope", "evidence"}:
+            raise ValueError("policy, authorization, scope, and evidence are separate stores")
+        if str(self.metadata.get("classification", "")).casefold() in {"owner_policy", "authorization", "scope", "evidence"}:
+            raise ValueError("memory metadata cannot claim policy, authorization, scope, or evidence authority")
     
     @classmethod
     def create(
@@ -80,6 +93,8 @@ class MemoryItem:
         source: str,
         provenance: str,
         metadata: dict[str, Any] | None = None,
+        domain: MemoryDomain = MemoryDomain.CONVERSATION,
+        request_id: str = "",
     ) -> MemoryItem:
         """Create a new memory item."""
         import uuid
@@ -97,6 +112,8 @@ class MemoryItem:
             created_at=now,
             updated_at=now,
             metadata=metadata or {},
+            domain=domain,
+            request_id=request_id,
         )
     
     def to_dict(self) -> dict[str, Any]:
@@ -113,6 +130,8 @@ class MemoryItem:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "metadata": self.metadata,
+            "domain": self.domain.value,
+            "request_id": self.request_id,
         }
     
     @classmethod
@@ -121,6 +140,7 @@ class MemoryItem:
         data = data.copy()
         data["memory_type"] = MemoryType(data["memory_type"])
         data["trust_classification"] = TrustClassification(data["trust_classification"])
+        data["domain"] = MemoryDomain(data.get("domain", MemoryDomain.CONVERSATION.value))
         return cls(**data)
 
 

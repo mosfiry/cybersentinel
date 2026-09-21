@@ -11,7 +11,7 @@ from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
 from security.owner_policy import (
     authenticate_owner, authentication_from_session, capture_policy_snapshot,
-    set_current_owner_instruction, load_state, load_policy, authority_snapshot,
+    set_current_owner_instruction, load_state, load_policy, authority_snapshot, policy_context_from_snapshot,
 )
 from security.owner_session import consume_owner_challenge
 from .version import PRODUCT_NAME, VERSION
@@ -72,14 +72,14 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
     }
     if owner_session_id or owner_challenge:
         try:
-            auth_context = consume_owner_challenge(owner_session_id, owner_challenge, text)
-            auth_evidence = authentication_from_session(auth_context)
+            auth_context = consume_owner_challenge(owner_session_id, owner_challenge, text, request_id)
+            auth_evidence = authentication_from_session(auth_context, request_id)
             owner_ok, owner_reason = True, "owner-session-challenge"
         except PermissionError as exc:
             owner_reason = str(exc)
     else:
         try:
-            auth_evidence = authenticate_owner(text, owner_token)
+            auth_evidence = authenticate_owner(text, owner_token, request_id)
             owner_ok, owner_reason = True, "owner-authenticated"
             auth_context = {
                 "owner_authenticated": True,
@@ -94,7 +94,9 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}
         complete_lifecycle(request_id, response, success=False, error=owner_reason)
         return response
-    set_current_owner_instruction(text, source, auth_evidence=auth_evidence)
+    if text.strip().casefold().startswith("owner instruction:"):
+        instruction_text = text.split(":", 1)[1].strip()
+        set_current_owner_instruction(instruction_text, source, auth_evidence=auth_evidence, request_id=request_id)
     policy_snapshot = capture_policy_snapshot(request_id, auth_evidence)
     conversation_intent = ConversationParser().understand(text)
     req = owner_request(text, source)
@@ -105,9 +107,10 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         complete_lifecycle(request_id, response, success=False, error=decision.reason)
         return response
 
-    planned = RUNTIME.plan(text)
+    snapshot_context = policy_context_from_snapshot(policy_snapshot)
+    planned = RUNTIME.plan(text, policy_context=snapshot_context)
     transition_lifecycle(request_id, "planned", provider=planned.get("provider", ""), model=planned.get("model", ""))
-    authorized, errors = authorize_plan(planned["tools"], owner_authenticated=True)
+    authorized, errors = authorize_plan(planned["tools"], owner_evidence=auth_evidence, request_id=request_id, policy_snapshot=policy_snapshot, current_policy=snapshot_context)
     if errors:
         add_event("authorization", "Plan rejected", "; ".join(errors), source, "warning", True, {"request_id": request_id, "decision": "deny", "provider": planned.get("provider"), "model": planned.get("model")})
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة: " + "; ".join(errors), "plan": [], "results": [], "lifecycle": "completed"}

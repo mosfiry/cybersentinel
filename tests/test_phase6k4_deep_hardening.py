@@ -41,8 +41,8 @@ def test_boolean_cannot_forge_owner_authentication(monkeypatch, tmp_path):
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
     with pytest.raises(PermissionError, match="typed"):
         set_current_owner_instruction("Owner allow safe analysis", owner_authenticated=True)
-    evidence = policy.OwnerAuthenticationEvidence("owner_token", "2026-09-21T00:00:00Z", "proof")
-    state = set_current_owner_instruction("Owner allow safe analysis", auth_evidence=evidence)
+    evidence = policy._issue_evidence("owner_token", "test-request", "proof")
+    state = set_current_owner_instruction("Owner allow safe analysis", auth_evidence=evidence, request_id="test-request")
     assert state["current_owner_instruction"] == "Owner allow safe analysis"
     assert state["authentication"]["method"] == "owner_token"
 
@@ -66,24 +66,27 @@ def test_untrusted_sources_cannot_mutate_policy(source_text, monkeypatch, tmp_pa
 def test_owner_instruction_conflicts_and_empty_instruction(monkeypatch, tmp_path):
     import security.owner_policy as policy
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
-    evidence = policy.OwnerAuthenticationEvidence("owner_token", "2026-09-21T00:00:00Z", "proof")
-    first = set_current_owner_instruction("Owner instruction A", auth_evidence=evidence)
-    repeated = set_current_owner_instruction("Owner instruction A", auth_evidence=evidence)
-    second = set_current_owner_instruction("Owner instruction B", auth_evidence=evidence)
+    evidence = policy._issue_evidence("owner_token", "test-request", "proof")
+    first = set_current_owner_instruction("Owner instruction A", auth_evidence=evidence, request_id="test-request")
+    repeated_evidence = policy._issue_evidence("owner_token", "test-request", "proof-2")
+    second_evidence = policy._issue_evidence("owner_token", "test-request", "proof-3")
+    repeated = set_current_owner_instruction("Owner instruction A", auth_evidence=repeated_evidence, request_id="test-request")
+    second = set_current_owner_instruction("Owner instruction B", auth_evidence=second_evidence, request_id="test-request")
     assert len(first["previous_owner_instructions"]) == 0
     assert len(repeated["previous_owner_instructions"]) == 0
     assert second["current_owner_instruction"] == "Owner instruction B"
     assert second["previous_owner_instructions"][0]["instruction"] == "Owner instruction A"
     assert second["previous_owner_instructions"][0]["instruction_fingerprint"] == owner_instruction_fingerprint("Owner instruction A")
+    empty_evidence = policy._issue_evidence("owner_token", "test-request", "proof-empty")
     with pytest.raises(ValueError, match="empty"):
-        set_current_owner_instruction("  ", auth_evidence=evidence)
+        set_current_owner_instruction("  ", auth_evidence=empty_evidence, request_id="test-request")
 
 
 def test_policy_snapshot_carries_instruction_policy_and_authentication(monkeypatch, tmp_path):
     import security.owner_policy as policy
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
-    evidence = policy.OwnerAuthenticationEvidence("owner_token", "2026-09-21T00:00:00Z", "proof")
-    set_current_owner_instruction("Owner analyze only", auth_evidence=evidence)
+    evidence = policy._issue_evidence("owner_token", "req-1", "proof")
+    set_current_owner_instruction("Owner analyze only", auth_evidence=evidence, request_id="req-1")
     snapshot = capture_policy_snapshot("req-1", evidence)
     assert snapshot.request_id == "req-1"
     assert snapshot.owner_instruction == "Owner analyze only"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hmac
+import hashlib
 import secrets
 import threading
 from typing import Any
@@ -55,7 +56,7 @@ class OwnerSessionManager:
             self._sessions[session.session_id] = session
         return session
 
-    def consume(self, session_id: str, challenge: str, message: str) -> dict[str, Any]:
+    def consume(self, session_id: str, challenge: str, message: str, request_id: str = "") -> dict[str, Any]:
         session_id = str(session_id or "").strip()
         challenge = str(challenge or "").strip()
         message = str(message or "")
@@ -74,11 +75,14 @@ class OwnerSessionManager:
             if challenge not in message:
                 raise PermissionError("owner challenge must be included in the message")
             session.used = True
+            session_proof = hmac.new(session.challenge.encode("utf-8"), f"{session.session_id}|{request_id}".encode("utf-8"), hashlib.sha256).hexdigest()
             return {
                 "owner_authenticated": True,
                 "owner_session_id": session.session_id,
                 "authentication_method": "owner_session_challenge",
                 "authenticated_at": now.isoformat(),
+                "request_id": str(request_id),
+                "session_proof": session_proof,
             }
 
     def validate_challenge(self, session_id: str, challenge: str, message: str) -> bool:
@@ -116,6 +120,15 @@ class OwnerSessionManager:
                 return False
             return True
 
+    def verify_proof(self, session_id: str, request_id: str, proof: str) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            session = self._sessions.get(str(session_id or ""))
+            if session is None or not session.used or session.expires_at <= now:
+                return False
+            expected = hmac.new(session.challenge.encode("utf-8"), f"{session.session_id}|{request_id}".encode("utf-8"), hashlib.sha256).hexdigest()
+            return hmac.compare_digest(expected, str(proof or ""))
+
     def _purge(self, now: datetime) -> None:
         expired = [key for key, value in self._sessions.items() if value.expires_at <= now or value.used]
         for key in expired:
@@ -129,9 +142,13 @@ def create_owner_session(presented_token: str | None) -> dict[str, Any]:
     return DEFAULT_OWNER_SESSIONS.create(presented_token).public()
 
 
-def consume_owner_challenge(session_id: str, challenge: str, message: str) -> dict[str, Any]:
-    return DEFAULT_OWNER_SESSIONS.consume(session_id, challenge, message)
+def consume_owner_challenge(session_id: str, challenge: str, message: str, request_id: str = "") -> dict[str, Any]:
+    return DEFAULT_OWNER_SESSIONS.consume(session_id, challenge, message, request_id)
 
 
 def validate_owner_challenge(session_id: str, challenge: str, message: str) -> bool:
     return DEFAULT_OWNER_SESSIONS.validate_challenge(session_id, challenge, message)
+
+
+def verify_owner_session_proof(session_id: str, request_id: str, proof: str) -> bool:
+    return DEFAULT_OWNER_SESSIONS.verify_proof(session_id, request_id, proof)
