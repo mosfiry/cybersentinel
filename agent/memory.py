@@ -65,6 +65,10 @@ class MemoryItem:
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.trust_classification is TrustClassification.AUTHORITATIVE:
+            raise ValueError("memory cannot be authoritative; Owner Policy is not memory")
     
     @classmethod
     def create(

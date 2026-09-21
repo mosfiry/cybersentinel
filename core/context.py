@@ -16,6 +16,10 @@ class ExecutionContext:
     owner_session_id: str | None = None
     authentication_method: str = "owner_token"
     authenticated_at: str | None = None
+    owner_instruction_snapshot: str = ""
+    owner_instruction_fingerprint: str = ""
+    policy_snapshot_details: dict[str, Any] = field(default_factory=dict)
+    scope_snapshot: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

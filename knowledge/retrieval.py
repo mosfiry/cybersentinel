@@ -1,9 +1,47 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+import math
+import re
 from typing import Iterable, Protocol
 
-from .foundation import KnowledgeKind, KnowledgeObject
+from .foundation import KnowledgeKind, KnowledgeObject, TrustClass
+
+_TOKEN_RE = re.compile(r"[\w\u0600-\u06ff]+", re.UNICODE)
+
+
+@dataclass(frozen=True)
+class KnowledgeQuery:
+    text: str = ""
+    actor: str | None = None
+    campaign: str | None = None
+    technique: str | None = None
+    cve: str | None = None
+    cwe: str | None = None
+    capec: str | None = None
+    malware: str | None = None
+    trust_class: TrustClass | None = None
+    claim_type: str | None = None
+    attribution_status: str | None = None
+    source: str | None = None
+    date: str | None = None
+    content_role: str | None = None
+    kind: KnowledgeKind | None = None
+    limit: int = 20
+
+    def __post_init__(self) -> None:
+        if self.limit < 1:
+            raise ValueError("query limit must be positive")
+
+    @classmethod
+    def from_value(cls, value: "KnowledgeQuery | str", **kwargs) -> "KnowledgeQuery":
+        if isinstance(value, cls):
+            meaningful = {key: item for key, item in kwargs.items() if not (key == "kind" and item is None) and not (key == "limit" and item == 20)}
+            if meaningful:
+                raise ValueError("query kwargs cannot accompany a KnowledgeQuery")
+            return value
+        return cls(text=str(value), **kwargs)
 
 
 @dataclass(frozen=True)
@@ -17,27 +55,118 @@ class RetrievalHit:
 
 
 class Retriever(Protocol):
-    def search(self, query: str, *, kind: KnowledgeKind | None = None, limit: int = 20) -> list[RetrievalHit]: ...
+    def search(self, query: KnowledgeQuery | str, *, kind: KnowledgeKind | None = None, limit: int = 20, **filters) -> list[RetrievalHit]: ...
 
 
-class BM25Retriever:
-    """Reserved adapter contract; implementation must preserve provenance and trust."""
+def _metadata_value(obj: KnowledgeObject, key: str):
+    metadata = obj.metadata or {}
+    if key in metadata:
+        return metadata[key]
+    for container in ("corpus", "provenance", "ingestion_manifest"):
+        nested = metadata.get(container)
+        if isinstance(nested, dict) and key in nested:
+            return nested[key]
+    return None
+
+
+def _matches(obj: KnowledgeObject, query: KnowledgeQuery) -> bool:
+    if query.kind is not None and obj.kind is not query.kind:
+        return False
+    if query.trust_class is not None and obj.trust_class is not query.trust_class:
+        return False
+    mapping = {
+        "actor": "actor_id", "campaign": "campaign_id", "technique": "technique",
+        "cve": "cve", "cwe": "cwe", "capec": "capec", "malware": "malware",
+        "claim_type": "claim_type", "attribution_status": "attribution_status",
+        "source": "source_id", "date": "date", "content_role": "content_role",
+    }
+    for field, key in mapping.items():
+        expected = getattr(query, field)
+        if expected is not None:
+            actual = _metadata_value(obj, key)
+            values = actual if isinstance(actual, (list, tuple, set)) else (actual,)
+            if not any(str(expected).casefold() == str(value).casefold() or str(expected).casefold() in str(value).casefold() for value in values if value is not None):
+                return False
+    return True
+
+
+def _hit(obj: KnowledgeObject, score: float) -> RetrievalHit:
+    return RetrievalHit(
+        obj.object_id, float(score), obj.kind, obj.is_exact_source, obj.trust_class.value,
+        {"source_id": obj.source_id, "source_url": obj.source_url, "content_hash": obj.content_hash, "metadata": dict(obj.metadata)},
+    )
+
+
+class LexicalRetriever:
+    """Explicit substring/term-presence retriever; not BM25."""
     def __init__(self, objects: Iterable[KnowledgeObject] = ()):
         self.objects = tuple(objects)
 
-    def search(self, query: str, *, kind: KnowledgeKind | None = None, limit: int = 20) -> list[RetrievalHit]:
-        needle = query.casefold()
-        candidates = [obj for obj in self.objects if (kind is None or obj.kind is kind) and needle in (obj.title + " " + obj.content).casefold()]
-        return [RetrievalHit(obj.object_id, 1.0, obj.kind, obj.is_exact_source, obj.trust_class.value, {"source_id": obj.source_id, "source_url": obj.source_url, "content_hash": obj.content_hash}) for obj in candidates[:limit]]
+    def search(self, query: KnowledgeQuery | str, *, kind: KnowledgeKind | None = None, limit: int = 20, **filters) -> list[RetrievalHit]:
+        q = KnowledgeQuery.from_value(query, kind=kind, limit=limit, **filters)
+        needle = q.text.casefold()
+        hits = [_hit(obj, 1.0) for obj in self.objects if _matches(obj, q) and (not needle or needle in (obj.title + " " + obj.content).casefold())]
+        return hits[: q.limit]
+
+
+class BM25Retriever:
+    """In-memory BM25 implementation with metadata filtering and provenance."""
+    def __init__(self, objects: Iterable[KnowledgeObject] = (), *, k1: float = 1.5, b: float = 0.75):
+        self.objects = tuple(objects)
+        self.k1 = k1
+        self.b = b
+
+    def search(self, query: KnowledgeQuery | str, *, kind: KnowledgeKind | None = None, limit: int = 20, **filters) -> list[RetrievalHit]:
+        q = KnowledgeQuery.from_value(query, kind=kind, limit=limit, **filters)
+        candidates = [obj for obj in self.objects if _matches(obj, q)]
+        terms = _TOKEN_RE.findall(q.text.casefold())
+        if not terms:
+            return [_hit(obj, 0.0) for obj in candidates[: q.limit]]
+        tokenized = [_TOKEN_RE.findall((obj.title + " " + obj.content).casefold()) for obj in candidates]
+        avgdl = sum(len(tokens) for tokens in tokenized) / max(len(tokenized), 1)
+        document_frequency = Counter(term for tokens in tokenized for term in set(tokens))
+        scored: list[tuple[float, KnowledgeObject]] = []
+        for obj, tokens in zip(candidates, tokenized):
+            counts = Counter(tokens)
+            dl = len(tokens)
+            score = 0.0
+            for term in terms:
+                if not counts[term]:
+                    continue
+                df = document_frequency[term]
+                idf = math.log(1.0 + (len(candidates) - df + 0.5) / (df + 0.5))
+                tf = counts[term]
+                score += idf * (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * dl / max(avgdl, 1)))
+            if score > 0:
+                scored.append((score, obj))
+        scored.sort(key=lambda pair: (-pair[0], pair[1].object_id))
+        return [_hit(obj, score) for score, obj in scored[: q.limit]]
+
+
+class MetadataRetriever:
+    """Metadata-only filter; it never infers authority or execution permission."""
+    def __init__(self, objects: Iterable[KnowledgeObject] = ()):
+        self.objects = tuple(objects)
+
+    def search(self, query: KnowledgeQuery | str = "", *, kind: KnowledgeKind | None = None, limit: int = 20, **filters) -> list[RetrievalHit]:
+        q = KnowledgeQuery.from_value(query, kind=kind, limit=limit, **filters)
+        return [_hit(obj, 1.0) for obj in self.objects if _matches(obj, q)][: q.limit]
 
 
 class VectorRetriever:
-    """Future vector adapter boundary; no embedding or execution permission is implied."""
-    def search(self, query: str, *, kind: KnowledgeKind | None = None, limit: int = 20) -> list[RetrievalHit]:
+    """Interface only: no vector backend is installed in Knowledge Foundation."""
+    status = "NOT_IMPLEMENTED"
+
+    def search(self, query: KnowledgeQuery | str, *, kind: KnowledgeKind | None = None, limit: int = 20, **filters) -> list[RetrievalHit]:
         raise NotImplementedError("vector index is not installed in Knowledge Foundation")
 
 
 class HybridRetriever:
-    """Future hybrid adapter boundary combining lexical and vector hits."""
-    def search(self, query: str, *, kind: KnowledgeKind | None = None, limit: int = 20) -> list[RetrievalHit]:
+    """Interface only until a vector backend and reranking policy are reviewed."""
+    status = "NOT_IMPLEMENTED"
+
+    def search(self, query: KnowledgeQuery | str, *, kind: KnowledgeKind | None = None, limit: int = 20, **filters) -> list[RetrievalHit]:
         raise NotImplementedError("hybrid index is not installed in Knowledge Foundation")
+
+
+__all__ = ["KnowledgeQuery", "RetrievalHit", "Retriever", "LexicalRetriever", "BM25Retriever", "MetadataRetriever", "VectorRetriever", "HybridRetriever"]
