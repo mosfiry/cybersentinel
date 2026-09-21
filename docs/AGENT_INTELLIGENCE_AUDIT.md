@@ -1,7 +1,7 @@
 # CyberSentinel X Agent Intelligence Audit
 
-Generated at: `2026-09-21T16:49:10.745745+00:00`  
-Commit: `25307b88960d7e9a04cb9ce14c3b00b8fbcee41e`  
+Generated at: `2026-09-21T16:54:18.542109+00:00`
+Commit: `de5c2c513648de7f552225681e39364717d1549f`
 Baseline: `25307b88960d7e9a04cb9ce14c3b00b8fbcee41e` with 276 tests before this upgrade.
 
 ## Scope
@@ -43,7 +43,7 @@ This report records the adaptive-loop audit. It does not claim production readin
 ```json
 {
   "status": "GOAL_COMPLETED",
-  "mission_id": "d616bf218913455cb32f51f2383f3deb",
+  "mission_id": "e4634a0568e7469fb818d50470a4d03b",
   "provider": [
     {
       "name": "default",
@@ -95,7 +95,7 @@ This report records the adaptive-loop audit. It does not claim production readin
 ```json
 {
   "status": "GOAL_COMPLETED",
-  "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+  "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
   "plan_versions": [
     2,
     3,
@@ -133,7 +133,7 @@ This report records the adaptive-loop audit. It does not claim production readin
       "to": "OBSERVING",
       "reason": "action returned observation",
       "data": {
-        "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:2:initial:0"
+        "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:2:initial:0"
       },
       "iteration": 1
     },
@@ -167,7 +167,7 @@ This report records the adaptive-loop audit. It does not claim production readin
       "to": "OBSERVING",
       "reason": "action returned observation",
       "data": {
-        "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:3:investigation-2:0"
+        "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:3:investigation-2:0"
       },
       "iteration": 2
     },
@@ -201,7 +201,7 @@ This report records the adaptive-loop audit. It does not claim production readin
       "to": "OBSERVING",
       "reason": "action returned observation",
       "data": {
-        "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:4:investigation-3:0"
+        "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:4:investigation-3:0"
       },
       "iteration": 3
     },
@@ -230,10 +230,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   "authorization_decisions": [
     {
       "event": "AuthorizationChecked",
-      "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+      "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
       "request_id": "",
       "step_id": "initial",
-      "timestamp": "2026-09-21T16:48:27.747719+00:00",
+      "timestamp": "2026-09-21T16:53:41.458173+00:00",
       "provenance": {},
       "data": {
         "allowed": true,
@@ -242,10 +242,10 @@ This report records the adaptive-loop audit. It does not claim production readin
     },
     {
       "event": "AuthorizationChecked",
-      "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+      "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
       "request_id": "",
       "step_id": "investigation-2",
-      "timestamp": "2026-09-21T16:48:27.752104+00:00",
+      "timestamp": "2026-09-21T16:53:41.461915+00:00",
       "provenance": {},
       "data": {
         "allowed": true,
@@ -254,10 +254,10 @@ This report records the adaptive-loop audit. It does not claim production readin
     },
     {
       "event": "AuthorizationChecked",
-      "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+      "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
       "request_id": "",
       "step_id": "investigation-3",
-      "timestamp": "2026-09-21T16:48:27.757769+00:00",
+      "timestamp": "2026-09-21T16:53:41.467303+00:00",
       "provenance": {},
       "data": {
         "allowed": true,
@@ -288,10 +288,10 @@ This report records the adaptive-loop audit. It does not claim production readin
 [
   {
     "event": "MissionStarted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "",
-    "timestamp": "2026-09-21T16:48:27.743296+00:00",
+    "timestamp": "2026-09-21T16:53:41.454645+00:00",
     "provenance": {},
     "data": {
       "objective": "Investigate whether CVE-X was the initial access vector for Incident-A"
@@ -299,10 +299,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "PlanCreated",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "",
-    "timestamp": "2026-09-21T16:48:27.743350+00:00",
+    "timestamp": "2026-09-21T16:53:41.454707+00:00",
     "provenance": {},
     "data": {
       "version": 2,
@@ -311,22 +311,22 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "StepSelected",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.747637+00:00",
+    "timestamp": "2026-09-21T16:53:41.458109+00:00",
     "provenance": {},
     "data": {
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:2:initial:0",
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:2:initial:0",
       "plan_version": 2
     }
   },
   {
     "event": "AuthorizationChecked",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.747719+00:00",
+    "timestamp": "2026-09-21T16:53:41.458173+00:00",
     "provenance": {},
     "data": {
       "allowed": true,
@@ -335,37 +335,37 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "ObservationReceived",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.749328+00:00",
+    "timestamp": "2026-09-21T16:53:41.459625+00:00",
     "provenance": {},
     "data": {
       "status": true,
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:2:initial:0"
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:2:initial:0"
     }
   },
   {
     "event": "ToolExecuted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.749344+00:00",
+    "timestamp": "2026-09-21T16:53:41.459640+00:00",
     "provenance": {},
     "data": {
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:2:initial:0",
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:2:initial:0",
       "status": "completed"
     }
   },
   {
     "event": "ObservationInterpreted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.749622+00:00",
+    "timestamp": "2026-09-21T16:53:41.459837+00:00",
     "provenance": {},
     "data": {
-      "observation_id": "obs-601520ee1d3aec23c815",
+      "observation_id": "obs-18b043fa76648f1723a0",
       "summary": "target version is not vulnerable",
       "facts": [],
       "new_evidence": [],
@@ -417,16 +417,16 @@ This report records the adaptive-loop audit. It does not claim production readin
       "provenance": {
         "source": "deterministic_observation_interpreter",
         "action": "search",
-        "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147"
+        "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7"
       }
     }
   },
   {
     "event": "HypothesisUpdated",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.749631+00:00",
+    "timestamp": "2026-09-21T16:53:41.459843+00:00",
     "provenance": {},
     "data": {
       "updates": [
@@ -441,10 +441,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "StrategyDecided",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.749664+00:00",
+    "timestamp": "2026-09-21T16:53:41.459873+00:00",
     "provenance": {},
     "data": {
       "decision": "REPLAN",
@@ -463,10 +463,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "EvidenceAdded",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.749677+00:00",
+    "timestamp": "2026-09-21T16:53:41.459882+00:00",
     "provenance": {},
     "data": {
       "criterion_id": "first-observation"
@@ -474,10 +474,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "ReplanTriggered",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "initial",
-    "timestamp": "2026-09-21T16:48:27.749689+00:00",
+    "timestamp": "2026-09-21T16:53:41.459900+00:00",
     "provenance": {},
     "data": {
       "decision": "REPLAN",
@@ -496,10 +496,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "PlanRevised",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "",
-    "timestamp": "2026-09-21T16:48:27.749777+00:00",
+    "timestamp": "2026-09-21T16:53:41.459968+00:00",
     "provenance": {},
     "data": {
       "version": 3,
@@ -509,22 +509,22 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "StepSelected",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.752026+00:00",
+    "timestamp": "2026-09-21T16:53:41.461842+00:00",
     "provenance": {},
     "data": {
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:3:investigation-2:0",
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:3:investigation-2:0",
       "plan_version": 3
     }
   },
   {
     "event": "AuthorizationChecked",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.752104+00:00",
+    "timestamp": "2026-09-21T16:53:41.461915+00:00",
     "provenance": {},
     "data": {
       "allowed": true,
@@ -533,37 +533,37 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "ObservationReceived",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.753838+00:00",
+    "timestamp": "2026-09-21T16:53:41.463475+00:00",
     "provenance": {},
     "data": {
       "status": true,
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:3:investigation-2:0"
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:3:investigation-2:0"
     }
   },
   {
     "event": "ToolExecuted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.753854+00:00",
+    "timestamp": "2026-09-21T16:53:41.463491+00:00",
     "provenance": {},
     "data": {
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:3:investigation-2:0",
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:3:investigation-2:0",
       "status": "completed"
     }
   },
   {
     "event": "ObservationInterpreted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.754040+00:00",
+    "timestamp": "2026-09-21T16:53:41.463660+00:00",
     "provenance": {},
     "data": {
-      "observation_id": "obs-8f187fd5a0000cb99d62",
+      "observation_id": "obs-ac82dec2fc0999c8d4e2",
       "summary": "IOC and remote-service evidence support the alternate path",
       "facts": [],
       "new_evidence": [
@@ -604,16 +604,16 @@ This report records the adaptive-loop audit. It does not claim production readin
       "provenance": {
         "source": "deterministic_observation_interpreter",
         "action": "search",
-        "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147"
+        "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7"
       }
     }
   },
   {
     "event": "HypothesisUpdated",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.754050+00:00",
+    "timestamp": "2026-09-21T16:53:41.463667+00:00",
     "provenance": {},
     "data": {
       "updates": [
@@ -628,10 +628,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "StrategyDecided",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.755113+00:00",
+    "timestamp": "2026-09-21T16:53:41.463693+00:00",
     "provenance": {},
     "data": {
       "decision": "CHANGE_HYPOTHESIS",
@@ -649,10 +649,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "EvidenceAdded",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.755136+00:00",
+    "timestamp": "2026-09-21T16:53:41.463704+00:00",
     "provenance": {},
     "data": {
       "criterion_id": "second-observation"
@@ -660,10 +660,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "ReplanTriggered",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-2",
-    "timestamp": "2026-09-21T16:48:27.755153+00:00",
+    "timestamp": "2026-09-21T16:53:41.463712+00:00",
     "provenance": {},
     "data": {
       "decision": "CHANGE_HYPOTHESIS",
@@ -681,10 +681,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "PlanRevised",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "",
-    "timestamp": "2026-09-21T16:48:27.755237+00:00",
+    "timestamp": "2026-09-21T16:53:41.464768+00:00",
     "provenance": {},
     "data": {
       "version": 4,
@@ -694,22 +694,22 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "StepSelected",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-3",
-    "timestamp": "2026-09-21T16:48:27.757701+00:00",
+    "timestamp": "2026-09-21T16:53:41.467226+00:00",
     "provenance": {},
     "data": {
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:4:investigation-3:0",
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:4:investigation-3:0",
       "plan_version": 4
     }
   },
   {
     "event": "AuthorizationChecked",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-3",
-    "timestamp": "2026-09-21T16:48:27.757769+00:00",
+    "timestamp": "2026-09-21T16:53:41.467303+00:00",
     "provenance": {},
     "data": {
       "allowed": true,
@@ -718,37 +718,37 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "ObservationReceived",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-3",
-    "timestamp": "2026-09-21T16:48:27.759395+00:00",
+    "timestamp": "2026-09-21T16:53:41.469159+00:00",
     "provenance": {},
     "data": {
       "status": true,
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:4:investigation-3:0"
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:4:investigation-3:0"
     }
   },
   {
     "event": "ToolExecuted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-3",
-    "timestamp": "2026-09-21T16:48:27.759407+00:00",
+    "timestamp": "2026-09-21T16:53:41.469175+00:00",
     "provenance": {},
     "data": {
-      "action_id": "66a90584cbcd4f07b3eeff7ada0b4147:4:investigation-3:0",
+      "action_id": "d9a411893dbf40ba9624bf0b59e62dc7:4:investigation-3:0",
       "status": "completed"
     }
   },
   {
     "event": "ObservationInterpreted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-3",
-    "timestamp": "2026-09-21T16:48:27.759551+00:00",
+    "timestamp": "2026-09-21T16:53:41.469324+00:00",
     "provenance": {},
     "data": {
-      "observation_id": "obs-eed7f858180e076d9c2b",
+      "observation_id": "obs-eda6d9a33ae534a6d815",
       "summary": "required evidence reconciled",
       "facts": [],
       "new_evidence": [],
@@ -767,16 +767,16 @@ This report records the adaptive-loop audit. It does not claim production readin
       "provenance": {
         "source": "deterministic_observation_interpreter",
         "action": "search",
-        "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147"
+        "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7"
       }
     }
   },
   {
     "event": "StrategyDecided",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-3",
-    "timestamp": "2026-09-21T16:48:27.759574+00:00",
+    "timestamp": "2026-09-21T16:53:41.469353+00:00",
     "provenance": {},
     "data": {
       "decision": "CONTINUE_PLAN",
@@ -792,10 +792,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "EvidenceAdded",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "investigation-3",
-    "timestamp": "2026-09-21T16:48:27.759583+00:00",
+    "timestamp": "2026-09-21T16:53:41.469365+00:00",
     "provenance": {},
     "data": {
       "criterion_id": "goal"
@@ -803,19 +803,19 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "GoalVerificationStarted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "",
-    "timestamp": "2026-09-21T16:48:27.762209+00:00",
+    "timestamp": "2026-09-21T16:53:41.472007+00:00",
     "provenance": {},
     "data": {}
   },
   {
     "event": "GoalVerified",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "",
-    "timestamp": "2026-09-21T16:48:27.762358+00:00",
+    "timestamp": "2026-09-21T16:53:41.472160+00:00",
     "provenance": {},
     "data": {
       "evidence_count": 4
@@ -823,10 +823,10 @@ This report records the adaptive-loop audit. It does not claim production readin
   },
   {
     "event": "MissionCompleted",
-    "mission_id": "66a90584cbcd4f07b3eeff7ada0b4147",
+    "mission_id": "d9a411893dbf40ba9624bf0b59e62dc7",
     "request_id": "",
     "step_id": "",
-    "timestamp": "2026-09-21T16:48:27.762367+00:00",
+    "timestamp": "2026-09-21T16:53:41.472170+00:00",
     "provenance": {},
     "data": {
       "verification": {
