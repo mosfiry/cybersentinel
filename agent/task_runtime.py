@@ -12,6 +12,7 @@ from agent.memory import ConversationMemory, MemoryProvider, MemoryType, TrustCl
 from agent.provider_api import ToolCall
 from agent.task import Task, TaskStatus
 from agent.task_manager import TaskManager
+from agent.planning import select_reasoning_profile
 from core.db import add_conversation_message, conversation_messages, ensure_conversation
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
@@ -161,12 +162,13 @@ class AgentTaskRuntime:
             raise PermissionError("task AuthorizationContext binding mismatch")
         return context
 
-    def _ask_model(self, context: Any) -> dict[str, Any]:
+    def _ask_model(self, context: Any, objective: str = "") -> dict[str, Any]:
         payload = context.to_provider_payload()
+        reasoning_profile = select_reasoning_profile(objective)
         try:
-            return self.router.tool_calling(payload["messages"], self._schemas())
+            return self.router.tool_calling(payload["messages"], self._schemas(), reasoning_profile=reasoning_profile)
         except (AttributeError, NotImplementedError):
-            return self.router.generate(payload["messages"])
+            return self.router.generate(payload["messages"], reasoning_profile=reasoning_profile)
 
     @staticmethod
     def _argument(call: ToolCall) -> str | None:
@@ -271,7 +273,8 @@ class AgentTaskRuntime:
         try:
             context = self._context(task)
             self._event(task, "assistant.started", {"context_hash": context.context_hash})
-            response = self._ask_model(context)
+            response = self._ask_model(context, task.objective)
+            task.execution_state["reasoning_profile"] = select_reasoning_profile(task.objective).to_dict()
             task.provider = response.get("provider", task.provider)
             task.model = response.get("model", task.model)
             kind, value = self._parse(response)

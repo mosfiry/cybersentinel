@@ -6,6 +6,7 @@ from typing import Any
 
 from .provider_api import ProviderCapabilities, ProviderResponse, response_from_legacy
 from .providers import OpenAICompatibleProvider
+from .planning import ReasoningProfile
 
 
 @dataclass
@@ -66,7 +67,11 @@ class ModelRouter:
             return response_from_legacy(value, provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"), capability=capability)
         raise TypeError("provider returned unsupported response")
 
-    def generate(self, messages: list[dict], temperature: float = 0, **kwargs: Any) -> dict[str, Any]:
+    def generate(self, messages: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
+        if reasoning_profile is not None:
+            temperature = reasoning_profile.temperature
+        if temperature is None:
+            temperature = 0.2
         errors = []
         self.last_trace = []
         for provider in self.providers:
@@ -82,7 +87,11 @@ class ModelRouter:
                 self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_reason": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
         raise RuntimeError("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured")
 
-    def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float = 0, **kwargs: Any) -> dict[str, Any]:
+    def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
+        if reasoning_profile is not None:
+            temperature = reasoning_profile.temperature
+        if temperature is None:
+            temperature = 0.1
         errors = []
         self.last_trace = []
         for provider in self.providers:
@@ -100,5 +109,5 @@ class ModelRouter:
             raise RuntimeError("native tool providers failed: " + "; ".join(errors))
         raise NotImplementedError("no provider supports native tool calling")
 
-    def chat(self, messages: list[dict], temperature: float = 0) -> dict:
-        return self.generate(messages, temperature=temperature)
+    def chat(self, messages: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None) -> dict:
+        return self.generate(messages, temperature=temperature, reasoning_profile=reasoning_profile)
