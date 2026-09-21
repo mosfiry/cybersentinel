@@ -9,31 +9,21 @@ from .trust import TrustedRequest, is_owner_instruction
 class Decision:
     allowed: bool
     reason: str
-
-
-# Explicitly disallowed because this project is a defensive agent, not an
-# unrestricted offensive execution framework.
-BLOCKED_PATTERNS = (
-    "arbitrary shell",
-    "reverse shell",
-    "credential theft",
-    "steal credentials",
-    "password dump",
-    "malware deployment",
-    "ransomware deployment",
-    "unauthorized exploit",
-    "exploit a third party",
-    "bypass authentication",
-    "persistence on third party",
-    "disable security controls",
-)
+    policy_source: str = "owner_instruction"
+    enforcement_required: bool = True
 
 
 def evaluate(req: TrustedRequest) -> Decision:
+    """Classify a trusted Owner instruction; do not turn keywords into authority.
+
+    This layer deliberately performs no model safety veto and no tool authorization.
+    Deterministic enforcement happens later through OwnerPolicy, AuthorizationContext,
+    ScopeSnapshot, and the tool registry. Host/platform safety boundaries remain
+    outside this application policy classifier.
+    """
     if not is_owner_instruction(req):
-        return Decision(False, "الطلب ليس أمرًا موثوقًا من المالك.")
-    text = req.text.casefold()
-    for pattern in BLOCKED_PATTERNS:
-        if pattern.casefold() in text:
-            return Decision(False, "الطلب خارج حدود CyberSentinel الدفاعية المسموح بها.")
-    return Decision(True, "owner-approved")
+        return Decision(False, "الطلب ليس أمرًا موثوقًا من المالك.", policy_source="trust_boundary")
+    return Decision(True, "owner-instruction-accepted-for-deterministic-enforcement", policy_source="owner_instruction")
+
+
+__all__ = ["Decision", "evaluate"]

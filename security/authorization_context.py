@@ -91,6 +91,9 @@ class AuthorizationContext:
             authentication=dict(policy_data.get("authentication", {})),
             captured_at=str(policy_data.get("captured_at", "")),
             instruction_record=dict(policy_data.get("instruction_record", {})),
+            owner_instruction_id=str(policy_data.get("owner_instruction_id", "")),
+            policy_version=str(policy_data.get("policy_version", "")),
+            created_at=str(policy_data.get("created_at", "")),
         )
         scope = None
         scope_id = data.get("scope_snapshot_id")

@@ -52,6 +52,28 @@ class MissionRuntime:
         mission.transition(MissionStatus.READY, "plan persisted")
         return self.store.save(mission)
 
+    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None) -> Mission:
+        """Create a Mission without allowing model understanding to rewrite the Owner objective."""
+        from security.authorization_context import AuthorizationContext
+        if not isinstance(authorization_context, AuthorizationContext):
+            raise TypeError("Owner Instruction requires typed AuthorizationContext")
+        objective = str(instruction).strip()
+        if not objective:
+            raise ValueError("Owner Instruction cannot be empty")
+        return self.create(
+            objective,
+            objective,
+            plan,
+            request_id=authorization_context.request_id,
+            owner_identity_ref=owner_identity_ref or authorization_context.owner_evidence_fingerprint,
+            owner_instruction=objective,
+            authorization_context=authorization_context.to_dict(),
+            scope_snapshot=scope_snapshot,
+            policy_snapshot=authorization_context.policy_snapshot.to_dict(),
+            completion_criteria=completion_criteria,
+            provenance={"source": "owner_instruction", **(provenance or {})},
+        )
+
     def provide_owner_decision(self, mission_id: str, *, allow: bool, authorization_context: dict[str, Any] | None = None) -> Mission:
         mission = self._load(mission_id)
         if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
@@ -144,6 +166,10 @@ class MissionRuntime:
         elif action is RecoveryAction.REPLAN:
             mission.transition(MissionStatus.REPLANNING, "observation invalidated current plan")
             new_plan = self.replanner(mission, observation)
+            if new_plan.objective != mission.objective:
+                mission.error = "replanner attempted to change Owner objective"
+                mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                return self.store.save(mission)
             mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": "failure observation"})
             mission.plan = new_plan
             mission.current_step = 0

@@ -59,10 +59,15 @@ class Mission:
     max_iterations: int = 50
     iteration_count: int = 0
     error: str = ""
+    request_id: str = ""
+    owner_identity_ref: str = ""
+    owner_instruction: str = ""
+    policy_snapshot: dict[str, Any] | None = None
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50) -> "Mission":
-        mission = cls(mission_id or uuid.uuid4().hex, owner_request, objective, MissionStatus.CREATED, plan, authorization_context=authorization_context, scope_snapshot=scope_snapshot, completion_criteria=completion_criteria or [], max_iterations=max_iterations)
+    def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50, request_id: str = "", owner_identity_ref: str = "", owner_instruction: str = "", policy_snapshot: dict[str, Any] | None = None, provenance: dict[str, Any] | None = None) -> "Mission":
+        mission = cls(mission_id or uuid.uuid4().hex, owner_request, objective, MissionStatus.CREATED, plan, authorization_context=authorization_context, scope_snapshot=scope_snapshot, completion_criteria=completion_criteria or [], max_iterations=max_iterations, request_id=request_id, owner_identity_ref=owner_identity_ref, owner_instruction=owner_instruction or owner_request, policy_snapshot=policy_snapshot, provenance=provenance or {})
         mission.plan_history = [{"version": plan.version, "fingerprint": plan.fingerprint, "reason": "created"}]
         mission.transition(MissionStatus.PLANNING, "mission created")
         return mission
@@ -89,7 +94,7 @@ class Mission:
         self.action_history.append({"action_id": action_id, "step_id": step_id, "status": status, "observation": observation or {}})
 
     def to_dict(self) -> dict[str, Any]:
-        return {"mission_id": self.mission_id, "owner_request": self.owner_request, "objective": self.objective, "status": self.status.value, "plan": self.plan.to_dict(), "current_step": self.current_step, "progress": self.progress, "observations": self.observations, "evidence": self.evidence, "artifacts": self.artifacts, "failures": self.failures, "authorization_context": self.authorization_context, "scope_snapshot": self.scope_snapshot, "completion_criteria": self.completion_criteria, "verification_state": self.verification_state, "checkpoint": self.checkpoint, "plan_history": self.plan_history, "action_history": self.action_history, "transitions": self.transitions, "retry_count": self.retry_count, "max_iterations": self.max_iterations, "iteration_count": self.iteration_count, "error": self.error}
+        return {"mission_id": self.mission_id, "owner_request": self.owner_request, "objective": self.objective, "status": self.status.value, "plan": self.plan.to_dict(), "current_step": self.current_step, "progress": self.progress, "observations": self.observations, "evidence": self.evidence, "artifacts": self.artifacts, "failures": self.failures, "authorization_context": self.authorization_context, "scope_snapshot": self.scope_snapshot, "completion_criteria": self.completion_criteria, "verification_state": self.verification_state, "checkpoint": self.checkpoint, "plan_history": self.plan_history, "action_history": self.action_history, "transitions": self.transitions, "retry_count": self.retry_count, "max_iterations": self.max_iterations, "iteration_count": self.iteration_count, "error": self.error, "request_id": self.request_id, "owner_identity_ref": self.owner_identity_ref, "owner_instruction": self.owner_instruction, "policy_snapshot": self.policy_snapshot, "provenance": self.provenance}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Mission":

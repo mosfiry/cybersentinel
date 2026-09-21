@@ -17,6 +17,16 @@ class IntentType(str, Enum):
     GENERAL_CONVERSATION = "GENERAL_CONVERSATION"
 
 
+class ModelOutputKind(str, Enum):
+    ANALYSIS = "ANALYSIS"
+    PROPOSAL = "PROPOSAL"
+    HYPOTHESIS = "HYPOTHESIS"
+    PLAN = "PLAN"
+    OBSERVATION_INTERPRETATION = "OBSERVATION_INTERPRETATION"
+    WARNING = "WARNING"
+    UNCERTAINTY = "UNCERTAINTY"
+
+
 @dataclass(frozen=True)
 class ConversationInput:
     text: str
@@ -86,6 +96,7 @@ class ConversationResponse:
     evidence_needed: tuple[str, ...] = ()
     provider: str = "deterministic"
     model: str = "rule-based"
+    output_kind: ModelOutputKind = ModelOutputKind.PROPOSAL
 
     def public(self) -> dict[str, Any]:
         # Deliberately no authority_granted field: authorization is external to the provider.
@@ -98,6 +109,7 @@ class ConversationResponse:
             "evidence_needed": list(self.evidence_needed),
             "provider": self.provider,
             "model": self.model,
+            "output_kind": self.output_kind.value,
         }
 
 
@@ -154,6 +166,6 @@ class ConversationParser:
 
 
 __all__ = [
-    "IntentType", "ConversationInput", "ConversationContext", "ConversationIntent",
+    "IntentType", "ModelOutputKind", "ConversationInput", "ConversationContext", "ConversationIntent",
     "ConversationActionProposal", "ConversationResponse", "ConversationProvider", "ConversationParser",
 ]

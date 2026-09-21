@@ -173,6 +173,9 @@ class OwnerPolicySnapshot:
     authentication: dict[str, Any]
     captured_at: str
     instruction_record: dict[str, Any] = field(default_factory=dict)
+    owner_instruction_id: str = ""
+    policy_version: str = ""
+    created_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,6 +187,9 @@ class OwnerPolicySnapshot:
             "authentication": self.authentication,
             "captured_at": self.captured_at,
             "instruction_record": self.instruction_record,
+            "owner_instruction_id": self.owner_instruction_id or self.owner_instruction_fingerprint,
+            "policy_version": self.policy_version or self.owner_policy_fingerprint,
+            "created_at": self.created_at or self.captured_at,
         }
 
 
@@ -381,6 +387,8 @@ def capture_policy_snapshot(request_id: str, authentication: OwnerAuthentication
     state = load_state()
     instruction = state.get("current_owner_instruction") or ""
     from security.authority import authority_snapshot as invariant_snapshot
+    captured_at = datetime.now(timezone.utc).isoformat()
+    record = dict(state.get("current_owner_instruction_record") or {})
     return OwnerPolicySnapshot(
         request_id=str(request_id),
         owner_instruction=instruction,
@@ -388,6 +396,9 @@ def capture_policy_snapshot(request_id: str, authentication: OwnerAuthentication
         owner_policy_fingerprint=policy_fingerprint(),
         authority_snapshot=invariant_snapshot(),
         authentication=authentication.to_dict(),
-        captured_at=datetime.now(timezone.utc).isoformat(),
-        instruction_record=dict(state.get("current_owner_instruction_record") or {}),
+        captured_at=captured_at,
+        instruction_record=record,
+        owner_instruction_id=str(record.get("fingerprint") or owner_instruction_fingerprint(instruction)),
+        policy_version=str(load_policy().version),
+        created_at=captured_at,
     )
