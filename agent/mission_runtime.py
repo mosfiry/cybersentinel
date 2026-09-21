@@ -94,10 +94,45 @@ class MissionRuntime:
             raise KeyError("unknown_mission")
         return mission
 
+    def reconcile_in_flight(self, mission_id: str, *, executed: bool, observation: dict[str, Any] | None = None) -> Mission:
+        """Resolve an ambiguous external side effect without silently replaying it.
+
+        ``executed=True`` records the external receipt as completed.  ``False``
+        records that reconciliation found no side effect and permits one safe
+        retry.  The runtime never infers either outcome from a process crash.
+        """
+        mission = self._load(mission_id)
+        checkpoint = dict(mission.checkpoint or {})
+        if checkpoint.get("status") != "in_flight":
+            raise ValueError("mission has no in-flight action requiring reconciliation")
+        action_id = str(checkpoint.get("action_id", ""))
+        step_id = str(checkpoint.get("step_id", ""))
+        if executed:
+            result = dict(observation or {"success": True, "source": "external_reconciliation"})
+            result.setdefault("success", True)
+            result.update({"action_id": action_id, "step_id": step_id, "type": "reconciled_observation"})
+            mission.record_observation(result)
+            mission.record_action(action_id, step_id, "completed", result)
+            mission.checkpoint = {**checkpoint, "status": "completed", "reconciled": True}
+            mission.evidence.append({"criterion_id": result.get("criterion_id", step_id), "passed": bool(result.get("success")), "source": result.get("source", "external_reconciliation"), "result": result, "provenance": {"mission_id": mission.mission_id, "action_id": action_id, "reconciled": True}})
+            mission.current_step += 1
+            mission.transition(MissionStatus.READY, "in-flight action reconciled as executed", action_id=action_id)
+        else:
+            mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
+            mission.transition(MissionStatus.READY, "in-flight action reconciled as not executed", action_id=action_id)
+        return self.store.save(mission)
+
     def run_slice(self, mission_id: str) -> Mission:
         mission = self._load(mission_id)
         if mission.is_terminal:
             return mission
+        if (mission.checkpoint or {}).get("status") == "in_flight":
+            action_id = str(mission.checkpoint.get("action_id", ""))
+            mission.error = "in-flight action outcome is unknown; reconciliation required"
+            mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id})
+            mission.emit(EventType.FAILURE_DIAGNOSED, step_id=str(mission.checkpoint.get("step_id", "")), data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "action_id": action_id})
+            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
+            return self.store.save(mission)
         if mission.iteration_count >= mission.max_iterations:
             mission.error = "iteration budget exhausted"
             mission.emit(EventType.FAILURE_DETECTED, data={"class": FailureClass.RESOURCE.value, "reason": mission.error})

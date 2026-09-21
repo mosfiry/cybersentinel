@@ -10,6 +10,7 @@ Current focused coverage includes:
 - objective preservation during replan;
 - goal verification blocking premature completion;
 - Mission persistence and restart load;
+- crash during an in-flight action stops at `RECOVERY_REQUIRED` without silent replay, followed by explicit receipt reconciliation;
 - `/api/chat` to `AgentCore` integration;
 - typed MissionState and trajectory persistence;
 - dead-loop detection;

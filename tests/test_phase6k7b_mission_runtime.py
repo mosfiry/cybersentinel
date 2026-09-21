@@ -54,10 +54,36 @@ def test_new_runtime_instance_resumes_after_simulated_process_crash(tmp_path):
     assert crashed.checkpoint["status"] == "in_flight"
 
     second = runtime(tmp_path, crashing_executor)
+    recovery_required = second.run_to_completion(mission.mission_id)
+    assert recovery_required.status is MissionStatus.RECOVERY_REQUIRED
+    assert len(recovery_required.action_history) == 0
+    assert attempts["count"] == 1
+
+    reconciled = second.reconcile_in_flight(mission.mission_id, executed=False)
+    assert reconciled.status is MissionStatus.READY
     resumed = second.run_to_completion(mission.mission_id)
     assert resumed.status is MissionStatus.GOAL_COMPLETED
     assert len(resumed.action_history) == 1
     assert attempts["count"] == 2
+
+
+def test_in_flight_receipt_reconciliation_prevents_duplicate_side_effect(tmp_path):
+    calls = []
+
+    def execute(mission, step, action_id):
+        calls.append(action_id)
+        raise RuntimeError("crash after external side effect")
+
+    plan = Plan.initial("receipt").replan(steps=(PlanStep("step", "step", action="run"),), reason="initial")
+    rt = runtime(tmp_path, execute)
+    mission = rt.create("receipt", "receipt", plan)
+    rt.run_slice(mission.mission_id)
+    assert rt.run_slice(mission.mission_id).status is MissionStatus.RECOVERY_REQUIRED
+    reconciled = rt.reconcile_in_flight(mission.mission_id, executed=True, observation={"success": True, "criterion_id": "step", "source": "receipt"})
+    assert reconciled.status is MissionStatus.READY
+    completed = rt.run_to_completion(mission.mission_id)
+    assert completed.status is MissionStatus.GOAL_COMPLETED
+    assert calls == ["%s:2:step:0" % mission.mission_id]
 
 
 def test_goal_verification_blocks_completion_until_required_evidence(tmp_path):
