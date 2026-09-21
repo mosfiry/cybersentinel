@@ -28,6 +28,7 @@ class EventType(str, Enum):
     GOAL_VERIFIED = "GoalVerified"
     MISSION_COMPLETED = "MissionCompleted"
     RECOVERY_REQUIRED = "RecoveryRequired"
+    MODEL_TURN = "ModelTurn"
 
 
 @dataclass(frozen=True)
