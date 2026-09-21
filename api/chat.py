@@ -7,6 +7,8 @@ from typing import Any, Iterator
 from agent.task import TaskStatus
 from agent.task_manager import TaskManager
 from agent.task_runtime import AgentTaskRuntime
+from agent.agent_core import AgentCore
+from agent.mission import MissionStatus
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
 from core.engine import RUNTIME, handle
 from security.owner_session import consume_owner_challenge
@@ -33,6 +35,10 @@ def _execute(text: str, *, owner_token: str, owner_session_id: str | None = None
 def _runtime() -> AgentTaskRuntime:
     executor = lambda command, *, owner_token, owner_session_id=None, scope_context=None: _execute(command, owner_token=owner_token, owner_session_id=owner_session_id)
     return AgentTaskRuntime(RUNTIME.router, executor=executor)
+
+
+def _agent_core() -> AgentCore:
+    return AgentCore(RUNTIME.router)
 
 
 def _task_public(task) -> dict[str, Any]:
@@ -118,6 +124,26 @@ def chat(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | N
     if not text:
         raise ValueError("text_required")
     conversation_id = _conversation_id(payload)
+    if bool(payload.get("mission")) or str(payload.get("mode", "")).casefold() == "mission":
+        core = _agent_core()
+        mission = core.resume_mission(str(payload["mission_id"]), owner_token=owner_token) if payload.get("mission_id") else core.run_owner_mission(
+            text,
+            owner_token=owner_token,
+            owner_session_id=owner_session_id,
+            owner_challenge=owner_challenge,
+            request_id=str(payload.get("request_id") or uuid.uuid4().hex),
+            scope_context=payload.get("scope_context"),
+            completion_criteria=payload.get("completion_criteria"),
+        )
+        answer = "Mission " + mission.status.value
+        return {
+            "conversation_id": conversation_id,
+            "mission_id": mission.mission_id,
+            "answer": answer,
+            "status": mission.status.value,
+            "activity": mission.trajectory,
+            "mission": mission.to_dict(),
+        }
     if RUNTIME.router.providers:
         result = create_task({"conversation_id": conversation_id, "text": text}, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge, authentication_method="owner_session_challenge" if owner_session_id else "owner_token", run=True)
         task = result["task"]

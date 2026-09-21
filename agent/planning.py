@@ -30,6 +30,42 @@ class ReasoningProfile:
         return {"mode": self.mode.value, "temperature": self.temperature, "long_horizon": self.long_horizon}
 
 
+@dataclass(frozen=True)
+class TaskProfile:
+    objective: str
+    task_type: str = "general"
+    constraints: tuple[str, ...] = ()
+    expected_outcome: str = ""
+    required_evidence: tuple[str, ...] = ()
+    likely_tools: tuple[str, ...] = ()
+    complexity: str = "unknown"
+    uncertainty: str = "unknown"
+    horizon: str = "single_step"
+    verification_requirements: tuple[str, ...] = ()
+
+    @classmethod
+    def from_proposal(cls, objective: str, proposal: dict[str, Any] | None = None) -> "TaskProfile":
+        proposal = proposal or {}
+        return cls(
+            objective=str(proposal.get("objective", objective)).strip(),
+            task_type=str(proposal.get("task_type", "general")),
+            constraints=tuple(str(item) for item in proposal.get("constraints", ()) if item),
+            expected_outcome=str(proposal.get("expected_outcome", "")),
+            required_evidence=tuple(str(item) for item in proposal.get("required_evidence", ()) if item),
+            likely_tools=tuple(str(item) for item in proposal.get("likely_tools", ()) if item),
+            complexity=str(proposal.get("complexity", "unknown")),
+            uncertainty=str(proposal.get("uncertainty", "unknown")),
+            horizon=str(proposal.get("horizon", "single_step")),
+            verification_requirements=tuple(str(item) for item in proposal.get("verification_requirements", ()) if item),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result = dict(self.__dict__)
+        for key in ("constraints", "required_evidence", "likely_tools", "verification_requirements"):
+            result[key] = list(result[key])
+        return result
+
+
 def select_reasoning_profile(objective: str) -> ReasoningProfile:
     """Select a bounded generation profile from task shape, never from authority."""
     text = str(objective or "").casefold()
@@ -189,7 +225,7 @@ def evidence_for(criterion_id: str, passed: bool, source: str, result: Any, *, p
 
 
 __all__ = [
-    "FailureClass", "GoalVerification", "Plan", "PlanRevision", "PlanStep",
+    "FailureClass", "GoalVerification", "Plan", "PlanRevision", "PlanStep", "TaskProfile",
     "ReasoningMode", "ReasoningProfile", "RecoveryAction", "RecoveryPolicy",
     "VerificationCriterion", "VerificationEvidence", "evidence_for", "select_reasoning_profile",
 ]

@@ -8,6 +8,8 @@ import json
 
 from .mission import Mission, MissionStatus, MissionStore
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
+from .trajectory import EventType
+from .observation import Observation
 
 
 class MissionRuntime:
@@ -98,30 +100,45 @@ class MissionRuntime:
             return mission
         if mission.iteration_count >= mission.max_iterations:
             mission.error = "iteration budget exhausted"
+            mission.emit(EventType.FAILURE_DETECTED, data={"class": FailureClass.RESOURCE.value, "reason": mission.error})
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
             return self.store.save(mission)
         mission.iteration_count += 1
         if mission.current_step >= len(mission.plan.steps):
             mission.transition(MissionStatus.VERIFYING, "all plan steps observed")
+            mission.emit(EventType.GOAL_VERIFICATION_STARTED)
             verification = self.verifier(mission)
             mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
             if verification.verified:
+                mission.emit(EventType.GOAL_VERIFIED, data={"evidence_count": len(verification.evidence)})
                 mission.transition(MissionStatus.GOAL_COMPLETED, "required verification evidence present")
+                mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state})
             else:
                 mission.transition(MissionStatus.RUNNING, "required verification evidence missing")
             return self.store.save(mission)
 
         step = mission.current_plan_step
         action_id = f"{mission.mission_id}:{mission.plan.version}:{step.step_id}:{mission.current_step}"
+        mission.emit(EventType.STEP_SELECTED, step_id=step.step_id, data={"action_id": action_id, "plan_version": mission.plan.version})
+        signatures = mission.progress.setdefault("loop_signatures", {})
+        signature = hashlib.sha256(json.dumps({"plan": mission.plan.fingerprint, "step": step.step_id, "action": step.action}, sort_keys=True).encode()).hexdigest()
+        signatures[signature] = int(signatures.get(signature, 0)) + 1
+        if signatures[signature] > 3:
+            mission.error = "dead loop detected: repeated plan and action"
+            mission.emit(EventType.FAILURE_DIAGNOSED, step_id=step.step_id, data={"class": FailureClass.LOGIC.value, "reason": mission.error})
+            mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
+            return self.store.save(mission)
         if any(item.get("action_id") == action_id and item.get("status") == "completed" for item in mission.action_history):
             mission.current_step += 1
             mission.transition(MissionStatus.READY, "idempotent action already completed")
             return self.store.save(mission)
 
         allowed, reason = self.authorizer(mission, step)
+        mission.emit(EventType.AUTHORIZATION_CHECKED, step_id=step.step_id, data={"allowed": allowed, "reason": reason})
         if not allowed:
             mission.error = reason
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value if "authorization" in reason else FailureClass.SCOPE.value, "reason": reason, "step_id": step.step_id})
+            mission.emit(EventType.OWNER_INPUT_REQUIRED if "authorization" in reason else EventType.FAILURE_DETECTED, step_id=step.step_id, data={"reason": reason})
             mission.transition(MissionStatus.OWNER_INPUT_REQUIRED if "authorization" in reason else MissionStatus.SCOPE_BLOCKED, reason)
             return self.store.save(mission)
 
@@ -141,6 +158,8 @@ class MissionRuntime:
         observation.setdefault("action_id", action_id)
         observation.setdefault("step_id", step.step_id)
         observation.setdefault("mission_id", mission.mission_id)
+        typed_observation = Observation.from_result(step.action, action_id, observation, request_id=mission.request_id, scope=mission.scope_snapshot)
+        observation["observation"] = typed_observation.to_dict()
         mission.transition(MissionStatus.OBSERVING, "action returned observation", action_id=action_id)
         mission.record_observation(observation)
         success = bool(observation.get("success", observation.get("ok", False)))
@@ -148,6 +167,7 @@ class MissionRuntime:
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version}
         if success:
             mission.evidence.append({"criterion_id": observation.get("criterion_id", step.step_id), "passed": True, "source": observation.get("source", step.action), "result": observation, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id}})
+            mission.emit(EventType.EVIDENCE_ADDED, step_id=step.step_id, data={"criterion_id": observation.get("criterion_id", step.step_id)})
             mission.current_step += 1
             mission.retry_count = 0
             mission.transition(MissionStatus.READY, "observation accepted")
@@ -155,8 +175,10 @@ class MissionRuntime:
 
         failure = FailureClass(str(observation.get("failure_class", FailureClass.UNKNOWN.value))) if str(observation.get("failure_class", FailureClass.UNKNOWN.value)) in {item.value for item in FailureClass} else FailureClass.UNKNOWN
         mission.failures.append({"class": failure.value, "reason": observation.get("error", "action failed"), "step_id": step.step_id, "action_id": action_id})
+        mission.emit(EventType.FAILURE_DETECTED, step_id=step.step_id, data={"class": failure.value, "reason": observation.get("error", "action failed")})
         mission.retry_count += 1
         action = self.recovery_policy.action_for(failure, mission.retry_count - 1)
+        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=step.step_id, data={"class": failure.value, "recovery": action.value})
         if action is RecoveryAction.OWNER_INPUT_REQUIRED:
             mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "authorization requires owner input")
         elif action is RecoveryAction.SCOPE_BLOCKED:
@@ -165,12 +187,14 @@ class MissionRuntime:
             mission.transition(MissionStatus.RESOURCE_BLOCKED, "resource blocked")
         elif action is RecoveryAction.REPLAN:
             mission.transition(MissionStatus.REPLANNING, "observation invalidated current plan")
+            mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data={"reason": "failure observation"})
             new_plan = self.replanner(mission, observation)
             if new_plan.objective != mission.objective:
                 mission.error = "replanner attempted to change Owner objective"
                 mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
                 return self.store.save(mission)
             mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": "failure observation"})
+            mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint})
             mission.plan = new_plan
             mission.current_step = 0
             mission.retry_count = 0

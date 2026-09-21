@@ -6,6 +6,7 @@ from typing import Any
 import uuid
 
 from .planning import Plan, GoalVerification
+from .trajectory import EventType, TrajectoryEvent
 
 
 class MissionStatus(str, Enum):
@@ -64,12 +65,15 @@ class Mission:
     owner_instruction: str = ""
     policy_snapshot: dict[str, Any] | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
+    trajectory: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50, request_id: str = "", owner_identity_ref: str = "", owner_instruction: str = "", policy_snapshot: dict[str, Any] | None = None, provenance: dict[str, Any] | None = None) -> "Mission":
         mission = cls(mission_id or uuid.uuid4().hex, owner_request, objective, MissionStatus.CREATED, plan, authorization_context=authorization_context, scope_snapshot=scope_snapshot, completion_criteria=completion_criteria or [], max_iterations=max_iterations, request_id=request_id, owner_identity_ref=owner_identity_ref, owner_instruction=owner_instruction or owner_request, policy_snapshot=policy_snapshot, provenance=provenance or {})
         mission.plan_history = [{"version": plan.version, "fingerprint": plan.fingerprint, "reason": "created"}]
         mission.transition(MissionStatus.PLANNING, "mission created")
+        mission.emit(EventType.MISSION_STARTED, data={"objective": mission.objective})
+        mission.emit(EventType.PLAN_CREATED, data={"version": plan.version, "fingerprint": plan.fingerprint})
         return mission
 
     @property
@@ -84,17 +88,23 @@ class Mission:
         self.status = target
         self.transitions.append({"from": self.transitions[-1]["to"] if self.transitions else "CREATED", "to": target.value, "reason": reason, "data": data, "iteration": self.iteration_count})
 
+    def emit(self, event_type: EventType, *, step_id: str = "", data: dict[str, Any] | None = None) -> None:
+        event = TrajectoryEvent(event_type, self.mission_id, self.request_id, step_id=step_id, provenance=dict(self.provenance), data=data or {})
+        self.trajectory.append(event.to_dict())
+
     def record_observation(self, observation: dict[str, Any]) -> None:
         self.observations.append(dict(observation))
         self.progress["last_observation"] = observation.get("type", "observation")
+        self.emit(EventType.OBSERVATION_RECEIVED, step_id=str(observation.get("step_id", "")), data={"status": observation.get("status", observation.get("success")), "action_id": observation.get("action_id", "")})
 
     def record_action(self, action_id: str, step_id: str, status: str, observation: dict[str, Any] | None = None) -> None:
         if any(item.get("action_id") == action_id for item in self.action_history):
             return
         self.action_history.append({"action_id": action_id, "step_id": step_id, "status": status, "observation": observation or {}})
+        self.emit(EventType.TOOL_EXECUTED, step_id=step_id, data={"action_id": action_id, "status": status})
 
     def to_dict(self) -> dict[str, Any]:
-        return {"mission_id": self.mission_id, "owner_request": self.owner_request, "objective": self.objective, "status": self.status.value, "plan": self.plan.to_dict(), "current_step": self.current_step, "progress": self.progress, "observations": self.observations, "evidence": self.evidence, "artifacts": self.artifacts, "failures": self.failures, "authorization_context": self.authorization_context, "scope_snapshot": self.scope_snapshot, "completion_criteria": self.completion_criteria, "verification_state": self.verification_state, "checkpoint": self.checkpoint, "plan_history": self.plan_history, "action_history": self.action_history, "transitions": self.transitions, "retry_count": self.retry_count, "max_iterations": self.max_iterations, "iteration_count": self.iteration_count, "error": self.error, "request_id": self.request_id, "owner_identity_ref": self.owner_identity_ref, "owner_instruction": self.owner_instruction, "policy_snapshot": self.policy_snapshot, "provenance": self.provenance}
+        return {"mission_id": self.mission_id, "owner_request": self.owner_request, "objective": self.objective, "status": self.status.value, "plan": self.plan.to_dict(), "current_step": self.current_step, "progress": self.progress, "observations": self.observations, "evidence": self.evidence, "artifacts": self.artifacts, "failures": self.failures, "authorization_context": self.authorization_context, "scope_snapshot": self.scope_snapshot, "completion_criteria": self.completion_criteria, "verification_state": self.verification_state, "checkpoint": self.checkpoint, "plan_history": self.plan_history, "action_history": self.action_history, "transitions": self.transitions, "retry_count": self.retry_count, "max_iterations": self.max_iterations, "iteration_count": self.iteration_count, "error": self.error, "request_id": self.request_id, "owner_identity_ref": self.owner_identity_ref, "owner_instruction": self.owner_instruction, "policy_snapshot": self.policy_snapshot, "provenance": self.provenance, "trajectory": self.trajectory}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Mission":
