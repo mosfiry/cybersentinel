@@ -85,7 +85,7 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}
         complete_lifecycle(request_id, response, success=False, error=owner_reason)
         return response
-    set_current_owner_instruction(text, source)
+    set_current_owner_instruction(text, source, owner_authenticated=True)
     req = owner_request(text, source)
     decision = evaluate(req)
     policy_event = add_event("policy", "Policy evaluation", decision.reason, source, "info" if decision.allowed else "warning", decision.allowed, {"request_id": request_id, "decision": "allow" if decision.allowed else "deny", "parent_event": auth_event})

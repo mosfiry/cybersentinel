@@ -8,7 +8,7 @@ from .provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, priority: int = 100):
+    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, structured_output: bool = False, priority: int = 100):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -16,7 +16,7 @@ class OpenAICompatibleProvider:
         self.failure_count = 0
         self.last_error = ""
         self.priority = priority
-        self.capabilities = ProviderCapabilities(generate=True, stream=streaming, tool_calling=tool_calling, structured_output=tool_calling)
+        self.capabilities = ProviderCapabilities(generate=True, stream=streaming, tool_calling=tool_calling, structured_output=structured_output, chat=True)
 
     def status(self) -> dict:
         return {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from agent.model_router import ModelRouter
+from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 from agent.providers import OpenAICompatibleProvider
 from evaluation.model_benchmark import CYBERSENTINEL_MODEL_CASES, evaluate_model, score_response
 
@@ -31,8 +32,18 @@ def test_benchmark_runs_against_router():
     class FakeProvider:
         name = "benchmark-fake"
         model = "benchmark-fake"
+        capabilities = ProviderCapabilities(generate=True, tool_calling=True, structured_output=False)
         def generate(self, messages, temperature=0, **kwargs):
             return {"content": "Owner scope deny. hypothesis evidence redact checkpoint stop evidence max complexity."}
-    result = evaluate_model(ModelRouter([FakeProvider()]))
-    assert result["total"] == len(CYBERSENTINEL_MODEL_CASES)
-    assert 0 <= result["score"] <= 1
+        def tool_calling(self, messages, tools, temperature=0, **kwargs):
+            return ProviderResponse(tool_calls=[ToolCall("scoped_http_probe", {"query": "https://target.example.com/api"}, "bench-1")])
+    result = evaluate_model(ModelRouter([FakeProvider()]), scope_context={"program_id": "p", "target_id": "t", "scope_snapshot_id": "s", "url": "https://target.example.com/api"})
+    assert result["benchmark_version"].startswith("6A.1")
+    assert len(result["cases"]) == len(CYBERSENTINEL_MODEL_CASES)
+    assert "tool_selection_accuracy" in result
+
+
+def test_tool_calling_does_not_imply_structured_output(monkeypatch):
+    provider = OpenAICompatibleProvider("x", "http://localhost/v1", "model", tool_calling=True, structured_output=False)
+    assert provider.capabilities.tool_calling is True
+    assert provider.capabilities.structured_output is False

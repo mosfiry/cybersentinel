@@ -10,6 +10,7 @@ class ProviderCapabilities:
     stream: bool = False
     tool_calling: bool = False
     structured_output: bool = False
+    chat: bool = False
 
 
 @dataclass(frozen=True)

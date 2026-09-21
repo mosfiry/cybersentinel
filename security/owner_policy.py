@@ -99,11 +99,13 @@ def _save_state(state: dict) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def set_current_owner_instruction(text: str, source: str = 'web') -> dict:
+def set_current_owner_instruction(text: str, source: str = 'web', *, owner_authenticated: bool = False) -> dict:
     """Make the latest authenticated Owner instruction authoritative for this turn.
 
     This does not let model output or external content modify policy state.
     """
+    if not owner_authenticated:
+        raise PermissionError('owner authentication required to set owner instruction')
     text = str(text).strip()
     state = load_state()
     old = state.get('current_owner_instruction') or ''
@@ -136,8 +138,9 @@ def current_owner_policy_context() -> str:
 
 
 def authority_snapshot() -> dict:
+    from security.authority import authority_snapshot as invariant_snapshot
     policy = load_policy()
-    return {
+    result = {
         'authority': 'Owner',
         'level': policy.owner_authority_level,
         'external_content_authority': policy.external_content_authority,
@@ -145,6 +148,8 @@ def authority_snapshot() -> dict:
         'system_safety_boundary': policy.system_safety_boundary,
         'policy_fingerprint': policy_fingerprint(),
     }
+    result['invariant'] = invariant_snapshot()
+    return result
 
 
 def verify_owner(text: str, presented_token: str | None = None) -> tuple[bool, str]:

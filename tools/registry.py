@@ -228,16 +228,19 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
         if not required.issubset(scope_context):
             raise PermissionError("incomplete scope context")
         from security.scope_resolver import resolve
-        decision = resolve(
-            scope_context["scope_snapshot_id"],
-            scope_context["target_id"],
-            scope_context["url"],
-            method=scope_context.get("method", "GET"),
-            expected_program_id=scope_context["program_id"],
-            redirect_chain=scope_context.get("redirect_chain", []),
-        )
-        if not decision.allowed:
-            raise PermissionError("scope denied: " + decision.reason)
+        requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
+        urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
+        for checked_url in urls:
+            decision = resolve(
+                scope_context["scope_snapshot_id"],
+                scope_context["target_id"],
+                checked_url,
+                method=scope_context.get("method", "GET"),
+                expected_program_id=scope_context["program_id"],
+                redirect_chain=scope_context.get("redirect_chain", []),
+            )
+            if not decision.allowed:
+                raise PermissionError("scope denied: " + decision.reason)
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)
