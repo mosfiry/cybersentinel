@@ -12,6 +12,11 @@ from .foundation import (
 from .store import add, get, init_store, search, verify_integrity
 from .retrieval import BM25Retriever, HybridRetriever, RetrievalHit, VectorRetriever
 from .ingestion import IngestionManifest, ingest_bytes, ingest_file
+from .corpus import (
+    UNKNOWN, AdversarialCase, AttributionStatus, CampaignCase, ClaimType, ContentRole,
+    CorpusDataset, DatasetManifest, DatasetSplit, EvidenceClaim, PoCKnowledge,
+    PromptInjectionCase, SourceRecord, TechniqueMapping, ThreatActorProfile,
+)
 
 __all__ = [
     "CyberKnowledge", "CyberLevel", "KnowledgeError", "KnowledgeKind", "KnowledgeObject",
@@ -19,4 +24,8 @@ __all__ = [
     "add", "get", "init_store", "search", "verify_integrity",
     "BM25Retriever", "HybridRetriever", "RetrievalHit", "VectorRetriever",
     "IngestionManifest", "ingest_bytes", "ingest_file",
+    "UNKNOWN", "AdversarialCase", "AttributionStatus", "CampaignCase", "ClaimType",
+    "ContentRole", "CorpusDataset", "DatasetManifest", "DatasetSplit", "EvidenceClaim",
+    "PoCKnowledge", "PromptInjectionCase", "SourceRecord", "TechniqueMapping",
+    "ThreatActorProfile",
 ]
