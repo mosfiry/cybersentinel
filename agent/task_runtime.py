@@ -4,6 +4,7 @@ import json
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Any, Callable
 
 from agent.context import ContextEngine, ExecutionState, RuntimeLimits
@@ -13,7 +14,8 @@ from agent.task import Task, TaskStatus
 from agent.task_manager import TaskManager
 from core.db import add_conversation_message, conversation_messages, ensure_conversation
 from security.authorization import authorize_tool
-from security.owner_policy import current_owner_policy_context
+from security.authorization_context import AuthorizationContext
+from security.owner_policy import current_owner_policy_context, policy_context_from_snapshot
 from security.owner_session import DEFAULT_OWNER_SESSIONS
 from tools.registry import REGISTRY, execute as execute_tool, get_tool
 
@@ -27,11 +29,11 @@ class AgentTaskRuntime:
         self.limits = runtime_limits or RuntimeLimits.from_owner_policy()
 
     @staticmethod
-    def _default_executor(command: str, *, owner_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _default_executor(command: str, *, owner_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None, authorization_decision: Any = None) -> dict[str, Any]:
         parts = command.split(" ", 2)
         name = parts[1] if len(parts) > 1 else ""
         argument = parts[2] if len(parts) > 2 else None
-        return {"ok": True, "result": execute_tool(name, argument, owner_authenticated=True, scope_context=scope_context)}
+        return {"ok": True, "result": execute_tool(name, argument, authorization_decision=authorization_decision, scope_context=scope_context)}
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
@@ -80,7 +82,11 @@ class AgentTaskRuntime:
             return "tool_calls", [ToolCall(value["name"], value.get("arguments") or {}, uuid.uuid4().hex)]
         return "final", content
 
-    def create_task(self, conversation_id: str, objective: str, *, owner_session_id: str = "", authentication_method: str = "owner_token", scope_context: dict[str, Any] | None = None) -> Task:
+    def create_task(self, conversation_id: str, objective: str, *, owner_session_id: str = "", authentication_method: str = "owner_token", scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None) -> Task:
+        if authorization_context is not None and owner_session_id and authorization_context.session_id != owner_session_id:
+            raise ValueError("task owner session does not match AuthorizationContext")
+        if authorization_context is not None:
+            owner_session_id = authorization_context.session_id or owner_session_id
         if scope_context is not None:
             required = {"program_id", "target_id", "scope_snapshot_id", "url"}
             if not required.issubset(scope_context):
@@ -90,9 +96,10 @@ class AgentTaskRuntime:
             if snapshot is None or snapshot.authorization.program_id != scope_context["program_id"] or snapshot.target(scope_context["target_id"]) is None:
                 raise ValueError("invalid_scope_context")
         ensure_conversation(conversation_id, owner_session_id)
-        request_id = uuid.uuid4().hex
+        request_id = authorization_context.request_id if authorization_context is not None else uuid.uuid4().hex
         task = TaskManager.create_task(conversation_id, request_id, owner_session_id, objective, authentication_method=authentication_method)
-        task.execution_state = {"tool_results": [], "evidence_refs": [], "memory_refs": [], "objective": objective, "events": [], "scope_context": scope_context}
+        bound_context = replace(authorization_context, task_id=task.task_id) if authorization_context is not None else None
+        task.execution_state = {"tool_results": [], "evidence_refs": [], "memory_refs": [], "objective": objective, "events": [], "scope_context": scope_context, "authorization_context": bound_context.to_dict() if bound_context is not None else None}
         self._event(task, "task.created", {"objective": objective, "authentication_method": authentication_method})
         objective_item = ConversationMemory.store_conversation_memory(conversation_id, objective, MemoryType.ACTIVE_OBJECTIVE, source="task", provenance=f"task:{task.task_id}")
         recent_item = ConversationMemory.store_conversation_memory(conversation_id, objective, MemoryType.RECENT, source="conversation", provenance="user_message")
@@ -101,6 +108,12 @@ class AgentTaskRuntime:
         return task
 
     def _valid_owner_session(self, task: Task, owner_session_id: str | None, owner_token: str) -> bool:
+        if isinstance(task.execution_state, dict) and task.execution_state.get("authorization_context"):
+            try:
+                self._authorization_context(task)
+                return True
+            except (PermissionError, ValueError, TypeError):
+                return False
         if owner_token:
             from security.owner_policy import verify_owner
             ok, _ = verify_owner("Owner task execution", owner_token)
@@ -119,10 +132,11 @@ class AgentTaskRuntime:
             provider=task.provider,
             model=task.model,
         )
+        bound_auth = self._authorization_context(task)
         context = ContextEngine.build(
             user_text=task.objective,
             conversation_id=task.conversation_id,
-            owner_policy_context=current_owner_policy_context(),
+            owner_policy_context=policy_context_from_snapshot(bound_auth.policy_snapshot) if bound_auth is not None else current_owner_policy_context(),
             conversation_messages=conversation_messages(task.conversation_id),
             tool_results=[(item.get("tool_name", "tool"), item.get("result") or {}) for item in task.tool_calls if item.get("result") is not None],
             execution_state=state,
@@ -135,6 +149,16 @@ class AgentTaskRuntime:
             self._event(task, "memory.updated", {"reason": "context_compaction", "context_hash": context.context_hash})
         task.execution_state["context_hash"] = context.context_hash
         task.execution_state["context_metadata"] = {"truncated": context.truncated, "messages": len(context.messages), "chars": sum(len(item.get("content", "")) for item in context.messages)}
+        return context
+
+    @staticmethod
+    def _authorization_context(task: Task) -> AuthorizationContext | None:
+        raw = task.execution_state.get("authorization_context") if isinstance(task.execution_state, dict) else None
+        if not raw:
+            return None
+        context = AuthorizationContext.from_dict(dict(raw))
+        if context.request_id != task.request_id or (context.task_id and context.task_id != task.task_id):
+            raise PermissionError("task AuthorizationContext binding mismatch")
         return context
 
     def _ask_model(self, context: Any) -> dict[str, Any]:
@@ -161,11 +185,14 @@ class AgentTaskRuntime:
         valid, reason = spec.validate(argument) if spec else (False, "unknown tool")
         if set(call.arguments) - {"query"}:
             valid, reason = False, "unknown tool argument"
-        decision = authorize_tool(item)
+        authorization_context = self._authorization_context(task)
+        decision = authorize_tool(item, context=authorization_context) if authorization_context is not None else authorize_tool(item)
         self._event(task, "tool.selected", {"tool": call.name, "tool_call_id": call.call_id})
         if spec is not None and spec.scope_required:
             scope_context = task.execution_state.get("scope_context")
-            if not isinstance(scope_context, dict):
+            if authorization_context is None or authorization_context.scope_snapshot is None or not isinstance(scope_context, dict) or scope_context.get("scope_snapshot_id") != authorization_context.scope_snapshot.snapshot_id:
+                valid, reason = False, "scope context is not bound to AuthorizationContext"
+            elif not isinstance(scope_context, dict):
                 valid, reason = False, "scope context required"
             else:
                 from security.scope_resolver import resolve
@@ -185,9 +212,9 @@ class AgentTaskRuntime:
         try:
             scope_context = task.execution_state.get("scope_context")
             if spec is not None and spec.scope_required:
-                result = {"ok": True, "result": execute_tool(call.name, argument, owner_authenticated=True, scope_context=scope_context)}
+                result = {"ok": True, "result": execute_tool(call.name, argument, authorization_decision=decision.decision, scope_context=scope_context)}
             else:
-                result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_token=owner_token, owner_session_id=owner_session_id, scope_context=scope_context)
+                result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_token=owner_token, owner_session_id=owner_session_id, scope_context=scope_context, authorization_context=authorization_context, authorization_decision=decision.decision)
             result = result if isinstance(result, dict) else {"ok": True, "result": result}
             status = "completed" if result.get("ok", True) else "failed"
         except Exception as exc:

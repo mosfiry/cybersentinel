@@ -5,7 +5,9 @@ from cyber_knowledge.models import normalize
 from reasoning.red_team import assess
 from retrieval.local import LocalRetriever
 from tools.registry import execute
-from security.owner_policy import authority_snapshot
+from security.owner_policy import authority_snapshot, _issue_evidence, capture_policy_snapshot
+from security.authorization import authorize_tool
+from security.authorization_context import AuthorizationContext
 
 
 def test_red_team_tool_requires_owner():
@@ -14,7 +16,10 @@ def test_red_team_tool_requires_owner():
 
 
 def test_red_team_assessment_is_defensive_only():
-    result = execute("red_team_assess", "php-fpm -> sh -> curl", owner_authenticated=True)
+    evidence = _issue_evidence("owner_token", "red-team-test", "test")
+    context = AuthorizationContext("red-team-test", evidence, capture_policy_snapshot("red-team-test", evidence))
+    decision = authorize_tool(["red_team_assess", "php-fpm -> sh -> curl"], context=context).decision
+    result = execute("red_team_assess", "php-fpm -> sh -> curl", authorization_decision=decision)
     assert result["mode"] == "owner_defensive_red_team"
     assert result["required_evidence"]
     assert result["contradicting_evidence"] == []

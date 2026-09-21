@@ -64,3 +64,6 @@ def test_owner_token_method_is_recorded_in_execution_context(monkeypatch, tmp_pa
     result = handle("Owner status", source="test", owner_token="owner-secret", request_id="auth-context-1")
     assert result["execution_context"]["authentication_method"] == "owner_token"
     assert result["execution_context"]["owner_authenticated"] is True
+    assert result["execution_context"]["authorization_context"]["request_id"] == "auth-context-1"
+    assert result["execution_context"]["authorization_decisions"]
+    assert result["execution_context"]["authorization_decisions"][0]["request_id"] == "auth-context-1"

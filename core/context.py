@@ -20,6 +20,8 @@ class ExecutionContext:
     owner_instruction_fingerprint: str = ""
     policy_snapshot_details: dict[str, Any] = field(default_factory=dict)
     scope_snapshot: dict[str, Any] = field(default_factory=dict)
+    authorization_context: dict[str, Any] = field(default_factory=dict)
+    authorization_decisions: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

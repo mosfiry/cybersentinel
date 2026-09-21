@@ -9,11 +9,13 @@ from agent.runtime import AgentRuntime
 from agent.conversation import ConversationParser
 from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
+from security.authorization_context import AuthorizationContext
 from security.owner_policy import (
     authenticate_owner, authentication_from_session, capture_policy_snapshot,
     set_current_owner_instruction, load_state, load_policy, authority_snapshot, policy_context_from_snapshot,
 )
 from security.owner_session import consume_owner_challenge
+from security.scope_store import get_snapshot
 from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
@@ -48,8 +50,8 @@ def status():
     }
 
 
-def execute(tool: str, argument: str | None = None, *, owner_authenticated: bool = False, scope_context: dict | None = None):
-    return execute_tool(tool, argument, owner_authenticated=owner_authenticated, scope_context=scope_context)
+def execute(tool: str, argument: str | None = None, *, authorization_decision=None, scope_context: dict | None = None):
+    return execute_tool(tool, argument, authorization_decision=authorization_decision, scope_context=scope_context)
 
 
 def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None, owner_session_id=None, owner_challenge=None, scope_context=None):
@@ -107,10 +109,19 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         complete_lifecycle(request_id, response, success=False, error=decision.reason)
         return response
 
+    scope_snapshot = get_snapshot(scope_context.get("scope_snapshot_id")) if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id") else None
+    authorization_context = AuthorizationContext(
+        request_id=request_id,
+        owner_evidence=auth_evidence,
+        policy_snapshot=policy_snapshot,
+        scope_snapshot=scope_snapshot,
+        session_id=auth_context.get("owner_session_id"),
+    )
     snapshot_context = policy_context_from_snapshot(policy_snapshot)
     planned = RUNTIME.plan(text, policy_context=snapshot_context)
     transition_lifecycle(request_id, "planned", provider=planned.get("provider", ""), model=planned.get("model", ""))
-    authorized, errors = authorize_plan(planned["tools"], owner_evidence=auth_evidence, request_id=request_id, policy_snapshot=policy_snapshot, current_policy=snapshot_context)
+    plan_result = authorize_plan(planned["tools"], context=authorization_context, current_policy=snapshot_context)
+    authorized, errors = plan_result
     if errors:
         add_event("authorization", "Plan rejected", "; ".join(errors), source, "warning", True, {"request_id": request_id, "decision": "deny", "provider": planned.get("provider"), "model": planned.get("model")})
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "تم رفض الخطة: " + "; ".join(errors), "plan": [], "results": [], "lifecycle": "completed"}
@@ -130,6 +141,7 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         auth_context["owner_session_id"], auth_context["authentication_method"],
         auth_context["authenticated_at"], policy_snapshot.owner_instruction,
         policy_snapshot.owner_instruction_fingerprint, policy_snapshot.to_dict(), scope_context or {},
+        authorization_context.to_dict(), tuple(item.to_dict() for item in plan_result.decisions),
     )
     plan_event = add_event("plan", "Defensive plan", json.dumps(serial_plan, ensure_ascii=False), source, "info", True, {"request_id": request_id, **provenance, "plan": serial_plan, "plan_hash": final_plan_hash, "parent_event": policy_event, "context": context.to_dict()})
     chain = (f"request:{request_id}", f"auth:{auth_event}", f"policy:{policy_event}", f"plan:{plan_event}")
@@ -141,7 +153,8 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
     transition_lifecycle(request_id, "executing", plan_hash=final_plan_hash)
     for sequence, (name, argument) in enumerate(authorized, start=1):
         spec = get_tool(name)
-        record = {"tool": name, "argument": argument, "risk_class": spec.risk_class, "owner_required": spec.requires_owner, "owner_authenticated": True, "policy_version": load_policy().version, "decision": "allow", "reason": "registry schema and Owner policy accepted", "plan_hash": final_plan_hash}
+        decision_for_record = next((item for item in plan_result.decisions if item.allowed and item.tool == name and item.request_id == request_id), None)
+        record = {"tool": name, "argument": argument, "risk_class": spec.risk_class, "owner_required": spec.requires_owner, "owner_authenticated": True, "policy_version": policy_snapshot.owner_policy_fingerprint, "decision": "allow", "reason": "registry schema and Owner policy snapshot accepted", "plan_hash": final_plan_hash, "authorization_decision": decision_for_record.to_dict() if decision_for_record else None}
         authorization_records.append(record)
         add_event("authorization", "Tool authorization", name, source, "info", True, {"request_id": request_id, **record, "parent_event": plan_event})
         if plan_hash(public_plan(authorized)) != final_plan_hash:
@@ -161,7 +174,8 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
             previous_evidence_hash = item_evidence["current_hash"]
             continue
         try:
-            result = execute(name, argument, owner_authenticated=True, scope_context=scope_context)
+            decision_for_tool = next((item for item in plan_result.decisions if item.allowed and item.tool == name and item.request_id == request_id), None)
+            result = execute(name, argument, authorization_decision=decision_for_tool, scope_context=scope_context)
             if name == "red_team_assess" and isinstance(result, dict):
                 result["critic"] = critique(result).to_dict()
                 save_reasoning_memory(request_id, result, result["critic"])

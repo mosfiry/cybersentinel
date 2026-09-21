@@ -12,6 +12,9 @@ from security.scope_resolver import resolve
 from security.scope_store import init_scope_store, save_snapshot
 from tools.registry import execute
 import security.scope_store as scope_store
+from security.authorization import authorize_tool
+from security.authorization_context import AuthorizationContext
+from security.owner_policy import _issue_evidence, capture_policy_snapshot
 
 
 @pytest.fixture
@@ -54,11 +57,15 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
 
 
 def test_direct_registry_execution_cannot_bypass_scope(snapshot):
-    with pytest.raises(PermissionError, match="scope context required"):
-        execute("scoped_http_probe", "https://target.example.com/api", owner_authenticated=True)
+    with pytest.raises(PermissionError, match="scope-bound AuthorizationDecision"):
+        execute("scoped_http_probe", "https://target.example.com/api")
+    evidence = _issue_evidence("owner_token", "scope-direct", "scope-direct")
+    auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
+    denied = authorize_tool(["scoped_http_probe", "https://other.example.com/api"], context=auth_context)
     with pytest.raises(PermissionError, match="scope denied"):
-        execute("scoped_http_probe", "https://target.example.com/api", owner_authenticated=True, scope_context=context("https://other.example.com/api"))
-    result = execute("scoped_http_probe", "https://target.example.com/api", owner_authenticated=True, scope_context=context())
+        execute("scoped_http_probe", "https://other.example.com/api", authorization_decision=denied.decision, scope_context=context("https://other.example.com/api"))
+    allowed = authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context)
+    result = execute("scoped_http_probe", "https://target.example.com/api", authorization_decision=allowed.decision, scope_context=context())
     assert result["ok"] is True
 
 

@@ -32,6 +32,7 @@ class ConversationContext:
     policy_snapshot_fingerprint: str = ""
     scope_snapshot_fingerprint: str = ""
     evidence_ids: tuple[str, ...] = ()
+    prior_turn_references: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
