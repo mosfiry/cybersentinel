@@ -1,0 +1,61 @@
+{
+  "mission": "Investigate whether CVE-2021-44228 was the initial access vector for Incident-A and determine the most supported attack-chain hypothesis.",
+  "objects": [
+    {
+      "object_id": "cve-2021-44228-vendor-advisory",
+      "kind": "CYBER",
+      "title": "Vendor advisory: CVE-2021-44228",
+      "language": "en",
+      "source_id": "vendor-advisory-cve-2021-44228",
+      "source_url": "https://logging.apache.org/log4j/2.x/security.html",
+      "edition": "fixture-1",
+      "author": "Apache Logging Services",
+      "trust_class": "PRIMARY_SOURCE",
+      "transformation_policy": "RETRIEVAL_ALLOWED",
+      "content": "The vendor advisory describes CVE-2021-44228 in Apache Log4j 2 and lists affected ranges and patched releases. This fixture is used for defensive hypothesis evaluation only.",
+      "metadata": {"cve": "CVE-2021-44228", "claim_type": "REPORTED", "relationships": {"affected_product": ["Apache Log4j 2"], "affected_versions": ["2.0-beta9 through 2.14.1"], "advisory": ["LOG4J-SECURITY"], "technique": ["T1190"]}}
+    },
+    {
+      "object_id": "cve-2021-44228-patch-evidence",
+      "kind": "CYBER",
+      "title": "Patch evidence for CVE-2021-44228",
+      "language": "en",
+      "source_id": "fixture-patch-record",
+      "source_url": "https://logging.apache.org/log4j/2.x/security.html",
+      "edition": "fixture-1",
+      "author": "Defensive test fixture",
+      "trust_class": "CURATED_SOURCE",
+      "transformation_policy": "RETRIEVAL_ALLOWED",
+      "content": "Incident-A asset inventory records version 2.17.1 before the investigated event, which is outside the vulnerable range in the advisory. This is counter-evidence against CVE-2021-44228 as initial access.",
+      "metadata": {"cve": "CVE-2021-44228", "claim_type": "OBSERVED", "relationships": {"affected_versions": ["2.17.1"], "counter_evidence": ["E17"]}}
+    },
+    {
+      "object_id": "incident-a-ioc-report",
+      "kind": "CYBER",
+      "title": "Incident-A IOC report",
+      "language": "en",
+      "source_id": "fixture-researcher-report",
+      "source_url": "https://example.invalid/incident-a-report",
+      "edition": "fixture-1",
+      "author": "Defensive test fixture",
+      "trust_class": "UNTRUSTED_EXTERNAL",
+      "transformation_policy": "RETRIEVAL_ALLOWED",
+      "content": "A researcher report links a suspicious external remote service and an IOC observed before the first confirmed session. Attribution is uncertain and the report requires independent validation.",
+      "metadata": {"claim_type": "REPORTED", "attribution_status": "LOW_CONFIDENCE", "relationships": {"ioc": ["IOC-INCIDENT-A-1"], "campaign": ["Incident-A"], "technique": ["T1133"]}}
+    },
+    {
+      "object_id": "incident-a-news-claim",
+      "kind": "OSINT",
+      "title": "Incident-A public news claim",
+      "language": "en",
+      "source_id": "fixture-news-claim",
+      "source_url": "https://example.invalid/news/incident-a",
+      "edition": "fixture-1",
+      "author": "Defensive test fixture",
+      "trust_class": "UNTRUSTED_EXTERNAL",
+      "transformation_policy": "RETRIEVAL_ALLOWED",
+      "content": "A public news claim alleges exploitation of a high-profile vulnerability but provides no asset version, timestamp, or reproducible evidence. Treat as an unverified alternative claim.",
+      "metadata": {"claim_type": "DISPUTED", "attribution_status": "UNKNOWN", "relationships": {"campaign": ["Incident-A"], "cve": ["CVE-2021-44228"]}}
+    }
+  ]
+}

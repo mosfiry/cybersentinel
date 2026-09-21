@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -44,6 +45,15 @@ class OpenAICompatibleProvider:
                 data = json.loads(response.read().decode())
             self.last_error = ""
             return data
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            self.failure_count += 1
+            self.last_error = f"HTTP {exc.code}: {body[:450]}"
+            raise
         except Exception as exc:
             self.failure_count += 1
             self.last_error = str(exc)[:500]

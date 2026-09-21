@@ -24,16 +24,21 @@ from .mission import Mission, MissionStore
 from .mission_runtime import MissionRuntime
 from .planning import Plan, PlanStep, RecoveryPolicy, TaskProfile, select_reasoning_profile
 from .provider_api import ToolCall
-from .context import ContextEngine, ExecutionState
+from .context import ContextEngine, ExecutionState, KnowledgeProvider
+from .observation_intelligence import ObservationInterpreter
+from .knowledge_context import TypedKnowledgeRetriever
+from .hypotheses import HypothesisState, HypothesisStatus
+from .strategy import StrategyState
 
 
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
 
-    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50):
+    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None):
         self.router = router
         self.store = store or MissionStore(db_path or DB_PATH.with_name("missions.sqlite3"))
         self.max_iterations = max_iterations
+        self.knowledge_retriever = knowledge_retriever or TypedKnowledgeRetriever()
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
@@ -76,8 +81,9 @@ class AgentCore:
             owner_policy_context=policy_context,
             tool_results=[("observation", observation)] if observation else None,
             execution_state=ExecutionState.initial(request_id, conversation_id or "agent-core"),
+            knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
         )
-        messages = context.messages
+        messages = context.provider_messages()
         try:
             return self.router.tool_calling(messages, self._schemas(), reasoning_profile=profile)
         except (AttributeError, NotImplementedError):
@@ -111,6 +117,42 @@ class AgentCore:
             failure_class = "PROVIDER" if response.get("error") else "LOGIC"
             steps.append(PlanStep("planning-failure", "Recover from malformed or empty model proposal", action="__planning_failure__", expected_observation="replanned action", retry_policy={"failure_class": failure_class}))
         return Plan.initial(objective, created_from="agent_core").replan(steps=steps, reason="initial agent-core plan")
+
+    def _observation_proposal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Ask the configured model to interpret an observation, never to authorize it."""
+        mission = payload.get("mission", {})
+        policy_context = ""
+        if mission.get("policy_snapshot"):
+            policy_context = json.dumps(mission["policy_snapshot"], ensure_ascii=False, sort_keys=True)
+        prompt = (
+            "Interpret the following tool observation for a defensive mission. Return JSON only with fields "
+            "summary, facts, new_evidence, contradictions, hypothesis_updates, unknowns, new_dependencies, "
+            "recommended_strategy_change, replan_reason, confidence_changes, required_next_evidence, "
+            "information_gain, triggers. The model proposes analysis only. Do not change Owner instruction, "
+            "policy, authorization, identity, scope, or objective. Never mark a hypothesis CONFIRMED.\n" +
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        )
+        context = ContextEngine.build(
+            user_text=prompt,
+            conversation_id=str(mission.get("mission_id", "agent-core")),
+            owner_policy_context=policy_context,
+            execution_state=ExecutionState.initial(str(mission.get("request_id", "")), str(mission.get("mission_id", "agent-core"))),
+            mission_context={"objective": mission.get("objective"), "owner_instruction": mission.get("owner_instruction"), "scope_snapshot": mission.get("scope_snapshot")},
+            hypothesis_state=payload.get("hypothesis_state") or [],
+            evidence_state=payload.get("evidence") or [],
+            strategy_state=mission.get("strategy_state") or {},
+            current_observation=payload.get("observation") or {},
+            knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
+        )
+        response = self.router.generate(context.provider_messages(), reasoning_profile=select_reasoning_profile(prompt))
+        content = str(response.get("content", "") or "").strip()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            start, end = content.find("{"), content.rfind("}")
+            if start < 0 or end <= start:
+                raise ValueError("observation interpreter did not return JSON")
+            return json.loads(content[start:end + 1])
 
     @staticmethod
     def _auth(text: str, owner_token: str, request_id: str, owner_session_id: str | None, owner_challenge: str | None) -> tuple[AuthorizationContext, dict[str, Any]]:
@@ -173,6 +215,7 @@ class AgentCore:
             executor=self._executor,
             replanner=lambda mission, observation: self._plan(mission.objective, observation, policy_context=policy_context, request_id=mission.request_id, conversation_id=mission.mission_id),
             recovery_policy=RecoveryPolicy(),
+            interpreter=ObservationInterpreter(proposer=self._observation_proposal),
         )
         mission = runtime.create_from_owner_instruction(
             instruction,
@@ -182,6 +225,11 @@ class AgentCore:
             completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
             provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
         )
+        mission.knowledge_context = [item.to_dict() for item in self.knowledge_retriever.retrieve(instruction, limit=5)]
+        mission.strategy_state = StrategyState("initial_investigation", mission.objective).to_dict()
+        if any(token in instruction.casefold() for token in ("investigate", "whether", "تحقق", "حقق", "حادث", "incident")):
+            mission.hypotheses = [HypothesisState("H1", f"Primary explanation for: {mission.objective}", HypothesisStatus.ACTIVE, 0.5, provenance={"source": "owner_objective", "authority": None}).to_dict()]
+        self.store.save(mission)
         return runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
 
     def resume_mission(self, mission_id: str, *, owner_token: str, max_slices: int | None = None) -> Mission:
@@ -192,7 +240,7 @@ class AgentCore:
         if not ok:
             raise PermissionError(reason)
         policy_context = policy_context_from_snapshot(OwnerPolicySnapshot(**dict(mission.policy_snapshot or {}))) if mission.policy_snapshot else ""
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy())
+        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal))
         return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations)
 
 

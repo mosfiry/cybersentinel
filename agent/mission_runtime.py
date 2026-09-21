@@ -10,18 +10,22 @@ from .mission import Mission, MissionStatus, MissionStore
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
 from .trajectory import EventType
 from .observation import Observation
+from .observation_intelligence import ObservationInterpreter, should_interpret_observation
+from .hypotheses import HypothesisEngine, HypothesisState
+from .strategy import StrategyState, decide as decide_strategy
 
 
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
         self.replanner = replanner or self._default_replanner
         self.verifier = verifier or self._default_verifier
         self.recovery_policy = recovery_policy or RecoveryPolicy()
+        self.interpreter = interpreter or ObservationInterpreter()
 
     @staticmethod
     def _default_authorizer(mission: Mission, step: PlanStep) -> tuple[bool, str]:
@@ -93,6 +97,56 @@ class MissionRuntime:
         if mission is None:
             raise KeyError("unknown_mission")
         return mission
+
+    def _interpret_observation(self, mission: Mission, step: PlanStep, observation: dict[str, Any], *, success: bool):
+        previous = mission.observations[-2] if len(mission.observations) > 1 else None
+        if not should_interpret_observation(observation, previous=previous):
+            return None
+        proposal = self.interpreter.interpret(
+            mission=mission.to_dict(),
+            plan=mission.plan.to_dict(),
+            current_step=step.to_dict(),
+            action=step.action,
+            observation=observation,
+            evidence=mission.evidence,
+            hypothesis_state=mission.hypotheses,
+            knowledge_context=mission.knowledge_context,
+            conversation_context=(),
+        )
+        engine = HypothesisEngine(HypothesisState.from_dict(item) for item in mission.hypotheses)
+        hypothesis_updates = engine.apply(proposal, goal_verified=False, deterministic_validation=False)
+        mission.hypotheses = engine.snapshot()
+        if proposal.new_evidence:
+            for item in proposal.new_evidence:
+                normalized = dict(item)
+                normalized.setdefault("criterion_id", str(normalized.get("evidence_id") or proposal.observation_id))
+                normalized.setdefault("passed", True)
+                normalized.setdefault("source", "observation_interpreter")
+                normalized.setdefault("result", dict(item))
+                normalized.setdefault("provenance", {"mission_id": mission.mission_id, "observation_id": proposal.observation_id, "authority": None})
+                mission.evidence.append(normalized)
+        mission.knowledge_context = list(mission.knowledge_context)
+        mission.interpretations.append(proposal.to_dict())
+        mission.emit(EventType.OBSERVATION_INTERPRETED, step_id=step.step_id, data=proposal.to_dict())
+        if hypothesis_updates:
+            mission.emit(EventType.HYPOTHESIS_UPDATED, step_id=step.step_id, data={"updates": hypothesis_updates})
+        scope_blocked = False
+        target = observation.get("target")
+        allowed_targets = (mission.scope_snapshot or {}).get("allowed_targets") if isinstance(mission.scope_snapshot, dict) else None
+        if target and isinstance(allowed_targets, (list, tuple, set)) and str(target) not in {str(item) for item in allowed_targets}:
+            scope_blocked = True
+        decision = decide_strategy(proposal, action_success=success, scope_blocked=scope_blocked)
+        mission.strategy_decisions.append(decision.to_dict())
+        strategy = StrategyState.from_dict(mission.strategy_state, objective=mission.objective)
+        if decision.next_strategy:
+            strategy.current_strategy = decision.next_strategy
+            strategy.version += 1
+        strategy.known_facts.extend(proposal.facts)
+        strategy.unknowns.extend(proposal.unknowns)
+        strategy.required_evidence.extend(proposal.required_next_evidence)
+        mission.strategy_state = strategy.to_dict()
+        mission.emit(EventType.STRATEGY_DECIDED, step_id=step.step_id, data=decision.to_dict())
+        return decision
 
     def reconcile_in_flight(self, mission_id: str, *, executed: bool, observation: dict[str, Any] | None = None) -> Mission:
         """Resolve an ambiguous external side effect without silently replaying it.
@@ -200,9 +254,39 @@ class MissionRuntime:
         success = bool(observation.get("success", observation.get("ok", False)))
         mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version}
+        try:
+            strategy_decision = self._interpret_observation(mission, step, observation, success=success)
+        except (TypeError, ValueError, KeyError) as exc:
+            mission.error = f"observation interpretation rejected: {type(exc).__name__}"
+            mission.recovery_events.append({"event": "interpretation_rejected", "reason": str(exc), "action_id": action_id})
+            mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+            return self.store.save(mission)
+        allowed_targets = (mission.scope_snapshot or {}).get("allowed_targets") if isinstance(mission.scope_snapshot, dict) else None
+        scope_blocked = bool(observation.get("target") and isinstance(allowed_targets, (list, tuple, set)) and str(observation.get("target")) not in {str(item) for item in allowed_targets})
+        if scope_blocked:
+            mission.error = "observation proposed a target outside deterministic scope"
+            mission.failures.append({"class": FailureClass.SCOPE.value, "reason": mission.error, "target": observation.get("target")})
+            mission.transition(MissionStatus.SCOPE_BLOCKED, mission.error)
+            return self.store.save(mission)
         if success:
             mission.evidence.append({"criterion_id": observation.get("criterion_id", step.step_id), "passed": True, "source": observation.get("source", step.action), "result": observation, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id}})
             mission.emit(EventType.EVIDENCE_ADDED, step_id=step.step_id, data={"criterion_id": observation.get("criterion_id", step.step_id)})
+            if strategy_decision is not None and strategy_decision.decision.value in {"REPLAN", "CHANGE_HYPOTHESIS", "ADD_EVIDENCE"}:
+                mission.transition(MissionStatus.REPLANNING, strategy_decision.reason)
+                mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data=strategy_decision.to_dict())
+                new_plan = self.replanner(mission, {**observation, "interpretation": mission.interpretations[-1], "strategy_decision": strategy_decision.to_dict()})
+                if new_plan.objective != mission.objective:
+                    mission.error = "replanner attempted to change Owner objective"
+                    mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                    return self.store.save(mission)
+                mission.replan_history.append({"from_version": mission.plan.version, "to_version": new_plan.version, "reason": strategy_decision.reason, "trigger": strategy_decision.to_dict()})
+                mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": strategy_decision.reason})
+                mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": strategy_decision.reason})
+                mission.plan = new_plan
+                mission.current_step = 0
+                mission.retry_count = 0
+                mission.transition(MissionStatus.READY, "informative observation caused replan", plan_version=new_plan.version)
+                return self.store.save(mission)
             mission.current_step += 1
             mission.retry_count = 0
             mission.transition(MissionStatus.READY, "observation accepted")

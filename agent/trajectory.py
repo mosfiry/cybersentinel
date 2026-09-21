@@ -15,7 +15,10 @@ class EventType(str, Enum):
     AUTHORIZATION_CHECKED = "AuthorizationChecked"
     TOOL_EXECUTED = "ToolExecuted"
     OBSERVATION_RECEIVED = "ObservationReceived"
+    OBSERVATION_INTERPRETED = "ObservationInterpreted"
     EVIDENCE_ADDED = "EvidenceAdded"
+    HYPOTHESIS_UPDATED = "HypothesisUpdated"
+    STRATEGY_DECIDED = "StrategyDecided"
     FAILURE_DETECTED = "FailureDetected"
     FAILURE_DIAGNOSED = "FailureDiagnosed"
     RECOVERY_ATTEMPTED = "RecoveryAttempted"
@@ -24,6 +27,7 @@ class EventType(str, Enum):
     GOAL_VERIFICATION_STARTED = "GoalVerificationStarted"
     GOAL_VERIFIED = "GoalVerified"
     MISSION_COMPLETED = "MissionCompleted"
+    RECOVERY_REQUIRED = "RecoveryRequired"
 
 
 @dataclass(frozen=True)

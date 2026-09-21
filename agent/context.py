@@ -204,9 +204,21 @@ class AgentContext:
     def to_provider_payload(self) -> dict[str, Any]:
         """Convert to provider-specific format."""
         return {
-            "messages": self.messages,
+            "messages": self.provider_messages(),
             "tools": self.tools,
         }
+
+    def provider_messages(self) -> list[dict[str, Any]]:
+        """Return OpenAI-compatible messages without orphaned role=tool items."""
+        result: list[dict[str, Any]] = []
+        for message in self.messages:
+            if message.get("role") == "tool":
+                previous = result[-1] if result else {}
+                if previous.get("role") != "assistant" or not previous.get("tool_calls"):
+                    result.append({"role": "user", "content": "[UNTRUSTED_TOOL_RESULT] " + str(message.get("content", ""))})
+                    continue
+            result.append(message)
+        return result
 
 
 # =============================================================================
@@ -275,9 +287,18 @@ class DurableMemoryProvider(MemoryProvider):
 
 class KnowledgeProvider:
     """Interface for knowledge retrieval."""
+
+    def __init__(self, retriever=None):
+        self.retriever = retriever
     
     def retrieve_relevant(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Retrieve relevant knowledge items."""
+        """Retrieve typed knowledge first; legacy intel is compatibility-only."""
+        if self.retriever is None:
+            from agent.knowledge_context import TypedKnowledgeRetriever
+            self.retriever = TypedKnowledgeRetriever()
+        typed = self.retriever.retrieve_relevant(query, limit=limit)
+        if typed:
+            return typed
         from core.db import search_all
         results = search_all(query, limit=limit)
         knowledge_items = []
@@ -548,12 +569,12 @@ class ContextBuilder:
             
             knowledge_item = ContextItem(
                 role="user",
-                content=f"[UNTRUSTED_KNOWLEDGE:{item.get('source', 'unknown')}] {content}",
+                content=f"[UNTRUSTED_KNOWLEDGE:{item.get('source', item.get('source_id', 'unknown'))}] {content}",
                 source=ContextSource.KNOWLEDGE,
                 trust_level=TrustLevel.UNTRUSTED_DATA,
                 metadata={
                     "object_id": item.get("object_id"),
-                    "source": item.get("source"),
+                    "source": item.get("source", item.get("source_id")),
                     "content_hash": item.get("content_hash"),
                     "provenance": item.get("provenance"),
                     "priority": "low",
@@ -566,7 +587,7 @@ class ContextBuilder:
                     "source": "knowledge",
                     "type": "retrieved",
                     "object_id": item.get("object_id"),
-                    "source": item.get("source"),
+                    "source": item.get("source", item.get("source_id")),
                     "trust": "untrusted_data",
                     "chars": len(content) + 50,
                 })
@@ -764,6 +785,12 @@ class ContextEngine:
         provider: str = "",
         model: str = "",
         memory_provider: MemoryProvider | None = None,
+        knowledge_provider: KnowledgeProvider | None = None,
+        mission_context: dict[str, Any] | None = None,
+        hypothesis_state: list[dict[str, Any]] | None = None,
+        evidence_state: list[dict[str, Any]] | None = None,
+        strategy_state: dict[str, Any] | None = None,
+        current_observation: dict[str, Any] | None = None,
     ) -> AgentContext:
         """Build context for a user request.
         
@@ -826,8 +853,18 @@ class ContextEngine:
         builder.add_memory_context(memory_provider, user_text, limit=5)
         
         # 7. Knowledge Context
-        knowledge_provider = KnowledgeProvider()
+        knowledge_provider = knowledge_provider or KnowledgeProvider()
         builder.add_knowledge_context(knowledge_provider, user_text, limit=2)
+
+        adaptive_state = {
+            "mission": mission_context or {},
+            "hypotheses": hypothesis_state or [],
+            "evidence": evidence_state or [],
+            "strategy": strategy_state or {},
+            "current_observation": current_observation or {},
+        }
+        if any(adaptive_state.values()):
+            builder.add_tool_result("adaptive_mission_state", adaptive_state)
         
         # 8. Current User Message (highest priority user content)
         builder.add_user_message(user_text)
