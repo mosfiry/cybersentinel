@@ -12,6 +12,20 @@ from core.engine import RUNTIME, handle
 from security.owner_session import consume_owner_challenge
 
 
+def _validate_chat_entry(text: str, *, owner_token: str, owner_session_id: str | None, owner_challenge: str | None) -> None:
+    """Validate chat credentials without consuming a single-use challenge."""
+    if owner_session_id or owner_challenge:
+        if not owner_session_id or not owner_challenge:
+            raise PermissionError("owner challenge required")
+        from security.owner_session import validate_owner_challenge
+        validate_owner_challenge(owner_session_id, owner_challenge, text)
+        return
+    from security.owner_policy import verify_owner
+    ok, reason = verify_owner("Owner chat", owner_token)
+    if not ok:
+        raise PermissionError(reason)
+
+
 def _execute(text: str, *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None) -> dict[str, Any]:
     return handle(text, source="chat", owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
 
@@ -109,6 +123,7 @@ def chat(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | N
         task = result["task"]
         answer = (task.get("result") or {}).get("answer") or (task.get("result") or {}).get("question") or ""
         return {"conversation_id": conversation_id, "task_id": task["task_id"], "answer": answer, "activity": task.get("events", []), "task": task}
+    _validate_chat_entry(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
     ensure_conversation(conversation_id, owner_session_id or "")
     add_conversation_message(conversation_id, "user", text)
     result = _execute(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)

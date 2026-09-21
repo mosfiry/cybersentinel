@@ -81,6 +81,26 @@ class OwnerSessionManager:
                 "authenticated_at": now.isoformat(),
             }
 
+    def validate_challenge(self, session_id: str, challenge: str, message: str) -> bool:
+        """Validate entry credentials without consuming the single-use challenge."""
+        session_id = str(session_id or "").strip()
+        challenge = str(challenge or "").strip()
+        message = str(message or "")
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise PermissionError("unknown owner session")
+            if session.expires_at <= now:
+                raise PermissionError("owner challenge expired")
+            if session.used:
+                raise PermissionError("owner challenge already used")
+            if not hmac.compare_digest(session.challenge, challenge):
+                raise PermissionError("invalid owner challenge")
+            if challenge not in message:
+                raise PermissionError("owner challenge must be included in the message")
+            return True
+
     def is_active(self, session_id: str) -> bool:
         """Return whether the authenticated session is present and unexpired.
 
@@ -111,3 +131,7 @@ def create_owner_session(presented_token: str | None) -> dict[str, Any]:
 
 def consume_owner_challenge(session_id: str, challenge: str, message: str) -> dict[str, Any]:
     return DEFAULT_OWNER_SESSIONS.consume(session_id, challenge, message)
+
+
+def validate_owner_challenge(session_id: str, challenge: str, message: str) -> bool:
+    return DEFAULT_OWNER_SESSIONS.validate_challenge(session_id, challenge, message)

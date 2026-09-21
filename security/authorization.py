@@ -17,8 +17,8 @@ class AuthorizationResult:
     risk_class: str | None = None
 
 
-def authorize_tool(item: Any, *, owner_authenticated: bool = True, current_policy: str = "") -> AuthorizationResult:
-    if not owner_authenticated:
+def authorize_tool(item: Any, *, owner_authenticated: bool | None = True, current_policy: str = "") -> AuthorizationResult:
+    if owner_authenticated is False:
         return AuthorizationResult(False, "owner authentication required")
     if not isinstance(item, (str, list, tuple)):
         return AuthorizationResult(False, "tool entry must be a string or [name, argument]")
@@ -31,7 +31,7 @@ def authorize_tool(item: Any, *, owner_authenticated: bool = True, current_polic
     if not isinstance(name, str) or name not in KNOWN_TOOLS:
         return AuthorizationResult(False, "unknown tool")
     spec = get_tool(name)
-    if spec is None or (spec.requires_owner and not owner_authenticated) or (spec.owner_only and not owner_authenticated):
+    if spec is None or (spec.requires_owner and owner_authenticated is False) or (spec.owner_only and owner_authenticated is False):
         return AuthorizationResult(False, "tool requires authenticated Owner")
     valid, reason = spec.validate(argument)
     if not valid:
