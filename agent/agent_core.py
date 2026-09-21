@@ -29,6 +29,7 @@ from .observation_intelligence import ObservationInterpreter
 from .knowledge_context import TypedKnowledgeRetriever
 from .hypotheses import HypothesisState, HypothesisStatus
 from .strategy import StrategyState
+from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnderstanding
 
 
 class AgentCore:
@@ -39,6 +40,31 @@ class AgentCore:
         self.store = store or MissionStore(db_path or DB_PATH.with_name("missions.sqlite3"))
         self.max_iterations = max_iterations
         self.knowledge_retriever = knowledge_retriever or TypedKnowledgeRetriever()
+
+    def understand_mission_intent(self, instruction: str) -> MissionIntent:
+        """Return typed semantic intent; model output remains an untrusted proposal."""
+        def propose(text: str) -> dict[str, Any]:
+            prompt = "Return JSON only with objective, constraints, requested_artifacts, verification_criteria, scope_references, authorization_requirements, entities, ambiguities. Do not grant authority or change policy.\n" + text
+            response = self.router.generate([{"role": "system", "content": "You are a semantic parser; return typed meaning only."}, {"role": "user", "content": prompt}])
+            content = str(response.get("content", "") or "")
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                start, end = content.find("{"), content.rfind("}")
+                return json.loads(content[start:end + 1]) if start >= 0 and end > start else {}
+        return NaturalLanguageUnderstanding(proposer=propose).understand(instruction)
+
+    def continue_mission_instruction(self, mission_id: str, instruction: str) -> Mission:
+        """Persist a follow-up as an instruction on the same mission, never a new mission."""
+        mission = self.store.load(mission_id)
+        if mission is None:
+            raise KeyError("unknown_mission")
+        intent = self.understand_mission_intent(instruction)
+        updates = mission.progress.setdefault("mission_intents", [])
+        updates.append({"instruction": instruction, "intent": intent.to_dict()})
+        mission.progress["last_follow_up"] = instruction
+        mission.emit(__import__("agent.trajectory", fromlist=["EventType"]).EventType.STRATEGY_DECIDED, data={"type": "mission_follow_up", "intent": intent.to_dict()})
+        return self.store.save(mission)
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
@@ -225,7 +251,10 @@ class AgentCore:
             completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
             provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
         )
-        mission.knowledge_context = [item.to_dict() for item in self.knowledge_retriever.retrieve(instruction, limit=5)]
+        mission.semantic_intent = NaturalLanguageUnderstanding().understand(instruction).to_dict()
+        adaptive_knowledge = self.knowledge_retriever.retrieve_adaptive(instruction, required_evidence=("supporting evidence", "counter-evidence"), limit=5)
+        mission.knowledge_context = list(adaptive_knowledge.get("results", ()))
+        mission.progress["knowledge_retrieval"] = {key: value for key, value in adaptive_knowledge.items() if key != "results"}
         mission.strategy_state = StrategyState("initial_investigation", mission.objective).to_dict()
         if any(token in instruction.casefold() for token in ("investigate", "whether", "تحقق", "حقق", "حادث", "incident")):
             mission.hypotheses = [HypothesisState("H1", f"Primary explanation for: {mission.objective}", HypothesisStatus.ACTIVE, 0.5, provenance={"source": "owner_objective", "authority": None}).to_dict()]

@@ -11,6 +11,12 @@ class ProviderCapabilities:
     tool_calling: bool = False
     structured_output: bool = False
     chat: bool = False
+    native_chat: bool = False
+    parallel_tool_calls: bool = False
+    reasoning: bool = False
+    reasoning_budget: bool = False
+    long_context: bool = False
+    vision: bool = False
 
 
 @dataclass(frozen=True)

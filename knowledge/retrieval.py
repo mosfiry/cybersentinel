@@ -162,11 +162,35 @@ class VectorRetriever:
 
 
 class HybridRetriever:
-    """Interface only until a vector backend and reranking policy are reviewed."""
-    status = "NOT_IMPLEMENTED"
+    """Deterministic fusion of BM25, exact lexical, and metadata retrieval.
+
+    This deliberately does not pretend to be a vector index. Each component keeps
+    its provenance and the fused score is only a ranking signal, never authority.
+    """
+    status = "READY"
+
+    def __init__(self, objects: Iterable[KnowledgeObject] = (), *, bm25_weight: float = 0.65, lexical_weight: float = 0.25, metadata_weight: float = 0.10):
+        self.objects = tuple(objects)
+        self.bm25_weight = float(bm25_weight)
+        self.lexical_weight = float(lexical_weight)
+        self.metadata_weight = float(metadata_weight)
 
     def search(self, query: KnowledgeQuery | str, *, kind: KnowledgeKind | None = None, limit: int = 20, **filters) -> list[RetrievalHit]:
-        raise NotImplementedError("hybrid index is not installed in Knowledge Foundation")
+        q = KnowledgeQuery.from_value(query, kind=kind, limit=limit, **filters)
+        bm25 = {item.object_id: item for item in BM25Retriever(self.objects).search(q)}
+        lexical = {item.object_id: item for item in LexicalRetriever(self.objects).search(q)}
+        metadata = {item.object_id: item for item in MetadataRetriever(self.objects).search(q)}
+        objects = {item.object_id: item for item in self.objects}
+        ranked: list[RetrievalHit] = []
+        for object_id, obj in objects.items():
+            if object_id not in bm25 and object_id not in lexical and object_id not in metadata:
+                continue
+            score = self.bm25_weight * bm25.get(object_id, RetrievalHit(object_id, 0.0, obj.kind, obj.is_exact_source, obj.trust_class.value, {})).score
+            score += self.lexical_weight * (1.0 if object_id in lexical else 0.0)
+            score += self.metadata_weight * (1.0 if object_id in metadata else 0.0)
+            ranked.append(_hit(obj, score))
+        ranked.sort(key=lambda item: (-item.score, item.object_id))
+        return ranked[:q.limit]
 
 
 __all__ = ["KnowledgeQuery", "RetrievalHit", "Retriever", "LexicalRetriever", "BM25Retriever", "MetadataRetriever", "VectorRetriever", "HybridRetriever"]

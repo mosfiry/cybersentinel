@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from knowledge.foundation import KnowledgeKind, KnowledgeObject, TrustClass
-from knowledge.retrieval import BM25Retriever, KnowledgeQuery, RetrievalHit
+from knowledge.retrieval import HybridRetriever, KnowledgeQuery, RetrievalHit
 from knowledge.store import search as store_search
 
 
@@ -94,13 +94,23 @@ class TypedKnowledgeRetriever:
         objects = self._objects(query)
         if not objects:
             return []
-        retriever = BM25Retriever(objects)
+        retriever = HybridRetriever(objects)
         hits = retriever.search(KnowledgeQuery(text=query, kind=kind, limit=limit))
         by_id = {obj.object_id: obj for obj in objects}
         return [_result(by_id[hit.object_id], hit.score, hit) for hit in hits if hit.object_id in by_id]
 
     def retrieve_relevant(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         return [item.to_dict() for item in self.retrieve(query, limit=limit)]
+
+    def retrieve_adaptive(self, query: str, *, required_evidence: Iterable[str] = (), limit: int = 5) -> dict[str, Any]:
+        """Retrieve, inspect gaps, and issue deterministic refinement queries."""
+        initial = self.retrieve(query, limit=limit)
+        missing = [item for item in required_evidence if not any(str(item).casefold() in result.content.casefold() for result in initial)]
+        refined = []
+        for item in missing[:3]:
+            refined.extend(self.retrieve(f"{query} {item}", limit=limit))
+        by_id = {item.knowledge_id: item for item in (*initial, *refined)}
+        return {"query": query, "results": [item.to_dict() for item in by_id.values()], "missing_evidence": missing, "refined_queries": [f"{query} {item}" for item in missing[:3]], "provenance": {"retrieval": "hybrid_adaptive", "authority": None}}
 
     def available(self) -> bool:
         return bool(self.objects) or self.fallback_store

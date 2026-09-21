@@ -19,6 +19,11 @@ class ReplanTrigger(str, Enum):
     GOAL_PROGRESS = "GOAL_PROGRESS"
     VERIFICATION_FAILURE = "VERIFICATION_FAILURE"
     INFORMATION_GAIN = "INFORMATION_GAIN"
+    HYPOTHESIS_WEAKENED = "HYPOTHESIS_WEAKENED"
+    HYPOTHESIS_REJECTED = "HYPOTHESIS_REJECTED"
+    NEW_HIGH_VALUE_EVIDENCE = "NEW_HIGH_VALUE_EVIDENCE"
+    CRITICAL_UNKNOWN = "CRITICAL_UNKNOWN"
+    LOW_INFORMATION_GAIN = "LOW_INFORMATION_GAIN"
 
 
 class InformationGain(str, Enum):
@@ -211,9 +216,19 @@ class ObservationInterpreter:
         if contradictions:
             triggers.extend((ReplanTrigger.CONTRADICTORY_EVIDENCE, ReplanTrigger.HYPOTHESIS_CHANGE))
             gain = InformationGain.HIGH
+        if any(float(item.get("delta", 0.0)) < 0 for item in observation.get("confidence_changes", ())):
+            triggers.append(ReplanTrigger.HYPOTHESIS_WEAKENED)
+        if any(float(item.get("delta", 0.0)) <= -0.8 for item in observation.get("confidence_changes", ())):
+            triggers.append(ReplanTrigger.HYPOTHESIS_REJECTED)
         if unknowns or required:
             triggers.append(ReplanTrigger.INFORMATION_GAIN)
             gain = max(gain, InformationGain.LOW, key=lambda item: list(InformationGain).index(item))
+            if not evidence:
+                triggers.append(ReplanTrigger.LOW_INFORMATION_GAIN)
+        if any(str(item).casefold() in {"critical", "critical_unknown"} for item in unknowns):
+            triggers.append(ReplanTrigger.CRITICAL_UNKNOWN)
+        if evidence and any(float(item.get("information_gain", 0.0)) >= 0.8 for item in evidence):
+            triggers.append(ReplanTrigger.NEW_HIGH_VALUE_EVIDENCE)
         replan_reason = "observation changed mission understanding" if gain in {InformationGain.HIGH, InformationGain.CRITICAL} else ("action failed" if not success else "")
         return ObservationInterpretationProposal(obs_id, summary, facts, evidence, contradictions, tuple(item.get("evidence_id", "") for item in evidence if item.get("evidence_id")), tuple(item.get("evidence_id", "") for item in contradictions if item.get("evidence_id")), tuple(dict(item) for item in observation.get("hypothesis_updates", ())), unknowns, tuple(str(item) for item in observation.get("new_dependencies", ())), str(observation.get("recommended_strategy_change", "")), replan_reason, confidence_changes, required, gain, tuple(dict.fromkeys(triggers)), {"source": "deterministic_observation_interpreter", "action": action, "mission_id": mission.get("mission_id", "")})
 

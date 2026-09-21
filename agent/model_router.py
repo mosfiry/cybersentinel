@@ -109,5 +109,7 @@ class ModelRouter:
             raise RuntimeError("native tool providers failed: " + "; ".join(errors))
         raise NotImplementedError("no provider supports native tool calling")
 
-    def chat(self, messages: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None) -> dict:
+    def chat(self, messages: list[dict], temperature: float | None = None, *, tools: list[dict] | None = None, reasoning_profile: ReasoningProfile | None = None) -> dict:
+        if tools:
+            return self.tool_calling(messages, tools, temperature=temperature, reasoning_profile=reasoning_profile)
         return self.generate(messages, temperature=temperature, reasoning_profile=reasoning_profile)
