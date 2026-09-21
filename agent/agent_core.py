@@ -81,10 +81,16 @@ class AgentCore:
         try:
             return self.router.tool_calling(messages, self._schemas(), reasoning_profile=profile)
         except (AttributeError, NotImplementedError):
-            return self.router.generate(messages, reasoning_profile=profile)
+            try:
+                return self.router.generate(messages, reasoning_profile=profile)
+            except Exception as exc:
+                return {"content": "", "provider": "unavailable", "model": "unavailable", "error": type(exc).__name__}
+        except Exception as exc:
+            return {"content": "", "provider": "failed", "model": "failed", "error": type(exc).__name__}
 
     def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "") -> Plan:
-        calls = self._calls(self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id))
+        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id)
+        calls = self._calls(response)
         steps: list[PlanStep] = []
         for index, call in enumerate(calls, start=1):
             spec = get_tool(call.name)
@@ -102,7 +108,8 @@ class AgentCore:
             ))
         if not steps:
             # No model call is an explicit planning failure, not a silent success.
-            steps.append(PlanStep("planning-failure", "Recover from malformed or empty model proposal", action="__planning_failure__", expected_observation="replanned action"))
+            failure_class = "PROVIDER" if response.get("error") else "LOGIC"
+            steps.append(PlanStep("planning-failure", "Recover from malformed or empty model proposal", action="__planning_failure__", expected_observation="replanned action", retry_policy={"failure_class": failure_class}))
         return Plan.initial(objective, created_from="agent_core").replan(steps=steps, reason="initial agent-core plan")
 
     @staticmethod
@@ -122,7 +129,7 @@ class AgentCore:
     @staticmethod
     def _executor(mission: Mission, step: PlanStep, action_id: str) -> dict[str, Any]:
         if step.action == "__planning_failure__":
-            return {"success": False, "failure_class": "LOGIC", "error": "malformed, empty, or unknown tool proposal"}
+            return {"success": False, "failure_class": dict(step.retry_policy).get("failure_class", "LOGIC"), "error": "malformed, empty, or unknown tool proposal"}
         arguments = dict(step.retry_policy).get("arguments", {})
         argument = arguments.get("query") if isinstance(arguments, dict) else None
         raw = mission.authorization_context or {}
