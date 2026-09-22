@@ -65,7 +65,7 @@ jobs:
           git config user.name "mosfiry"
           git config user.email "msfiry36@gmail.com"
           git add diagnostics/
-          git commit -m "ci diagnostics [skip ci]" || echo "nothing to commit"
+          git commit -m "ci status report (ci-skip-marker)" || echo "nothing to commit"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
