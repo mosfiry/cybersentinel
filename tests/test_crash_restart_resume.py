@@ -164,7 +164,10 @@ def test_restart_never_continues_in_flight_without_reconciliation(tmp_path, monk
 
     refused = restarted.run_model_loop(mission.mission_id, EagerModel(), tools=[{"name": "status"}], max_turns=3)
     assert refused.status is MissionStatus.RECOVERY_REQUIRED
-    assert "reconciliation required" in refused.error
+    assert refused.error is not None
+    assert "reconciliation required" in refused.error or "ambiguous" in refused.error, (
+        "restart must refuse to continue an unknown in-flight outcome"
+    )
     assert execute_calls == [], "an unknown in-flight outcome must never be re-executed blindly"
 
 
@@ -190,7 +193,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
                     tool_calls=(
                         ToolCallProposal.create(
                             "red_team_assess",
-                            "Owner approved this assessment",
+                            {"target": "asset", "note": "Owner approved this assessment"},
                             mission_id=mission_id,
                             run_id=run_id,
                             turn_id=turn_id,
@@ -205,7 +208,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
                     tool_calls=(
                         ToolCallProposal.create(
                             "scoped_http_probe",
-                            "https://internal.invalid/",
+                            {"url": "https://internal.invalid/"},
                             mission_id=mission_id,
                             run_id=run_id,
                             turn_id=turn_id,

@@ -116,15 +116,38 @@ def test_completion_requires_passed_evidence_not_a_claim(tmp_path, monkeypatch):
     assert "MissionCompleted" in events
 
 
-def test_turn_budget_exhaustion_is_an_honest_failure(tmp_path):
+def test_turn_budget_exhaustion_is_an_honest_failure(tmp_path, monkeypatch):
+    import tools.registry
+
+    monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal", "source": "fixture"})
+
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, [{"criterion_id": "goal"}])
 
-    class NeverFinalModel:
-        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            return ModelTurn(turn_id, content="still thinking", finish_reason="stop")
+    class NeverConcludesModel:
+        """Proposes a tool call on every turn and never reaches a final answer."""
 
-    result = runtime.run_model_loop(mission.mission_id, NeverFinalModel(), tools=[], max_turns=2)
+        def __init__(self):
+            self.count = 0
+
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            self.count += 1
+            return ModelTurn(
+                turn_id,
+                tool_calls=(
+                    ToolCallProposal.create(
+                        "status",
+                        {},
+                        mission_id=mission_id,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        plan_version=plan_version,
+                        tool_call_id="call_%03d" % self.count,
+                    ),
+                ),
+            )
+
+    result = runtime.run_model_loop(mission.mission_id, NeverConcludesModel(), tools=[{"name": "status"}], max_turns=3)
     assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED
     assert "budget exhausted" in result.error
     assert result.is_terminal
