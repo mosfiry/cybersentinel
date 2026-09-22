@@ -25,6 +25,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: pip install
         run: |
+          set +e
           python -m pip install -r requirements.txt > pip_out.txt 2>&1
           code=$?
           if [ "$code" -ne 0 ]; then
@@ -33,6 +34,7 @@ jobs:
           fi
       - name: compileall
         run: |
+          set +e
           python -m compileall -q . > compile_out.txt 2>&1
           code=$?
           if [ "$code" -ne 0 ]; then
@@ -41,6 +43,7 @@ jobs:
           fi
       - name: pytest
         run: |
+          set +e
           python -m pytest -q > pytest_out.txt 2>&1
           code=$?
           if [ "$code" -ne 0 ]; then
@@ -49,14 +52,17 @@ jobs:
           fi
       - name: git diff check
         run: |
-          if ! git diff --check > diff_out.txt 2>&1; then
-            { echo "## git diff --check failed (whitespace error)"; cat diff_out.txt; } >> diag.txt
+          set +e
+          git diff --check > diff_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## git diff --check failed (whitespace error, exit $code)"; cat diff_out.txt; } >> diag.txt
             exit 1
           fi
       - name: Secret and sensitive-file scan
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?$)' > sens_out.txt; then
             { echo "## sensitive file tracked by git:"; cat sens_out.txt; } >> diag.txt
             exit 1
@@ -84,7 +90,7 @@ jobs:
           git config user.email "msfiry36@gmail.com"
           git add diagnostics/
           git commit -m "ci status report (ci-skip-marker)" || echo "nothing to commit"
-          git pull --rebase || true
+          git pull --rebase --no-edit || true
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
