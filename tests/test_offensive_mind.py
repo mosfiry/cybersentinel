@@ -109,7 +109,9 @@ def test_honeytoken_is_flagged_as_bait():
     mind = OffensiveMind(_engagement())
     campaign = mind.plan("assess target.example", ("web-exposed-surface",))
     mind.adapt(campaign, {"type": "OBSERVATION", "note": "found a honeytoken secret immediately"})
-    assert any("honeytoken" in flag for flag in campaign.deception_flags)
+    assert any("too-easily-found secret" in flag for flag in campaign.deception_flags), (
+        "the honeytoken deception cue must be flagged as bait"
+    )
 
 
 def test_creativity_level_one_limits_fallback_width():
