@@ -5,14 +5,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from core.config import BRIDGE_HOST, BRIDGE_PORT, BRIDGE_TOKEN
-from core.engine import handle, status
+from core.engine import status
 from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 from security.owner_policy import verify_owner
 from security.owner_session import create_owner_session
 from api.chat import chat, get_session, sse, stream, task_stream, create_task, resume_task, pause_task, cancel_task
 from agent.task_manager import TaskManager
-from agent.loop import tool_definitions
+from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 
 ROOT = Path(__file__).resolve().parent
@@ -206,8 +206,14 @@ class Handler(BaseHTTPRequestHandler):
             request_id = str(data.get("request_id", self.headers.get("X-CyberSentinel-Request-ID", ""))).strip()
             if request_id and (len(request_id) > 128 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in request_id)):
                 return self._send(400, {"ok": False, "error": "invalid_request_id"})
-            owner_token = self.headers.get("X-CyberSentinel-Owner-Token", "")
-            return self._send(200, handle(text, source="web", presented_token=self.headers.get("X-CyberSentinel-Token"), owner_token=owner_token, request_id=request_id or None, owner_session_id=self.headers.get("X-CyberSentinel-Owner-Session"), owner_challenge=self.headers.get("X-CyberSentinel-Owner-Challenge")))
+            owner_token, owner_session, owner_challenge = self._chat_auth()
+            result = chat(
+                {**data, "text": text, "request_id": request_id or None},
+                owner_token=owner_token,
+                owner_session_id=owner_session,
+                owner_challenge=owner_challenge,
+            )
+            return self._send(200, {"ok": True, **result})
         except Exception:
             return self._send(400, {"ok": False, "error": "invalid_request"})
 

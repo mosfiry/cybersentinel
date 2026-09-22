@@ -208,6 +208,16 @@ class MissionRuntime:
             current_step = mission.current_plan_step
             assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools)
             progress["last_context_hash"] = assembled.context_hash
+            progress["context_compaction"] = {
+                "compacted": assembled.compacted,
+                "compacted_items": assembled.compacted_items,
+                "owner_objective": mission.objective,
+                "mission_id": mission.mission_id,
+                "scope_snapshot": mission.scope_snapshot,
+                "authorization_context": mission.authorization_context,
+                "evidence_provenance": [item.get("provenance", {}) for item in mission.evidence],
+                "tool_call_ids": [item.get("tool_call_id", "") for item in progress.get("tool_results", ())],
+            }
             messages = assembled.messages
             turn = model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version)
             if auth_context is not None and turn.tool_calls:
@@ -224,6 +234,8 @@ class MissionRuntime:
             progress["turns"].append(turn.to_dict())
             mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
             if not turn.tool_calls:
+                progress["last_model_content"] = turn.content
+                progress["last_model_finish_reason"] = turn.finish_reason
                 verification = self.verifier(mission)
                 mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
                 if verification.verified:

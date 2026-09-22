@@ -403,7 +403,7 @@ class ContextBuilder:
     
     def add_tool_definitions(self) -> ContextBuilder:
         """Add tool definitions from registry."""
-        from agent.loop import tool_definitions
+        from tools.registry import tool_definitions
         self.tool_definitions = tool_definitions()
         
         # Create a compact tool summary

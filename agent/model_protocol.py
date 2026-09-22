@@ -119,7 +119,13 @@ class RouterNativeModel:
         self.router = router
 
     def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int) -> ModelTurn:
-        response = self.router.tool_calling([item.to_dict() for item in messages], list(tools))
+        payload = [item.to_dict() for item in messages]
+        try:
+            response = self.router.tool_calling(payload, list(tools))
+        except (AttributeError, NotImplementedError, RuntimeError):
+            # Text-capable providers remain on the same canonical MissionRuntime;
+            # their output is still normalized into untrusted typed proposals.
+            response = self.router.generate(payload)
         return model_turn_from_provider(response, mission_id=mission_id, run_id=run_id, turn_id=turn_id, request_id="", plan_version=plan_version)
 
 

@@ -124,43 +124,52 @@ def chat(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | N
     if not text:
         raise ValueError("text_required")
     conversation_id = _conversation_id(payload)
-    if bool(payload.get("mission")) or str(payload.get("mode", "")).casefold() == "mission":
-        core = _agent_core()
-        mission = core.resume_mission(str(payload["mission_id"]), owner_token=owner_token) if payload.get("mission_id") else core.run_owner_mission(
-            text,
-            owner_token=owner_token,
-            owner_session_id=owner_session_id,
-            owner_challenge=owner_challenge,
-            request_id=str(payload.get("request_id") or uuid.uuid4().hex),
-            scope_context=payload.get("scope_context"),
-            completion_criteria=payload.get("completion_criteria"),
-        )
-        answer = "Mission " + mission.status.value
-        return {
-            "conversation_id": conversation_id,
-            "mission_id": mission.mission_id,
-            "answer": answer,
-            "status": mission.status.value,
-            "activity": mission.trajectory,
-            "mission": mission.to_dict(),
-        }
-    if RUNTIME.router.providers:
-        result = create_task({"conversation_id": conversation_id, "text": text}, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge, authentication_method="owner_session_challenge" if owner_session_id else "owner_token", run=True)
-        task = result["task"]
-        answer = (task.get("result") or {}).get("answer") or (task.get("result") or {}).get("question") or ""
-        return {"conversation_id": conversation_id, "task_id": task["task_id"], "answer": answer, "activity": task.get("events", []), "task": task}
+    # All chat modes now enter the same durable MissionRuntime.  The legacy
+    # task/core-engine branch remains available only through the explicit task
+    # compatibility endpoints below; it is not a chat execution path.
     _validate_chat_entry(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
+    core = _agent_core()
     ensure_conversation(conversation_id, owner_session_id or "")
     add_conversation_message(conversation_id, "user", text)
-    result = _execute(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
-    answer = result.get("answer", "")
-    add_conversation_message(conversation_id, "assistant", answer, {"request_id": result.get("request_id"), "planner": result.get("planner")})
+    mission = core.resume_mission(str(payload["mission_id"]), owner_token=owner_token) if payload.get("mission_id") else core.run_owner_mission(
+        text,
+        owner_token=owner_token,
+        owner_session_id=owner_session_id,
+        owner_challenge=owner_challenge,
+        request_id=str(payload.get("request_id") or uuid.uuid4().hex),
+        scope_context=payload.get("scope_context"),
+        completion_criteria=payload.get("completion_criteria"),
+    )
+    answer = str(mission.progress.get("last_model_content") or "")
+    if answer:
+        try:
+            parsed = json.loads(answer)
+            if isinstance(parsed, dict):
+                answer = str(parsed.get("content", parsed.get("answer", answer)))
+        except json.JSONDecodeError:
+            pass
+    if not answer:
+        initial = mission.progress.get("initial_model_response") or {}
+        answer = str(initial.get("content", "") or "")
+        try:
+            parsed = json.loads(answer)
+            if isinstance(parsed, dict):
+                answer = str(parsed.get("content", parsed.get("answer", answer)))
+        except json.JSONDecodeError:
+            pass
+    answer = answer or "Mission " + mission.status.value
+    add_conversation_message(conversation_id, "assistant", answer, {"mission_id": mission.mission_id, "status": mission.status.value, "request_id": mission.request_id})
+    activity = list(mission.trajectory)
+    for action in mission.action_history:
+        if action.get("status") == "completed":
+            activity.append({"event": "tool.completed", "tool": action.get("step_id"), "action_id": action.get("action_id")})
     return {
         "conversation_id": conversation_id,
         "answer": answer,
-        "activity": [{"type": "execution", "request_id": result.get("request_id"), "status": result.get("decision")}],
-        "mode": "local_limited" if result.get("planner") == "local" else "model",
-        "capability_limited": result.get("planner") == "local",
+        "mission_id": mission.mission_id,
+        "status": mission.status.value,
+        "activity": activity,
+        "mission": mission.to_dict(),
     }
 
 

@@ -43,7 +43,20 @@ class ModelRouter:
         return cls(providers)
 
     def status(self):
-        return [provider.status() for provider in self.providers]
+        result = []
+        for provider in self.providers:
+            status = getattr(provider, "status", None)
+            if callable(status):
+                result.append(status())
+            else:
+                capabilities = getattr(provider, "capabilities", None)
+                result.append({
+                    "name": getattr(provider, "name", "unknown"),
+                    "model": getattr(provider, "model", "unknown"),
+                    "available": True,
+                    "capabilities": getattr(capabilities, "__dict__", {}),
+                })
+        return result
 
     @staticmethod
     def _caps(provider: Any) -> ProviderCapabilities:

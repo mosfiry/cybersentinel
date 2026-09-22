@@ -211,6 +211,31 @@ REGISTRY = build_registry([
 KNOWN_TOOLS = frozenset(REGISTRY)
 
 
+def tool_definitions() -> list[dict[str, Any]]:
+    """Build provider-neutral tool metadata from the canonical registry."""
+    definitions: list[dict[str, Any]] = []
+    for spec in REGISTRY.values():
+        parameters: dict[str, Any] = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        if spec.argument_type is str:
+            parameters["properties"]["query"] = {
+                "type": "string",
+                "maxLength": MAX_ARG_LENGTH,
+            }
+            parameters["required"] = ["query"]
+        definitions.append({
+            "name": spec.name,
+            "description": spec.description[:512],
+            "risk_class": spec.risk_class,
+            "owner_required": spec.requires_owner,
+            "parameters": parameters,
+        })
+    return definitions
+
+
 def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 

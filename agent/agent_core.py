@@ -122,6 +122,7 @@ class AgentCore:
 
     def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "") -> Plan:
         response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id)
+        self._last_model_response = dict(response)
         calls = self._calls(response)
         steps: list[PlanStep] = []
         for index, call in enumerate(calls, start=1):
@@ -139,6 +140,11 @@ class AgentCore:
                 verification=(f"step-{index}-{call.name}",),
             ))
         if not steps:
+            if observation is not None:
+                # A textual continuation after an observed action means that
+                # the durable evidence should be verified now; it is not a
+                # new executable step.
+                return Plan.initial(objective, created_from="agent_core").replan(steps=(), reason="model final after observation")
             # No model call is an explicit planning failure, not a silent success.
             failure_class = "PROVIDER" if response.get("error") else "LOGIC"
             steps.append(PlanStep("planning-failure", "Recover from malformed or empty model proposal", action="__planning_failure__", expected_observation="replanned action", retry_policy={"failure_class": failure_class}))
@@ -177,7 +183,7 @@ class AgentCore:
         except json.JSONDecodeError:
             start, end = content.find("{"), content.rfind("}")
             if start < 0 or end <= start:
-                raise ValueError("observation interpreter did not return JSON")
+                return {}
             return json.loads(content[start:end + 1])
 
     @staticmethod
@@ -218,7 +224,7 @@ class AgentCore:
             value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except Exception as exc:
-            return {"success": False, "failure_class": "TOOL", "error": type(exc).__name__, "execution_id": action_id}
+            return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
 
     def run_owner_mission(self, instruction: str, *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None) -> Mission:
         request_id = request_id or uuid.uuid4().hex
@@ -251,6 +257,8 @@ class AgentCore:
             completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
             provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
         )
+        if getattr(self, "_last_model_response", None):
+            mission.progress["initial_model_response"] = dict(self._last_model_response)
         mission.semantic_intent = NaturalLanguageUnderstanding().understand(instruction).to_dict()
         adaptive_knowledge = self.knowledge_retriever.retrieve_adaptive(instruction, required_evidence=("supporting evidence", "counter-evidence"), limit=5)
         mission.knowledge_context = list(adaptive_knowledge.get("results", ()))
@@ -259,14 +267,39 @@ class AgentCore:
         if any(token in instruction.casefold() for token in ("investigate", "whether", "تحقق", "حقق", "حادث", "incident")):
             mission.hypotheses = [HypothesisState("H1", f"Primary explanation for: {mission.objective}", HypothesisStatus.ACTIVE, 0.5, provenance={"source": "owner_objective", "authority": None}).to_dict()]
         self.store.save(mission)
-        # Native model intelligence is the canonical path when the configured
-        # provider explicitly advertises native chat/tool capabilities. Text
-        # providers remain a compatibility path and are never mislabeled native.
+        if plan.steps and plan.steps[0].action == "__planning_failure__":
+            # Preserve the model's untrusted final text for presentation, but
+            # do not execute a fabricated planning step or call the provider
+            # repeatedly. Completion remains unavailable without evidence.
+            return self.store.save(mission)
+        # Every configured provider enters MissionRuntime. Providers that do
+        # not advertise native tool calling use MissionRuntime's durable slice
+        # planner; this is a compatibility mode inside the same engine, not a
+        # second AgentTaskRuntime/core-engine execution path.
         capabilities = [getattr(provider, "capabilities", None) for provider in getattr(self.router, "providers", ())]
         if any(getattr(item, "native_chat", False) and getattr(item, "tool_calling", False) for item in capabilities):
             from .model_protocol import RouterNativeModel
             return runtime.run_model_loop(mission.mission_id, RouterNativeModel(self.router), tools=self._schemas(), max_turns=self.max_iterations)
-        return runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
+        result = runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
+        last_response = getattr(self, "_last_model_response", None)
+        if isinstance(last_response, dict) and last_response.get("content"):
+            result.progress["last_model_content"] = str(last_response["content"])
+            result.progress["last_model_response"] = dict(last_response)
+            self.store.save(result)
+        # Text-only compatibility providers do not expose a native continuation
+        # channel. A final interpretation is presentation-only: deterministic
+        # verification has already decided the mission status.
+        initial = result.progress.get("initial_model_response", {})
+        if initial.get("tool_calls") and not result.progress.get("last_model_content"):
+            try:
+                final_response = self._ask(result.objective, result.observations[-1] if result.observations else None, policy_context=policy_context, request_id=result.request_id, conversation_id=result.mission_id)
+                if final_response.get("content"):
+                    result.progress["last_model_content"] = str(final_response["content"])
+                    result.progress["last_model_response"] = dict(final_response)
+                    self.store.save(result)
+            except Exception:
+                pass
+        return result
 
     def resume_mission(self, mission_id: str, *, owner_token: str, max_slices: int | None = None) -> Mission:
         mission = self.store.load(mission_id)
