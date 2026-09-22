@@ -22,6 +22,7 @@ from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
 from security.plan_integrity import plan_hash
 from .lifecycle import begin as begin_lifecycle, complete as complete_lifecycle, get as get_lifecycle, is_cancelled, recover_incomplete, transition as transition_lifecycle
 from evaluation.critic import critique
+from .response import InternalDiagnostic
 
 TOOLS = KNOWN_TOOLS
 RUNTIME = AgentRuntime()
@@ -210,6 +211,15 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         "evidence_chain": chain + (f"response:{response_event}",),
         "lifecycle": "completed",
     }
+    if planned.get("planner") == "local":
+        response["diagnostic"] = InternalDiagnostic(
+            code="no_model_provider_configured" if planned.get("provider") == "local" else "model_provider_unavailable",
+            message=str(planned.get("fallback_reason") or "model provider unavailable"),
+            provider_available=False,
+            provider=str(planned.get("provider", "")),
+            model=str(planned.get("model", "")),
+            details={"planner": planned.get("planner"), "request_id": request_id},
+        ).to_dict()
     cancelled = is_cancelled(request_id)
     if cancelled:
         response["cancelled"] = True
@@ -237,8 +247,11 @@ def handle(text, source="web", presented_token=None, owner_token=None, request_i
 
 
 def summarize(plan, results, planner, rationale):
-    lines = [f"تم تنفيذ خطة دفاعية فعلية ({planner})."]
-    if rationale:
+    if planner == "local":
+        lines = ["يعمل النظام في الوضع المحلي المحدود؛ لم يتوفر مزود نموذج للمحادثة."]
+    else:
+        lines = ["تم تنفيذ الخطة بعد اقتراحها والتحقق من صلاحياتها."]
+    if rationale and planner != "local":
         lines.append("منطق التخطيط: " + rationale)
     for item in results:
         tool = item["tool"]

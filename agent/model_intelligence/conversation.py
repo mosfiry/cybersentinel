@@ -8,6 +8,7 @@ from typing import Any, Callable
 @dataclass(frozen=True)
 class MissionIntent:
     objective: str
+    intent_type: str = "GENERAL_CONVERSATION"
     constraints: tuple[str, ...] = ()
     requested_artifacts: tuple[str, ...] = ()
     verification_criteria: tuple[str, ...] = ()
@@ -19,7 +20,7 @@ class MissionIntent:
     source: str = "model"
 
     def to_dict(self) -> dict[str, Any]:
-        return {"objective": self.objective, "constraints": list(self.constraints), "requested_artifacts": list(self.requested_artifacts), "verification_criteria": list(self.verification_criteria), "scope_references": list(self.scope_references), "authorization_requirements": list(self.authorization_requirements), "entities": list(self.entities), "ambiguities": list(self.ambiguities), "semantic_fingerprint": self.semantic_fingerprint, "source": self.source}
+        return {"objective": self.objective, "intent_type": self.intent_type, "constraints": list(self.constraints), "requested_artifacts": list(self.requested_artifacts), "verification_criteria": list(self.verification_criteria), "scope_references": list(self.scope_references), "authorization_requirements": list(self.authorization_requirements), "entities": list(self.entities), "ambiguities": list(self.ambiguities), "semantic_fingerprint": self.semantic_fingerprint, "source": self.source}
 
 
 class NaturalLanguageUnderstanding:
@@ -31,7 +32,7 @@ class NaturalLanguageUnderstanding:
     def understand(self, text: str) -> MissionIntent:
         raw = str(text or "").strip()
         data: dict[str, Any] = {}
-        source = "fallback"
+        source = "deterministic_fallback"
         if self.proposer:
             try:
                 candidate = self.proposer(raw)
@@ -43,11 +44,23 @@ class NaturalLanguageUnderstanding:
         objective = str(data.get("objective") or raw).strip()
         import hashlib
         fingerprint = hashlib.sha256(json.dumps({key: data.get(key, ()) for key in ("objective", "constraints", "requested_artifacts", "verification_criteria", "scope_references", "authorization_requirements", "entities")}, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
-        return MissionIntent(objective=objective, constraints=tuple(map(str, data.get("constraints", ()))), requested_artifacts=tuple(map(str, data.get("requested_artifacts", ()))), verification_criteria=tuple(map(str, data.get("verification_criteria", ()))), scope_references=tuple(map(str, data.get("scope_references", ()))), authorization_requirements=tuple(map(str, data.get("authorization_requirements", ()))), entities=tuple(map(str, data.get("entities", ()))), ambiguities=tuple(map(str, data.get("ambiguities", ()))), semantic_fingerprint=fingerprint, source=source)
+        intent_type = str(data.get("intent_type") or self._fallback_intent_type(raw))
+        return MissionIntent(objective=objective, intent_type=intent_type, constraints=tuple(map(str, data.get("constraints", ()))), requested_artifacts=tuple(map(str, data.get("requested_artifacts", ()))), verification_criteria=tuple(map(str, data.get("verification_criteria", ()))), scope_references=tuple(map(str, data.get("scope_references", ()))), authorization_requirements=tuple(map(str, data.get("authorization_requirements", ()))), entities=tuple(map(str, data.get("entities", ()))), ambiguities=tuple(map(str, data.get("ambiguities", ()))), semantic_fingerprint=fingerprint, source=source)
 
     @staticmethod
     def _fallback(text: str) -> dict[str, Any]:
         return {"objective": text, "verification_criteria": ("distinguish facts, inferences, hypotheses, and unknowns",), "ambiguities": ("model unavailable; semantic interpretation requires owner review",)}
+
+    @staticmethod
+    def _fallback_intent_type(text: str) -> str:
+        folded = text.casefold()
+        if any(token in folded for token in ("incident", "root cause", "حادث", "السبب الجذري")):
+            return "MISSION_REQUEST"
+        if any(token in folded for token in ("status", "الحالة", "حالة النظام")):
+            return "STATUS_REQUEST"
+        if any(token in folded for token in ("tool", "أداة", "نفذ")):
+            return "TOOL_REQUEST"
+        return "GENERAL_CONVERSATION"
 
 
 __all__ = ["MissionIntent", "NaturalLanguageUnderstanding"]

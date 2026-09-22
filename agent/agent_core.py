@@ -259,6 +259,13 @@ class AgentCore:
         if any(token in instruction.casefold() for token in ("investigate", "whether", "تحقق", "حقق", "حادث", "incident")):
             mission.hypotheses = [HypothesisState("H1", f"Primary explanation for: {mission.objective}", HypothesisStatus.ACTIVE, 0.5, provenance={"source": "owner_objective", "authority": None}).to_dict()]
         self.store.save(mission)
+        # Native model intelligence is the canonical path when the configured
+        # provider explicitly advertises native chat/tool capabilities. Text
+        # providers remain a compatibility path and are never mislabeled native.
+        capabilities = [getattr(provider, "capabilities", None) for provider in getattr(self.router, "providers", ())]
+        if any(getattr(item, "native_chat", False) and getattr(item, "tool_calling", False) for item in capabilities):
+            from .model_protocol import RouterNativeModel
+            return runtime.run_model_loop(mission.mission_id, RouterNativeModel(self.router), tools=self._schemas(), max_turns=self.max_iterations)
         return runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
 
     def resume_mission(self, mission_id: str, *, owner_token: str, max_slices: int | None = None) -> Mission:

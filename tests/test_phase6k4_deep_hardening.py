@@ -29,7 +29,7 @@ def make_object(object_id: str, content: str, metadata: dict) -> KnowledgeObject
 
 def test_application_authority_order_is_owner_instruction_first():
     snapshot = authority_snapshot()
-    assert AuthorityTier.SYSTEM_PLATFORM > AuthorityTier.OWNER_INSTRUCTION
+    assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.SYSTEM_PLATFORM
     assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.OWNER_POLICY
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.DETERMINISTIC_ENFORCEMENT
     assert snapshot["application_policy_order"][0] == "OWNER_INSTRUCTION"

@@ -210,6 +210,17 @@ class MissionRuntime:
             progress["last_context_hash"] = assembled.context_hash
             messages = assembled.messages
             turn = model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version)
+            if auth_context is not None and turn.tool_calls:
+                from dataclasses import replace as replace_dataclass
+                turn = replace_dataclass(turn, tool_calls=tuple(
+                    replace_dataclass(
+                        proposal,
+                        request_id=mission.request_id,
+                        authorization_context_id=auth_context.owner_evidence_fingerprint,
+                        scope_snapshot_id=auth_context.scope_snapshot.snapshot_id if auth_context.scope_snapshot else "",
+                    )
+                    for proposal in turn.tool_calls
+                ))
             progress["turns"].append(turn.to_dict())
             mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
             if not turn.tool_calls:
@@ -254,7 +265,8 @@ class MissionRuntime:
                             if current_step is not None:
                                 self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
                             if bool(observation.get("success", observation.get("ok", True))):
-                                mission.evidence.append({"criterion_id": observation.get("criterion_id", proposal.step_id or proposal.name), "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
+                                criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
+                                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
                             mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
                             mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                             result = ToolCallResult(proposal, True, result=observation)
@@ -307,7 +319,8 @@ class MissionRuntime:
             if current_step is not None:
                 self._interpret_observation(mission, current_step, observation, success=success)
             if success:
-                mission.evidence.append({"criterion_id": observation.get("criterion_id", proposal.step_id or proposal.name), "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
+                criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
+                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
             mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
             results.append(ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", ""))))
         mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}

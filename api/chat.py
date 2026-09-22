@@ -155,7 +155,13 @@ def chat(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | N
     result = _execute(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
     answer = result.get("answer", "")
     add_conversation_message(conversation_id, "assistant", answer, {"request_id": result.get("request_id"), "planner": result.get("planner")})
-    return {"conversation_id": conversation_id, "answer": answer, "activity": [{"type": "execution", "request_id": result.get("request_id"), "status": result.get("decision")}], "execution": result}
+    return {
+        "conversation_id": conversation_id,
+        "answer": answer,
+        "activity": [{"type": "execution", "request_id": result.get("request_id"), "status": result.get("decision")}],
+        "mode": "local_limited" if result.get("planner") == "local" else "model",
+        "capability_limited": result.get("planner") == "local",
+    }
 
 
 def get_session(conversation_id: str) -> dict[str, Any] | None:

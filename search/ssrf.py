@@ -303,5 +303,24 @@ def check_url_ssrf(url: str, raise_on_block: bool = False) -> bool:
         if raise_on_block:
             raise SSRFError("URL is a cloud metadata endpoint", provider="ssrf")
         return False
-    
+
+    # Validate DNS results at the network boundary as well as the URL text.
+    # A public-looking hostname may resolve to a private address (or change
+    # between validation and connection), so unresolved DNS must fail closed.
+    hostname = urlparse(url).hostname or ""
+    try:
+        ipaddress.ip_address(hostname)
+        resolved = [hostname]
+    except ValueError:
+        resolved = get_ip_addresses(hostname)
+    if not resolved:
+        if raise_on_block:
+            raise SSRFError("hostname could not be resolved safely", provider="ssrf")
+        return False
+    for resolved_ip in resolved:
+        if is_private_ip(resolved_ip):
+            if raise_on_block:
+                raise SSRFError("hostname resolves to a blocked private address", provider="ssrf")
+            return False
+
     return True

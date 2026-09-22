@@ -62,7 +62,7 @@ class ToolCallResult:
     error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"tool_call_id": self.proposal.tool_call_id, "name": self.proposal.name, "ok": self.ok, "result": dict(self.result), "error": self.error, **self.proposal.identity()}
+        return {"tool_call_id": self.proposal.tool_call_id, "name": self.proposal.name, "arguments": dict(self.proposal.arguments), "ok": self.ok, "result": dict(self.result), "error": self.error, **self.proposal.identity()}
 
 
 @dataclass(frozen=True)

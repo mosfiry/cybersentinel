@@ -13,6 +13,8 @@ from security.owner_policy import authority_snapshot, load_state, set_current_ow
 
 def test_authority_tiers_are_closed_and_ordered():
     assert_authority_invariant()
+    assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.SYSTEM_PLATFORM
+    assert AuthorityTier.SYSTEM_PLATFORM > AuthorityTier.OWNER_POLICY
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.MODEL_OUTPUT
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.EXTERNAL_DATA
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.TOOL_RUNTIME
