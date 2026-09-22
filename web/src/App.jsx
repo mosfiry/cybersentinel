@@ -43,7 +43,8 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-slate-950 text-slate-200"
+    <div className="f
+lex h-screen flex-col overflow-hidden bg-slate-950 text-slate-200"
       style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
       <header className="flex h-9 shrink-0 items-center gap-3 border-b border-slate-800 bg-slate-900 px-3">
         <span className="text-xs font-bold">CyberSentinel <span className="text-emerald-400">X</span></span>
@@ -74,7 +75,8 @@ export default function App() {
           {task && (
             <div className="space-y-1 p-2">
               {(["pause", "resume", "cancel"] as const).map((a) => (
-                <button key={a} onClick={() => control(a).catch(() => {})}
+                <button key={a} onClick={() => 
+control(a).catch(() => {})}
                   className="w-full rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-800">
                   {a} task
                 </button>
