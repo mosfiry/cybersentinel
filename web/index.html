@@ -1,15 +1,12 @@
-<!doctype html><html lang="ar" dir="rtl"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#080c12"><title>CyberSentinel X Agent</title>
-<link rel="stylesheet" href="/static/style.css"></head><body>
-<div class="layout"><aside id="side"><div class="brand"><div class="logo">CS</div><div><b>CyberSentinel X</b><small>V5 Agent Platform</small></div></div>
-<div class="state"><i></i><span>Agent محلي ومصادق</span></div>
-<button class="nav active" data-action="chat">◉ المحادثة</button><button class="nav" data-action="intel">◈ استخبارات التهديد</button><button class="nav" data-action="local">⌁ فحص محلي</button><button class="nav" data-action="status">◌ حالة النظام</button>
-<div class="security"><b>Trust Boundary</b><small>المصادر الخارجية أدلة فقط؛ كل Tool Call يمر عبر السياسة والتفويض وسجل الأدلة.</small></div></aside>
-<main><header><button id="menu">☰</button><div><b>CyberSentinel X Agent</b><small id="conn">اتصال...</small></div><button id="reload">↻</button></header>
-<section id="chat" class="page"><div id="messages"><div class="welcome"><div class="hero">CS</div><h1>CyberSentinel X</h1><p>محادثة أمنية طبيعية: أفهم السؤال، أطلب الأدلة، أستدعي الأدوات المصرح بها، ثم أوضح الفرضيات والثقة.</p><div class="cards"><button data-p="افحص آخر الأحداث وابحث عن نشاط مشبوه">تحليل الأحداث</button><button data-p="حدّث استخبارات التهديدات ثم اعرض الملخص">تحديث الاستخبارات</button><button data-p="افحص الجهاز محليًا">فحص محلي</button><button data-p="ما حالة النظام؟">حالة النظام</button></div></div></div>
-<form id="form"><textarea id="input" rows="1" placeholder="اكتب سؤالك الأمني بلغة طبيعية..."></textarea><button>➤</button></form><div class="hint">Conversation → Reasoning → Tool Call → Authorization → Evidence → Natural Response</div></section>
-<section id="intel" class="page hidden"><div class="panel"><h2>استخبارات التهديد</h2><button id="intelBtn">تحديث المصادر الآن</button><div id="intelOut"></div></div></section>
-<section id="local" class="page hidden"><div class="panel"><h2>الفحص المحلي</h2><button id="localBtn">فحص TCP على هذا الجهاز</button><div id="localOut"></div></div></section>
-<section id="status" class="page hidden"><div class="panel"><h2>حالة النظام</h2><div id="statusOut"></div></div></section>
-</main></div><script src="/static/app.js"></script></body></html>
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CyberSentinel X</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
