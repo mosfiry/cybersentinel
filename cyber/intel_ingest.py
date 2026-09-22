@@ -84,6 +84,16 @@ def _edge_status_for(source_class: SourceClass) -> EdgeStatus:
     return EdgeStatus.UNKNOWN
 
 
+def _technique_id_of(obj: dict[str, Any]) -> str | None:
+    """The syntactically valid ATT&CK external id of an attack-pattern, or None."""
+    for ref in (obj.get("external_references") or []):
+        if isinstance(ref, dict):
+            eid = ref.get("external_id")
+            if isinstance(eid, str) and _TECHNIQUE_ID.match(eid):
+                return eid
+    return None
+
+
 class IntelIngest:
     """Turns ATT&CK STIX bundles and NVD-style items into graph knowledge.
 
@@ -99,8 +109,7 @@ class IntelIngest:
     # -- shared helpers -------------------------------------------------
 
     def _add_entity(self, entity: Entity, report: IngestReport) -> None:
-        existing = self.graph.entity(entity.entity_id)
-        if existing is None:
+        if self.graph.entity(entity.entity_id) is None:
             self.graph.add_entity(entity)
             report.ingested_entities += 1
 
@@ -121,7 +130,9 @@ class IntelIngest:
         A technique is accepted only if:
         * the object is of type attack-pattern,
         * it carries an external_id matching the ATT&CK technique syntax,
-        * a parent technique (for sub-techniques) exists or is in the same bundle.
+        * a sub-technique's parent technique exists in the graph or in the
+          same bundle (two-pass: parents first, then sub-techniques - an
+          orphan sub-technique is refused and never enters the graph).
 
         Anything else is refused and reported. Sub-techniques get a
         DEPENDS_ON claim to their parent technique.
@@ -138,8 +149,9 @@ class IntelIngest:
             report.refuse("bundle without an objects list", type(objects).__name__)
             return report
 
-        status = _edge_status_for(source_class)
-
+        # Pre-scan: which valid technique ids does this bundle offer?
+        attack_patterns: list[tuple[str, dict[str, Any]]] = []
+        bundle_ids: set[str] = set()
         for obj in objects:
             if not isinstance(obj, dict):
                 report.refuse("non-dict bundle object", repr(obj)[:80])
@@ -147,33 +159,42 @@ class IntelIngest:
             if obj.get("type") != "attack-pattern":
                 # other STIX object types are out of scope for this ingest
                 continue
-            ext_ids = [
-                ref.get("external_id")
-                for ref in (obj.get("external_references") or [])
-                if isinstance(ref, dict)
-            ]
-            tech_id = next((eid for eid in ext_ids if isinstance(eid, str) and _TECHNIQUE_ID.match(eid)), None)
+            tech_id = _technique_id_of(obj)
             if tech_id is None:
                 report.refuse("attack-pattern without a syntactically valid ATT&CK id", obj.get("id"))
                 continue
+            attack_patterns.append((tech_id, obj))
+            bundle_ids.add(tech_id)
 
-            is_sub = "." in tech_id
-            entity_type = "SUBTECHNIQUE" if is_sub else "TECHNIQUE"
+        status = _edge_status_for(source_class)
+        parents: list[tuple[str, dict[str, Any]]] = [t for t in attack_patterns if "." not in t[0]]
+        subs: list[tuple[str, dict[str, Any]]] = [t for t in attack_patterns if "." in t[0]]
+
+        # Pass 1: parent techniques.
+        for tech_id, obj in parents:
             name = str(obj.get("name") or tech_id)
-            entity = Entity(
+            phases = obj.get("kill_chain_phases") or []
+            phase = phases[0].get("phase_name", "") if isinstance(phases, list) and phases and isinstance(phases[0], dict) else ""
+            self._add_entity(Entity(
                 entity_id=tech_id,
-                entity_type=entity_type,
+                entity_type="TECHNIQUE",
                 name=name,
-                attributes={"stix_id": obj.get("id", ""), "phase": (obj.get("kill_chain_phases") or [{}])[0].get("phase_name", "") if obj.get("kill_chain_phases") else ""},
-            )
-            self._add_entity(entity, report)
+                attributes={"stix_id": obj.get("id", ""), "phase": phase},
+            ), report)
 
-            if is_sub:
-                parent_id = tech_id.split(".")[0]
-                parent = self.graph.entity(parent_id)
-                if parent is None:
-                    report.refuse("sub-technique without parent technique in graph or bundle", tech_id)
-                    continue
+        # Pass 2: sub-techniques, now that parents are resolvable.
+        for tech_id, obj in subs:
+            parent_id = tech_id.split(".")[0]
+            if self.graph.entity(parent_id) is None and parent_id not in bundle_ids:
+                report.refuse("sub-technique without parent technique in graph or bundle", tech_id)
+                continue
+            self._add_entity(Entity(
+                entity_id=tech_id,
+                entity_type="SUBTECHNIQUE",
+                name=str(obj.get("name") or tech_id),
+                attributes={"stix_id": obj.get("id", ""), "phase": ""},
+            ), report)
+            if self.graph.entity(parent_id) is not None:
                 self._add_claim(ClaimEdge(
                     relation="DEPENDS_ON",
                     source_id=tech_id,
