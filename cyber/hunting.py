@@ -55,6 +55,11 @@ class ThreatHunter:
                     hypothesis.entry_entity
                 )
             )
+            # an unanswerable hunt still records the residual honestly:
+            # absence of evidence is NOT evidence of absence
+            result.unknowns.append(
+                "no evidenced path matched the hypothesis; absence of evidence is NOT evidence of absence"
+            )
             return result
         seen: set[str] = set()
         frontier = [hypothesis.entry_entity]
@@ -71,9 +76,8 @@ class ThreatHunter:
                 result.findings.append(current)
             for relation in hypothesis.traverse_relations:
                 for edge in self.graph.edges_from(current, relation):
-                    # _evidenced discipline is preserved by the graph queries:
-                    # an UNVERIFIED edge never appears as a detection because
-                    # edges_from returns raw edges; filter by evidenced status
+                    # _evidenced discipline is preserved by this filter: an
+                    # UNVERIFIED edge never appears as a detection
                     if edge.provenance.source_class.value in ("REAL", "PARTIAL"):
                         frontier.append(edge.target_id)
         result.status = "DETECTED" if result.findings else "NO_DETECTIONS"
