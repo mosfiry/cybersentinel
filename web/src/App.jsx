@@ -20,8 +20,10 @@ const store = createStore(initialRuntimeState, runtimeReducer);
 export default function App() {
   const [taskId, setTaskId] = useState("");
   const [taskIdInput, setTaskIdInput] = useState("");
-  const [health_, setHealth] = useState(null);
+  const [healthInfo, setHealthInfo] = useState(null);
   const [healthError, setHealthError] = useState(null);
+  const [conn, setConn] = useState("DISCONNECTED");
+  const [events, setEvents] = useState([]);
 
   const { task, state, error, loading, refresh, control } = useTask(taskId || null);
 
@@ -30,28 +32,24 @@ export default function App() {
   const onResync = useCallback(async () => { if (taskId) await refresh(); }, [taskId, refresh]);
   useEventStream(taskId || null, { onEvent, onStatus, onResync });
 
-  const [conn, setConn] = useState("DISCONNECTED");
   store.subscribe((s) => setConn(s.connection));
-
-  const [events, setEvents] = useState([]);
   store.subscribe((s) => setEvents(s.events.slice(-200)));
 
   const checkHealth = async () => {
     setHealthError(null);
-    try { const h = await health(); setHealth(h); }
+    try { const h = await health(); setHealthInfo(h); }
     catch (e) { setHealthError(e); }
   };
 
   return (
-    <div className="f
-lex h-screen flex-col overflow-hidden bg-slate-950 text-slate-200"
+    <div className="flex h-screen flex-col overflow-hidden bg-slate-950 text-slate-200"
       style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
       <header className="flex h-9 shrink-0 items-center gap-3 border-b border-slate-800 bg-slate-900 px-3">
         <span className="text-xs font-bold">CyberSentinel <span className="text-emerald-400">X</span></span>
         <button onClick={checkHealth} className="rounded border border-slate-700 px-2 py-0.5 text-[10px] hover:bg-slate-800">
           check backend
         </button>
-        {health_ && <span className="font-mono text-[10px] text-emerald-300">{health_.service} v{health_.version}</span>}
+        {healthInfo && <span className="font-mono text-[10px] text-emerald-300">{healthInfo.service} v{healthInfo.version}</span>}
         {healthError && <span className="text-[10px] text-rose-300">backend unreachable</span>}
         <div className="ml-auto flex items-center gap-3">
           <ConnectionChip status={conn} />
@@ -59,7 +57,6 @@ lex h-screen flex-col overflow-hidden bg-slate-950 text-slate-200"
       </header>
 
       <div className="flex min-h-0 flex-1">
-        {/* left: task lookup + controls */}
         <aside className="flex w-64 shrink-0 flex-col border-r border-slate-800 bg-slate-900/40">
           <div className="border-b border-slate-800 p-2">
             <input value={taskIdInput} onChange={(e) => setTaskIdInput(e.target.value)}
@@ -74,9 +71,8 @@ lex h-screen flex-col overflow-hidden bg-slate-950 text-slate-200"
           </div>
           {task && (
             <div className="space-y-1 p-2">
-              {(["pause", "resume", "cancel"] as const).map((a) => (
-                <button key={a} onClick={() => 
-control(a).catch(() => {})}
+              {["pause", "resume", "cancel"].map((a) => (
+                <button key={a} onClick={() => control(a).catch(() => {})}
                   className="w-full rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-800">
                   {a} task
                 </button>
@@ -89,7 +85,6 @@ control(a).catch(() => {})}
           </div>
         </aside>
 
-        {/* center: task runtime */}
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-auto p-3">
             {!taskId && <EmptyState title="No task open" hint="Enter a backend-issued task id to open its live stream." />}
