@@ -19,7 +19,7 @@ def test_red_team_assessment_is_defensive_only():
     evidence = _issue_evidence("owner_token", "red-team-test", "test")
     context = AuthorizationContext("red-team-test", evidence, capture_policy_snapshot("red-team-test", evidence))
     decision = authorize_tool(["red_team_assess", "php-fpm -> sh -> curl"], context=context).decision
-    result = execute("red_team_assess", "php-fpm -> sh -> curl", authorization_decision=decision)
+    result = execute("red_team_assess", "php-fpm -> sh -> curl", authorization_decision=decision, request_id="red-team-test")
     assert result["mode"] == "owner_defensive_red_team"
     assert result["required_evidence"]
     assert result["contradicting_evidence"] == []

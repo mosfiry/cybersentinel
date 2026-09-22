@@ -222,7 +222,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
-        decision_valid = isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.is_valid_for(name, argument, request_id)
+        decision_valid = bool(request_id) and isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.is_valid_for(name, argument, request_id)
         if not decision_valid:
             raise PermissionError("invalid or argument-mismatched AuthorizationDecision")
     if spec.owner_only and not decision_valid:

@@ -69,7 +69,7 @@ def test_decision_argument_binding_blocks_confused_deputy(monkeypatch, tmp_path)
     decision = AuthorizationDecision.issue(context, allowed=True, reason="accepted", tool="search", risk_class="read", argument="safe")
     from tools.registry import execute
     with pytest.raises(PermissionError, match="argument-mismatched"):
-        execute("search", "different", authorization_decision=decision)
+        execute("search", "different", authorization_decision=decision, request_id=context.request_id)
 
 
 def test_parallel_contexts_cannot_cross_authorize(monkeypatch, tmp_path):

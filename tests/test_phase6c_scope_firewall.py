@@ -63,9 +63,9 @@ def test_direct_registry_execution_cannot_bypass_scope(snapshot):
     auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
     denied = authorize_tool(["scoped_http_probe", "https://other.example.com/api"], context=auth_context)
     with pytest.raises(PermissionError, match="scope denied"):
-        execute("scoped_http_probe", "https://other.example.com/api", authorization_decision=denied.decision, scope_context=context("https://other.example.com/api"))
+        execute("scoped_http_probe", "https://other.example.com/api", authorization_decision=denied.decision, scope_context=context("https://other.example.com/api"), request_id="scope-direct")
     allowed = authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context)
-    result = execute("scoped_http_probe", "https://target.example.com/api", authorization_decision=allowed.decision, scope_context=context())
+    result = execute("scoped_http_probe", "https://target.example.com/api", authorization_decision=allowed.decision, scope_context=context(), request_id="scope-direct")
     assert result["ok"] is True
 
 
