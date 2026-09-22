@@ -63,8 +63,7 @@ RELATION_TYPES = frozenset({
 class Provenance:
     """Where a piece of knowledge came from. Required on every claim."""
 
-    sourc
-e: str
+    source: str
     uri: str = ""
     retrieved_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -129,8 +128,7 @@ class ClaimEdge:
 
     def __post_init__(self) -> None:
         if self.relation not in RELATION_TYPES:
-            raise ValueError("unknown rela
-tion: {!r}".format(self.relation))
+            raise ValueError("unknown relation: {!r}".format(self.relation))
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be within [0, 1]")
         if self.status is EdgeStatus.SUPPORTED and not self.evidence_refs:
@@ -179,8 +177,7 @@ class CyberKnowledgeGraph:
             edge for edge in self._edges
             if edge.source_id == entity_id
             and (relation is None or edge.relation == relation)
-      
-  ]
+        ]
 
     def edges_to(self, entity_id: str, relation: str | None = None) -> list[ClaimEdge]:
         return [
@@ -233,8 +230,7 @@ class CyberKnowledgeGraph:
             for edge in self._evidenced(self.edges_from(node, "USES")):
                 target = self._entities[edge.target_id]
                 if target.entity_type == "TECHNIQUE" and target.entity_id not in seen:
-             
-       seen.add(target.entity_id)
+                    seen.add(target.entity_id)
                     techniques.append(target.entity_id)
                 elif target.entity_type in ("TOOL", "MALWARE", "CAMPAIGN"):
                     visit(target.entity_id, depth + 1)
@@ -278,8 +274,7 @@ class CyberKnowledgeGraph:
         out: list[str] = []
         for relation in ("REQUIRES", "DEPENDS_ON"):
             for edge in self._evidenced(self.edges_from(entity_id, relation)):
-           
-     if edge.target_id not in out:
+                if edge.target_id not in out:
                     out.append(edge.target_id)
         return out
 
