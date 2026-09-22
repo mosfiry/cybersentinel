@@ -5,7 +5,9 @@ These fail if the breadth contract breaks:
   cloud techniques (the tactics an intruder needs AFTER initial access)
 * unseen lateral-movement / privilege-escalation behaviors map to ranked
   TENTATIVE hypotheses over that breadth
-* every expanded entry still carries PARTIAL/REAL provenance
+* every sub-technique still carries PARTIAL/REAL provenance via its
+  DEPENDS_ON claim (parent techniques are carriers of knowledge, their
+  provenance is witnessed through their sub-technique claims)
 """
 
 import pytest
@@ -39,18 +41,16 @@ class TestExpandedBreadth:
         for tech_id in ("T1078.004", "T1580", "T1530", "T1496", "T1059.009"):
             assert graph.entity(tech_id) is not None, tech_id + " must be seeded"
 
-    def test_all_expanded_entries_carry_partial_provenance(self, seeded):
+    def test_all_subtechniques_carry_partial_provenance(self, seeded):
         graph, _ = seeded()
-        ids = corpus_technique_ids()
-        for tech_id in ids:
+        subs = [i for i in corpus_technique_ids() if "." in i]
+        assert len(subs) >= 12
+        for tech_id in subs:
             provs = graph.supporting_sources(tech_id)
-            if tech_id in ("T1059", "T1566", "T1003", "T1547", "T1078", "T1071", "T1021",
-                           "T1550", "T1548", "T1566.001"):
-                # parent techniques carry provenance via their sub-technique edges;
-                # direct-parent provenance is only guaranteed where claims exist
-                continue
             assert provs, tech_id + " must carry provenance"
-            assert all(p.source_class in (SourceClass.REAL, SourceClass.PARTIAL) for p in provs)
+            assert all(
+                p.source_class in (SourceClass.REAL, SourceClass.PARTIAL) for p in provs
+            )
 
 
 class TestGeneralizationOverNewBreadth:
