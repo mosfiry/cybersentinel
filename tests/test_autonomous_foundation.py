@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -17,31 +18,32 @@ from api.missions import MissionService
 from agent.planning import Plan
 
 
-def snapshot() -> MissionAuthorizationSnapshot:
+def snapshot(*, root: str = "/workspace/project", actions=None, tools=None, live: bool = False, forbidden=None) -> MissionAuthorizationSnapshot:
+    created = datetime.now(timezone.utc) if live else datetime(2026, 1, 1, tzinfo=timezone.utc)
     return MissionAuthorizationSnapshot.create(
         owner_identity="owner-1",
         mission_id="mission-1",
         target_identity="workspace-1",
         scope=["repository"],
-        allowed_actions=["read", "test"],
-        forbidden_actions=["delete"],
-        allowed_tools=["run_project_tests"],
+        allowed_actions=["read", "test"] if actions is None else actions,
+        forbidden_actions=["delete"] if forbidden is None else forbidden,
+        allowed_tools=["run_project_tests"] if tools is None else tools,
         time_window={"timezone": "UTC"},
         max_duration=3600,
         rate_limits={"run_project_tests": 2},
         network_boundary={"allowed": []},
         data_boundary={"allowed": ["workspace-1"]},
         credential_boundary={"allowed": []},
-        workspace_boundary={"root": "/workspace/project"},
+        workspace_boundary={"root": root},
         policy_version="policy-v1",
         owner_approval="approval-1",
-        created_at="2026-01-01T00:00:00+00:00",
-        expires_at="2026-01-01T01:00:00+00:00",
+        created_at=created.isoformat(),
+        expires_at=(created + timedelta(hours=1)).isoformat(),
     )
 
 
 def test_workspace_root_path_validation_and_file_operations(tmp_path):
-    ws = Workspace(tmp_path)
+    ws = Workspace(tmp_path, authorization_snapshot=snapshot(root=str(tmp_path), actions=["read", "write", "edit", "create", "move", "delete"], tools=[], live=True, forbidden=[]))
     ws.write("src/app.py", "print('ok')\n")
     assert ws.read("src/app.py") == "print('ok')\n"
     ws.edit("src/app.py", "ok", "done")
@@ -54,7 +56,7 @@ def test_workspace_root_path_validation_and_file_operations(tmp_path):
 
 
 def test_workspace_shell_and_process_timeout_are_policy_governed(tmp_path):
-    ws = Workspace(tmp_path, policy=WorkspacePolicy(allowed_shell_commands=("python",), default_timeout=0.05))
+    ws = Workspace(tmp_path, policy=WorkspacePolicy(allowed_shell_commands=("python",), default_timeout=0.05), authorization_snapshot=snapshot(root=str(tmp_path), actions=["shell", "process"], tools=[], live=True))
     result = ws.run_shell("python -c 'print(42)'", timeout=2)
     assert result.ok and result.stdout.strip() == "42"
     with pytest.raises(WorkspacePolicyError):

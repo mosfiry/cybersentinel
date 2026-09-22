@@ -31,7 +31,7 @@ class BoundedSelfRepair:
         self.max_retries = max_retries
         self.time_budget_seconds = time_budget_seconds
 
-    def run(self, action: Callable[[], Any], diagnose: Callable[[Exception], str], repair: Callable[[str, int], None], verify: Callable[[Any], bool]) -> SelfRepairResult:
+    def run(self, action: Callable[[], Any], diagnose: Callable[[Exception], str], repair: Callable[[str, int], None], verify: Callable[[Any], bool], authorize_repair: Callable[[str], bool] | None = None) -> SelfRepairResult:
         started = time.monotonic()
         records: list[RepairRecord] = []
         for attempt in range(self.max_retries + 1):
@@ -51,6 +51,9 @@ class BoundedSelfRepair:
             records.append(RepairRecord("diagnosis", diagnosis, attempt))
             hypothesis = f"repair hypothesis for attempt {attempt + 1}: {diagnosis}"
             records.append(RepairRecord("hypothesis", hypothesis, attempt))
+            if authorize_repair is not None and not authorize_repair(diagnosis):
+                records.append(RepairRecord("authorization", "repair denied by mission authorization", attempt))
+                return SelfRepairResult(False, attempt + 1, tuple(records), None, "repair authorization denied")
             repair(diagnosis, attempt + 1)
             records.append(RepairRecord("repair", diagnosis, attempt + 1))
             if time.monotonic() - started >= self.time_budget_seconds:

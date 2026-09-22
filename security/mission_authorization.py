@@ -101,6 +101,21 @@ class MissionAuthorizationSnapshot:
         moment = _parse(at or _now())
         return _parse(self.created_at) <= moment < _parse(self.expires_at)
 
+    def validate_for_mission(self, *, mission_id: str, owner_identity: str, target_identity: str, version: int = 1, at: str | None = None) -> tuple[bool, str]:
+        if self.authorization_hash != self.compute_hash():
+            return False, "authorization snapshot hash mismatch"
+        if self.mission_id != mission_id:
+            return False, "authorization snapshot mission mismatch"
+        if self.owner_identity != owner_identity:
+            return False, "authorization snapshot owner mismatch"
+        if self.target_identity != target_identity:
+            return False, "authorization snapshot target mismatch"
+        if self.version != version or self.version < 1:
+            return False, "authorization snapshot version invalid"
+        if not self.is_active(at=at):
+            return False, "authorization snapshot expired or not active"
+        return True, "authorized"
+
     def check(self, *, action: str, tool_id: str, target_identity: str, at: str | None = None, network: str | None = None, credential: str | None = None, workspace_path: str | None = None) -> tuple[bool, str]:
         if not self.is_active(at=at):
             return False, "authorization snapshot expired or not active"

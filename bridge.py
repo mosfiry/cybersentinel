@@ -13,6 +13,7 @@ from core.config import (
     PUBLIC_SESSION_TTL_SECONDS,
     PUBLIC_WEB_ENABLED,
     PUBLIC_WEB_ORIGIN,
+    DB_PATH,
 )
 from core.engine import status
 from core.lifecycle import get as get_lifecycle, request_cancel
@@ -24,6 +25,11 @@ from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 from security.public_session import DEFAULT_PUBLIC_SESSIONS
+from api.missions import MissionService
+from agent.mission_worker import MissionQueue, MissionScheduler
+from agent.mission_runtime import MissionRuntime
+from agent.mission import MissionStore
+from agent.agent_core import AgentCore
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -64,6 +70,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat_auth(self):
         return self.headers.get("X-CyberSentinel-Owner-Token", ""), self.headers.get("X-CyberSentinel-Owner-Session"), self.headers.get("X-CyberSentinel-Owner-Challenge")
+
+    def _mission_service(self) -> MissionService:
+        core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
+        runtime = MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True)
+        queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"))
+        scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
+        return MissionService(runtime, queue, scheduler)
+
+    def _mission_owner(self):
+        if not self._bridge_auth():
+            self._send(401, {"ok": False, "error": "bridge authentication required"})
+            return None
+        owner_token, owner_session, owner_challenge = self._chat_auth()
+        if owner_session and owner_challenge:
+            return owner_token, owner_session, owner_challenge
+        owner_ok, reason = verify_owner("Owner mission API", owner_token)
+        if not owner_ok:
+            self._send(403, {"ok": False, "error": reason})
+            return None
+        return owner_token, owner_session, owner_challenge
 
     def _public_enabled(self):
         return PUBLIC_WEB_ENABLED
@@ -119,6 +145,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             return self._static("index.html")
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/missions/"):
+            auth = self._mission_owner()
+            if auth is None:
+                return
+            parts = parsed.path[len("/api/missions/"):].split("/")
+            mission_id, action = parts[0], parts[1] if len(parts) > 1 else "status"
+            try:
+                service = self._mission_service()
+                values = {"status": service.status, "timeline": service.timeline, "evidence": service.evidence, "artifacts": service.artifacts, "logs": service.logs}
+                if action not in values:
+                    return self._send(404, {"ok": False, "error": "unknown_mission_action"})
+                return self._send(200, {"ok": True, "mission_id": mission_id, action: values[action](mission_id)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
         if parsed.path == "/api/tools":
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
@@ -189,6 +229,43 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
+        if self.path == "/api/missions":
+            auth = self._mission_owner()
+            if auth is None:
+                return
+            try:
+                payload = self._read_json()
+                owner_token, owner_session, owner_challenge = auth
+                result = chat(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge)
+                return self._send(201, {"ok": True, "mission": result.get("mission"), "mission_id": result.get("mission_id"), "status": result.get("status")})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, KeyError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if self.path.startswith("/api/missions/"):
+            auth = self._mission_owner()
+            if auth is None:
+                return
+            parts = self.path[len("/api/missions/"):].split("/")
+            mission_id, action = parts[0], parts[1] if len(parts) > 1 else "start"
+            try:
+                service = self._mission_service()
+                owner_token, owner_session, owner_challenge = auth
+                if action == "start" or action == "resume":
+                    result = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3")).resume_mission(mission_id, owner_token=owner_token)
+                    return self._send(200, {"ok": True, "mission": result.to_dict()})
+                if action == "pause":
+                    return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id)})
+                if action == "cancel":
+                    return self._send(200, {"ok": True, "mission": service.cancel_mission(mission_id)})
+                if action == "schedule":
+                    payload = self._read_json()
+                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
+                return self._send(404, {"ok": False, "error": "unknown_mission_action"})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, KeyError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
         if self.path == "/api/public/session":
             if not self._public_enabled() or not self._public_origin_allowed():
                 return self._send(404, {"ok": False, "error": "public_boundary_disabled"})

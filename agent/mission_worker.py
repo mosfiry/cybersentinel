@@ -37,6 +37,8 @@ class QueueItem:
     available_at: str
     claimed_at: str | None = None
     last_error: str = ""
+    lease_owner: str | None = None
+    lease_expires_at: str | None = None
 
 
 class MissionQueue:
@@ -46,6 +48,11 @@ class MissionQueue:
         self.db_path = str(db_path)
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS mission_queue (mission_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, claimed_at TEXT, last_error TEXT NOT NULL DEFAULT '')")
+            for column, definition in (("lease_owner", "TEXT"), ("lease_expires_at", "TEXT")):
+                try:
+                    db.execute(f"ALTER TABLE mission_queue ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError:
+                    pass
 
     def enqueue(self, mission_id: str, *, available_at: str | None = None, state: WorkerMissionState = WorkerMissionState.QUEUED) -> QueueItem:
         if not mission_id.strip():
@@ -57,30 +64,48 @@ class MissionQueue:
 
     def get(self, mission_id: str) -> QueueItem:
         with sqlite3.connect(self.db_path) as db:
-            row = db.execute("SELECT mission_id,state,attempts,available_at,claimed_at,last_error FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
+            row = db.execute("SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
         if row is None:
             raise KeyError("unknown queued mission")
-        return QueueItem(row[0], WorkerMissionState(row[1]), row[2], row[3], row[4], row[5])
+        return QueueItem(row[0], WorkerMissionState(row[1]), row[2], row[3], row[4], row[5], row[6], row[7])
 
-    def claim_next(self, *, now: str | None = None) -> QueueItem | None:
+    def claim_next(self, *, now: str | None = None, worker_id: str = "worker", lease_seconds: int = 60) -> QueueItem | None:
         moment = now or datetime.now(timezone.utc).isoformat()
+        expiry = (datetime.fromisoformat(moment.replace("Z", "+00:00")) + timedelta(seconds=lease_seconds)).isoformat()
         with sqlite3.connect(self.db_path) as db:
-            row = db.execute("SELECT mission_id FROM mission_queue WHERE state IN (?, ?, ?) AND available_at <= ? ORDER BY available_at,mission_id LIMIT 1", (WorkerMissionState.QUEUED.value, WorkerMissionState.SCHEDULED.value, WorkerMissionState.SLEEPING.value, moment)).fetchone()
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT mission_id FROM mission_queue WHERE state IN (?, ?, ?) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?) ORDER BY available_at,mission_id LIMIT 1", (WorkerMissionState.QUEUED.value, WorkerMissionState.SCHEDULED.value, WorkerMissionState.SLEEPING.value, moment, moment)).fetchone()
             if row is None:
                 return None
             mission_id = row[0]
-            db.execute("UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=? WHERE mission_id=?", (WorkerMissionState.EXECUTING.value, moment, mission_id))
+            db.execute("UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=? WHERE mission_id=?", (WorkerMissionState.EXECUTING.value, moment, worker_id, expiry, mission_id))
         return self.get(mission_id)
 
     def update(self, mission_id: str, state: WorkerMissionState, *, available_at: str | None = None, error: str = "") -> QueueItem:
         with sqlite3.connect(self.db_path) as db:
-            db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END WHERE mission_id=?", (state.value, available_at, error, state.value, mission_id))
+            db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, state.value, state.value, state.value, mission_id))
         return self.get(mission_id)
+
+    def heartbeat(self, mission_id: str, *, worker_id: str, now: str | None = None, lease_seconds: int = 60) -> QueueItem:
+        moment = now or datetime.now(timezone.utc).isoformat()
+        expiry = (datetime.fromisoformat(moment.replace("Z", "+00:00")) + timedelta(seconds=lease_seconds)).isoformat()
+        with sqlite3.connect(self.db_path) as db:
+            updated = db.execute("UPDATE mission_queue SET lease_expires_at=? WHERE mission_id=? AND state=? AND lease_owner=?", (expiry, mission_id, WorkerMissionState.EXECUTING.value, worker_id))
+            if updated.rowcount != 1:
+                raise PermissionError("worker lease is not owned")
+        return self.get(mission_id)
+
+    def recover_expired(self, *, now: str | None = None) -> list[QueueItem]:
+        moment = now or datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.db_path) as db:
+            rows = db.execute("SELECT mission_id FROM mission_queue WHERE state=? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?", (WorkerMissionState.EXECUTING.value, moment)).fetchall()
+            db.execute("UPDATE mission_queue SET state=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, last_error=? WHERE state=? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?", (WorkerMissionState.QUEUED.value, "worker lease expired", WorkerMissionState.EXECUTING.value, moment))
+        return [self.get(row[0]) for row in rows]
 
     def recover_after_restart(self) -> list[QueueItem]:
         with sqlite3.connect(self.db_path) as db:
             rows = db.execute("SELECT mission_id FROM mission_queue WHERE state IN (?, ?, ?, ?)", (WorkerMissionState.EXECUTING.value, WorkerMissionState.PLANNING.value, WorkerMissionState.WAITING_FOR_TOOL.value, WorkerMissionState.WAITING_FOR_MODEL.value)).fetchall()
-            db.execute("UPDATE mission_queue SET state=?, claimed_at=NULL, last_error=? WHERE state IN (?, ?, ?, ?)", (WorkerMissionState.QUEUED.value, "worker restart recovery", WorkerMissionState.EXECUTING.value, WorkerMissionState.PLANNING.value, WorkerMissionState.WAITING_FOR_TOOL.value, WorkerMissionState.WAITING_FOR_MODEL.value))
+            db.execute("UPDATE mission_queue SET state=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, last_error=? WHERE state IN (?, ?, ?, ?)", (WorkerMissionState.QUEUED.value, "worker restart recovery", WorkerMissionState.EXECUTING.value, WorkerMissionState.PLANNING.value, WorkerMissionState.WAITING_FOR_TOOL.value, WorkerMissionState.WAITING_FOR_MODEL.value))
         return [self.get(row[0]) for row in rows]
 
     def list(self, states: tuple[WorkerMissionState, ...] | None = None) -> list[QueueItem]:
@@ -98,9 +123,10 @@ class MissionQueue:
 class MissionWorker:
     """Single-step worker adapter; a supervisor may call run_once repeatedly."""
 
-    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any]):
+    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker"):
         self.queue = queue
         self.runtime_factory = runtime_factory
+        self.worker_id = worker_id
 
     def enqueue(self, mission_id: str) -> QueueItem:
         return self.queue.enqueue(mission_id)
@@ -109,7 +135,7 @@ class MissionWorker:
         return self.queue.recover_after_restart()
 
     def run_once(self, *, now: str | None = None, max_slices: int | None = None) -> QueueItem | None:
-        item = self.queue.claim_next(now=now)
+        item = self.queue.claim_next(now=now, worker_id=self.worker_id)
         if item is None:
             return None
         runtime = self.runtime_factory()

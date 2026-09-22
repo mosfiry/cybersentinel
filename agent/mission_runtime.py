@@ -22,7 +22,7 @@ from .model_intelligence.tool_calls import execute_bounded_parallel, validate_pr
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = False):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -30,6 +30,17 @@ class MissionRuntime:
         self.verifier = verifier or self._default_verifier
         self.recovery_policy = recovery_policy or RecoveryPolicy()
         self.interpreter = interpreter or ObservationInterpreter()
+        self.require_authorization_snapshot = require_authorization_snapshot
+
+    def _mission_authorization(self, mission: Mission) -> tuple[bool, str]:
+        if not self.require_authorization_snapshot:
+            return True, "legacy runtime authorization mode"
+        try:
+            from security.mission_authorization import MissionAuthorizationSnapshot
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+            return snapshot.validate_for_mission(mission_id=mission.mission_id, owner_identity=mission.owner_identity_ref, target_identity=snapshot.target_identity, version=int(mission.authorization_snapshot.get("version", 1)))
+        except (KeyError, TypeError, ValueError, PermissionError) as exc:
+            return False, f"authorization snapshot invalid: {type(exc).__name__}"
 
     @staticmethod
     def _default_authorizer(mission: Mission, step: PlanStep) -> tuple[bool, str]:
@@ -364,6 +375,12 @@ class MissionRuntime:
         mission = self._load(mission_id)
         if mission.is_terminal:
             return mission
+        authorization_ok, authorization_reason = self._mission_authorization(mission)
+        if not authorization_ok:
+            mission.error = authorization_reason
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
+            return self.store.save(mission)
         if (mission.checkpoint or {}).get("status") == "in_flight":
             action_id = str(mission.checkpoint.get("action_id", ""))
             mission.error = "in-flight action outcome is unknown; reconciliation required"
