@@ -227,7 +227,7 @@ class AgentCore:
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
 
-    def run_owner_mission(self, instruction: str, *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None) -> Mission:
+    def run_owner_mission(self, instruction: str, *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True) -> Mission:
         request_id = request_id or uuid.uuid4().hex
         authorization_context, policy_context = self._auth(instruction, owner_token, request_id, owner_session_id, owner_challenge)
         if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
@@ -268,6 +268,8 @@ class AgentCore:
         if any(token in instruction.casefold() for token in ("investigate", "whether", "تحقق", "حقق", "حادث", "incident")):
             mission.hypotheses = [HypothesisState("H1", f"Primary explanation for: {mission.objective}", HypothesisStatus.ACTIVE, 0.5, provenance={"source": "owner_objective", "authority": None}).to_dict()]
         self.store.save(mission)
+        if not run:
+            return mission
         if plan.steps and plan.steps[0].action == "__planning_failure__":
             # Preserve the model's untrusted final text for presentation, but
             # do not execute a fabricated planning step or call the provider

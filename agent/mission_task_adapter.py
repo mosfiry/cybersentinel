@@ -29,7 +29,7 @@ class MissionTaskAdapter:
 
     def create_task(self, conversation_id: str, objective: str, *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None, authentication_method: str = "owner_token", scope_context: dict[str, Any] | None = None, run: bool = True) -> Task:
         ensure_conversation(conversation_id, owner_session_id or "")
-        mission = self.core.run_owner_mission(objective, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge, scope_context=scope_context)
+        mission = self.core.run_owner_mission(objective, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge, scope_context=scope_context, run=run)
         task = TaskManager.create_task(conversation_id, mission.request_id, owner_session_id or "", objective, authentication_method=authentication_method)
         task.execution_state = {"canonical_runtime": "MissionRuntime", "mission_id": mission.mission_id, "mission": mission.to_dict()}
         task.result = {"mission_id": mission.mission_id, "mission_status": mission.status.value}
