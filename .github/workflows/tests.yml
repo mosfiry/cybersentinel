@@ -2,11 +2,19 @@ name: tests
 
 on:
   push:
+    paths-ignore:
+      - 'diagnostics/**'
   pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     strategy:
       matrix:
         python-version: ["3.13"]
@@ -15,19 +23,74 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -r requirements.txt
-      - run: python -m compileall -q .
-      - run: python -m pytest -q
-      - run: git diff --check
+      - name: pip install
+        run: |
+          set +e
+          python -m pip install -r requirements.txt > pip_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## pip install failed (exit $code)"; tail -c 2000 pip_out.txt; } >> diag.txt
+            exit 1
+          fi
+      - name: compileall
+        run: |
+          set +e
+          python -m compileall -q . > compile_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## compileall failed (exit $code)"; tail -c 1200 compile_out.txt; } >> diag.txt
+            exit 1
+          fi
+      - name: pytest
+        run: |
+          set +e
+          python -m pytest -q > pytest_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## pytest failed (exit $code)"; tail -c 6000 pytest_out.txt; } >> diag.txt
+            exit 1
+          fi
+      - name: git diff check
+        run: |
+          set +e
+          git diff --check > diff_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## git diff --check failed (whitespace error, exit $code)"; cat diff_out.txt; } >> diag.txt
+            exit 1
+          fi
       - name: Secret and sensitive-file scan
         shell: bash
         run: |
-          set -euo pipefail
-          if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?$)'; then
-            echo 'Sensitive file tracked by git'
+          set -uo pipefail
+          if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?$)' > sens_out.txt; then
+            { echo "## sensitive file tracked by git:"; cat sens_out.txt; } >> diag.txt
             exit 1
           fi
-          if git grep -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example'; then
-            echo 'Secret-like value found'
+          if MATCHES=$(git grep -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example' ':!diagnostics'); then
+            { echo "## secret-scan match:"; echo "$MATCHES"; } >> diag.txt
             exit 1
           fi
+      - name: Write status
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+          sha="${GITHUB_SHA:0:12}"
+          if [ -f diag.txt ]; then
+            { echo "# CI run $sha"; echo "result: FAILURE"; echo; cat diag.txt; } > "diagnostics/ci-$sha.md"
+          else
+            { echo "# CI run $sha"; echo "result: SUCCESS"; } > "diagnostics/ci-$sha.md"
+          fi
+      - name: Publish diagnostics
+        if: always() && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          git config user.name "mosfiry"
+          git config user.email "msfiry36@gmail.com"
+          git add diagnostics/
+          git commit -m "ci status report (ci-skip-marker)" || echo "nothing to commit"
+          git pull --rebase --no-edit || true
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -127,32 +127,17 @@ class WebSearchProvider(SearchProvider):
             except Exception:
                 pass
         
-        # Check if we can make HTTP requests
+        # Local, dependency-free capability check: constructing the HTTP
+        # session proves an HTTP client library is usable. No third-party
+        # endpoint is contacted during availability probing (SSRF posture:
+        # no outbound request is needed to answer "is a client library present").
         try:
             session = self._get_session()
-            if hasattr(session, 'get'):
-                import httpx
-                import requests
-                
-                # Try a simple request to a known endpoint
-                if isinstance(session, httpx.Client):
-                    response = session.get(
-                        "https://httpbin.org/get",
-                        timeout=5.0,
-                    )
-                elif isinstance(session, requests.Session):
-                    response = session.get(
-                        "https://httpbin.org/get",
-                        timeout=5.0,
-                    )
-                else:
-                    return ProviderStatus.UNAVAILABLE
-                
-                if response.status_code == 200:
-                    return ProviderStatus.AVAILABLE
-                return ProviderStatus.UNAVAILABLE
         except Exception:
             return ProviderStatus.UNAVAILABLE
+        if session is not None and hasattr(session, "get"):
+            return ProviderStatus.AVAILABLE
+        return ProviderStatus.UNAVAILABLE
     
     def check_availability(self) -> ProviderStatus:
         """Check if provider is available."""

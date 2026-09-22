@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from typing import Any
 
-from .scope import ScopeDecision, ScopeError, ScopeSnapshot, _asset_matches, canonical_url
+from .scope import ScopeDecision, ScopeError, ScopeSnapshot, _asset_matches, canonical_host, canonical_url
 from .scope_store import count_rate_events, get_snapshot, record_rate_event
 
 
@@ -18,12 +18,35 @@ def _expired(value: str | None) -> bool:
 
 
 def _out_of_scope(snapshot: ScopeSnapshot, host: str, path: str) -> bool:
+    """Return True when host/path is excluded by the authorization.
+
+    Hardening (2026-09-22 audit):
+    - Exclusion hosts are canonicalized with the same canonical_host rules
+      as in-scope assets, so IDN/Unicode or trailing-dot exclusion entries
+      actually match instead of silently failing open.
+    - A non-empty but malformed exclusion entry fails CLOSED (treated as a
+      match) instead of being silently skipped.
+    - Wildcard exclusions ("*.example.com") cover the apex and all
+      subdomains, matching the previous semantics.
+    """
     for asset in snapshot.authorization.out_of_scope_assets:
-        candidate = str(asset.get("host") or asset.get("hostname") or "").lower().lstrip("*.")
-        if host == candidate or host.endswith("." + candidate):
-            excluded_paths = asset.get("paths") or asset.get("excluded_paths") or []
-            if not excluded_paths or any(path == item or path.startswith(str(item).rstrip("/") + "/") for item in excluded_paths):
-                return True
+        raw = str(asset.get("host") or asset.get("hostname") or "").strip()
+        if not raw:
+            continue
+        try:
+            candidate = canonical_host(raw)
+        except ScopeError:
+            return True
+        if candidate.startswith("*."):
+            base = candidate[2:]
+            matched = host == base or host.endswith("." + base)
+        else:
+            matched = host == candidate or host.endswith("." + candidate)
+        if not matched:
+            continue
+        excluded_paths = asset.get("paths") or asset.get("excluded_paths") or []
+        if not excluded_paths or any(path == item or path.startswith(str(item).rstrip("/") + "/") for item in excluded_paths):
+            return True
     return False
 
 
