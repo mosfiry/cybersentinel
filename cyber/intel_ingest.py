@@ -3,7 +3,9 @@
 Owner policy (this layer):
 * Every accepted item must carry provenance (source feed + source class).
 * Fabricated identifiers (fake technique id, fake CVE) are REFUSED and
-  reported - never silently ingested.
+  reported - never silently ingested, and the fabricated identifier itself
+  is never echoed back into any report: a fabricated id must not propagate
+  through the system it tried to poison.
 * Authority-bearing keys in feed items (authorization/scope/owner_instruction)
   are stripped: intel feeds are DATA, they can never grant authority.
 * Source class caps confidence and edge strength: UNVERIFIED/SYNTHETIC/FIXTURE
@@ -27,7 +29,6 @@ from cyber.knowledge_model import (
     Provenance,
     SourceClass,
 )
-
 
 _TECHNIQUE_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
 _CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$")
@@ -255,7 +256,12 @@ class IntelIngest:
             return report
         cve_id = cve.get("id")
         if not isinstance(cve_id, str) or not _CVE_ID.match(cve_id):
-            report.refuse("refusing to ingest invented CVE id", cve.get("id"))
+            # the fabricated identifier is intentionally NOT echoed back:
+            # a fake id must not propagate into any report or audit dump
+            report.refuse(
+                "refusing to ingest invented CVE id",
+                "fabricated identifier withheld from report",
+            )
             return report
 
         cvss = cve.get("cvss")
