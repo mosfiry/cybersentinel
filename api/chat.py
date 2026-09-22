@@ -6,12 +6,11 @@ from typing import Any, Iterator
 
 from agent.task import TaskStatus
 from agent.task_manager import TaskManager
-from agent.task_runtime import AgentTaskRuntime
+from agent.mission_task_adapter import MissionTaskAdapter
 from agent.agent_core import AgentCore
 from agent.mission import MissionStatus
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
-from core.engine import RUNTIME, handle
-from security.owner_session import consume_owner_challenge
+from core.engine import RUNTIME
 
 
 def _validate_chat_entry(text: str, *, owner_token: str, owner_session_id: str | None, owner_challenge: str | None) -> None:
@@ -28,13 +27,8 @@ def _validate_chat_entry(text: str, *, owner_token: str, owner_session_id: str |
         raise PermissionError(reason)
 
 
-def _execute(text: str, *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None) -> dict[str, Any]:
-    return handle(text, source="chat", owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
-
-
-def _runtime() -> AgentTaskRuntime:
-    executor = lambda command, *, owner_token, owner_session_id=None, scope_context=None: _execute(command, owner_token=owner_token, owner_session_id=owner_session_id)
-    return AgentTaskRuntime(RUNTIME.router, executor=executor)
+def _runtime() -> MissionTaskAdapter:
+    return MissionTaskAdapter(RUNTIME.router)
 
 
 def _agent_core() -> AgentCore:
@@ -59,23 +53,8 @@ def create_task(payload: dict[str, Any], *, owner_token: str, owner_session_id: 
     if not text:
         raise ValueError("text_required")
     conversation_id = _conversation_id(payload)
-    if owner_session_id:
-        if not owner_challenge:
-            raise PermissionError("owner challenge required")
-        consume_owner_challenge(owner_session_id, owner_challenge, text)
-    else:
-        from security.owner_policy import verify_owner
-        ok, reason = verify_owner("Owner create task", owner_token)
-        if not ok:
-            raise PermissionError(reason)
     task_runtime = _runtime()
-    task = task_runtime.create_task(conversation_id, text, owner_session_id=owner_session_id or "", authentication_method=authentication_method, scope_context=payload.get("scope_context"))
-    if run and RUNTIME.router.providers:
-        task = task_runtime.run_to_completion(task.task_id, owner_token=owner_token, owner_session_id=owner_session_id)
-    elif run:
-        task.update_status(TaskStatus.FAILED)
-        task.error = "no_model_provider_configured"
-        TaskManager.update_task(task)
+    task = task_runtime.create_task(conversation_id, text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge, authentication_method=authentication_method, scope_context=payload.get("scope_context"), run=run)
     return {"task": _task_public(task)}
 
 
@@ -84,7 +63,7 @@ def resume_task(task_id: str, *, owner_token: str, owner_session_id: str | None 
     if task is None:
         raise KeyError("unknown_task")
     if run:
-        task = _runtime().run_to_completion(task_id, owner_token=owner_token, owner_session_id=owner_session_id)
+        task = _runtime().resume_task(task_id, owner_token=owner_token)
     return {"task": _task_public(task)}
 
 

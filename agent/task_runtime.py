@@ -10,6 +10,7 @@ from typing import Any, Callable
 from agent.context import ContextEngine, ExecutionState, RuntimeLimits
 from agent.memory import ConversationMemory, MemoryProvider, MemoryType, TrustClassification
 from agent.provider_api import ToolCall
+from agent.provider_api import CapabilityUnsupported
 from agent.task import Task, TaskStatus
 from agent.task_manager import TaskManager
 from agent.planning import select_reasoning_profile
@@ -167,7 +168,7 @@ class AgentTaskRuntime:
         reasoning_profile = select_reasoning_profile(objective)
         try:
             return self.router.tool_calling(payload["messages"], self._schemas(), reasoning_profile=reasoning_profile)
-        except (AttributeError, NotImplementedError):
+        except CapabilityUnsupported:
             return self.router.generate(payload["messages"], reasoning_profile=reasoning_profile)
 
     @staticmethod
