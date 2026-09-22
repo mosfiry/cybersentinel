@@ -2,8 +2,6 @@ name: tests
 
 on:
   push:
-    paths-ignore:
-      - 'diagnostics/**'
   pull_request:
 
 concurrency:
