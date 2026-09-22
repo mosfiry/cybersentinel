@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -28,6 +28,46 @@ class ToolSpec:
     handler: Callable[[str | None], Any]
     owner_only: bool = False
     scope_required: bool = False
+    version: str = "1.0.0"
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    output_schema: dict[str, Any] = field(default_factory=dict)
+    network_access: str = "none"
+    filesystem_access: str = "none"
+    process_access: str = "none"
+    credential_access: str = "none"
+    scope_requirements: tuple[str, ...] = ()
+    timeout: int = DEFAULT_TOOL_TIMEOUT
+    rate_limit: str = "bounded"
+    evidence_requirements: tuple[str, ...] = ("authorization_decision", "observation")
+
+    @property
+    def tool_id(self) -> str:
+        return self.name
+
+    @property
+    def required_authorization(self) -> str:
+        if self.scope_required:
+            return "owner_and_scope_snapshot"
+        return "owner" if self.requires_owner else "none"
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "tool_id": self.tool_id,
+            "version": self.version,
+            "description": self.description,
+            "input_schema": self.input_schema or {"type": "string" if self.argument_type is str else "null"},
+            "output_schema": self.output_schema or {"type": "object"},
+            "risk_class": self.risk_class,
+            "required_authorization": self.required_authorization,
+            "network_access": self.network_access,
+            "filesystem_access": self.filesystem_access,
+            "process_access": self.process_access,
+            "credential_access": self.credential_access,
+            "scope_requirements": list(self.scope_requirements),
+            "timeout": self.timeout,
+            "rate_limit": self.rate_limit,
+            "evidence_requirements": list(self.evidence_requirements),
+        }
 
     def validate(self, argument: Any) -> tuple[bool, str]:
         if self.argument_type is None:
@@ -232,6 +272,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "risk_class": spec.risk_class,
             "owner_required": spec.requires_owner,
             "parameters": parameters,
+            **spec.metadata(),
         })
     return definitions
 
@@ -277,7 +318,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)
-    limit = timeout or TOOL_TIMEOUTS.get(name, DEFAULT_TOOL_TIMEOUT)
+    limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     future = executor.submit(spec.handler, argument)
     try:
