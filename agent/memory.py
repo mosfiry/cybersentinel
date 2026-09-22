@@ -76,6 +76,9 @@ class MemoryItem:
     request_id: str = ""
 
     def __post_init__(self) -> None:
+        expected_hash = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+        if not self.content_hash or not expected_hash.startswith(str(self.content_hash)):
+            raise ValueError("memory_content_hash_mismatch")
         if self.trust_classification is TrustClassification.AUTHORITATIVE:
             raise ValueError("memory cannot be authoritative; Owner Policy is not memory")
         if self.domain.value in {"owner_policy", "authorization", "scope", "evidence"}:

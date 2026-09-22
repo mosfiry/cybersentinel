@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 import uuid
+import hashlib
+import json
 
 from .planning import Plan, GoalVerification
-from .trajectory import EventType, TrajectoryEvent
+from .trajectory import EventType, TrajectoryEvent, verify_trajectory
 
 
 class MissionStatus(str, Enum):
@@ -76,6 +78,7 @@ class Mission:
     verification_history: list[dict[str, Any]] = field(default_factory=list)
     recovery_events: list[dict[str, Any]] = field(default_factory=list)
     semantic_intent: dict[str, Any] = field(default_factory=dict)
+    integrity_hash: str = ""
 
     @classmethod
     def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50, request_id: str = "", owner_identity_ref: str = "", owner_instruction: str = "", policy_snapshot: dict[str, Any] | None = None, provenance: dict[str, Any] | None = None) -> "Mission":
@@ -95,11 +98,20 @@ class Mission:
         return self.plan.steps[self.current_step] if self.current_step < len(self.plan.steps) else None
 
     def transition(self, target: MissionStatus, reason: str, **data: Any) -> None:
+        if not isinstance(target, MissionStatus):
+            raise TypeError("mission transition requires MissionStatus")
+        if self.status is MissionStatus.RECOVERY_REQUIRED and target not in {MissionStatus.RECOVERY_REQUIRED, MissionStatus.READY}:
+            raise ValueError("recovery requires reconciliation before continuation")
+        recovery_reconciled = self.status is MissionStatus.RECOVERY_REQUIRED and target is MissionStatus.READY
+        owner_intervention = self.status is MissionStatus.OWNER_INPUT_REQUIRED and target in {MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.READY}
+        if self.is_terminal and target is not self.status and not recovery_reconciled and not owner_intervention:
+            raise ValueError(f"terminal mission cannot transition {self.status.value}->{target.value}")
         self.status = target
         self.transitions.append({"from": self.transitions[-1]["to"] if self.transitions else "CREATED", "to": target.value, "reason": reason, "data": data, "iteration": self.iteration_count})
 
     def emit(self, event_type: EventType, *, step_id: str = "", data: dict[str, Any] | None = None) -> None:
-        event = TrajectoryEvent(event_type, self.mission_id, self.request_id, step_id=step_id, provenance=dict(self.provenance), data=data or {})
+        previous_hash = str(self.trajectory[-1].get("event_hash", "")) if self.trajectory else ""
+        event = TrajectoryEvent(event_type, self.mission_id, self.request_id, step_id=step_id, provenance=dict(self.provenance), data=data or {}, previous_hash=previous_hash)
         self.trajectory.append(event.to_dict())
 
     def record_observation(self, observation: dict[str, Any]) -> None:
@@ -113,17 +125,32 @@ class Mission:
         self.action_history.append({"action_id": action_id, "step_id": step_id, "status": status, "observation": observation or {}})
         self.emit(EventType.TOOL_EXECUTED, step_id=step_id, data={"action_id": action_id, "status": status})
 
-    def to_dict(self) -> dict[str, Any]:
+    def _unsigned_dict(self) -> dict[str, Any]:
         return {"mission_id": self.mission_id, "owner_request": self.owner_request, "objective": self.objective, "status": self.status.value, "plan": self.plan.to_dict(), "current_step": self.current_step, "progress": self.progress, "observations": self.observations, "evidence": self.evidence, "artifacts": self.artifacts, "failures": self.failures, "authorization_context": self.authorization_context, "scope_snapshot": self.scope_snapshot, "completion_criteria": self.completion_criteria, "verification_state": self.verification_state, "checkpoint": self.checkpoint, "plan_history": self.plan_history, "action_history": self.action_history, "transitions": self.transitions, "retry_count": self.retry_count, "max_iterations": self.max_iterations, "iteration_count": self.iteration_count, "error": self.error, "request_id": self.request_id, "owner_identity_ref": self.owner_identity_ref, "owner_instruction": self.owner_instruction, "policy_snapshot": self.policy_snapshot, "provenance": self.provenance, "trajectory": self.trajectory, "hypotheses": self.hypotheses, "strategy_state": self.strategy_state, "knowledge_context": self.knowledge_context, "interpretations": self.interpretations, "strategy_decisions": self.strategy_decisions, "replan_history": self.replan_history, "verification_history": self.verification_history, "recovery_events": self.recovery_events, "semantic_intent": self.semantic_intent}
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self._unsigned_dict()
+        payload["integrity_hash"] = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Mission":
         raw = dict(data)
+        supplied_hash = str(raw.pop("integrity_hash", "") or "")
+        if supplied_hash:
+            expected_hash = hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+            if supplied_hash != expected_hash:
+                raise ValueError("mission_integrity_hash_mismatch")
+        trajectory = raw.get("trajectory") or []
+        if trajectory and any("event_hash" in item for item in trajectory):
+            if not all("event_hash" in item for item in trajectory) or not verify_trajectory(trajectory):
+                raise ValueError("trajectory_integrity_mismatch")
         plan_data = raw.pop("plan")
         from .planning import PlanStep
         steps = tuple(PlanStep(**{**step, "prerequisites": tuple(step.get("prerequisites", ())), "verification": tuple(step.get("verification", ()))}) for step in plan_data.get("steps", []))
         raw["plan"] = Plan(version=plan_data["version"], objective=plan_data["objective"], assumptions=tuple(plan_data.get("assumptions", ())), steps=steps, dependencies=tuple(plan_data.get("dependencies", ())), completion_criteria=tuple(plan_data.get("completion_criteria", ())), risk=plan_data.get("risk", "unknown"), created_from=plan_data.get("created_from", ""))
         raw["status"] = MissionStatus(raw["status"])
+        raw["integrity_hash"] = supplied_hash
         return cls(**raw)
 
 
@@ -139,7 +166,19 @@ class MissionStore:
     def save(self, mission: Mission) -> Mission:
         import json, sqlite3
         with sqlite3.connect(self.db_path) as db:
-            db.execute("INSERT OR REPLACE INTO missions(mission_id,payload) VALUES(?,?)", (mission.mission_id, json.dumps(mission.to_dict(), ensure_ascii=False)))
+            payload = mission.to_dict()
+            encoded = json.dumps(payload, ensure_ascii=False)
+            existing = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
+            if existing is None:
+                db.execute("INSERT INTO missions(mission_id,payload) VALUES(?,?)", (mission.mission_id, encoded))
+            else:
+                current_hash = str(json.loads(existing[0]).get("integrity_hash", ""))
+                if not mission.integrity_hash or current_hash != mission.integrity_hash:
+                    raise ValueError("stale mission write rejected")
+                updated = db.execute("UPDATE missions SET payload=? WHERE mission_id=? AND payload=?", (encoded, mission.mission_id, existing[0]))
+                if updated.rowcount != 1:
+                    raise ValueError("concurrent mission write rejected")
+            mission.integrity_hash = str(payload["integrity_hash"])
         return mission
 
     def load(self, mission_id: str) -> Mission | None:

@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+import hashlib
+import json
 
 
 class EventType(str, Enum):
@@ -40,6 +42,18 @@ class TrajectoryEvent:
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     provenance: dict[str, Any] = field(default_factory=dict)
     data: dict[str, Any] = field(default_factory=dict)
+    previous_hash: str = ""
+    event_hash: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.event_hash:
+            payload = {
+                "event": self.event_type.value, "mission_id": self.mission_id,
+                "request_id": self.request_id, "step_id": self.step_id,
+                "timestamp": self.timestamp, "provenance": self.provenance,
+                "data": self.data, "previous_hash": self.previous_hash,
+            }
+            object.__setattr__(self, "event_hash", hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,7 +64,26 @@ class TrajectoryEvent:
             "timestamp": self.timestamp,
             "provenance": dict(self.provenance),
             "data": dict(self.data),
+            "previous_hash": self.previous_hash,
+            "event_hash": self.event_hash,
         }
 
 
-__all__ = ["EventType", "TrajectoryEvent"]
+def verify_trajectory(events: list[dict[str, Any]]) -> bool:
+    previous = ""
+    for item in events:
+        if item.get("previous_hash", "") != previous:
+            return False
+        candidate = TrajectoryEvent(
+            EventType(item["event"]), str(item["mission_id"]), str(item["request_id"]),
+            step_id=str(item.get("step_id", "")), timestamp=str(item["timestamp"]),
+            provenance=dict(item.get("provenance", {})), data=dict(item.get("data", {})),
+            previous_hash=str(item.get("previous_hash", "")), event_hash="",
+        )
+        if candidate.event_hash != item.get("event_hash"):
+            return False
+        previous = candidate.event_hash
+    return True
+
+
+__all__ = ["EventType", "TrajectoryEvent", "verify_trajectory"]

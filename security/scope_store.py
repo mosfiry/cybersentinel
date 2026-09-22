@@ -49,7 +49,10 @@ def save_snapshot(snapshot: ScopeSnapshot, *, owner_token: str | None = None) ->
         raise PermissionError(reason)
     payload = json.dumps(snapshot.to_dict(), ensure_ascii=False, sort_keys=True)
     with _LOCK, _connect() as conn:
-        conn.execute("INSERT OR REPLACE INTO scope_snapshots(snapshot_id,program_id,scope_version,evidence_hash,snapshot_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", (snapshot.snapshot_id, snapshot.authorization.program_id, snapshot.authorization.scope_version, snapshot.authorization.evidence_hash, payload, snapshot.created_at, snapshot.expires_at))
+        try:
+            conn.execute("INSERT INTO scope_snapshots(snapshot_id,program_id,scope_version,evidence_hash,snapshot_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", (snapshot.snapshot_id, snapshot.authorization.program_id, snapshot.authorization.scope_version, snapshot.authorization.evidence_hash, payload, snapshot.created_at, snapshot.expires_at))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("scope_snapshot_id_already_exists") from exc
     return snapshot
 
 
@@ -65,7 +68,7 @@ def get_snapshot(snapshot_id: str) -> ScopeSnapshot | None:
     if stored_hash and stored_hash != auth.evidence_hash:
         raise ValueError("scope_evidence_hash_mismatch")
     targets = tuple(TargetIdentity(**{**item, "allowed_ports": tuple(item.get("allowed_ports", [])), "allowed_paths": tuple(item.get("allowed_paths", [])), "excluded_paths": tuple(item.get("excluded_paths", []))}) for item in data["targets"])
-    return make_snapshot(data["snapshot_id"], auth, list(targets), expires_at=data.get("expires_at"))
+    return make_snapshot(data["snapshot_id"], auth, list(targets), expires_at=data.get("expires_at"), created_at=data.get("created_at"))
 
 
 def delete_snapshot(snapshot_id: str) -> bool:

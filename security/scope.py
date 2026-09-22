@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import ipaddress
 import json
+import hmac
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -116,6 +117,8 @@ class ProgramAuthorization:
         computed = self.computed_evidence_hash()
         if not self.evidence_hash:
             object.__setattr__(self, "evidence_hash", computed)
+        elif not hmac.compare_digest(str(self.evidence_hash), computed):
+            raise ScopeError("scope_evidence_hash_mismatch")
 
     def computed_evidence_hash(self) -> str:
         payload = {"program_id": self.program_id, "platform": self.platform, "scope_version": self.scope_version, "in_scope_assets": self.in_scope_assets, "out_of_scope_assets": self.out_of_scope_assets, "allowed_methods": self.allowed_methods, "prohibited_methods": self.prohibited_methods, "rate_limits": self.rate_limits, "testing_window": self.testing_window, "disclosure_policy": self.disclosure_policy}
@@ -154,7 +157,7 @@ class ScopeDecision:
         return self.__dict__.copy()
 
 
-def make_snapshot(snapshot_id: str, authorization: ProgramAuthorization, targets: list[TargetIdentity], *, expires_at: str | None = None) -> ScopeSnapshot:
+def make_snapshot(snapshot_id: str, authorization: ProgramAuthorization, targets: list[TargetIdentity], *, expires_at: str | None = None, created_at: str | None = None) -> ScopeSnapshot:
     if any(target.program_id != authorization.program_id for target in targets):
         raise ScopeError("target_program_mismatch")
-    return ScopeSnapshot(snapshot_id, authorization, tuple(targets), expires_at=expires_at)
+    return ScopeSnapshot(snapshot_id, authorization, tuple(targets), created_at=created_at or _utc(), expires_at=expires_at)

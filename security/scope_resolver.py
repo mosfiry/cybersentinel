@@ -28,6 +28,8 @@ def _out_of_scope(snapshot: ScopeSnapshot, host: str, path: str) -> bool:
 
 
 def resolve(snapshot_id: str, target_id: str, url: str, *, method: str = "GET", expected_program_id: str | None = None, redirect_chain: list[str] | None = None, consume_rate: bool = True) -> ScopeDecision:
+    if redirect_chain is not None and len(redirect_chain) > 10:
+        return ScopeDecision(False, "redirect_chain_too_long", snapshot_id=snapshot_id, target_id=target_id)
     snapshot = get_snapshot(snapshot_id)
     if snapshot is None:
         return ScopeDecision(False, "unknown_scope_snapshot", snapshot_id=snapshot_id, target_id=target_id)
