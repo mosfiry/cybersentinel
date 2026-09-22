@@ -215,7 +215,7 @@ class AgentCore:
         if not decision.allowed:
             return {"success": False, "failure_class": "AUTHORIZATION", "error": decision.reason}
         try:
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot)
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": type(exc).__name__, "execution_id": action_id}

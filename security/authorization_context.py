@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
+import os
 from typing import Any
 
 import security.owner_policy as owner_policy
@@ -13,6 +15,9 @@ from security.scope import ScopeSnapshot
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_DECISION_SECRET = os.environ.get("CYBERSENTINEL_DECISION_SECRET", "").encode("utf-8") or os.urandom(32)
 
 
 @dataclass(frozen=True)
@@ -129,17 +134,39 @@ class AuthorizationDecision:
     decision_timestamp: str
     decision_source: str
     arguments_hash: str = ""
+    decision_signature: str = ""
+
+    def _signed_payload(self) -> str:
+        return json.dumps({
+            "allowed": self.allowed, "reason": self.reason, "request_id": self.request_id,
+            "tool": self.tool, "risk_class": self.risk_class,
+            "owner_evidence_fingerprint": self.owner_evidence_fingerprint,
+            "policy_fingerprint": self.policy_fingerprint, "scope_fingerprint": self.scope_fingerprint,
+            "decision_timestamp": self.decision_timestamp, "decision_source": self.decision_source,
+            "arguments_hash": self.arguments_hash,
+        }, sort_keys=True, separators=(",", ":"))
+
+    def is_valid_for(self, tool: str, argument: Any = None, request_id: str | None = None) -> bool:
+        if not self.allowed or self.tool != str(tool) or (request_id is not None and self.request_id != str(request_id)):
+            return False
+        expected = hmac.new(_DECISION_SECRET, self._signed_payload().encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, self.decision_signature):
+            return False
+        if self.arguments_hash:
+            return hmac.compare_digest(self.arguments_hash, _fingerprint(argument))
+        return argument is None
 
     @classmethod
     def issue(cls, context: AuthorizationContext, *, allowed: bool, reason: str, tool: str, risk_class: str | None, argument: Any = None) -> "AuthorizationDecision":
         if not isinstance(context, AuthorizationContext):
             raise TypeError("only AuthorizationContext may issue AuthorizationDecision")
-        return cls(
+        decision = cls(
             allowed=bool(allowed), reason=str(reason), request_id=context.request_id, tool=str(tool), risk_class=risk_class,
             owner_evidence_fingerprint=context.owner_evidence_fingerprint, policy_fingerprint=context.policy_fingerprint,
             scope_fingerprint=context.scope_fingerprint, decision_timestamp=datetime.now(timezone.utc).isoformat(),
             decision_source="security.authorization_context", arguments_hash=_fingerprint(argument) if argument is not None else "",
         )
+        return cls(**{**decision.__dict__, "decision_signature": hmac.new(_DECISION_SECRET, decision._signed_payload().encode("utf-8"), hashlib.sha256).hexdigest()})
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)

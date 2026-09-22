@@ -214,7 +214,7 @@ class AgentTaskRuntime:
         try:
             scope_context = task.execution_state.get("scope_context")
             if spec is not None and spec.scope_required:
-                result = {"ok": True, "result": execute_tool(call.name, argument, authorization_decision=decision.decision, scope_context=scope_context)}
+                result = {"ok": True, "result": execute_tool(call.name, argument, authorization_decision=decision.decision, scope_context=scope_context, request_id=task.request_id)}
             else:
                 result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_token=owner_token, owner_session_id=owner_session_id, scope_context=scope_context, authorization_context=authorization_context, authorization_decision=decision.decision)
             result = result if isinstance(result, dict) else {"ok": True, "result": result}

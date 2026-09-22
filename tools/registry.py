@@ -215,18 +215,14 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
-        decision_valid = isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.allowed and authorization_decision.tool == name
-        if decision_valid and authorization_decision.arguments_hash:
-            import hashlib, json
-            actual_hash = hashlib.sha256(json.dumps(argument, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
-            decision_valid = actual_hash == authorization_decision.arguments_hash
+        decision_valid = isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.is_valid_for(name, argument, request_id)
         if not decision_valid:
             raise PermissionError("invalid or argument-mismatched AuthorizationDecision")
     if spec.owner_only and not decision_valid:

@@ -258,7 +258,7 @@ class MissionRuntime:
                         try:
                             mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                             self.store.save(mission)
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot)
+                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
                             observation = dict(raw or {})
                             observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
                             mission.record_observation(observation)
@@ -306,7 +306,7 @@ class MissionRuntime:
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
             proposal, argument, decision = item
             try:
-                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot) or {})
+                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id) or {})
             except Exception as exc:
                 return {"success": False, "error": str(exc), "failure_class": FailureClass.TOOL.value, "exception": type(exc).__name__}
         raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
