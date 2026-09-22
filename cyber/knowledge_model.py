@@ -63,8 +63,7 @@ RELATION_TYPES = frozenset({
 class Provenance:
     """Where a piece of knowledge came from. Required on every claim."""
 
-    sourc
-e: str
+    source: str
     uri: str = ""
     retrieved_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -129,8 +128,7 @@ class ClaimEdge:
 
     def __post_init__(self) -> None:
         if self.relation not in RELATION_TYPES:
-            raise ValueError("unknown rela
-tion: {!r}".format(self.relation))
+            raise ValueError("unknown relation: {!r}".format(self.relation))
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be within [0, 1]")
         if self.status is EdgeStatus.SUPPORTED and not self.evidence_refs:
@@ -183,8 +181,7 @@ class CyberKnowledgeGraph:
             edge for edge in self._edges
             if edge.source_id == entity_id
             and (relation is None or edge.relation == relation)
-      
-  ]
+        ]
 
     def edges_to(self, entity_id: str, relation: str | None = None) -> list[ClaimEdge]:
         return [
@@ -227,8 +224,7 @@ class CyberKnowledgeGraph:
 
     def techniques_of_actor(self, actor_id: str) -> list[str]:
         """Actor -(ATTRIBUTED_TO)-> CAMPAIGN -(USES)-> TOOL -(USES)-> TECHNIQUE,
-        plus direct Actor -USES-> TECHN
-IQUE edges."""
+        plus direct Actor -USES-> TECHNIQUE edges."""
         techniques: list[str] = []
         seen: set[str] = set()
 
@@ -273,8 +269,7 @@ IQUE edges."""
                     seen.add(edge.target_id)
                     found.append(edge.target_id)
             for edge in self._evidenced(self.edges_from(current, "ENABLES")):
-                if edge.t
-arget_id not in seen:
+                if edge.target_id not in seen:
                     frontier.append(edge.target_id)
         return found
 
@@ -326,7 +321,6 @@ arget_id not in seen:
         }
 
 
-def classify_cyber_claim(graph: CyberKnowledgeGraph, entity_id: str) -
-> ClaimClass:
+def classify_cyber_claim(graph: CyberKnowledgeGraph, entity_id: str) -> ClaimClass:
     """Anti-hallucination entrypoint: a fabricated identifier is UNKNOWN."""
     return graph.classify_entity(entity_id)
