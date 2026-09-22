@@ -7,6 +7,9 @@ import pytest
 
 from agent.evidence import EvidenceChainStore
 from agent.mission_worker import MissionQueue, WorkerMissionState
+from agent.mission import MissionStatus, MissionStore
+from agent.mission_runtime import MissionRuntime
+from agent.planning import Plan
 from agent.self_repair import BoundedSelfRepair
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
@@ -118,3 +121,12 @@ def test_successful_command_without_goal_evidence_is_unknown_and_repair_requires
     assert not repaired.success
     assert repaired.reason == "repair authorization denied"
     assert any(item.phase == "authorization" for item in repaired.records)
+
+
+def test_expired_snapshot_blocks_mission_runtime_execution(tmp_path):
+    expired = auth(str(tmp_path), expiry=datetime.now(timezone.utc) - timedelta(seconds=1))
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    runtime = MissionRuntime(store, executor=lambda *_args: pytest.fail("expired mission executed"), require_authorization_snapshot=True)
+    mission = runtime.create("request", "objective", Plan.initial("objective"), owner_identity_ref="owner-proof", authorization_snapshot=expired.to_dict(), max_iterations=1)
+    result = runtime.run_slice(mission.mission_id)
+    assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
