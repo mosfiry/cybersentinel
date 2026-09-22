@@ -28,9 +28,15 @@ from cyber.knowledge_model import CyberKnowledgeGraph
 
 _TECHNIQUE_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
 
-# authority-bearing vocabulary neutralized inside free-text descriptions:
-# a poison attempt must never become a keyword signal nor appear in output
-_POISON_VOCAB = re.compile(r"owner_instruction|authorization|grant-all|identity|scope_grant")
+# authority-bearing vocabulary neutralized inside free-text descriptions and
+# evidence statements: a poison attempt must never become a signal nor leak
+POISON_VOCAB = re.compile(r"owner_instruction|authorization|grant-all|identity|scope_grant")
+
+
+def neutralize_poison_text(text: str) -> str:
+    """Strip authority-bearing vocabulary from free text (signals stay, poison dies)."""
+    return POISON_VOCAB.sub(" ", str(text))
+
 
 # similarity threshold below which we refuse to map (honest UNKNOWN)
 SIMILARITY_THRESHOLD = 0.35
@@ -85,8 +91,7 @@ class UnseenTechniqueMatcher:
 
     def extract_features(self, description: str, *, tactic: str = "") -> BehaviorFeatures:
         safe = _sanitize({"text": description})
-        text = str(safe.get("text", "")).lower()
-        text = _POISON_VOCAB.sub(" ", text)
+        text = neutralize_poison_text(safe.get("text", "")).lower()
         known_tactics = ("initial-access", "execution", "persistence", "privilege-escalation",
                          "defense-evasion", "credential-access", "discovery", "lateral-movement",
                          "collection", "command-and-control", "exfiltration", "impact")
@@ -153,12 +158,13 @@ class UnseenTechniqueMatcher:
         entity = self.graph.entity(technique_id)
         if entity is None:
             raise ValueError("refusing to promote a technique absent from the graph: " + str(technique_id))
-        if not evidence_statement or not str(evidence_statement).strip():
-            raise ValueError("promotion requires an evidence statement")
+        clean = neutralize_poison_text(evidence_statement).strip()
+        if not clean:
+            raise ValueError("promotion requires an evidence statement free of authority-bearing content")
         return MappedHypothesis(
             technique_id=technique_id,
             technique_name=entity.name,
             similarity=1.0,
             status="SUPPORTED",
-            reasons=["independent evidence recorded: {}".format(str(evidence_statement)[:120])],
+            reasons=["independent evidence recorded: {}".format(clean[:120])],
         )
