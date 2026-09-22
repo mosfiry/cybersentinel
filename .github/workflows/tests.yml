@@ -32,22 +32,12 @@ jobs:
           fi
       - name: compileall
         run: |
-          set +e
-          python -m compileall -q . > compile_out.txt 2>&1
-          code=$?
-          if [ "$code" -ne 0 ]; then
-            { echo "## compileall failed (exit $code)"; tail -c 1200 compile_out.txt; } >> diag.txt
-            exit 1
-          fi
+          set -o pipefail
+          python -m compileall -q . 2>&1 | tee compile_out.txt
       - name: pytest
         run: |
-          set +e
-          python -m pytest -q > pytest_out.txt 2>&1
-          code=$?
-          if [ "$code" -ne 0 ]; then
-            { echo "## pytest failed (exit $code)"; tail -c 6000 pytest_out.txt; } >> diag.txt
-            exit 1
-          fi
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee pytest_out.txt
       - name: git diff check
         run: |
           set +e
