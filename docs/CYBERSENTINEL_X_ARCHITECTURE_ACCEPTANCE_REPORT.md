@@ -9,7 +9,7 @@
 | Field | Result |
 |---|---|
 | `START_COMMIT` | `59e6950f3124c443237f08b7459c867b34a2b9d5` |
-| `FINAL_COMMIT` | يُسجل بعد commit هذه المرحلة |
+| `FINAL_COMMIT` | `ba37e6d` (يتغير إلى hash الـamend النهائي) |
 | Branch | `main` |
 | Required final state | `HEAD == origin/main`, working tree clean بعد الدفع |
 
