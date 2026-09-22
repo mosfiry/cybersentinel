@@ -85,3 +85,14 @@ def count_rate_events(rate_key: str, since: float) -> int:
     with _LOCK, _connect() as conn:
         conn.execute("DELETE FROM scope_rate_events WHERE occurred_at < ?", (since - 86400,))
         return int(conn.execute("SELECT COUNT(*) FROM scope_rate_events WHERE rate_key = ? AND occurred_at >= ?", (rate_key, since)).fetchone()[0])
+
+
+def try_consume_rate_event(rate_key: str, occurred_at: float, limit: int, window_seconds: float = 60.0) -> bool:
+    """Atomically check and record a rate event under the store lock."""
+    with _LOCK, _connect() as conn:
+        conn.execute("DELETE FROM scope_rate_events WHERE occurred_at < ?", (occurred_at - 86400,))
+        count = int(conn.execute("SELECT COUNT(*) FROM scope_rate_events WHERE rate_key = ? AND occurred_at >= ?", (rate_key, occurred_at - window_seconds)).fetchone()[0])
+        if count >= int(limit):
+            return False
+        conn.execute("INSERT INTO scope_rate_events(rate_key, occurred_at) VALUES(?, ?)", (rate_key, occurred_at))
+        return True

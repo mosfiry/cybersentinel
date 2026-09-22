@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 from typing import Any
 
 from .scope import ScopeDecision, ScopeError, ScopeSnapshot, _asset_matches, canonical_host, canonical_url
-from .scope_store import count_rate_events, get_snapshot, record_rate_event
+from .scope_store import get_snapshot, try_consume_rate_event
 
 
 def _expired(value: str | None) -> bool:
@@ -95,10 +95,9 @@ def resolve(snapshot_id: str, target_id: str, url: str, *, method: str = "GET", 
     if rate_limit:
         import time
         now = time.time()
-        if count_rate_events(rate_key, now - 60) >= rate_limit:
-            return ScopeDecision(False, "rate_limit_exceeded", snapshot.authorization.program_id, target_id, snapshot_id, normalized, rate_key)
         if consume_rate:
-            record_rate_event(rate_key, now)
+            if not try_consume_rate_event(rate_key, now, rate_limit):
+                return ScopeDecision(False, "rate_limit_exceeded", snapshot.authorization.program_id, target_id, snapshot_id, normalized, rate_key)
     return ScopeDecision(True, "scope_authorized", snapshot.authorization.program_id, target_id, snapshot_id, normalized, rate_key)
 
 
