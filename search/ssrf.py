@@ -52,6 +52,8 @@ class SSRFProtection:
         "::ffff:10.0.0.0/112",   # IPv4-mapped IPv6 private
         "::ffff:172.16.0.0/108", # IPv4-mapped IPv6 private
         "::ffff:192.168.0.0/112", # IPv4-mapped IPv6 private
+        "fc00::/7",             # IPv6 unique-local (fd00::/8 included)
+        "0.0.0.0/8",             # "This" network / unspecified source
         "169.254.169.254/32",    # AWS metadata
     })
     
