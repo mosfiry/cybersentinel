@@ -16,7 +16,6 @@ from typing import Any
 from cyber.intel_ingest import IntelIngest
 from cyber.knowledge_model import CyberKnowledgeGraph, SourceClass
 
-
 # (technique_id, name, tactic, [platform keywords], [behavior keywords])
 _CORPUS: list[tuple[str, str, str, list[str], list[str]]] = [
     ("T1059", "Command and Scripting Interpreter", "execution", ["windows", "linux", "macos"], ["script", "interpreter", "shell", "command"]),
@@ -25,6 +24,7 @@ _CORPUS: list[tuple[str, str, str, list[str], list[str]]] = [
     ("T1059.004", "Unix Shell", "execution", ["linux", "macos"], ["bash", "sh", "unix", "shell"]),
     ("T1059.009", "Cloud API", "execution", ["iaas"], ["cloud", "api", "cli"]),
     ("T1078", "Valid Accounts", "defense-evasion", ["windows", "linux", "cloud"], ["valid", "account", "credentials", "login"]),
+    ("T1078.004", "Cloud Accounts", "defense-evasion", ["iaas"], ["cloud", "account", "credentials", "valid"]),
     ("T1566", "Phishing", "initial-access", ["windows", "linux", "macos"], ["phishing", "email", "lure", "attachment"]),
     ("T1566.001", "Spearphishing Attachment", "initial-access", ["windows", "linux", "macos"], ["phishing", "email", "attachment", "lure"]),
     ("T1190", "Exploit Public-Facing Application", "initial-access", ["windows", "linux"], ["exploit", "public", "web", "application", "internet"]),
@@ -49,6 +49,27 @@ _CORPUS: list[tuple[str, str, str, list[str], list[str]]] = [
     ("T1485", "Data Destruction", "impact", ["windows", "linux"], ["destroy", "wipe", "delete", "impact"]),
     ("T1490", "Inhibit System Recovery", "impact", ["windows"], ["recovery", "shadow", "backup", "delete", "restore"]),
     ("T1489", "Service Stop", "impact", ["windows", "linux"], ["service", "stop", "disable", "shutdown"]),
+    # -- discovery ------------------------------------------------------
+    ("T1087", "Account Discovery", "discovery", ["windows", "linux", "cloud"], ["account", "discovery", "enumerate", "users"]),
+    ("T1083", "File and Directory Discovery", "discovery", ["windows", "linux"], ["file", "directory", "discovery", "enumerate"]),
+    ("T1046", "Network Service Discovery", "discovery", ["windows", "linux"], ["network", "service", "port", "scan", "discovery"]),
+    ("T1057", "Process Discovery", "discovery", ["windows", "linux", "macos"], ["process", "discovery", "enumerate", "task"]),
+    ("T1069", "Permission Groups Discovery", "discovery", ["windows", "linux", "cloud"], ["permission", "group", "discovery", "enumerate"]),
+    ("T1580", "Cloud Infrastructure Discovery", "discovery", ["iaas"], ["cloud", "infrastructure", "discovery", "enumerate"]),
+    # -- lateral movement -------------------------------------------------
+    ("T1021", "Remote Services", "lateral-movement", ["windows", "linux"], ["remote", "services", "lateral", "session"]),
+    ("T1021.001", "Remote Desktop Protocol", "lateral-movement", ["windows"], ["rdp", "remote", "desktop", "lateral"]),
+    ("T1550", "Use Alternate Authentication Material", "lateral-movement", ["windows"], ["authentication", "material", "token", "hash", "ticket"]),
+    ("T1550.002", "Pass the Hash", "lateral-movement", ["windows"], ["pass", "hash", "ntlm", "lateral", "authentication"]),
+    ("T1570", "Lateral Tool Transfer", "lateral-movement", ["windows", "linux"], ["tool", "transfer", "lateral", "copy"]),
+    # -- privilege escalation ----------------------------------------------
+    ("T1068", "Exploitation for Privilege Escalation", "privilege-escalation", ["windows", "linux"], ["exploit", "privilege", "escalation", "elevation", "vulnerability"]),
+    ("T1548", "Abuse Elevation Control Mechanism", "privilege-escalation", ["windows", "linux"], ["elevation", "control", "abuse", "sudo", "uac"]),
+    ("T1548.002", "Bypass User Account Control", "privilege-escalation", ["windows"], ["uac", "bypass", "elevation", "control"]),
+    ("T1134", "Access Token Manipulation", "privilege-escalation", ["windows"], ["token", "manipulation", "impersonate", "privilege"]),
+    # -- cloud impact/collection ---------------------------------------------
+    ("T1530", "Data from Cloud Storage", "collection", ["iaas"], ["cloud", "storage", "data", "download"]),
+    ("T1496", "Resource Hijacking", "impact", ["iaas", "windows", "linux"], ["resource", "hijacking", "cryptomining", "compute"]),
 ]
 
 _CVE_CORPUS: list[tuple[str, float, str, str, str, str]] = [
