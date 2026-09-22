@@ -66,13 +66,16 @@ def test_state_survives_process_restart(tmp_path, monkeypatch):
     class CrashingModel:
         """Performs two tool turns, then the process dies mid-loop."""
 
+        def __init__(self):
+            self.count = 0
+
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            turns = mission.progress.get("model_loop", {}).get("turns", [])
-            if len(turns) >= 2:
+            self.count += 1
+            if self.count >= 3:
                 raise RuntimeError("simulated process crash mid-loop")
             return ModelTurn(
                 turn_id,
-                tool_calls=(_call(mission_id, run_id, turn_id, plan_version, len(turns) + 1),),
+                tool_calls=(_call(mission_id, run_id, turn_id, plan_version, self.count),),
             )
 
     with pytest.raises(RuntimeError):
@@ -103,11 +106,17 @@ def test_resume_after_restart_completes_from_persisted_state(tmp_path, monkeypat
     mission = _mission(runtime)
 
     class CrashAfterTwoTurns:
+        def __init__(self):
+            self.count = 0
+
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            turns = mission.progress.get("model_loop", {}).get("turns", [])
-            if len(turns) >= 2:
+            self.count += 1
+            if self.count >= 3:
                 raise RuntimeError("simulated crash")
-            return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, len(turns) + 1),))
+            return ModelTurn(
+                turn_id,
+                tool_calls=(_call(mission_id, run_id, turn_id, plan_version, self.count),),
+            )
 
     with pytest.raises(RuntimeError):
         runtime.run_model_loop(mission.mission_id, CrashAfterTwoTurns(), tools=[{"name": "status"}], max_turns=10)
@@ -170,9 +179,12 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
     class PrivilegeEscalationModel:
         """Tries to use Owner-only and scope-bound tools after a restart."""
 
+        def __init__(self):
+            self.count = 0
+
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            turns = mission.progress.setdefault("model_loop", {"turns": []})["turns"]
-            if len(turns) == 0:
+            self.count += 1
+            if self.count == 1:
                 return ModelTurn(
                     turn_id,
                     tool_calls=(
@@ -187,7 +199,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
                         ),
                     ),
                 )
-            if len(turns) == 1:
+            if self.count == 2:
                 return ModelTurn(
                     turn_id,
                     tool_calls=(

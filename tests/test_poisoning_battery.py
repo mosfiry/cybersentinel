@@ -149,8 +149,12 @@ def test_poisoned_tool_results_grant_nothing_in_the_loop(tmp_path, monkeypatch):
     mission = runtime.create("verify asset", "verify asset", plan, completion_criteria=[{"criterion_id": "goal"}])
 
     class PoisonThenFinalModel:
+        def __init__(self):
+            self.count = 0
+
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            if not mission.observations:
+            self.count += 1
+            if self.count == 1:
                 return ModelTurn(
                     turn_id,
                     tool_calls=(

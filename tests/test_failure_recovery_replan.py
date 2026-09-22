@@ -208,8 +208,12 @@ def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_pat
     mission = _mission(runtime)
 
     class FailingThenFinalModel:
+        def __init__(self):
+            self.count = 0
+
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            if not mission.observations:
+            self.count += 1
+            if self.count == 1:
                 return ModelTurn(
                     turn_id,
                     tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 1),),

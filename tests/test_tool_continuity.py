@@ -76,14 +76,18 @@ def test_duplicate_tool_call_id_is_rejected_prior_result_is_authoritative(tmp_pa
     mission = _mission(runtime)
 
     class ReplayModel:
-        """Turn 1 executes call_001; turn 2 replays the same id."""
+        """Turn 1 executes call_001; later turns replay the same id."""
+
+        def __init__(self):
+            self.count = 0
 
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            if not executions:
+            self.count += 1
+            if self.count == 1:
                 return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),))
-            return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 2, "call_001"),))
+            return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, self.count, "call_001"),))
 
-    result = runtime.run_model_loop(mission.mission_id, ReplayModel(), tools=[{"name": "status"}], max_turns=4)
+    result = runtime.run_model_loop(mission.mission_id, ReplayModel(), tools=[{"name": "status"}], max_turns=3)
     assert len(executions) == 1, "a replayed tool_call_id must never execute twice"
     tool_results = result.progress["model_loop"]["tool_results"]
     assert tool_results[1]["ok"] is False
@@ -132,17 +136,20 @@ def test_parallel_results_fold_deterministically(tmp_path, monkeypatch):
     mission = _mission(runtime)
 
     class ParallelModel:
+        def __init__(self):
+            self.count = 0
+
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            done = mission.progress.get("model_loop", {}).get("tool_results")
-            if done:
-                return ModelTurn(turn_id, content="parallel observations complete", finish_reason="stop")
-            return ModelTurn(
-                turn_id,
-                tool_calls=(
-                    _call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),
-                    _call(mission_id, run_id, turn_id, plan_version, 2, "call_002"),
-                ),
-            )
+            self.count += 1
+            if self.count == 1:
+                return ModelTurn(
+                    turn_id,
+                    tool_calls=(
+                        _call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),
+                        _call(mission_id, run_id, turn_id, plan_version, 2, "call_002"),
+                    ),
+                )
+            return ModelTurn(turn_id, content="parallel observations complete", finish_reason="stop")
 
     result = runtime.run_model_loop(mission.mission_id, ParallelModel(), tools=[{"name": "status"}], max_turns=4)
     tool_results = result.progress["model_loop"]["tool_results"]

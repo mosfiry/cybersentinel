@@ -86,8 +86,12 @@ def test_completion_requires_passed_evidence_not_a_claim(tmp_path, monkeypatch):
     mission = _mission(runtime, [{"criterion_id": "goal"}])
 
     class EvidenceThenFinalModel:
+        def __init__(self):
+            self.count = 0
+
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            if not mission.evidence:
+            self.count += 1
+            if self.count == 1:
                 return ModelTurn(
                     turn_id,
                     tool_calls=(
