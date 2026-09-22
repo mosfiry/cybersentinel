@@ -158,5 +158,7 @@ class TestPoisonResistance:
         ingest = IntelIngest(g)
         r1 = ingest.ingest_nvd_item(_nvd_item(), source="nvd", source_class=SourceClass.REAL)
         r2 = ingest.ingest_nvd_item(_nvd_item(), source="nvd", source_class=SourceClass.REAL)
-        assert r1.ingested_entities == 5  # cve + product + version (+2 from first call? no: 3)
+        # one nvd item contributes exactly: cve + product + version = 3 entities
+        assert r1.ingested_entities == 3
         assert r2.ingested_entities == 0
+        assert len(g.entity("CVE-2026-1234").attributes) >= 1
