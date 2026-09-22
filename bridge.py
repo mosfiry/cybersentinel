@@ -3,8 +3,17 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlparse
-from core.config import BRIDGE_HOST, BRIDGE_PORT, BRIDGE_TOKEN
+from core.config import (
+    BRIDGE_HOST,
+    BRIDGE_PORT,
+    BRIDGE_TOKEN,
+    PUBLIC_SESSION_COOKIE,
+    PUBLIC_SESSION_TTL_SECONDS,
+    PUBLIC_WEB_ENABLED,
+    PUBLIC_WEB_ORIGIN,
+)
 from core.engine import status
 from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
@@ -14,6 +23,7 @@ from api.chat import chat, get_session, sse, stream, task_stream, create_task, r
 from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
+from security.public_session import DEFAULT_PUBLIC_SESSIONS
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -23,12 +33,17 @@ MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", 
 class Handler(BaseHTTPRequestHandler):
     server_version = SERVER_VERSION
 
-    def _send(self, code, payload, ctype="application/json; charset=utf-8"):
+    def _send(self, code, payload, ctype="application/json; charset=utf-8", headers=None):
         raw = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -50,6 +65,40 @@ class Handler(BaseHTTPRequestHandler):
     def _chat_auth(self):
         return self.headers.get("X-CyberSentinel-Owner-Token", ""), self.headers.get("X-CyberSentinel-Owner-Session"), self.headers.get("X-CyberSentinel-Owner-Challenge")
 
+    def _public_enabled(self):
+        return PUBLIC_WEB_ENABLED
+
+    def _public_origin_allowed(self):
+        origin = self.headers.get("Origin", "").strip()
+        return not origin or (PUBLIC_WEB_ORIGIN and origin == PUBLIC_WEB_ORIGIN)
+
+    def _public_cookie(self):
+        cookie = SimpleCookie()
+        cookie.load(self.headers.get("Cookie", ""))
+        morsel = cookie.get(PUBLIC_SESSION_COOKIE)
+        return morsel.value if morsel else ""
+
+    def _public_guard(self, *, csrf=True):
+        if not self._public_enabled():
+            self._send(404, {"ok": False, "error": "public_boundary_disabled"})
+            return None
+        if not self._public_origin_allowed():
+            self._send(403, {"ok": False, "error": "origin_not_allowed"})
+            return None
+        try:
+            if csrf:
+                return DEFAULT_PUBLIC_SESSIONS.validate(self._public_cookie(), self.headers.get("X-CSRF-Token"))
+            session = DEFAULT_PUBLIC_SESSIONS.get(self._public_cookie())
+            if session is None:
+                raise PermissionError("public session required")
+            return session
+        except PermissionError as exc:
+            self._send(401, {"ok": False, "error": str(exc)})
+            return None
+
+    def _public_cookie_header(self, session_id, max_age):
+        return f"{PUBLIC_SESSION_COOKIE}={session_id}; Max-Age={max_age}; Path=/; HttpOnly; Secure; SameSite=Lax"
+
     def _send_sse(self, events):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -62,6 +111,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/health":
+            return self._send(200, {"ok": True, "service": PRODUCT_NAME, "version": VERSION})
+        if self.path == "/api/public/health":
+            if not self._public_enabled() or not self._public_origin_allowed():
+                return self._send(404, {"ok": False, "error": "not_found"})
             return self._send(200, {"ok": True, "service": PRODUCT_NAME, "version": VERSION})
         if self.path == "/":
             return self._static("index.html")
@@ -106,6 +159,8 @@ class Handler(BaseHTTPRequestHandler):
             if owner_session and task.owner_session_id != owner_session:
                 return self._send(403, {"ok": False, "error": "task access denied"})
             return self._send(200, {"ok": True, "task": task.to_dict()})
+        if self.path in {"/app.js", "/style.css"}:
+            return self._static(self.path[1:])
         if self.path.startswith("/static/"):
             return self._static(self.path[8:])
         if self.path == "/api/status":
@@ -134,6 +189,25 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
+        if self.path == "/api/public/session":
+            if not self._public_enabled() or not self._public_origin_allowed():
+                return self._send(404, {"ok": False, "error": "public_boundary_disabled"})
+            session = DEFAULT_PUBLIC_SESSIONS.create()
+            return self._send(201, {"ok": True, "session": session.public()}, headers={"Set-Cookie": self._public_cookie_header(session.session_id, PUBLIC_SESSION_TTL_SECONDS)})
+        if self.path == "/api/public/logout":
+            session = self._public_guard(csrf=False)
+            if session is None:
+                return
+            DEFAULT_PUBLIC_SESSIONS.revoke(session.session_id)
+            return self._send(200, {"ok": True}, headers={"Set-Cookie": self._public_cookie_header("", 0)})
+        if self.path == "/api/public/chat":
+            session = self._public_guard(csrf=True)
+            if session is None:
+                return
+            # Public session identity is deliberately not Owner authority.
+            # Do not call the internal chat path until an Owner-approved
+            # identity-to-Owner mapping exists.
+            return self._send(403, {"ok": False, "error": "owner_authorization_required"})
         if not self._bridge_auth():
             return self._send(401, {"ok": False, "error": "bridge authentication required"})
         if self.path == "/api/owner/session":

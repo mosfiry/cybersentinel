@@ -11,6 +11,10 @@ def env(name: str, default: str = "") -> str:
 BRIDGE_HOST = env("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(env("BRIDGE_PORT", "8787"))
 BRIDGE_TOKEN = env("BRIDGE_TOKEN")
+PUBLIC_WEB_ENABLED = env("PUBLIC_WEB_ENABLED", "false").lower() in {"1", "true", "yes"}
+PUBLIC_SESSION_COOKIE = env("PUBLIC_SESSION_COOKIE", "cs_public_session")
+PUBLIC_SESSION_TTL_SECONDS = int(env("PUBLIC_SESSION_TTL_SECONDS", "1800"))
+PUBLIC_WEB_ORIGIN = env("PUBLIC_WEB_ORIGIN")
 DB_PATH = Path(env("DB_PATH", "~/.cybersentinel-x/intel.db")).expanduser()
 
 LLM_BASE_URL = env("LLM_BASE_URL").rstrip("/")
