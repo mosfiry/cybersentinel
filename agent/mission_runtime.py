@@ -14,6 +14,7 @@ from .observation_intelligence import ObservationInterpreter, should_interpret_o
 from .hypotheses import HypothesisEngine, HypothesisState
 from .strategy import StrategyState, decide as decide_strategy
 from .model_protocol import ConversationTurn, NativeModel, ToolCallResult
+from .provider_api import ProviderError
 from .model_intelligence.context import ContextAssembler
 from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
 
@@ -219,7 +220,28 @@ class MissionRuntime:
                 "tool_call_ids": [item.get("tool_call_id", "") for item in progress.get("tool_results", ())],
             }
             messages = assembled.messages
-            turn = model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version)
+            try:
+                turn = model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version)
+            except ProviderError as exc:
+                kind = getattr(exc, "kind", "PROVIDER_FAILURE")
+                failure = {"class": FailureClass.PROVIDER.value, "kind": str(kind), "reason": str(exc), "turn_id": turn_id, "run_id": run_id}
+                mission.failures.append(failure)
+                mission.progress.setdefault("model_failures", []).append(failure)
+                mission.emit(EventType.FAILURE_DETECTED, data=failure)
+                mission.error = f"model provider failure: {kind}"
+                mission.retry_count += 1
+                action = self.recovery_policy.action_for(FailureClass.PROVIDER, mission.retry_count - 1)
+                mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.PROVIDER.value, "kind": str(kind), "recovery": action.value})
+                if action is RecoveryAction.RETRY:
+                    mission.transition(MissionStatus.READY, "provider failure; bounded retry selected")
+                elif action is RecoveryAction.REPLAN:
+                    mission.transition(MissionStatus.REPLANNING, "provider failure; replan selected")
+                else:
+                    mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
+                self.store.save(mission)
+                if mission.is_terminal:
+                    return mission
+                continue
             if auth_context is not None and turn.tool_calls:
                 from dataclasses import replace as replace_dataclass
                 turn = replace_dataclass(turn, tool_calls=tuple(

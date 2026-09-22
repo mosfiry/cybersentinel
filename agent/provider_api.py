@@ -1,7 +1,51 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
+
+
+class ProviderFailureKind(StrEnum):
+    CAPABILITY_UNSUPPORTED = "CAPABILITY_UNSUPPORTED"
+    PROVIDER_FAILURE = "PROVIDER_FAILURE"
+    INVALID_MODEL_RESPONSE = "INVALID_MODEL_RESPONSE"
+    TIMEOUT = "TIMEOUT"
+    AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
+
+
+class ProviderError(RuntimeError):
+    """Typed provider boundary error; never silently changes execution mode."""
+
+    def __init__(self, kind: ProviderFailureKind, message: str, *, provider: str = "", model: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.provider = provider
+        self.model = model
+
+
+class CapabilityUnsupported(ProviderError):
+    def __init__(self, message: str = "provider capability unsupported", **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.CAPABILITY_UNSUPPORTED, message, **kwargs)
+
+
+class ProviderFailure(ProviderError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.PROVIDER_FAILURE, message, **kwargs)
+
+
+class InvalidModelResponse(ProviderError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.INVALID_MODEL_RESPONSE, message, **kwargs)
+
+
+class ProviderTimeout(ProviderError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.TIMEOUT, message, **kwargs)
+
+
+class ProviderAuthenticationFailure(ProviderError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.AUTHENTICATION_FAILURE, message, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -73,3 +117,10 @@ def response_from_legacy(value: dict[str, Any], *, provider: str, model: str, ca
         usage=value.get("usage") or {},
         capability=capability,
     )
+
+
+__all__ = [
+    "CapabilityUnsupported", "InvalidModelResponse", "ProviderAuthenticationFailure", "ProviderError",
+    "ProviderFailure", "ProviderFailureKind", "ProviderResponse", "ProviderTimeout", "ProviderCapabilities", "ToolCall",
+    "response_from_legacy",
+]

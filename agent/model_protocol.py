@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence
 import uuid
 
+from .provider_api import CapabilityUnsupported
+
 
 @dataclass(frozen=True)
 class ConversationTurn:
@@ -122,9 +124,10 @@ class RouterNativeModel:
         payload = [item.to_dict() for item in messages]
         try:
             response = self.router.tool_calling(payload, list(tools))
-        except (AttributeError, NotImplementedError, RuntimeError):
+        except CapabilityUnsupported:
             # Text-capable providers remain on the same canonical MissionRuntime;
-            # their output is still normalized into untrusted typed proposals.
+            # a real native provider failure must propagate into MissionRuntime
+            # recovery and must never be disguised as a generate() response.
             response = self.router.generate(payload)
         return model_turn_from_provider(response, mission_id=mission_id, run_id=run_id, turn_id=turn_id, request_id="", plan_version=plan_version)
 

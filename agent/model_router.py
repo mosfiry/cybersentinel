@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from .provider_api import ProviderCapabilities, ProviderResponse, response_from_legacy
+from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, response_from_legacy
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
 
@@ -78,7 +78,20 @@ class ModelRouter:
             return value
         if isinstance(value, dict):
             return response_from_legacy(value, provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"), capability=capability)
-        raise TypeError("provider returned unsupported response")
+        raise InvalidModelResponse("provider returned unsupported response", provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"))
+
+    @staticmethod
+    def _classify(exc: Exception, provider: Any) -> ProviderError:
+        details = {"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown")}
+        if isinstance(exc, ProviderError):
+            return exc
+        if isinstance(exc, TimeoutError):
+            return ProviderTimeout(str(exc) or "provider timeout", **details)
+        if isinstance(exc, PermissionError):
+            return ProviderAuthenticationFailure(str(exc) or "provider authentication failed", **details)
+        if isinstance(exc, (TypeError, ValueError)):
+            return InvalidModelResponse(str(exc) or "invalid provider response", **details)
+        return ProviderFailure(f"{type(exc).__name__}: {exc}", **details)
 
     def generate(self, messages: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
@@ -96,9 +109,10 @@ class ModelRouter:
                 self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return response
             except Exception as exc:
-                errors.append(f"{getattr(provider, 'name', 'unknown')}: {type(exc).__name__}")
-                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_reason": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
-        raise RuntimeError("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured")
+                failure = self._classify(exc, provider)
+                errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
+                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
+        raise ProviderFailure("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured")
 
     def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
@@ -116,11 +130,12 @@ class ModelRouter:
                 self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return result
             except Exception as exc:
-                errors.append(f"{getattr(provider, 'name', 'unknown')}: {type(exc).__name__}")
-                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_reason": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
+                failure = self._classify(exc, provider)
+                errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
+                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
         if errors:
-            raise RuntimeError("native tool providers failed: " + "; ".join(errors))
-        raise NotImplementedError("no provider supports native tool calling")
+            raise ProviderFailure("native tool providers failed: " + "; ".join(errors))
+        raise CapabilityUnsupported("no provider supports native tool calling")
 
     def chat(self, messages: list[dict], temperature: float | None = None, *, tools: list[dict] | None = None, reasoning_profile: ReasoningProfile | None = None) -> dict:
         if tools:

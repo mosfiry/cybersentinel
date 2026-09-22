@@ -20,10 +20,11 @@ from security.owner_session import consume_owner_challenge
 from security.scope_store import get_snapshot
 from tools.registry import REGISTRY, execute as execute_tool, get_tool
 
-from .mission import Mission, MissionStore
+from .mission import Mission, MissionStatus, MissionStore
 from .mission_runtime import MissionRuntime
 from .planning import Plan, PlanStep, RecoveryPolicy, TaskProfile, select_reasoning_profile
 from .provider_api import ToolCall
+from .provider_api import CapabilityUnsupported
 from .context import ContextEngine, ExecutionState, KnowledgeProvider
 from .observation_intelligence import ObservationInterpreter
 from .knowledge_context import TypedKnowledgeRetriever
@@ -112,7 +113,7 @@ class AgentCore:
         messages = context.provider_messages()
         try:
             return self.router.tool_calling(messages, self._schemas(), reasoning_profile=profile)
-        except (AttributeError, NotImplementedError):
+        except CapabilityUnsupported:
             try:
                 return self.router.generate(messages, reasoning_profile=profile)
             except Exception as exc:
@@ -305,10 +306,28 @@ class AgentCore:
         mission = self.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
-        ok, reason = verify_owner("Owner resume mission", owner_token)
-        if not ok:
-            raise PermissionError(reason)
-        policy_context = policy_context_from_snapshot(OwnerPolicySnapshot(**dict(mission.policy_snapshot or {}))) if mission.policy_snapshot else ""
+        try:
+            evidence = authenticate_owner("Owner resume mission", owner_token, mission.request_id)
+        except PermissionError as exc:
+            if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
+                if mission.status is MissionStatus.RECOVERY_REQUIRED:
+                    mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation required after restore")
+                else:
+                    mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation failed after restore")
+                mission.recovery_events.append({"event": "owner_revalidation_failed", "reason": str(exc)})
+                self.store.save(mission)
+            raise
+        fresh_snapshot = capture_policy_snapshot(mission.request_id, evidence)
+        old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
+        fresh_scope = get_snapshot(str(old_scope_id)) if old_scope_id else None
+        fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope)
+        mission.authorization_context = fresh_context.to_dict()
+        mission.policy_snapshot = fresh_snapshot.to_dict()
+        mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "owner_token", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})
+        if mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
+            mission.transition(MissionStatus.READY, "owner authorization revalidated")
+        self.store.save(mission)
+        policy_context = policy_context_from_snapshot(fresh_snapshot)
         runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal))
         return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations)
 
