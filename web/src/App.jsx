@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useTask } from "./hooks/useTask.js";
 import { useEventStream } from "./hooks/useEventStream.js";
 import { createStore, initialRuntimeState, runtimeReducer } from "./state/store.js";
@@ -12,7 +12,7 @@ import { health } from "./api/bridge.js";
  * Thin composition root — NOT a God Component. All data comes from the
  * verified backend contract through the api/ layer; capabilities without
  * backend contracts render explicit blocked states (see api/adapters.js).
- * Credentials live in memory only (api/config.js).
+ * Credentials live in memory only (api/config.js) — never in bundle or localStorage.
  */
 
 const store = createStore(initialRuntimeState, runtimeReducer);
@@ -32,12 +32,19 @@ export default function App() {
   const onResync = useCallback(async () => { if (taskId) await refresh(); }, [taskId, refresh]);
   useEventStream(taskId || null, { onEvent, onStatus, onResync });
 
-  store.subscribe((s) => setConn(s.connection));
-  store.subscribe((s) => setEvents(s.events.slice(-200)));
+  // Single subscription for the whole mount: connection + bounded event tail.
+  useEffect(() => {
+    const onState = (s) => {
+      setConn(s.connection);
+      setEvents(s.events.slice(-200));
+    };
+    onState(store.getState());
+    return store.subscribe(onState);
+  }, []);
 
   const checkHealth = async () => {
     setHealthError(null);
-    try { const h = await health(); setHealthInfo(h); }
+    try { setHealthInfo(await health()); }
     catch (e) { setHealthError(e); }
   };
 
@@ -57,6 +64,7 @@ export default function App() {
       </header>
 
       <div className="flex min-h-0 flex-1">
+        {/* left: task lookup + controls */}
         <aside className="flex w-64 shrink-0 flex-col border-r border-slate-800 bg-slate-900/40">
           <div className="border-b border-slate-800 p-2">
             <input value={taskIdInput} onChange={(e) => setTaskIdInput(e.target.value)}
@@ -85,6 +93,7 @@ export default function App() {
           </div>
         </aside>
 
+        {/* center: task runtime */}
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-auto p-3">
             {!taskId && <EmptyState title="No task open" hint="Enter a backend-issued task id to open its live stream." />}
