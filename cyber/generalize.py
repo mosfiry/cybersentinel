@@ -11,7 +11,10 @@ strict because this is exactly where hallucination would live:
   (promote_with_evidence), otherwise it stays TENTATIVE or UNKNOWN.
 * Below the similarity threshold the honest answer is UNKNOWN with the reason
   recorded - the engine refuses to force a match.
-* Authority-bearing keys in behavior descriptions are stripped (poison).
+* Authority-bearing keys in behavior descriptions are stripped (poison), and
+  authority-bearing VOCABULARY inside the description text is neutralized:
+  an injection attempt is never a behavioral signal and never leaks into any
+  output.
 """
 
 from __future__ import annotations
@@ -23,8 +26,11 @@ from typing import Any
 from cyber.intel_ingest import _sanitize
 from cyber.knowledge_model import CyberKnowledgeGraph
 
-
 _TECHNIQUE_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
+
+# authority-bearing vocabulary neutralized inside free-text descriptions:
+# a poison attempt must never become a keyword signal nor appear in output
+_POISON_VOCAB = re.compile(r"owner_instruction|authorization|grant-all|identity|scope_grant")
 
 # similarity threshold below which we refuse to map (honest UNKNOWN)
 SIMILARITY_THRESHOLD = 0.35
@@ -80,6 +86,7 @@ class UnseenTechniqueMatcher:
     def extract_features(self, description: str, *, tactic: str = "") -> BehaviorFeatures:
         safe = _sanitize({"text": description})
         text = str(safe.get("text", "")).lower()
+        text = _POISON_VOCAB.sub(" ", text)
         known_tactics = ("initial-access", "execution", "persistence", "privilege-escalation",
                          "defense-evasion", "credential-access", "discovery", "lateral-movement",
                          "collection", "command-and-control", "exfiltration", "impact")
@@ -141,7 +148,8 @@ class UnseenTechniqueMatcher:
 
     def promote_with_evidence(self, technique_id: str, *, evidence_statement: str) -> MappedHypothesis:
         if not _TECHNIQUE_ID.match(technique_id or ""):
-            raise ValueError("refusing to promote an invented technique id: " + str(technique_id))
+            raise ValueError(
+                "refusing to promote an invented technique id: " + str(technique_id))
         entity = self.graph.entity(technique_id)
         if entity is None:
             raise ValueError("refusing to promote a technique absent from the graph: " + str(technique_id))
