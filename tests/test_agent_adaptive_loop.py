@@ -1,4 +1,5 @@
 from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 
 from pathlib import Path
 import json
@@ -22,8 +23,7 @@ def make_runtime(tmp_path, executor, *, replanner=None, interpreter=None):
         MissionStore(Path(tmp_path) / "missions.sqlite3"),
         executor=executor,
         replanner=replanner,
-        interpreter=interpreter,
-    )
+        interpreter=interpreter, authorization_snapshot_factory=make_test_snapshot)
 
 
 def initial_plan(objective="investigate"):

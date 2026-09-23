@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import os
-import subprocess
 import sys
 
 MAX_ARG_LENGTH = 256
@@ -28,6 +27,46 @@ class ToolSpec:
     handler: Callable[[str | None], Any]
     owner_only: bool = False
     scope_required: bool = False
+    version: str = "1.0.0"
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    output_schema: dict[str, Any] = field(default_factory=dict)
+    network_access: str = "none"
+    filesystem_access: str = "none"
+    process_access: str = "none"
+    credential_access: str = "none"
+    scope_requirements: tuple[str, ...] = ()
+    timeout: int = DEFAULT_TOOL_TIMEOUT
+    rate_limit: str = "bounded"
+    evidence_requirements: tuple[str, ...] = ("authorization_decision", "observation")
+
+    @property
+    def tool_id(self) -> str:
+        return self.name
+
+    @property
+    def required_authorization(self) -> str:
+        if self.scope_required:
+            return "owner_and_scope_snapshot"
+        return "owner" if self.requires_owner else "none"
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "tool_id": self.tool_id,
+            "version": self.version,
+            "description": self.description,
+            "input_schema": self.input_schema or {"type": "string" if self.argument_type is str else "null"},
+            "output_schema": self.output_schema or {"type": "object"},
+            "risk_class": self.risk_class,
+            "required_authorization": self.required_authorization,
+            "network_access": self.network_access,
+            "filesystem_access": self.filesystem_access,
+            "process_access": self.process_access,
+            "credential_access": self.credential_access,
+            "scope_requirements": list(self.scope_requirements),
+            "timeout": self.timeout,
+            "rate_limit": self.rate_limit,
+            "evidence_requirements": list(self.evidence_requirements),
+        }
 
     def validate(self, argument: Any) -> tuple[bool, str]:
         if self.argument_type is None:
@@ -147,26 +186,19 @@ def _unwatch(argument):
     return {"keyword": argument, "watches": watches()}
 
 
-def _run_project_tests(argument):
-    root = Path(os.getenv("CYBERSENTINEL_TEST_ROOT", Path.cwd())).expanduser().resolve()
-    target = (root / (argument or ".")).resolve()
-    if root != target and root not in target.parents:
-        raise ValueError("project directory is outside the configured test root")
-    if not target.is_dir():
-        raise ValueError("project directory does not exist")
+def _run_project_tests(argument, *, workspace=None):
+    if workspace is None:
+        raise PermissionError("run_project_tests requires governed Workspace")
+    target = argument or "."
     try:
-        completed = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q"],
-            cwd=target,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return {"ok": False, "timed_out": True, "returncode": None, "output": (exc.stdout or "")[-4000:]}
-    output = ((completed.stdout or "") + (completed.stderr or ""))[-4000:]
-    return {"ok": completed.returncode == 0, "timed_out": False, "returncode": completed.returncode, "output": output}
+        if not workspace.resolve(target).is_dir():
+            raise ValueError("project directory does not exist")
+    except Exception as exc:
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError("project directory is outside the configured test root") from exc
+    result = workspace.develop((sys.executable, "-m", "pytest", "-q"), cwd=target, timeout=60)
+    return {"ok": result.ok, "timed_out": result.timed_out, "returncode": result.exit_code, "output": (result.stdout + result.stderr)[-4000:]}
 
 
 def _red_team_assess(argument):
@@ -232,6 +264,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "risk_class": spec.risk_class,
             "owner_required": spec.requires_owner,
             "parameters": parameters,
+            **spec.metadata(),
         })
     return definitions
 
@@ -240,7 +273,7 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
@@ -274,12 +307,32 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             )
             if not decision.allowed:
                 raise PermissionError("scope denied: " + decision.reason)
+    if mission_authorization is not None:
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
+        allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
+        if not allowed:
+            raise PermissionError("mission authorization blocked: " + reason)
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)
-    limit = timeout or TOOL_TIMEOUTS.get(name, DEFAULT_TOOL_TIMEOUT)
+    limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
-    future = executor.submit(spec.handler, argument)
+    if name == "run_project_tests":
+        workspace_authorization = mission_authorization
+        if workspace is None:
+            from datetime import datetime, timedelta, timezone
+            from security.mission_authorization import MissionAuthorizationSnapshot
+            root = Path(os.getenv("CYBERSENTINEL_TEST_ROOT", Path.cwd())).expanduser().resolve()
+            legacy_owner = getattr(authorization_decision, "owner_evidence_fingerprint", "legacy-compatibility")
+            compatibility_snapshot = MissionAuthorizationSnapshot.create(owner_identity=legacy_owner, mission_id=str(request_id or "legacy-request"), target_identity="legacy-workspace", scope=("workspace",), allowed_actions=(name,), forbidden_actions=(), allowed_tools=(name,), time_window={"timezone": "UTC"}, max_duration=60, rate_limits={name: 1}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("legacy-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(root)}, policy_version="compatibility", owner_approval=legacy_owner, created_at=datetime.now(timezone.utc).isoformat(), expires_at=(datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat())
+            from workspace import Workspace
+            workspace = Workspace(root, authorization_snapshot=compatibility_snapshot)
+            workspace_authorization = compatibility_snapshot
+        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
+        future = executor.submit(spec.handler, argument, workspace=workspace)
+    else:
+        future = executor.submit(spec.handler, argument)
     try:
         return future.result(timeout=limit)
     except FutureTimeout as exc:

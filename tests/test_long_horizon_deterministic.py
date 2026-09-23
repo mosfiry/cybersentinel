@@ -1,3 +1,5 @@
+from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 """Round 2 P0-3 - long-horizon trajectory (MOCK-VERIFIED, 23 model turns).
 
 HONESTY LABEL: MOCK-VERIFIED. This harness drives the REAL MissionRuntime
@@ -13,7 +15,6 @@ failure), interpretation, hypothesis updates, replan decisions, evidence, and
 final deterministic goal verification.
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 
@@ -84,7 +85,7 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
 
     monkeypatch.setattr(tools.registry, "execute", fixture)
 
-    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {})
+    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("audit asset A across a long horizon").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )

@@ -1,3 +1,5 @@
+from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 """Round 2 P0-3 - real-provider long-horizon harness.
 
 HONESTY LABEL: UNVERIFIED - REAL PROVIDER UNAVAILABLE.
@@ -13,7 +15,6 @@ When both are present the harness asserts a 20+ model-turn trajectory with
 real tool calls, observations, evidence, and deterministic verification.
 """
 
-from __future__ import annotations
 
 import importlib
 import os
@@ -41,7 +42,7 @@ def test_real_provider_long_horizon(tmp_path):
     router = getattr(importlib.import_module(module_name), function_name)()
     assert callable(getattr(router, "tool_calling", None)), "router must expose tool_calling()"
 
-    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {})
+    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("live long-horizon audit").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="live"
     )

@@ -83,11 +83,13 @@ def main() -> None:
         )
     result = {
         "status": "PASS" if mission.status.value == "GOAL_COMPLETED" else "INCOMPLETE",
+        "request_id": mission.request_id,
         "provider": router.status(),
         "mission_id": mission.mission_id,
         "mission_status": mission.status.value,
         "plan_versions": [item.get("version") for item in mission.plan_history],
         "observations": len(mission.observations),
+        "evidence_count": len(mission.evidence),
         "knowledge_objects": len(mission.knowledge_context),
         "hypotheses": mission.hypotheses,
         "interpretations": len(mission.interpretations),

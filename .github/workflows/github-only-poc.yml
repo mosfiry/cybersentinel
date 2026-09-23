@@ -1,0 +1,105 @@
+name: GitHub-only CyberSentinel POC
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_iterations:
+        description: "Maximum bounded MissionRuntime iterations"
+        required: false
+        default: "4"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-only-poc-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bounded-poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      POC_OUTPUT: poc-output
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout audited commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt pytest
+
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
+      - name: Run existing tests
+        run: python -m pytest -q
+
+      - name: Initialize bounded proof workspace
+        run: |
+          set -euo pipefail
+          mkdir -p "$POC_OUTPUT"
+          cat > "$POC_OUTPUT/run-context.json" <<EOF
+          {
+            "status": "WORKFLOW_STARTED",
+            "commit_sha": "${GITHUB_SHA}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "ref": "${GITHUB_REF}",
+            "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Execute bounded REAL provider mission when credentials are available
+        env:
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OWNER_TOKEN: ${{ secrets.OWNER_TOKEN }}
+          REAL_PROVIDER_MODEL: ${{ secrets.REAL_PROVIDER_MODEL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_API_KEY:-}" || -z "${OWNER_TOKEN:-}" ]]; then
+            cat > "$POC_OUTPUT/real-mission.json" <<'EOF'
+          {
+            "status": "NOT EXECUTED — credentials unavailable",
+            "request_id": null,
+            "mission_id": null,
+            "provider": null,
+            "model": null,
+            "evidence_count": 0,
+            "verification": null,
+            "reason": "Required provider and Owner credentials were not supplied to this workflow. No mission was started."
+          }
+          EOF
+            exit 0
+          fi
+          python scripts/run_real_provider_mission.py \
+            --max-iterations "${{ inputs.max_iterations }}" \
+            --artifact "$POC_OUTPUT/real-mission.json"
+
+      - name: Add artifact hash and validate non-secret proof
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$POC_OUTPUT/real-mission.json" ]]; then
+            sha256sum "$POC_OUTPUT/real-mission.json" > "$POC_OUTPUT/real-mission.sha256"
+          fi
+          if grep -RInE 'gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|OWNER_TOKEN|BRIDGE_TOKEN|OPENAI_API_KEY' "$POC_OUTPUT"; then
+            echo "Potential secret material found in proof output; refusing artifact publication."
+            exit 1
+          fi
+
+      - name: Upload non-secret proof artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cybersentinel-github-only-poc-${{ github.run_id }}
+          path: poc-output/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,3 +1,5 @@
+from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 """Round 2 P0-4 - deterministic failure -> recovery -> replan semantics.
 
 Exercises the real MissionRuntime with the real RecoveryPolicy. Invariants:
@@ -9,7 +11,6 @@ Exercises the real MissionRuntime with the real RecoveryPolicy. Invariants:
 - recovery is bounded: no infinite retry loop exists in the policy matrix.
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from agent.planning import (
 
 
 def _runtime(tmp_path):
-    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {})
+    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
 def _mission(runtime):

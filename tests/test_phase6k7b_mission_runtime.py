@@ -1,4 +1,5 @@
 from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from agent.planning import FailureClass, Plan, PlanStep
 
 
 def runtime(tmp_path, executor, **kwargs):
-    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=executor, **kwargs)
+    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=executor, **kwargs, authorization_snapshot_factory=make_test_snapshot)
 
 
 def test_end_to_end_observation_failure_replan_verify_and_persistence(tmp_path):
