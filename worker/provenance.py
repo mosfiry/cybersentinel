@@ -18,7 +18,7 @@ class ProvenanceLayer(str, Enum):
     EXTERNAL_DATA = "EXTERNAL_DATA"
 
 
-# Fixed order: higher index = lower authority.
+# Fixed order: lower index = higher authority.
 PROVENANCE_HIERARCHY: tuple[ProvenanceLayer, ...] = (
     ProvenanceLayer.OWNER_INSTRUCTION,
     ProvenanceLayer.SYSTEM_PLATFORM,
@@ -32,30 +32,36 @@ PROVENANCE_HIERARCHY: tuple[ProvenanceLayer, ...] = (
 
 _RANK = {layer: index for index, layer in enumerate(PROVENANCE_HIERARCHY)}
 
-# Layers that may NEVER be claimed by non-owner sources regardless of
-# direction: these are authority layers, and nothing a worker produces
-# (capability, evidence, model output, external data) can grant them.
+# Layers that may NEVER be claimed by non-owner sources: authority layers.
+# Nothing a worker produces (capability, evidence, model output, external
+# data) can grant them.
 AUTHORITY_LAYERS: frozenset[ProvenanceLayer] = frozenset({
     ProvenanceLayer.OWNER_INSTRUCTION,
     ProvenanceLayer.OWNER_POLICY,
     ProvenanceLayer.AUTHORIZATION_SCOPE,
 })
 
-# Provenance of anything produced by the worker package:
+# The only provenance layers worker-produced data may ever claim.
 WORKER_PROVENANCE_LAYERS: frozenset[ProvenanceLayer] = frozenset({
-    ProvenanceLayer.EXTERNAL_DATA,
-    ProvenanceLayer.MODEL_OUTPUT,
     ProvenanceLayer.TOOL_RUNTIME,
+    ProvenanceLayer.MODEL_OUTPUT,
+    ProvenanceLayer.EXTERNAL_DATA,
 })
 
 
 def promotion_allowed(source: ProvenanceLayer, claimed: ProvenanceLayer) -> bool:
-    """Authority boundary check.
+    """Authority boundary check: may data of provenance `source` be
+    recorded as provenance `claimed`?
 
-    A worker-derived source layer may NEVER claim an authority layer, even
-    though authority layers sit above it in the hierarchy. Capability,
-    evidence and findings are facts about the world, not grants of power.
+    Rules (deterministic, no exceptions):
+      * Worker-derived data (TOOL_RUNTIME / MODEL_OUTPUT / EXTERNAL_DATA)
+        may only ever be recorded as one of those same worker layers — it
+        can never claim an authority layer (OWNER_INSTRUCTION, OWNER_POLICY,
+        AUTHORIZATION_SCOPE) or any system layer above it. Capability,
+        evidence and findings are facts about the world, not grants of power.
+      * For non-worker sources, only a same-or-lower authority claim is
+        allowed (rank(claimed) >= rank(source)); upward promotion is denied.
     """
-    if source in WORKER_PROVENANCE_LAYERS and claimed in AUTHORITY_LAYERS:
-        return False
-    return _RANK[claimed] >= _RANK[source] is False or _RANK[source] <= _RANK[claimed]
+    if source in WORKER_PROVENANCE_LAYERS:
+        return claimed in WORKER_PROVENANCE_LAYERS
+    return _RANK[claimed] >= _RANK[source]

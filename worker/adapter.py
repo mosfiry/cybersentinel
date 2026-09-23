@@ -41,14 +41,15 @@ class LiveResearchWorkerAdapter:
          path (Owner policy -> MissionAuthorizationSnapshot -> Scope
          Firewall) remains the only authority.
       4. blocked capabilities produce BLOCKED plans, never EXECUTE_ANYWAY.
-      5. evidence is accepted only with honest provenance (EXTERNAL_DATA)
-         and validated structure.
+      5. evidence is accepted only with honest provenance (worker layers
+         only: TOOL_RUNTIME / MODEL_OUTPUT / EXTERNAL_DATA) and validated
+         structure.
     """
 
     def __init__(self, capability_set: WorkerCapabilitySet):
         self.capability_set = capability_set
 
-    # --- capability != authorization: fixed, unoverridable facts ---
+    # --- capability != authorization: fixed, unoverridable fact ---
 
     @staticmethod
     def capability_grants_authority() -> bool:
@@ -56,24 +57,24 @@ class LiveResearchWorkerAdapter:
         return False
 
     def plan_task(self, task_id: str, requirements: Iterable[CapabilityRequirement]) -> WorkerTaskPlan:
-        check = check_requirements(requirements, self.capability_set)
+        reqs = tuple(requirements)  # materialize once; no double consumption
+        check = check_requirements(reqs, self.capability_set)
         return WorkerTaskPlan(
             task_id=task_id,
-            requirements=tuple(requirements),
+            requirements=reqs,
             check=check,
-            authorization_required=True,
-            dispatchable=check.allowed,
+            authorization_required=True,  # capability allowed != authorized
+            dispatchable=check.allowed,     # dispatchable refers ONLY to capability
         )
 
     def accept_evidence(self, observation: WorkerObservation) -> None:
         """Validate worker evidence before it can enter the evidence chain.
 
-        Rejects any attempt to smuggle authority provenance in as data.
-        (Acceptance here is structural validation only; the evidence chain
-        itself and finding validation stay inside CyberSentinel.)
+        Structural validation only. The evidence chain itself and finding
+        validation stay inside CyberSentinel's existing architecture.
         """
         if not promotion_allowed(observation.provenance, ProvenanceLayer.TOOL_RUNTIME):
-            # Worker evidence claiming OWNER/AUTHORITY layers is a hard error.
+            # Worker evidence claiming OWNER/AUTHORITY/SYSTEM layers is a hard error.
             raise ValueError("evidence provenance violates authority boundary: " + observation.provenance.value)
         if not observation.request_id or not observation.worker_id:
             raise ValueError("evidence missing request_id/worker_id")
