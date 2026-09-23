@@ -17,13 +17,13 @@
 from .capability import CapabilityStatus, WorkerCapability, WorkerCapabilitySet, VIBE_CAPABILITY_SET
 from .requirements import CapabilityRequirement, CapabilityCheckResult, RequirementDecision, check_requirements
 from .provenance import ProvenanceLayer, PROVENANCE_HIERARCHY, promotion_allowed
-from .evidence import EvidenceClass, ObservationKind, WorkerObservation, finding_status_from_observation
+from .evidence import EvidenceClass, FindingStatus, ObservationKind, WorkerObservation, finding_status_from_observation
 from .adapter import LiveResearchWorkerAdapter, WorkerTaskPlan
 
 __all__ = [
     "CapabilityStatus", "WorkerCapability", "WorkerCapabilitySet", "VIBE_CAPABILITY_SET",
     "CapabilityRequirement", "CapabilityCheckResult", "RequirementDecision", "check_requirements",
     "ProvenanceLayer", "PROVENANCE_HIERARCHY", "promotion_allowed",
-    "EvidenceClass", "ObservationKind", "WorkerObservation", "finding_status_from_observation",
+    "EvidenceClass", "FindingStatus", "ObservationKind", "WorkerObservation", "finding_status_from_observation",
     "LiveResearchWorkerAdapter", "WorkerTaskPlan",
 ]

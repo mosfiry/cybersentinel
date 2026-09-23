@@ -160,7 +160,7 @@ def test_provenance_no_promotion_of_worker_data_to_authority():
 
 
 def test_evidence_cannot_claim_authority_provenance(vibe):
-    from worker import LiveResearchWorkerAdapter, WorkerObservation, ObservationKind, EvidenceClass
+    from worker import LiveResearchWorkerAdapter, WorkerObservation, ObservationKind, EvidenceClass, ProvenanceLayer
     adapter = LiveResearchWorkerAdapter(vibe)
     with pytest.raises(ValueError):
         WorkerObservation(
