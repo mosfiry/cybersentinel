@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { useTask } from "./hooks/useTask.js";
 import { useEventStream } from "./hooks/useEventStream.js";
 import { createStore, initialRuntimeState, runtimeReducer } from "./state/store.js";
+import { ChatPanel } from "./panels/ChatPanel.jsx";
 import { TerminalPanel } from "./panels/TerminalPanel.jsx";
 import { ActivityTimeline, TaskHeader } from "./components/ActivityView.jsx";
 import { ConnectionChip } from "./components/StateChip.jsx";
@@ -9,15 +10,23 @@ import { ErrorState, LoadingState, EmptyState } from "./components/ErrorState.js
 import { health } from "./api/bridge.js";
 
 /*
- * Thin composition root — NOT a God Component. All data comes from the
- * verified backend contract through the api/ layer; capabilities without
- * backend contracts render explicit blocked states (see api/adapters.js).
- * Credentials live in memory only (api/config.js) — never in bundle or localStorage.
+ * Thin composition root — NOT a God Component. The primary experience is the
+ * conversation with the agent (verified /api/chat/stream + /api/missions
+ * contracts). Task runtime and one-shot terminal remain available as tabs.
+ * Credentials live in memory only (api/config.js) — never in bundle or
+ * localStorage.
  */
 
 const store = createStore(initialRuntimeState, runtimeReducer);
 
+const TABS = [
+  { id: "chat", label: "Conversation" },
+  { id: "task", label: "Task runtime" },
+  { id: "terminal", label: "Terminal" },
+];
+
 export default function App() {
+  const [tab, setTab] = useState("chat");
   const [taskId, setTaskId] = useState("");
   const [taskIdInput, setTaskIdInput] = useState("");
   const [healthInfo, setHealthInfo] = useState(null);
@@ -53,6 +62,14 @@ export default function App() {
       style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
       <header className="flex h-9 shrink-0 items-center gap-3 border-b border-slate-800 bg-slate-900 px-3">
         <span className="text-xs font-bold">CyberSentinel <span className="text-emerald-400">X</span></span>
+        <nav className="flex items-center gap-1" aria-label="Views">
+          {TABS.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              className={"rounded px-2 py-0.5 text-[10px] " + (tab === t.id ? "bg-slate-800 text-emerald-300" : "text-slate-400 hover:bg-slate-800/60")}>
+              {t.label}
+            </button>
+          ))}
+        </nav>
         <button onClick={checkHealth} className="rounded border border-slate-700 px-2 py-0.5 text-[10px] hover:bg-slate-800">
           check backend
         </button>
@@ -63,57 +80,72 @@ export default function App() {
         </div>
       </header>
 
-      <div className="flex min-h-0 flex-1">
-        {/* left: task lookup + controls */}
-        <aside className="flex w-64 shrink-0 flex-col border-r border-slate-800 bg-slate-900/40">
-          <div className="border-b border-slate-800 p-2">
-            <input value={taskIdInput} onChange={(e) => setTaskIdInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") setTaskId(taskIdInput.trim()); }}
-              placeholder="task id (backend-issued)"
-              aria-label="Task id"
-              className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] outline-none focus:border-emerald-600" />
-            <button onClick={() => setTaskId(taskIdInput.trim())}
-              className="mt-1 w-full rounded border border-emerald-600/50 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/20">
-              Open task stream
-            </button>
-          </div>
-          {task && (
-            <div className="space-y-1 p-2">
-              {["pause", "resume", "cancel"].map((a) => (
-                <button key={a} onClick={() => control(a).catch(() => {})}
-                  className="w-full rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-800">
-                  {a} task
-                </button>
-              ))}
-            </div>
-          )}
-          <div className="mt-auto border-t border-slate-800 p-2 text-[9px] leading-4 text-slate-500">
-            Workspace / missions list / git / evidence / findings / scheduler:
-            backend contracts not yet available — adapters fail loudly, no fake data.
-          </div>
-        </aside>
+      {tab === "chat" && (
+        <div className="min-h-0 flex-1">
+          <ChatPanel />
+        </div>
+      )}
 
-        {/* center: task runtime */}
-        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div className="min-h-0 flex-1 overflow-auto p-3">
-            {!taskId && <EmptyState title="No task open" hint="Enter a backend-issued task id to open its live stream." />}
-            {taskId && loading && <LoadingState label="Fetching task snapshot…" />}
-            {taskId && error && <ErrorState error={error} onRetry={refresh} />}
-            {taskId && !loading && !error && task && <TaskHeader task={task} state={state} />}
-            <div className="mt-2">
-              <ActivityTimeline events={events} />
+      {tab !== "chat" && (
+        <div className="flex min-h-0 flex-1">
+          {/* left: task lookup + controls */}
+          <aside className="flex w-64 shrink-0 flex-col border-r border-slate-800 bg-slate-900/40">
+            <div className="border-b border-slate-800 p-2">
+              <input value={taskIdInput} onChange={(e) => setTaskIdInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") setTaskId(taskIdInput.trim()); }}
+                placeholder="task id (backend-issued)"
+                aria-label="Task id"
+                className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] outline-none focus:border-emerald-600" />
+              <button onClick={() => setTaskId(taskIdInput.trim())}
+                className="mt-1 w-full rounded border border-emerald-600/50 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/20">
+                Open task stream
+              </button>
             </div>
-          </div>
-          <div className="h-56 shrink-0 border-t border-slate-800">
-            <TerminalPanel />
-          </div>
-        </main>
-      </div>
+            {task && (
+              <div className="space-y-1 p-2">
+                {["pause", "resume", "cancel"].map((a) => (
+                  <button key={a} onClick={() => control(a).catch(() => {})}
+                    className="w-full rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-800">
+                    {a} task
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="mt-auto border-t border-slate-800 p-2 text-[9px] leading-4 text-slate-500">
+              Workspace / git / findings / scheduler: backend contracts not yet
+              available — adapters fail loudly, no fake data. Mission evidence is
+              available per mission via /api/missions/{"{id}"}/evidence.
+            </div>
+          </aside>
+
+          {/* center */}
+          <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {tab === "task" && (
+              <>
+                <div className="min-h-0 flex-1 overflow-auto p-3">
+                  {!taskId && <EmptyState title="No task open" hint="Enter a backend-issued task id to open its live stream." />}
+                  {taskId && loading && <LoadingState label="Fetching task snapshot…" />}
+                  {taskId && error && <ErrorState error={error} onRetry={refresh} />}
+                  {taskId && !loading && !error && task && <TaskHeader task={task} state={state} />}
+                  <div className="mt-2">
+                    <ActivityTimeline events={events} />
+                  </div>
+                </div>
+              </>
+            )}
+            {tab === "terminal" && (
+              <div className="min-h-0 flex-1">
+                <TerminalPanel tall />
+              </div>
+            )}
+          </main>
+        </div>
+      )}
 
       <footer className="flex h-6 shrink-0 items-center gap-3 border-t border-slate-800 bg-slate-900 px-3 text-[10px] text-slate-500">
         <span>secrets in bundle/localStorage: none (memory-only session)</span>
         <span>authorization: backend-enforced</span>
-        <span className="ml-auto">verified contracts: bridge.py @ main</span>
+        <span className="ml-auto">verified contracts: bridge.py + api/chat.py + api/missions.py @ main</span>
       </footer>
     </div>
   );

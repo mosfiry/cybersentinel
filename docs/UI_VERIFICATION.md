@@ -1,28 +1,26 @@
-# UI VERIFICATION — production integration stage
+# UI Verification (honesty-first)
 
-Honesty rules applied: PASS = tested; IMPLEMENTED = code exists;
-NOT VERIFIED = not tested in this environment.
+## Verified in this phase (source-level, agent environment)
+- Every consumed endpoint re-read from bridge.py / api/chat.py /
+  api/missions.py / agent/mission.py / agent/trajectory.py on main.
+- Chat SSE wire format: event name + JSON data blocks (api/chat.py sse()).
+- MissionStatus enum and trajectory EventType set mapped 1:1 in
+  web/src/state/lifecycle.js with icon+text+tone (never color alone).
+- No raw chain-of-thought rendered: ModelTurn content is excluded by the
+  trajectory display model (tested in web/tests/conversation.test.js).
+- No mock data in any runtime path; blocked capabilities render explicit
+  contract-blocked states.
 
-## Verified by direct source inspection (bridge.py on main)
-- Backend contract map in web/src/api/endpoints.js — every VERIFIED entry
-  cites its routing evidence string from bridge.py. PASS (source-inspected).
+## NOT VERIFIED (no Node/browser in the agent environment)
+- npm run build
+- npm test (vitest) — tests exist but were not executed here
+- live conversation against a running backend
+- responsive layout at 1280-1920px, mobile, RTL/LTR rendering
 
-## Unit tests
-- web/tests: EventTransport SSE parsing/dedupe, runtime reducer, lifecycle
-  mapping, adapters fail-loudly, ApiError remediation. IMPLEMENTED.
-- Execution: NOT VERIFIED (no Node/vitest runtime available to the agent;
-  CI does not run web tests). Run locally: cd web && npm test.
-
-## Build
-- Vite toolchain added (package.json, vite.config.js, index.html,
-  main.jsx). IMPLEMENTED. Execution: NOT VERIFIED — run npm run build.
-
-## Browser verification
-- NOT VERIFIED (no browser automation available). Viewports, RTL, and
-  interactive flows must be verified by a human or in CI with a browser
-  runner. The previous-stage canvas render (IDE shell) remains the visual
-  reference for the layout.
-
-## Known code fix applied
-- App.jsx originally contained TypeScript-only syntax in a JSX file;
-  fixed in the tests/docs commit before this document was written.
+## Honest limitations
+- The chat stream is blocking (backend runs the mission synchronously);
+  the UI does not fake streaming progress.
+- Mission resume is only available via POST /api/missions (chat path);
+  the GET stream contract has no resume parameter.
+- Scheduler/evidence-listing/findings/workspace/git remain BLOCKED until
+  backend contracts exist (BACKEND_DEPENDENCY — do not work around).

@@ -1,42 +1,56 @@
-# WEB_API_REQUIREMENTS — CyberSentinel X
+# CyberSentinel X — Web API Requirements (verified contract map)
 
-## Part 1 — VERIFIED contracts (read directly from bridge.py on main)
+Method: every VERIFIED entry below was read directly from the backend
+source on main (bridge.py routing, api/chat.py, api/missions.py,
+agent/mission.py MissionStatus, agent/trajectory.py EventType).
+Anything not listed as VERIFIED does not exist; the UI must fail loudly
+(ContractNotAvailableError) and never fake it.
 
-The IDE consumes ONLY these. Authentication model (verified):
-- Bridge auth: `X-CyberSentinel-Token` header must equal backend BRIDGE_TOKEN.
-- Owner auth: `X-CyberSentinel-Owner-Token`, `X-CyberSentinel-Owner-Session`,
-  `X-CyberSentinel-Owner-Challenge` headers; the backend (create_owner_session,
-  verify_owner) is the sole authority. The frontend never grants anything.
+## Part 1 — VERIFIED contracts
 
-| Endpoint | Method | Auth | Response shape |
-|---|---|---|---|
-| /api/health | GET | none | {ok, service, version} |
-| /api/tools | GET | bridge | {ok, tools} |
-| /api/status | GET | bridge | engine status |
-| /api/session/{id} | GET | bridge | {ok, session} |
-| /api/chat | POST | bridge+owner | {ok, ...chat result} |
-| /api/chat/stream | GET (SSE) | bridge+owner | SSE events |
-| /api/tasks | POST | bridge+owner | {ok, task...} (201) |
-| /api/tasks/{id} | GET | bridge+owner(verify_owner) | task snapshot |
-| /api/tasks/{id}/stream | GET (SSE) | bridge+owner | SSE task events |
-| /api/tasks/{id}/pause|resume|cancel | POST | bridge+owner | control result |
-| /api/execution/{request_id} | GET | bridge | {ok, request_id, lifecycle, events} |
-| /api/reasoning/{request_id} | GET | bridge+owner | reasoning memory |
-| /api/owner/session | POST | bridge+owner-token | {ok, session} (201) |
-| /api/cancel | POST | bridge | {ok, request_id, lifecycle, cancel_requested} |
-| /api/command | POST | bridge | {ok, request_id...} one-shot authorized command |
-
-## Part 2 — REQUIRED but NOT IMPLEMENTED in backend (contract blockers)
-
-These are consumed through adapters that fail with
-ContractNotAvailableError; the UI renders an explicit blocked state.
-
-| Capability | Missing endpoints | Notes |
+### Conversational agent (primary UI path)
+| Contract | Endpoint | Shape |
 |---|---|---|
-| Missions | GET/POST /api/missions, mission lifecycle | tasks are the closest existing analog |
-| Workspace | /api/missions/{id}/workspace/tree + file GET/PUT | Manus parallel workstream |
-| Terminal sessions | interactive streaming exec contract | /api/command covers one-shot submit only |
-| Git | /api/missions/{id}/git | branch/diff/commits |
-| Evidence | /api/evidence/{id}, mission linkage | provenance chain UI depends on this |
-| Findings | /api/findings?mission={id} | claim vs validated status from backend |
-| Scheduler | /api/schedules | schedule CRUD + next/last run |
+| chatStream | GET /api/chat/stream?text=&conversation_id= (SSE) | blocks: `event: started` -> per-activity event names (trajectory EventType) -> `event: completed` with { conversation_id, answer, mission_id, status, activity, mission } |
+| missionChat | POST /api/missions { text, conversation_id, mission_id? } | blocking chat path; mission_id resumes an existing mission; response { ok, mission, mission_id, status } |
+| sessionGet | GET /api/session/{id} | owner-only conversation info + messages + tasks |
+
+Owner auth: X-CyberSentinel-Owner-Token, or -Owner-Session/-Owner-Challenge
+(single-use). Bridge auth: X-CyberSentinel-Token. The frontend is never
+the authority.
+
+### Mission lifecycle
+| Contract | Endpoint |
+|---|---|
+| missionGet | GET /api/missions/{id}/{status|timeline|evidence|artifacts|logs} |
+| missionControl | POST /api/missions/{id}/{start|resume|pause|cancel|schedule} |
+| missionCreate | POST /api/missions (structured plan dict OR chat fallback) |
+
+Mission statuses (agent/mission.py): CREATED, PLANNING, READY, RUNNING,
+OBSERVING, VERIFYING, REPLANNING, GOAL_COMPLETED, OWNER_INPUT_REQUIRED,
+AUTHORIZATION_BLOCKED, SCOPE_BLOCKED, RESOURCE_BLOCKED, RECOVERY_REQUIRED,
+SAFETY_BLOCKED, FAILED_RETRY_EXHAUSTED, CANCELLED.
+
+### Engine / task compatibility layer
+health, status, tools, tasks (create/get/stream/pause/resume/cancel),
+execution lifecycle, reasoning memory (owner-only), owner session,
+cancel, one-shot command. (Full list in web/src/api/endpoints.js.)
+
+## Part 2 — BLOCKED (backend contract missing — BACKEND_DEPENDENCY)
+| Capability | Missing endpoint |
+|---|---|
+| workspaceTree | GET /api/missions/{id}/workspace/tree |
+| workspaceFile (read/write/create/rename/delete/search) | GET/PUT /api/missions/{id}/workspace/file |
+| terminal (interactive session, streaming exec) | beyond one-shot /api/command |
+| git (branch/diff/commits) | GET /api/missions/{id}/git |
+| evidence (generic listing) | GET /api/evidence/{id} (mission-scoped evidence EXISTS via /api/missions/{id}/evidence) |
+| findings (claim/validated status) | GET /api/findings?mission={id} |
+| scheduler (listing/management) | GET/POST /api/schedules (mission schedule action exists; no listing) |
+
+Notes:
+- The GET chat stream does not carry mission resume (query contract is
+  text+conversation_id only); resume uses the verified POST /api/missions
+  chat path. Documented, not worked around.
+- The chat stream is blocking: activity arrives when the mission run
+  finishes in-process. The UI shows honest live progress as events
+  arrive; it does not simulate intermediate steps.

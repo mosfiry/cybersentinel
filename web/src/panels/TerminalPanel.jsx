@@ -1,6 +1,5 @@
 import { useState, useRef, useCallback } from "react";
-import { submitCommand } from "../api/bridge.js";
-import { cancelRequest } from "../api/bridge.js";
+import { submitCommand, cancelRequest } from "../api/bridge.js";
 import { ApiError } from "../api/errors.js";
 
 const MAX_LINES = 5000; // bounded terminal rendering
@@ -12,7 +11,7 @@ const MAX_LINES = 5000; // bounded terminal rendering
  * One-shot command submission exists; an interactive session contract
  * (streaming exec + per-exec cancel) is BLOCKED and documented.
  */
-export function TerminalPanel() {
+export function TerminalPanel({ tall = false }) {
   const [lines, setLines] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -54,7 +53,7 @@ export function TerminalPanel() {
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col" dir="ltr">
+    <div className={(tall ? "" : "flex h-full ") + "flex min-h-0 h-full flex-col"} dir="ltr">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto bg-slate-950/70 p-2 font-mono text-[11px] leading-[18px]">
         {lines.length === 0 && <div className="text-slate-600">Authorized command submission — POST /api/command (verified contract).</div>}
         {lines.map((l, i) => (

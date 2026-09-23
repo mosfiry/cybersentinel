@@ -2,21 +2,15 @@
 // EXIST yet (verified against bridge.py on main). Each adapter fails loudly
 // with ContractNotAvailableError — the UI then renders an explicit
 // "backend contract not available" state. NO fake data, NO fake success.
+// Mission endpoints now EXIST and are consumed via api/missions.js and
+// api/conversation.js (chat stream + mission lifecycle) — the MissionService
+// adapter was removed rather than left throwing for a real contract.
 import { ContractNotAvailableError } from "./errors.js";
 import { BLOCKED } from "./endpoints.js";
 
 const blocked = (name) => (..._args) => {
   const b = BLOCKED[name];
   throw new ContractNotAvailableError(name, b.missing);
-};
-
-export const MissionServiceAdapter = {
-  // NOTE: task endpoints exist and are used for real task lifecycle;
-  // the *mission* level (scope/target/authorization snapshot per mission)
-  // has no backend contract yet.
-  listMissions: blocked("missions"),
-  createMission: blocked("missions"),
-  missionAuthorizationSnapshot: blocked("missions"),
 };
 
 export const WorkspaceServiceAdapter = {
@@ -41,7 +35,9 @@ export const GitServiceAdapter = {
 };
 
 export const EvidenceServiceAdapter = {
-  list: blocked("evidence"), get: blocked("evidence"), findByMission: blocked("evidence"),
+  // Mission-scoped evidence IS available: GET /api/missions/{id}/evidence.
+  // A generic evidence listing contract is not.
+  list: blocked("evidence"), get: blocked("evidence"),
 };
 
 export const FindingsServiceAdapter = {
@@ -49,5 +45,7 @@ export const FindingsServiceAdapter = {
 };
 
 export const SchedulerServiceAdapter = {
+  // POST /api/missions/{id}/schedule exists, but no schedule listing/management
+  // contract — the UI does not invent a scheduler view around half a contract.
   list: blocked("scheduler"), create: blocked("scheduler"), pause: blocked("scheduler"), resume: blocked("scheduler"), cancel: blocked("scheduler"),
 };
