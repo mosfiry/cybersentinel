@@ -3,7 +3,9 @@
 Owner policy (this layer):
 * Every accepted item must carry provenance (source feed + source class).
 * Fabricated identifiers (fake technique id, fake CVE) are REFUSED and
-  reported - never silently ingested.
+  reported - never silently ingested, and the fabricated identifier itself
+  is never echoed back into any report: a fabricated id must not propagate
+  through the system it tried to poison.
 * Authority-bearing keys in feed items (authorization/scope/owner_instruction)
   are stripped: intel feeds are DATA, they can never grant authority.
 * Source class caps confidence and edge strength: UNVERIFIED/SYNTHETIC/FIXTURE
@@ -27,7 +29,6 @@ from cyber.knowledge_model import (
     Provenance,
     SourceClass,
 )
-
 
 _TECHNIQUE_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
 _CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$")
@@ -92,6 +93,18 @@ def _technique_id_of(obj: dict[str, Any]) -> str | None:
             if isinstance(eid, str) and _TECHNIQUE_ID.match(eid):
                 return eid
     return None
+
+
+def _behavior_keywords(obj: dict[str, Any]) -> list[str]:
+    """Optional behavioral keyword signals carried by a feed item.
+
+    These power similarity-based generalization. They are signals only:
+    they can influence a TENTATIVE ranking, never a claim's evidence status.
+    """
+    raw = obj.get("x_synth_behavior_keywords")
+    if not isinstance(raw, list):
+        return []
+    return [str(k) for k in raw if isinstance(k, str) and k]
 
 
 class IntelIngest:
@@ -179,7 +192,11 @@ class IntelIngest:
                 entity_id=tech_id,
                 entity_type="TECHNIQUE",
                 name=name,
-                attributes={"stix_id": obj.get("id", ""), "phase": phase},
+                attributes={
+                    "stix_id": obj.get("id", ""),
+                    "phase": phase,
+                    "keywords": _behavior_keywords(obj),
+                },
             ), report)
 
         # Pass 2: sub-techniques, now that parents are resolvable.
@@ -188,11 +205,17 @@ class IntelIngest:
             if self.graph.entity(parent_id) is None and parent_id not in bundle_ids:
                 report.refuse("sub-technique without parent technique in graph or bundle", tech_id)
                 continue
+            phases = obj.get("kill_chain_phases") or []
+            phase = phases[0].get("phase_name", "") if isinstance(phases, list) and phases and isinstance(phases[0], dict) else ""
             self._add_entity(Entity(
                 entity_id=tech_id,
                 entity_type="SUBTECHNIQUE",
                 name=str(obj.get("name") or tech_id),
-                attributes={"stix_id": obj.get("id", ""), "phase": ""},
+                attributes={
+                    "stix_id": obj.get("id", ""),
+                    "phase": phase,
+                    "keywords": _behavior_keywords(obj),
+                },
             ), report)
             if self.graph.entity(parent_id) is not None:
                 self._add_claim(ClaimEdge(
@@ -233,7 +256,12 @@ class IntelIngest:
             return report
         cve_id = cve.get("id")
         if not isinstance(cve_id, str) or not _CVE_ID.match(cve_id):
-            report.refuse("refusing to ingest invented CVE id", cve.get("id"))
+            # the fabricated identifier is intentionally NOT echoed back:
+            # a fake id must not propagate into any report or audit dump
+            report.refuse(
+                "refusing to ingest invented CVE id",
+                "fabricated identifier withheld from report",
+            )
             return report
 
         cvss = cve.get("cvss")

@@ -166,6 +166,10 @@ class CyberKnowledgeGraph:
 
     # -- primitive queries -------------------------------------------------
 
+    def entities(self) -> dict[str, Entity]:
+        # Read-only view of all entities (for index building).
+        return dict(self._entities)
+
     def has_entity(self, entity_id: str) -> bool:
         return entity_id in self._entities
 
