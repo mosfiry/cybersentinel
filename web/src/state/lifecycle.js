@@ -1,7 +1,7 @@
 // Task/mission state mapping. Backend lifecycle states are mapped to UI
 // states with icon + text + tone (never color alone). Mapping is honest:
 // unreported states default to UNKNOWN; the backend remains the authority.
-// Mission states verified against agent/mission.py MissionStatus on main.
+// Mission statuses verified against agent/mission.py MissionStatus on main.
 export const TASK_STATE = {
   QUEUED:            { icon: "…", text: "QUEUED",            tone: "muted",   desc: "created, not started" },
   RUNNING:           { icon: "▶", text: "RUNNING",           tone: "run",     desc: "executing" },
@@ -50,6 +50,76 @@ export function mapMissionState(mission) {
     : (mission && (mission.status || (mission.mission && mission.mission.status))) || "";
   const norm = String(raw).toUpperCase().replace(/[\s-]/g, "_");
   return MISSION_STATE[norm] ? norm : "UNKNOWN";
+}
+
+// ---------------------------------------------------------------------------
+// DERIVED control state — verified against api/missions.py on main.
+//
+// The backend pause contract does NOT set mission.status = PAUSED (PAUSED is
+// not a MissionStatus). It records:
+//   mission.progress["pause_requested"] = True
+//   mission.checkpoint["status"] = "paused"
+// and mission.status may legitimately remain RUNNING. Resume pops
+// pause_requested and re-enqueues, but REFUSES (400) when status is
+// RECOVERY_REQUIRED ("in-flight mission requires reconciliation before
+// resume"). Cancel only transitions non-terminal missions.
+//
+// So the UI derives a SEPARATE control state from progress/checkpoint while
+// keeping mission.status as the official backend state. No new MissionStatus
+// values are invented here.
+// ---------------------------------------------------------------------------
+
+/** Verified terminal statuses (agent/mission.py TERMINAL_MISSION_STATUSES). */
+export const MISSION_TERMINAL = new Set([
+  "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "AUTHORIZATION_BLOCKED",
+  "SCOPE_BLOCKED", "RESOURCE_BLOCKED", "RECOVERY_REQUIRED",
+  "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
+]);
+
+/** Derived control states (UI-only, NOT backend MissionStatus values). */
+export const MISSION_CONTROL = {
+  TERMINAL:           { icon: "■", text: "CONTROL LOCKED",       tone: "muted", desc: "mission is in a terminal state; no pause/resume/cancel" },
+  RECOVERY_REQUIRED:  { icon: "↻", text: "RECOVERY REQUIRED",     tone: "warn",  desc: "in-flight checkpoint needs reconciliation; backend refuses resume until then" },
+  PAUSED:             { icon: "⏸", text: "PAUSED",               tone: "warn",  desc: "pause requested and checkpoint paused; resume available" },
+  PAUSE_REQUESTED:    { icon: "⏸", text: "PAUSE REQUESTED",       tone: "warn",  desc: "pause requested; the worker honors it at the next safe point; resume available" },
+  PAUSED_CHECKPOINT:  { icon: "⏸", text: "PAUSED — CHECKPOINT",  tone: "warn",  desc: "checkpoint status is paused; resume available" },
+  RUNNABLE:           { icon: "▶", text: "ACTIVE",                tone: "run",   desc: "mission is active; pause and cancel available" },
+  IDLE:               { icon: "○", text: "NOT STARTED",           tone: "muted", desc: "mission created; pause and cancel available" },
+  UNKNOWN:            { icon: " ", text: "UNKNOWN",              tone: "muted", desc: "control state not derivable from the mission record" },
+};
+
+/**
+ * Derive the control state from the REAL contract fields:
+ * mission.status (official) + mission.progress.pause_requested +
+ * mission.checkpoint.status. Nothing invented, nothing ignored.
+ */
+export function missionControlState(mission) {
+  if (!mission || typeof mission !== "object") return "UNKNOWN";
+  const status = mapMissionState(mission);
+  const progress = (mission.progress && typeof mission.progress === "object") ? mission.progress : {};
+  const checkpoint = (mission.checkpoint && typeof mission.checkpoint === "object") ? mission.checkpoint : {};
+  if (MISSION_TERMINAL.has(status)) {
+    return status === "RECOVERY_REQUIRED" ? "RECOVERY_REQUIRED" : "TERMINAL";
+  }
+  if (progress.pause_requested === true) {
+    return checkpoint.status === "paused" ? "PAUSED" : "PAUSE_REQUESTED";
+  }
+  if (checkpoint.status === "paused") return "PAUSED_CHECKPOINT";
+  if (status === "CREATED" || status === "READY" || status === "PLANNING") return "IDLE";
+  return "RUNNABLE";
+}
+
+/**
+ * Which owner control actions the verified endpoints accept for this mission:
+ * pause/resume/cancel via POST /api/missions/{id}/{action}.
+ */
+export function controlActions(mission) {
+  const cs = missionControlState(mission);
+  return {
+    pause: cs === "RUNNABLE" || cs === "IDLE",
+    resume: cs === "PAUSED" || cs === "PAUSE_REQUESTED" || cs === "PAUSED_CHECKPOINT",
+    cancel: cs !== "TERMINAL" && cs !== "RECOVERY_REQUIRED" && cs !== "UNKNOWN",
+  };
 }
 
 // Structured trajectory display (verified: agent/trajectory.py EventType).

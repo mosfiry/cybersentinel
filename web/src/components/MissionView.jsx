@@ -1,4 +1,4 @@
-import { MISSION_STATE, mapMissionState, trajectoryModel } from "../state/lifecycle.js";
+import { MISSION_STATE, MISSION_CONTROL, mapMissionState, missionControlState, trajectoryModel } from "../state/lifecycle.js";
 
 const TONE_CLASS = {
   run: "text-emerald-300 border-emerald-500/40 bg-emerald-500/10",
@@ -9,13 +9,29 @@ const TONE_CLASS = {
   muted: "text-slate-400 border-slate-600 bg-slate-500/10",
 };
 
-/** Mission lifecycle chip: icon + text + tone (never color alone). */
+/** Mission lifecycle chip: official backend status, icon + text + tone. */
 export function MissionChip({ status, missionId }) {
   const key = mapMissionState(status);
   const m = MISSION_STATE[key];
   return (
     <span className={"inline-flex items-center gap-1.5 rounded border px-1.5 py-0.5 text-[10px] font-semibold " + (TONE_CLASS[m.tone] || TONE_CLASS.muted)}
       title={m.desc + (missionId ? " — " + missionId : "")} role="status">
+      <span aria-hidden="true">{m.icon}</span>{m.text}
+    </span>
+  );
+}
+
+/**
+ * Derived control chip — NOT a backend MissionStatus. Reflects the verified
+ * pause contract: progress.pause_requested + checkpoint.status == "paused"
+ * while mission.status may legitimately stay RUNNING.
+ */
+export function MissionControlChip({ mission }) {
+  const key = missionControlState(mission);
+  const m = MISSION_CONTROL[key];
+  return (
+    <span className={"inline-flex items-center gap-1.5 rounded border px-1.5 py-0.5 text-[10px] font-semibold " + (TONE_CLASS[m.tone] || TONE_CLASS.muted)}
+      title={m.desc} role="status">
       <span aria-hidden="true">{m.icon}</span>{m.text}
     </span>
   );
@@ -55,6 +71,7 @@ export function MissionSummary({ mission }) {
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-slate-300">{mission.mission_id || "mission"}</span>
         <MissionChip status={mission.status} />
+        <MissionControlChip mission={mission} />
       </div>
       {plan.objective && <div className="mt-1 text-slate-400">Objective: {plan.objective}</div>}
       {steps !== null && <div className="mt-0.5 text-slate-500">Plan steps: {steps}</div>}

@@ -2,8 +2,8 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { runtimeConfig, setBridgeToken, setOwnerCredentials } from "../api/config.js";
 import { runConversation, continueMission } from "../api/conversation.js";
 import { controlMission, missionStatus } from "../api/missions.js";
-import { mapMissionState, MISSION_STATE } from "../state/lifecycle.js";
-import { MissionChip, TrajectoryView, MissionSummary } from "../components/MissionView.jsx";
+import { mapMissionState, missionControlState, controlActions, MISSION_CONTROL } from "../state/lifecycle.js";
+import { MissionChip, MissionControlChip, TrajectoryView, MissionSummary } from "../components/MissionView.jsx";
 import { ApiError } from "../api/errors.js";
 
 /**
@@ -13,8 +13,10 @@ import { ApiError } from "../api/errors.js";
  *   - the conversation (user / assistant messages)
  *   - structured agent progress (verified trajectory events, no raw CoT)
  *   - mission lifecycle state and owner lifecycle actions
- * Everything comes from the verified /api/chat/stream and /api/missions*
- * contracts. No mock data. Missing capabilities fail loudly.
+ * Pause/Resume follows the REAL backend contract: pause is recorded in
+ * progress.pause_requested + checkpoint.status == "paused" while
+ * mission.status may stay RUNNING. The official status chip and the
+ * derived control chip are therefore shown side by side.
  */
 export function ChatPanel() {
   const [authed, setAuthed] = useState(Boolean(runtimeConfig.baseUrl && runtimeConfig.bridgeToken && (runtimeConfig.owner.token || runtimeConfig.owner.sessionId)));
@@ -42,7 +44,9 @@ export function ChatPanel() {
     setAuthed(Boolean(runtimeConfig.baseUrl && runtimeConfig.bridgeToken && runtimeConfig.owner.token));
   };
 
-  const isResume = mission && ["OWNER_INPUT_REQUIRED", "PAUSED", "RECOVERY_REQUIRED"].includes(mapMissionState(mission));
+  // Conversational resume is the verified path for an owner decision
+  // (OWNER_INPUT_REQUIRED). It is NOT offered for other states.
+  const isResume = mission !== null && mapMissionState(mission) === "OWNER_INPUT_REQUIRED";
 
   const send = async () => {
     const text = input.trim();
@@ -138,7 +142,10 @@ export function ChatPanel() {
   }
 
   const missionState = mapMissionState(mission);
+  const ctrl = mission ? controlActions(mission) : { pause: false, resume: false, cancel: false };
+  const controlKey = mission ? missionControlState(mission) : null;
   const needsOwner = missionState === "OWNER_INPUT_REQUIRED";
+  const recoveryNeeded = missionState === "RECOVERY_REQUIRED";
 
   return (
     <div className="flex h-full min-h-0 flex-col" dir="ltr">
@@ -194,22 +201,33 @@ export function ChatPanel() {
               (verified resume path). You stay the authority — the backend enforces authorization.
             </div>
           )}
+
+          {recoveryNeeded && !busy && (
+            <div className="mx-auto max-w-3xl rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-200" role="alert">
+              The mission has an in-flight checkpoint that requires reconciliation. The backend refuses
+              resume in this state (verified contract) — no resume button is shown until the backend
+              reports a resumable state.
+            </div>
+          )}
         </div>
       </div>
 
-      {/* mission bar */}
+      {/* mission bar: official status + derived control state + owner actions */}
       {mission && (
         <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-slate-800 bg-slate-900/60 px-4 py-1.5 text-[10px]">
           <span className="font-mono text-slate-400">{mission.mission_id || ""}</span>
           <MissionChip status={mission} />
+          <MissionControlChip mission={mission} />
           <div className="ml-auto flex gap-1.5">
-            {["RUNNING", "OBSERVING", "VERIFYING", "REPLANNING", "PLANNING", "READY", "CREATED"].includes(missionState) && (
+            {ctrl.pause && (
               <button onClick={() => doControl("pause")} className="rounded border border-slate-700 px-1.5 py-0.5 text-slate-300 hover:bg-slate-800">pause mission</button>
             )}
-            {["PAUSED", "RECOVERY_REQUIRED"].includes(mapMissionState(mission)) && (
-              <button onClick={() => doControl("resume")} className="rounded border border-slate-700 px-1.5 py-0.5 text-slate-300 hover:bg-slate-800">resume mission</button>
+            {ctrl.resume && (
+              <button onClick={() => doControl("resume")} className="rounded border border-emerald-600/50 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-300 hover:bg-emerald-500/20">resume mission</button>
             )}
-            <button onClick={() => doControl("cancel")} className="rounded border border-slate-700 px-1.5 py-0.5 text-slate-300 hover:bg-slate-800">cancel mission</button>
+            {ctrl.cancel && (
+              <button onClick={() => doControl("cancel")} className="rounded border border-slate-700 px-1.5 py-0.5 text-slate-300 hover:bg-slate-800">cancel mission</button>
+            )}
           </div>
         </div>
       )}
