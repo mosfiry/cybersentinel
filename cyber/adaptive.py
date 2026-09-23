@@ -12,8 +12,8 @@ Owner policy:
 * TENTATIVE hypotheses are recorded as hypotheses (never as evidence).
 * Hunts run only from SUPPORTED (promoted) techniques; TENTATIVE ones are
   listed as suggested next actions for the operator to confirm.
-* Evidence statements are poison-neutralized before entering the case:
-  authority-bearing content can never launder itself into case evidence.
+ * Evidence statements are preserved as data; explicit source and authority
+  metadata prevent their contents from becoming authority.
 * No execution authority anywhere; hunts are graph traversals only.
 """
 
@@ -22,7 +22,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from cyber.case_engine import CyberCase, EvidenceStatus, Provenance as CaseProvenance
+from cyber.case_engine import (
+    EXTERNAL_UNTRUSTED,
+    NO_AUTHORITY,
+    CyberCase,
+    EvidenceStatus,
+    Provenance as CaseProvenance,
+)
 from cyber.generalize import UnseenTechniqueMatcher
 from cyber.hunting import HuntHypothesis, ThreatHunter
 from cyber.seed_corpus import build_seed_graph
@@ -92,14 +98,15 @@ class AdaptiveAnalyst:
         traceable from the case itself. The statement is poison-neutralized
         before it can enter the case.
         """
-        statement = str(evidence_statement).strip()
-        if not statement:
+        statement = str(evidence_statement)
+        if not statement.strip():
             raise ValueError("promotion requires a non-empty evidence statement")
         promoted = self.matcher.promote_with_evidence(technique_id, evidence_statement=statement)
         prov = CaseProvenance(source=source, classification="REAL")
         evidence_id = self.case.add_evidence(
             "independent evidence for technique {}: {}".format(technique_id, statement),
             provenance=prov, status=EvidenceStatus.SUPPORTED,
+            source=EXTERNAL_UNTRUSTED, authority=NO_AUTHORITY,
         )
         entry = {
             "technique_id": technique_id,

@@ -11,10 +11,9 @@ strict because this is exactly where hallucination would live:
   (promote_with_evidence), otherwise it stays TENTATIVE or UNKNOWN.
 * Below the similarity threshold the honest answer is UNKNOWN with the reason
   recorded - the engine refuses to force a match.
-* Authority-bearing keys in behavior descriptions are stripped (poison), and
-  authority-bearing VOCABULARY inside the description text is neutralized:
-  an injection attempt is never a behavioral signal and never leaks into any
-  output.
+* Structured authority fields are not accepted as authority. Free-text
+  vocabulary is preserved for analysis and traceability; explicit source and
+  authority metadata keep it from acquiring Owner authority.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from cyber.case_engine import EXTERNAL_UNTRUSTED, NO_AUTHORITY
 from cyber.intel_ingest import _sanitize
 from cyber.knowledge_model import CyberKnowledgeGraph
 
@@ -45,6 +45,8 @@ class MappedHypothesis:
     similarity: float
     status: str = "TENTATIVE"
     reasons: list[str] = field(default_factory=list)
+    source: str = EXTERNAL_UNTRUSTED
+    authority: str = NO_AUTHORITY
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +55,8 @@ class MappedHypothesis:
             "similarity": round(self.similarity, 3),
             "status": self.status,
             "reasons": list(self.reasons),
+            "source": self.source,
+            "authority": self.authority,
         }
 
 
@@ -159,4 +163,6 @@ class UnseenTechniqueMatcher:
             similarity=1.0,
             status="SUPPORTED",
             reasons=["independent evidence recorded: {}".format(statement[:120])],
+            source=EXTERNAL_UNTRUSTED,
+            authority=NO_AUTHORITY,
         )
