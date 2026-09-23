@@ -233,7 +233,7 @@ class CyberKnowledgeGraph:
                 return
             for edge in self._evidenced(self.edges_from(node, "USES")):
                 target = self._entities[edge.target_id]
-                if target.entity_type == "TECHNIQUE" and target.entity_id not in seen:
+                if target.entity_type in ("TECHNIQUE", "SUBTECHNIQUE") and target.entity_id not in seen:
                     seen.add(target.entity_id)
                     techniques.append(target.entity_id)
                 elif target.entity_type in ("TOOL", "MALWARE", "CAMPAIGN"):

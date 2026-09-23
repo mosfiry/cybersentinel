@@ -23,20 +23,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from cyber.case_engine import neutralize_poison_text
 from cyber.intel_ingest import _sanitize
 from cyber.knowledge_model import CyberKnowledgeGraph
 
 _TECHNIQUE_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
-
-# authority-bearing vocabulary neutralized inside free-text descriptions and
-# evidence statements: a poison attempt must never become a signal nor leak
-POISON_VOCAB = re.compile(r"owner_instruction|authorization|grant-all|identity|scope_grant")
-
-
-def neutralize_poison_text(text: str) -> str:
-    """Strip authority-bearing vocabulary from free text (signals stay, poison dies)."""
-    return POISON_VOCAB.sub(" ", str(text))
-
 
 # similarity threshold below which we refuse to map (honest UNKNOWN)
 SIMILARITY_THRESHOLD = 0.35
