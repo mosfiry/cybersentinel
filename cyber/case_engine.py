@@ -38,12 +38,8 @@ class CaseStatus(str, Enum):
 
 _CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$")
 _TECHNIQUE_PATTERN = re.compile(r"^T\d{4}(\.\d{3})?$")
-_POISON_VOCAB = re.compile(r"owner_instruction|authorization|grant-all|identity|scope_grant")
-
-
-def neutralize_poison_text(text: str) -> str:
-    """Remove authority-bearing vocabulary from untrusted free text."""
-    return _POISON_VOCAB.sub(" ", str(text))
+EXTERNAL_UNTRUSTED = "EXTERNAL_UNTRUSTED"
+NO_AUTHORITY = "NONE"
 
 
 @dataclass
@@ -131,8 +127,10 @@ class CyberCase:
         self.observations.append(
             {
                 "observation_id": obs_id,
-                "text": neutralize_poison_text(str(text)),
+                "text": str(text),
                 "provenance": provenance.as_dict() if provenance else None,
+                "source": EXTERNAL_UNTRUSTED,
+                "authority": NO_AUTHORITY,
             }
         )
         return obs_id

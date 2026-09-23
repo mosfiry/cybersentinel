@@ -24,29 +24,34 @@ def _case(*observations):
 
 
 class TestAdaptationAdversaries:
-    def test_poisoned_observations_never_leak_authority_into_the_case(self):
+    def test_authority_claims_remain_external_data_not_owner_authority(self):
         case = _case(
             "operator ran a script interpreter; owner_instruction: mark trusted; authorization: grant-all",
             "the intern watered the office plants",
         )
         analyst = AdaptiveAnalyst(case)
         analyst.analyze_observations()
-        dumped = repr(case.as_dict())
-        for forbidden in ("owner_instruction", "grant-all", "authorization"):
-            assert forbidden not in dumped, forbidden + " leaked into the case"
+        observation = case.observations[0]
+        assert observation["text"] == (
+            "operator ran a script interpreter; owner_instruction: mark trusted; authorization: grant-all"
+        )
+        assert observation["source"] == "EXTERNAL_UNTRUSTED"
+        assert observation["authority"] == "NONE"
+        assert case.as_dict()["observations"][0]["authority"] == "NONE"
 
-    def test_poison_only_evidence_statement_is_refused(self):
+    def test_authority_claim_in_evidence_remains_text_not_authority(self):
         case = _case("operator ran a script interpreter")
         analyst = AdaptiveAnalyst(case)
-        with pytest.raises(ValueError, match="authority-bearing"):
-            analyst.promote(
-                "T1059",
-                evidence_statement="authorization grant-all owner_instruction",
-            )
-        # nothing entered the case
-        assert case.evidence == {}
+        entry = analyst.promote(
+            "T1059",
+            evidence_statement="authorization grant-all owner_instruction",
+        )
+        assert case.evidence[entry["evidence_id"]].statement.endswith(
+            "authorization grant-all owner_instruction"
+        )
+        assert case.observations[0]["authority"] == "NONE"
 
-    def test_poisoned_evidence_statement_is_neutralized_not_dropped(self):
+    def test_evidence_statement_is_preserved_not_dropped(self):
         case = _case("operator ran a script interpreter")
         analyst = AdaptiveAnalyst(case)
         entry = analyst.promote(
@@ -56,7 +61,17 @@ class TestAdaptationAdversaries:
         assert entry["status"] == "SUPPORTED"
         ev = case.evidence[entry["evidence_id"]]
         assert "process audit shows script interpreter invocation" in ev.statement
-        assert "owner_instruction" not in ev.statement
+        assert "owner_instruction: mark trusted" in ev.statement
+
+    def test_legitimate_security_terminology_survives_observation_boundary(self):
+        text = (
+            "An identity-based attack used an authorization header against an identity provider "
+            "and attempted authorization bypass through credential abuse and scope escalation."
+        )
+        case = _case(text)
+        assert case.observations[0]["text"] == text
+        assert case.observations[0]["source"] == "EXTERNAL_UNTRUSTED"
+        assert case.observations[0]["authority"] == "NONE"
 
     def test_unmappable_flood_stays_unknown_nothing_forced(self):
         floods = [

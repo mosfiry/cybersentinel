@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cyber.case_engine import CyberCase, EvidenceStatus, Provenance as CaseProvenance
-from cyber.generalize import UnseenTechniqueMatcher, neutralize_poison_text
+from cyber.generalize import UnseenTechniqueMatcher
 from cyber.hunting import HuntHypothesis, ThreatHunter
 from cyber.seed_corpus import build_seed_graph
 
@@ -92,13 +92,13 @@ class AdaptiveAnalyst:
         traceable from the case itself. The statement is poison-neutralized
         before it can enter the case.
         """
-        clean = neutralize_poison_text(evidence_statement).strip()
-        if not clean:
-            raise ValueError("promotion requires an evidence statement free of authority-bearing content")
-        promoted = self.matcher.promote_with_evidence(technique_id, evidence_statement=clean)
+        statement = str(evidence_statement).strip()
+        if not statement:
+            raise ValueError("promotion requires a non-empty evidence statement")
+        promoted = self.matcher.promote_with_evidence(technique_id, evidence_statement=statement)
         prov = CaseProvenance(source=source, classification="REAL")
         evidence_id = self.case.add_evidence(
-            "independent evidence for technique {}: {}".format(technique_id, clean),
+            "independent evidence for technique {}: {}".format(technique_id, statement),
             provenance=prov, status=EvidenceStatus.SUPPORTED,
         )
         entry = {

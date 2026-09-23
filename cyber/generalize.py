@@ -23,7 +23,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from cyber.case_engine import neutralize_poison_text
 from cyber.intel_ingest import _sanitize
 from cyber.knowledge_model import CyberKnowledgeGraph
 
@@ -82,7 +81,9 @@ class UnseenTechniqueMatcher:
 
     def extract_features(self, description: str, *, tactic: str = "") -> BehaviorFeatures:
         safe = _sanitize({"text": description})
-        text = neutralize_poison_text(safe.get("text", "")).lower()
+        # _sanitize removes untrusted structured keys; free-text cyber
+        # terminology remains available to analysis and feature extraction.
+        text = str(safe.get("text", "")).lower()
         known_tactics = ("initial-access", "execution", "persistence", "privilege-escalation",
                          "defense-evasion", "credential-access", "discovery", "lateral-movement",
                          "collection", "command-and-control", "exfiltration", "impact")
@@ -149,13 +150,13 @@ class UnseenTechniqueMatcher:
         entity = self.graph.entity(technique_id)
         if entity is None:
             raise ValueError("refusing to promote a technique absent from the graph: " + str(technique_id))
-        clean = neutralize_poison_text(evidence_statement).strip()
-        if not clean:
-            raise ValueError("promotion requires an evidence statement free of authority-bearing content")
+        statement = str(evidence_statement).strip()
+        if not statement:
+            raise ValueError("promotion requires a non-empty evidence statement")
         return MappedHypothesis(
             technique_id=technique_id,
             technique_name=entity.name,
             similarity=1.0,
             status="SUPPORTED",
-            reasons=["independent evidence recorded: {}".format(clean[:120])],
+            reasons=["independent evidence recorded: {}".format(statement[:120])],
         )
