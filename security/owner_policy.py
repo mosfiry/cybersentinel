@@ -58,6 +58,7 @@ class OwnerPolicy:
 
 class OwnerInstructionSource(str, Enum):
     OWNER_TOKEN = "owner_token"
+    OWNER_PASSWORD = "owner_password"
     OWNER_SESSION = "owner_session_challenge"
 
 
@@ -351,7 +352,14 @@ def policy_context_from_snapshot(snapshot: OwnerPolicySnapshot) -> str:
     )
 
 
-def verify_owner(text: str, presented_token: str | None = None) -> tuple[bool, str]:
+def verify_owner(text: str, presented_token: str | None = None, *, username: str | None = None, password: str | None = None) -> tuple[bool, str]:
+    if username is not None or password is not None:
+        from security.owner_credentials import OwnerCredentialError, authenticate
+        try:
+            authenticate(str(username or ""), str(password or ""))
+        except (OwnerCredentialError, ValueError):
+            return False, "owner authentication required"
+        return True, "owner-authenticated"
     policy = load_policy()
     if policy.require_owner_token:
         if not OWNER_TOKEN or not presented_token or not hmac.compare_digest(OWNER_TOKEN, presented_token):
@@ -363,10 +371,15 @@ def verify_owner(text: str, presented_token: str | None = None) -> tuple[bool, s
     return True, "owner-authenticated"
 
 
-def authenticate_owner(text: str, presented_token: str | None = None, request_id: str = "") -> OwnerAuthenticationEvidence:
-    ok, reason = verify_owner(text, presented_token)
+def authenticate_owner(text: str, presented_token: str | None = None, request_id: str = "", *, username: str | None = None, password: str | None = None) -> OwnerAuthenticationEvidence:
+    ok, reason = verify_owner(text, presented_token, username=username, password=password)
     if not ok:
         raise PermissionError(reason)
+    if username is not None or password is not None:
+        from security.owner_credentials import authenticate
+        owner = authenticate(str(username or ""), str(password or ""))
+        proof_material = f"{owner.username}|{owner.credential_version}"
+        return _issue_evidence(OwnerInstructionSource.OWNER_PASSWORD.value, request_id, proof_material)
     token_material = OWNER_TOKEN or presented_token or "local-owner-channel"
     return _issue_evidence(OwnerInstructionSource.OWNER_TOKEN.value, request_id, token_material)
 

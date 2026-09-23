@@ -4,9 +4,23 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, response_from_legacy
+from .provider_api import CapabilityUnsupported, ContextOverflow, InvalidModelResponse, ModelRefusal, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderRateLimit, ProviderResponse, ProviderTimeout, ProviderUnavailable, response_from_legacy
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
+
+
+@dataclass
+class ModelProfile:
+    provider: str
+    model: str
+    capabilities: dict[str, Any]
+    tool_calling: bool = False
+    streaming: bool = False
+    context_limit: int | None = None
+    reasoning: bool = False
+    priority: int = 100
+    enabled: bool = True
+    health: str = "unknown"
 
 
 @dataclass
@@ -58,6 +72,21 @@ class ModelRouter:
                 })
         return result
 
+    @property
+    def profiles(self) -> list[ModelProfile]:
+        return [ModelProfile(
+            provider=str(getattr(provider, "name", "unknown")),
+            model=str(getattr(provider, "model", "unknown")),
+            capabilities=self._caps(provider).__dict__.copy(),
+            tool_calling=self._caps(provider).tool_calling,
+            streaming=self._caps(provider).stream,
+            context_limit=getattr(provider, "context_limit", None),
+            reasoning=self._caps(provider).reasoning,
+            priority=int(getattr(provider, "priority", 100)),
+            enabled=bool(getattr(provider, "enabled", True)),
+            health=str(getattr(provider, "health", "unknown")),
+        ) for provider in self.providers]
+
     @staticmethod
     def _caps(provider: Any) -> ProviderCapabilities:
         value = getattr(provider, "capabilities", None)
@@ -75,20 +104,35 @@ class ModelRouter:
     @staticmethod
     def _normalize(value: Any, provider: Any, capability: str) -> ProviderResponse:
         if isinstance(value, ProviderResponse):
-            return value
-        if isinstance(value, dict):
-            return response_from_legacy(value, provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"), capability=capability)
-        raise InvalidModelResponse("provider returned unsupported response", provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"))
+            response = value
+        elif isinstance(value, dict):
+            if value.get("refusal") or str(value.get("finish_reason", "")).lower() in {"refusal", "content_filter"}:
+                raise ModelRefusal("model refusal", provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"))
+            response = response_from_legacy(value, provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"), capability=capability)
+        else:
+            raise InvalidModelResponse("provider returned unsupported response", provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"))
+        if str(response.finish_reason).lower() in {"refusal", "content_filter"}:
+            raise ModelRefusal("model refusal", provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"))
+        return response
 
     @staticmethod
     def _classify(exc: Exception, provider: Any) -> ProviderError:
         details = {"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown")}
         if isinstance(exc, ProviderError):
             return exc
-        if isinstance(exc, TimeoutError):
+        text = str(exc).lower()
+        if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
             return ProviderTimeout(str(exc) or "provider timeout", **details)
-        if isinstance(exc, PermissionError):
+        if isinstance(exc, PermissionError) or "401" in text or "403" in text or "authentication" in text or "unauthorized" in text:
             return ProviderAuthenticationFailure(str(exc) or "provider authentication failed", **details)
+        if "429" in text or "rate limit" in text or "too many requests" in text:
+            return ProviderRateLimit(str(exc) or "provider rate limit", **details)
+        if "context" in text and ("limit" in text or "length" in text or "overflow" in text or "token" in text):
+            return ContextOverflow(str(exc) or "context limit exceeded", **details)
+        if "refus" in text or "content filter" in text:
+            return ModelRefusal(str(exc) or "model refusal", **details)
+        if "unavailable" in text or "connection refused" in text or "not configured" in text:
+            return ProviderUnavailable(str(exc) or "provider unavailable", **details)
         if isinstance(exc, (TypeError, ValueError)):
             return InvalidModelResponse(str(exc) or "invalid provider response", **details)
         return ProviderFailure(f"{type(exc).__name__}: {exc}", **details)
@@ -101,6 +145,8 @@ class ModelRouter:
         errors = []
         self.last_trace = []
         for provider in self.providers:
+            if not getattr(provider, "enabled", True):
+                continue
             if not self._caps(provider).generate:
                 continue
             try:
@@ -122,6 +168,8 @@ class ModelRouter:
         errors = []
         self.last_trace = []
         for provider in self.providers:
+            if not getattr(provider, "enabled", True):
+                continue
             if not self._caps(provider).tool_calling:
                 continue
             try:

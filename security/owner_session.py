@@ -17,12 +17,16 @@ class OwnerSession:
     challenge: str
     expires_at: datetime
     used: bool = False
+    owner_identity: str = "legacy-owner"
+    credential_version: int = 0
 
     def public(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
             "challenge": self.challenge,
             "expires_at": self.expires_at.isoformat(),
+            "owner_identity": self.owner_identity,
+            "credential_version": self.credential_version,
         }
 
 
@@ -41,15 +45,28 @@ class OwnerSessionManager:
         self._sessions: dict[str, OwnerSession] = {}
         self._lock = threading.RLock()
 
-    def create(self, presented_token: str | None) -> OwnerSession:
-        ok, reason = verify_owner("Owner session", presented_token)
-        if not ok:
-            raise PermissionError(reason)
+    def create(self, presented_token: str | None = None, *, username: str | None = None, password: str | None = None) -> OwnerSession:
+        owner_identity = "legacy-owner"
+        credential_version = 0
+        if username is not None or password is not None:
+            from security.owner_credentials import OwnerCredentialError, authenticate
+            try:
+                owner = authenticate(str(username or ""), str(password or ""))
+            except (OwnerCredentialError, ValueError) as exc:
+                raise PermissionError("owner authentication required") from exc
+            owner_identity = owner.username
+            credential_version = owner.credential_version
+        else:
+            ok, reason = verify_owner("Owner session", presented_token)
+            if not ok:
+                raise PermissionError(reason)
         now = datetime.now(timezone.utc)
         session = OwnerSession(
             session_id=secrets.token_urlsafe(24),
             challenge="CSO-" + secrets.token_hex(4).upper() + "-" + secrets.token_hex(2).upper(),
             expires_at=now + timedelta(seconds=self.ttl_seconds),
+            owner_identity=owner_identity,
+            credential_version=credential_version,
         )
         with self._lock:
             self._purge(now)
@@ -79,6 +96,8 @@ class OwnerSessionManager:
             return {
                 "owner_authenticated": True,
                 "owner_session_id": session.session_id,
+                "owner_identity": session.owner_identity,
+                "credential_version": session.credential_version,
                 "authentication_method": "owner_session_challenge",
                 "authenticated_at": now.isoformat(),
                 "request_id": str(request_id),
@@ -120,6 +139,12 @@ class OwnerSessionManager:
                 return False
             return True
 
+    def invalidate_identity(self, owner_identity: str, *, except_session_id: str | None = None) -> None:
+        with self._lock:
+            for session_id, session in list(self._sessions.items()):
+                if session.owner_identity == owner_identity and session_id != except_session_id:
+                    self._sessions.pop(session_id, None)
+
     def verify_proof(self, session_id: str, request_id: str, proof: str) -> bool:
         now = datetime.now(timezone.utc)
         with self._lock:
@@ -138,8 +163,8 @@ class OwnerSessionManager:
 DEFAULT_OWNER_SESSIONS = OwnerSessionManager()
 
 
-def create_owner_session(presented_token: str | None) -> dict[str, Any]:
-    return DEFAULT_OWNER_SESSIONS.create(presented_token).public()
+def create_owner_session(presented_token: str | None = None, *, username: str | None = None, password: str | None = None) -> dict[str, Any]:
+    return DEFAULT_OWNER_SESSIONS.create(presented_token, username=username, password=password).public()
 
 
 def consume_owner_challenge(session_id: str, challenge: str, message: str, request_id: str = "") -> dict[str, Any]:

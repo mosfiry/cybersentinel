@@ -62,6 +62,16 @@ class Evidence:
     statement: str
     status: EvidenceStatus = EvidenceStatus.UNKNOWN
     provenance: Provenance | None = None
+    source: str = EXTERNAL_UNTRUSTED
+    authority: str = NO_AUTHORITY
+
+    def __post_init__(self) -> None:
+        if not self.statement or not str(self.statement).strip():
+            raise ValueError("evidence statement is required")
+        # Evidence may carry knowledge, but its contents can never grant
+        # Owner authority.  Authority is metadata, not a claim in text.
+        if self.authority != NO_AUTHORITY:
+            raise ValueError("evidence cannot carry authority")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -69,6 +79,8 @@ class Evidence:
             "statement": self.statement,
             "status": self.status.value,
             "provenance": self.provenance.as_dict() if self.provenance else None,
+            "source": self.source,
+            "authority": self.authority,
         }
 
 
@@ -138,12 +150,15 @@ class CyberCase:
     # -- evidence ------------------------------------------------------
 
     def add_evidence(self, statement: str, *, provenance: Provenance | None = None,
-                     status: EvidenceStatus = EvidenceStatus.WEAK) -> str:
+                     status: EvidenceStatus = EvidenceStatus.WEAK,
+                     source: str = EXTERNAL_UNTRUSTED,
+                     authority: str = NO_AUTHORITY) -> str:
         if not statement or not str(statement).strip():
             raise ValueError("evidence statement is required")
         evidence_id = "ev-{}".format(len(self.evidence) + 1)
         self.evidence[evidence_id] = Evidence(
-            evidence_id=evidence_id, statement=str(statement), status=status, provenance=provenance
+            evidence_id=evidence_id, statement=str(statement), status=status,
+            provenance=provenance, source=source, authority=authority,
         )
         return evidence_id
 

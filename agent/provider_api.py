@@ -7,9 +7,13 @@ from typing import Any
 
 class ProviderFailureKind(StrEnum):
     CAPABILITY_UNSUPPORTED = "CAPABILITY_UNSUPPORTED"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     PROVIDER_FAILURE = "PROVIDER_FAILURE"
     INVALID_MODEL_RESPONSE = "INVALID_MODEL_RESPONSE"
     TIMEOUT = "TIMEOUT"
+    RATE_LIMIT = "RATE_LIMIT"
+    CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW"
+    MODEL_REFUSAL = "MODEL_REFUSAL"
     AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
 
 
@@ -33,6 +37,11 @@ class ProviderFailure(ProviderError):
         super().__init__(ProviderFailureKind.PROVIDER_FAILURE, message, **kwargs)
 
 
+class ProviderUnavailable(ProviderError):
+    def __init__(self, message: str = "provider unavailable", **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.PROVIDER_UNAVAILABLE, message, **kwargs)
+
+
 class InvalidModelResponse(ProviderError):
     def __init__(self, message: str, **kwargs: Any) -> None:
         super().__init__(ProviderFailureKind.INVALID_MODEL_RESPONSE, message, **kwargs)
@@ -41,6 +50,21 @@ class InvalidModelResponse(ProviderError):
 class ProviderTimeout(ProviderError):
     def __init__(self, message: str, **kwargs: Any) -> None:
         super().__init__(ProviderFailureKind.TIMEOUT, message, **kwargs)
+
+
+class ProviderRateLimit(ProviderError):
+    def __init__(self, message: str = "provider rate limit", **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.RATE_LIMIT, message, **kwargs)
+
+
+class ContextOverflow(ProviderError):
+    def __init__(self, message: str = "context limit exceeded", **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.CONTEXT_OVERFLOW, message, **kwargs)
+
+
+class ModelRefusal(ProviderError):
+    def __init__(self, message: str = "model refused request", **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.MODEL_REFUSAL, message, **kwargs)
 
 
 class ProviderAuthenticationFailure(ProviderError):
@@ -120,7 +144,7 @@ def response_from_legacy(value: dict[str, Any], *, provider: str, model: str, ca
 
 
 __all__ = [
-    "CapabilityUnsupported", "InvalidModelResponse", "ProviderAuthenticationFailure", "ProviderError",
-    "ProviderFailure", "ProviderFailureKind", "ProviderResponse", "ProviderTimeout", "ProviderCapabilities", "ToolCall",
+    "CapabilityUnsupported", "ContextOverflow", "InvalidModelResponse", "ModelRefusal", "ProviderAuthenticationFailure", "ProviderError",
+    "ProviderFailure", "ProviderFailureKind", "ProviderResponse", "ProviderRateLimit", "ProviderTimeout", "ProviderUnavailable", "ProviderCapabilities", "ToolCall",
     "response_from_legacy",
 ]
