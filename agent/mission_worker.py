@@ -81,9 +81,18 @@ class MissionQueue:
             db.execute("UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=? WHERE mission_id=?", (WorkerMissionState.EXECUTING.value, moment, worker_id, expiry, mission_id))
         return self.get(mission_id)
 
-    def update(self, mission_id: str, state: WorkerMissionState, *, available_at: str | None = None, error: str = "") -> QueueItem:
+    def update(self, mission_id: str, state: WorkerMissionState, *, available_at: str | None = None, error: str = "", worker_id: str | None = None) -> QueueItem:
         with sqlite3.connect(self.db_path) as db:
-            db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, state.value, state.value, state.value, mission_id))
+            terminal = state.value in {"completed", "failed", "cancelled", "needs_input", "partial_success"}
+            if worker_id is not None:
+                if terminal:
+                    updated = db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL WHERE mission_id=? AND lease_owner=? AND state=?", (state.value, available_at, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value))
+                else:
+                    updated = db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=? WHERE mission_id=? AND lease_owner=?", (state.value, available_at, error, mission_id, worker_id))
+                if updated.rowcount != 1:
+                    raise PermissionError("worker lease is not owned")
+            else:
+                db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, state.value, state.value, state.value, mission_id))
         return self.get(mission_id)
 
     def heartbeat(self, mission_id: str, *, worker_id: str, now: str | None = None, lease_seconds: int = 60) -> QueueItem:
@@ -140,9 +149,14 @@ class MissionWorker:
             return None
         runtime = self.runtime_factory()
         try:
-            mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices)
+            try:
+                mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id))
+            except TypeError as exc:
+                if "heartbeat" not in str(exc):
+                    raise
+                mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices)
         except Exception as exc:
-            return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}")
+            return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}", worker_id=self.worker_id)
         state = {
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
             MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
@@ -152,7 +166,7 @@ class MissionWorker:
             MissionStatus.SCOPE_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
         }.get(mission.status, WorkerMissionState.PARTIAL_SUCCESS if mission.evidence else WorkerMissionState.FAILED)
-        return self.queue.update(item.mission_id, state, error=mission.error)
+        return self.queue.update(item.mission_id, state, error=mission.error, worker_id=self.worker_id)
 
 
 @dataclass(frozen=True)

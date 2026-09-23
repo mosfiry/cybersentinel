@@ -15,7 +15,7 @@ from core.config import (
     PUBLIC_WEB_ORIGIN,
     DB_PATH,
 )
-from core.engine import status
+from core.engine import RUNTIME, status
 from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 from security.owner_policy import verify_owner
@@ -30,6 +30,8 @@ from agent.mission_worker import MissionQueue, MissionScheduler
 from agent.mission_runtime import MissionRuntime
 from agent.mission import MissionStore
 from agent.agent_core import AgentCore
+from agent.planning import Plan, PlanStep
+from security.mission_authorization import MissionAuthorizationSnapshot
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -90,6 +92,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, {"ok": False, "error": reason})
             return None
         return owner_token, owner_session, owner_challenge
+
+    def _mission_snapshot_factory(self, owner_identity: str, scope_context: dict | None = None):
+        scope_context = scope_context or {}
+        target = str(scope_context.get("target_id") or "api-target")
+        root = str(scope_context.get("workspace_root") or Path.cwd().resolve())
+        def factory(mission):
+            actions = tuple(step.action for step in mission.plan.steps if step.action != "__planning_failure__")
+            return MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity=target, scope=("workspace",), allowed_actions=actions, forbidden_actions=tuple(scope_context.get("forbidden_actions", ())), allowed_tools=actions, time_window={"timezone": "UTC"}, max_duration=max(300, mission.max_iterations * 60), rate_limits={action: 10 for action in actions}, network_boundary={"allowed": tuple(scope_context.get("allowed_networks", ()))}, data_boundary={"allowed": (target,)}, credential_boundary={"allowed": tuple(scope_context.get("allowed_credentials", ()))}, workspace_boundary={"root": root}, policy_version="api-owner-policy", owner_approval=owner_identity)
+        return factory
 
     def _public_enabled(self):
         return PUBLIC_WEB_ENABLED
@@ -236,6 +247,17 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json()
                 owner_token, owner_session, owner_challenge = auth
+                if isinstance(payload.get("plan"), dict):
+                    objective = str(payload.get("objective") or payload.get("text") or "").strip()
+                    if not objective:
+                        raise ValueError("objective_required")
+                    raw_plan = payload["plan"]
+                    raw_steps = raw_plan.get("steps", [])
+                    steps = tuple(PlanStep(step_id=str(item["step_id"]), objective=str(item.get("objective", item["step_id"])), prerequisites=tuple(item.get("prerequisites", ())), action=str(item.get("action", "")), expected_observation=str(item.get("expected_observation", "")), authorization_requirement=str(item.get("authorization_requirement", "owner")), scope_requirement=str(item.get("scope_requirement", "")), retry_policy=dict(item.get("retry_policy", {})), verification=tuple(item.get("verification", ()))) for item in raw_steps)
+                    plan = Plan(version=int(raw_plan.get("version", 1)), objective=objective, assumptions=tuple(raw_plan.get("assumptions", ())), steps=steps, dependencies=tuple(raw_plan.get("dependencies", ())), completion_criteria=tuple(raw_plan.get("completion_criteria", ())), risk=str(raw_plan.get("risk", "unknown")), created_from=str(raw_plan.get("created_from", "api")))
+                    owner_identity = "owner-session" if owner_session else "owner-token"
+                    mission = self._mission_service().create_mission(objective, objective, plan, owner_identity_ref=owner_identity, scope_snapshot=payload.get("scope_context"), completion_criteria=payload.get("completion_criteria") or [], authorization_snapshot_factory=self._mission_snapshot_factory(owner_identity, payload.get("scope_context")))
+                    return self._send(201, {"ok": True, "mission": mission, "mission_id": mission["mission_id"], "status": mission["status"]})
                 result = chat(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge)
                 return self._send(201, {"ok": True, "mission": result.get("mission"), "mission_id": result.get("mission_id"), "status": result.get("status")})
             except PermissionError as exc:
@@ -252,8 +274,8 @@ class Handler(BaseHTTPRequestHandler):
                 service = self._mission_service()
                 owner_token, owner_session, owner_challenge = auth
                 if action == "start" or action == "resume":
-                    result = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3")).resume_mission(mission_id, owner_token=owner_token)
-                    return self._send(200, {"ok": True, "mission": result.to_dict()})
+                    result = service.start_mission(mission_id) if action == "start" else service.resume_mission(mission_id)
+                    return self._send(200, {"ok": True, "mission": result})
                 if action == "pause":
                     return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id)})
                 if action == "cancel":
