@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any
 import json
+from pathlib import Path
 
 
 class MissionAuthorizationError(PermissionError):
@@ -129,8 +130,11 @@ class MissionAuthorizationSnapshot:
             return False, "network boundary violation"
         if credential and credential not in set(self.credential_boundary.get("allowed", ())) and self.credential_boundary.get("allowed"):
             return False, "credential boundary violation"
-        if workspace_path and self.workspace_boundary.get("root") and not str(workspace_path).startswith(str(self.workspace_boundary["root"]).rstrip("/") + "/") and str(workspace_path) != str(self.workspace_boundary["root"]):
-            return False, "workspace boundary violation"
+        if workspace_path and self.workspace_boundary.get("root"):
+            root = Path(str(self.workspace_boundary["root"])).expanduser().resolve()
+            candidate = Path(str(workspace_path)).expanduser().resolve()
+            if candidate != root and root not in candidate.parents:
+                return False, "workspace boundary violation"
         return True, "authorized"
 
     def amend(self, *, owner_approval: str, changes: dict[str, Any], created_at: str | None = None, expires_at: str | None = None) -> "MissionAuthorizationSnapshot":

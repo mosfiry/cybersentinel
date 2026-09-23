@@ -22,7 +22,7 @@ from .model_intelligence.tool_calls import execute_bounded_parallel, validate_pr
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = False):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -31,14 +31,33 @@ class MissionRuntime:
         self.recovery_policy = recovery_policy or RecoveryPolicy()
         self.interpreter = interpreter or ObservationInterpreter()
         self.require_authorization_snapshot = require_authorization_snapshot
+        self.authorization_snapshot_factory = authorization_snapshot_factory
 
     def _mission_authorization(self, mission: Mission) -> tuple[bool, str]:
         if not self.require_authorization_snapshot:
-            return True, "legacy runtime authorization mode"
+            raise RuntimeError("authorization snapshot bypass is not supported")
         try:
             from security.mission_authorization import MissionAuthorizationSnapshot
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
-            return snapshot.validate_for_mission(mission_id=mission.mission_id, owner_identity=mission.owner_identity_ref, target_identity=snapshot.target_identity, version=int(mission.authorization_snapshot.get("version", 1)))
+            scope = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+            target = str(scope.get("target_id") or snapshot.target_identity)
+            expected_version = int(mission.provenance.get("authorization_snapshot_version", 1))
+            valid, reason = snapshot.validate_for_mission(mission_id=mission.mission_id, owner_identity=mission.owner_identity_ref, target_identity=target, version=expected_version)
+            if not valid:
+                return False, reason
+            actions = {step.action for step in mission.plan.steps if step.action != "__planning_failure__"}
+            if actions - set(snapshot.allowed_actions) or actions - set(snapshot.allowed_tools) or actions.intersection(snapshot.forbidden_actions):
+                return False, "mission actions or tools outside authorization snapshot"
+            expected_root = str(scope.get("workspace_root", ""))
+            if expected_root and str(snapshot.workspace_boundary.get("root", "")) != expected_root:
+                return False, "workspace boundary mismatch"
+            expected_network = set(scope.get("allowed_networks", ()))
+            if expected_network != set(snapshot.network_boundary.get("allowed", ())):
+                return False, "network boundary mismatch"
+            expected_credentials = set(scope.get("allowed_credentials", ()))
+            if expected_credentials != set(snapshot.credential_boundary.get("allowed", ())):
+                return False, "credential boundary mismatch"
+            return True, "authorized"
         except (KeyError, TypeError, ValueError, PermissionError) as exc:
             return False, f"authorization snapshot invalid: {type(exc).__name__}"
 
@@ -69,11 +88,18 @@ class MissionRuntime:
         return GoalVerification.evaluate(mission.objective, criteria, evidence)
 
     def create(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> Mission:
+        snapshot_factory = kwargs.pop("authorization_snapshot_factory", None) or self.authorization_snapshot_factory
         mission = Mission.create(owner_request, objective, plan, **kwargs)
+        if mission.authorization_snapshot is None and snapshot_factory is not None:
+            snapshot = snapshot_factory(mission)
+            if snapshot is not None:
+                mission.authorization_snapshot = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        if mission.authorization_snapshot:
+            mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot.get("version", 1))
         mission.transition(MissionStatus.READY, "plan persisted")
         return self.store.save(mission)
 
-    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None) -> Mission:
+    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None) -> Mission:
         """Create a Mission without allowing model understanding to rewrite the Owner objective."""
         from security.authorization_context import AuthorizationContext
         if not isinstance(authorization_context, AuthorizationContext):
@@ -93,6 +119,7 @@ class MissionRuntime:
             policy_snapshot=authorization_context.policy_snapshot.to_dict(),
             completion_criteria=completion_criteria,
             provenance={"source": "owner_instruction", **(provenance or {})},
+            authorization_snapshot_factory=authorization_snapshot_factory,
         )
 
     def provide_owner_decision(self, mission_id: str, *, allow: bool, authorization_context: dict[str, Any] | None = None) -> Mission:
@@ -525,9 +552,11 @@ class MissionRuntime:
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, "recovery budget exhausted")
         return self.store.save(mission)
 
-    def run_to_completion(self, mission_id: str, *, max_slices: int | None = None) -> Mission:
+    def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:
         limit = max_slices or self._load(mission_id).max_iterations
         for _ in range(limit):
+            if heartbeat is not None:
+                heartbeat()
             mission = self.run_slice(mission_id)
             if mission.is_terminal:
                 return mission

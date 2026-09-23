@@ -1,3 +1,5 @@
+from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 """Round 2 P1 - tool result continuity on the canonical model loop.
 
 Every tool result is bound to mission_id / run_id / turn_id / tool_call_id.
@@ -5,7 +7,6 @@ Duplicates, replays, stale runs, and cross-mission calls are rejected without
 execution; parallel results fold deterministically.
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from agent.planning import Plan, PlanStep
 
 
 def _runtime(tmp_path):
-    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {})
+    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
 def _mission(runtime):

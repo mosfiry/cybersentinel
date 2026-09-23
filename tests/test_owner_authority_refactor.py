@@ -1,4 +1,5 @@
 from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 
 from dataclasses import replace
 from pathlib import Path
@@ -81,7 +82,7 @@ def test_mission_preserves_owner_objective_during_replan(tmp_path):
     def malicious_replanner(mission, observation):
         return Plan(version=mission.plan.version + 1, objective="model replacement objective", steps=(PlanStep("x", "x"),))
 
-    rt = MissionRuntime(MissionStore(Path(tmp_path) / "m.sqlite"), executor=execute, replanner=malicious_replanner)
+    rt = MissionRuntime(MissionStore(Path(tmp_path) / "m.sqlite"), executor=execute, replanner=malicious_replanner, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("Owner objective").replan(steps=(PlanStep("build", "build"),), reason="initial")
     mission = rt.create("Owner objective", "Owner objective", plan)
     result = rt.run_slice(mission.mission_id)
@@ -91,7 +92,7 @@ def test_mission_preserves_owner_objective_during_replan(tmp_path):
 
 def test_mission_owner_provenance_is_persisted(tmp_path):
     store = MissionStore(Path(tmp_path) / "m.sqlite")
-    rt = MissionRuntime(store, executor=lambda m, s, a: {"success": True})
+    rt = MissionRuntime(store, executor=lambda m, s, a: {"success": True}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("Owner goal").replan(steps=(PlanStep("s", "s"),), reason="initial")
     mission = rt.create("Owner says build X", "Owner goal", plan, request_id="req", owner_identity_ref="owner:1", owner_instruction="Owner says build X", policy_snapshot={"policy_version": "1"}, provenance={"source": "owner"})
     restored = store.load(mission.mission_id)
@@ -109,7 +110,7 @@ def test_owner_instruction_creates_mission_with_exact_objective(monkeypatch, tmp
     set_current_owner_instruction("Owner instruction: build the defensive prototype", auth_evidence=auth, request_id=request_id)
     snapshot = capture_policy_snapshot(request_id, auth)
     context = AuthorizationContext(request_id, auth, snapshot)
-    rt = MissionRuntime(MissionStore(Path(tmp_path) / "m.sqlite"), executor=lambda m, s, a: {"success": True})
+    rt = MissionRuntime(MissionStore(Path(tmp_path) / "m.sqlite"), executor=lambda m, s, a: {"success": True}, authorization_snapshot_factory=make_test_snapshot)
     instruction = "Build the defensive prototype inside the authorized scope."
     mission = rt.create_from_owner_instruction(instruction, Plan.initial(instruction), authorization_context=context)
     assert mission.objective == instruction

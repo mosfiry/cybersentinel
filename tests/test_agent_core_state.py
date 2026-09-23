@@ -1,4 +1,5 @@
 from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from agent.state import MissionState
 
 
 def _runtime(tmp_path, executor, replanner=None):
-    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=executor, replanner=replanner)
+    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=executor, replanner=replanner, authorization_snapshot_factory=make_test_snapshot)
 
 
 def test_agent_state_projection_contains_auditable_fields(tmp_path):

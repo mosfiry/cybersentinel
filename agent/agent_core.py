@@ -261,6 +261,30 @@ class AgentCore:
             interpreter=ObservationInterpreter(proposer=self._observation_proposal),
             require_authorization_snapshot=True,
         )
+        target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
+        workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
+        allowed_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
+
+        def authorization_snapshot_factory(created_mission: Mission) -> MissionAuthorizationSnapshot:
+            return MissionAuthorizationSnapshot.create(
+                owner_identity=created_mission.owner_identity_ref,
+                mission_id=created_mission.mission_id,
+                target_identity=target_identity,
+                scope=tuple((scope_context or {}).get("scope", ("workspace",))),
+                allowed_actions=allowed_tools,
+                forbidden_actions=tuple((scope_context or {}).get("forbidden_actions", ())),
+                allowed_tools=allowed_tools,
+                time_window={"timezone": "UTC"},
+                max_duration=max(60, created_mission.max_iterations * 60),
+                rate_limits={tool: 1 for tool in allowed_tools},
+                network_boundary={"allowed": tuple((scope_context or {}).get("allowed_networks", ()))},
+                data_boundary={"allowed": (target_identity,)},
+                credential_boundary={"allowed": tuple((scope_context or {}).get("allowed_credentials", ()))},
+                workspace_boundary={"root": workspace_root},
+                policy_version=str(getattr(authorization_context.policy_snapshot, "policy_version", "owner-policy")),
+                owner_approval=authorization_context.owner_evidence.proof_fingerprint,
+                expires_at=authorization_context.owner_evidence.expires_at,
+            )
         mission = runtime.create_from_owner_instruction(
             instruction,
             plan,
@@ -268,31 +292,8 @@ class AgentCore:
             scope_snapshot=scope_context,
             completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
             provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
+            authorization_snapshot_factory=authorization_snapshot_factory,
         )
-        target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
-        workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
-        allowed_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
-        snapshot = MissionAuthorizationSnapshot.create(
-            owner_identity=mission.owner_identity_ref,
-            mission_id=mission.mission_id,
-            target_identity=target_identity,
-            scope=tuple((scope_context or {}).get("scope", ("workspace",))),
-            allowed_actions=allowed_tools,
-            forbidden_actions=tuple((scope_context or {}).get("forbidden_actions", ())),
-            allowed_tools=allowed_tools,
-            time_window={"timezone": "UTC"},
-            max_duration=max(60, mission.max_iterations * 60),
-            rate_limits={tool: 1 for tool in allowed_tools},
-            network_boundary={"allowed": tuple((scope_context or {}).get("allowed_networks", ()))},
-            data_boundary={"allowed": (target_identity,)},
-            credential_boundary={"allowed": tuple((scope_context or {}).get("allowed_credentials", ()))},
-            workspace_boundary={"root": workspace_root},
-            policy_version=str(getattr(authorization_context.policy_snapshot, "policy_version", "owner-policy")),
-            owner_approval=authorization_context.owner_evidence.proof_fingerprint,
-            expires_at=authorization_context.owner_evidence.expires_at,
-        )
-        mission.authorization_snapshot = snapshot.to_dict()
-        self.store.save(mission)
         if getattr(self, "_last_model_response", None):
             mission.progress["initial_model_response"] = dict(self._last_model_response)
         mission.semantic_intent = NaturalLanguageUnderstanding().understand(instruction).to_dict()
@@ -358,6 +359,7 @@ class AgentCore:
         try:
             old_authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
             mission.authorization_snapshot = old_authorization.amend(owner_approval=evidence.proof_fingerprint, changes={}, expires_at=evidence.expires_at).to_dict()
+            mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot["version"])
         except (KeyError, TypeError, ValueError, PermissionError):
             if mission.authorization_snapshot:
                 mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "authorization snapshot cannot be renewed")
@@ -368,6 +370,7 @@ class AgentCore:
             mission.owner_identity_ref = owner_identity
             renewed = MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity="local-workspace", scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=(), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(60, mission.max_iterations * 60), rate_limits={tool: 1 for tool in allowed_tools}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("local-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(Path.cwd().resolve())}, policy_version="owner-policy", owner_approval=evidence.proof_fingerprint, expires_at=evidence.expires_at)
             mission.authorization_snapshot = renewed.to_dict()
+            mission.provenance["authorization_snapshot_version"] = int(renewed.version)
         old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
         fresh_scope = get_snapshot(str(old_scope_id)) if old_scope_id else None
         fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope)

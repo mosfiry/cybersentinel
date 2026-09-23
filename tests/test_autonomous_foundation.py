@@ -1,4 +1,5 @@
 from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -154,7 +155,7 @@ def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path):
     from agent.mission import MissionStore
 
     store = MissionStore(Path(tmp_path) / "missions.sqlite3")
-    runtime = MissionRuntime(store, executor=lambda _mission, _step, _action: {"success": True, "criterion_id": "done", "source": "test"})
+    runtime = MissionRuntime(store, executor=lambda _mission, _step, _action: {"success": True, "criterion_id": "done", "source": "test"}, authorization_snapshot_factory=make_test_snapshot)
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     scheduler = MissionScheduler(Path(tmp_path) / "scheduler.sqlite3", queue)
     service = MissionService(runtime, queue, scheduler)

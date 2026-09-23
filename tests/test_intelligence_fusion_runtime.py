@@ -1,4 +1,5 @@
 from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 
 from pathlib import Path
 
@@ -28,7 +29,7 @@ def test_native_runtime_parallel_calls_have_independent_results(tmp_path, monkey
         return {"ok": True, "criterion_id": "goal", "source": name}
 
     monkeypatch.setattr(tools.registry, "execute", execute)
-    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {})
+    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("collect").replan(steps=(PlanStep("s", "collect", action="status"),), reason="test")
     mission = runtime.create("collect", "collect", plan, completion_criteria=[{"criterion_id": "goal"}])
     result = runtime.run_model_loop(mission.mission_id, ParallelModel(), tools=[{"name": "status"}, {"name": "latest_intel"}], max_turns=3)

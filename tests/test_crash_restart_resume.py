@@ -1,3 +1,5 @@
+from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 """Round 2 P0-5 - crash / restart / resume on the canonical MissionRuntime.
 
 The mission state is durable SQLite. A simulated process crash (unhandled
@@ -6,7 +8,6 @@ must never silently continue an in-flight side effect or silently restore
 Owner authority.
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def _db(tmp_path):
 
 
 def _runtime(db):
-    return MissionRuntime(MissionStore(db), executor=lambda *_: {})
+    return MissionRuntime(MissionStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
 def _mission(runtime):

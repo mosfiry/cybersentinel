@@ -1,3 +1,5 @@
+from __future__ import annotations
+from runtime_authorization import make_test_snapshot
 """Round 2 P1 - deterministic goal verification.
 
 A MODEL CLAIM alone can never complete a mission. Completion requires
@@ -5,7 +7,6 @@ observable evidence for every required criterion evaluated by the deterministic
 GoalVerification, or the mission returns to READY instead of completing.
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from agent.planning import (
 
 
 def _runtime(tmp_path):
-    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {})
+    return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
 def _mission(runtime, criteria):
