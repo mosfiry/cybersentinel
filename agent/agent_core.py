@@ -252,6 +252,31 @@ class AgentCore:
                 session_id=authorization_context.session_id,
             )
         plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id)
+        # Owner-derived tool allowlist. MODEL_OUTPUT may never mint AUTHORIZATION_SCOPE:
+        # the snapshot allowlist comes from the Owner's scope_context, or
+        # deterministically from the system tool registry - never from the plan.
+        owner_allowed_tools = (scope_context or {}).get("allowed_tools")
+        if isinstance(owner_allowed_tools, (list, tuple)):
+            allowed_tools = tuple(str(tool) for tool in owner_allowed_tools)
+            allowlist_source = "owner_scope_context"
+        else:
+            allowed_tools = tuple(REGISTRY)
+            allowlist_source = "system_tool_registry"
+        kept_steps: list[PlanStep] = []
+        blocked_tool_proposals: list[str] = []
+        for step in plan.steps:
+            if step.action == "__planning_failure__" or step.action in allowed_tools:
+                kept_steps.append(step)
+            else:
+                blocked_tool_proposals.append(step.action)
+        if blocked_tool_proposals:
+            if kept_steps:
+                plan = plan.replan(steps=kept_steps, reason="owner tool allowlist filtered model proposals")
+            else:
+                plan = plan.replan(
+                    steps=[PlanStep("planning-failure", "No model-proposed tool lies within the owner allowlist", action="__planning_failure__", expected_observation="replanned action", retry_policy={"failure_class": "AUTHORIZATION"})],
+                    reason="owner tool allowlist rejected all model proposals",
+                )
         task_profile = TaskProfile.from_proposal(instruction, {"task_type": "owner_mission", "horizon": "long_horizon", "complexity": "multi_step", "likely_tools": [step.action for step in plan.steps if step.action != "__planning_failure__"]})
         runtime = MissionRuntime(
             self.store,
@@ -263,7 +288,6 @@ class AgentCore:
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
-        allowed_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
 
         def authorization_snapshot_factory(created_mission: Mission) -> MissionAuthorizationSnapshot:
             return MissionAuthorizationSnapshot.create(
@@ -291,7 +315,7 @@ class AgentCore:
             authorization_context=authorization_context,
             scope_snapshot=scope_context,
             completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
-            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
+            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict(), "tool_allowlist_source": allowlist_source, "blocked_tool_proposals": blocked_tool_proposals},
             authorization_snapshot_factory=authorization_snapshot_factory,
         )
         if getattr(self, "_last_model_response", None):
@@ -365,7 +389,8 @@ class AgentCore:
                 mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "authorization snapshot cannot be renewed")
                 self.store.save(mission)
                 raise PermissionError("authorization snapshot cannot be renewed")
-            allowed_tools = tuple(step.action for step in mission.plan.steps if step.action != "__planning_failure__")
+            # Deterministic system allowlist - MODEL_OUTPUT may never mint AUTHORIZATION_SCOPE
+            allowed_tools = tuple(REGISTRY)
             owner_identity = mission.owner_identity_ref or evidence.proof_fingerprint
             mission.owner_identity_ref = owner_identity
             renewed = MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity="local-workspace", scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=(), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(60, mission.max_iterations * 60), rate_limits={tool: 1 for tool in allowed_tools}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("local-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(Path.cwd().resolve())}, policy_version="owner-policy", owner_approval=evidence.proof_fingerprint, expires_at=evidence.expires_at)
