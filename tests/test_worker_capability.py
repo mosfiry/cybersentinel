@@ -140,8 +140,9 @@ def test_plan_always_requires_authorization(vibe):
     from worker import LiveResearchWorkerAdapter, CapabilityRequirement
     adapter = LiveResearchWorkerAdapter(vibe)
     plan = adapter.plan_task("t1", [CapabilityRequirement("https_get")])
+    assert plan.capability_ready is True
     assert plan.authorization_required is True  # capability allowed != authorized
-    assert plan.dispatchable is True  # dispatchable refers ONLY to capability
+    assert plan.dispatchable is False  # authorization is still required
 
 
 def test_blocked_plan_is_not_dispatchable(vibe):
@@ -184,6 +185,50 @@ def test_adapter_rejects_foreign_worker_evidence(vibe):
         ))
 
 
+def test_adapter_accepts_external_data_evidence(vibe):
+    from worker import LiveResearchWorkerAdapter, WorkerObservation, ObservationKind, EvidenceClass, ProvenanceLayer
+    adapter = LiveResearchWorkerAdapter(vibe)
+    adapter.accept_evidence(WorkerObservation(
+        request_id="r3", worker_id=vibe.worker_id, capability="https_get",
+        timestamp="2026-09-23T00:00:00Z", target="example.com",
+        operation=ObservationKind.RESPONSE_BODY, url="https://example.com",
+        evidence_class=EvidenceClass.OBSERVED, status="200",
+        provenance=ProvenanceLayer.EXTERNAL_DATA,
+    ))
+
+
+def test_adapter_accepts_tool_runtime_evidence(vibe):
+    from worker import LiveResearchWorkerAdapter, WorkerObservation, ObservationKind, EvidenceClass, ProvenanceLayer
+    adapter = LiveResearchWorkerAdapter(vibe)
+    adapter.accept_evidence(WorkerObservation(
+        request_id="r4", worker_id=vibe.worker_id, capability="https_get",
+        timestamp="2026-09-23T00:00:00Z", target="example.com",
+        operation=ObservationKind.REQUEST_TIMING, url="https://example.com",
+        evidence_class=EvidenceClass.OBSERVED, status="completed",
+        provenance=ProvenanceLayer.TOOL_RUNTIME,
+    ))
+
+
+def test_model_output_evidence_is_limited_to_interpretation(vibe):
+    from worker import LiveResearchWorkerAdapter, WorkerObservation, ObservationKind, EvidenceClass, ProvenanceLayer
+    adapter = LiveResearchWorkerAdapter(vibe)
+    adapter.accept_evidence(WorkerObservation(
+        request_id="r5", worker_id=vibe.worker_id, capability="https_get",
+        timestamp="2026-09-23T00:00:00Z", target="example.com",
+        operation=ObservationKind.RESPONSE_DIFFERENCE, url="https://example.com",
+        evidence_class=EvidenceClass.INFERRED, status="interpreted",
+        provenance=ProvenanceLayer.MODEL_OUTPUT,
+    ))
+    with pytest.raises(ValueError):
+        WorkerObservation(
+            request_id="r6", worker_id=vibe.worker_id, capability="https_get",
+            timestamp="2026-09-23T00:00:00Z", target="example.com",
+            operation=ObservationKind.RESPONSE_BODY, url="https://example.com",
+            evidence_class=EvidenceClass.OBSERVED, status="200",
+            provenance=ProvenanceLayer.MODEL_OUTPUT,
+        )
+
+
 def test_hierarchy_order_unchanged():
     from worker import PROVENANCE_HIERARCHY, ProvenanceLayer
     assert [l.value for l in PROVENANCE_HIERARCHY] == [
@@ -224,10 +269,10 @@ def test_worker_cannot_self_confirm_finding():
     assert finding_status_from_observation(obs) is FindingStatus.UNPROVEN
 
 
-def test_validator_corroboration_is_explicit_metadata():
+def test_worker_confirmation_metadata_is_not_trusted():
     from worker import finding_status_from_observation, ObservationKind, EvidenceClass, FindingStatus
     obs = _obs(ObservationKind.RESPONSE_MATCH, EvidenceClass.CONFIRMED, metadata={"corroborated_by_validator": True})
-    assert finding_status_from_observation(obs) is FindingStatus.CONFIRMED
+    assert finding_status_from_observation(obs) is FindingStatus.UNPROVEN
 
 
 def test_hypothesis_stays_unproven():

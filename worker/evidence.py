@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
-from .provenance import ProvenanceLayer
+from .provenance import ProvenanceLayer, WORKER_PROVENANCE_LAYERS
 
 
 class EvidenceClass(str, Enum):
@@ -68,9 +68,12 @@ class WorkerObservation:
     provenance: ProvenanceLayer = ProvenanceLayer.EXTERNAL_DATA
 
     def __post_init__(self) -> None:
-        # A worker observation may never claim an authority provenance.
-        if self.provenance in (ProvenanceLayer.OWNER_INSTRUCTION, ProvenanceLayer.OWNER_POLICY, ProvenanceLayer.AUTHORIZATION_SCOPE):
+        # Worker observations must remain in their declared worker layer.
+        if self.provenance not in WORKER_PROVENANCE_LAYERS:
             raise ValueError("worker evidence may not claim authority provenance: " + self.provenance.value)
+        # MODEL_OUTPUT is an interpretation layer, not raw worker observation.
+        if self.provenance is ProvenanceLayer.MODEL_OUTPUT and self.evidence_class not in (EvidenceClass.INFERRED, EvidenceClass.HYPOTHESIS, EvidenceClass.UNPROVEN, EvidenceClass.BLOCKED):
+            raise ValueError("MODEL_OUTPUT evidence must be an interpretation claim")
 
 
 def finding_status_from_observation(observation: WorkerObservation) -> FindingStatus:
@@ -86,8 +89,8 @@ def finding_status_from_observation(observation: WorkerObservation) -> FindingSt
     if observation.operation is ObservationKind.RESPONSE_DIFFERENCE:
         return FindingStatus.UNPROVEN
     if observation.evidence_class is EvidenceClass.CONFIRMED:
-        # CONFIRMED requires explicit corroboration metadata recorded by the
-        # validating authority (CyberSentinel), not by the worker itself.
-        corroborated = bool(observation.metadata.get("corroborated_by_validator"))
-        return FindingStatus.CONFIRMED if corroborated else FindingStatus.UNPROVEN
+        # This package has no trusted CyberSentinel validation event. A worker
+        # cannot self-confirm by supplying metadata such as
+        # corroborated_by_validator=True.
+        return FindingStatus.UNPROVEN
     return FindingStatus.OBSERVATION

@@ -5,7 +5,7 @@ from typing import Iterable
 
 from .capability import WorkerCapabilitySet
 from .evidence import WorkerObservation
-from .provenance import ProvenanceLayer, promotion_allowed
+from .provenance import WORKER_PROVENANCE_LAYERS
 from .requirements import CapabilityCheckResult, CapabilityRequirement, check_requirements
 
 
@@ -22,6 +22,7 @@ class WorkerTaskPlan:
     task_id: str
     requirements: tuple[CapabilityRequirement, ...]
     check: CapabilityCheckResult
+    capability_ready: bool = False
     authorization_required: bool = True
     dispatchable: bool = field(default=False)
 
@@ -63,8 +64,9 @@ class LiveResearchWorkerAdapter:
             task_id=task_id,
             requirements=reqs,
             check=check,
+            capability_ready=check.allowed,
             authorization_required=True,  # capability allowed != authorized
-            dispatchable=check.allowed,     # dispatchable refers ONLY to capability
+            dispatchable=False,             # authorization is outside this adapter
         )
 
     def accept_evidence(self, observation: WorkerObservation) -> None:
@@ -73,8 +75,8 @@ class LiveResearchWorkerAdapter:
         Structural validation only. The evidence chain itself and finding
         validation stay inside CyberSentinel's existing architecture.
         """
-        if not promotion_allowed(observation.provenance, ProvenanceLayer.TOOL_RUNTIME):
-            # Worker evidence claiming OWNER/AUTHORITY/SYSTEM layers is a hard error.
+        if observation.provenance not in WORKER_PROVENANCE_LAYERS:
+            # Worker evidence must remain in its declared worker provenance layer.
             raise ValueError("evidence provenance violates authority boundary: " + observation.provenance.value)
         if not observation.request_id or not observation.worker_id:
             raise ValueError("evidence missing request_id/worker_id")
