@@ -158,13 +158,15 @@ class KaliExecutionGate:
             if marker not in set(snapshot.scope):
                 return {"decision": NEEDS_OWNER_APPROVAL, "reason": "destructive_tool_requires_explicit_owner_approval", "detail": marker}
 
-        # Privilege requirement is part of the capability record and the
-        # authorization record; a capability-with-limitations run that still
-        # matches authorization is permitted, otherwise blocked.
+        # Capability limitations are hard execution blocks: a tool whose
+        # required runtime resources are missing cannot run, regardless of
+        # authorization. Authorization can never repair a capability gap.
         if capability.status is CapabilityStatus.AVAILABLE_WITH_LIMITATIONS:
             for limitation in capability.limitations:
                 if limitation.startswith("missing_privileges:"):
                     return {"decision": AUTHORIZATION_BLOCKED, "reason": "runtime_privilege_missing", "detail": limitation}
+                if limitation == "network_unavailable":
+                    return {"decision": AUTHORIZATION_BLOCKED, "reason": "runtime_network_unavailable", "detail": limitation}
 
         return {
             "decision": AUTHORIZED,
