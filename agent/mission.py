@@ -38,6 +38,40 @@ TERMINAL_MISSION_STATUSES = frozenset({
 })
 
 
+_ALLOWED_EXIT_STATES = frozenset({
+    MissionStatus.READY, MissionStatus.RUNNING, MissionStatus.OBSERVING, MissionStatus.VERIFYING,
+    MissionStatus.REPLANNING, MissionStatus.GOAL_COMPLETED, MissionStatus.OWNER_INPUT_REQUIRED,
+    MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.SCOPE_BLOCKED, MissionStatus.RESOURCE_BLOCKED,
+    MissionStatus.RECOVERY_REQUIRED, MissionStatus.SAFETY_BLOCKED, MissionStatus.FAILED_RETRY_EXHAUSTED,
+    MissionStatus.CANCELLED,
+})
+
+ALLOWED_MISSION_TRANSITIONS: dict[MissionStatus, frozenset[MissionStatus]] = {
+    # CREATED exists only between Mission.create and plan persistence.
+    MissionStatus.CREATED: frozenset({MissionStatus.PLANNING, MissionStatus.CANCELLED}),
+    MissionStatus.PLANNING: frozenset({MissionStatus.READY, MissionStatus.CANCELLED}),
+    # Active execution states may move to any runtime exit state; the runtime
+    # still owns WHICH exit is legitimate for a given observation.
+    MissionStatus.READY: _ALLOWED_EXIT_STATES,
+    MissionStatus.RUNNING: _ALLOWED_EXIT_STATES,
+    MissionStatus.OBSERVING: _ALLOWED_EXIT_STATES,
+    MissionStatus.VERIFYING: _ALLOWED_EXIT_STATES,
+    MissionStatus.REPLANNING: _ALLOWED_EXIT_STATES,
+    # Recovery must be reconciled before any other continuation.
+    MissionStatus.RECOVERY_REQUIRED: frozenset({MissionStatus.RECOVERY_REQUIRED, MissionStatus.READY}),
+    # Owner intervention is the only terminal state that can be resolved.
+    MissionStatus.OWNER_INPUT_REQUIRED: frozenset({MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.READY}),
+    # All other terminal states are immutable.
+    MissionStatus.GOAL_COMPLETED: frozenset({MissionStatus.GOAL_COMPLETED}),
+    MissionStatus.AUTHORIZATION_BLOCKED: frozenset({MissionStatus.AUTHORIZATION_BLOCKED}),
+    MissionStatus.SCOPE_BLOCKED: frozenset({MissionStatus.SCOPE_BLOCKED}),
+    MissionStatus.RESOURCE_BLOCKED: frozenset({MissionStatus.RESOURCE_BLOCKED}),
+    MissionStatus.SAFETY_BLOCKED: frozenset({MissionStatus.SAFETY_BLOCKED}),
+    MissionStatus.FAILED_RETRY_EXHAUSTED: frozenset({MissionStatus.FAILED_RETRY_EXHAUSTED}),
+    MissionStatus.CANCELLED: frozenset({MissionStatus.CANCELLED}),
+}
+
+
 @dataclass
 class Mission:
     mission_id: str
@@ -101,12 +135,13 @@ class Mission:
     def transition(self, target: MissionStatus, reason: str, **data: Any) -> None:
         if not isinstance(target, MissionStatus):
             raise TypeError("mission transition requires MissionStatus")
-        if self.status is MissionStatus.RECOVERY_REQUIRED and target not in {MissionStatus.RECOVERY_REQUIRED, MissionStatus.READY}:
-            raise ValueError("recovery requires reconciliation before continuation")
-        recovery_reconciled = self.status is MissionStatus.RECOVERY_REQUIRED and target is MissionStatus.READY
-        owner_intervention = self.status is MissionStatus.OWNER_INPUT_REQUIRED and target in {MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.READY}
-        if self.is_terminal and target is not self.status and not recovery_reconciled and not owner_intervention:
-            raise ValueError(f"terminal mission cannot transition {self.status.value}->{target.value}")
+        allowed_targets = ALLOWED_MISSION_TRANSITIONS.get(self.status, frozenset({self.status}))
+        if target is not self.status and target not in allowed_targets:
+            if self.status is MissionStatus.RECOVERY_REQUIRED:
+                raise ValueError("recovery requires reconciliation before continuation")
+            if self.status in TERMINAL_MISSION_STATUSES:
+                raise ValueError(f"terminal mission cannot transition {self.status.value}->{target.value}")
+            raise ValueError(f"invalid mission transition {self.status.value}->{target.value}")
         self.status = target
         self.transitions.append({"from": self.transitions[-1]["to"] if self.transitions else "CREATED", "to": target.value, "reason": reason, "data": data, "iteration": self.iteration_count})
 

@@ -75,6 +75,26 @@ class MissionRuntime:
             return False, "scope snapshot required"
         return True, "authorized"
 
+    def _proposal_snapshot_gate(self, mission: Mission, tool_name: str) -> tuple[bool, str]:
+        """Deterministic MissionAuthorizationSnapshot gate for model-proposed tools.
+
+        Model output proposes tools but can never widen this gate: membership is
+        checked only against the Owner-minted mission snapshot. This gate is not
+        an alternative to authorize_tool(); it runs before it.
+        """
+        from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        except (MissionAuthorizationError, KeyError, TypeError, ValueError, PermissionError) as exc:
+            return False, f"authorization snapshot invalid: {type(exc).__name__}"
+        if not snapshot.is_active():
+            return False, "authorization snapshot expired or not yet active"
+        if tool_name in snapshot.forbidden_actions:
+            return False, f"tool {tool_name} is forbidden by authorization snapshot"
+        if tool_name not in snapshot.allowed_tools or tool_name not in snapshot.allowed_actions:
+            return False, f"tool {tool_name} outside authorization snapshot allowlist"
+        return True, "authorized"
+
     @staticmethod
     def _default_replanner(mission: Mission, observation: dict[str, Any]) -> Plan:
         step = mission.current_plan_step
@@ -231,6 +251,12 @@ class MissionRuntime:
             mission.error = "in-flight native tool outcome is unknown; reconciliation required"
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
             return self.store.save(mission)
+        authorization_ok, authorization_reason = self._mission_authorization(mission)
+        if not authorization_ok:
+            mission.error = authorization_reason
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
+            return self.store.save(mission)
         run_id = run_id or str(mission.progress.get("model_run_id") or hashlib.sha256((mission.mission_id + mission.request_id).encode()).hexdigest()[:20])
         mission.progress["model_run_id"] = run_id
         progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
@@ -321,6 +347,13 @@ class MissionRuntime:
                     seen.add(proposal.tool_call_id)
                     progress["seen_call_ids"].append(proposal.tool_call_id)
                     argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
+                    snapshot_ok, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+                    if not snapshot_ok:
+                        mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+                        mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": snapshot_reason})
+                        result = ToolCallResult(proposal, False, error=snapshot_reason)
+                        progress["tool_results"].append(result.to_dict())
+                        continue
                     decision = authorize_tool([proposal.name, argument], context=auth_context)
                     mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
                     mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
@@ -367,6 +400,11 @@ class MissionRuntime:
             seen.add(proposal.tool_call_id)
             progress["seen_call_ids"].append(proposal.tool_call_id)
             argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
+            snapshot_ok, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+            if not snapshot_ok:
+                mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": snapshot_reason})
+                results.append(ToolCallResult(proposal, False, error=snapshot_reason))
+                continue
             decision = authorize_tool([proposal.name, argument], context=auth_context)
             mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
             if decision.allowed:
