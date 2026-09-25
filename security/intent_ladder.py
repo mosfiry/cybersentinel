@@ -453,7 +453,7 @@ class ActionIntent:
     parent_mission_fingerprint: str
     tool_name: str
     arguments: dict[str, Any]
-    arguments_fingerprint: str
+    arguments_fingerprint: str = ""
     dependencies: tuple[str, ...] = ()
     description: str = ""
     provenance: str = "MODEL_PROPOSAL"
