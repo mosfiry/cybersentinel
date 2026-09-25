@@ -70,8 +70,16 @@ jobs:
           else
             { echo "# CI run $sha"; echo "result: SUCCESS"; } > "diagnostics/ci-$sha.md"
           fi
+          # Diagnostics transparency: publish the actual compile/pytest output
+          # tails so failures on any branch can be diagnosed from source alone.
+          if [ -f compile_out.txt ]; then
+            { echo; echo "## compileall output (last 100 lines)"; tail -n 100 compile_out.txt; } >> "diagnostics/ci-$sha.md"
+          fi
+          if [ -f pytest_out.txt ]; then
+            { echo; echo "## pytest output (last 400 lines)"; tail -n 400 pytest_out.txt; } >> "diagnostics/ci-$sha.md"
+          fi
       - name: Publish diagnostics
-        if: always() && github.ref == 'refs/heads/main'
+        if: always()
         shell: bash
         run: |
           git config user.name "mosfiry"
