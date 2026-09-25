@@ -159,3 +159,48 @@ def test_parallel_results_fold_deterministically(tmp_path, monkeypatch):
     assert len(result.observations) == 2
     assert result.checkpoint.get("status") == "completed"
     assert result.progress["model_loop"]["seen_call_ids"] == ["call_001", "call_002"]
+
+
+def test_parallel_tool_exception_requires_reconciliation(tmp_path, monkeypatch):
+    import tools.registry
+
+    executions = []
+
+    def fixture(name, argument, **kwargs):
+        executions.append(name)
+        if len(executions) == 2:
+            raise RuntimeError("worker crashed after external side effect")
+        return {"ok": True, "source": "parallel-fixture"}
+
+    monkeypatch.setattr(tools.registry, "execute", fixture)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+
+    class FailingParallelModel:
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            return ModelTurn(
+                turn_id,
+                tool_calls=(
+                    _call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),
+                    _call(mission_id, run_id, turn_id, plan_version, 2, "call_002"),
+                ),
+            )
+
+    result = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=2)
+    assert len(executions) == 2
+    assert result.status.name == "RECOVERY_REQUIRED"
+    assert result.checkpoint.get("status") == "in_flight_parallel"
+    assert result.checkpoint.get("ambiguous_tool_call_ids") == ["call_002"]
+
+    resumed_without_reconciliation = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=2)
+    assert len(executions) == 2, "restart must not replay any parallel side effect before reconciliation"
+    assert resumed_without_reconciliation.status.name == "RECOVERY_REQUIRED"
+
+    reconciled = runtime.reconcile_in_flight(
+        mission.mission_id,
+        executed=True,
+        observation={"success": True, "criterion_id": "goal", "source": "parallel-external-receipt"},
+    )
+    assert reconciled.status.name == "READY"
+    assert reconciled.checkpoint.get("status") == "completed"
+    assert reconciled.checkpoint.get("reconciled") is True

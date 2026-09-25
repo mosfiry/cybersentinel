@@ -199,8 +199,28 @@ class MissionRuntime:
         """
         mission = self._load(mission_id)
         checkpoint = dict(mission.checkpoint or {})
-        if checkpoint.get("status") != "in_flight":
+        checkpoint_status = checkpoint.get("status")
+        if checkpoint_status not in {"in_flight", "in_flight_parallel"}:
             raise ValueError("mission has no in-flight action requiring reconciliation")
+        if checkpoint_status == "in_flight_parallel":
+            ambiguous_ids = [str(item) for item in checkpoint.get("ambiguous_tool_call_ids", checkpoint.get("tool_call_ids", []))]
+            if not ambiguous_ids:
+                raise ValueError("parallel checkpoint has no ambiguous tool calls")
+            if executed:
+                base_observation = dict(observation or {"success": True, "source": "external_reconciliation"})
+                base_observation.setdefault("success", True)
+                for tool_call_id in ambiguous_ids:
+                    result = {**base_observation, "tool_call_id": tool_call_id, "type": "reconciled_observation"}
+                    mission.record_observation(result)
+                    mission.record_action(tool_call_id, str(checkpoint.get("step_id", "")), "completed", result)
+                    mission.evidence.append({"criterion_id": result.get("criterion_id", str(checkpoint.get("step_id", ""))), "passed": bool(result.get("success")), "source": result.get("source", "external_reconciliation"), "result": result, "provenance": {"mission_id": mission.mission_id, "tool_call_id": tool_call_id, "reconciled": True}})
+                mission.checkpoint = {**checkpoint, "status": "completed", "reconciled": True}
+                mission.current_step += 1
+                mission.transition(MissionStatus.READY, "parallel in-flight actions reconciled as executed", tool_call_ids=ambiguous_ids)
+            else:
+                mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
+                mission.transition(MissionStatus.READY, "parallel in-flight actions reconciled as not executed", tool_call_ids=ambiguous_ids)
+            return self.store.save(mission)
         action_id = str(checkpoint.get("action_id", ""))
         step_id = str(checkpoint.get("step_id", ""))
         if executed:
@@ -309,6 +329,8 @@ class MissionRuntime:
             if len(turn.tool_calls) > 1:
                 self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, current_step=current_step, progress=progress, seen=seen)
                 self.store.save(mission)
+                if mission.is_terminal:
+                    return mission
                 continue
             for proposal in turn.tool_calls:
                 if proposal.mission_id and proposal.mission_id != mission.mission_id:
@@ -380,9 +402,15 @@ class MissionRuntime:
             try:
                 return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id) or {})
             except Exception as exc:
-                return {"success": False, "error": str(exc), "failure_class": FailureClass.TOOL.value, "exception": type(exc).__name__}
+                # An exception after dispatch cannot prove that the external side effect did not happen.
+                # Preserve ambiguity so recovery cannot blindly replay this proposal.
+                return {"_ambiguous": True, "error": str(exc), "failure_class": FailureClass.UNKNOWN.value, "exception": type(exc).__name__}
         raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
+        ambiguous: list[tuple[Any, dict[str, Any]]] = []
         for item, raw in zip(authorized, raw_results):
+            if raw.get("_ambiguous"):
+                ambiguous.append((item[0], raw))
+                continue
             proposal = item[0]
             observation = dict(raw)
             observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
@@ -395,8 +423,21 @@ class MissionRuntime:
                 mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
             mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
             results.append(ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", ""))))
-        mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
         progress["tool_results"].extend(result.to_dict() for result in results)
+        if ambiguous:
+            ambiguous_ids = [proposal.tool_call_id for proposal, _ in ambiguous]
+            mission.error = "parallel tool outcome is ambiguous; reconciliation required"
+            mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "tool_call_ids": ambiguous_ids})
+            mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "tool_call_ids": ambiguous_ids})
+            mission.checkpoint = {
+                "status": "in_flight_parallel",
+                "tool_call_ids": [item[0].tool_call_id for item in authorized],
+                "ambiguous_tool_call_ids": ambiguous_ids,
+                "run_id": run_id,
+            }
+            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+            return
+        mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
 
     def run_slice(self, mission_id: str) -> Mission:
         mission = self._load(mission_id)
