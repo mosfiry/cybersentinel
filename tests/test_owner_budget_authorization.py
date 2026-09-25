@@ -155,8 +155,15 @@ def test_b1_7_scope_expansion_attempts_fail_closed(tmp_path, monkeypatch):
     budget = OwnerAuthorizedToolBudget(frozenset({"status"}))
     with pytest.raises(OwnerBudgetError):
         budget.narrowed_by(["status", "watch"])
+    # An Owner Policy without a budget declaration grants nothing.
+    import security.owner_budget as owner_budget_module
+    from dataclasses import replace as _replace
+    class _NoBudgetPolicy:
+        owner_tool_budget = []
+    real_load = owner_budget_module.OwnerAuthorizedToolBudget.from_owner_policy
+    monkeypatch.setattr(owner_policy, "load_policy", lambda: _NoBudgetPolicy())
     with pytest.raises(OwnerBudgetError):
-        core_unused = OwnerAuthorizedToolBudget.from_owner_policy
+        OwnerAuthorizedToolBudget.from_owner_policy()
 
 
 def test_b1_7_renamed_or_malformed_model_tools_never_enter_scope(tmp_path, monkeypatch):
