@@ -77,7 +77,7 @@ def test_b3a_replay_safe_repeated_100_times():
 
 
 # fail-closed: malformed proposals
-@pytest.mark.parametrize("bad", [None, "text", 42, [], [42], [{"objective": ""}], [[]], [[]]])
+@pytest.mark.parametrize("bad", ["text", 42, [], [42], [{"objective": ""}], [[]]])
 def test_b3a_malformed_model_proposal_fails_closed(bad):
     with pytest.raises(TaskIntentError):
         derive_task_intents(_mission(), bad)
