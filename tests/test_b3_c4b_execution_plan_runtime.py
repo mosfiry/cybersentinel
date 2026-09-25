@@ -169,9 +169,15 @@ def test_c4b_gate_rejects_unplanned_action_tool_and_arguments(tmp_path):
     plan = derive_mission_execution_plan(mission, [ToolCallProposal.create("status", {"query": "q"}, mission_id=mission.mission_id, tool_call_id="call_1", action_id="a1")])
     ok, code, _reason = gate_action_against_plan(plan, action_id="a1:call_1", tool_name="status", arguments={"query": "q"})
     assert ok is True and code == ""
-    # case 13: action not present in the ExecutionPlan
-    ok, code, _ = gate_action_against_plan(plan, action_id="a9:call_9", tool_name="status", arguments={"query": "q"})
+    # case 13: action not present in the ExecutionPlan (identity unknown and
+    # arguments do not correspond to any planned effective action)
+    ok, code, _ = gate_action_against_plan(plan, action_id="a9:call_9", tool_name="status", arguments={"query": "unplanned"})
     assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
+    # duplicate emission: a fresh identity of an already-planned effective
+    # action (same tool, same canonical arguments) is not a new action; it
+    # maps to the planned action and cannot add or alter authority
+    ok, code, reason = gate_action_against_plan(plan, action_id="a9:call_9", tool_name="status", arguments={"query": "q"})
+    assert ok is True and "duplicate emission" in reason
     # case 14: arguments differ from the ExecutionPlan
     ok, code, _ = gate_action_against_plan(plan, action_id="a1:call_1", tool_name="status", arguments={"query": "changed"})
     assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
@@ -279,6 +285,26 @@ def test_c4b_inv10_parallel_duplicate_tool_with_changed_arguments(tmp_path, monk
     blocked = [item for item in result.progress["model_loop"]["tool_results"] if item["tool_call_id"] == "call_002"]
     assert blocked and blocked[0]["ok"] is False
     assert blocked[0]["error"].startswith("PLAN_MISMATCH:")
+
+
+def test_c4b_inv10_parallel_identical_duplicate_calls_execute_in_plan_order(tmp_path, monkeypatch):
+    """Duplicate emissions of ONE planned effective action stay executable and fold in proposal order.
+
+    The C3 plan keeps effective actions first-seen-unique per tool, so two
+    identical proposals (same tool, same canonical arguments) map to the same
+    planned action. Both execute once each, in proposal order, and neither
+    can add, replace, or widen a planned action (INV-C4-10).
+    """
+    calls = _recording_registry(monkeypatch)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
+    model = ScriptedModel(mission.mission_id, [[("status", {}, "a1", "call_001"), ("status", {}, "a2", "call_002")]])
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
+    assert [call["tool"] for call in calls] == ["status", "status"]
+    tool_results = result.progress["model_loop"]["tool_results"]
+    assert [item["tool_call_id"] for item in tool_results] == ["call_001", "call_002"]
+    assert all(item["ok"] for item in tool_results)
+    assert len(result.progress["execution_plans"]) == 1
 
 
 # ---------------------------------------------------------------------------

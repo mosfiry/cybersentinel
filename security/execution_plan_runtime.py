@@ -212,24 +212,37 @@ def gate_action_against_plan(plan: ExecutionPlan, *, action_id: str, tool_name: 
     """B3-C4B execution gate (section 9): action-in-plan proof before execution.
 
     A proposal may execute only if it maps to a concrete action of the
-    CURRENT ExecutionPlan with identical action identity, tool, and
-    canonical arguments. A model cannot introduce a new action between
-    planning and execution by emitting another ToolCall: identity, tool, or
+    CURRENT ExecutionPlan with identical canonical arguments (and, when the
+    proposal's action identity is itself a planned action identity, an
+    identical identity and tool). A model cannot introduce a new action
+    between planning and execution by emitting another ToolCall: tool or
     argument mismatches fail closed with PLAN_MISMATCH and no tool handler
     runs (INV-C4-3). A forged/tampered plan is rejected by full plan
     re-validation (INV-C4-2).
+
+    Duplicate emissions: the C3 plan represents effective actions as
+    first-seen-unique per tool, so a second proposal of an already-planned
+    action carries a fresh action identity. The gate accepts such a proposal
+    only when its tool and canonical arguments are identical to an existing
+    planned action; anything else (different tool, different arguments,
+    unknown action) fails closed. A duplicate emission can never add or
+    alter an effective action.
     """
     ok, reason = validate_execution_plan(plan)
     if not ok:
         return False, RejectionCode.PLAN_MISMATCH.value, "execution plan integrity failure: " + reason
     wanted = str(action_id or "").strip()
+    candidate = arguments if isinstance(arguments, dict) else {}
+    candidate_fingerprint = canonical_execution_fingerprint(candidate)
     match = next((action for action in plan.actions if action.action_id == wanted), None)
     if match is None:
-        return False, RejectionCode.PLAN_MISMATCH.value, "action is not part of the current ExecutionPlan: " + wanted
+        duplicate = next((action for action in plan.actions if action.tool_name == str(tool_name or "").strip() and action.arguments_fingerprint == candidate_fingerprint), None)
+        if duplicate is None:
+            return False, RejectionCode.PLAN_MISMATCH.value, "action is not part of the current ExecutionPlan: " + wanted
+        return True, "", "duplicate emission of a planned effective action"
     if match.tool_name != str(tool_name or "").strip():
         return False, RejectionCode.PLAN_MISMATCH.value, "action tool differs from the current ExecutionPlan: " + str(tool_name)
-    candidate = arguments if isinstance(arguments, dict) else {}
-    if match.arguments_fingerprint != canonical_execution_fingerprint(candidate):
+    if match.arguments_fingerprint != candidate_fingerprint:
         return False, RejectionCode.PLAN_MISMATCH.value, "action arguments differ from the current ExecutionPlan: " + wanted
     return True, "", "authorized"
 
