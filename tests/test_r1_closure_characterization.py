@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-"""R1 CLOSURE TESTS (B-2 / INV-AUTH-3 enforced; B-1 / INV-SCOPE-2 pinned).
+"""R1 CLOSURE TESTS (B-2 / INV-AUTH-3 enforced; B-1 / INV-SCOPE-2 enforced).
 
 B-2 section: enforced defenses. The structural-only authorization adapter
 in security.authorization.authorize_tool is closed (INV-AUTH-3): every tool
 whose descriptor declares required_authorization "owner" or
 "owner_and_scope_snapshot" fails closed on untyped requests.
 
-B-1 section: HAZARD PINS. AgentCore.run_owner_mission and the resume_mission
-renewal branch still derive the ENTIRE authorized tool budget from the
-model-planned steps; an explicit Owner budget declaration is ignored.
-These pins MUST be inverted by the B-1 closure commit on this branch.
+B-1 section: ENFORCED DEFENSES (INV-SCOPE-2). run_owner_mission authorizes
+only the intersection of the Owner budget with the model request; the model
+plan can never widen the scope. resume_mission cannot mint authority from the
+model plan and fails closed without a valid Owner-authorized snapshot.
 """
 
 from pathlib import Path
@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from agent.agent_core import AgentCore
-from agent.mission import MissionStore
+from agent.mission import MissionStatus, MissionStore
 from agent.planning import Plan, PlanStep
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
@@ -118,14 +118,14 @@ def test_b2_typed_owner_context_still_authorizes(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# B-1 HAZARD PINS (INV-SCOPE-2): to be inverted by the B-1 closure commit
+# B-1 ENFORCED (INV-SCOPE-2): Owner budget intersection, no resume minting
 # ---------------------------------------------------------------------------
 
 
-def test_b1ch_model_plan_overrides_owner_budget_declaration_hazard(tmp_path, monkeypatch):
-    """HAZARD PIN: the Owner explicitly declares owner_allowed_tools=["status"]
-    in the scope context, but run_owner_mission ignores the declaration
-    entirely and authorizes every model-planned tool."""
+def test_b1_owner_budget_intersection_is_enforced(tmp_path, monkeypatch):
+    """INV-SCOPE-2 enforced: the Owner declares owner_allowed_tools=["status"]
+    while the model plans status+search. Only the intersection enters the
+    authorization snapshot; the model plan can never widen the scope."""
     plan = _plan(("status", "search"))
     core = AgentCore(router=object(), store=MissionStore(Path(tmp_path) / "missions-core.sqlite3"))
     context = _owner_context(tmp_path, monkeypatch)
@@ -137,13 +137,15 @@ def test_b1ch_model_plan_overrides_owner_budget_declaration_hazard(tmp_path, mon
         run=False,
         scope_context={"owner_allowed_tools": ["status"], "forbidden_actions": []},
     )
-    assert tuple(mission.authorization_snapshot["allowed_tools"]) == ("status", "search")
+    assert tuple(mission.authorization_snapshot["allowed_tools"]) == ("status",)
+    assert set(mission.provenance["model_requested_tools"]) == {"status", "search"}
+    assert mission.provenance["owner_budget"]["tools"] == ["status"]
 
 
-def test_b1ch_resume_renews_budget_from_model_plan_hazard(tmp_path, monkeypatch):
-    """HAZARD PIN: resume_mission renews a missing authorization snapshot with
-    allowed_tools derived entirely from the (model-planned) mission plan; no
-    Owner budget exists anywhere in the renewal path."""
+def test_b1_resume_cannot_mint_authorization_from_model_plan(tmp_path, monkeypatch):
+    """INV-SCOPE-2 enforced: resume_mission cannot renew a missing
+    authorization snapshot from the model-planned steps. A mission without a
+    valid snapshot fails closed instead of minting new authority."""
     import agent.agent_core as agent_core_module
     import security.owner_policy as owner_policy
     from agent.mission import Mission
@@ -157,19 +159,12 @@ def test_b1ch_resume_renews_budget_from_model_plan_hazard(tmp_path, monkeypatch)
     monkeypatch.setattr(agent_core_module, "authenticate_owner", lambda text, token, request_id: evidence)
     monkeypatch.setattr(agent_core_module, "get_snapshot", lambda snapshot_id: None)
 
-    class _StubRuntime:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run_to_completion(self, mission_id, max_slices=None):
-            return store.load(mission_id)
-
-    monkeypatch.setattr(agent_core_module, "MissionRuntime", _StubRuntime)
-
     core = AgentCore(router=object(), store=store)
-    renewed = core.resume_mission(mission.mission_id, owner_token="stubbed-auth", max_slices=0)
-    snapshot = (renewed or store.load(mission.mission_id)).authorization_snapshot
-    assert tuple(snapshot["allowed_tools"]) == ("status", "search")
+    with pytest.raises(PermissionError):
+        core.resume_mission(mission.mission_id, owner_token="stubbed-auth", max_slices=0)
+    restored = store.load(mission.mission_id)
+    assert restored.status is MissionStatus.AUTHORIZATION_BLOCKED
+    assert not restored.authorization_snapshot
 
 
 __all__ = []

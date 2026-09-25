@@ -122,9 +122,11 @@ class MissionAuthorizationSnapshot:
             return False, "authorization snapshot expired or not active"
         if target_identity != self.target_identity:
             return False, "target identity outside authorization snapshot"
-        if action in self.forbidden_actions or (self.allowed_actions and action not in self.allowed_actions):
+        # INV-SCOPE-2: empty allowlists deny everything (fail closed); an
+        # empty Owner budget never degrades into an unrestricted snapshot.
+        if action in self.forbidden_actions or action not in self.allowed_actions:
             return False, "action outside authorization snapshot"
-        if self.allowed_tools and tool_id not in self.allowed_tools:
+        if tool_id not in self.allowed_tools:
             return False, "tool outside authorization snapshot"
         if network and network not in set(self.network_boundary.get("allowed", ())) and self.network_boundary.get("allowed"):
             return False, "network boundary violation"

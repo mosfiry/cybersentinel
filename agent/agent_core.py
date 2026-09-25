@@ -22,6 +22,7 @@ from tools.registry import REGISTRY, execute as execute_tool, get_tool
 from agent.evidence import EvidenceChainStore
 from workspace import Workspace
 from security.mission_authorization import MissionAuthorizationSnapshot
+from security.owner_budget import OwnerAuthorizedToolBudget
 
 from .mission import Mission, MissionStatus, MissionStore
 from .mission_runtime import MissionRuntime
@@ -275,7 +276,16 @@ class AgentCore:
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
-        allowed_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
+        # INV-SCOPE-2 (B-1 closure): the authorized tool scope is the Owner
+        # budget intersected with the model request. The model plan can only
+        # narrow the budget; it can never mint, widen, or redefine authority.
+        owner_budget = OwnerAuthorizedToolBudget.from_owner_declaration(
+            scope_context,
+            policy_version=str(getattr(authorization_context.policy_snapshot, "policy_version", "owner-policy")),
+            owner_approval=authorization_context.owner_evidence.proof_fingerprint,
+        )
+        model_requested_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
+        effective_tools = owner_budget.intersect(model_requested_tools)
 
         def authorization_snapshot_factory(created_mission: Mission) -> MissionAuthorizationSnapshot:
             return MissionAuthorizationSnapshot.create(
@@ -283,12 +293,12 @@ class AgentCore:
                 mission_id=created_mission.mission_id,
                 target_identity=target_identity,
                 scope=tuple((scope_context or {}).get("scope", ("workspace",))),
-                allowed_actions=allowed_tools,
+                allowed_actions=effective_tools,
                 forbidden_actions=tuple((scope_context or {}).get("forbidden_actions", ())),
-                allowed_tools=allowed_tools,
+                allowed_tools=effective_tools,
                 time_window={"timezone": "UTC"},
                 max_duration=max(60, created_mission.max_iterations * 60),
-                rate_limits={tool: 1 for tool in allowed_tools},
+                rate_limits={tool: 1 for tool in effective_tools},
                 network_boundary={"allowed": tuple((scope_context or {}).get("allowed_networks", ()))},
                 data_boundary={"allowed": (target_identity,)},
                 credential_boundary={"allowed": tuple((scope_context or {}).get("allowed_credentials", ()))},
@@ -303,7 +313,7 @@ class AgentCore:
             authorization_context=authorization_context,
             scope_snapshot=scope_context,
             completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
-            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
+            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict(), "owner_budget": owner_budget.to_dict(), "model_requested_tools": list(model_requested_tools), "effective_tools": list(effective_tools)},
             authorization_snapshot_factory=authorization_snapshot_factory,
         )
         if getattr(self, "_last_model_response", None):
@@ -373,16 +383,15 @@ class AgentCore:
             mission.authorization_snapshot = old_authorization.amend(owner_approval=evidence.proof_fingerprint, changes={}, expires_at=evidence.expires_at).to_dict()
             mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot["version"])
         except (KeyError, TypeError, ValueError, PermissionError):
-            if mission.authorization_snapshot:
-                mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "authorization snapshot cannot be renewed")
-                self.store.save(mission)
-                raise PermissionError("authorization snapshot cannot be renewed")
-            allowed_tools = tuple(step.action for step in mission.plan.steps if step.action != "__planning_failure__")
-            owner_identity = mission.owner_identity_ref or evidence.proof_fingerprint
-            mission.owner_identity_ref = owner_identity
-            renewed = MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity="local-workspace", scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=(), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(60, mission.max_iterations * 60), rate_limits={tool: 1 for tool in allowed_tools}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("local-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(Path.cwd().resolve())}, policy_version="owner-policy", owner_approval=evidence.proof_fingerprint, expires_at=evidence.expires_at)
-            mission.authorization_snapshot = renewed.to_dict()
-            mission.provenance["authorization_snapshot_version"] = int(renewed.version)
+            # INV-SCOPE-2 (B-1 closure): resume may only renew an existing
+            # Owner-authorized snapshot. Authority is never re-derived from
+            # the model plan at resume; a mission without a valid snapshot
+            # fails closed instead of minting a new authorization scope.
+            mission.status = MissionStatus.AUTHORIZATION_BLOCKED
+            mission.trajectory.append({"event": "MissionAuthorizationBlocked", "reason": "authorization snapshot cannot be renewed"})
+            mission.recovery_events.append({"event": "authorization_renewal_failed", "reason": "INV-SCOPE-2: no authorization scope may be minted at resume"})
+            self.store.save(mission)
+            raise PermissionError("authorization snapshot cannot be renewed: no authorization scope may be minted at resume (INV-SCOPE-2)")
         old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
         fresh_scope = get_snapshot(str(old_scope_id)) if old_scope_id else None
         fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope)

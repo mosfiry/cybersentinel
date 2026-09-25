@@ -54,6 +54,7 @@ class OwnerPolicy:
     external_content_authority: str = "none"
     model_authority: str = "none"
     system_safety_boundary: str = "immutable"
+    owner_tool_budget: list[str] = field(default_factory=list)
 
 
 class OwnerInstructionSource(str, Enum):

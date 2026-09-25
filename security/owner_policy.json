@@ -13,6 +13,7 @@
   "external_content_authority": "none",
   "model_authority": "none",
   "system_safety_boundary": "immutable",
+  "owner_tool_budget": ["status", "latest_intel", "refresh_intel", "local_security_check", "local_system_info", "search", "watch", "unwatch", "run_project_tests", "red_team_assess", "scoped_http_probe"],
   "runtime_limits": {
     "max_context_messages": 50,
     "max_context_chars": 32000,
