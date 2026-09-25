@@ -31,6 +31,9 @@ class EventType(str, Enum):
     MISSION_COMPLETED = "MissionCompleted"
     RECOVERY_REQUIRED = "RecoveryRequired"
     MODEL_TURN = "ModelTurn"
+    PROOF_CREATED = "ProofCreated"
+    PROOF_VERIFIED = "ProofVerified"
+    EXECUTION_REJECTED = "ExecutionRejected"
 
 
 @dataclass(frozen=True)
