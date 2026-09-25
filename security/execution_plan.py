@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-"""B3-C2: typed execution-intent structure only.
+"""B3-C2/C3: typed execution-intent structure and trusted derivation.
 
-ExecutionPlan is the boundary after ActionIntent and before any future
-execution-plan/authorization integration. It is descriptive data, never
-authority: this module does not import authorization, proof, policy, budget,
-or tool-execution machinery.
+ExecutionPlan is descriptive data, never authority. The pure contract remains
+free of authority imports. The single ``derive_execution_plan`` factory below
+is the trusted derivation boundary: it validates ActionIntent requests,
+intersects them with an already-created OwnerAuthorizedToolBudget, and passes
+only the derived effective actions to the pure contract.
 
 The current ActionIntent contract exposes a semantic mission fingerprint but
 not a runtime mission_id or run_id. C2 therefore binds the plan to the common
@@ -30,6 +31,15 @@ MAX_EXECUTION_PLAN_ACTIONS = 64
 
 class ExecutionPlanError(ValueError):
     """Raised when a typed execution-intent structure is invalid."""
+
+
+def _is_owner_budget(value: Any) -> bool:
+    """Recognize the existing immutable Owner budget without importing it."""
+    return (
+        value.__class__.__name__ == "OwnerAuthorizedToolBudget"
+        and value.__class__.__module__ == "security.owner_budget"
+        and isinstance(getattr(value, "tools", None), frozenset)
+    )
 
 
 def _canonical_fingerprint(value: Any) -> str:
@@ -179,4 +189,56 @@ class ExecutionPlan:
         }
 
 
-__all__ = ["ExecutionPlan", "ExecutionPlanError", "MAX_EXECUTION_PLAN_ACTIONS", "validate_execution_plan"]
+def derive_execution_plan(owner_budget: Any, action_intents: tuple[ActionIntent, ...]) -> ExecutionPlan:
+    """Derive one immutable plan from validated requests and Owner authority.
+
+    ``owner_budget.tools`` is the only authority source and
+    ``ActionIntent.tool_name`` is the only model-request source. The
+    intersection is order-preserving and first-seen unique. No effective
+    action, policy, approval, snapshot, proof, or execution field is accepted
+    as an input. Empty intersections fail closed because C2 forbids empty
+    ExecutionPlans.
+    """
+    if not _is_owner_budget(owner_budget):
+        raise ExecutionPlanError("execution plan derivation requires a typed OwnerAuthorizedToolBudget")
+    if not isinstance(action_intents, tuple) or not action_intents:
+        raise ExecutionPlanError("execution plan derivation requires a non-empty ActionIntent tuple")
+    typed = tuple(action_intents)
+    if not all(_is_action_intent(item) for item in typed):
+        raise ExecutionPlanError("execution plan derivation requires typed ActionIntent objects")
+
+    # Reuse the canonical ActionIntent validator. The conversion is limited to
+    # its proposal fields; authority-shaped fields never enter this boundary.
+    from security.intent_ladder import validate_action_intent_proposal
+
+    proposal = tuple(
+        {
+            "action_id": action.action_id,
+            "task_id": action.task_id,
+            "tool_name": action.tool_name,
+            "arguments": dict(action.arguments),
+            "dependencies": tuple(action.dependencies),
+            "description": action.description,
+        }
+        for action in typed
+    )
+    task_ids = frozenset(action.task_id for action in typed)
+    valid, reason = validate_action_intent_proposal(proposal, task_ids)
+    if not valid:
+        raise ExecutionPlanError("invalid ActionIntent request: " + reason)
+
+    missions = {str(action.parent_mission_fingerprint) for action in typed}
+    if len(missions) != 1 or not next(iter(missions), "").strip():
+        raise ExecutionPlanError("cross-mission ActionIntent binding rejected")
+
+    effective_tools = owner_budget.intersect(action.tool_name for action in typed)
+    by_tool: dict[str, ActionIntent] = {}
+    for action in typed:
+        by_tool.setdefault(action.tool_name, action)
+    effective = [by_tool[tool_name] for tool_name in effective_tools]
+    if not effective:
+        raise ExecutionPlanError("Owner Budget and ActionIntent requests have an empty intersection")
+    return ExecutionPlan.derive(tuple(effective), provenance="DETERMINISTIC_DERIVED")
+
+
+__all__ = ["ExecutionPlan", "ExecutionPlanError", "MAX_EXECUTION_PLAN_ACTIONS", "derive_execution_plan", "validate_execution_plan"]
