@@ -2,8 +2,9 @@ from __future__ import annotations
 
 """B3-C1 characterization only: current ActionIntent -> execution behavior.
 
-These tests intentionally pin the pre-ExecutionPlan state. They must describe
-what exists today, not prescribe or implement B3-C2/B3-C3/B3-C4.
+These tests describe the current state after B3-C2. H1 is inverted because
+the typed ExecutionPlan contract now exists; H2/H3 remain pre-C3 pins. These
+tests do not prescribe or implement B3-C3/B3-C4.
 """
 
 from dataclasses import fields
@@ -35,12 +36,18 @@ def _action():
     )[0]
 
 
-def test_b3c1_h1_no_independent_typed_execution_plan_exists():
-    """Current typed ladder ends at ActionIntent; B3-C has not been built."""
-    assert not hasattr(intent_ladder, "ExecutionPlan")
-    assert importlib.util.find_spec("security.execution_plan") is None
-    assert not hasattr(intent_ladder, "derive_execution_plan")
-    assert not hasattr(intent_ladder, "validate_execution_plan")
+def test_b3c2_h1_typed_execution_plan_contract_exists():
+    """B3-C2 inverts H1 without connecting the contract to execution."""
+    from agent.model_intelligence.conversation import NaturalLanguageUnderstanding
+    from security.execution_plan import ExecutionPlan, validate_execution_plan
+    from security.intent_ladder import derive_action_intents, derive_task_intents
+
+    assert importlib.util.find_spec("security.execution_plan") is not None
+    mission = NaturalLanguageUnderstanding().understand("Inspect the local workspace")
+    tasks = derive_task_intents(mission, [{"task_id": "task-1", "objective": "Inspect workspace"}])
+    action = derive_action_intents(tasks, [{"action_id": "action-1", "task_id": "task-1", "tool_name": "status"}])
+    plan = ExecutionPlan.derive(action)
+    assert validate_execution_plan(plan) == (True, "valid")
 
 
 def test_b3c1_h2_legacy_plan_has_only_legacy_fingerprint_binding():
