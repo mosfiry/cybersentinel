@@ -75,25 +75,54 @@ class MissionRuntime:
             return False, "scope snapshot required"
         return True, "authorized"
 
-    def _proposal_snapshot_gate(self, mission: Mission, tool_name: str) -> tuple[bool, str]:
+    def _proposal_snapshot_gate(self, mission: Mission, tool_name: str) -> tuple[bool, str, str]:
         """Deterministic MissionAuthorizationSnapshot gate for model-proposed tools.
 
         Model output proposes tools but can never widen this gate: membership is
         checked only against the Owner-minted mission snapshot. This gate is not
-        an alternative to authorize_tool(); it runs before it.
+        an alternative to authorize_tool(); it runs before it. Rejections carry a
+        structured RejectionCode so behavior never depends on human-readable
+        message text.
         """
+        from security.execution_proof import RejectionCode
         from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
+        if not (mission.authorization_snapshot or {}):
+            return False, RejectionCode.SNAPSHOT_MISSING.value, "mission authorization snapshot missing"
         try:
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
         except (MissionAuthorizationError, KeyError, TypeError, ValueError, PermissionError) as exc:
-            return False, f"authorization snapshot invalid: {type(exc).__name__}"
+            return False, RejectionCode.SNAPSHOT_INVALID.value, f"authorization snapshot invalid: {type(exc).__name__}"
         if not snapshot.is_active():
-            return False, "authorization snapshot expired or not yet active"
+            return False, RejectionCode.SNAPSHOT_EXPIRED.value, "authorization snapshot expired or not yet active"
         if tool_name in snapshot.forbidden_actions:
-            return False, f"tool {tool_name} is forbidden by authorization snapshot"
+            return False, RejectionCode.FORBIDDEN_ACTION.value, f"tool {tool_name} is forbidden by authorization snapshot"
         if tool_name not in snapshot.allowed_tools or tool_name not in snapshot.allowed_actions:
-            return False, f"tool {tool_name} outside authorization snapshot allowlist"
-        return True, "authorized"
+            return False, RejectionCode.TOOL_NOT_ALLOWED.value, f"tool {tool_name} outside authorization snapshot allowlist"
+        return True, "", "authorized"
+
+    def _derive_execution_proof(self, mission: Mission, proposal: Any, argument: Any, decision: Any) -> Any:
+        """Derive the deterministic ExecutionAuthorizationProof for one proposal.
+
+        The proof is derived evidence of the authorization already granted by
+        the Owner-minted snapshot and authorize_tool(). It never creates or
+        widens authority, and model output can never construct one.
+        """
+        from security.execution_proof import ExecutionAuthorizationProof
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        return ExecutionAuthorizationProof.derive(
+            mission_id=mission.mission_id,
+            request_id=mission.request_id,
+            tool=proposal.name,
+            argument=argument,
+            snapshot=snapshot,
+            decision=decision.decision if decision is not None and decision.allowed else None,
+            tool_call_id=proposal.tool_call_id,
+            plan_hash=mission.plan.fingerprint,
+            scope=mission.scope_snapshot,
+            mission_status=mission.status.value,
+            lifecycle_revision=len(mission.transitions),
+        )
 
     @staticmethod
     def _default_replanner(mission: Mission, observation: dict[str, Any]) -> Plan:
@@ -242,6 +271,7 @@ class MissionRuntime:
         """Run a real model/tool/observation loop for a durable mission."""
         from security.authorization import authorize_tool
         from security.authorization_context import AuthorizationContext
+        from security.execution_proof import ExecutionAuthorizationProof
         from tools.registry import execute as execute_tool
 
         mission = self._load(mission_id)
@@ -253,8 +283,11 @@ class MissionRuntime:
             return self.store.save(mission)
         authorization_ok, authorization_reason = self._mission_authorization(mission)
         if not authorization_ok:
-            mission.error = authorization_reason
+            from security.execution_proof import classify_snapshot_reason
+            code = classify_snapshot_reason(authorization_reason).value
+            mission.error = f"{code}: {authorization_reason}"
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
+            mission.emit(EventType.EXECUTION_REJECTED, data={"code": code, "reason": authorization_reason})
             mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
             return self.store.save(mission)
         run_id = run_id or str(mission.progress.get("model_run_id") or hashlib.sha256((mission.mission_id + mission.request_id).encode()).hexdigest()[:20])
@@ -347,11 +380,12 @@ class MissionRuntime:
                     seen.add(proposal.tool_call_id)
                     progress["seen_call_ids"].append(proposal.tool_call_id)
                     argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
-                    snapshot_ok, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+                    snapshot_ok, snapshot_code, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
                     if not snapshot_ok:
                         mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
-                        mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": snapshot_reason})
-                        result = ToolCallResult(proposal, False, error=snapshot_reason)
+                        mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{snapshot_code}: {snapshot_reason}"})
+                        mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": snapshot_code, "reason": snapshot_reason})
+                        result = ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}")
                         progress["tool_results"].append(result.to_dict())
                         continue
                     decision = authorize_tool([proposal.name, argument], context=auth_context)
@@ -360,21 +394,38 @@ class MissionRuntime:
                     if not decision.allowed:
                         result = ToolCallResult(proposal, False, error=decision.reason)
                     else:
+                        result = ToolCallResult(proposal, False)
                         try:
-                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
-                            self.store.save(mission)
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
-                            observation = dict(raw or {})
-                            observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
-                            mission.record_observation(observation)
-                            if current_step is not None:
-                                self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
-                            if bool(observation.get("success", observation.get("ok", True))):
-                                criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
-                                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
-                            mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
-                            mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
-                            result = ToolCallResult(proposal, True, result=observation)
+                            proof = self._derive_execution_proof(mission, proposal, argument, decision)
+                            mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+                        except Exception as exc:
+                            mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution proof derivation failed: {type(exc).__name__}"})
+                            result = ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution proof derivation failed: {type(exc).__name__}")
+                            proof = None
+                        if proof is None:
+                            progress["tool_results"].append(result.to_dict())
+                            continue
+                        try:
+                            proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.validate_against_mission(proof, mission)
+                            mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": proof_reason})
+                            if not proof_ok:
+                                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": proof_code, "reason": proof_reason})
+                                result = ToolCallResult(proposal, False, error=f"{proof_code}: {proof_reason}")
+                            else:
+                                mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
+                                self.store.save(mission)
+                                raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, execution_proof=proof)
+                                observation = dict(raw or {})
+                                observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+                                mission.record_observation(observation)
+                                if current_step is not None:
+                                    self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
+                                if bool(observation.get("success", observation.get("ok", True))):
+                                    criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
+                                    mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
+                                mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
+                                mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
+                                result = ToolCallResult(proposal, True, result=observation)
                         except Exception as exc:
                             mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
                             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
@@ -388,9 +439,10 @@ class MissionRuntime:
     def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str]) -> None:
         """Authorize and execute independent proposals concurrently, then fold results deterministically."""
         from security.authorization import authorize_tool
+        from security.execution_proof import ExecutionAuthorizationProof
         from tools.registry import execute as execute_tool
         identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
-        authorized: list[tuple[Any, Any, Any]] = []
+        authorized: list[tuple[Any, Any, Any, Any]] = []
         results: list[ToolCallResult] = []
         for proposal in proposals:
             mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
@@ -400,29 +452,45 @@ class MissionRuntime:
             seen.add(proposal.tool_call_id)
             progress["seen_call_ids"].append(proposal.tool_call_id)
             argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
-            snapshot_ok, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+            snapshot_ok, snapshot_code, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
             if not snapshot_ok:
-                mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": snapshot_reason})
-                results.append(ToolCallResult(proposal, False, error=snapshot_reason))
+                mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{snapshot_code}: {snapshot_reason}"})
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": snapshot_code, "reason": snapshot_reason})
+                results.append(ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}"))
                 continue
             decision = authorize_tool([proposal.name, argument], context=auth_context)
             mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
             if decision.allowed:
-                authorized.append((proposal, argument, decision))
+                try:
+                    proof = self._derive_execution_proof(mission, proposal, argument, decision)
+                    mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+                    authorized.append((proposal, argument, decision, proof))
+                except Exception as exc:
+                    mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution proof derivation failed: {type(exc).__name__}"})
+                    results.append(ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution proof derivation failed: {type(exc).__name__}"))
             else:
                 results.append(ToolCallResult(proposal, False, error=decision.reason))
         mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
         self.store.save(mission)
-        def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
-            proposal, argument, decision = item
+        def execute_one(item: tuple[Any, Any, Any, Any]) -> dict[str, Any]:
+            proposal, argument, decision, proof = item
+            proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.validate_against_mission(proof, mission)
+            if not proof_ok:
+                return {"proof_ok": False, "proof_code": proof_code, "proof_reason": proof_reason, "raw": None}
             try:
-                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id) or {})
+                return {"proof_ok": True, "proof_code": "", "proof_reason": proof_reason, "raw": dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, execution_proof=proof) or {})}
             except Exception as exc:
-                return {"success": False, "error": str(exc), "failure_class": FailureClass.TOOL.value, "exception": type(exc).__name__}
+                return {"proof_ok": True, "proof_code": "", "proof_reason": proof_reason, "raw": {"success": False, "error": str(exc), "failure_class": FailureClass.TOOL.value, "exception": type(exc).__name__}}
         raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
         for item, raw in zip(authorized, raw_results):
             proposal = item[0]
-            observation = dict(raw)
+            proof_ok = bool(raw.get("proof_ok"))
+            mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": str(raw.get("proof_reason", ""))})
+            if not proof_ok:
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": raw.get("proof_code"), "reason": raw.get("proof_reason")})
+                results.append(ToolCallResult(proposal, False, error=f"{raw.get('proof_code')}: {raw.get('proof_reason')}"))
+                continue
+            observation = dict(raw.get("raw") or {})
             observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
             mission.record_observation(observation)
             success = bool(observation.get("success", observation.get("ok", True)))

@@ -232,8 +232,19 @@ class AgentCore:
             workspace = Workspace(workspace_root)
             evidence_store = EvidenceChainStore(DB_PATH.with_name("evidence_chain.db"))
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity)
+            from security.execution_proof import ExecutionAuthorizationProof
+            from .trajectory import EventType
+            proof = ExecutionAuthorizationProof.derive(mission_id=mission.mission_id, request_id=mission.request_id, tool=step.action, argument=argument, snapshot=snapshot, decision=decision.decision, tool_call_id=action_id, plan_hash=mission.plan.fingerprint, scope=mission.scope_snapshot, mission_status=mission.status.value, lifecycle_revision=len(mission.transitions))
+            mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": action_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+            proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.validate_against_mission(proof, mission)
+            mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": action_id, "allowed": proof_ok, "reason": proof_reason})
+            if not proof_ok:
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": action_id, "code": proof_code, "reason": proof_reason})
+                return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{proof_code}: {proof_reason}", "execution_id": action_id}
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_proof=proof)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
+        except PermissionError as exc:
+            return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
 
