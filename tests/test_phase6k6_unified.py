@@ -68,8 +68,13 @@ def test_decision_argument_binding_blocks_confused_deputy(monkeypatch, tmp_path)
     context = make_context(monkeypatch, tmp_path)
     decision = AuthorizationDecision.issue(context, allowed=True, reason="accepted", tool="search", risk_class="read", argument="safe")
     from tools.registry import execute
-    with pytest.raises(PermissionError, match="argument-mismatched"):
-        execute("search", "different", authorization_decision=decision, request_id=context.request_id)
+    from security.execution_boundary import OwnerDirectBoundary
+
+    proof = OwnerDirectBoundary.derive(tool="search", argument="safe", decision=decision, request_id=context.request_id, tool_call_id=context.request_id + ":search")
+    # The proof is bound to the authorized argument; a different argument is
+    # rejected at the boundary (PROOF_BINDING_MISMATCH) before the handler.
+    with pytest.raises(PermissionError, match="PROOF_BINDING_MISMATCH"):
+        execute("search", "different", authorization_decision=decision, request_id=context.request_id, execution_proof=proof, execution_class="OWNER_DIRECT")
 
 
 def test_parallel_contexts_cannot_cross_authorize(monkeypatch, tmp_path):

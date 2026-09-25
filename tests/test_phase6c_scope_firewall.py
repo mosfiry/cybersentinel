@@ -57,15 +57,31 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
 
 
 def test_direct_registry_execution_cannot_bypass_scope(snapshot):
-    with pytest.raises(PermissionError, match="scope-bound AuthorizationDecision"):
+    from security.execution_boundary import OwnerDirectBoundary
+
+    # No proof at all: the registry is fail-closed before scope is consulted.
+    with pytest.raises(PermissionError, match="PROOF_REQUIRED"):
         execute("scoped_http_probe", "https://target.example.com/api")
     evidence = _issue_evidence("owner_token", "scope-direct", "scope-direct")
     auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
     denied = authorize_tool(["scoped_http_probe", "https://other.example.com/api"], context=auth_context)
     with pytest.raises(PermissionError, match="scope denied"):
-        execute("scoped_http_probe", "https://other.example.com/api", authorization_decision=denied.decision, scope_context=context("https://other.example.com/api"), request_id="scope-direct")
+        OwnerDirectBoundary.execute(
+            tool="scoped_http_probe",
+            argument="https://other.example.com/api",
+            decision=denied.decision,
+            request_id="scope-direct",
+            tool_call_id="scope-direct:denied",
+            scope_context=context("https://other.example.com/api"),
+        )
     allowed = authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context)
-    result = execute("scoped_http_probe", "https://target.example.com/api", authorization_decision=allowed.decision, scope_context=context(), request_id="scope-direct")
+    result = OwnerDirectBoundary.execute(
+        tool="scoped_http_probe",        argument="https://target.example.com/api",
+        decision=allowed.decision,
+        request_id="scope-direct",
+        tool_call_id="scope-direct:allowed",
+        scope_context=context(),
+    )
     assert result["ok"] is True
 
 

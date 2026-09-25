@@ -177,7 +177,9 @@ def test_poisoned_tool_results_grant_nothing_in_the_loop(tmp_path, monkeypatch):
 
     result = runtime.run_model_loop(mission.mission_id, PoisonThenFinalModel(), tools=[], max_turns=4)
     assert result.progress["model_loop"]["tool_results"][0]["ok"] is False
-    assert result.progress["model_loop"]["tool_results"][0]["error"] == "sensitive tool requires AuthorizationContext"
+    # The deterministic Owner-minted snapshot allowlist rejects the sensitive
+    # tool before any AuthorizationContext is ever consulted.
+    assert result.progress["model_loop"]["tool_results"][0]["error"] == "TOOL_NOT_ALLOWED: tool red_team_assess outside authorization snapshot allowlist"
     assert result.authorization_context is None
     assert result.scope_snapshot is None
     assert result.status is MissionStatus.READY

@@ -58,5 +58,14 @@ def test_tool_timeout_is_explicit(monkeypatch):
         time.sleep(0.05)
         return {"ok": True}
     monkeypatch.setitem(registry.REGISTRY, "slow_test", ToolSpec("slow_test", "test", "read", True, None, slow))
+    import security.owner_policy as owner_policy
+    from security.authorization import authorize_tool
+    from security.authorization_context import AuthorizationContext
+    from security.execution_boundary import OwnerDirectBoundary
+
+    evidence = owner_policy._issue_evidence("owner_token", "v46-timeout", "test")
+    auth_context = AuthorizationContext("v46-timeout", evidence, owner_policy.capture_policy_snapshot("v46-timeout", evidence))
+    decision = authorize_tool(["slow_test", None], context=auth_context)
+    assert decision.allowed
     with __import__("pytest").raises(ToolTimeout):
-        execute("slow_test", timeout=0.001)
+        OwnerDirectBoundary.execute(tool="slow_test", argument=None, decision=decision.decision, request_id="v46-timeout", tool_call_id="v46-timeout:slow", timeout=0.001)

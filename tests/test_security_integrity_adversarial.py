@@ -32,16 +32,26 @@ def test_forged_authorization_decision_cannot_cross_tool_boundary():
         decision_timestamp="2026-01-01T00:00:00+00:00",
         decision_source="model",
     )
-    with pytest.raises(PermissionError, match="invalid"):
+    from security.execution_boundary import OwnerDirectBoundary
+    from security.execution_proof import ExecutionProofError
+
+    with pytest.raises(PermissionError, match="PROOF_REQUIRED"):
         execute("status", authorization_decision=forged)
+    # A forged decision can never mint the proof the boundary requires.
+    with pytest.raises(ExecutionProofError) as excinfo:
+        OwnerDirectBoundary.derive(tool="status", argument=None, decision=forged, request_id="r1")
+    assert excinfo.value.code in {"PROOF_BINDING_MISMATCH", "PROOF_INVALID"}
 
 
 def test_authorization_decision_is_bound_to_request_identity():
     evidence = owner_policy._issue_evidence("owner_token", "mission-1", "test-proof")
     context = AuthorizationContext("mission-1", evidence, owner_policy.capture_policy_snapshot("mission-1", evidence))
     decision = AuthorizationDecision.issue(context, allowed=True, reason="authorized", tool="status", risk_class="read")
-    with pytest.raises(PermissionError, match="invalid"):
-        execute("status", authorization_decision=decision, request_id="mission-2")
+    from security.execution_boundary import OwnerDirectBoundary
+
+    proof = OwnerDirectBoundary.derive(tool="status", argument=None, decision=decision, request_id="mission-1")
+    with pytest.raises(PermissionError, match="PROOF_BINDING_MISMATCH"):
+        execute("status", authorization_decision=decision, request_id="mission-2", execution_proof=proof, execution_class="OWNER_DIRECT")
 
 
 def test_program_authorization_rejects_crafted_evidence_hash():
@@ -93,7 +103,7 @@ def test_terminal_and_recovery_transitions_are_closed():
     with pytest.raises(ValueError, match="reconciliation"):
         mission.transition(MissionStatus.GOAL_COMPLETED, "forged completion")
     mission.transition(MissionStatus.READY, "reconciled")
-    mission.transition(MissionStatus.GOAL_COMPLETED, "verified")
+    mission.transition(MissionStatus.GOAL_COMPLETED, "verified", verification={"verified": True})
     with pytest.raises(ValueError, match="terminal"):
         mission.transition(MissionStatus.RUNNING, "forged resurrection")
 
