@@ -45,6 +45,10 @@ class MissionRuntime:
             valid, reason = snapshot.validate_for_mission(mission_id=mission.mission_id, owner_identity=mission.owner_identity_ref, target_identity=target, version=expected_version)
             if not valid:
                 return False, reason
+            from security.execution_plan_runtime import validate_stored_execution_plan
+            plan_ok, plan_reason = validate_stored_execution_plan(mission)
+            if not plan_ok:
+                return False, plan_reason
             actions = {step.action for step in mission.plan.steps if step.action != "__planning_failure__"}
             if actions - set(snapshot.allowed_actions) or actions - set(snapshot.allowed_tools) or actions.intersection(snapshot.forbidden_actions):
                 return False, "mission actions or tools outside authorization snapshot"
@@ -100,14 +104,17 @@ class MissionRuntime:
             return False, RejectionCode.TOOL_NOT_ALLOWED.value, f"tool {tool_name} outside authorization snapshot allowlist"
         return True, "", "authorized"
 
-    def _derive_execution_proof(self, mission: Mission, proposal: Any, argument: Any, decision: Any) -> Any:
+    def _derive_execution_proof(self, mission: Mission, proposal: Any, argument: Any, decision: Any, plan_hash: str | None = None) -> Any:
         """Derive the deterministic ExecutionAuthorizationProof for one proposal.
 
         The proof is derived evidence of the authorization already granted by
         the Owner-minted snapshot and authorize_tool(). It never creates or
         widens authority, and model output can never construct one. Derivation
         is delegated to the canonical MissionExecutionBoundary so no caller
-        re-implements half of the binding process.
+        re-implements half of the binding process. When the current derived
+        ExecutionPlan is available its fingerprint is the canonical plan
+        identity bound into the proof (B3-C4B section 8); otherwise the
+        boundary binds the legacy Plan fingerprint unchanged.
         """
         from security.execution_boundary import MissionExecutionBoundary
         return MissionExecutionBoundary.derive(
@@ -116,7 +123,58 @@ class MissionRuntime:
             argument=argument,
             decision=decision.decision if decision is not None and decision.allowed else None,
             tool_call_id=proposal.tool_call_id,
+            **({} if plan_hash is None else {"plan_hash": str(plan_hash)}),
         )
+
+    def _turn_survivors(self, mission: Mission, proposals: tuple[Any, ...], run_id: str, seen: set[str]) -> list[Any]:
+        """Deterministic pre-filter: proposals eligible for plan derivation.
+
+        Only proposals with valid identity (mission, run, not already seen)
+        that also pass the Owner snapshot gate enter the canonical
+        ExecutionPlan derivation. Rejected proposals are handled by the
+        existing per-proposal fail-closed paths and never reach execution.
+        """
+        survivors: list[Any] = []
+        pre_seen = set(seen)
+        for proposal in proposals:
+            if proposal.mission_id and proposal.mission_id != mission.mission_id:
+                continue
+            if proposal.run_id and proposal.run_id != run_id:
+                continue
+            if proposal.tool_call_id in pre_seen:
+                continue
+            snapshot_ok, _code, _reason = self._proposal_snapshot_gate(mission, proposal.name)
+            if snapshot_ok:
+                pre_seen.add(proposal.tool_call_id)
+                survivors.append(proposal)
+        return survivors
+
+    def _turn_execution_plan(self, mission: Mission, survivors: list[Any]) -> Any:
+        """Derive and bind the canonical per-turn ExecutionPlan (B3-C4B).
+
+        The runtime obtains ExecutionPlan objects only through the trusted
+        derive_execution_plan boundary (Owner Budget intersect validated
+        ActionIntents). Derivation failure fails closed for the whole turn:
+        no tool executes, no empty executable plan is created, and there is
+        no fallback to model tools, policy tools, registered tools, or the
+        legacy Plan (INV-C4-11).
+        """
+        from security.execution_plan_runtime import bind_execution_plan, derive_mission_execution_plan
+        plan = derive_mission_execution_plan(mission, survivors)
+        bind_execution_plan(mission, plan)
+        return plan
+
+    def _reject_turn_plan_derivation(self, mission: Mission, survivors: list[Any], exc: Exception, progress: dict[str, Any]) -> None:
+        """Map ExecutionPlanError at the runtime to a durable authorization denial."""
+        reason = f"execution plan derivation failed closed: {type(exc).__name__}: {exc}"
+        for proposal in survivors:
+            mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"TOOL_NOT_ALLOWED: {reason}"})
+            mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "TOOL_NOT_ALLOWED", "reason": reason})
+            progress["tool_results"].append(ToolCallResult(proposal, False, error=f"TOOL_NOT_ALLOWED: {reason}").to_dict())
+        mission.error = f"TOOL_NOT_ALLOWED: {reason}"
+        mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": reason})
+        mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "model proposals cannot derive a valid ExecutionPlan; authorization denied")
 
     @staticmethod
     def _default_replanner(mission: Mission, observation: dict[str, Any]) -> Plan:
@@ -359,8 +417,20 @@ class MissionRuntime:
                     mission.error = "model final lacked deterministic goal evidence"
                     mission.transition(MissionStatus.READY, mission.error)
                 return self.store.save(mission)
+            plan = None
+            if turn.tool_calls:
+                # B3-C4B: model proposals become executable only by deriving
+                # the canonical ExecutionPlan (Owner Budget intersect
+                # validated ActionIntents) and executing against it.
+                survivors = self._turn_survivors(mission, turn.tool_calls, run_id, seen)
+                if survivors:
+                    try:
+                        plan = self._turn_execution_plan(mission, survivors)
+                    except Exception as exc:
+                        self._reject_turn_plan_derivation(mission, survivors, exc, progress)
+                        return self.store.save(mission)
             if len(turn.tool_calls) > 1:
-                self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, current_step=current_step, progress=progress, seen=seen)
+                self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, current_step=current_step, progress=progress, seen=seen, plan=plan)
                 self.store.save(mission)
                 continue
             for proposal in turn.tool_calls:
@@ -382,6 +452,16 @@ class MissionRuntime:
                         result = ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}")
                         progress["tool_results"].append(result.to_dict())
                         continue
+                    if plan is not None:
+                        from security.execution_plan_runtime import gate_action_against_plan, proposal_action_identity
+                        gate_ok, gate_code, gate_reason = gate_action_against_plan(plan, action_id=proposal_action_identity(proposal), tool_name=proposal.name, arguments=proposal.arguments if isinstance(proposal.arguments, dict) else {})
+                        if not gate_ok:
+                            mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+                            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{gate_code}: {gate_reason}"})
+                            mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": gate_code, "reason": gate_reason})
+                            result = ToolCallResult(proposal, False, error=f"{gate_code}: {gate_reason}")
+                            progress["tool_results"].append(result.to_dict())
+                            continue
                     decision = authorize_tool([proposal.name, argument], context=auth_context)
                     mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
                     mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
@@ -390,7 +470,7 @@ class MissionRuntime:
                     else:
                         result = ToolCallResult(proposal, False)
                         try:
-                            proof = self._derive_execution_proof(mission, proposal, argument, decision)
+                            proof = self._derive_execution_proof(mission, proposal, argument, decision, plan_hash=plan.plan_fingerprint if plan is not None else None)
                             mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
                         except Exception as exc:
                             mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution proof derivation failed: {type(exc).__name__}"})
@@ -430,8 +510,14 @@ class MissionRuntime:
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self.store.save(mission)
 
-    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str]) -> None:
-        """Authorize and execute independent proposals concurrently, then fold results deterministically."""
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str], plan: Any = None) -> None:
+        """Authorize and execute independent proposals concurrently, then fold results deterministically.
+
+        B3-C4B: the parallel path obeys exactly the same canonical
+        ExecutionPlan gate as the serial path. Every executed proposal maps
+        to a concrete action of the current derived plan (identity, tool and
+        canonical arguments); there is no parallel bypass (INV-C4-10).
+        """
         from security.authorization import authorize_tool
         from security.execution_proof import ExecutionAuthorizationProof
         from tools.registry import execute as execute_tool
@@ -452,11 +538,19 @@ class MissionRuntime:
                 mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": snapshot_code, "reason": snapshot_reason})
                 results.append(ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}"))
                 continue
+            if plan is not None:
+                from security.execution_plan_runtime import gate_action_against_plan, proposal_action_identity
+                gate_ok, gate_code, gate_reason = gate_action_against_plan(plan, action_id=proposal_action_identity(proposal), tool_name=proposal.name, arguments=proposal.arguments if isinstance(proposal.arguments, dict) else {})
+                if not gate_ok:
+                    mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{gate_code}: {gate_reason}"})
+                    mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": gate_code, "reason": gate_reason})
+                    results.append(ToolCallResult(proposal, False, error=f"{gate_code}: {gate_reason}"))
+                    continue
             decision = authorize_tool([proposal.name, argument], context=auth_context)
             mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
             if decision.allowed:
                 try:
-                    proof = self._derive_execution_proof(mission, proposal, argument, decision)
+                    proof = self._derive_execution_proof(mission, proposal, argument, decision, plan_hash=plan.plan_fingerprint if plan is not None else None)
                     mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
                     authorized.append((proposal, argument, decision, proof))
                 except Exception as exc:

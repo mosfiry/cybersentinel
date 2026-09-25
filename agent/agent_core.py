@@ -285,7 +285,18 @@ class AgentCore:
             owner_approval=authorization_context.owner_evidence.proof_fingerprint,
         )
         model_requested_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
-        effective_tools = owner_budget.intersect(model_requested_tools)
+        # B3-C4B (sections 7 and 16): the legacy Plan/PlanStep representation
+        # reaches executable authority only through the compatibility
+        # adapter: PlanStep -> validated ActionIntent ->
+        # derive_execution_plan(owner_budget, action_intents). The Owner
+        # budget is the only tool-authority source; the derived effective
+        # tools are the tool names of the derived ExecutionPlan, so the
+        # snapshot allowlist corresponds exactly to the derived plan. The
+        # model can only narrow; it can never add, widen, or mint tools.
+        from security.execution_plan_runtime import legacy_plan_effective_tools
+        effective_tools, derived_initial_plan = legacy_plan_effective_tools(owner_budget, plan, request_id=request_id)
+        if not set(effective_tools) <= set(owner_budget.intersect(model_requested_tools)):
+            raise PermissionError("derived execution plan widened the Owner budget intersection (INV-C4-4)")
 
         def authorization_snapshot_factory(created_mission: Mission) -> MissionAuthorizationSnapshot:
             return MissionAuthorizationSnapshot.create(
@@ -313,7 +324,7 @@ class AgentCore:
             authorization_context=authorization_context,
             scope_snapshot=scope_context,
             completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
-            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict(), "owner_budget": owner_budget.to_dict(), "model_requested_tools": list(model_requested_tools), "effective_tools": list(effective_tools)},
+            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict(), "owner_budget": owner_budget.to_dict(), "model_requested_tools": list(model_requested_tools), "effective_tools": list(effective_tools), "execution_plan_fingerprint": derived_initial_plan.plan_fingerprint if derived_initial_plan is not None else ""},
             authorization_snapshot_factory=authorization_snapshot_factory,
         )
         if getattr(self, "_last_model_response", None):

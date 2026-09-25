@@ -118,6 +118,30 @@ def classify_snapshot_reason(reason: str) -> RejectionCode:
     return RejectionCode.SNAPSHOT_INVALID
 
 
+def canonical_mission_plan_identity(mission: Any) -> str:
+    """B3-C4B: exactly one canonical plan identity per mission execution path.
+
+    On the Mission model-derived path the canonical identity is the bound
+    ExecutionPlan fingerprint (mission.progress["execution_plan"]
+    ["plan_fingerprint"]). When no derived ExecutionPlan is bound (legacy
+    slice path, owner-direct compatibility) the legacy Plan fingerprint
+    remains canonical. The relationship is explicit and deterministic; the
+    two identities are never silently interchanged, so a proof bound to one
+    cannot validate against the other (fail closed). Duck-typed on purpose:
+    no new imports, no dependency on the agent layer.
+    """
+    try:
+        progress = getattr(mission, "progress", None)
+        stored = dict(progress or {}).get("execution_plan") if isinstance(progress, dict) else None
+        if isinstance(stored, dict):
+            fingerprint = str(stored.get("plan_fingerprint", "") or "")
+            if fingerprint:
+                return fingerprint
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return mission.plan.fingerprint
+
+
 class ExecutionProofError(PermissionError):
     """Raised when proof derivation cannot bind an execution to its authorization."""
 
@@ -360,7 +384,7 @@ class ExecutionAuthorizationProof:
             return False, "execution proof belongs to another mission", RejectionCode.PROOF_BINDING_MISMATCH.value
         if getattr(mission, "request_id", "") and proof.request_id != str(mission.request_id):
             return False, "execution proof belongs to another request", RejectionCode.PROOF_BINDING_MISMATCH.value
-        if proof.plan_hash and proof.plan_hash != mission.plan.fingerprint:
+        if proof.plan_hash and proof.plan_hash != canonical_mission_plan_identity(mission):
             return False, "mission plan changed after proof derivation", RejectionCode.PLAN_MISMATCH.value
         if proof.scope_hash != _fingerprint(mission.scope_snapshot or {}):
             return False, "mission scope snapshot changed after proof derivation", RejectionCode.SCOPE_MISMATCH.value
@@ -387,5 +411,6 @@ __all__ = [
     "PROOF_TTL_SECONDS",
     "RejectionCode",
     "canonical_execution_fingerprint",
+    "canonical_mission_plan_identity",
     "classify_snapshot_reason",
 ]
