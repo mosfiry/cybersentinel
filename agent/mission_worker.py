@@ -161,6 +161,7 @@ class MissionWorker:
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
             MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
             MissionStatus.AUTHORIZATION_BLOCKED: WorkerMissionState.FAILED,
+            MissionStatus.RECOVERY_REQUIRED: WorkerMissionState.WAITING_FOR_TOOL,
             MissionStatus.CANCELLED: WorkerMissionState.CANCELLED,
             MissionStatus.FAILED_RETRY_EXHAUSTED: WorkerMissionState.FAILED,
             MissionStatus.SCOPE_BLOCKED: WorkerMissionState.FAILED,

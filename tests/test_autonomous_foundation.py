@@ -109,6 +109,25 @@ def test_queue_worker_and_restart_recovery(tmp_path):
     assert result.state is WorkerMissionState.COMPLETED
 
 
+def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-recovery", available_at="2026-01-01T00:00:00+00:00")
+
+    class Mission:
+        status = MissionStatus.RECOVERY_REQUIRED
+        evidence = []
+        error = "in-flight tool outcome is unknown"
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None):
+            assert mission_id == "mission-recovery"
+            return Mission()
+
+    result = MissionWorker(queue, lambda: Runtime()).run_once(now="2026-01-01T00:00:00+00:00")
+    assert result.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert result.last_error == "in-flight tool outcome is unknown"
+
+
 def test_scheduler_supports_one_time_and_recurring_dispatch(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     scheduler = MissionScheduler(Path(tmp_path) / "scheduler.sqlite3", queue)
