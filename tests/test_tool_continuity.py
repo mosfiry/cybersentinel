@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 """Round 2 P1 - tool result continuity on the canonical model loop.
 
 Every tool result is bound to mission_id / run_id / turn_id / tool_call_id.
@@ -21,11 +21,11 @@ def _runtime(tmp_path):
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime):
+def _mission(runtime, **kwargs):
     plan = Plan.initial("maintain continuity").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
-    return runtime.create("maintain continuity", "maintain continuity", plan)
+    return runtime.create("maintain continuity", "maintain continuity", plan, **kwargs)
 
 
 def _call(mission_id, run_id, turn_id, plan_version, n, tool_call_id=None):
@@ -74,7 +74,7 @@ def test_duplicate_tool_call_id_is_rejected_prior_result_is_authoritative(tmp_pa
 
     monkeypatch.setattr(tools.registry, "execute", fixture)
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     class ReplayModel:
         """Turn 1 executes call_001; later turns replay the same id."""
@@ -134,7 +134,7 @@ def test_parallel_results_fold_deterministically(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools.registry, "execute", fixture)
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     class ParallelModel:
         def __init__(self):

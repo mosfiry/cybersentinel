@@ -40,7 +40,11 @@ def test_router_discards_forged_provider_metadata():
     result = ModelRouter([ForgedProvider()]).chat([])
     assert result["provider"] == "trusted-name"
     assert result["model"] == "trusted-model"
-    assert AgentRuntime(ModelRouter([ForgedProvider()])).plan("Owner status")["provider"] == "trusted-name"
+    plan = AgentRuntime(ModelRouter([ForgedProvider()])).plan("Owner status")
+    # INV-AUTH-3: the forged-provider plan fails closed to the deterministic
+    # fallback; the router still discards forged provider metadata above.
+    assert plan["provider"] == "local"
+    assert "INV-AUTH-3" in plan["fallback_reason"]
 
 
 def test_tampered_evidence_is_detected():

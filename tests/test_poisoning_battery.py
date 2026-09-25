@@ -54,7 +54,9 @@ def test_poisoned_plan_grants_no_privileged_steps():
     # grant nothing; the privileged steps are rejected as before.
     assert accepted == []
     assert len(errors) == 3
-    assert all(error == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)" for error in errors)
+    assert errors[0] == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
+    assert errors[1] == "sensitive tool requires AuthorizationContext"
+    assert errors[2] == "scope-bound tool requires AuthorizationContext with ScopeSnapshot"
 
 
 def test_model_shaped_records_cannot_become_authorization_decisions():

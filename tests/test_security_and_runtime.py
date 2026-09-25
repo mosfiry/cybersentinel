@@ -25,8 +25,13 @@ def test_unknown_tool_and_bad_arguments_are_rejected():
     assert not authorize_tool(["search", {"arbitrary": "object"}]).allowed
     assert not authorize_tool(["search", "x" * 257]).allowed
     accepted, errors = authorize_plan(["status", ["search", "CVE-2026"]])
-    assert not errors
-    assert accepted == [("status", None), ("search", "CVE-2026")]
+    # INV-AUTH-3: authorize_plan is fail-closed without a typed
+    # AuthorizationContext; an untyped request authorizes nothing.
+    assert accepted == []
+    assert list(errors) == [
+        "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)",
+        "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)",
+    ]
 
 
 def test_runtime_model_plan_fails_closed_without_typed_context():

@@ -50,7 +50,7 @@ def runtime_for(provider, monkeypatch, owner="owner"):
     return AgentTaskRuntime(ModelRouter([provider]), executor=lambda command, **kwargs: {"ok": True, "request_id": "exec-1", "result": {"command": command}})
 
 
-def test_task_backed_runtime_persists_multi_slice_context_memory_and_events(isolated_dbs, monkeypatch):
+def test_task_backed_runtime_persists_multi_slice_context_memory_and_events(tmp_path, isolated_dbs, monkeypatch):
     provider = ScriptedProvider([
         ProviderResponse(tool_calls=[ToolCall("search", {"query": "CVE-2026"}, "call-1")], finish_reason="tool_calls"),
         ProviderResponse(text=json.dumps({"type": "final", "content": "تم جمع الدليل وتحليل المهمة."}), finish_reason="stop"),
@@ -69,7 +69,7 @@ def test_task_backed_runtime_persists_multi_slice_context_memory_and_events(isol
     assert memory.MemoryProvider.get_relevant_memory("conv-1", limit=20)
 
 
-def test_duplicate_tool_call_id_is_idempotent(isolated_dbs, monkeypatch):
+def test_duplicate_tool_call_id_is_idempotent(tmp_path, isolated_dbs, monkeypatch):
     provider = ScriptedProvider([
         ProviderResponse(tool_calls=[ToolCall("search", {"query": "same"}, "same-id")]),
         ProviderResponse(tool_calls=[ToolCall("search", {"query": "same"}, "same-id")]),

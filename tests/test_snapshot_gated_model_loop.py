@@ -14,7 +14,7 @@ from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.planning import Plan, PlanStep
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 
 
 class ScriptedProposer:
@@ -39,9 +39,9 @@ def _runtime(tmp_path, factory) -> MissionRuntime:
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=factory)
 
 
-def _mission(runtime: MissionRuntime, action: str = "status"):
+def _mission(runtime: MissionRuntime, action: str = "status", **kwargs):
     plan = Plan.initial("investigate").replan(steps=(PlanStep("observe", "observe", action=action),), reason="test")
-    return runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}])
+    return runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}], **kwargs)
 
 
 def _restricted(mission, **overrides):
@@ -57,7 +57,7 @@ def test_model_loop_executes_owner_authorized_tool(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools.registry, "execute", lambda *args, **kwargs: {"ok": True, "criterion_id": "goal", "source": "fixture-result"})
     runtime = _runtime(tmp_path, make_test_snapshot)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     result = runtime.run_model_loop(mission.mission_id, ScriptedProposer(mission.mission_id, [("status", "call_001")]), tools=[{"name": "status"}], max_turns=3)
 
@@ -211,7 +211,7 @@ def test_parallel_calls_gated_per_proposal(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(tools.registry, "execute", lambda *args, **kwargs: calls.append(args) or {"ok": True, "criterion_id": "goal", "source": "fixture-result"})
     runtime = _runtime(tmp_path, _restricted)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     result = runtime.run_model_loop(mission.mission_id, ScriptedProposer(mission.mission_id, [("status", "call_001"), ("search", "call_002")]), tools=[], max_turns=3)
 
