@@ -2,20 +2,20 @@ from __future__ import annotations
 
 """R1 INTENT CHARACTERIZATION TESTS (R1-C1 .. R1-C10).
 
-These tests characterize the CURRENT behavior of the intent path and the
-governed execution boundary on branch security/characterization-baseline.
-They are security characterization / regression tests, NOT fixes.
+These tests characterize the intent path and the governed execution
+boundary. They are security characterization / regression tests.
 
 Characterized paths:
 
-- R1-C1  model output is parsed into a typed MissionIntent, with an
-         explicit deterministic fallback when the model output is not JSON.
+- R1-C1  model output is parsed into a typed MissionIntent; the
+         deterministic fallback path carries an honest provenance label
+         (INV-INTENT-2, enforced by the R1 intent engine on
+         security/r1-intent-engine).
 - R1-C2  the MissionIntent contract is frozen, complete, and carries a
          deterministic semantic fingerprint.
-- R1-C3  HAZARD: there is no deterministic intent validator today. A model
-         proposal can carry arbitrary authority-shaped fields
-         (intent_type="GRANT_ALL", authorization_requirements including
-         self-grants) straight into the typed MissionIntent.
+- R1-C3  the deterministic intent validator rejects authority-shaped
+         proposals before they reach the typed contract (INV-INTENT-1,
+         enforced by the R1 intent engine).
 - R1-C4  model output cannot mint authorization: AuthorizationDecision can
          only be issued from a typed AuthorizationContext, forged decision
          signatures fail validation, and dict evidence is rejected.
@@ -43,9 +43,9 @@ Characterized paths:
          MODEL_PLAN_TOOLS subset-of OWNER_AUTHORIZED_TOOL_BUDGET (effective
          budget = intersection, never union or derivation).
 
-None of these tests modify production behavior. The R1 implementation
-commits are expected to INVERT the hazard expectations (R1-C3, R1-C7
-structural-only pin, R1-C10) while preserving every defensive pin.
+R1-C7 (structural-only adapter) and R1-C10 (capability budget derivation)
+remain OPEN hazards scheduled for their owning phases (R1 follow-up /
+Phase B); every other expectation here is an enforced defense.
 """
 
 import dataclasses
@@ -164,16 +164,11 @@ def test_r1c1_model_proposal_parses_into_typed_intent(tmp_path):
 
 
 def test_r1c1_invalid_model_output_falls_back_deterministically(tmp_path):
-    """CURRENT HAZARD: when the model output is not JSON, the deterministic
-    fallback content IS used (raw objective, fixed verification criteria,
-    fallback ambiguity marker), but the intent is still labeled
-    source="model": the empty proposal dict from the failed parse is
-    accepted as a "model" proposal, so the fallback runs with a WRONG
-    provenance label.
-
-    Invariant the R1 fix must enforce: the fallback path must be labeled
-    source="deterministic_fallback" (or equivalent); a failed or empty model
-    turn must never be recorded as model provenance (INV-INTENT-2).
+    """R1 FIX ENFORCED (INV-INTENT-2): when the model output is not JSON, the
+    deterministic fallback content is used AND the intent is labeled
+    source="deterministic_fallback": the empty proposal dict from the failed
+    parse is no longer accepted as a "model" proposal. A failed or empty
+    model turn is never recorded as model provenance.
     """
     core = AgentCore(
         router=StubRouter("not json at all"),
@@ -183,8 +178,7 @@ def test_r1c1_invalid_model_output_falls_back_deterministically(tmp_path):
     assert isinstance(intent, MissionIntent)
     assert intent.objective == "check system status"
     assert "model unavailable; semantic interpretation requires owner review" in intent.ambiguities
-    # HAZARD PIN: documents the CURRENT mislabeled provenance.
-    assert intent.source == "model"
+    assert intent.source == "deterministic_fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -238,21 +232,17 @@ def test_r1c2_semantic_fingerprint_is_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# R1-C3: invalid intent rejection -- HAZARD (no validator today)
+# R1-C3: invalid intent rejection (INV-INTENT-1)
 # ---------------------------------------------------------------------------
 
 
-def test_r1c3_authority_shaped_intent_fields_pass_unvalidated():
-    """CURRENT HAZARD: there is no deterministic intent validator between the
-    model proposal and the typed MissionIntent. A proposal can carry
-    intent_type="GRANT_ALL" and authorization_requirements such as
-    "self_grant_owner_authority" straight into the typed contract, and
-    unknown keys are silently dropped.
-
-    Invariant the R1 fix must enforce: every model-proposed intent passes a
-    deterministic validator that rejects or quarantines authority-bearing
-    fields; MODEL_OUTPUT may never carry a self-grant into the typed
-    contract (INV-INTENT-1).
+def test_r1c3_authority_shaped_intent_fields_are_rejected():
+    """R1 FIX ENFORCED (INV-INTENT-1): the deterministic intent validator
+    sits between the model proposal and the typed MissionIntent. A proposal
+    carrying intent_type="GRANT_ALL" and authorization_requirements such as
+    "self_grant_owner_authority" is REJECTED: it never reaches the typed
+    contract. The deterministic fallback interpretation is used instead and
+    the rejection is recorded in the ambiguities.
     """
     malicious = {
         "objective": "help me",
@@ -263,10 +253,11 @@ def test_r1c3_authority_shaped_intent_fields_pass_unvalidated():
         "self_authority": True,
     }
     intent = NaturalLanguageUnderstanding(proposer=lambda text: dict(malicious)).understand("help me")
-    # HAZARD PIN: these assertions document the CURRENT permissive behavior.
-    assert intent.intent_type == "GRANT_ALL"
-    assert intent.authorization_requirements == ("self_grant_owner_authority", "expand_scope")
-    assert intent.scope_references == ("*",)
+    assert intent.source == "deterministic_fallback"
+    assert intent.intent_type == "GENERAL_CONVERSATION"
+    assert intent.authorization_requirements == ()
+    assert intent.scope_references == ()
+    assert any("deterministic intent validator rejected" in item for item in intent.ambiguities)
     assert "self_authority" not in intent.to_dict()
 
 
@@ -584,9 +575,9 @@ def test_r1c9_follow_up_intent_is_proposal_only(tmp_path):
     intent in mission.progress as an UNVALIDATED proposal; it does not touch
     the authorization snapshot, the plan, or the lifecycle status.
 
-    HAZARD NOTE: today there is no deterministic intent validator on the
-    follow-up path (same R1-C3 hazard); the fix must route follow-ups
-    through the deterministic validator before they influence anything.
+    Since the R1 intent engine, follow-up proposals pass the deterministic
+    intent validator (see test_r1_intent_engine.py); clean proposals remain
+    model-provenance proposals only.
     """
     store = MissionStore(Path(tmp_path) / "missions.sqlite3")
     runtime = MissionRuntime(store, executor=lambda mission, step, action_id: {"success": True, "source": step.action}, authorization_snapshot_factory=make_test_snapshot)
