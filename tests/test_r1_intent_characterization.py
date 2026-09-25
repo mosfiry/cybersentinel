@@ -164,12 +164,16 @@ def test_r1c1_model_proposal_parses_into_typed_intent(tmp_path):
 
 
 def test_r1c1_invalid_model_output_falls_back_deterministically(tmp_path):
-    """CURRENT BEHAVIOR: non-JSON model output falls back to the
-    deterministic parser, explicitly marked source="deterministic_fallback"
-    with the raw instruction preserved as the objective.
+    """CURRENT HAZARD: when the model output is not JSON, the deterministic
+    fallback content IS used (raw objective, fixed verification criteria,
+    fallback ambiguity marker), but the intent is still labeled
+    source="model": the empty proposal dict from the failed parse is
+    accepted as a "model" proposal, so the fallback runs with a WRONG
+    provenance label.
 
-    Invariant the R1 fix must preserve: the fallback is deterministic and
-    never elevates a failed model turn into trusted interpretation.
+    Invariant the R1 fix must enforce: the fallback path must be labeled
+    source="deterministic_fallback" (or equivalent); a failed or empty model
+    turn must never be recorded as model provenance (INV-INTENT-2).
     """
     core = AgentCore(
         router=StubRouter("not json at all"),
@@ -177,9 +181,10 @@ def test_r1c1_invalid_model_output_falls_back_deterministically(tmp_path):
     )
     intent = core.understand_mission_intent("check system status")
     assert isinstance(intent, MissionIntent)
-    assert intent.source == "deterministic_fallback"
     assert intent.objective == "check system status"
     assert "model unavailable; semantic interpretation requires owner review" in intent.ambiguities
+    # HAZARD PIN: documents the CURRENT mislabeled provenance.
+    assert intent.source == "model"
 
 
 # ---------------------------------------------------------------------------
@@ -528,15 +533,21 @@ def test_r1c8_run_project_tests_fails_closed_without_governed_mission(tmp_path, 
 
 
 def test_r1c8_execution_class_confusion_rejected(tmp_path, monkeypatch):
-    """CURRENT DEFENSE: an OWNER_DIRECT proof cannot be replayed against a
-    MISSION_BOUND execution (mission_id present); class confusion fails
-    closed (INV-PROOF-3).
+    """CURRENT DEFENSE: an OWNER_DIRECT proof (which carries an empty
+    mission identity by construction) replayed against a MISSION_BOUND
+    execution (mission_id present) is rejected - fail closed. In practice
+    the rejection happens even BEFORE the execution-class comparison: the
+    proof fails its mission binding first (PROOF_BINDING_MISMATCH).
+
+    Invariant the R1 fix must preserve: an owner-direct proof can never
+    authorize a mission-bound execution; class confusion is blocked at
+    every ordering of the checks (INV-PROOF-3).
     """
     from tools.registry import execute
 
     context = _owner_context(tmp_path, monkeypatch, request_id="req-c8b")
     decision, proof = _owner_direct_proof(context, tool="status")
-    with pytest.raises(PermissionError, match="EXECUTION_CLASS_MISMATCH"):
+    with pytest.raises(PermissionError) as excinfo:
         execute(
             "status",
             authorization_decision=decision,
@@ -544,6 +555,8 @@ def test_r1c8_execution_class_confusion_rejected(tmp_path, monkeypatch):
             execution_proof=proof,
             mission_id="mission-1",
         )
+    message = str(excinfo.value)
+    assert "PROOF_BINDING_MISMATCH" in message or "EXECUTION_CLASS_MISMATCH" in message
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +591,9 @@ def test_r1c9_follow_up_intent_is_proposal_only(tmp_path):
     store = MissionStore(Path(tmp_path) / "missions.sqlite3")
     runtime = MissionRuntime(store, executor=lambda mission, step, action_id: {"success": True, "source": step.action}, authorization_snapshot_factory=make_test_snapshot)
     mission = runtime.create("request", "objective", _plan(), request_id="req-c9")
-    snapshot_before = dict(mission.authorization_snapshot)
+    # Normalize through a JSON round-trip: the persisted snapshot re-loads
+    # with boundary tuples materialized as lists.
+    snapshot_before = json.loads(json.dumps(mission.authorization_snapshot))
     status_before = mission.status
 
     core = AgentCore(
