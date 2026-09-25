@@ -273,10 +273,21 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+    # The registry is the last line of defense, not a policy creator: it only
+    # validates that mission-bound executions carry a proof derived by the
+    # authorization machinery. It never issues authorization itself.
+    mission_bound = mission_authorization is not None or workspace is not None or evidence_store is not None or bool(mission_id)
+    if mission_bound:
+        from security.execution_proof import ExecutionAuthorizationProof, RejectionCode
+        if execution_proof is None:
+            raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: mission-bound execution requires an ExecutionAuthorizationProof")
+        proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id)
+        if not proof_ok:
+            raise PermissionError(f"{proof_code}: {proof_reason}")
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
@@ -319,17 +330,13 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
-        workspace_authorization = mission_authorization
-        if workspace is None:
-            from datetime import datetime, timedelta, timezone
-            from security.mission_authorization import MissionAuthorizationSnapshot
-            root = Path(os.getenv("CYBERSENTINEL_TEST_ROOT", Path.cwd())).expanduser().resolve()
-            legacy_owner = getattr(authorization_decision, "owner_evidence_fingerprint", "legacy-compatibility")
-            compatibility_snapshot = MissionAuthorizationSnapshot.create(owner_identity=legacy_owner, mission_id=str(request_id or "legacy-request"), target_identity="legacy-workspace", scope=("workspace",), allowed_actions=(name,), forbidden_actions=(), allowed_tools=(name,), time_window={"timezone": "UTC"}, max_duration=60, rate_limits={name: 1}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("legacy-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(root)}, policy_version="compatibility", owner_approval=legacy_owner, created_at=datetime.now(timezone.utc).isoformat(), expires_at=(datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat())
-            from workspace import Workspace
-            workspace = Workspace(root, authorization_snapshot=compatibility_snapshot)
-            workspace_authorization = compatibility_snapshot
-        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
+        # Legacy compatibility snapshot minting was removed: the registry must
+        # never create authorization from a decision field. A governed
+        # workspace and a real mission authorization snapshot are required
+        # from the caller.
+        if workspace is None or mission_authorization is None:
+            raise PermissionError("run_project_tests requires a governed workspace and a mission authorization snapshot")
+        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=mission_authorization, evidence_store=evidence_store)
         future = executor.submit(spec.handler, argument, workspace=workspace)
     else:
         future = executor.submit(spec.handler, argument)
