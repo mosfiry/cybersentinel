@@ -59,7 +59,7 @@ class MissionQueue:
             raise ValueError("mission_id required")
         available = available_at or datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.db_path) as db:
-            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL", (mission_id, state.value, 0, available))
+            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL", (mission_id, state.value, 0, available))
         return self.get(mission_id)
 
     def get(self, mission_id: str) -> QueueItem:

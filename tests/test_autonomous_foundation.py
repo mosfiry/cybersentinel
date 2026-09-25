@@ -109,6 +109,40 @@ def test_queue_worker_and_restart_recovery(tmp_path):
     assert result.state is WorkerMissionState.COMPLETED
 
 
+def test_reenqueue_clears_stale_lease_and_error(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-requeued", available_at="2026-01-01T00:00:00+00:00")
+    queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=3600)
+    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker")
+
+    requeued = queue.enqueue("mission-requeued", available_at="2026-01-01T00:01:00+00:00")
+    assert requeued.state is WorkerMissionState.QUEUED
+    assert requeued.last_error == ""
+    assert requeued.lease_owner is None
+    assert requeued.lease_expires_at is None
+
+    reclaimed = queue.claim_next(now="2026-01-01T00:01:00+00:00", worker_id="new-worker")
+    assert reclaimed is not None
+    assert reclaimed.lease_owner == "new-worker"
+
+
+def test_concurrent_workers_claim_a_mission_once(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-once", available_at="2026-01-01T00:00:00+00:00")
+
+    def claim(worker_id):
+        return queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id=worker_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(claim, ("worker-a", "worker-b")))
+
+    successful = [item for item in claims if item is not None]
+    assert len(successful) == 1
+    assert queue.get("mission-once").attempts == 1
+
+
 def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-recovery", available_at="2026-01-01T00:00:00+00:00")
