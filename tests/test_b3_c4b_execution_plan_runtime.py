@@ -295,8 +295,10 @@ def test_c4b_h1_inv5_inv10_parallel_identical_duplicates_execute_exactly_once(tm
     identical proposals (same tool, same canonical arguments, distinct
     identities) map to ONE planned action. Only the proposal carrying the
     planned action identity executes; the duplicate fails closed with
-    PLAN_MISMATCH and no tool handler runs for it (INV-C4-H1-4/5). Results
-    still fold deterministically in proposal order.
+    PLAN_MISMATCH and no tool handler runs for it (INV-C4-H1-4/5). The
+    parallel fold is deterministic: rejections are recorded during the
+    authorization loop and executed results afterwards, so tool_results
+    order is [rejected duplicate, executed planned action].
     """
     calls = _recording_registry(monkeypatch)
     runtime = _runtime(tmp_path)
@@ -305,9 +307,9 @@ def test_c4b_h1_inv5_inv10_parallel_identical_duplicates_execute_exactly_once(tm
     result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
     assert [call["tool"] for call in calls] == ["status"]
     tool_results = result.progress["model_loop"]["tool_results"]
-    assert [item["tool_call_id"] for item in tool_results] == ["call_001", "call_002"]
-    assert [item["ok"] for item in tool_results] == [True, False]
-    assert tool_results[1]["error"].startswith("PLAN_MISMATCH:")
+    assert [item["tool_call_id"] for item in tool_results] == ["call_002", "call_001"]
+    assert [item["ok"] for item in tool_results] == [False, True]
+    assert tool_results[0]["error"].startswith("PLAN_MISMATCH:")
     assert len(result.progress["execution_plans"]) == 1
 
 
@@ -569,18 +571,21 @@ def test_h1_inv4_case_a_ten_identical_proposals_cannot_exceed_plan_cardinality(t
     duplicate-emission fallback would accept every proposal, executing a
     side-effect tool ten times against a plan of cardinality one (PLAN
     CARDINALITY BYPASS). Strict identity bounds executions to the derived
-    plan cardinality: exactly one execution.
+    plan cardinality: exactly one execution. (The parallel fold records
+    rejections during the authorization loop and executed results afterwards,
+    so the deterministic tool_results order is [rejected..., executed...].)
     """
     calls = _recording_registry(monkeypatch)
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="watch", request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
-    model = ScriptedModel(mission.mission_id, [[("watch", {}, "a%d" % i, "call_%03d" % i) for i in range(1, 11)]])
+    model = ScriptedModel(mission.mission_id, [[("watch", {"query": "counter-term"}, "a%d" % i, "call_%03d" % i) for i in range(1, 11)]])
     result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
     assert [call["tool"] for call in calls] == ["watch"], "planned cardinality is 1: exactly one execution"
     tool_results = result.progress["model_loop"]["tool_results"]
-    assert [item["tool_call_id"] for item in tool_results] == ["call_%03d" % i for i in range(1, 11)]
+    assert sorted(item["tool_call_id"] for item in tool_results) == ["call_%03d" % i for i in range(1, 11)]
     assert sum(1 for item in tool_results if item["ok"]) == 1
-    assert tool_results[0]["ok"] is True
+    executed = [item["tool_call_id"] for item in tool_results if item["ok"]]
+    assert executed == ["call_001"]
     assert all(item["error"].startswith("PLAN_MISMATCH:") for item in tool_results if not item["ok"])
     assert [action["action_id"] for action in result.progress["execution_plan"]["actions"]] == ["a1:call_001"]
 
@@ -601,12 +606,12 @@ def test_h1_side_effect_counter_executes_exactly_once(tmp_path, monkeypatch):
     monkeypatch.setattr("tools.registry.execute", increment_counter)
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="watch", request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
-    model = ScriptedModel(mission.mission_id, [[("watch", {}, "a1", "call_%03d" % i) for i in (1, 2, 3)]])
+    model = ScriptedModel(mission.mission_id, [[("watch", {"query": "counter-term"}, "a1", "call_%03d" % i) for i in (1, 2, 3)]])
     result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
     assert counter["executions"] == 1, "expected executions = 1; actual must equal 1"
     tool_results = result.progress["model_loop"]["tool_results"]
-    assert [item["ok"] for item in tool_results] == [True, False, False]
-    assert [item["tool_call_id"] for item in tool_results] == ["call_001", "call_002", "call_003"]
+    assert sorted(item["tool_call_id"] for item in tool_results) == ["call_001", "call_002", "call_003"]
+    assert sum(1 for item in tool_results if item["ok"]) == 1
     assert all(item["error"].startswith("PLAN_MISMATCH:") for item in tool_results if not item["ok"])
 
 

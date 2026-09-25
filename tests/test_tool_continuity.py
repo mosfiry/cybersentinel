@@ -28,10 +28,10 @@ def _mission(runtime, **kwargs):
     return runtime.create("maintain continuity", "maintain continuity", plan, **kwargs)
 
 
-def _call(mission_id, run_id, turn_id, plan_version, n, tool_call_id=None, name="status"):
+def _call(mission_id, run_id, turn_id, plan_version, n, tool_call_id=None, name="status", args=None):
     return ToolCallProposal.create(
         name,
-        {},
+        dict(args or {}),
         mission_id=mission_id,
         run_id=run_id,
         turn_id=turn_id,
@@ -153,7 +153,7 @@ def test_parallel_results_fold_deterministically(tmp_path, monkeypatch):
                     turn_id,
                     tool_calls=(
                         _call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),
-                        _call(mission_id, run_id, turn_id, plan_version, 2, "call_002", name="search"),
+                        _call(mission_id, run_id, turn_id, plan_version, 2, "call_002", name="search", args={"query": "parallel-fold"}),
                     ),
                 )
             return ModelTurn(turn_id, content="parallel observations complete", finish_reason="stop")
