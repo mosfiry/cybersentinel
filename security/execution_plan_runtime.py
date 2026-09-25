@@ -211,22 +211,26 @@ def derive_mission_execution_plan(mission: Any, proposals: Iterable[Any]) -> Exe
 def gate_action_against_plan(plan: ExecutionPlan, *, action_id: str, tool_name: str, arguments: Any) -> tuple[bool, str, str]:
     """B3-C4B execution gate (section 9): action-in-plan proof before execution.
 
-    A proposal may execute only if it maps to a concrete action of the
-    CURRENT ExecutionPlan with identical canonical arguments (and, when the
-    proposal's action identity is itself a planned action identity, an
-    identical identity and tool). A model cannot introduce a new action
-    between planning and execution by emitting another ToolCall: tool or
-    argument mismatches fail closed with PLAN_MISMATCH and no tool handler
-    runs (INV-C4-3). A forged/tampered plan is rejected by full plan
+    B3-C4B-H1 strict action identity: a proposal may execute only if it
+    maps to a concrete action of the CURRENT ExecutionPlan by exact planned
+    action identity, with identical tool and canonical arguments. There is
+    NO tool+arguments fallback: equality of tool and arguments never mints
+    an execution, and a fresh action identity fails closed with
+    PLAN_MISMATCH even when it repeats an already-planned action
+    (INV-C4-H1-2, INV-C4-H1-3). A model cannot introduce a new action
+    between planning and execution by emitting another ToolCall: identity,
+    tool, or argument mismatches fail closed with PLAN_MISMATCH and no tool
+    handler runs (INV-C4-3). A forged/tampered plan is rejected by full plan
     re-validation (INV-C4-2).
 
-    Duplicate emissions: the C3 plan represents effective actions as
-    first-seen-unique per tool, so a second proposal of an already-planned
-    action carries a fresh action identity. The gate accepts such a proposal
-    only when its tool and canonical arguments are identical to an existing
-    planned action; anything else (different tool, different arguments,
-    unknown action) fails closed. A duplicate emission can never add or
-    alter an effective action.
+    Execution cardinality equals derived ExecutionPlan cardinality
+    (INV-C4-H1-4): the C3 plan represents effective actions as
+    first-seen-unique per tool (by_tool), so one planned action carries
+    exactly one executable identity per turn and duplicate proposals of the
+    same planned action are rejected. The plan representation itself has no
+    repeated-action multiplicity, so the gate must not discover any
+    implicitly. Legitimate repetition of a side effect is a new model turn,
+    which derives a new plan with fresh identities (INV-C4-H1-5).
     """
     ok, reason = validate_execution_plan(plan)
     if not ok:
@@ -236,10 +240,7 @@ def gate_action_against_plan(plan: ExecutionPlan, *, action_id: str, tool_name: 
     candidate_fingerprint = canonical_execution_fingerprint(candidate)
     match = next((action for action in plan.actions if action.action_id == wanted), None)
     if match is None:
-        duplicate = next((action for action in plan.actions if action.tool_name == str(tool_name or "").strip() and action.arguments_fingerprint == candidate_fingerprint), None)
-        if duplicate is None:
-            return False, RejectionCode.PLAN_MISMATCH.value, "action is not part of the current ExecutionPlan: " + wanted
-        return True, "", "duplicate emission of a planned effective action"
+        return False, RejectionCode.PLAN_MISMATCH.value, "action is not part of the current ExecutionPlan: " + wanted
     if match.tool_name != str(tool_name or "").strip():
         return False, RejectionCode.PLAN_MISMATCH.value, "action tool differs from the current ExecutionPlan: " + str(tool_name)
     if match.arguments_fingerprint != candidate_fingerprint:

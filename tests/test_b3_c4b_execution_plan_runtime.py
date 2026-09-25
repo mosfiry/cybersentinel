@@ -173,11 +173,12 @@ def test_c4b_gate_rejects_unplanned_action_tool_and_arguments(tmp_path):
     # arguments do not correspond to any planned effective action)
     ok, code, _ = gate_action_against_plan(plan, action_id="a9:call_9", tool_name="status", arguments={"query": "unplanned"})
     assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
-    # duplicate emission: a fresh identity of an already-planned effective
-    # action (same tool, same canonical arguments) is not a new action; it
-    # maps to the planned action and cannot add or alter authority
-    ok, code, reason = gate_action_against_plan(plan, action_id="a9:call_9", tool_name="status", arguments={"query": "q"})
-    assert ok is True and "duplicate emission" in reason
+    # B3-C4B-H1 (strict identity): a fresh identity of an already-planned
+    # effective action (same tool, same canonical arguments) is NOT accepted
+    # as a duplicate emission. Tool + arguments equality never mints an
+    # execution; a fresh action identity fails closed (INV-C4-H1-2/3).
+    ok, code, _reason = gate_action_against_plan(plan, action_id="a9:call_9", tool_name="status", arguments={"query": "q"})
+    assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
     # case 14: arguments differ from the ExecutionPlan
     ok, code, _ = gate_action_against_plan(plan, action_id="a1:call_1", tool_name="status", arguments={"query": "changed"})
     assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
@@ -287,23 +288,26 @@ def test_c4b_inv10_parallel_duplicate_tool_with_changed_arguments(tmp_path, monk
     assert blocked[0]["error"].startswith("PLAN_MISMATCH:")
 
 
-def test_c4b_inv10_parallel_identical_duplicate_calls_execute_in_plan_order(tmp_path, monkeypatch):
-    """Duplicate emissions of ONE planned effective action stay executable and fold in proposal order.
+def test_c4b_h1_inv5_inv10_parallel_identical_duplicates_execute_exactly_once(tmp_path, monkeypatch):
+    """B3-C4B-H1: duplicate proposals of ONE planned action cannot increase execution count.
 
     The C3 plan keeps effective actions first-seen-unique per tool, so two
-    identical proposals (same tool, same canonical arguments) map to the same
-    planned action. Both execute once each, in proposal order, and neither
-    can add, replace, or widen a planned action (INV-C4-10).
+    identical proposals (same tool, same canonical arguments, distinct
+    identities) map to ONE planned action. Only the proposal carrying the
+    planned action identity executes; the duplicate fails closed with
+    PLAN_MISMATCH and no tool handler runs for it (INV-C4-H1-4/5). Results
+    still fold deterministically in proposal order.
     """
     calls = _recording_registry(monkeypatch)
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
     model = ScriptedModel(mission.mission_id, [[("status", {}, "a1", "call_001"), ("status", {}, "a2", "call_002")]])
     result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
-    assert [call["tool"] for call in calls] == ["status", "status"]
+    assert [call["tool"] for call in calls] == ["status"]
     tool_results = result.progress["model_loop"]["tool_results"]
     assert [item["tool_call_id"] for item in tool_results] == ["call_001", "call_002"]
-    assert all(item["ok"] for item in tool_results)
+    assert [item["ok"] for item in tool_results] == [True, False]
+    assert tool_results[1]["error"].startswith("PLAN_MISMATCH:")
     assert len(result.progress["execution_plans"]) == 1
 
 
@@ -522,6 +526,217 @@ def test_c4b_inv14_owner_budget_view_never_widens(tmp_path):
     # The model request can only narrow: an outside proposal never enters.
     assert budget.intersect(["watch", "status"]) == ("status",)
     assert "watch" not in budget.tools
+
+
+# ---------------------------------------------------------------------------
+# B3-C4B-H1: ExecutionPlan cardinality / identity hardening.
+#
+# Strict action identity (Option A): a proposal executes only when its
+# canonical action identity equals a planned action identity of the CURRENT
+# ExecutionPlan, with identical tool and canonical arguments. There is no
+# tool+arguments fallback, so MODEL_OUTPUT can never create more executions
+# than the derived ExecutionPlan cardinality (INV-C4-H1-1..8 and the 16-case
+# adversarial matrix; every rejection also proves that no tool handler ran).
+# ---------------------------------------------------------------------------
+
+
+def test_h1_inv2_inv3_fresh_identity_never_mints_execution(tmp_path):
+    """INV-C4-H1-2/3: tool + arguments equality is never sufficient."""
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    plan = derive_mission_execution_plan(mission, [ToolCallProposal.create("status", {}, mission_id=mission.mission_id, tool_call_id="call_1", action_id="a1")])
+    ok, _code, _reason = gate_action_against_plan(plan, action_id="a1:call_1", tool_name="status", arguments={})
+    assert ok is True
+    fresh = [
+        # same tool, same canonical arguments, fresh action identities
+        ToolCallProposal.create("status", {}, mission_id=mission.mission_id, tool_call_id="call_2", action_id="a2"),
+        ToolCallProposal.create("status", {}, mission_id=mission.mission_id, tool_call_id="call_2", action_id="a1"),
+        ToolCallProposal.create("status", {}, mission_id=mission.mission_id, tool_call_id="call_9", action_id="a9"),
+    ]
+    for proposal in fresh:
+        gate_ok, code, _reason = gate_action_against_plan(plan, action_id=proposal_action_identity(proposal), tool_name=proposal.name, arguments={})
+        assert gate_ok is False and code == RejectionCode.PLAN_MISMATCH.value
+    # forged identity shapes fail closed as well (matrix case 7)
+    for forged in ("", "a1", "a1:call_1:extra", "*"):
+        gate_ok, code, _reason = gate_action_against_plan(plan, action_id=forged, tool_name="status", arguments={})
+        assert gate_ok is False and code == RejectionCode.PLAN_MISMATCH.value
+
+
+def test_h1_inv4_case_a_ten_identical_proposals_cannot_exceed_plan_cardinality(tmp_path, monkeypatch):
+    """INV-C4-H1-4 (matrix case 3): one planned action, ten identical proposals with distinct identities.
+
+    This is Case A of the H1 security question: without strict identity the
+    duplicate-emission fallback would accept every proposal, executing a
+    side-effect tool ten times against a plan of cardinality one (PLAN
+    CARDINALITY BYPASS). Strict identity bounds executions to the derived
+    plan cardinality: exactly one execution.
+    """
+    calls = _recording_registry(monkeypatch)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, action="watch", request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
+    model = ScriptedModel(mission.mission_id, [[("watch", {}, "a%d" % i, "call_%03d" % i) for i in range(1, 11)]])
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
+    assert [call["tool"] for call in calls] == ["watch"], "planned cardinality is 1: exactly one execution"
+    tool_results = result.progress["model_loop"]["tool_results"]
+    assert [item["tool_call_id"] for item in tool_results] == ["call_%03d" % i for i in range(1, 11)]
+    assert sum(1 for item in tool_results if item["ok"]) == 1
+    assert tool_results[0]["ok"] is True
+    assert all(item["error"].startswith("PLAN_MISMATCH:") for item in tool_results if not item["ok"])
+    assert [action["action_id"] for action in result.progress["execution_plan"]["actions"]] == ["a1:call_001"]
+
+
+def test_h1_side_effect_counter_executes_exactly_once(tmp_path, monkeypatch):
+    """Matrix case 12: a countable side-effect fixture proves execution count equals planned count.
+
+    The plan contains the state-write tool exactly once; the model emits
+    three identical proposals. expected executions = 1; the fixture counter
+    proves actual executions = 1 (no network, no files, no external targets).
+    """
+    counter = {"executions": 0}
+
+    def increment_counter(name, argument=None, **kwargs):
+        counter["executions"] += 1
+        return {"ok": True, "criterion_id": "goal", "count": counter["executions"], "source": "fixture"}
+
+    monkeypatch.setattr("tools.registry.execute", increment_counter)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, action="watch", request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
+    model = ScriptedModel(mission.mission_id, [[("watch", {}, "a1", "call_%03d" % i) for i in (1, 2, 3)]])
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
+    assert counter["executions"] == 1, "expected executions = 1; actual must equal 1"
+    tool_results = result.progress["model_loop"]["tool_results"]
+    assert [item["ok"] for item in tool_results] == [True, False, False]
+    assert [item["tool_call_id"] for item in tool_results] == ["call_001", "call_002", "call_003"]
+    assert all(item["error"].startswith("PLAN_MISMATCH:") for item in tool_results if not item["ok"])
+
+
+def test_h1_inv1_executions_map_one_to_one_to_planned_instances(tmp_path, monkeypatch):
+    """INV-C4-H1-1/4 (matrix cases 8/6): every executed action is a planned instance; nothing else executes."""
+    calls = _recording_registry(monkeypatch)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
+    model = ScriptedModel(mission.mission_id, [[("status", {}, "a1", "call_001"), ("search", {"query": "q"}, "a2", "call_002"), ("status", {}, "a3", "call_003")]])
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
+    planned = [action["action_id"] for action in result.progress["execution_plan"]["actions"]]
+    assert planned == ["a1:call_001", "a2:call_002"], "first-seen-unique per tool"
+    executed = [item["tool_call_id"] for item in result.progress["model_loop"]["tool_results"] if item["ok"]]
+    assert executed == ["call_001", "call_002"], "executions map 1:1 to planned instances"
+    assert [call["tool"] for call in calls] == ["status", "search"]
+    assert all(item["error"].startswith("PLAN_MISMATCH:") for item in result.progress["model_loop"]["tool_results"] if not item["ok"])
+
+
+def test_h1_reversed_proposal_order_folds_deterministically(tmp_path, monkeypatch):
+    """Matrix case 9: two planned actions, reversed proposal order; both execute in proposal order.
+
+    Deterministic ordering is preserved, but ordering can never change the
+    set of executable identities or mint an extra execution.
+    """
+    calls = _recording_registry(monkeypatch)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
+    model = ScriptedModel(mission.mission_id, [[("search", {"query": "q"}, "a1", "call_001"), ("status", {}, "a2", "call_002")]])
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=3)
+    assert [call["tool"] for call in calls] == ["search", "status"]
+    planned = [action["action_id"] for action in result.progress["execution_plan"]["actions"]]
+    assert planned == ["a1:call_001", "a2:call_002"]
+    assert all(item["ok"] for item in result.progress["model_loop"]["tool_results"])
+
+
+def test_h1_plan_fingerprint_identity_cardinality_arguments_order(tmp_path):
+    """Section 14 fingerprint battery (pure derivations, same mission binding)."""
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    status_1 = ToolCallProposal.create("status", {}, mission_id=mission.mission_id, tool_call_id="call_1", action_id="a1")
+    search_2 = ToolCallProposal.create("search", {"query": "q"}, mission_id=mission.mission_id, tool_call_id="call_2", action_id="a2")
+    status_args = ToolCallProposal.create("status", {"query": "q"}, mission_id=mission.mission_id, tool_call_id="call_1", action_id="a1")
+    # same plan -> same fingerprint (deterministic re-derivation)
+    first = derive_mission_execution_plan(mission, [status_1])
+    second = derive_mission_execution_plan(mission, [status_1])
+    assert first.plan_fingerprint == second.plan_fingerprint
+    # additional planned action (different cardinality) -> different fingerprint
+    two = derive_mission_execution_plan(mission, [status_1, search_2])
+    assert two.plan_fingerprint != first.plan_fingerprint
+    # different arguments -> different fingerprint
+    args = derive_mission_execution_plan(mission, [status_args])
+    assert args.plan_fingerprint != first.plan_fingerprint
+    # different order -> different fingerprint
+    swapped = derive_mission_execution_plan(mission, [search_2, status_1])
+    assert swapped.plan_fingerprint != two.plan_fingerprint
+    # a fresh proposal action_id cannot change or widen the plan: gate calls
+    # are pure and never mutate plan identity (INV-C4-H1-2).
+    fingerprint = first.plan_fingerprint
+    for forged in ("a9:call_9", "a1:call_2", "", "x" * 64):
+        gate_action_against_plan(first, action_id=forged, tool_name="status", arguments={})
+    assert first.plan_fingerprint == fingerprint
+
+
+def test_h1_stale_plan_cannot_execute_its_actions_under_p2(tmp_path):
+    """Matrix case 14: a P1 action identity is not part of P2 and cannot execute under it."""
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    p1 = derive_mission_execution_plan(mission, [ToolCallProposal.create("status", {}, mission_id=mission.mission_id, tool_call_id="call_1", action_id="a1")])
+    p2 = derive_mission_execution_plan(mission, [ToolCallProposal.create("search", {"query": "q"}, mission_id=mission.mission_id, tool_call_id="call_2", action_id="a2")])
+    assert p1.plan_fingerprint != p2.plan_fingerprint
+    ok, code, _reason = gate_action_against_plan(p2, action_id="a1:call_1", tool_name="status", arguments={})
+    assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
+    # the former duplicate fallback must not resurrect the P1 action under P2
+    ok, code, _reason = gate_action_against_plan(p2, action_id="zz:call_z", tool_name="status", arguments={})
+    assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
+
+
+def test_h1_replay_after_replan_cannot_reexecute_p1(tmp_path, monkeypatch):
+    """Matrix case 16 (replan P1 -> P2): a replayed P1 proposal never re-executes.
+
+    P1 stays immutable history; the replay is rejected as a duplicate
+    emission before any plan gate or handler (INV-C4-H1-4/8).
+    """
+    calls = _recording_registry(monkeypatch)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
+    model = ScriptedModel(mission.mission_id, [[("status", {}, "a1", "call_001")], [("status", {}, "a1", "call_001")]])
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=4)
+    assert [call["tool"] for call in calls] == ["status"]
+    tool_results = result.progress["model_loop"]["tool_results"]
+    assert [item["ok"] for item in tool_results] == [True, False]
+    assert "duplicate tool call rejected" in tool_results[1]["error"]
+    assert len(result.progress["execution_plans"]) == 1
+
+
+def test_h1_cross_mission_proposal_fails_closed(tmp_path, monkeypatch):
+    """INV-C4-H1-7 (matrix case 13): a proposal bound to another mission never executes here."""
+    calls = _recording_registry(monkeypatch)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
+    other = _mission(runtime, request_id="req-other", authorization_context=make_test_authorization_context("req-other", tmp_path).to_dict())
+    proposal = ToolCallProposal.create("status", {}, mission_id=other.mission_id, tool_call_id="call_001", action_id="a1")
+    model = ScriptedModel(mission.mission_id, [])
+    model.complete = lambda messages, tools, **kw: ModelTurn(kw["turn_id"], tool_calls=(proposal,))
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=1)
+    assert calls == [], "no rejected proposal reaches the handler"
+    assert result.progress["model_loop"]["tool_results"][0]["ok"] is False
+    assert "execution_plan" not in result.progress
+
+
+def test_h1_cross_mission_identity_strings_are_descriptive_only(tmp_path):
+    """Section 8/13: identical identity strings across missions are descriptive, never authority.
+
+    Two missions may emit the same action_id/tool_call_id strings; the plans
+    remain bound to distinct mission fingerprints, and the runtime rejects
+    cross-mission proposals before any gate call (previous test).
+    """
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    other = _mission(runtime)
+    plan_a = derive_mission_execution_plan(mission, [ToolCallProposal.create("status", {}, mission_id=mission.mission_id, tool_call_id="call_1", action_id="a1")])
+    plan_b = derive_mission_execution_plan(other, [ToolCallProposal.create("status", {}, mission_id=other.mission_id, tool_call_id="call_1", action_id="a1")])
+    assert plan_a.actions[0].action_id == plan_b.actions[0].action_id
+    assert plan_a.mission_fingerprint != plan_b.mission_fingerprint
+    assert plan_a.plan_fingerprint != plan_b.plan_fingerprint
+    # each stored plan validates only against its own mission binding
+    bind_execution_plan(mission, plan_a)
+    bind_execution_plan(other, plan_b)
+    assert validate_stored_execution_plan(mission) == (True, "authorized")
+    assert validate_stored_execution_plan(other) == (True, "authorized")
 
 
 __all__ = []

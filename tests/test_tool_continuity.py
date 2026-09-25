@@ -28,9 +28,9 @@ def _mission(runtime, **kwargs):
     return runtime.create("maintain continuity", "maintain continuity", plan, **kwargs)
 
 
-def _call(mission_id, run_id, turn_id, plan_version, n, tool_call_id=None):
+def _call(mission_id, run_id, turn_id, plan_version, n, tool_call_id=None, name="status"):
     return ToolCallProposal.create(
-        "status",
+        name,
         {},
         mission_id=mission_id,
         run_id=run_id,
@@ -143,11 +143,17 @@ def test_parallel_results_fold_deterministically(tmp_path, monkeypatch):
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
             self.count += 1
             if self.count == 1:
+                # B3-C4B-H1 (strict action identity): the two parallel
+                # proposals are DISTINCT planned actions (status, search).
+                # Identical duplicate proposals of one planned action are
+                # rejected with PLAN_MISMATCH after exactly one execution;
+                # that cardinality invariant is pinned by the dedicated
+                # B3-C4B-H1 battery (tests/test_b3_c4b_execution_plan_runtime.py).
                 return ModelTurn(
                     turn_id,
                     tool_calls=(
                         _call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),
-                        _call(mission_id, run_id, turn_id, plan_version, 2, "call_002"),
+                        _call(mission_id, run_id, turn_id, plan_version, 2, "call_002", name="search"),
                     ),
                 )
             return ModelTurn(turn_id, content="parallel observations complete", finish_reason="stop")
