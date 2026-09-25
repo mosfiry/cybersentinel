@@ -2,14 +2,11 @@ from __future__ import annotations
 
 """B-3 characterization pins (HAZARD BASELINE - pre-implementation).
 
-These tests document the CURRENT (pre-B-3) behavior of the planning
-pipeline. They are hazard pins: every assertion below describes a gap that
-the B-3 four-layer intent ladder must close. Commit 2 of B-3 inverts these
-pins into enforced defenses:
-
-    HAZARD B3-H1: no typed intent ladder module exists. MODEL_OUTPUT flows
-    directly into Plan steps without typed MissionIntent / TaskIntent /
-    ActionIntent layers or deterministic per-layer validators.
+These tests document the CURRENT behavior of the planning pipeline relative
+to the B-3 four-layer intent ladder. B3-A inverted the H1 pin: the typed
+intent ladder module (security.intent_ladder, MissionIntent -> TaskIntent)
+now exists and is covered by tests/test_task_intent_authorization.py.
+The remaining pins below describe gaps that B3-B/B3-C must close:
 
     HAZARD B3-H2: run_owner_mission records no typed ExecutionPlan bound to
     mission identity, run identity, snapshot hash, or authorization
@@ -55,8 +52,16 @@ def _core(tmp_path, monkeypatch, actions, scope_context=None, request_id="req-b3
     return core, mission
 
 
-def test_b3_h1_no_typed_intent_ladder_module_exists_yet():
-    assert importlib.util.find_spec("security.intent_ladder") is None
+def test_b3_h1_inverted_b3a_typed_intent_ladder_module_exists():
+    """B3-A inverted this pin: the typed intent ladder module now exists and
+    exports the frozen TaskIntent contract with deterministic validation and
+    derivation. H2..H4 below remain pinned until B3-B/B3-C close them."""
+    assert importlib.util.find_spec("security.intent_ladder") is not None
+    from security.intent_ladder import TaskIntent, TaskIntentError, derive_task_intents, validate_task_intent_proposal
+
+    assert callable(derive_task_intents)
+    assert callable(validate_task_intent_proposal)
+    assert issubclass(TaskIntentError, PermissionError)
 
 
 def test_b3_h2_owner_mission_records_no_typed_execution_plan(tmp_path, monkeypatch):
@@ -78,7 +83,7 @@ def test_b3_h3_legacy_plan_contract_carries_no_authorization_binding():
 def test_b3_h4_model_steps_outside_owner_budget_still_reach_the_plan(tmp_path, monkeypatch):
     """Pre-B-3: budget filtering happens only at the snapshot level; the
     legacy plan keeps out-of-budget steps (the runtime rejects them late).
-    B-3 must reject/remove them deterministically inside the typed ladder."""
+    B3-B/B3-C must reject/remove them deterministically inside the typed ladder."""
     core, mission = _core(tmp_path, monkeypatch, ("status", "definitely_not_a_tool"), scope_context={"owner_allowed_tools": ["status"]})
     assert "definitely_not_a_tool" in mission.provenance["model_requested_tools"]
     assert tuple(mission.authorization_snapshot["allowed_tools"]) == ("status",)
