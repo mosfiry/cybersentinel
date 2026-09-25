@@ -273,27 +273,39 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None, execution_class: str | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
-    # The registry is the last line of defense, not a policy creator: it only
-    # validates that mission-bound executions carry a proof derived by the
-    # authorization machinery. It never issues authorization itself.
+    # The registry is the last line of defense, not a policy creator. There is
+    # no implicit "not mission-bound" escape hatch: a caller cannot opt out of
+    # the proof boundary by omitting mission_id. Every governed execution is
+    # classified (MISSION_BOUND when mission governance kwargs are present,
+    # OWNER_DIRECT otherwise) and must carry an ExecutionAuthorizationProof of
+    # exactly that class, derived from authorization that already exists.
+    from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, RejectionCode
     mission_bound = mission_authorization is not None or workspace is not None or evidence_store is not None or bool(mission_id)
-    if mission_bound:
-        from security.execution_proof import ExecutionAuthorizationProof, RejectionCode
-        if execution_proof is None:
-            raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: mission-bound execution requires an ExecutionAuthorizationProof")
-        proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id)
-        if not proof_ok:
-            raise PermissionError(f"{proof_code}: {proof_reason}")
+    resolved_class = str(execution_class or (ExecutionClass.MISSION_BOUND.value if mission_bound else ExecutionClass.OWNER_DIRECT.value))
+    if execution_proof is None:
+        raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: {resolved_class} execution requires an ExecutionAuthorizationProof")
+    proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id)
+    if not proof_ok:
+        raise PermissionError(f"{proof_code}: {proof_reason}")
+    if str(getattr(execution_proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != resolved_class:
+        raise PermissionError(f"{RejectionCode.EXECUTION_CLASS_MISMATCH.value}: proof execution class {getattr(execution_proof, 'execution_class', '')} does not match {resolved_class} execution")
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
         decision_valid = bool(request_id) and isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.is_valid_for(name, argument, request_id)
         if not decision_valid:
             raise PermissionError("invalid or argument-mismatched AuthorizationDecision")
+        # Decision binding: the proof must be bound to exactly this decision
+        # (canonical signature) and its policy fingerprint. A proof derived
+        # from a different decision can never authorize this execution.
+        if str(getattr(authorization_decision, "decision_signature", "")) != str(getattr(execution_proof, "decision_fingerprint", "")):
+            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: execution proof is not bound to the supplied AuthorizationDecision")
+        if str(getattr(authorization_decision, "policy_fingerprint", "")) != str(getattr(execution_proof, "policy_fingerprint", "")):
+            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: execution proof policy binding does not match the authorization decision policy")
     if spec.owner_only and not decision_valid:
         raise PermissionError("AuthorizationDecision required for this tool")
     if spec.scope_required and not decision_valid:
@@ -321,6 +333,8 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     if mission_authorization is not None:
         from security.mission_authorization import MissionAuthorizationSnapshot
         snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
+        if str(snapshot.authorization_hash) != str(getattr(execution_proof, "snapshot_hash", "")):
+            raise PermissionError(f"{RejectionCode.SNAPSHOT_MISMATCH.value}: live mission authorization snapshot differs from the proof-bound snapshot")
         allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
         if not allowed:
             raise PermissionError("mission authorization blocked: " + reason)
