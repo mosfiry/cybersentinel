@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 
 from pathlib import Path
 
@@ -31,7 +31,8 @@ def test_native_loop_executes_tool_then_models_again(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.registry, "execute", lambda *args, **kwargs: {"ok": True, "criterion_id": "goal", "source": "fixture-result"})
     runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("investigate").replan(steps=(PlanStep("observe", "observe", action="status"),), reason="test")
-    mission = runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}])
+    context = make_test_authorization_context("req-native", tmp_path)
+    mission = runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}], request_id="req-native", authorization_context=context.to_dict())
     model = ScriptedModel(mission.mission_id)
 
     result = runtime.run_model_loop(mission.mission_id, model, tools=[{"name": "status"}], max_turns=3)

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 """Round 2 P0-3 - long-horizon trajectory (MOCK-VERIFIED, 23 model turns).
 
 HONESTY LABEL: MOCK-VERIFIED. This harness drives the REAL MissionRuntime
@@ -94,6 +94,8 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
         "audit asset A across a long horizon",
         plan,
         completion_criteria=[{"criterion_id": "goal"}],
+        request_id="req-long",
+        authorization_context=make_test_authorization_context("req-long", tmp_path).to_dict(),
     )
     model = LongHorizonModel()
 

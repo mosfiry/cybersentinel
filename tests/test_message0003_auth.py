@@ -103,9 +103,14 @@ def test_session_challenge_is_consumed_once_and_session_remains_active(isolated_
         chat_mod.chat({"text": f"{session.challenge} again", "conversation_id": "session-again"}, owner_token="valid-owner", owner_session_id=session.session_id, owner_challenge=session.challenge)
 
 
-def test_agentloop_preflight_is_not_owner_authentication(monkeypatch):
+def test_agentloop_preflight_requires_typed_context():
+    # INV-AUTH-3: the untyped preflight path no longer authorizes anything;
+    # every owner-required tool needs a typed AuthorizationContext, and a
+    # negative authentication boolean still fails closed.
     from security.authorization import authorize_tool
-    assert authorize_tool("status", owner_authenticated=None).allowed is True
+    untyped = authorize_tool("status", owner_authenticated=None)
+    assert untyped.allowed is False
+    assert untyped.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
     assert authorize_tool("status", owner_authenticated=False).allowed is False
 
 

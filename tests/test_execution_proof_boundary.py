@@ -29,7 +29,7 @@ import hashlib
 
 import pytest
 
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
@@ -50,9 +50,9 @@ def _runtime(tmp_path, factory=make_test_snapshot):
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=factory)
 
 
-def _mission(runtime, action="status"):
+def _mission(runtime, action="status", **kwargs):
     plan = Plan.initial("objective").replan(steps=(PlanStep("s1", "objective", action=action),), reason="test")
-    return runtime.create("request", "objective", plan, completion_criteria=[{"criterion_id": "goal"}])
+    return runtime.create("request", "objective", plan, completion_criteria=[{"criterion_id": "goal"}], **kwargs)
 
 
 def _run_id(mission):
@@ -96,7 +96,7 @@ def test_valid_proof_execution_succeeds_and_is_audited(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools.registry, "execute", fake_execute)
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
     result = runtime.run_model_loop(mission.mission_id, OneTurnModel([_proposal(mission)]), tools=[], max_turns=2)
     assert [call[0] for call in calls] == ["status"]
     kwargs = calls[0][2]
@@ -391,7 +391,7 @@ def test_parallel_proposals_each_carry_their_own_proof(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools.registry, "execute", fake_execute)
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
     proposals = [
         _proposal(mission, "status", tool_call_id="call_a", n=1),
         _proposal(mission, "search", arguments={"query": "q"}, tool_call_id="call_b", n=2),

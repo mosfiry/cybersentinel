@@ -6,9 +6,8 @@ import uuid
 from typing import Any, Callable
 
 from core.db import add_conversation_message, conversation_messages, ensure_conversation
-from security.authorization import authorize_tool
 from security.owner_policy import current_owner_policy_context
-from tools.registry import REGISTRY
+from tools.registry import REGISTRY, get_tool
 from .context import (
     ContextEngine,
     ExecutionState,
@@ -216,18 +215,25 @@ class AgentLoop:
             name = parsed["name"]
             arguments = parsed.get("arguments") or {}
             argument = arguments.get("query") if isinstance(arguments, dict) else arguments
-            item = name if argument is None else [name, argument]
-
-            # Structural preflight only. Real Owner authentication remains in the executor/core engine.
-            decision = authorize_tool(item)
-            if not decision.allowed:
-                result = {"ok": False, "error": decision.reason}
+            # Structural preflight only (INV-AUTH-3): the proposed tool must
+            # exist and its argument must be structurally valid. This preflight
+            # grants nothing; real Owner authorization is enforced by the typed
+            # executor / core engine boundary.
+            spec = get_tool(name)
+            if spec is None:
+                valid, reason = False, "unknown tool"
+            else:
+                valid, reason = spec.validate(argument)
+            if isinstance(arguments, dict) and set(arguments) - {"query"}:
+                valid, reason = False, "unknown tool argument"
+            if not valid:
+                result = {"ok": False, "error": reason}
                 activity.append({
                     "step": step,
                     "type": "tool_call",
                     "name": name,
                     "status": "denied",
-                    "error": decision.reason,
+                    "error": reason,
                 })
                 # Add denied tool result to context
                 tool_results.append((name, result))

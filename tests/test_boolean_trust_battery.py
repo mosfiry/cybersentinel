@@ -83,13 +83,15 @@ def test_plan_size_limit_is_enforced():
     assert errors
 
 
-def test_structural_plan_items_still_authorize_without_booleans():
-    # The non-sensitive structural path must keep working without any
-    # boolean authority claim in sight.
+def test_structural_plan_items_fail_closed_without_typed_context():
+    # INV-AUTH-3: the structural-only adapter is closed. Without a typed
+    # AuthorizationContext no plan item is authorized, whatever boolean
+    # authority claims are absent or present.
     result = authorize_plan(["status", ["search", "cve-2026"]])
     accepted, errors = result
-    assert errors == []
-    assert [item[0] for item in accepted] == ["status", "search"]
+    assert accepted == []
+    assert len(errors) == 2
+    assert all(error == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)" for error in errors)
 
 
 def test_unknown_tools_never_authorize_even_with_owner_evidence_shape():

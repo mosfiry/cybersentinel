@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 """Round 2 P0-4 - deterministic failure -> recovery -> replan semantics.
 
 Exercises the real MissionRuntime with the real RecoveryPolicy. Invariants:
@@ -32,7 +32,7 @@ def _runtime(tmp_path):
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime):
+def _mission(runtime, **kwargs):
     plan = Plan.initial("recover the mission").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
@@ -41,6 +41,7 @@ def _mission(runtime):
         "recover the mission",
         plan,
         completion_criteria=[{"criterion_id": "goal"}],
+        **kwargs,
     )
 
 
@@ -93,7 +94,7 @@ def _ambiguous_execution_runtime(tmp_path, monkeypatch, exception):
 
     monkeypatch.setattr(tools.registry, "execute", boom)
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     class OneShotModel:
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
@@ -206,7 +207,7 @@ def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_pat
         lambda *a, **k: {"ok": False, "error": "deterministic failure", "error_type": "provider_unavailable"},
     )
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     class FailingThenFinalModel:
         def __init__(self):

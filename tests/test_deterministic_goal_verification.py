@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 """Round 2 P1 - deterministic goal verification.
 
 A MODEL CLAIM alone can never complete a mission. Completion requires
@@ -28,11 +28,11 @@ def _runtime(tmp_path):
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime, criteria):
+def _mission(runtime, criteria, **kwargs):
     plan = Plan.initial("prove the goal").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
-    return runtime.create("prove the goal", "prove the goal", plan, completion_criteria=criteria)
+    return runtime.create("prove the goal", "prove the goal", plan, completion_criteria=criteria, **kwargs)
 
 
 def test_goal_verification_requires_all_required_criteria():
@@ -84,7 +84,7 @@ def test_completion_requires_passed_evidence_not_a_claim(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal", "source": "fixture"})
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime, [{"criterion_id": "goal"}])
+    mission = _mission(runtime, [{"criterion_id": "goal"}], request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     class EvidenceThenFinalModel:
         def __init__(self):

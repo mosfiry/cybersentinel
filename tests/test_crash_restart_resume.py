@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 from security.mission_authorization import MissionAuthorizationSnapshot
 """Round 2 P0-5 - crash / restart / resume on the canonical MissionRuntime.
 
@@ -28,7 +28,7 @@ def _runtime(db):
     return MissionRuntime(MissionStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime):
+def _mission(runtime, **kwargs):
     plan = Plan.initial("audit the asset").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
@@ -37,6 +37,7 @@ def _mission(runtime):
         "audit the asset",
         plan,
         completion_criteria=[{"criterion_id": "goal"}],
+        **kwargs,
     )
 
 
@@ -63,7 +64,7 @@ def test_state_survives_process_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.registry, "execute", fixture)
 
     runtime = _runtime(_db(tmp_path))
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     class CrashingModel:
         """Performs two tool turns, then the process dies mid-loop."""
@@ -105,7 +106,7 @@ def test_resume_after_restart_completes_from_persisted_state(tmp_path, monkeypat
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal", "source": "fixture"})
     db = _db(tmp_path)
     runtime = _runtime(db)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     class CrashAfterTwoTurns:
         def __init__(self):
@@ -141,7 +142,7 @@ def test_restart_never_continues_in_flight_without_reconciliation(tmp_path, monk
 
     db = _db(tmp_path)
     runtime = _runtime(db)
-    mission = _mission(runtime)
+    mission = _mission(runtime, request_id="req-test", authorization_context=make_test_authorization_context("req-test", tmp_path).to_dict())
 
     def boom(*a, **k):
         raise RuntimeError("crash during side effect")

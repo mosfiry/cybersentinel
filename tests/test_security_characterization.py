@@ -39,7 +39,7 @@ import hashlib
 
 import pytest
 
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 
 from agent.agent_core import AgentCore
 from agent.mission import MissionStatus, MissionStore
@@ -66,12 +66,13 @@ def _runtime(tmp_path, executor, interpreter=None, factory=make_test_snapshot):
     )
 
 
-def _mission(runtime, criteria):
+def _mission(runtime, criteria, **kwargs):
     return runtime.create(
         "request",
         "objective",
         _plan(),
         completion_criteria=criteria,
+        **kwargs,
     )
 
 
@@ -182,7 +183,7 @@ def test_a2_observation_without_criterion_falls_back_to_first_criterion(tmp_path
 
     monkeypatch.setattr(tools.registry, "execute", fake_execute)
     runtime = _runtime(tmp_path, lambda mission, step, action_id: {})
-    mission = _mission(runtime, [{"criterion_id": "first-criterion"}])
+    mission = _mission(runtime, [{"criterion_id": "first-criterion"}], request_id="req-a2", authorization_context=make_test_authorization_context("req-a2", tmp_path).to_dict())
 
     mission = runtime.run_model_loop(
         mission.mission_id, OneTurnModel([_proposal(mission)]), tools=[], max_turns=2

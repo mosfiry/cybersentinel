@@ -13,6 +13,7 @@ from agent.task_manager import TaskManager
 from agent.task_runtime import AgentTaskRuntime
 from agent.task import TaskStatus
 from agent.model_router import ModelRouter
+from runtime_authorization import make_test_authorization_context
 
 
 class ScriptedProvider:
@@ -55,7 +56,8 @@ def test_task_backed_runtime_persists_multi_slice_context_memory_and_events(isol
         ProviderResponse(text=json.dumps({"type": "final", "content": "تم جمع الدليل وتحليل المهمة."}), finish_reason="stop"),
     ])
     runtime = runtime_for(provider, monkeypatch)
-    task = runtime.create_task("conv-1", "ابدأ تحقيقاً دفاعياً", authentication_method="owner_token")
+    context = make_test_authorization_context("req-task-1", tmp_path)
+    task = runtime.create_task("conv-1", "ابدأ تحقيقاً دفاعياً", authentication_method="owner_token", authorization_context=context)
     completed = runtime.run_to_completion(task.task_id, owner_token="owner")
     assert completed.status == TaskStatus.COMPLETED
     assert completed.current_step == 2
@@ -77,7 +79,8 @@ def test_duplicate_tool_call_id_is_idempotent(isolated_dbs, monkeypatch):
     monkeypatch.setattr(policy, "OWNER_TOKEN", "owner")
     executions = []
     runtime = AgentTaskRuntime(ModelRouter([provider]), executor=lambda command, **kwargs: executions.append(command) or {"ok": True})
-    task = runtime.create_task("conv-2", "investigate", authentication_method="owner_token")
+    context = make_test_authorization_context("req-task-2", tmp_path)
+    task = runtime.create_task("conv-2", "investigate", authentication_method="owner_token", authorization_context=context)
     runtime.run_slice(task.task_id, owner_token="owner")
     # A replayed native id must not execute a second time.
     runtime.run_slice(task.task_id, owner_token="owner")

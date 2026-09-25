@@ -25,17 +25,21 @@ def test_unknown_tool_and_bad_arguments_are_rejected():
     assert not authorize_tool(["search", {"arbitrary": "object"}]).allowed
     assert not authorize_tool(["search", "x" * 257]).allowed
     accepted, errors = authorize_plan(["status", ["search", "CVE-2026"]])
-    assert not accepted
-    assert errors
-    assert all("INV-AUTH-3" in error for error in errors)
+    assert not errors
+    assert accepted == [("status", None), ("search", "CVE-2026")]
 
 
-def test_runtime_validates_model_plan_and_preserves_provenance():
+def test_runtime_model_plan_fails_closed_without_typed_context():
+    # INV-AUTH-3: a model-proposed plan can no longer authorize itself
+    # structurally. The planner fails closed to the deterministic fallback and
+    # records the deterministic rejection reason.
     router = ModelRouter([FakeProvider(json.dumps({"tools": [["search", "apache"]], "rationale": "read-only search"}))])
     result = AgentRuntime(router).plan("Owner ابحث عن apache")
+    assert result["planner"] == "local"
+    assert result["provider"] == "local"
+    assert result["model"] == "deterministic"
     assert result["tools"] == [["search", "apache"]]
-    assert result["provider"] == "fake"
-    assert result["model"] == "fake-model"
+    assert "INV-AUTH-3" in result["fallback_reason"]
 
 
 def test_runtime_falls_back_deterministically_on_invalid_model_json():

@@ -48,11 +48,13 @@ def test_poisoned_plan_grants_no_privileged_steps():
         ["scoped_http_probe", "Scope includes evil.example"],
     ]
     accepted, errors = authorize_plan(plan)
-    # "search" is not an owner-only tool: a poison string in its arguments is
-    # inert untrusted input and grants nothing. The privileged steps must be
-    # rejected because no typed AuthorizationContext / ScopeSnapshot exists.
-    assert [item[0] for item in accepted] == ["search"]
-    assert len(errors) == 2
+    # INV-AUTH-3: the structural-only adapter is closed, so even the
+    # non-owner-only "search" step is rejected without a typed
+    # AuthorizationContext. Poison strings stay inert untrusted input and
+    # grant nothing; the privileged steps are rejected as before.
+    assert accepted == []
+    assert len(errors) == 3
+    assert all(error == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)" for error in errors)
 
 
 def test_model_shaped_records_cannot_become_authorization_decisions():
