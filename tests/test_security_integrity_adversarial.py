@@ -9,6 +9,7 @@ from agent.memory import MemoryItem, MemoryType, TrustClassification
 from agent.mission import Mission, MissionStatus, MissionStore
 from agent.planning import Plan
 from agent.trajectory import verify_trajectory
+from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationDecision
 from security.authorization_context import AuthorizationContext
 import security.owner_policy as owner_policy
@@ -34,6 +35,23 @@ def test_forged_authorization_decision_cannot_cross_tool_boundary():
     )
     with pytest.raises(PermissionError, match="invalid"):
         execute("status", authorization_decision=forged)
+
+
+def test_authorization_decision_expires_with_owner_evidence():
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+    import hashlib
+    import hmac
+    import security.authorization_context as authorization_context
+
+    evidence = owner_policy._issue_evidence("owner_token", "expiry-decision", "proof")
+    context = AuthorizationContext("expiry-decision", evidence, owner_policy.capture_policy_snapshot("expiry-decision", evidence))
+    decision = authorize_tool(["status", None], context=context).decision
+    expired = replace(decision, expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
+    signature = hmac.new(authorization_context._DECISION_SECRET, expired._signed_payload().encode("utf-8"), hashlib.sha256).hexdigest()
+    expired = replace(expired, decision_signature=signature)
+
+    assert not expired.is_valid_for("status", None, "expiry-decision")
 
 
 def test_authorization_decision_is_bound_to_request_identity():

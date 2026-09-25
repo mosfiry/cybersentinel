@@ -135,6 +135,7 @@ class AuthorizationDecision:
     decision_source: str
     arguments_hash: str = ""
     decision_signature: str = ""
+    expires_at: str = ""
 
     def _signed_payload(self) -> str:
         return json.dumps({
@@ -143,12 +144,18 @@ class AuthorizationDecision:
             "owner_evidence_fingerprint": self.owner_evidence_fingerprint,
             "policy_fingerprint": self.policy_fingerprint, "scope_fingerprint": self.scope_fingerprint,
             "decision_timestamp": self.decision_timestamp, "decision_source": self.decision_source,
-            "arguments_hash": self.arguments_hash,
+            "arguments_hash": self.arguments_hash, "expires_at": self.expires_at,
         }, sort_keys=True, separators=(",", ":"))
 
     def is_valid_for(self, tool: str, argument: Any = None, request_id: str | None = None) -> bool:
         if not self.allowed or self.tool != str(tool) or (request_id is not None and self.request_id != str(request_id)):
             return False
+        if self.expires_at:
+            try:
+                if datetime.fromisoformat(self.expires_at) <= datetime.now(timezone.utc):
+                    return False
+            except ValueError:
+                return False
         expected = hmac.new(_DECISION_SECRET, self._signed_payload().encode("utf-8"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, self.decision_signature):
             return False
@@ -165,6 +172,7 @@ class AuthorizationDecision:
             owner_evidence_fingerprint=context.owner_evidence_fingerprint, policy_fingerprint=context.policy_fingerprint,
             scope_fingerprint=context.scope_fingerprint, decision_timestamp=datetime.now(timezone.utc).isoformat(),
             decision_source="security.authorization_context", arguments_hash=_fingerprint(argument) if argument is not None else "",
+            expires_at=context.owner_evidence.expires_at,
         )
         return cls(**{**decision.__dict__, "decision_signature": hmac.new(_DECISION_SECRET, decision._signed_payload().encode("utf-8"), hashlib.sha256).hexdigest()})
 
