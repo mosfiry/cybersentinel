@@ -64,6 +64,21 @@ class RejectionCode(str, Enum):
     PROOF_EXPIRED = "PROOF_EXPIRED"
     PROOF_REPLAY = "PROOF_REPLAY"
     PROOF_BINDING_MISMATCH = "PROOF_BINDING_MISMATCH"
+    EXECUTION_CLASS_MISMATCH = "EXECUTION_CLASS_MISMATCH"
+    PROOF_INCOMPLETE = "PROOF_INCOMPLETE"
+
+
+class ExecutionClass(str, Enum):
+    """Explicit execution classes.
+
+    There is no implicit "not mission-bound" execution: every governed tool
+    execution is classified deterministically, and the class decides which
+    bindings the proof must carry. Model output and external data can never
+    select or alter an execution class.
+    """
+
+    MISSION_BOUND = "MISSION_BOUND"
+    OWNER_DIRECT = "OWNER_DIRECT"
 
 
 def _now() -> str:
@@ -134,9 +149,11 @@ class ExecutionAuthorizationProof:
     decision_fingerprint: str = ""
     proof_signature: str = ""
     snapshot: dict[str, Any] = field(default_factory=dict)
+    execution_class: str = "MISSION_BOUND"
 
     def _binding_payload(self) -> dict[str, Any]:
         return {
+            "execution_class": self.execution_class,
             "mission_id": self.mission_id,
             "request_id": self.request_id,
             "tool": self.tool,
@@ -167,6 +184,7 @@ class ExecutionAuthorizationProof:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "execution_class": self.execution_class,
             "mission_id": self.mission_id,
             "request_id": self.request_id,
             "tool": self.tool,
@@ -188,17 +206,25 @@ class ExecutionAuthorizationProof:
         }
 
     @classmethod
-    def derive(cls, *, mission_id: str, request_id: str, tool: str, argument: Any, snapshot: MissionAuthorizationSnapshot, decision: Any = None, tool_call_id: str = "", plan_hash: str = "", scope: Any = None, mission_status: str = "", lifecycle_revision: int = 0, policy_fingerprint: str = "", ttl_seconds: int = PROOF_TTL_SECONDS, at: str | None = None) -> "ExecutionAuthorizationProof":
-        """Derive a proof for exactly one execution. Never creates authority."""
-        if not isinstance(snapshot, MissionAuthorizationSnapshot):
-            raise ExecutionProofError(RejectionCode.SNAPSHOT_INVALID.value, "execution proof requires a typed MissionAuthorizationSnapshot")
+    def derive(cls, *, mission_id: str, request_id: str, tool: str, argument: Any, snapshot: MissionAuthorizationSnapshot | None = None, decision: Any = None, tool_call_id: str = "", plan_hash: str = "", scope: Any = None, mission_status: str = "", lifecycle_revision: int = 0, policy_fingerprint: str = "", ttl_seconds: int = PROOF_TTL_SECONDS, at: str | None = None, execution_class: str = "MISSION_BOUND") -> "ExecutionAuthorizationProof":
+        """Derive a proof for exactly one execution. Never creates authority.
+
+        The execution class is explicit and determines the required bindings:
+
+        - MISSION_BOUND: mission identity, request identity, mission lifecycle
+          status and revision, the plan fingerprint, the scope fingerprint and
+          the typed Owner-minted MissionAuthorizationSnapshot (embedded for
+          boundary re-validation) are all mandatory. The AuthorizationDecision
+          is bound when one exists.
+        - OWNER_DIRECT: the owner-authenticated non-mission execution class
+          (chat / task paths). The typed AuthorizationDecision that authorized
+          the execution and its request identity are mandatory; the decision
+          signature and policy fingerprint are bound canonically.
+        """
+        klass = str(execution_class)
+        if klass not in {item.value for item in ExecutionClass}:
+            raise ExecutionProofError(RejectionCode.PROOF_INVALID.value, f"unknown execution class {klass}")
         moment = _parse(at or _now())
-        if not snapshot.is_active(at=at):
-            raise ExecutionProofError(RejectionCode.SNAPSHOT_EXPIRED.value, "authorization snapshot expired or not active")
-        if tool in snapshot.forbidden_actions:
-            raise ExecutionProofError(RejectionCode.FORBIDDEN_ACTION.value, f"tool {tool} is forbidden by authorization snapshot")
-        if tool not in snapshot.allowed_tools or tool not in snapshot.allowed_actions:
-            raise ExecutionProofError(RejectionCode.TOOL_NOT_ALLOWED.value, f"tool {tool} outside authorization snapshot allowlist")
         decision_fingerprint = ""
         effective_policy_fingerprint = str(policy_fingerprint or "")
         if decision is not None:
@@ -209,18 +235,53 @@ class ExecutionAuthorizationProof:
                 raise ExecutionProofError(RejectionCode.PROOF_BINDING_MISMATCH.value, "authorization decision does not match tool, arguments, or request")
             decision_fingerprint = decision.decision_signature
             effective_policy_fingerprint = decision.policy_fingerprint
-        expiry = _parse(snapshot.expires_at)
-        bounded = moment + timedelta(seconds=max(1, int(ttl_seconds)))
-        expires_at = (expiry if expiry <= bounded else bounded).isoformat()
+        if klass == ExecutionClass.MISSION_BOUND.value:
+            if not isinstance(snapshot, MissionAuthorizationSnapshot):
+                raise ExecutionProofError(RejectionCode.SNAPSHOT_INVALID.value, "mission-bound proof requires a typed MissionAuthorizationSnapshot")
+            if not str(mission_id):
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires mission identity")
+            if not str(mission_status):
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires mission lifecycle status")
+            if not str(plan_hash or ""):
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires the mission plan fingerprint")
+            if not snapshot.is_active(at=at):
+                raise ExecutionProofError(RejectionCode.SNAPSHOT_EXPIRED.value, "authorization snapshot expired or not active")
+            if tool in snapshot.forbidden_actions:
+                raise ExecutionProofError(RejectionCode.FORBIDDEN_ACTION.value, f"tool {tool} is forbidden by authorization snapshot")
+            if tool not in snapshot.allowed_tools or tool not in snapshot.allowed_actions:
+                raise ExecutionProofError(RejectionCode.TOOL_NOT_ALLOWED.value, f"tool {tool} outside authorization snapshot allowlist")
+            snapshot_hash = snapshot.authorization_hash
+            snapshot_version = int(snapshot.version)
+            embedded = snapshot.to_dict()
+            expiry = _parse(snapshot.expires_at)
+            bounded = moment + timedelta(seconds=max(1, int(ttl_seconds)))
+            expires_at = (expiry if expiry <= bounded else bounded).isoformat()
+            proof_status = str(mission_status)
+            proof_revision = int(lifecycle_revision)
+        else:
+            if snapshot is not None:
+                raise ExecutionProofError(RejectionCode.PROOF_INVALID.value, "owner-direct proof must not carry a mission authorization snapshot")
+            if decision is None:
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "owner-direct proof requires the typed AuthorizationDecision that authorized the execution")
+            if not str(request_id or ""):
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "owner-direct proof requires the request identity")
+            snapshot_hash = ""
+            snapshot_version = 0
+            embedded = {}
+            bounded = moment + timedelta(seconds=max(1, int(ttl_seconds)))
+            expires_at = bounded.isoformat()
+            mission_id = ""
+            proof_status = ExecutionClass.OWNER_DIRECT.value
+            proof_revision = 0
         proof = cls(
             mission_id=str(mission_id),
             request_id=str(request_id or ""),
             tool=str(tool),
             arguments_hash=_fingerprint(argument),
-            snapshot_hash=snapshot.authorization_hash,
-            snapshot_version=int(snapshot.version),
-            mission_status=str(mission_status),
-            lifecycle_revision=int(lifecycle_revision),
+            snapshot_hash=snapshot_hash,
+            snapshot_version=snapshot_version,
+            mission_status=proof_status,
+            lifecycle_revision=proof_revision,
             created_at=moment.isoformat(),
             expires_at=expires_at,
             tool_call_id=str(tool_call_id or ""),
@@ -228,7 +289,8 @@ class ExecutionAuthorizationProof:
             scope_hash=_fingerprint(scope or {}),
             policy_fingerprint=effective_policy_fingerprint,
             decision_fingerprint=decision_fingerprint,
-            snapshot=snapshot.to_dict(),
+            execution_class=klass,
+            snapshot=embedded,
         )
         object.__setattr__(proof, "execution_binding_hash", proof._computed_binding_hash())
         object.__setattr__(proof, "proof_signature", hmac.new(_DECISION_SECRET, proof.execution_binding_hash.encode("utf-8"), hashlib.sha256).hexdigest())
@@ -262,10 +324,21 @@ class ExecutionAuthorizationProof:
             return False, "execution proof belongs to another tool call", RejectionCode.PROOF_BINDING_MISMATCH.value
         if not hmac.compare_digest(proof.arguments_hash, _fingerprint(argument)):
             return False, "execution proof argument binding mismatch", RejectionCode.PROOF_BINDING_MISMATCH.value
+        klass = str(getattr(proof, "execution_class", ExecutionClass.MISSION_BOUND.value))
+        if klass == ExecutionClass.OWNER_DIRECT.value:
+            if not proof.decision_fingerprint or not proof.policy_fingerprint:
+                return False, "owner-direct proof is missing its decision or policy binding", RejectionCode.PROOF_INCOMPLETE.value
+            return True, "authorized", ""
+        if not proof.plan_hash:
+            return False, "mission-bound proof is missing its plan binding", RejectionCode.PROOF_INCOMPLETE.value
+        if proof.mission_status not in EXECUTION_ALLOWED_MISSION_STATUSES:
+            return False, f"mission status {proof.mission_status} cannot execute tools", RejectionCode.LIFECYCLE_MISMATCH.value
         try:
             embedded = MissionAuthorizationSnapshot.from_dict(dict(proof.snapshot or {}))
         except (MissionAuthorizationError, KeyError, TypeError, ValueError, PermissionError):
             return False, "embedded authorization snapshot invalid", RejectionCode.PROOF_INVALID.value
+        if embedded.mission_id != proof.mission_id:
+            return False, "embedded authorization snapshot belongs to another mission", RejectionCode.SNAPSHOT_MISMATCH.value
         if embedded.authorization_hash != proof.snapshot_hash or int(embedded.version) != proof.snapshot_version:
             return False, "embedded authorization snapshot does not match proof binding", RejectionCode.SNAPSHOT_MISMATCH.value
         if not embedded.is_active(at=at):
@@ -281,6 +354,8 @@ class ExecutionAuthorizationProof:
         """Re-validate a proof against the live mission right before execution (TOCTOU bound)."""
         if not isinstance(proof, ExecutionAuthorizationProof):
             return False, "execution proof is not a typed ExecutionAuthorizationProof", RejectionCode.PROOF_INVALID.value
+        if str(getattr(proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != ExecutionClass.MISSION_BOUND.value:
+            return False, "owner-direct proof cannot execute mission-bound tools", RejectionCode.EXECUTION_CLASS_MISMATCH.value
         if str(mission.mission_id) != proof.mission_id:
             return False, "execution proof belongs to another mission", RejectionCode.PROOF_BINDING_MISMATCH.value
         if getattr(mission, "request_id", "") and proof.request_id != str(mission.request_id):
@@ -307,6 +382,7 @@ class ExecutionAuthorizationProof:
 __all__ = [
     "EXECUTION_ALLOWED_MISSION_STATUSES",
     "ExecutionAuthorizationProof",
+    "ExecutionClass",
     "ExecutionProofError",
     "PROOF_TTL_SECONDS",
     "RejectionCode",
