@@ -418,7 +418,7 @@ def test_c4b_inv13_snapshot_renewal_keeps_plan_inside_owner_scope(tmp_path, monk
     (["status", "watch"], ["unwatch", "nonexistent_tool", "status"], ["status"]),
     (["status"], ["Status", "status"], ["status"]),
 ])
-def test_c4b_legacy_adapter_equals_owner_budget_intersection(granted, requested):
+def test_c4b_legacy_adapter_equals_owner_budget_intersection(granted, requested, expected):
     budget = OwnerAuthorizedToolBudget(frozenset(granted))
     plan = Plan.initial("objective").replan(steps=tuple(PlanStep(f"s{i}", "objective", action=action) for i, action in enumerate(requested, start=1)), reason="test")
     effective, derived = legacy_plan_effective_tools(budget, plan, request_id="req-legacy")
