@@ -58,6 +58,10 @@ def test_tool_timeout_is_explicit(monkeypatch):
         time.sleep(0.05)
         return {"ok": True}
     monkeypatch.setitem(registry.REGISTRY, "slow_test", ToolSpec("slow_test", "test", "read", True, None, slow))
+    # KNOWN_TOOLS is captured from REGISTRY at import time, so a test tool
+    # registered afterwards must also be added to the authorization allowlist
+    # the same way production tools are declared before import.
+    monkeypatch.setattr("security.authorization.KNOWN_TOOLS", registry.KNOWN_TOOLS | {"slow_test"})
     import security.owner_policy as owner_policy
     from security.authorization import authorize_tool
     from security.authorization_context import AuthorizationContext
