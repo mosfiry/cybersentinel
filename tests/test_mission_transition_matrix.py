@@ -70,9 +70,33 @@ ALLOWED_TRANSITIONS = [
 @pytest.mark.parametrize("source,target", ALLOWED_TRANSITIONS)
 def test_valid_transition_is_allowed(source, target):
     mission = _mission_at(source)
-    mission.transition(target, "canonical path")
+    if target is MissionStatus.GOAL_COMPLETED:
+        # Completion authority: GOAL_COMPLETED is reachable only with the
+        # deterministic verification evidence the canonical paths supply.
+        mission.transition(target, "canonical path", verification={"verified": True, "source": "deterministic_verifier"})
+    else:
+        mission.transition(target, "canonical path")
     assert mission.status is target
     assert mission.transitions[-1]["to"] == target.value
+
+
+@pytest.mark.parametrize("source", [MissionStatus.READY, MissionStatus.VERIFYING, MissionStatus.GOAL_COMPLETED])
+def test_goal_completion_without_verification_evidence_is_rejected(source):
+    # Reaching GOAL_COMPLETED without deterministic verification evidence is
+    # rejected even when the transition itself is part of the allowed matrix:
+    # holding the Mission object must never be sufficient to announce success.
+    with pytest.raises(ValueError, match="verification"):
+        _mission_at(source).transition(MissionStatus.GOAL_COMPLETED, "attempted completion without evidence")
+
+
+@pytest.mark.parametrize("source", [MissionStatus.READY, MissionStatus.VERIFYING])
+def test_goal_completion_with_forged_verification_shape_is_rejected(source):
+    # Model-shaped or caller-forged verification payloads never count as
+    # deterministic evidence: only {"verified": True} from the canonical
+    # verifier path satisfies the completion guard.
+    for forged in ({}, {"verified": "true"}, {"verified": 1}, {"verified": None}, {"evidence_count": 3}):
+        with pytest.raises(ValueError, match="verification"):
+            _mission_at(source).transition(MissionStatus.GOAL_COMPLETED, "forged verification", verification=forged)
 
 
 def test_terminal_states_immutable_except_owner_and_recovery_carveouts():

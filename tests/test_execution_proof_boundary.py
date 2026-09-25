@@ -395,3 +395,153 @@ def test_parallel_proposals_each_carry_their_own_proof(tmp_path, monkeypatch):
     # A proof derived for one parallel proposal cannot serve another.
     ok, reason, code = ExecutionAuthorizationProof.verify(proofs[0], name="search", argument="q")
     assert ok is False and code == RejectionCode.PROOF_BINDING_MISMATCH.value
+
+
+# ---------------------------------------------------------------------------
+# Owner-direct execution class (chat / task paths)
+# ---------------------------------------------------------------------------
+
+def _owner_decision(tmp_path, monkeypatch, *, tool="status", argument=None, request_id="req-owner"):
+    import security.owner_policy as owner_policy
+    from security.authorization import authorize_tool
+    from security.authorization_context import AuthorizationContext
+
+    monkeypatch.setattr(owner_policy, "STATE_PATH", tmp_path / "owner-policy.json")
+    evidence = owner_policy._issue_evidence("owner_token", request_id, "proof")
+    context = AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=owner_policy.capture_policy_snapshot(request_id, evidence))
+    return authorize_tool([tool, argument] if argument is not None else [tool], context=context)
+
+
+def test_owner_direct_proof_requires_typed_decision_and_request_identity(tmp_path, monkeypatch):
+    from security.execution_boundary import OwnerDirectBoundary
+
+    decision = _owner_decision(tmp_path, monkeypatch)
+    assert decision.allowed and decision.decision is not None
+    # No typed AuthorizationDecision -> there is no authorization to derive
+    # evidence from.
+    with pytest.raises(ExecutionProofError) as e_decision:
+        OwnerDirectBoundary.derive(tool="status", argument=None, decision=None, request_id="req-owner")
+    assert e_decision.value.code == RejectionCode.PROOF_INCOMPLETE.value
+    # Missing request identity -> the proof cannot be bound to a request (or
+    # the decision itself refuses the mismatched request identity).
+    with pytest.raises(ExecutionProofError) as e_request:
+        OwnerDirectBoundary.derive(tool="status", argument=None, decision=decision.decision, request_id="")
+    assert e_request.value.code in {RejectionCode.PROOF_INCOMPLETE.value, RejectionCode.PROOF_BINDING_MISMATCH.value}
+    # A mission authorization snapshot can never be smuggled into an
+    # owner-direct proof: the class forbids carrying mission authority.
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    with pytest.raises(ExecutionProofError) as e_snapshot:
+        ExecutionAuthorizationProof.derive(execution_class="OWNER_DIRECT", mission_id="", request_id="req-owner", tool="status", argument=None, snapshot=_snapshot(mission), decision=decision.decision, tool_call_id="x")
+    assert e_snapshot.value.code == RejectionCode.PROOF_INVALID.value
+
+
+def test_owner_direct_execution_through_registry_boundary(tmp_path, monkeypatch):
+    import tools.registry
+    from security.execution_boundary import OwnerDirectBoundary
+
+    calls = []
+
+    def fake_handler(argument):
+        calls.append(argument)
+        return {"ok": True, "seen": argument}
+
+    monkeypatch.setitem(tools.registry.REGISTRY, "status", ToolSpec("status", "test probe", "read", True, None, fake_handler))
+    decision = _owner_decision(tmp_path, monkeypatch)
+    result = OwnerDirectBoundary.execute(tool="status", argument=None, decision=decision.decision, request_id="req-owner", tool_call_id="req-owner:status")
+    assert result == {"ok": True, "seen": None}
+    assert calls == [None]
+
+
+def test_owner_direct_registry_call_without_proof_is_rejected(tmp_path, monkeypatch):
+    import tools.registry
+
+    monkeypatch.setitem(tools.registry.REGISTRY, "status", ToolSpec("status", "test probe", "read", True, None, lambda _a: {"ok": True}))
+    decision = _owner_decision(tmp_path, monkeypatch)
+    with pytest.raises(PermissionError) as excinfo:
+        registry_execute("status", authorization_decision=decision.decision, request_id="req-owner")
+    assert str(excinfo.value).startswith("PROOF_REQUIRED:")
+    assert "OWNER_DIRECT" in str(excinfo.value)
+
+
+def test_execution_class_mismatch_owner_direct_proof_in_mission_bound_call(tmp_path, monkeypatch):
+    import tools.registry
+
+    monkeypatch.setitem(tools.registry.REGISTRY, "status", ToolSpec("status", "test probe", "read", True, None, lambda _a: {"ok": True}))
+    decision = _owner_decision(tmp_path, monkeypatch)
+    from security.execution_boundary import OwnerDirectBoundary
+
+    owner_proof = OwnerDirectBoundary.derive(tool="status", argument=None, decision=decision.decision, request_id="req-owner")
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    # Presenting mission governance kwargs re-classifies the call as
+    # MISSION_BOUND; an owner-direct proof can never satisfy that class.
+    with pytest.raises(PermissionError) as excinfo:
+        registry_execute("status", mission_authorization=_snapshot(mission), execution_proof=owner_proof)
+    assert str(excinfo.value).startswith("EXECUTION_CLASS_MISMATCH:")
+
+
+def test_execution_class_mismatch_mission_proof_in_owner_direct_call(tmp_path, monkeypatch):
+    import tools.registry
+
+    monkeypatch.setitem(tools.registry.REGISTRY, "status", ToolSpec("status", "test probe", "read", True, None, lambda _a: {"ok": True}))
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    mission_proof = _proof(mission)
+    # A mission-bound proof presented to an owner-direct (non-mission) call is
+    # rejected before any handler runs.
+    with pytest.raises(PermissionError) as excinfo:
+        registry_execute("status", execution_proof=mission_proof, execution_class="OWNER_DIRECT")
+    assert str(excinfo.value).startswith(("EXECUTION_CLASS_MISMATCH:", "PROOF_BINDING_MISMATCH:"))
+
+
+def test_registry_binds_proof_to_the_supplied_authorization_decision(tmp_path, monkeypatch):
+    import tools.registry
+
+    monkeypatch.setitem(tools.registry.REGISTRY, "status", ToolSpec("status", "test probe", "read", True, None, lambda _a: {"ok": True}))
+    decision_a = _owner_decision(tmp_path, monkeypatch, request_id="req-a")
+    decision_b = _owner_decision(tmp_path, monkeypatch, request_id="req-b")
+    from security.execution_boundary import OwnerDirectBoundary
+
+    proof_a = OwnerDirectBoundary.derive(tool="status", argument=None, decision=decision_a.decision, request_id="req-a")
+    # Substituting decision B for a proof derived from decision A must be
+    # rejected: the proof is bound to exactly one canonical decision.
+    with pytest.raises(PermissionError) as excinfo:
+        registry_execute("status", authorization_decision=decision_b.decision, request_id="req-b", execution_proof=proof_a, execution_class="OWNER_DIRECT")
+    assert "PROOF_BINDING_MISMATCH" in str(excinfo.value) or "AuthorizationDecision" in str(excinfo.value)
+
+
+def test_mission_bound_proof_completeness_is_enforced(tmp_path):
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    # plan_hash is a required MISSION_BOUND binding: an empty plan fingerprint
+    # means the proof is not bound to the mission plan.
+    with pytest.raises(ExecutionProofError) as excinfo:
+        _proof(mission, plan_hash="")
+    assert excinfo.value.code == RejectionCode.PROOF_INCOMPLETE.value
+    with pytest.raises(ExecutionProofError) as excinfo_status:
+        _proof(mission, mission_status="")
+    assert excinfo_status.value.code == RejectionCode.PROOF_INCOMPLETE.value
+    with pytest.raises(ExecutionProofError) as excinfo_snapshot:
+        _proof(mission, snapshot=None)
+    assert excinfo_snapshot.value.code == RejectionCode.SNAPSHOT_INVALID.value
+
+
+def test_embedded_snapshot_identity_tamper_is_rejected(tmp_path):
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    proof = _proof(mission)
+    tampered = dict(proof.to_dict())
+    tampered["snapshot"] = {**(tampered.get("snapshot") or {}), "mission_id": "other-mission"}
+    rebuilt = ExecutionAuthorizationProof.from_dict(tampered)
+    ok, reason, code = ExecutionAuthorizationProof.verify(rebuilt, name="status", argument=None, mission_id=mission.mission_id, request_id=mission.request_id)
+    assert ok is False and code == RejectionCode.SNAPSHOT_MISMATCH.value
+
+
+def test_cancelled_and_terminal_status_proofs_cannot_execute(tmp_path):
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    for terminal in ("CANCELLED", "GOAL_COMPLETED", "RECOVERY_REQUIRED", "FAILED_RETRY_EXHAUSTED"):
+        proof = _proof(mission, mission_status=terminal)
+        ok, reason, code = ExecutionAuthorizationProof.verify(proof, name="status", argument=None, mission_id=mission.mission_id, request_id=mission.request_id)
+        assert ok is False and code == RejectionCode.LIFECYCLE_MISMATCH.value, terminal

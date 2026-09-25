@@ -91,9 +91,9 @@ def test_run_project_tests_is_bounded_and_not_shell(tmp_path):
         expires_at=(now + timedelta(minutes=10)).isoformat(),
     )
     workspace = Workspace(tmp_path, authorization_snapshot=snapshot)
-    proof = ExecutionAuthorizationProof.derive(mission_id="m1", request_id="req-1", tool="run_project_tests", argument=".", snapshot=snapshot, mission_status="READY", lifecycle_revision=0)
+    proof = ExecutionAuthorizationProof.derive(mission_id="m1", request_id="req-1", tool="run_project_tests", argument=".", snapshot=snapshot, plan_hash="test-plan", mission_status="READY", lifecycle_revision=0)
     result = execute("run_project_tests", ".", request_id="req-1", mission_authorization=snapshot, workspace=workspace, mission_id="m1", execution_proof=proof)
     assert set(result) == {"ok", "timed_out", "returncode", "output"}
-    escape_proof = ExecutionAuthorizationProof.derive(mission_id="m1", request_id="req-1", tool="run_project_tests", argument="../", snapshot=snapshot, mission_status="READY", lifecycle_revision=0)
+    escape_proof = ExecutionAuthorizationProof.derive(mission_id="m1", request_id="req-1", tool="run_project_tests", argument="../", snapshot=snapshot, plan_hash="test-plan", mission_status="READY", lifecycle_revision=0)
     with pytest.raises(ValueError):
         execute("run_project_tests", "../", request_id="req-1", mission_authorization=snapshot, workspace=workspace, mission_id="m1", execution_proof=escape_proof)
