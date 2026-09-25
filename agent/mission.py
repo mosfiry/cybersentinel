@@ -142,6 +142,14 @@ class Mission:
             if self.status in TERMINAL_MISSION_STATUSES:
                 raise ValueError(f"terminal mission cannot transition {self.status.value}->{target.value}")
             raise ValueError(f"invalid mission transition {self.status.value}->{target.value}")
+        if target is MissionStatus.GOAL_COMPLETED:
+            # Completion authority: reaching MissionStatus.GOAL_COMPLETED is
+            # only legitimate through the deterministic goal verifier. A
+            # caller holding the Mission object can never announce completion
+            # without verified evidence supplied by the canonical path.
+            verification = data.get("verification")
+            if not (isinstance(verification, dict) and verification.get("verified") is True):
+                raise ValueError("goal completion requires deterministic verification evidence")
         self.status = target
         self.transitions.append({"from": self.transitions[-1]["to"] if self.transitions else "CREATED", "to": target.value, "reason": reason, "data": data, "iteration": self.iteration_count})
 

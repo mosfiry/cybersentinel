@@ -105,23 +105,17 @@ class MissionRuntime:
 
         The proof is derived evidence of the authorization already granted by
         the Owner-minted snapshot and authorize_tool(). It never creates or
-        widens authority, and model output can never construct one.
+        widens authority, and model output can never construct one. Derivation
+        is delegated to the canonical MissionExecutionBoundary so no caller
+        re-implements half of the binding process.
         """
-        from security.execution_proof import ExecutionAuthorizationProof
-        from security.mission_authorization import MissionAuthorizationSnapshot
-        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
-        return ExecutionAuthorizationProof.derive(
-            mission_id=mission.mission_id,
-            request_id=mission.request_id,
+        from security.execution_boundary import MissionExecutionBoundary
+        return MissionExecutionBoundary.derive(
+            mission,
             tool=proposal.name,
             argument=argument,
-            snapshot=snapshot,
             decision=decision.decision if decision is not None and decision.allowed else None,
             tool_call_id=proposal.tool_call_id,
-            plan_hash=mission.plan.fingerprint,
-            scope=mission.scope_snapshot,
-            mission_status=mission.status.value,
-            lifecycle_revision=len(mission.transitions),
         )
 
     @staticmethod
@@ -358,7 +352,7 @@ class MissionRuntime:
                 verification = self.verifier(mission)
                 mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
                 if verification.verified:
-                    mission.transition(MissionStatus.GOAL_COMPLETED, "model final accepted with deterministic evidence")
+                    mission.transition(MissionStatus.GOAL_COMPLETED, "model final accepted with deterministic evidence", verification=mission.verification_state)
                     mission.emit(EventType.GOAL_VERIFIED, data=mission.verification_state)
                     mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state, "model_final": turn.content})
                 else:
@@ -534,7 +528,7 @@ class MissionRuntime:
             mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
             if verification.verified:
                 mission.emit(EventType.GOAL_VERIFIED, data={"evidence_count": len(verification.evidence)})
-                mission.transition(MissionStatus.GOAL_COMPLETED, "required verification evidence present")
+                mission.transition(MissionStatus.GOAL_COMPLETED, "required verification evidence present", verification=mission.verification_state)
                 mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state})
             else:
                 mission.transition(MissionStatus.RUNNING, "required verification evidence missing")
