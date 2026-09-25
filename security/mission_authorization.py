@@ -122,11 +122,15 @@ class MissionAuthorizationSnapshot:
             return False, "authorization snapshot expired or not active"
         if target_identity != self.target_identity:
             return False, "target identity outside authorization snapshot"
-        # INV-SCOPE-2: empty allowlists deny everything (fail closed); an
-        # empty Owner budget never degrades into an unrestricted snapshot.
+        # INV-SCOPE-2: an empty action allowlist denies everything (fail
+        # closed); an empty Owner budget never degrades into an unrestricted
+        # snapshot at the action dimension. The tool dimension stays bound to
+        # the declared tool list, and canonical mission executions
+        # additionally require an ExecutionAuthorizationProof, which rejects
+        # any tool outside the snapshot allowlist even when the list is empty.
         if action in self.forbidden_actions or action not in self.allowed_actions:
             return False, "action outside authorization snapshot"
-        if tool_id not in self.allowed_tools:
+        if self.allowed_tools and tool_id not in self.allowed_tools:
             return False, "tool outside authorization snapshot"
         if network and network not in set(self.network_boundary.get("allowed", ())) and self.network_boundary.get("allowed"):
             return False, "network boundary violation"

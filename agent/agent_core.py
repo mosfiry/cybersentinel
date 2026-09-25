@@ -388,7 +388,6 @@ class AgentCore:
             # the model plan at resume; a mission without a valid snapshot
             # fails closed instead of minting a new authorization scope.
             mission.status = MissionStatus.AUTHORIZATION_BLOCKED
-            mission.trajectory.append({"event": "MissionAuthorizationBlocked", "reason": "authorization snapshot cannot be renewed"})
             mission.recovery_events.append({"event": "authorization_renewal_failed", "reason": "INV-SCOPE-2: no authorization scope may be minted at resume"})
             self.store.save(mission)
             raise PermissionError("authorization snapshot cannot be renewed: no authorization scope may be minted at resume (INV-SCOPE-2)")

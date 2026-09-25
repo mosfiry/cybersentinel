@@ -205,7 +205,9 @@ def test_b1_8_resume_reuses_documented_authorization_state(tmp_path, monkeypatch
 
 def test_b1_9_cross_mission_replay_rejected(tmp_path, monkeypatch):
     core_a, mission_a = _core(tmp_path, monkeypatch, ("status",), scope_context={"owner_allowed_tools": ["status"]}, request_id="req-a")
-    core_b, mission_b = _core(Path(str(tmp_path) + "-b"), monkeypatch, ("status",), scope_context={"owner_allowed_tools": ["status"]}, request_id="req-b")
+    second = tmp_path / "b"
+    second.mkdir()
+    core_b, mission_b = _core(second, monkeypatch, ("status",), scope_context={"owner_allowed_tools": ["status"]}, request_id="req-b")
     snapshot_a = MissionAuthorizationSnapshot.from_dict(mission_a.authorization_snapshot)
     ok, reason = snapshot_a.validate_for_mission(mission_id=mission_b.mission_id, owner_identity=snapshot_a.owner_identity, target_identity="local-workspace")
     assert ok is False
