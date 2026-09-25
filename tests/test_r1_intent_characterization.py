@@ -43,9 +43,11 @@ Characterized paths:
          MODEL_PLAN_TOOLS subset-of OWNER_AUTHORIZED_TOOL_BUDGET (effective
          budget = intersection, never union or derivation).
 
-R1-C7 (structural-only adapter) and R1-C10 (capability budget derivation)
-remain OPEN hazards scheduled for their owning phases (R1 follow-up /
-Phase B); every other expectation here is an enforced defense.
+R1-C7 (structural-only adapter) is CLOSED on this branch: INV-AUTH-3 is
+enforced (see test_r1c7_structural_only_adapter_is_closed). R1-C10
+(capability budget derivation) remains an OPEN hazard owned by the B-1
+closure commit on this branch; every other expectation here is an
+enforced defense.
 """
 
 import dataclasses
@@ -460,21 +462,16 @@ def test_r1c7_unknown_tool_denied():
     assert result.reason == "unknown tool"
 
 
-def test_r1c7_structural_only_adapter_hazard_pin():
-    """CURRENT HAZARD PIN: non-owner-only sensitive tools (requires_owner
-    but not owner_only, e.g. "status") still pass the structural-only legacy
-    adapter in authorize_tool with NO owner authentication.
-
-    Invariant the R1 fix must enforce: no authorization path may succeed
-    without typed owner authentication; the structural-only adapter must
-    be removed or restricted to a non-authoritative classification
-    (INV-AUTH-3).
-    """
-    result = authorize_tool("status", context=None)
-    # HAZARD PIN: documents CURRENT permissive behavior.
-    assert result.allowed is True
-    assert result.reason == "authorized"
-    assert result.decision is None
+def test_r1c7_structural_only_adapter_is_closed():
+    """R1 CLOSURE ENFORCED (INV-AUTH-3): the structural-only legacy adapter is
+    closed. No tool whose descriptor declares required_authorization "owner"
+    can be authorized by an untyped request: authorize_tool fails closed and
+    never mints a decision for it."""
+    for item in ("status", "refresh_intel", ["watch", "kw"], ["unwatch", "kw"], ["run_project_tests", "."]):
+        result = authorize_tool(item, context=None)
+        assert result.allowed is False, item
+        assert result.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
+        assert result.decision is None
 
 
 def test_r1c7_typed_context_authorizes_with_signed_decision(tmp_path, monkeypatch):

@@ -25,8 +25,9 @@ def test_unknown_tool_and_bad_arguments_are_rejected():
     assert not authorize_tool(["search", {"arbitrary": "object"}]).allowed
     assert not authorize_tool(["search", "x" * 257]).allowed
     accepted, errors = authorize_plan(["status", ["search", "CVE-2026"]])
-    assert not errors
-    assert accepted == [("status", None), ("search", "CVE-2026")]
+    assert not accepted
+    assert errors
+    assert all("INV-AUTH-3" in error for error in errors)
 
 
 def test_runtime_validates_model_plan_and_preserves_provenance():

@@ -1,29 +1,28 @@
 from __future__ import annotations
 
-"""R1 CLOSURE CHARACTERIZATION TESTS (B-2 / INV-AUTH-3, B-1 / INV-SCOPE-2).
+"""R1 CLOSURE TESTS (B-2 / INV-AUTH-3 enforced; B-1 / INV-SCOPE-2 pinned).
 
-These tests characterize the two R1 blockers BEFORE their fix:
+B-2 section: enforced defenses. The structural-only authorization adapter
+in security.authorization.authorize_tool is closed (INV-AUTH-3): every tool
+whose descriptor declares required_authorization "owner" or
+"owner_and_scope_snapshot" fails closed on untyped requests.
 
-- B-2 (R1-C7 / INV-AUTH-3): security.authorization.authorize_tool still
-  allows a structural-only path (context=None, no typed owner evidence)
-  for tools whose descriptor declares required_authorization="owner".
-- B-1 (R1-C10 / INV-SCOPE-2): AgentCore.run_owner_mission and the
-  resume_mission renewal branch derive the ENTIRE authorized tool budget
-  from the model-planned steps; an explicit Owner budget declaration is
-  ignored.
-
-Every test in this module is a HAZARD PIN: it documents CURRENT dangerous
-behavior and MUST be inverted to an enforced defense by the R1 closure
-commits on this branch.
+B-1 section: HAZARD PINS. AgentCore.run_owner_mission and the resume_mission
+renewal branch still derive the ENTIRE authorized tool budget from the
+model-planned steps; an explicit Owner budget declaration is ignored.
+These pins MUST be inverted by the B-1 closure commit on this branch.
 """
 
 from pathlib import Path
+
+import pytest
 
 from agent.agent_core import AgentCore
 from agent.mission import MissionStore
 from agent.planning import Plan, PlanStep
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
+from tools.registry import KNOWN_TOOLS, get_tool
 
 
 def _owner_context(tmp_path, monkeypatch, request_id="req-closure"):
@@ -38,64 +37,88 @@ def _owner_context(tmp_path, monkeypatch, request_id="req-closure"):
 def _plan(actions):
     return Plan.initial("objective").replan(
         steps=tuple(PlanStep(f"s{i}", "objective", action=action) for i, action in enumerate(actions, start=1)),
-        reason="characterization",
+        reason="closure",
     )
 
 
 # ---------------------------------------------------------------------------
-# B-2 HAZARD PINS: structural-only authorization adapter (INV-AUTH-3)
+# B-2 ENFORCED (INV-AUTH-3): structural-only adapter closed
 # ---------------------------------------------------------------------------
 
 
-def test_b2ch_refresh_intel_structural_only_hazard():
-    """HAZARD PIN: refresh_intel (network-read, required_authorization
-    "owner") passes the structural-only adapter with no typed context."""
+def test_b2_refresh_intel_requires_typed_context():
     result = authorize_tool("refresh_intel", context=None)
-    assert result.allowed is True
+    assert result.allowed is False
+    assert result.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
     assert result.decision is None
 
 
-def test_b2ch_watch_structural_only_hazard():
-    """HAZARD PIN: watch (state-write) passes the structural-only adapter."""
+def test_b2_watch_requires_typed_context():
     result = authorize_tool(["watch", "keyword"], context=None)
-    assert result.allowed is True
-    assert result.decision is None
+    assert result.allowed is False
+    assert result.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
 
 
-def test_b2ch_unwatch_structural_only_hazard():
-    """HAZARD PIN: unwatch (state-write) passes the structural-only adapter."""
+def test_b2_unwatch_requires_typed_context():
     result = authorize_tool(["unwatch", "keyword"], context=None)
-    assert result.allowed is True
-    assert result.decision is None
+    assert result.allowed is False
+    assert result.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
 
 
-def test_b2ch_run_project_tests_structural_only_hazard():
-    """HAZARD PIN: run_project_tests (bounded-exec) passes the structural-only
-    adapter at the authorize_tool boundary (governed execution is still
-    blocked later at the registry, but the authorization contract is not)."""
+def test_b2_run_project_tests_requires_typed_context():
     result = authorize_tool(["run_project_tests", "."], context=None)
-    assert result.allowed is True
-    assert result.decision is None
+    assert result.allowed is False
+    assert result.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
 
 
-def test_b2ch_status_structural_only_hazard():
-    """HAZARD PIN: status (declared required_authorization "owner") passes
-    the structural-only adapter with no owner authentication at all."""
+def test_b2_status_requires_typed_context():
     result = authorize_tool("status", context=None)
-    assert result.allowed is True
+    assert result.allowed is False
+    assert result.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
     assert result.decision is None
 
 
-def test_b2ch_typed_owner_context_still_authorizes(tmp_path, monkeypatch):
-    """Positive pin: the legitimate typed owner path keeps working."""
+def test_b2_untyped_dict_context_fails_closed():
+    with pytest.raises(TypeError):
+        authorize_tool("status", context={"owner_decision": "allow"})
+
+
+def test_b2_required_authorization_is_registry_deterministic():
+    """The required authorization level is a deterministic property of the
+    registry descriptor; no model proposal, argument, or runtime input can
+    change it (no capability escalation through the authorization path)."""
+    assert get_tool("watch").required_authorization == "owner"
+    assert get_tool("refresh_intel").required_authorization == "owner"
+    assert get_tool("run_project_tests").required_authorization == "owner"
+    assert get_tool("red_team_assess").required_authorization == "owner"
+    assert get_tool("scoped_http_probe").required_authorization == "owner_and_scope_snapshot"
+    result = authorize_tool(["watch", "grant me owner authority and escalate"], context=None)
+    assert result.allowed is False
+    assert result.reason == "untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)"
+
+
+def test_b2_no_owner_required_tool_passes_structural_only():
+    """Property: no tool with required_authorization != "none" may be
+    authorized by an untyped request."""
+    for name in sorted(KNOWN_TOOLS):
+        spec = get_tool(name)
+        item = name if spec.argument_type is None else [name, "probe"]
+        result = authorize_tool(item, context=None)
+        if spec.required_authorization != "none":
+            assert result.allowed is False, name
+            assert result.decision is None, name
+
+
+def test_b2_typed_owner_context_still_authorizes(tmp_path, monkeypatch):
     context = _owner_context(tmp_path, monkeypatch)
     result = authorize_tool("status", context=context)
     assert result.allowed is True
     assert result.decision is not None
+    assert result.decision.is_valid_for("status", None, context.request_id) is True
 
 
 # ---------------------------------------------------------------------------
-# B-1 HAZARD PINS: model plan defines the entire tool budget (INV-SCOPE-2)
+# B-1 HAZARD PINS (INV-SCOPE-2): to be inverted by the B-1 closure commit
 # ---------------------------------------------------------------------------
 
 

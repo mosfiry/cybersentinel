@@ -40,8 +40,12 @@ def _result(context: AuthorizationContext | None, *, allowed: bool, reason: str,
 def authorize_tool(item: Any, *, context: AuthorizationContext | None = None, owner_authenticated: bool | None = None, owner_evidence: OwnerAuthenticationEvidence | None = None, request_id: str | None = None, current_policy: str = "") -> AuthorizationResult:
     """Authorize a tool. Sensitive execution must use an immutable AuthorizationContext.
 
-    Legacy evidence arguments remain as a compatibility adapter for the core boundary;
-    boolean authentication is never accepted as a source of authority.
+    Legacy typed owner evidence remains a compatibility adapter for the core
+    boundary; boolean authentication is never accepted as a source of
+    authority. INV-AUTH-3: the structural-only path is closed. A tool whose
+    descriptor declares required_authorization "owner" or
+    "owner_and_scope_snapshot" can never be authorized by an untyped request
+    (context=None with no typed owner evidence): fail closed.
     """
     if context is not None and any(value is not None for value in (owner_authenticated, owner_evidence, request_id)):
         return _result(context, allowed=False, reason="mixed authorization inputs are forbidden")
@@ -78,6 +82,12 @@ def authorize_tool(item: Any, *, context: AuthorizationContext | None = None, ow
         return _result(context, allowed=False, reason=reason, name=name, risk_class=spec.risk_class)
     if isinstance(argument, str):
         argument = argument.strip()
+    if structural_only and spec.required_authorization != "none":
+        # INV-AUTH-3 (B-2 closure): an untyped request (no typed
+        # AuthorizationContext and no typed owner evidence) can never
+        # authorize a tool whose descriptor requires owner authorization.
+        # The structural-only legacy adapter is closed: fail closed.
+        return _result(context, allowed=False, reason="untyped authorization request rejected: typed AuthorizationContext required (INV-AUTH-3)", name=name, risk_class=spec.risk_class)
     return _result(context, allowed=True, reason="authorized", name=name, argument=argument, risk_class=spec.risk_class)
 
 
