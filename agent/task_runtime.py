@@ -19,6 +19,7 @@ from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.owner_policy import current_owner_policy_context, policy_context_from_snapshot
 from security.owner_session import DEFAULT_OWNER_SESSIONS
+from security.execution_boundary import OwnerDirectBoundary
 from tools.registry import REGISTRY, execute as execute_tool, get_tool
 
 
@@ -35,7 +36,14 @@ class AgentTaskRuntime:
         parts = command.split(" ", 2)
         name = parts[1] if len(parts) > 1 else ""
         argument = parts[2] if len(parts) > 2 else None
-        return {"ok": True, "result": execute_tool(name, argument, authorization_decision=authorization_decision, scope_context=scope_context)}
+        # Owner-direct execution class: the proof is derived from the typed
+        # AuthorizationDecision bound to this task's AuthorizationContext
+        # (whose request identity is bound to the task). Without a decision or
+        # request identity there is no authorization to derive evidence from
+        # and the canonical boundary rejects (PROOF_INCOMPLETE).
+        request_id = str(getattr(authorization_context, "request_id", "") or "")
+        proof = OwnerDirectBoundary.derive(tool=name, argument=argument, decision=authorization_decision, request_id=request_id, tool_call_id=f"{request_id}:{name}", scope_context=scope_context if isinstance(scope_context, dict) else None)
+        return {"ok": True, "result": execute_tool(name, argument, authorization_decision=authorization_decision, scope_context=scope_context, request_id=request_id or None, execution_proof=proof)}
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
@@ -215,7 +223,10 @@ class AgentTaskRuntime:
         try:
             scope_context = task.execution_state.get("scope_context")
             if spec is not None and spec.scope_required:
-                result = {"ok": True, "result": execute_tool(call.name, argument, authorization_decision=decision.decision, scope_context=scope_context, request_id=task.request_id)}
+                # Owner-direct proof bound to this exact tool call, decision,
+                # scope context and task request identity.
+                proof = OwnerDirectBoundary.derive(tool=call.name, argument=argument, decision=decision.decision, request_id=task.request_id, tool_call_id=call.call_id, scope_context=scope_context)
+                result = {"ok": True, "result": execute_tool(call.name, argument, authorization_decision=decision.decision, scope_context=scope_context, request_id=task.request_id, execution_proof=proof)}
             else:
                 result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_token=owner_token, owner_session_id=owner_session_id, scope_context=scope_context, authorization_context=authorization_context, authorization_decision=decision.decision)
             result = result if isinstance(result, dict) else {"ok": True, "result": result}

@@ -16,6 +16,7 @@ from security.owner_policy import (
 )
 from security.owner_session import consume_owner_challenge
 from security.scope_store import get_snapshot
+from security.execution_boundary import OwnerDirectBoundary
 from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
@@ -51,8 +52,8 @@ def status():
     }
 
 
-def execute(tool: str, argument: str | None = None, *, authorization_decision=None, scope_context: dict | None = None):
-    return execute_tool(tool, argument, authorization_decision=authorization_decision, scope_context=scope_context)
+def execute(tool: str, argument: str | None = None, *, authorization_decision=None, scope_context: dict | None = None, request_id: str | None = None, execution_proof=None):
+    return execute_tool(tool, argument, authorization_decision=authorization_decision, scope_context=scope_context, request_id=request_id, execution_proof=execution_proof)
 
 
 def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None, owner_session_id=None, owner_challenge=None, scope_context=None):
@@ -176,7 +177,21 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
             continue
         try:
             decision_for_tool = next((item for item in plan_result.decisions if item.allowed and item.tool == name and item.request_id == request_id), None)
-            result = execute(name, argument, authorization_decision=decision_for_tool, scope_context=scope_context)
+            # Owner-direct is an explicit execution class: the proof can only be
+            # derived from the typed AuthorizationDecision that already
+            # authorized this exact tool call. Without a decision there is no
+            # authorization to derive evidence from and the registry rejects.
+            proof = None
+            if decision_for_tool is not None:
+                proof = OwnerDirectBoundary.derive(
+                    tool=name,
+                    argument=argument,
+                    decision=decision_for_tool,
+                    request_id=request_id,
+                    tool_call_id=f"{request_id}:{final_plan_hash}:{name}",
+                    scope_context=scope_context if isinstance(scope_context, dict) else None,
+                )
+            result = execute(name, argument, authorization_decision=decision_for_tool, scope_context=scope_context, request_id=request_id, execution_proof=proof)
             if name == "red_team_assess" and isinstance(result, dict):
                 result["critic"] = critique(result).to_dict()
                 save_reasoning_memory(request_id, result, result["critic"])
