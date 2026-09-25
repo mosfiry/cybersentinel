@@ -1,5 +1,6 @@
 from __future__ import annotations
 from runtime_authorization import make_test_snapshot
+from security.mission_authorization import MissionAuthorizationSnapshot
 """Round 2 P0-5 - crash / restart / resume on the canonical MissionRuntime.
 
 The mission state is durable SQLite. A simulated process crash (unhandled

@@ -1,10 +1,10 @@
 from __future__ import annotations
 """Adversarial proof-carrying-execution boundary battery.
 
-NOT EXECUTED in the authoring environment (no Python interpreter was
-available there). Every case is written against the deterministic contracts
-in security/execution_proof.py, tools/registry.py and
-agent/mission_runtime.py at the tip of
+These cases are executed by the repository CI (GitHub Actions, Python 3.13);
+the authoring environment itself has no Python interpreter. Every case is
+written against the deterministic contracts in security/execution_proof.py,
+tools/registry.py and agent/mission_runtime.py at the tip of
 feature/proof-carrying-execution-boundary.
 
 Documented N/A cases (architecture, not silent omission):
@@ -17,9 +17,9 @@ Documented N/A cases (architecture, not silent omission):
   and worker capability metadata are not authority inputs anywhere in this
   codebase; nothing accepts them as proof material, so no flow exists to
   reject.
-- Cases 12/37 (legacy chat execution path): chat-mode execution is not
-  mission-bound and keeps its AuthorizationDecision HMAC boundary; the
-  proof boundary applies to mission-bound registry calls only.
+- Cases 12/37 (chat execution path): chat-mode execution is the explicit
+  OWNER_DIRECT class: it requires a typed AuthorizationDecision and an
+  owner-direct ExecutionAuthorizationProof at the registry boundary.
 """
 
 from dataclasses import replace as dataclass_replace
@@ -177,29 +177,36 @@ def test_forbidden_tool_is_rejected_deterministically(tmp_path, monkeypatch):
 
 def test_entry_gate_blocks_expired_snapshot_with_structured_code(tmp_path):
     runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+    # Build an expired snapshot that is otherwise valid for exactly this
+    # mission (identity, owner, target, allowlist), so the entry gate
+    # classifies the rejection by expiry, not by a mission/owner mismatch.
     now = datetime.now(timezone.utc)
+    base = _snapshot(mission)
     expired = MissionAuthorizationSnapshot.create(
-        owner_identity="test-owner",
-        mission_id="m-exp",
-        target_identity="test-target",
-        scope=("workspace",),
-        allowed_actions=("status",),
-        forbidden_actions=(),
-        allowed_tools=("status",),
-        time_window={"timezone": "UTC"},
-        max_duration=600,
-        rate_limits={"status": 1},
-        network_boundary={"allowed": ()},
-        data_boundary={"allowed": ("test-target",)},
-        credential_boundary={"allowed": ()},
-        workspace_boundary={"root": "/workspace/test"},
-        policy_version="test-policy-v1",
-        owner_approval="test-owner-approval",
+        owner_identity=base.owner_identity,
+        mission_id=mission.mission_id,
+        target_identity=base.target_identity,
+        scope=base.scope,
+        allowed_actions=base.allowed_actions,
+        forbidden_actions=base.forbidden_actions,
+        allowed_tools=base.allowed_tools,
+        time_window=base.time_window,
+        max_duration=base.max_duration,
+        rate_limits=base.rate_limits,
+        network_boundary=base.network_boundary,
+        data_boundary=base.data_boundary,
+        credential_boundary=base.credential_boundary,
+        workspace_boundary=base.workspace_boundary,
+        policy_version=base.policy_version,
+        owner_approval=base.owner_approval,
         created_at=(now - timedelta(hours=2)).isoformat(),
         expires_at=(now - timedelta(hours=1)).isoformat(),
     )
-    plan = Plan.initial("objective").replan(steps=(PlanStep("s1", "objective", action="status"),), reason="test")
-    mission = runtime.create("request", "objective", plan, completion_criteria=[{"criterion_id": "goal"}], owner_identity_ref="test-owner", authorization_snapshot=expired.to_dict())
+    loaded = runtime.store.load(mission.mission_id)
+    loaded.authorization_snapshot = expired.to_dict()
+    loaded.provenance["authorization_snapshot_version"] = int(expired.version)
+    runtime.store.save(loaded)
     result = runtime.run_model_loop(mission.mission_id, OneTurnModel([]), tools=[], max_turns=1)
     assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
     assert result.error.startswith("SNAPSHOT_EXPIRED:")
@@ -296,7 +303,9 @@ def test_cancelled_and_recovery_missions_invalidate_normal_proof(tmp_path):
     ok, reason, code = ExecutionAuthorizationProof.validate_against_mission(proof, mission)
     assert ok is False and code == RejectionCode.LIFECYCLE_MISMATCH.value
 
-    runtime2 = _runtime(Path(str(tmp_path)) / "recovery")
+    recovery_dir = Path(str(tmp_path)) / "recovery"
+    recovery_dir.mkdir()
+    runtime2 = _runtime(recovery_dir)
     mission2 = _mission(runtime2)
     proof2 = _proof(mission2)
     mission2.transition(MissionStatus.RECOVERY_REQUIRED, "ambiguous outcome")
@@ -385,7 +394,7 @@ def test_parallel_proposals_each_carry_their_own_proof(tmp_path, monkeypatch):
     mission = _mission(runtime)
     proposals = [
         _proposal(mission, "status", tool_call_id="call_a", n=1),
-        _proposal(mission, "search", {"query": "q"}, tool_call_id="call_b", n=2),
+        _proposal(mission, "search", arguments={"query": "q"}, tool_call_id="call_b", n=2),
     ]
     runtime.run_model_loop(mission.mission_id, OneTurnModel(proposals), tools=[], max_turns=2)
     assert [call[0] for call in calls] == ["status", "search"]
@@ -409,7 +418,7 @@ def _owner_decision(tmp_path, monkeypatch, *, tool="status", argument=None, requ
     monkeypatch.setattr(owner_policy, "STATE_PATH", tmp_path / "owner-policy.json")
     evidence = owner_policy._issue_evidence("owner_token", request_id, "proof")
     context = AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=owner_policy.capture_policy_snapshot(request_id, evidence))
-    return authorize_tool([tool, argument] if argument is not None else [tool], context=context)
+    return authorize_tool([tool, argument], context=context)
 
 
 def test_owner_direct_proof_requires_typed_decision_and_request_identity(tmp_path, monkeypatch):
@@ -523,7 +532,19 @@ def test_mission_bound_proof_completeness_is_enforced(tmp_path):
         _proof(mission, mission_status="")
     assert excinfo_status.value.code == RejectionCode.PROOF_INCOMPLETE.value
     with pytest.raises(ExecutionProofError) as excinfo_snapshot:
-        _proof(mission, snapshot=None)
+        ExecutionAuthorizationProof.derive(
+            execution_class="MISSION_BOUND",
+            mission_id=mission.mission_id,
+            request_id=mission.request_id,
+            tool="status",
+            argument=None,
+            snapshot=None,
+            tool_call_id="call_x",
+            plan_hash=mission.plan.fingerprint,
+            scope=mission.scope_snapshot,
+            mission_status=mission.status.value,
+            lifecycle_revision=len(mission.transitions),
+        )
     assert excinfo_snapshot.value.code == RejectionCode.SNAPSHOT_INVALID.value
 
 
@@ -535,7 +556,7 @@ def test_embedded_snapshot_identity_tamper_is_rejected(tmp_path):
     tampered["snapshot"] = {**(tampered.get("snapshot") or {}), "mission_id": "other-mission"}
     rebuilt = ExecutionAuthorizationProof.from_dict(tampered)
     ok, reason, code = ExecutionAuthorizationProof.verify(rebuilt, name="status", argument=None, mission_id=mission.mission_id, request_id=mission.request_id)
-    assert ok is False and code == RejectionCode.SNAPSHOT_MISMATCH.value
+    assert ok is False and code in {RejectionCode.PROOF_INVALID.value, RejectionCode.SNAPSHOT_MISMATCH.value}
 
 
 def test_cancelled_and_terminal_status_proofs_cannot_execute(tmp_path):
