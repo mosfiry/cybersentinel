@@ -60,7 +60,9 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
     context = AuthorizationContext(request_id="req-1", owner_evidence=evidence, policy_snapshot=owner_policy.capture_policy_snapshot("req-1", evidence))
     decision = authorize_tool(["run_project_tests", "."], context=context)
     assert decision.allowed and decision.decision is not None
-    result = execute("run_project_tests", ".", authorization_decision=decision.decision, request_id="req-1", mission_authorization=snapshot, workspace=workspace, evidence_store=store, mission_id="m1")
+    from security.execution_proof import ExecutionAuthorizationProof
+    proof = ExecutionAuthorizationProof.derive(mission_id="m1", request_id="req-1", tool="run_project_tests", argument=".", snapshot=snapshot, decision=decision.decision, mission_status="READY", lifecycle_revision=0)
+    result = execute("run_project_tests", ".", authorization_decision=decision.decision, request_id="req-1", mission_authorization=snapshot, workspace=workspace, evidence_store=store, mission_id="m1", execution_proof=proof)
     assert result["ok"] is True
     assert result["returncode"] == 0
     records = store.list(request_id="req-1")

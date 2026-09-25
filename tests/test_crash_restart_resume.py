@@ -176,7 +176,34 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
     import tools.registry
 
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal"})
-    runtime = _runtime(_db(tmp_path))
+    # The Owner snapshot must explicitly allow the two sensitive tools so this
+    # test still exercises the authorize_tool boundary ("sensitive tool
+    # requires AuthorizationContext") instead of being stopped earlier by the
+    # snapshot allowlist gate. The allowlist stays Owner-minted: the model
+    # never widens it at runtime.
+    def widened_snapshot(mission):
+        base = make_test_snapshot(mission)
+        return MissionAuthorizationSnapshot.create(
+            owner_identity=base.owner_identity,
+            mission_id=base.mission_id,
+            target_identity=base.target_identity,
+            scope=base.scope,
+            allowed_actions=tuple(base.allowed_actions) + ("red_team_assess", "scoped_http_probe"),
+            forbidden_actions=base.forbidden_actions,
+            allowed_tools=tuple(base.allowed_tools) + ("red_team_assess", "scoped_http_probe"),
+            time_window=base.time_window,
+            max_duration=base.max_duration,
+            rate_limits={**base.rate_limits, "red_team_assess": 10, "scoped_http_probe": 10},
+            network_boundary=base.network_boundary,
+            data_boundary=base.data_boundary,
+            credential_boundary=base.credential_boundary,
+            workspace_boundary=base.workspace_boundary,
+            policy_version=base.policy_version,
+            owner_approval=base.owner_approval,
+            created_at=base.created_at,
+            expires_at=base.expires_at,
+        )
+    runtime = MissionRuntime(MissionStore(_db(tmp_path)), executor=lambda *_: {}, authorization_snapshot_factory=widened_snapshot)
     mission = _mission(runtime)
     assert mission.authorization_context is None, "fixture mission intentionally carries no Owner authorization"
 

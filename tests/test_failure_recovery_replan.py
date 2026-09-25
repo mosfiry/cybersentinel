@@ -255,5 +255,10 @@ def test_unavailable_tool_is_rejected_at_authorization(tmp_path, monkeypatch):
 
     result = runtime.run_model_loop(mission.mission_id, UnknownToolModel(), tools=[], max_turns=1)
     assert calls == [], "an unknown tool must never reach execution"
-    assert result.progress["model_loop"]["tool_results"][0]["error"] == "unknown tool"
+    # Security ordering is intentional: the Owner snapshot gate runs before
+    # tool resolution, so a model-proposed tool outside the Owner allowlist is
+    # rejected deterministically as TOOL_NOT_ALLOWED and never reaches the
+    # registry ("unknown tool" applies only to allowlisted-but-unregistered
+    # tools, which the registry itself rejects with ValueError).
+    assert result.progress["model_loop"]["tool_results"][0]["error"].startswith("TOOL_NOT_ALLOWED:")
     assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED

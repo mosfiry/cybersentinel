@@ -57,9 +57,43 @@ def test_unknown_tool_cannot_reach_handler():
         execute("delete_everything")
 
 
-def test_run_project_tests_is_bounded_and_not_shell(tmp_path, monkeypatch):
-    monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(tmp_path))
-    result = execute("run_project_tests", ".")
+def test_run_project_tests_is_bounded_and_not_shell(tmp_path):
+    # The registry no longer mints a compatibility authorization snapshot: a
+    # governed workspace, a real Owner mission authorization snapshot and an
+    # execution proof derived from that snapshot are required. Argument
+    # escape ("../") is rejected even with its own correctly-derived proof,
+    # because the proof binds the exact arguments and cannot widen them.
+    from datetime import datetime, timedelta, timezone
+
+    from security.execution_proof import ExecutionAuthorizationProof
+    from security.mission_authorization import MissionAuthorizationSnapshot
+    from workspace import Workspace
+
+    now = datetime.now(timezone.utc)
+    snapshot = MissionAuthorizationSnapshot.create(
+        owner_identity="owner-proof",
+        mission_id="m1",
+        target_identity="target-1",
+        scope=["workspace"],
+        allowed_actions=["run_project_tests"],
+        forbidden_actions=[],
+        allowed_tools=["run_project_tests"],
+        time_window={"timezone": "UTC"},
+        max_duration=600,
+        rate_limits={"run_project_tests": 1},
+        network_boundary={"allowed": []},
+        data_boundary={"allowed": ["target-1"]},
+        credential_boundary={"allowed": []},
+        workspace_boundary={"root": str(tmp_path)},
+        policy_version="policy-v1",
+        owner_approval="approval",
+        created_at=now.isoformat(),
+        expires_at=(now + timedelta(minutes=10)).isoformat(),
+    )
+    workspace = Workspace(tmp_path, authorization_snapshot=snapshot)
+    proof = ExecutionAuthorizationProof.derive(mission_id="m1", request_id="req-1", tool="run_project_tests", argument=".", snapshot=snapshot, mission_status="READY", lifecycle_revision=0)
+    result = execute("run_project_tests", ".", request_id="req-1", mission_authorization=snapshot, workspace=workspace, mission_id="m1", execution_proof=proof)
     assert set(result) == {"ok", "timed_out", "returncode", "output"}
+    escape_proof = ExecutionAuthorizationProof.derive(mission_id="m1", request_id="req-1", tool="run_project_tests", argument="../", snapshot=snapshot, mission_status="READY", lifecycle_revision=0)
     with pytest.raises(ValueError):
-        execute("run_project_tests", "../")
+        execute("run_project_tests", "../", request_id="req-1", mission_authorization=snapshot, workspace=workspace, mission_id="m1", execution_proof=escape_proof)
