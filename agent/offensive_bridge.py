@@ -66,6 +66,7 @@ from typing import Any
 
 import tools.registry
 from cyber.offensive import GuardDecision, OffensiveAction, ScopeGuard
+from security.authorization_context import AuthorizationDecision
 from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, RejectionCode
 from security.mission_authorization import MissionAuthorizationSnapshot
 from security.tool_adapter import (
@@ -151,10 +152,22 @@ class ScopedHttpProbeAdapter(ToolAdapter):
 
     tool_name = "scoped_http_probe"
     timeout_seconds = 10
+    # The registry demands a typed Owner AuthorizationDecision for
+    # scope_required tools; the decision is owner-side authority, verified —
+    # never minted — here (INV-OFF-4).
+    requires_authorization_decision = True
 
     def __init__(self) -> None:
         super().__init__()
         self._bound_scope_context: dict[str, Any] | None = None
+        self._bound_decision: AuthorizationDecision | None = None
+
+    def bind_authorization(self, decision: AuthorizationDecision) -> "ScopedHttpProbeAdapter":
+        """Bind the typed Owner AuthorizationDecision for the NEXT execution."""
+        if not isinstance(decision, AuthorizationDecision) or not decision.allowed:
+            raise OffensiveActionRejected("scope-bound execution requires an allowed typed Owner AuthorizationDecision")
+        self._bound_decision = decision
+        return self
 
     def bind_scope(self, scope_context: dict[str, Any]) -> "ScopedHttpProbeAdapter":
         """Bind the typed owner-side scope context for the NEXT execution.
@@ -178,6 +191,7 @@ class ScopedHttpProbeAdapter(ToolAdapter):
         handler is reachable. Without a bound context the tool fails closed.
         """
         context = getattr(self, "_bound_scope_context", None)
+        decision = getattr(self, "_bound_decision", None)
         if context is None:
             raise ToolAdapterError(
                 AdapterPhase.EXECUTE,
@@ -185,6 +199,14 @@ class ScopedHttpProbeAdapter(ToolAdapter):
                 "scope-bound execution requires a bound typed scope context",
                 tool=str(request.tool or ""),
                 rejection_code=RejectionCode.SCOPE_MISMATCH.value,
+            )
+        if decision is None:
+            raise ToolAdapterError(
+                AdapterPhase.EXECUTE,
+                AdapterErrorCode.AUTHORIZATION_DENIED,
+                "scope-bound execution requires a bound typed Owner AuthorizationDecision",
+                tool=str(request.tool or ""),
+                rejection_code=RejectionCode.PROOF_REQUIRED.value,
             )
         try:
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(getattr(request.mission, "authorization_snapshot", None) or {}))
@@ -208,6 +230,7 @@ class ScopedHttpProbeAdapter(ToolAdapter):
                 execution_run_id=request.run_id,
                 timeout=prepared.timeout,
                 scope_context=dict(context),
+                authorization_decision=decision,
             )
         except PermissionError as exc:
             code = _rejection_code_from_message(str(exc))
@@ -284,7 +307,7 @@ class OffensiveActionBridge:
 
     # -- Phase 4/5/6: proof derivation through the existing owner chain ----
 
-    def _derive_proof(self, proposal: OffensiveActionProposal, mission: Any, argument: Any, live_run_id: str) -> ExecutionAuthorizationProof:
+    def _derive_proof(self, proposal: OffensiveActionProposal, mission: Any, argument: Any, live_run_id: str, decision: Any = None) -> ExecutionAuthorizationProof:
         snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
         return ExecutionAuthorizationProof.derive(
             mission_id=mission.mission_id,
@@ -292,6 +315,7 @@ class OffensiveActionBridge:
             tool=proposal.tool_id,
             argument=argument,
             snapshot=snapshot,
+            decision=decision,
             tool_call_id=proposal.proposal_id,
             run_id=live_run_id,
             plan_hash=mission.plan.fingerprint,
@@ -309,6 +333,7 @@ class OffensiveActionBridge:
         mission: Any,
         adapter: ToolAdapter,
         scope_snapshot: Any = None,
+        authorization_decision: Any = None,
         dry_run: bool = False,
     ) -> OffensiveExecutionRecord:
         """Validate → bind → scope → authorize → execute → record. Fail closed."""
@@ -317,6 +342,13 @@ class OffensiveActionBridge:
             raise OffensiveActionRejected("tool is not registered in the runtime registry: " + str(proposal.tool_id))
         if getattr(adapter, "tool_name", "") != proposal.tool_id:
             raise OffensiveActionRejected("adapter does not wrap the proposed tool")
+        if getattr(adapter, "requires_authorization_decision", False):
+            if authorization_decision is None:
+                raise OffensiveActionRejected("scope-bound tool execution requires a typed Owner AuthorizationDecision")
+            binder_decision = getattr(adapter, "bind_authorization", None)
+            if binder_decision is None:
+                raise OffensiveActionRejected("adapter does not accept a bound AuthorizationDecision")
+            binder_decision(authorization_decision)
         live_run_id = self._bind_mission(proposal, mission)
         guard_decision, argument = self._enforce_scope(proposal, scope_snapshot)
         if proposal.target_kind == "network":
@@ -330,7 +362,7 @@ class OffensiveActionBridge:
                 "url": str(argument),
                 "method": "GET",
             })
-        proof = self._derive_proof(proposal, mission, argument, live_run_id)
+        proof = self._derive_proof(proposal, mission, argument, live_run_id, decision=authorization_decision)
         request = ToolAdapterRequest(
             tool=proposal.tool_id,
             argument=argument,

@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 import tools.registry
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_authorization_context, make_test_snapshot
 
 import security.owner_policy as owner_policy
 import security.scope_store as scope_store
@@ -38,7 +38,8 @@ from agent.offensive_bridge import (
 )
 from agent.offensive_mind import Engagement, OffensiveMind
 from agent.planning import Plan, PlanStep
-from security.scope import ProgramAuthorization, TargetIdentity, make_snapshot
+from security.authorization_context import AuthorizationDecision
+from security.scope import ProgramAuthorization, TargetIdentity, canonical_url, make_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +53,7 @@ def _runtime(tmp_path):
 
 def _mission(runtime, action="local_process_info"):
     plan = Plan.initial("objective").replan(steps=(PlanStep("s1", "objective", action=action),), reason="test")
-    return runtime.create("request", "objective", plan, completion_criteria=[{"criterion_id": "goal"}])
+    return runtime.create("request", "objective", plan, request_id="req-1", completion_criteria=[{"criterion_id": "goal"}])
 
 
 def _proposal(mission, tool="local_process_info", **overrides):
@@ -127,6 +128,26 @@ def saved_scope_snapshot(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def owner_decision(tmp_path):
+    """A REAL typed Owner AuthorizationDecision for the scoped probe.
+
+    Issued from a typed Owner AuthorizationContext (owner evidence + policy
+    snapshot) through the existing owner authorization path — the same path
+    production owner requests take. The argument is the canonical url the
+    ScopeGuard will produce for the in-scope target.
+    """
+    context = make_test_authorization_context(request_id="req-1", state_dir=tmp_path)
+    return AuthorizationDecision.issue(
+        context,
+        allowed=True,
+        reason="owner authorized the scoped probe against the in-scope target",
+        tool="scoped_http_probe",
+        risk_class="network-read",
+        argument=canonical_url("https://target.example/"),
+    )
+
+
+@pytest.fixture
 def counting_handler(monkeypatch):
     class Counter:
         def __init__(self):
@@ -169,7 +190,7 @@ def test_live_local_reachability_full_chain(tmp_path, execute_spy):
     assert result.evidence["proof_fingerprint"] == record.proof_fingerprint
 
 
-def test_live_network_reachability_scope_authorized(tmp_path, execute_spy, counting_handler, saved_scope_snapshot):
+def test_live_network_reachability_scope_authorized(tmp_path, execute_spy, counting_handler, saved_scope_snapshot, owner_decision):
     """Network action: scope firewall allows, canonical url executes, evidence binds."""
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="scoped_http_probe")
@@ -182,7 +203,7 @@ def test_live_network_reachability_scope_authorized(tmp_path, execute_spy, count
         target_id="t1",
         risk_class="network_read",
     )
-    record = OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
+    record = OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot, authorization_decision=owner_decision)
     assert record.status == "EXECUTED", record.result.error_state
     assert counting_handler.calls == 1
     assert execute_spy == ["scoped_http_probe"]
@@ -330,14 +351,14 @@ def test_malformed_proposals_fail_closed(tmp_path, execute_spy):
     assert execute_spy == []
 
 
-def test_tool_output_is_observation_not_authority(tmp_path, execute_spy, counting_handler, saved_scope_snapshot):
+def test_tool_output_is_observation_not_authority(tmp_path, execute_spy, counting_handler, saved_scope_snapshot, owner_decision):
     """The probe's output stays untrusted data; it can never widen scope."""
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="scoped_http_probe")
     mission.progress["model_run_id"] = "run-1"
     proposal = _proposal(mission, tool="scoped_http_probe", target_kind="network", target_url="https://target.example/", target_id="t1")
     bridge = OffensiveActionBridge()
-    record = bridge.run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
+    record = bridge.run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot, authorization_decision=owner_decision)
     assert record.status == "EXECUTED", record.result.error_state
     # A second action pointing at an endpoint the OBSERVED output mentions
     # is refused: observation is never authorization (INV-OFF-2/INV-OFF-5).
