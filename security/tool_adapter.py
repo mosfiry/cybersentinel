@@ -559,6 +559,30 @@ class ToolAdapter:
         tool, the registry, or any handler, and must never repair a failure.
         """
 
+    def _evidence_safe(
+        self,
+        request: ToolAdapterRequest,
+        authorization: AdapterAuthorization | None,
+        raw: Any,
+        normalized: dict[str, Any] | None,
+        error: ToolAdapterError | None,
+        *,
+        status: str,
+        executed: bool,
+    ) -> tuple[dict[str, Any], str]:
+        """Collect evidence without ever raising (evidence failure is classified).
+
+        A failing evidence hook must never crash the envelope, mask a primary
+        error, or silently pass: on the success path the caller converts the
+        returned error string into an EVIDENCE_FAILED result state.
+        """
+        try:
+            return self.collect_evidence(request, authorization, raw, normalized, error, status=status, executed=executed), ""
+        except ToolAdapterError as exc:
+            return {}, str(exc)
+        except Exception as exc:  # a misbehaving evidence hook is classified, never fatal
+            return {}, str(ToolAdapterError(AdapterPhase.COLLECT_EVIDENCE, AdapterErrorCode.EVIDENCE_FAILED, str(exc), tool=str(request.tool or "")))
+
     # -- Orchestration -------------------------------------------------------
 
     def run(self, request: ToolAdapterRequest, *, dry_run: bool = False) -> AdapterResult:
@@ -585,7 +609,10 @@ class ToolAdapter:
             prepared = self.prepare(request, authorization)
             if dry_run:
                 dry_run_plan = self.dry_run(request, authorization, prepared)
-                evidence = self.collect_evidence(request, authorization, None, None, None, status="DRY_RUN", executed=False)
+                evidence, evidence_error = self._evidence_safe(request, authorization, None, None, None, status="DRY_RUN", executed=False)
+                if evidence_error and error is None:
+                    error = ToolAdapterError(AdapterPhase.COLLECT_EVIDENCE, AdapterErrorCode.EVIDENCE_FAILED, evidence_error, tool=str(request.tool))
+                    evidence_error = ""
             else:
                 try:
                     raw = self.execute(request, authorization, prepared)
@@ -595,13 +622,15 @@ class ToolAdapter:
                         executed = True  # the handler was submitted before the failure
                     raise
                 normalized = self.normalize_output(raw)
-                evidence = self.collect_evidence(request, authorization, raw, normalized, None, status="SUCCESS", executed=executed)
+                evidence, evidence_error = self._evidence_safe(request, authorization, raw, normalized, None, status="SUCCESS", executed=executed)
+                if evidence_error and error is None:
+                    error = ToolAdapterError(AdapterPhase.COLLECT_EVIDENCE, AdapterErrorCode.EVIDENCE_FAILED, evidence_error, tool=str(request.tool))
+                    evidence_error = ""
         except ToolAdapterError as exc:
             error = exc
-            try:
-                evidence = self.collect_evidence(request, authorization, raw, normalized, exc, status="ERROR", executed=executed)
-            except ToolAdapterError as evidence_exc:
-                evidence_error = str(evidence_exc)
+            evidence, evidence_retry_error = self._evidence_safe(request, authorization, raw, normalized, exc, status="ERROR", executed=executed)
+            if evidence_retry_error:
+                evidence_error = (evidence_error + " | " if evidence_error else "") + evidence_retry_error
         finally:
             try:
                 self.cleanup(request)
