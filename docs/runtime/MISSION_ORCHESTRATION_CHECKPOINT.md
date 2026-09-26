@@ -1,65 +1,98 @@
 # Mission Orchestration Engineering Checkpoint
 
-> Checkpoint describes the actual local branch state at the recorded verification point. Remote CI is not represented as passing unless a branch run confirms it.
+> Final integration checkpoint for the Owner-governed deterministic execution graph. Test/CI statements below name the exact source commit they validate; this file is updated in a documentation-only commit after those checks.
 
 ## Repository identity
 
-- **MISSION:** Deterministic Mission Orchestration + DAG Scheduling + Parallel Execution Engine
+- **MISSION:** Activate deterministic Mission Orchestration as the live execution path in CyberSentinel X.
 - **REPOSITORY:** `mosfiry/cybersentinel`
-- **BRANCH:** `engineering/mission-orchestration`
-- **BASE_COMMIT:** `4889f69d5d5e1f172cbdbbd7b0a6ed1abcd7d98d`
-- **IMPLEMENTATION_COMMIT:** `6ce02331fc0c6da789f31cac17e21140a29a6dfb`
-- **HEAD_AT_CHECKPOINT_UPDATE:** `381fe1c3b8c3382e5d4abe093696ed639f2145ea` (source and checkpoint state verified by GitHub Actions; this metadata file is updated once more)
-- **LAST_VERIFIED_COMMIT:** `381fe1c3b8c3382e5d4abe093696ed639f2145ea`
+- **BRANCH:** `engineering/mission-orchestration-live-integration`
+- **PARENT / BASE FOR THIS INTEGRATION:** `c1fae6e4fbb5c29e3a87b703ccff3c287a29a61f` (`docs(runtime): finalize verified checkpoint`)
+- **IMPLEMENTATION + TEST COMMIT:** `8eec19add414fffdd209776c0ac7b2d6c22e2930` (`feat: activate owner-governed mission orchestration`)
+- **OWNER-SESSION SECURITY FIX COMMIT:** `a76f0f14e03c3074394ded10bd14a0031d8cce30` (`fix: bind mission controls to authenticated owner sessions`)
+- **CHECKPOINT METADATA COMMIT:** documentation-only follow-up to the implementation commit; exact commit ID is recorded in the final task report.
 
-## Continuation
+## Completion status
 
-- **CURRENT_PHASE:** IMPLEMENTED, TESTED, CI_VERIFIED, CHECKPOINTED
-- **CURRENT_STEP:** No implementation work remains in this milestone; branch is pushed and verified. Review/merge can proceed through the repository's normal process.
-- **LAST_COMPLETED_STEP:** Inspected the actual repository/runtime, corrected the verified authority-hierarchy documentation conflicts, implemented the persistent DAG scheduler and MissionWorker controls, performed targeted tests, performance profiling, and hardened the scheduler to avoid full-graph scans per reservation.
-- **NEXT_ACTION:** `git status --short --branch` to confirm the pushed branch is clean; no further local edits planned.
-
-## Component status
-
-- **GRAPH_ENGINE_STATUS:** Implemented in `agent/orchestration.py`: stable mission/run/step node identity; duplicate/missing/self/cycle validation; iterative cycle identification and Kahn topology validation; deterministic priority/depth/stable-id ordering and aging; adjacency/dependency indexes; read/write conflict handling; bounded dispatch and retry policy; fail-closed dependency blocking.
-- **SCHEDULER_STATUS:** Durable scheduler state is checkpointed through the existing SQLite `MissionStore`; plan, run, policy, and authorization identities are checked on resume. Versioned index/budget migration preserves existing counters and pending work. Budgets cover runs, nodes, tools, retries, parallelism, and elapsed time.
-- **PARALLEL_EXECUTION_STATUS:** Bounded to 32 workers, node authorization is repeated before dispatch, parallel callbacks receive isolated mission/step snapshots, and results are folded in deterministic batch order. Resource conflicts serialize dispatch.
-- **RECOVERY_STATUS:** Persisted in-flight work becomes `UNKNOWN` after recovery and is not blindly replayed. Owner reconciliation requires typed request-bound context, explicit success evidence to mark work executed, and idempotent trusted policy plus remaining retry budget to retry as not executed.
-- **AUTHORIZATION_STATUS:** Typed Owner pause/resume/cancel/reconcile/replan controls are bound to current Owner evidence and policy. Per-node actions are reauthorized. Legacy/model-loop paths cannot bypass active DAG execution. Replan is restricted to the same objective, strictly increasing version, unchanged active authority, and pre-dispatch point.
-- **LIFECYCLE_STATUS:** Mission and queue reflect pause/cancel/budget/failure/verification states; Worker releases leases between durable slices, requeues unfinished work, and respects Owner changes made while a node is running.
-- **FAILURE_TAXONOMY:** Includes retryable, non-retryable, dependency, validation, network, provider/model, tool, authorization, scope, resource, timeout, unknown, and unknown-outcome classes. Retryability/idempotency remain runtime policy, not plan/model claims.
+- **CURRENT_PHASE:** IMPLEMENTED, HTTP_REACHABLE, TESTED, CI_VERIFIED, CHECKPOINTED.
+- **LIVE_PATH:** `/api/chat` and `/api/missions` create or load Owner-bound missions in `execution_mode=dag`; the bridge worker supervisor claims queued missions and drives `MissionRuntime.run_to_completion`/`run_graph`.
+- **EXECUTION:** DAG validation and deterministic scheduling are mandatory for user-facing mission creation/worker dispatch. `MissionService` creation/start/schedule/control now require a typed, request-bound Owner `AuthorizationContext`. The worker fails closed on a queued mission with no persisted DAG.
+- **PARALLELISM:** Scheduler/runtime hard cap is 32 workers, with deterministic dependency/resource-conflict batching. Current public Owner entrypoints choose `max_parallel=1` conservatively; graph capability and limits are retained, but live concurrency is intentionally serial until a policy explicitly allows a larger bound.
 - **AUTHORITY HIERARCHY (fixed, non-negotiable):**
 
   `OWNER_INSTRUCTION > SYSTEM_PLATFORM > OWNER_POLICY > DETERMINISTIC_ENFORCEMENT > AUTHORIZATION_SCOPE > TOOL_RUNTIME > MODEL_OUTPUT > EXTERNAL_DATA`
 
+- **OWNER BOUNDARY:** Tool allowlists are derived from authenticated Owner text, not model proposals. Each planned action and its arguments are checked against that instruction; node authorization is revalidated before dispatch. Model-proposed tool calls cannot bypass an active DAG. Tool output is data, not authority.
+- **UNKNOWN SIDE EFFECTS:** Interrupted/in-flight external operations enter recovery/UNKNOWN; no blind retry. They require explicit Owner reconciliation, with retry limited to trusted idempotent policy and remaining budgets.
+
+## Activation proof and call graph
+
+Automated local HTTP E2E tests start a real `ThreadingHTTPServer` on loopback. One test POSTs `/api/chat` with an authenticated Owner request and a deterministic provider; it asserts a completed DAG, persisted completed-node state, observations, and `GOAL_COMPLETED`. A second test POSTs `/api/missions`, starts the queued mission, runs the actual bridge background supervisor, then polls the status route and asserts the worker completed the DAG and queue item. A third creates a mission with a challenge-authenticated Owner session, verifies an unrelated session cannot read its status, exercises start/pause/resume controls, then resumes the DAG through `/api/chat` using the active Owner session.
+
+```text
+HTTP POST /api/chat
+  -> bridge.Handler.do_POST (/api/chat)
+  -> api.chat.chat
+  -> AgentCore.run_owner_mission
+  -> authenticated Owner context + request-bound policy snapshot
+  -> AgentCore._owner_proposal_allowed (action/argument boundary)
+  -> MissionRuntime.create_owner_graph (durable DAG)
+  -> MissionRuntime.run_to_completion
+  -> MissionRuntime.run_graph
+  -> DeterministicScheduler.reserve_batch
+  -> MissionRuntime._authorize_graph_node (per-node reauthorization)
+  -> AgentCore._executor (final Owner action/argument gate)
+  -> tool registry execution
+  -> deterministic observation/evidence fold + completion verifier
+
+HTTP POST /api/missions -> POST /api/missions/{id}/start
+  -> bridge.Handler.do_POST
+  -> typed Owner context + MissionService start authorization
+  -> persistent SQLite MissionQueue
+  -> bridge.mission_worker_supervisor
+  -> MissionWorker.run_once (rejects non-DAG queue entries)
+  -> MissionRuntime.run_to_completion -> run_graph -> DeterministicScheduler
+  -> per-node authorization -> executor -> evidence/verification
+```
+
+The corresponding verified code anchors are `bridge.py:44,281,381`, `api/chat.py:101`, `agent/agent_core.py:241,319,369,404,486`, `agent/mission_runtime.py:141,541,553,617,994`, `agent/orchestration.py:398`, and `agent/mission_worker.py:175` (line numbers are for Owner-session security fix commit `a76f0f1`).
+
 ## Verification
 
-- **BASELINE_TEST_STATUS:** `644 passed, 1 skipped` on base `4889f69d5d5e1f172cbdbbd7b0a6ed1abcd7d98d` using Python 3.12 after installing repository requirements.
-- **TARGETED_TEST_STATUS:** `75 passed` on orchestration, governed execution, tool continuity, and failure recovery before the final recovery/replan tests; the final focused run recorded `36 passed` for `tests/test_mission_orchestration.py`.
-- **FULL_TEST_STATUS:** `680 passed, 1 skipped` in 16.53s after `python3 -m compileall -q .`, full `pytest`, and the latest source/lifecycle/migration changes.
-- **COVERAGE_STATUS:** `agent.orchestration` 86%, `agent.mission_runtime` 87%, `agent.mission_worker` 82% (combined 86%).
-- **PERFORMANCE_STATUS:** Synthetic linear-DAG scheduler benchmark on 100/500/1,000/5,000 nodes: graph build 0.0022/0.0117/0.0222/0.1484s; scheduler 0.0033/0.0130/0.0213/0.1962s; scheduler throughput 30,566/38,549/46,997/25,485 nodes/s. Single-process deterministic scheduler benchmark; excludes SQLite persistence, authorization, and tool execution.
-- **REPOSITORY_INVARIANT_STATUS:** Latest `git diff --check` passed. Full-repository search found no verified inverted authority-hierarchy statements.
-- **CI_STATUS:** GitHub Actions run [`36248547369`](https://github.com/mosfiry/cybersentinel/actions/runs/36248547369) on branch `engineering/mission-orchestration`, commit `381fe1c3b8c3382e5d4abe093696ed639f2145ea`, completed successfully. It passed Python 3.13 compileall, pytest, diff check, and secret/sensitive-file scan.
+- **LOCAL FULL SUITE:** `686 passed, 1 skipped` in `15.78s` under Python 3.12.3, after `python3 -m compileall -q .`; `git diff --check` and tracked sensitive-file/secret-pattern scans passed. The suite included HTTP `/api/chat` reachability, HTTP-to-worker completion, durable queue lifecycle, adversarial Owner/model conflicts, and Owner-session controls/read-isolation/resume.
+- **GITHUB ACTIONS:** [run `36277347617`](https://github.com/mosfiry/cybersentinel/actions/runs/36277347617), branch `engineering/mission-orchestration-live-integration`, source commit `a76f0f14e03c3074394ded10bd14a0031d8cce30`, **success**. Python 3.13 compileall, pytest, diff check, and secret/sensitive-file scan passed. The preceding source commit `8eec19add414fffdd209776c0ac7b2d6c22e2930` also passed [run `36269676387`](https://github.com/mosfiry/cybersentinel/actions/runs/36269676387).
+- **ADVERSARIAL AUTHORITY TESTS:** Model-requested unapproved `watch` is rejected before executor dispatch when Owner asked only for status; a model-expanded `search` query is rejected despite use of the same Owner-approved tool; poisoned tool output cannot expand the allowlist; unbound/restarted missions fail closed without typed Owner evidence.
+- **ARCHITECTURE AUDIT:** Production route search found no `AgentTaskRuntime` or native-model-loop callsite in `bridge.py`/`api`; canonical task routes use `MissionTaskAdapter`. `run_model_loop` explicitly refuses missions marked `execution_mode=dag`. User-facing worker/service boundaries refuse non-DAG work; remaining sequential compatibility routines are not exposed as mission HTTP execution paths.
+- **LOCAL SECURITY SCANS:** `git diff --check` and the CI-equivalent tracked sensitive-file / secret-pattern scans passed.
 
-## Changed files
+## End-to-end latency profile
 
-- `agent/orchestration.py` — graph model, validation, indexed deterministic scheduler, durable budgets, retry/resource/recovery/control state.
-- `agent/mission_runtime.py` — DAG creation/execution, authorization enforcement, durable checkpoints, Owner controls/reconciliation/replan, run-path guards, verification and lifecycle mapping.
-- `agent/mission.py` — persisted lifecycle statuses and graph metadata round-trip.
-- `agent/mission_worker.py` — queue lease/control lifecycle, slice requeue, reconciliation adapter.
-- `agent/planning.py` — plan priorities/resource proposals and complete failure-class vocabulary.
-- `agent/trajectory.py` — scheduler decision evidence event.
-- `tests/test_mission_orchestration.py` — graph, adversarial authority, budgets, fairness, resource isolation, concurrency, recovery, controls, worker requeue and legacy migration tests.
-- `docs/OWNER_AUTHORITY_MODEL.md`, `docs/GITHUB_ONLY_POC_RESULTS.md`, `docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md`, `docs/OWNER_MASTER_DIRECTIVE_AUDIT_2026-09-22.md` — corrected or clarified verified authority-hierarchy conflicts.
-- `docs/runtime/MISSION_ORCHESTRATION_CHECKPOINT.md` — this checkpoint.
+Python 3.12.3, one local SQLite database, 30 full mission runs plus repeated component measurements. A full run included Owner authentication/snapshot, graph creation/persistence, scheduler reservation, per-node reauthorization, local `status` tool execution, observations/evidence/checkpointing, and goal verification. Model-provider planning and remote/network tool latency were intentionally excluded. Values are median / p95 milliseconds.
 
-## Known limitations / unresolved review
+| Component | Samples | Median / p95 (ms) |
+|---|---:|---:|
+| Owner auth/context capture | 100 | 0.293 / 0.371 |
+| Node reauthorization | 200 | 0.143 / 0.172 |
+| SQLite mission load | 200 | 0.675 / 1.141 |
+| SQLite mission save | 100 | 0.789 / 0.973 |
+| One-node scheduler reserve/finish | 200 | 0.024 / 0.037 |
+| Local status tool executor | 60 | 3.313 / 7.649 |
+| Full Owner-to-verified-goal E2E | 30 | 23.681 / 30.614 |
 
-- Automatic third-party idempotency reconciliation was not introduced: ambiguous external outcomes remain `UNKNOWN` until a trusted Owner reconciliation provides evidence.
-- The benchmark measures the pure in-memory scheduler, not end-to-end database/tool latency.
-- This last change records the succeeding CI run; it updates checkpoint metadata only and does not alter source or tests.
+All 30 end-to-end benchmark missions reached `GOAL_COMPLETED`. This microbenchmark is a local status-tool profile, not a claim about external API/tool performance or parallel workload throughput. The earlier pure in-memory scheduler scaling profile (100/500/1,000/5,000-node synthetic linear DAG) recorded 30,566/38,549/46,997/25,485 nodes/s respectively; its detailed methodology remains in the prior checkpoint history.
+
+## Changed files in implementation commit
+
+- `agent/agent_core.py`, `agent/mission_runtime.py`, `agent/mission_worker.py`, `agent/mission_task_adapter.py`, `api/missions.py`, `api/chat.py`, `bridge.py`, `security/owner_policy.py` — Owner-bound DAG creation/execution, request-bound policy snapshots, worker supervision, per-node authorization, session-aware mission/task lifecycle controls and reads, and fail-closed non-DAG dispatch.
+- `tests/runtime_authorization.py` plus integration, recovery, model-protocol, poisoning, API/HTTP and orchestration tests — signed Owner test contexts, adversarial authority cases, Owner-session isolation/resume, and live route reachability.
+- Earlier scheduler/component implementation and authority documentation corrections remain in the parent commits listed in repository history.
+
+## Known limits
+
+- No third-party idempotency reconciliation is automated. An ambiguous external side effect remains `UNKNOWN` until explicit Owner reconciliation.
+- Live Owner entrypoints currently persist `max_parallel=1` as a conservative policy choice. The scheduler supports up to 32 concurrent workers, but public execution is not currently using that concurrency.
+- E2E benchmark excludes model planning and remote/external tool latency; the HTTP E2E tests are correctness/reachability tests, not throughput tests.
 
 ## Owner decisions required
 
-- None identified for the scoped implementation and verification work.
+- None for this completed integration milestone. Increasing live parallelism above one should be a separate policy decision with explicit per-tool concurrency/rate-limit constraints.
