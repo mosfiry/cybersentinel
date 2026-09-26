@@ -66,9 +66,18 @@ from typing import Any
 
 import tools.registry
 from cyber.offensive import GuardDecision, OffensiveAction, ScopeGuard
-from security.execution_proof import ExecutionAuthorizationProof
+from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, RejectionCode
 from security.mission_authorization import MissionAuthorizationSnapshot
-from security.tool_adapter import LocalProcessInfoAdapter, ToolAdapter, ToolAdapterRequest
+from security.tool_adapter import (
+    AdapterErrorCode,
+    AdapterPhase,
+    LocalProcessInfoAdapter,
+    ToolAdapter,
+    ToolAdapterError,
+    ToolAdapterRequest,
+    _classify_rejection,
+    _rejection_code_from_message,
+)
 
 __all__ = [
     "LOCAL_PROCESS_INFO_ADAPTER",
@@ -142,6 +151,71 @@ class ScopedHttpProbeAdapter(ToolAdapter):
 
     tool_name = "scoped_http_probe"
     timeout_seconds = 10
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._bound_scope_context: dict[str, Any] | None = None
+
+    def bind_scope(self, scope_context: dict[str, Any]) -> "ScopedHttpProbeAdapter":
+        """Bind the typed owner-side scope context for the NEXT execution.
+
+        The context is composed ONLY from typed owner-side state (the scope
+        snapshot's program identity, the proposal's target identity, the
+        guard's canonical url). It is never derived from tool output or
+        model output (INV-OFF-2).
+        """
+        required = {"program_id", "target_id", "scope_snapshot_id", "url"}
+        if not isinstance(scope_context, dict) or not required.issubset(scope_context):
+            raise OffensiveActionRejected("scope-bound tool requires a complete typed scope context")
+        self._bound_scope_context = dict(scope_context)
+        return self
+
+    def execute(self, request: ToolAdapterRequest, authorization: Any, prepared: Any) -> Any:
+        """Execute through the canonical registry boundary WITH the scope context.
+
+        scoped_http_probe is a scope_required registry tool: tools.registry.execute
+        re-resolves the request against the typed scope snapshot store before the
+        handler is reachable. Without a bound context the tool fails closed.
+        """
+        context = getattr(self, "_bound_scope_context", None)
+        if context is None:
+            raise ToolAdapterError(
+                AdapterPhase.EXECUTE,
+                AdapterErrorCode.AUTHORIZATION_DENIED,
+                "scope-bound execution requires a bound typed scope context",
+                tool=str(request.tool or ""),
+                rejection_code=RejectionCode.SCOPE_MISMATCH.value,
+            )
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(getattr(request.mission, "authorization_snapshot", None) or {}))
+        except Exception as exc:
+            raise ToolAdapterError(
+                AdapterPhase.EXECUTE,
+                AdapterErrorCode.AUTHORIZATION_DENIED,
+                "live mission authorization snapshot is invalid: " + str(exc),
+                tool=str(request.tool or ""),
+                rejection_code=RejectionCode.SNAPSHOT_INVALID.value,
+            ) from None
+        try:
+            return tools.registry.execute(
+                request.tool,
+                request.argument,
+                mission_id=request.mission_id,
+                request_id=request.request_id,
+                mission_authorization=snapshot,
+                execution_proof=request.execution_proof,
+                execution_class=ExecutionClass.MISSION_BOUND.value,
+                execution_run_id=request.run_id,
+                timeout=prepared.timeout,
+                scope_context=dict(context),
+            )
+        except PermissionError as exc:
+            code = _rejection_code_from_message(str(exc))
+            raise ToolAdapterError(AdapterPhase.EXECUTE, _classify_rejection(code), str(exc), tool=str(request.tool or ""), rejection_code=code) from None
+        except TimeoutError as exc:
+            raise ToolAdapterError(AdapterPhase.EXECUTE, AdapterErrorCode.TIMEOUT, str(exc), tool=str(request.tool or "")) from None
+        except ValueError as exc:
+            raise ToolAdapterError(AdapterPhase.EXECUTE, AdapterErrorCode.INPUT_INVALID, str(exc), tool=str(request.tool or "")) from None
 
 
 LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()
@@ -245,6 +319,17 @@ class OffensiveActionBridge:
             raise OffensiveActionRejected("adapter does not wrap the proposed tool")
         live_run_id = self._bind_mission(proposal, mission)
         guard_decision, argument = self._enforce_scope(proposal, scope_snapshot)
+        if proposal.target_kind == "network":
+            binder = getattr(adapter, "bind_scope", None)
+            if binder is None:
+                raise OffensiveActionRejected("network tool adapter does not support bound scope contexts")
+            binder({
+                "program_id": str(getattr(getattr(scope_snapshot, "authorization", None), "program_id", "")),
+                "target_id": str(proposal.target_id),
+                "scope_snapshot_id": str(getattr(scope_snapshot, "snapshot_id", "")),
+                "url": str(argument),
+                "method": "GET",
+            })
         proof = self._derive_proof(proposal, mission, argument, live_run_id)
         request = ToolAdapterRequest(
             tool=proposal.tool_id,

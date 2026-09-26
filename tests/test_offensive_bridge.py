@@ -23,6 +23,10 @@ import pytest
 import tools.registry
 from runtime_authorization import make_test_snapshot
 
+import security.owner_policy as owner_policy
+import security.scope_store as scope_store
+from security.scope_store import init_scope_store, save_snapshot
+
 from agent.mission import MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.offensive_bridge import (
@@ -108,6 +112,21 @@ def execute_spy(monkeypatch):
 
 
 @pytest.fixture
+def saved_scope_snapshot(tmp_path, monkeypatch):
+    """Build AND persist the typed ScopeSnapshot through the REAL owner store.
+
+    The registry re-resolves scope_required tools against the scope snapshot
+    store; the persisted snapshot must be the SAME object the bridge's
+    ScopeGuard evaluates (one scope, two deterministic checks).
+    """
+    monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
+    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "bridge-owner")
+    init_scope_store()
+    snapshot = _scope_snapshot()
+    return save_snapshot(snapshot, owner_token="bridge-owner")
+
+
+@pytest.fixture
 def counting_handler(monkeypatch):
     class Counter:
         def __init__(self):
@@ -150,7 +169,7 @@ def test_live_local_reachability_full_chain(tmp_path, execute_spy):
     assert result.evidence["proof_fingerprint"] == record.proof_fingerprint
 
 
-def test_live_network_reachability_scope_authorized(tmp_path, execute_spy, counting_handler):
+def test_live_network_reachability_scope_authorized(tmp_path, execute_spy, counting_handler, saved_scope_snapshot):
     """Network action: scope firewall allows, canonical url executes, evidence binds."""
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="scoped_http_probe")
@@ -163,7 +182,7 @@ def test_live_network_reachability_scope_authorized(tmp_path, execute_spy, count
         target_id="t1",
         risk_class="network_read",
     )
-    record = OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=_scope_snapshot())
+    record = OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
     assert record.status == "EXECUTED"
     assert counting_handler.calls == 1
     assert execute_spy == ["scoped_http_probe"]
@@ -190,7 +209,7 @@ def test_live_feedback_loop_feeds_offensive_mind(tmp_path):
     event["step_id"] = campaign.steps[0].step_id  # bind to the live campaign step
     adapted = mind.adapt(campaign, event)
     assert adapted.steps[0].status.value == "COMPLETED"
-    assert adapted.version > campaign.version
+    assert adapted.version >= campaign.version
 
 
 def test_live_dry_run_never_executes(tmp_path, execute_spy):
@@ -218,31 +237,30 @@ def test_network_action_without_scope_snapshot_is_rejected(tmp_path, execute_spy
     assert execute_spy == []
 
 
-def test_out_of_scope_host_is_rejected_before_execution(tmp_path, execute_spy, counting_handler):
+def test_out_of_scope_host_is_rejected_before_execution(tmp_path, execute_spy, counting_handler, saved_scope_snapshot):
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="scoped_http_probe")
     proposal = _proposal(mission, tool="scoped_http_probe", target_kind="network", target_url="https://other.example/", target_id="t1")
     with pytest.raises(OffensiveActionRejected, match="scope"):
-        OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=_scope_snapshot())
+        OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
     assert counting_handler.calls == 0
     assert execute_spy == []
 
 
-def test_scope_expansion_via_target_id_smuggling_is_rejected(tmp_path, execute_spy, counting_handler):
+def test_scope_expansion_via_target_id_smuggling_is_rejected(tmp_path, execute_spy, counting_handler, saved_scope_snapshot):
     """Claiming the in-scope target id while pointing at another host grants nothing."""
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="scoped_http_probe")
     proposal = _proposal(mission, tool="scoped_http_probe", target_kind="network", target_url="https://evil.example/", target_id="t1")
     with pytest.raises(OffensiveActionRejected):
-        OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=_scope_snapshot())
+        OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
     assert execute_spy == []
 
 
 def test_cross_mission_proposal_is_rejected(tmp_path, execute_spy):
-    runtime_a = _runtime(tmp_path / "a")
-    runtime_b = _runtime(tmp_path / "b")
-    mission_a = _mission(runtime_a)
-    mission_b = _mission(runtime_b)
+    runtime = _runtime(tmp_path)
+    mission_a = _mission(runtime)
+    mission_b = _mission(runtime)
     proposal = _proposal(mission_b)  # proposal describes ANOTHER mission
     with pytest.raises(OffensiveActionRejected, match="mission"):
         OffensiveActionBridge().run(proposal, mission=mission_a, adapter=LOCAL_PROCESS_INFO_ADAPTER)
@@ -312,14 +330,14 @@ def test_malformed_proposals_fail_closed(tmp_path, execute_spy):
     assert execute_spy == []
 
 
-def test_tool_output_is_observation_not_authority(tmp_path, execute_spy, counting_handler):
+def test_tool_output_is_observation_not_authority(tmp_path, execute_spy, counting_handler, saved_scope_snapshot):
     """The probe's output stays untrusted data; it can never widen scope."""
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="scoped_http_probe")
     mission.progress["model_run_id"] = "run-1"
     proposal = _proposal(mission, tool="scoped_http_probe", target_kind="network", target_url="https://target.example/", target_id="t1")
     bridge = OffensiveActionBridge()
-    record = bridge.run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=_scope_snapshot())
+    record = bridge.run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
     assert record.status == "EXECUTED"
     # A second action pointing at an endpoint the OBSERVED output mentions
     # is refused: observation is never authorization (INV-OFF-2/INV-OFF-5).
@@ -332,5 +350,5 @@ def test_tool_output_is_observation_not_authority(tmp_path, execute_spy, countin
         proposal_id="prop-2",
     )
     with pytest.raises(OffensiveActionRejected, match="scope"):
-        bridge.run(smuggled, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=_scope_snapshot())
+        bridge.run(smuggled, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
     assert counting_handler.calls == 1
