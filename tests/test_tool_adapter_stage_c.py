@@ -128,7 +128,9 @@ class CountingHandler:
             time.sleep(self.delay)
         if self.exc is not None:
             raise self.exc
-        return dict(self.result)
+        if isinstance(self.result, dict):
+            return dict(self.result)
+        return self.result  # non-dict payloads flow to normalization to be classified there
 
 
 def _patch_handler(monkeypatch, **handler_kwargs):
@@ -201,6 +203,18 @@ def _set_mission_snapshot(mission, snapshot):
         mission.authorization_snapshot = snapshot
     except Exception:
         object.__setattr__(mission, "authorization_snapshot", snapshot)
+
+
+def _rotate_mission_snapshot(mission):
+    """Rotate the owner authorization snapshot through the REAL amendment path
+    (version + 1, freshly computed hash): the rotated snapshot is internally
+    consistent, so the rejection is a true SNAPSHOT_MISMATCH against the
+    proof-bound snapshot — not a corruption artifact."""
+    from security.mission_authorization import MissionAuthorizationSnapshot
+
+    current = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+    rotated = current.amend(owner_approval="test-owner-approval", changes={"policy_version": "test-policy-v2"})
+    _set_mission_snapshot(mission, rotated.to_dict())
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +447,17 @@ def test_stage_c_proof_for_other_tool_rejected(tmp_path, counting_handler, execu
 
 def test_stage_c_proof_for_system_info_rejected_by_process_adapter(tmp_path, counting_handler, execute_spy):
     """Identity confusion between the two registered adapters is impossible:
-    a local_system_info proof never authorizes a local_process_info run."""
+    a local_system_info proof never authorizes a local_process_info run,
+    even when the mission snapshot legitimately allows both tools."""
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    plan = Plan.initial("objective").replan(
+        steps=(
+            PlanStep("s1", "objective", action="local_process_info"),
+            PlanStep("s2", "objective", action="local_system_info"),
+        ),
+        reason="test",
+    )
+    mission = runtime.create("request", "objective", plan, completion_criteria=[{"criterion_id": "goal"}])
     proof_system = _proof(mission, tool="local_system_info")
     result = LOCAL_PROCESS_INFO_ADAPTER.run(_request(mission, proof_system))
     assert result.status == "ERROR"
@@ -576,9 +598,7 @@ def test_stage_c_stale_snapshot_rejected(tmp_path, counting_handler, execute_spy
     mission = _mission(runtime)
     proof = _proof(mission)
     # The owner authorization snapshot rotates after the proof was derived.
-    tampered = dict(mission.authorization_snapshot or {})
-    tampered["version"] = int(tampered.get("version", 1)) + 1
-    _set_mission_snapshot(mission, tampered)
+    _rotate_mission_snapshot(mission)
     result = LOCAL_PROCESS_INFO_ADAPTER.run(_request(mission, proof))
     assert result.status == "ERROR"
     assert result.error_state["code"] == "AUTHORIZATION_DENIED"
@@ -1163,9 +1183,7 @@ def test_stage_c_boundary_5_valid_proof_is_not_execution_after_changes(tmp_path,
 
     mission_snapshot = _mission(runtime)
     proof_snapshot = _proof(mission_snapshot)
-    tampered = dict(mission_snapshot.authorization_snapshot or {})
-    tampered["version"] = int(tampered.get("version", 1)) + 1
-    _set_mission_snapshot(mission_snapshot, tampered)
+    _rotate_mission_snapshot(mission_snapshot)
     snapshot_result = LOCAL_PROCESS_INFO_ADAPTER.run(_request(mission_snapshot, proof_snapshot))
     assert snapshot_result.status == "ERROR"
     assert snapshot_result.error_state["rejection_code"] == RejectionCode.SNAPSHOT_MISMATCH.value
@@ -1241,9 +1259,7 @@ def _rejection_scenarios(tmp_path):
 
     mission = _mission(runtime)
     proof = _proof(mission)
-    tampered = dict(mission.authorization_snapshot or {})
-    tampered["version"] = int(tampered.get("version", 1)) + 1
-    _set_mission_snapshot(mission, tampered)
+    _rotate_mission_snapshot(mission)
     scenarios.append(("stale-snapshot", LOCAL_PROCESS_INFO_ADAPTER, _request(mission, proof)))
 
     mission = _mission(runtime)
