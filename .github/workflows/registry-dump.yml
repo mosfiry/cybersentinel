@@ -1,0 +1,32 @@
+name: registry-byte-dump
+
+on:
+  push:
+    branches: [security/b3-four-layer-intent]
+
+permissions:
+  contents: write
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dump registry.py base64 in two parts
+        run: |
+          mkdir -p diagnostics
+          base64 -w 76 tools/registry.py > /tmp/registry.b64
+          split -n 2 -d -a 1 /tmp/registry.b64 /tmp/part
+          { echo "# registry.py base64 dump part 1 (temporary byte-exactness shim; will be removed)"; cat /tmp/part0; } > diagnostics/registry-b64-part1.md
+          { echo "# registry.py base64 dump part 2 (temporary byte-exactness shim; will be removed)"; cat /tmp/part1; } > diagnostics/registry-b64-part2.md
+      - name: publish
+        shell: bash
+        run: |
+          git config user.name "mosfiry"
+          git config user.email "msfiry36@gmail.com"
+          git add diagnostics/
+          git commit -m "chore(diagnostics): temporary registry byte-exactness dump (shim)" || echo "nothing to commit"
+          git pull --rebase --no-edit || true
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
