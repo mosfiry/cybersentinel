@@ -87,6 +87,7 @@ __all__ = [
     "OffensiveActionBridge",
     "OffensiveExecutionRecord",
     "ScopedHttpProbeAdapter",
+    "ScopedDnsLookupAdapter",
 ]
 
 # Target kinds: "local" = local read-only analysis (no network surface, the
@@ -239,6 +240,22 @@ class ScopedHttpProbeAdapter(ToolAdapter):
             raise ToolAdapterError(AdapterPhase.EXECUTE, AdapterErrorCode.TIMEOUT, str(exc), tool=str(request.tool or "")) from None
         except ValueError as exc:
             raise ToolAdapterError(AdapterPhase.EXECUTE, AdapterErrorCode.INPUT_INVALID, str(exc), tool=str(request.tool or "")) from None
+
+
+class ScopedDnsLookupAdapter(ScopedHttpProbeAdapter):
+    """Adapter for the registered scoped_dns_lookup observation tool (P1).
+
+    Same contract as the scoped probe adapter, for the DNS observation
+    family: the typed Owner AuthorizationDecision and the typed owner-side
+    scope context are bound BEFORE execution, and the tool executes ONLY
+    through tools.registry.execute, which re-resolves the scope snapshot and
+    re-verifies the decision binding (INV-OFF-3/INV-OFF-4). Resolved
+    addresses are OBSERVED data — they can never become authorized targets
+    (INV-OFF-2).
+    """
+
+    tool_name = "scoped_dns_lookup"
+    timeout_seconds = 10
 
 
 LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()

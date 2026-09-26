@@ -289,6 +289,77 @@ def _probe_http_observation(url, *, timeout=SCOPED_PROBE_TIMEOUT_SECONDS, max_by
     }
 
 
+def _scoped_dns_lookup(argument):
+    """Real bounded DNS observation behind the Scope Firewall and proof chain.
+
+    The registry invokes this handler ONLY after the same gate sequence as
+    scoped_http_probe: the typed Owner AuthorizationDecision matched tool +
+    argument fingerprint + request identity, the ExecutionAuthorizationProof
+    verified, and the scope resolver re-resolved the request against the
+    persisted typed snapshot. The executed argument is the ScopeGuard's
+    CANONICAL url: this handler extracts the host from that url and resolves
+    exactly that host — one name, one bounded lookup. Resolved addresses are
+    OBSERVED data only; they can never widen scope (INV-OFF-2).
+    """
+    url = argument if isinstance(argument, str) else ""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return {"ok": False, "operation": "scoped_dns_lookup", "error": "DNS_ARGUMENT_INVALID", "reason": "the dns observation accepts exactly one canonical http(s) url"}
+    return _dns_observation(url)
+
+
+SCOPED_DNS_TIMEOUT_SECONDS = 10  # the bound is enforced by the registry executor (spec timeout)
+SCOPED_DNS_MAX_RECORDS = 32
+
+
+def _dns_resolve(host):
+    """The single DNS seam of the observation: no shell, no other resolver surface."""
+    import socket
+
+    return socket.getaddrinfo(host, None)
+
+
+def _dns_observation(url, *, max_records=SCOPED_DNS_MAX_RECORDS):
+    import socket
+    import time
+    from urllib.parse import urlsplit
+
+    started = time.monotonic()
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        host = ""
+    if not host:
+        return {"ok": False, "operation": "scoped_dns_lookup", "url": url, "error": "DNS_ARGUMENT_INVALID", "reason": "the url carries no resolvable host", "elapsed_ms": int((time.monotonic() - started) * 1000)}
+    try:
+        entries = _dns_resolve(host)
+    except (socket.gaierror, OSError, UnicodeError, ValueError) as exc:
+        return {"ok": False, "operation": "scoped_dns_lookup", "url": url, "host": host, "error": "DNS_FAILED", "reason": str(exc), "elapsed_ms": int((time.monotonic() - started) * 1000)}
+    records: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in entries or []:
+        family = entry[0]
+        address = str(entry[4][0]) if len(entry) > 4 and entry[4] else ""
+        family_name = "AF_INET" if family == socket.AF_INET else ("AF_INET6" if family == socket.AF_INET6 else "OTHER")
+        if not address or (family_name, address) in seen:
+            continue
+        seen.add((family_name, address))
+        records.append({"family": family_name, "address": address})
+    records.sort(key=lambda record: (record["family"], record["address"]))
+    truncated = len(records) > max_records
+    if truncated:
+        records = records[:max_records]
+    return {
+        "ok": True,
+        "operation": "scoped_dns_lookup",
+        "url": url,
+        "host": host,
+        "records": records,
+        "record_count": len(records),
+        "truncated": truncated,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -317,6 +388,7 @@ REGISTRY = build_registry([
     ToolSpec("run_project_tests", "ØªØ´ØºÙÙ pytest -q Ø¯Ø§Ø®Ù Ø¬Ø°Ø± Ø§Ø®ØªØ¨Ø§Ø± Ø§ÙÙØ´Ø±ÙØ¹ Ø§ÙÙØ­Ø¯Ø¯", "bounded-exec", True, str, _run_project_tests),
     ToolSpec("red_team_assess", "ØªÙÙÙÙ ÙØ¬ÙÙÙ Ø¯ÙØ§Ø¹Ù ÙÙÙØ§ÙÙ ÙÙØ·; ÙØ§ ÙÙÙØ° Ø§Ø³ØªØºÙØ§ÙØ§Ù Ø£Ù Ø£ÙØ±Ø© ÙØ¸Ø§Ù", "analysis", True, str, _red_team_assess, True),
     ToolSpec("scoped_http_probe", "ÙØ±Ø§ÙØ¨Ø© HTTP ÙØ­Ø¯ÙØ¯Ø© ÙØ§ ØªØ¹ÙÙ Ø¥ÙØ§ ÙØ¹ Scope Snapshot ÙTarget ÙØµØ§Ø¯Ù Ø¹ÙÙÙ", "network-read", True, str, _scoped_http_probe, False, True),
+    ToolSpec("scoped_dns_lookup", "مراقبة DNS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_dns_lookup, False, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
