@@ -293,7 +293,7 @@ class AgentCore:
         # tools are the tool names of the derived ExecutionPlan, so the
         # snapshot allowlist corresponds exactly to the derived plan. The
         # model can only narrow; it can never add, widen, or mint tools.
-        from security.execution_plan_runtime import legacy_plan_effective_tools
+        from security.execution_plan_runtime import bind_execution_plan, legacy_plan_effective_tools
         effective_tools, derived_initial_plan = legacy_plan_effective_tools(owner_budget, plan, request_id=request_id)
         if not set(effective_tools) <= set(owner_budget.intersect(model_requested_tools)):
             raise PermissionError("derived execution plan widened the Owner budget intersection (INV-C4-4)")
@@ -329,6 +329,19 @@ class AgentCore:
         )
         if getattr(self, "_last_model_response", None):
             mission.progress["initial_model_response"] = dict(self._last_model_response)
+        if derived_initial_plan is not None:
+            # B3-C5-A part 2 (B3-H2): the Owner-direct mission binds its
+            # derived canonical ExecutionPlan at creation, so the canonical
+            # plan identity is fixed before the first slice executes and
+            # every proof on the owner-direct path binds it (Owner Policy ->
+            # Owner Budget -> Effective Tools -> canonical ExecutionPlan ->
+            # Mission/Run binding -> Snapshot -> Action Identity -> Proof ->
+            # Registry -> Handler). A mission whose legacy plan cannot
+            # enter any canonical ExecutionPlan stays unbound and fails
+            # closed at the slice gate (B3-H3). The binding never widens
+            # anything: the plan is the trusted derivation from the Owner
+            # budget, and the slice gate always re-derives ground truth.
+            bind_execution_plan(mission, derived_initial_plan)
         mission.semantic_intent = NaturalLanguageUnderstanding().understand(instruction).to_dict()
         adaptive_knowledge = self.knowledge_retriever.retrieve_adaptive(instruction, required_evidence=("supporting evidence", "counter-evidence"), limit=5)
         mission.knowledge_context = list(adaptive_knowledge.get("results", ()))
