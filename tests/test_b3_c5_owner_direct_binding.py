@@ -24,6 +24,7 @@ from agent.provider_api import ProviderResponse, ToolCall
 from security.execution_plan_runtime import (
     ExecutionPlanRuntimeError,
     reconstruct_execution_plan,
+    validate_stored_execution_plan,
 )
 from security.execution_proof import canonical_mission_plan_identity
 
@@ -57,14 +58,14 @@ def _core(tmp_path, provider):
     return AgentCore(ModelRouter([provider]), store=MissionStore(Path(tmp_path) / "missions.sqlite3"))
 
 
-def test_owner_direct_mission_binds_canonical_execution_plan_at_creation(mission_env):
+def _bound_mission(mission_env):
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "c1")])])
     core = _core(mission_env, provider)
-    mission = core.run_owner_mission(
-        "Investigate system status and verify the observation",
-        owner_token="valid-owner",
-        run=False,
-    )
+    return core.run_owner_mission("Investigate system status", owner_token="valid-owner", run=False)
+
+
+def test_owner_direct_mission_binds_canonical_execution_plan_at_creation(mission_env):
+    mission = _bound_mission(mission_env)
     stored = mission.progress.get("execution_plan") or {}
     assert stored.get("plan_fingerprint"), "owner-direct creation must bind the derived canonical ExecutionPlan"
     # the bound identity is exactly the derived-plan fingerprint recorded in provenance
@@ -72,7 +73,7 @@ def test_owner_direct_mission_binds_canonical_execution_plan_at_creation(mission
     assert provenance.get("execution_plan_fingerprint") == stored.get("plan_fingerprint")
     # the mission canonical plan identity is the bound canonical plan, not the legacy fingerprint
     assert canonical_mission_plan_identity(mission) == stored.get("plan_fingerprint")
-    # the bound plan reconstructs and fingerprint-verifies (tamper evidence)
+    # the bound plan reconstructs and fingerprint-verifies
     plan = reconstruct_execution_plan(stored)
     assert plan.plan_fingerprint == stored.get("plan_fingerprint")
     # B3-H4 / INV-SCOPE-2: the binding never widens authority; every planned
@@ -81,25 +82,36 @@ def test_owner_direct_mission_binds_canonical_execution_plan_at_creation(mission
     allowed = set(snapshot.get("allowed_tools") or ())
     planned_tools = {action.get("tool_name") for action in stored.get("actions", ())}
     assert planned_tools and planned_tools <= allowed
+    # the entry gate accepts the honest binding
+    ok, reason = validate_stored_execution_plan(mission)
+    assert ok, reason
 
 
-def test_owner_direct_stored_plan_binding_is_tamper_evident(mission_env):
-    provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "c1")])])
-    core = _core(mission_env, provider)
-    mission = core.run_owner_mission("Investigate system status", owner_token="valid-owner", run=False)
+def test_owner_direct_stored_plan_fingerprint_tamper_is_detected(mission_env):
+    mission = _bound_mission(mission_env)
     stored = dict(mission.progress["execution_plan"])
-    # forged action arguments fingerprint: recomputation diverges from the
-    # stored plan fingerprint, so reconstruction fails closed
+    # forged plan fingerprint: recomputation diverges from the stored one,
+    # so reconstruction fails closed
     tampered = dict(stored)
-    tampered["actions"] = [dict(item) for item in stored.get("actions", ())]
-    tampered["actions"][0]["arguments_fingerprint"] = "forged-fingerprint"
+    tampered["plan_fingerprint"] = "forged-plan-fingerprint"
     with pytest.raises(ExecutionPlanRuntimeError):
         reconstruct_execution_plan(tampered)
-    # forged plan fingerprint: same fail-closed outcome
-    tampered2 = dict(stored)
-    tampered2["plan_fingerprint"] = "forged-plan-fingerprint"
-    with pytest.raises(ExecutionPlanRuntimeError):
-        reconstruct_execution_plan(tampered2)
+
+
+def test_owner_direct_stored_plan_tamper_cannot_widen_authority(mission_env):
+    mission = _bound_mission(mission_env)
+    stored = dict(mission.progress["execution_plan"])
+    # attacker forges a stored action for a tool outside the Owner-minted
+    # snapshot allowlist: the entry gate must fail closed
+    allowed = set((mission.authorization_snapshot or {}).get("allowed_tools") or ())
+    assert "search" not in allowed, "fixture must forge a tool outside the allowlist"
+    forged = dict(stored)
+    forged["actions"] = [dict(item) for item in stored.get("actions", ())] + [
+        dict(stored["actions"][0], action_id="forged-widening", tool_name="search")
+    ]
+    mission.progress["execution_plan"] = forged
+    ok, reason = validate_stored_execution_plan(mission)
+    assert not ok, "a stored plan action outside the Owner snapshot allowlist must fail the entry gate"
 
 
 def test_owner_direct_unknown_tool_plan_stays_unbound_and_fails_closed(mission_env):
