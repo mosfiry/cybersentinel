@@ -1,16 +1,16 @@
-# CyberSentinel — Engineering Checkpoint (B3-C5)
+# CyberSentinel - Engineering Checkpoint (B3-C5)
 
-- CURRENT_PHASE: B3 — four-layer intent + canonical execution boundary
-- CURRENT_UNIT: C5 — close B3-H2, B3-H3, B3-H4; convert cross-run proof to PROVEN
-- CURRENT_STEP: C5-D run binding re-landed byte-exact (previous attempt pushed fetch-mangled files; restored from bb3b5f27 originals + re-applied edits)
-- LAST_COMPLETED_STEP: C5-D core — run_id bound into ExecutionAuthorizationProof (schema, binding hash, signature, serialization, verify, validate_against_mission, registry) + adversarial battery
-- NEXT_STEP: C5-A/B — bind owner-direct/slice path (run_slice + agent_core) through canonical ExecutionPlan; C5-C pin budget-intersection exclusion at derivation; C5-E full adversarial matrix; C5-G full validation
-- LAST_VERIFIED_COMMIT: bb3b5f27 (975 passed / 1 skipped); this fix commit pending CI
-- TEST_STATUS: pending CI for this commit
+- CURRENT_PHASE: B3 - four-layer intent + canonical execution boundary
+- CURRENT_UNIT: C5 - close B3-H2, B3-H3, B3-H4; convert cross-run proof to PROVEN
+- CURRENT_STEP: C5-A/B core landed (slice path canonical binding + gate); C5-A part 2 (agent_core binding) pending archaeology dumps
+- LAST_COMPLETED_STEP: C5-A/B core - run_slice derives the canonical ExecutionPlan (Owner budget from snapshot intersect validated legacy steps), binds it as the canonical plan identity, and gates every step BEFORE the executor (deterministic PLAN_MISMATCH/AUTHORIZATION_BLOCKED, handler not called); run_to_completion rotates a fresh execution_run_id per completion run; MissionExecutionBoundary.derive defaults plan_hash to canonical_mission_plan_identity (bound canonical plan, legacy fingerprint fallback); replan branches drop the stale canonical binding so proofs bound to the previous identity fail closed; adversarial battery tests/test_b3_c5_canonical_slice_binding.py
+- NEXT_STEP: verify CI for this commit; land agent_core.run_owner_mission initial-plan binding once diagnostics/agent_core_part*.txt dumps exist (byte-exact fetch); then C5-C (budget-intersection exclusion pin at derivation), C5-E adversarial matrix completion, C5-F recovery/resume/replan validation, C5-G full validation + remove the archaeology shim (delete diagnostics/.dump_mission_runtime_tail marker, workflow dump steps, dump files)
+- LAST_VERIFIED_COMMIT: bb3b5f27 (975 passed / 1 skipped); d465a8ca (C5-D test fixes) pending CI at write time
+- TEST_STATUS: pending CI for this commit (new battery: 10 tests; expected fallout in legacy-fixture tests that drive run_to_completion with unregistered tool names such as "write"/"run" - those fixtures must move to registered tools)
 - CI_STATUS: see diagnostics/ci-<sha>.md for the newest run
-- OPEN_ISSUES: none
-- INVARIANTS_PROVEN: H1 set (strict action identity, no tool+args fallback, no fresh identity minting, cardinality, serial+parallel gate, stale plan/lifecycle rejection, replay protection) at bb3b5f27; cross-run run_id binding pending CI
-- INVARIANTS_NOT_PROVEN: B3-H2 (owner-direct/slice path still binds legacy Plan fingerprint as canonical identity until C5-A); B3-H3 (legacy Plan containment at slice execution); B3-H4 pinning (budget-intersection exclusion at derivation); cross-run proof at runtime level
-- FILES_CHANGED: security/execution_proof.py, security/execution_boundary.py, tools/registry.py, .github/workflows/tests.yml (temporary tail-dump shim, two parts), CHECKPOINT.md
-- NEXT_SESSION_FIRST_ACTION: read this file and the newest diagnostics/ci-*.md; if green, fetch diagnostics/mission_runtime_tail_part1.txt + part2.txt (byte-exact, via GitHub contents base64 API — plain raw fetch inserts line-wrap corruption), reconstruct agent/mission_runtime.py, implement C5-A/B in run_slice, then remove the tail-dump shim and marker
-- ENGINEERING NOTE: the plain web fetch used for source reading inserts soft line wraps (~120 cols) — never push content fetched that way; always fetch byte-exact via api.github.com contents base64 and verify decoded length == size field.
+- OPEN_ISSUES: expected CI fallout from the slice gate on legacy fixtures with fake tool names; fix by switching fixtures to registered tools (status/search/watch/...)
+- INVARIANTS_PROVEN: H1 set at bb3b5f27 (strict action identity, no tool+args fallback, no fresh identity minting, cardinality, serial+parallel gate, stale plan/lifecycle rejection, replay protection); cross-run run_id binding (schema/hash/signature/serialization/verify/validate/registry + model-loop and slice-path runtime tests) pending green CI
+- INVARIANTS_NOT_PROVEN: B3-H2 owner-direct binding at agent_core creation path (C5-A part 2); B3-H4 explicit budget-intersection exclusion pin (C5-C); C5-E full adversarial matrix at runtime level; CI green for the slice gate
+- FILES_CHANGED: agent/mission_runtime.py, security/execution_boundary.py, tests/test_b3_c5_canonical_slice_binding.py, .github/workflows/tests.yml (temporary archaeology shim), CHECKPOINT.md
+- NEXT_SESSION_FIRST_ACTION: read this file and the newest diagnostics/ci-*.md; fix any fixture fallout; fetch diagnostics/agent_core_part1.txt + part2.txt (byte-exact via contents base64 with whitespace-then-escape cleanup; decoded length must equal size), reconstruct agent/agent_core.py, bind derived_initial_plan in run_owner_mission, then proceed to C5-C
+- ENGINEERING NOTE: never push content fetched via plain raw.githubusercontent.com (soft line wraps corrupt it; they can even split a JSON backslash-n escape). Byte-exact method: api.github.com contents base64 (or git blobs by sha), strip whitespace FIRST, then remove backslash-n escapes, assert no stray backslash remains, decode, and assert decoded length == size field.

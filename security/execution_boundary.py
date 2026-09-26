@@ -42,6 +42,8 @@ class MissionExecutionBoundary:
         bound into the proof, so a proof issued for one run can never be
         reused in another run.
         """
+        from security.execution_plan_runtime import canonical_mission_plan_identity
+
         snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
         progress = getattr(mission, "progress", None)
         live_run = str((progress.get("model_run_id") if isinstance(progress, dict) else "") or ((progress.get("execution_run_id") if isinstance(progress, dict) else "")) or "")
@@ -55,7 +57,7 @@ class MissionExecutionBoundary:
             decision=decision,
             tool_call_id=tool_call_id,
             run_id=live_run,
-            plan_hash=plan_hash if plan_hash is not None else mission.plan.fingerprint,
+            plan_hash=plan_hash if plan_hash is not None else canonical_mission_plan_identity(mission),
             scope=scope if scope is not None else mission.scope_snapshot,
             mission_status=mission.status.value,
             lifecycle_revision=len(mission.transitions),
