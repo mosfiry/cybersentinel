@@ -52,3 +52,26 @@ def local_system_info():
               __import__("json").dumps(info,ensure_ascii=False),
               "local:runtime","info",True,info)
     return info
+
+def local_process_info():
+    import subprocess
+    completed=subprocess.run(
+        ["ps","-eo","pid=,ppid=,user=,comm=","--no-headers"],
+        capture_output=True,text=True,timeout=10,check=False,
+    )
+    if completed.returncode!=0 or not completed.stdout:
+        raise RuntimeError("local process listing unavailable: ps failed")
+    processes=[]
+    for line in completed.stdout.splitlines():
+        parts=line.split(None,3)
+        if len(parts)!=4:
+            continue
+        try:
+            processes.append({"pid":int(parts[0]),"ppid":int(parts[1]),"user":parts[2],"command":parts[3]})
+        except ValueError:
+            continue
+    info={"processes":processes,"count":len(processes)}
+    add_event("local_check","Local process listing",
+              __import__("json").dumps(info,ensure_ascii=False),
+              "local:runtime","info",True,info)
+    return info

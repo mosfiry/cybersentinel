@@ -106,6 +106,10 @@ def _system_info(_):
     from core.local_defense import local_system_info
     return local_system_info()
 
+def _process_info(_):
+    from core.local_defense import local_process_info
+    return local_process_info()
+
 
 def _search(argument):
     from search.service import search_service
@@ -232,6 +236,7 @@ REGISTRY = build_registry([
     ToolSpec("refresh_intel", "Ø¬ÙØ¹ Ø§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø¯ÙØ§Ø¹ÙØ© Ø¶Ø¯ Ø§ÙØªÙØ¯ÙØ¯Ø§Øª", "network-read", True, None, _refresh_intel),
     ToolSpec("local_security_check", "ÙØ­Øµ ÙØ³ØªÙØ¹Ù TCP Ø§ÙÙØ­ÙÙØ©", "read", True, None, _local_security),
     ToolSpec("local_system_info", "ÙØ±Ø§Ø¡Ø© ÙØ¹ÙÙÙØ§Øª Ø§ÙÙØ¸Ø§Ù Ø§ÙÙØ­ÙÙ", "read", True, None, _system_info),
+    ToolSpec("local_process_info", "قراءة قائمة العمليات المحلية الجارية (فحص دفاعي محلي)", "read", True, None, _process_info),
     ToolSpec("search", "Ø¨Ø­Ø« ÙÙ Ø§ÙØ£Ø­Ø¯Ø§Ø« ÙØ§ÙØ§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø§ÙÙØ­ÙÙØ©", "read", True, str, _search),
     ToolSpec("watch", "Ø¥Ø¶Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _watch),
     ToolSpec("unwatch", "Ø¥Ø²Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _unwatch),
