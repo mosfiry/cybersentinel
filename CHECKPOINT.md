@@ -82,3 +82,63 @@ ion): e168da58d93b "feat(security): Stage A typed security tool inventory (Layer
 - NEXT_SESSION_FIRST_ACTION: Stage B is complete and CI-green at 0fd29599dea4. Next session: read this checkpoint, verify diagnostics/ci-0fd29599dea4.md is the branch HEAD CI (1136 passed / 1 skipped), then begin Stage C design per the mission sequence: a second adapter for an external-binary informational tool (e.g. whois) REQUIRING first the Owner decision on the catalog-vs-registration disjointness invariant recorded above; until that decision exists, do NOT register new runtime tools. If the Owner decision is not available, continue with hardening within current scope: adversarial review of adapter integration points in agent/runtime layers (read-only analysis) and documentation of the Adapter Contract in docs/.
 - EXACT_RESUME_POINT: Stage B COMPLETE (implementation + tests + CI green + security review + checkpoint). First incomplete step: Stage C pre-work — Owner decision on catalog-vs-registration disjointness, then second adapter (external-binary, informational) + battery.
 - DISCIPLINE REMINDER (unchanged): do NOT start B3-C6, Phase A, or R2; do not touch main; no reset/rebase/squash/force-push.
+
+## SESSION 3 — Security Tooling Expansion, Stage C: Second Adapter (COMPLETE)
+
+- Branch: security/b3-four-layer-intent
+- Start HEAD (session): 0984385941098cf4edfa3d807097b5239aebee4f
+- Final HEAD: 94466e2cd6311d2ee23ec8a66bc2ee8243f20ac3
+- Completed stages: Stage A (typed tool inventory), Stage B (adapter contract + battery), Stage C (second adapter + battery + Path A architectural decision).
+- Current stage: Security Tooling Expansion — Stage C COMPLETE; integration into mission_runtime/agent_core deferred to the next stage (boundary documented below).
+
+### Architectural decision — Path A (catalog/registry separation retained)
+- The documented tension "catalog_ids ∩ KNOWN_TOOLS = ∅" was resolved WITHOUT breaking the invariant, by adopting Path A: the catalog remains metadata/taxonomy/capability knowledge only; the runtime registry remains the ONLY source of executable authority; presence of a ToolSpec in the catalog does NOT mean a tool is executable; registration in the registry is a separate, explicit operation; the catalog alone can never grant execution authority.
+- The second adapter therefore wraps a registry-registered tool that is deliberately NOT in the catalog: `local_process_info` (local/informational/read-only/non-destructive, argument-free, local-first). The Stage A disjointness test remains green and a NEW explicit test asserts local_process_info is registered in the registry and absent from the catalog.
+
+### Second adapter — LocalProcessInfoAdapter
+- Tool: `local_process_info`, tool_class INFORMATIONAL, risk READ_ONLY, required_binary="ps", timeout enforced by the adapter contract.
+- All 9 contract phases from Stage B are reused unchanged: validate_input → authorize → prepare → dry_run → execute → normalize_output → collect_evidence → cleanup → error classification. No parallel execution path exists: execute() reaches the handler ONLY through tools.registry.execute.
+- Fail-closed: missing `ps` binary → PREPARE rejection (BINARY_UNAVAILABLE), no fallback, handler never invoked.
+- No self-granted authority: no proof minting (AST-enforced), no registry mutation (AST-enforced), owner-direct path requires the typed AuthorizationDecision bound to proof and request.
+
+### Integration status (Stage C boundary)
+- Real-handler integration is proven in-test: LocalProcessInfoAdapter drives the actual registered local_process_info handler through the full chain (Owner Policy → Authorization → ExecutionPlan → Proof → tools.registry.execute → handler) end to end.
+- Structural wiring of the adapter into MissionRuntime/AgentCore slice execution is DEFERRED to the next stage: the battery proves (16-scenario consolidated rejection + execute spy) that the adapter cannot execute anything outside the existing chain, so deferral does not leave an open authority path. The stage that should perform the wiring is Stage D (adapter integration into mission_runtime slice execution through the existing proof chain), pending Owner confirmation.
+
+### Adversarial battery — tests/test_tool_adapter_stage_c.py (NEW, ~83 test items)
+- Authority: no owner authority → no execution; invalid/forged/expired proof → no execution; proof from another mission → rejected; stale plan → rejected; rotated snapshot (via real amend path) → rejected; stale authorization version → rejected. All rejections proven BEFORE handler invocation (spy counters: handler_calls==0, execute_spy==[]).
+- Tool identity: unregistered tool rejected; tool absent from snapshot rejected; out-of-budget tool rejected; plan-incompatible tool rejected; forged tool ID rejected; class/risk mismatch rejected.
+- Input: invalid arguments → no handler; non-canonical arguments → no handler; argument widening → rejected; out-of-plan argument injection → rejected.
+- Execution: dry-run handler_calls==0; every rejection handler_calls==0; authorization failure handler_calls==0; timeout → classified failure; handler failure → classified failure; normalization failure (non-dict payload, verified to fail AT normalize_output) → classified failure; evidence failure → classified failure; cleanup failure does not mask the primary error.
+- Replay: same proof after run rotation rejected; changed plan rejected; changed snapshot rejected; changed run rejected. Replay semantics confirmed as single-RUN (not single-USE) — recorded for Owner review; a single-use nonce is a candidate future hardening.
+- Output poisoning: 15 authority-shaped keys (owner, authorization, permission, scope, policy, proof, plan authority, execution authority, etc.) parametrized — tool output can never inject or forge authority fields.
+- The five-layer boundary test ("Adapter is not an Authorization Layer"): adapter exists ≠ authorized; ToolSpec exists ≠ registered; registered ≠ authorized for this mission; authorized ≠ proof valid; proof valid ≠ execution allowed after plan/snapshot/run changes — each boundary proven by an actual test.
+- AUTHORITY_OUTPUT_TOKENS expanded for Stage C; catalog-vs-registration cross-layer test extended to local_process_info.
+
+### Commits (this session)
+- 236662116ead "feat(tools): register local_process_info informational handler" (CI green: 1136/1)
+- e0a106802855 "feat(security): Stage C LocalProcessInfoAdapter (ps, fail-closed)" (CI green: 1136/1)
+- 26a165c0b153 "test(security): Stage C adversarial adapter battery" (CI RED: 4 failed / 1132 passed — ALL FOUR were test-side defects, no production change required)
+- 94466e2cd631 "fix(security): correct Stage C battery fixtures (two-action plan, real snapshot rotation, handler passthrough)" (CI GREEN: 1219 passed / 1 skipped, diagnostics/ci-94466e2cd631.md)
+
+### Failures and root causes (all test-side; production never weakened)
+1. proof_for_system_info: a single-action plan permitted only local_process_info, so the chain correctly refused to derive a proof for local_system_info (TOOL_NOT_ALLOWED) — fixed with a two-action plan in the fixture.
+2/3. stale_snapshot_rejected / boundary_5: mutating the snapshot dict's "version" corrupted the internal authorization_hash, so the chain reported SNAPSHOT_INVALID instead of SNAPSHOT_MISMATCH — fixed by rotating the snapshot through the real path (amend with owner_approval and changes={"policy_version": ...}, helper _rotate_mission_snapshot).
+4. normalization_failure_on_non_dict: CountingHandler wrapped every result in dict(), raising ValueError inside the handler before normalize_output — fixed to pass non-dict payloads through untouched so they fail at NORMALIZE_OUTPUT.
+
+### Files changed (no deletions)
+- core/local_defense.py (modified: local_process_info handler, pure-local read-only)
+- tools/registry.py (modified: register local_process_info)
+- security/tool_adapter.py (modified: LocalProcessInfoAdapter + expanded AUTHORITY_OUTPUT_TOKENS)
+- tests/test_tool_adapter_stage_c.py (NEW: Stage C adversarial battery)
+- CHECKPOINT.md (this session record)
+
+### Security invariants upheld
+- No parallel authority path; execution only through tools.registry.execute. Adapter never mints proofs, never mutates the registry, no process-execution surface (AST-enforced). Fail-closed on missing binary. Catalog cannot grant execution authority (Path A). Output can never become authority. Cleanup inert on all paths. No tests weakened; every rejection proven pre-handler.
+
+### Unresolved risks / deferred items (for Owner)
+- Replay semantics are single-RUN, not single-USE; a single-use nonce in the proof is candidate hardening (requires Owner decision since it changes proof semantics).
+- Adapter wiring into MissionRuntime/AgentCore slice execution deferred to Stage D (boundary proven closed meanwhile).
+
+- NEXT_SESSION_FIRST_ACTION: verify diagnostics/ci-<this-checkpoint-commit-sha>.md is green at branch HEAD (1219 passed / 1 skipped), then begin Stage D design: wire the adapter layer into MissionRuntime slice execution through the existing proof chain (read security/tool_adapter.py, runtime slice execution path, and the Stage B/C batteries first); keep catalog/registry disjoint (Path A); do NOT touch main, B3-C6, Phase A, or R2.
+- EXACT_RESUME_POINT: Stage C COMPLETE (second adapter + ~83-item adversarial battery + CI green 1219/1 + Path A decision + checkpoint). First incomplete step: Stage D — adapter integration into MissionRuntime slice execution through the existing proof chain.
