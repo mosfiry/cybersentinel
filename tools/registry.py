@@ -360,6 +360,151 @@ def _dns_observation(url, *, max_records=SCOPED_DNS_MAX_RECORDS):
     }
 
 
+def _scoped_tls_observation(argument):
+    """Real bounded TLS observation behind the Scope Firewall and proof chain.
+
+    The registry invokes this handler ONLY after the same gate sequence as
+    the scoped probe and dns tools. The executed argument is the ScopeGuard's
+    CANONICAL url: this handler derives the host and port from that url and
+    nothing else. SNI is NOT an input — it is ALWAYS the canonical host, so a
+    caller can never point the observation at a different virtual host.
+
+    Verification semantics are FIXED and documented: the handshake runs
+    under ssl.create_default_context() (CERT_REQUIRED, check_hostname=True).
+    Handshake success and certificate validity are classified SEPARATELY:
+    a successful-but-untrusted chain is TLS_CERTIFICATE_INVALID, never
+    success. Certificate data (CN, SAN, issuer) is OBSERVED data only — it
+    can never widen scope (INV-OFF-2).
+    """
+    url = argument if isinstance(argument, str) else ""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return {"ok": False, "operation": "scoped_tls_observation", "error": "TLS_ARGUMENT_INVALID", "reason": "the tls observation accepts exactly one canonical http(s) url"}
+    return _tls_observation(url)
+
+
+SCOPED_TLS_TIMEOUT_SECONDS = 10  # enforced by the registry executor (spec/adapter timeout)
+SCOPED_TLS_MAX_SANS = 32
+SCOPED_TLS_FIELD_MAX = 512
+
+
+def _tls_connect(host, port, timeout):
+    """The single network/TLS seam: connect + verifying handshake. No shell.
+
+    Verification is ON by construction (default context); it is never relaxed
+    to make an observation succeed.
+    """
+    import socket
+    import ssl
+
+    context = ssl.create_default_context()
+    raw = socket.create_connection((host, port), timeout=timeout)
+    return context.wrap_socket(raw, server_hostname=host)  # SNI == the canonical host, always
+
+
+def _tls_cert_fields(cert):
+    """Deterministic public certificate metadata extraction (no key material)."""
+    subject = ""
+    for rdn in cert.get("subject", ()) or ():
+        for key, value in rdn:
+            if key == "commonName" and not subject:
+                subject = str(value)[:512]
+    issuer = ""
+    for rdn in cert.get("issuer", ()) or ():
+        for key, value in rdn:
+            if key == "commonName" and not issuer:
+                issuer = str(value)[:512]
+    serial = str(cert.get("serialNumber") or "")[:128]
+    not_before = str(cert.get("notBefore") or "")[:64]
+    not_after = str(cert.get("notAfter") or "")[:64]
+    sans = sorted({"{}:{}".format(str(key), str(value)[:SCOPED_TLS_FIELD_MAX]) for key, value in (cert.get("subjectAltName") or ())})
+    return subject, issuer, serial, not_before, not_after, sans
+
+
+def _tls_observation(url, *, timeout=SCOPED_TLS_TIMEOUT_SECONDS, max_sans=SCOPED_TLS_MAX_SANS):
+    import hashlib
+    import socket
+    import ssl
+    import time
+    from datetime import datetime, timezone
+    from urllib.parse import urlsplit
+
+    started = time.monotonic()
+    elapsed = lambda: int((time.monotonic() - started) * 1000)
+    try:
+        parts = urlsplit(url)
+        host = str(parts.hostname or "")
+        port = parts.port
+    except ValueError:
+        host, port = "", None
+    if not host:
+        return {"ok": False, "operation": "scoped_tls_observation", "url": url, "error": "TLS_ARGUMENT_INVALID", "reason": "the url carries no observable host", "elapsed_ms": elapsed()}
+    if port is None:
+        port = 443  # the default TLS port; an explicit canonical port is kept as-is
+    common = {"operation": "scoped_tls_observation", "url": url, "host": host, "port": port}
+    try:
+        sock = _tls_connect(host, port, timeout)
+    except ssl.SSLCertVerificationError as exc:
+        # The handshake completed far enough to reject the chain: this is a
+        # VERIFICATION classification, never a success.
+        return dict(common, ok=False, error="TLS_CERTIFICATE_INVALID", connection_success=False, verification_result="TLS_CERTIFICATE_INVALID", verification_error=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except ssl.SSLError as exc:
+        return dict(common, ok=False, error="TLS_HANDSHAKE_FAILED", connection_success=False, verification_result="TLS_CERTIFICATE_UNAVAILABLE", verification_error=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except TimeoutError as exc:
+        return dict(common, ok=False, error="TLS_TIMEOUT", connection_success=False, verification_result="TLS_CERTIFICATE_UNAVAILABLE", verification_error=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except (socket.gaierror, ConnectionError, OSError, ValueError) as exc:
+        return dict(common, ok=False, error="TLS_CONNECTION_FAILED", connection_success=False, verification_result="TLS_CERTIFICATE_UNAVAILABLE", verification_error=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        version = str(sock.version() or "")
+        cipher = sock.cipher()
+        cipher_name = str(cipher[0]) if cipher else ""
+        try:
+            peer = sock.getpeername()
+            resolved_endpoint = str(peer) if peer else None
+        except Exception:
+            resolved_endpoint = None
+        try:
+            der = sock.getpeercert(binary_form=True)
+        except Exception:
+            der = None
+        try:
+            cert = sock.getpeercert() or {}
+        except Exception:
+            cert = {}
+    except Exception as exc:
+        return dict(common, ok=False, error="TLS_RUNTIME_ERROR", connection_success=True, verification_result="TLS_CERTIFICATE_UNAVAILABLE", verification_error=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    fingerprint = hashlib.sha256(der).hexdigest() if der else ""
+    subject, issuer, serial, not_before, not_after, sans = _tls_cert_fields(cert)
+    truncated = len(sans) > max_sans
+    if truncated:
+        sans = sans[:max_sans]
+    return {
+        "ok": True,
+        **common,
+        "connection_success": True,
+        "tls_version": version,  # the ACTUALLY negotiated protocol, never inferred
+        "cipher": cipher_name,  # the ACTUALLY negotiated cipher, never inferred
+        "certificate_subject": subject or None,
+        "certificate_issuer": issuer or None,
+        "certificate_serial": serial or None,
+        "certificate_not_before": not_before or None,
+        "certificate_not_after": not_after or None,
+        "certificate_fingerprint": fingerprint or None,
+        "fingerprint_algorithm": "SHA-256" if fingerprint else None,
+        "subject_alt_names": sans,
+        "sans_truncated": truncated,
+        "verification_result": "TLS_CERTIFICATE_VALID",
+        "verification_error": None,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "resolved_endpoint": resolved_endpoint,
+        "elapsed_ms": elapsed(),
+    }
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -389,6 +534,7 @@ REGISTRY = build_registry([
     ToolSpec("red_team_assess", "ØªÙÙÙÙ ÙØ¬ÙÙÙ Ø¯ÙØ§Ø¹Ù ÙÙÙØ§ÙÙ ÙÙØ·; ÙØ§ ÙÙÙØ° Ø§Ø³ØªØºÙØ§ÙØ§Ù Ø£Ù Ø£ÙØ±Ø© ÙØ¸Ø§Ù", "analysis", True, str, _red_team_assess, True),
     ToolSpec("scoped_http_probe", "ÙØ±Ø§ÙØ¨Ø© HTTP ÙØ­Ø¯ÙØ¯Ø© ÙØ§ ØªØ¹ÙÙ Ø¥ÙØ§ ÙØ¹ Scope Snapshot ÙTarget ÙØµØ§Ø¯Ù Ø¹ÙÙÙ", "network-read", True, str, _scoped_http_probe, False, True),
     ToolSpec("scoped_dns_lookup", "مراقبة DNS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_dns_lookup, False, True),
+    ToolSpec("scoped_tls_observation", "مراقبة TLS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tls_observation, False, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)

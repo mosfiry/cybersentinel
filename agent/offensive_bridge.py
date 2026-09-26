@@ -88,6 +88,7 @@ __all__ = [
     "OffensiveExecutionRecord",
     "ScopedHttpProbeAdapter",
     "ScopedDnsLookupAdapter",
+    "ScopedTlsObservationAdapter",
 ]
 
 # Target kinds: "local" = local read-only analysis (no network surface, the
@@ -255,6 +256,24 @@ class ScopedDnsLookupAdapter(ScopedHttpProbeAdapter):
     """
 
     tool_name = "scoped_dns_lookup"
+    timeout_seconds = 10
+
+
+class ScopedTlsObservationAdapter(ScopedHttpProbeAdapter):
+    """Adapter for the registered scoped_tls_observation tool (P1-B).
+
+    Same contract as the scoped probe/dns adapters: the typed Owner
+    AuthorizationDecision and the typed owner-side scope context are bound
+    BEFORE execution, and the tool executes ONLY through
+    tools.registry.execute, which re-resolves the persisted scope snapshot
+    and re-verifies the decision binding (INV-OFF-3/INV-OFF-4). SNI is not
+    an input anywhere in this chain: the handler derives it from the
+    ScopeGuard's canonical url, so the observed virtual host is always the
+    authorized one. Certificate data is OBSERVED data — CN/SAN/issuer can
+    never widen scope (INV-OFF-2).
+    """
+
+    tool_name = "scoped_tls_observation"
     timeout_seconds = 10
 
 
