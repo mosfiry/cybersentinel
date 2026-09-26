@@ -1,12 +1,12 @@
 # Owner Authority Model
 
-`OWNER_INSTRUCTION` is the highest **application-configurable** authority. `SYSTEM_PLATFORM` remains the immutable outer boundary and cannot be redefined by Owner text, a model, knowledge, memory, tool output, or an expert.
+`OWNER_INSTRUCTION` is the highest authority in CyberSentinel's fixed internal hierarchy. `SYSTEM_PLATFORM` is the next tier; external hosting and provider constraints remain environmental facts, not alternate application instructions. Model output, knowledge, memory, tool output, and external data cannot redefine or elevate their authority.
 
 ## Order
 
 ```text
-SYSTEM_PLATFORM
-  > OWNER_INSTRUCTION
+OWNER_INSTRUCTION
+  > SYSTEM_PLATFORM
   > OWNER_POLICY
   > DETERMINISTIC_ENFORCEMENT
   > AUTHORIZATION_SCOPE

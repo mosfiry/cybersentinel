@@ -83,16 +83,17 @@ class MissionQueue:
 
     def update(self, mission_id: str, state: WorkerMissionState, *, available_at: str | None = None, error: str = "", worker_id: str | None = None) -> QueueItem:
         with sqlite3.connect(self.db_path) as db:
-            terminal = state.value in {"completed", "failed", "cancelled", "needs_input", "partial_success"}
+            terminal = state.value in {"completed", "failed", "cancelled", "needs_input", "partial_success", "paused"}
+            release_lease = terminal or state in {WorkerMissionState.QUEUED, WorkerMissionState.SLEEPING}
             if worker_id is not None:
-                if terminal:
+                if release_lease:
                     updated = db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL WHERE mission_id=? AND lease_owner=? AND state=?", (state.value, available_at, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value))
                 else:
                     updated = db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=? WHERE mission_id=? AND lease_owner=?", (state.value, available_at, error, mission_id, worker_id))
                 if updated.rowcount != 1:
                     raise PermissionError("worker lease is not owned")
             else:
-                db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, state.value, state.value, state.value, mission_id))
+                db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, int(release_lease), int(release_lease), int(release_lease), mission_id))
         return self.get(mission_id)
 
     def heartbeat(self, mission_id: str, *, worker_id: str, now: str | None = None, lease_seconds: int = 60) -> QueueItem:
@@ -143,6 +144,29 @@ class MissionWorker:
     def recover_after_restart(self) -> list[QueueItem]:
         return self.queue.recover_after_restart()
 
+    def control_graph(self, mission_id: str, command: str, *, authorization_context: Any) -> Any:
+        """Apply a typed Owner decision to the canonical runtime and durable queue."""
+        mission = self.runtime_factory().control_graph(mission_id, command, authorization_context=authorization_context)
+        queue_state = {"pause": WorkerMissionState.PAUSED, "resume": WorkerMissionState.QUEUED, "cancel": WorkerMissionState.CANCELLED}.get(command)
+        if queue_state is None:
+            raise ValueError("unknown graph control")
+        current = self.queue.get(mission_id)
+        if command == "resume" and current.state is not WorkerMissionState.PAUSED:
+            raise ValueError("only a paused queue item can be resumed")
+        self.queue.update(mission_id, queue_state, error="")
+        return mission
+
+    def reconcile_graph_node(self, mission_id: str, node_id: str, *, executed: bool, result: Any = None, authorization_context: Any) -> Any:
+        mission = self.runtime_factory().reconcile_graph_node(mission_id, node_id, executed=executed, result=result, authorization_context=authorization_context)
+        current = self.queue.get(mission_id)
+        if not mission.checkpoint.get("orchestration", {}).get("recovery_required") and current.state is WorkerMissionState.WAITING_FOR_TOOL:
+            queue_state = {
+                MissionStatus.PAUSED: WorkerMissionState.PAUSED,
+                MissionStatus.CANCELLED: WorkerMissionState.CANCELLED,
+            }.get(mission.status, WorkerMissionState.QUEUED)
+            self.queue.update(mission_id, queue_state, error="")
+        return mission
+
     def run_once(self, *, now: str | None = None, max_slices: int | None = None) -> QueueItem | None:
         item = self.queue.claim_next(now=now, worker_id=self.worker_id)
         if item is None:
@@ -158,16 +182,30 @@ class MissionWorker:
         except Exception as exc:
             return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}", worker_id=self.worker_id)
         state = {
+            MissionStatus.PAUSED: WorkerMissionState.PAUSED,
+            MissionStatus.CANCELLING: WorkerMissionState.CANCELLING,
+            MissionStatus.READY: WorkerMissionState.QUEUED,
+            MissionStatus.RUNNING: WorkerMissionState.QUEUED,
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
             MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
             MissionStatus.AUTHORIZATION_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.RECOVERY_REQUIRED: WorkerMissionState.WAITING_FOR_TOOL,
+            MissionStatus.BUDGET_BLOCKED: WorkerMissionState.NEEDS_INPUT,
+            MissionStatus.VERIFICATION_BLOCKED: WorkerMissionState.NEEDS_INPUT,
+            MissionStatus.RESOURCE_BLOCKED: WorkerMissionState.FAILED,
+            MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.CANCELLED: WorkerMissionState.CANCELLED,
             MissionStatus.FAILED_RETRY_EXHAUSTED: WorkerMissionState.FAILED,
             MissionStatus.SCOPE_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
         }.get(mission.status, WorkerMissionState.PARTIAL_SUCCESS if mission.evidence else WorkerMissionState.FAILED)
-        return self.queue.update(item.mission_id, state, error=mission.error, worker_id=self.worker_id)
+        try:
+            return self.queue.update(item.mission_id, state, error=mission.error, worker_id=self.worker_id)
+        except PermissionError:
+            current = self.queue.get(item.mission_id)
+            if current.state in {WorkerMissionState.PAUSED, WorkerMissionState.CANCELLED, WorkerMissionState.QUEUED, WorkerMissionState.WAITING_FOR_TOOL}:
+                return current
+            raise
 
 
 @dataclass(frozen=True)

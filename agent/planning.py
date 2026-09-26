@@ -80,17 +80,22 @@ def select_reasoning_profile(objective: str) -> ReasoningProfile:
 
 class FailureClass(str, Enum):
     TRANSIENT = "TRANSIENT"
+    NON_RETRYABLE = "NON_RETRYABLE"
     DEPENDENCY = "DEPENDENCY"
+    VALIDATION = "VALIDATION"
     COMPILATION = "COMPILATION"
     TEST_FAILURE = "TEST_FAILURE"
     NETWORK = "NETWORK"
     PROVIDER = "PROVIDER"
+    MODEL = "MODEL"
+    TIMEOUT = "TIMEOUT"
     TOOL = "TOOL"
     AUTHORIZATION = "AUTHORIZATION"
     SCOPE = "SCOPE"
     RESOURCE = "RESOURCE"
     LOGIC = "LOGIC"
     UNKNOWN = "UNKNOWN"
+    UNKNOWN_OUTCOME = "UNKNOWN_OUTCOME"
 
 
 class RecoveryAction(str, Enum):
@@ -132,6 +137,10 @@ class PlanStep:
     scope_requirement: str = ""
     retry_policy: dict[str, Any] = field(default_factory=dict)
     verification: tuple[str, ...] = ()
+    priority: int = 0
+    resources_read: tuple[str, ...] = ()
+    resources_write: tuple[str, ...] = ()
+    idempotent: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +153,10 @@ class PlanStep:
             "scope_requirement": self.scope_requirement,
             "retry_policy": dict(self.retry_policy),
             "verification": list(self.verification),
+            "priority": self.priority,
+            "resources_read": list(self.resources_read),
+            "resources_write": list(self.resources_write),
+            "idempotent": self.idempotent,
         }
 
 

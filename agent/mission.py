@@ -16,10 +16,14 @@ class MissionStatus(str, Enum):
     PLANNING = "PLANNING"
     READY = "READY"
     RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    CANCELLING = "CANCELLING"
     OBSERVING = "OBSERVING"
     VERIFYING = "VERIFYING"
     REPLANNING = "REPLANNING"
     GOAL_COMPLETED = "GOAL_COMPLETED"
+    BUDGET_BLOCKED = "BUDGET_BLOCKED"
+    VERIFICATION_BLOCKED = "VERIFICATION_BLOCKED"
     OWNER_INPUT_REQUIRED = "OWNER_INPUT_REQUIRED"
     AUTHORIZATION_BLOCKED = "AUTHORIZATION_BLOCKED"
     SCOPE_BLOCKED = "SCOPE_BLOCKED"
@@ -34,6 +38,7 @@ TERMINAL_MISSION_STATUSES = frozenset({
     MissionStatus.GOAL_COMPLETED, MissionStatus.OWNER_INPUT_REQUIRED,
     MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.SCOPE_BLOCKED,
     MissionStatus.RESOURCE_BLOCKED, MissionStatus.RECOVERY_REQUIRED, MissionStatus.SAFETY_BLOCKED,
+    MissionStatus.BUDGET_BLOCKED, MissionStatus.VERIFICATION_BLOCKED,
     MissionStatus.FAILED_RETRY_EXHAUSTED, MissionStatus.CANCELLED,
 })
 
@@ -148,7 +153,7 @@ class Mission:
                 raise ValueError("trajectory_integrity_mismatch")
         plan_data = raw.pop("plan")
         from .planning import PlanStep
-        steps = tuple(PlanStep(**{**step, "prerequisites": tuple(step.get("prerequisites", ())), "verification": tuple(step.get("verification", ()))}) for step in plan_data.get("steps", []))
+        steps = tuple(PlanStep(**{**step, "prerequisites": tuple(step.get("prerequisites", ())), "verification": tuple(step.get("verification", ())), "resources_read": tuple(step.get("resources_read", ())), "resources_write": tuple(step.get("resources_write", ()))}) for step in plan_data.get("steps", []))
         raw["plan"] = Plan(version=plan_data["version"], objective=plan_data["objective"], assumptions=tuple(plan_data.get("assumptions", ())), steps=steps, dependencies=tuple(plan_data.get("dependencies", ())), completion_criteria=tuple(plan_data.get("completion_criteria", ())), risk=plan_data.get("risk", "unknown"), created_from=plan_data.get("created_from", ""))
         raw["status"] = MissionStatus(raw["status"])
         raw["integrity_hash"] = supplied_hash

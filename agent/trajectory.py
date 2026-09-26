@@ -31,6 +31,7 @@ class EventType(str, Enum):
     MISSION_COMPLETED = "MissionCompleted"
     RECOVERY_REQUIRED = "RecoveryRequired"
     MODEL_TURN = "ModelTurn"
+    SCHEDULER_DECISION = "SchedulerDecision"
 
 
 @dataclass(frozen=True)

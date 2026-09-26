@@ -61,11 +61,12 @@ Baseline before this audit: `38328ddbab7f4157ac54ed24c9b3086dd4a415bc` (CI succe
 - `agent/agent_core.py` `_auth()`: challenge path via
   `consume_owner_challenge` (single-use, message-bound), token path via
   `authenticate_owner`; both produce typed evidence bound to `request_id`.
-- Owner hierarchy `OWNER_INSTRUCTION > SYSTEM_PLATFORM > OWNER_POLICY > ...`
-  is documented as binding semantics in `docs/AGENT_ARCHITECTURE.md`,
-  including the clarification that `SYSTEM_PLATFORM` means the *internal*
-  CyberSentinel platform layer, not external hosting constraints (which are
-  outside the hierarchy entirely). No reordering was made anywhere.
+- At the time of this 2026-09-22 audit, the hierarchy
+  `OWNER_INSTRUCTION > SYSTEM_PLATFORM > OWNER_POLICY > ...` was documented
+  in `docs/AGENT_ARCHITECTURE.md`. A later repository-wide check found older
+  GitHub POC documents with a contradictory ordering; those references were
+  corrected in the mission-orchestration engineering branch. External hosting
+  constraints remain environmental facts outside the application hierarchy.
 - `AuthorityTier` is not used as an execution input in any path audited.
 
 ## 3. Runtime Architecture — PARTIAL (canonical not exclusive)

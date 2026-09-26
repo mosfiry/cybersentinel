@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
+import copy
 import hashlib
 import json
 
@@ -17,12 +19,13 @@ from .model_protocol import ConversationTurn, NativeModel, ToolCallResult
 from .provider_api import ProviderError
 from .model_intelligence.context import ContextAssembler
 from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
+from .orchestration import DeterministicScheduler, ExecutionGraph, ExecutionNode, GraphValidationError, NodeState
 
 
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, orchestration_retry_policies: dict[str, dict[str, Any]] | None = None, orchestration_resource_policies: dict[str, dict[str, Any]] | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -32,8 +35,10 @@ class MissionRuntime:
         self.interpreter = interpreter or ObservationInterpreter()
         self.require_authorization_snapshot = require_authorization_snapshot
         self.authorization_snapshot_factory = authorization_snapshot_factory
+        self.orchestration_retry_policies = {str(key): dict(value) for key, value in (orchestration_retry_policies or {}).items()}
+        self.orchestration_resource_policies = {str(key): dict(value) for key, value in (orchestration_resource_policies or {}).items()}
 
-    def _mission_authorization(self, mission: Mission) -> tuple[bool, str]:
+    def _mission_authorization(self, mission: Mission, *, actions: set[str] | None = None) -> tuple[bool, str]:
         if not self.require_authorization_snapshot:
             raise RuntimeError("authorization snapshot bypass is not supported")
         try:
@@ -45,8 +50,8 @@ class MissionRuntime:
             valid, reason = snapshot.validate_for_mission(mission_id=mission.mission_id, owner_identity=mission.owner_identity_ref, target_identity=target, version=expected_version)
             if not valid:
                 return False, reason
-            actions = {step.action for step in mission.plan.steps if step.action != "__planning_failure__"}
-            if actions - set(snapshot.allowed_actions) or actions - set(snapshot.allowed_tools) or actions.intersection(snapshot.forbidden_actions):
+            requested_actions = actions if actions is not None else {step.action for step in mission.plan.steps if step.action != "__planning_failure__"}
+            if requested_actions - set(snapshot.allowed_actions) or requested_actions - set(snapshot.allowed_tools) or requested_actions.intersection(snapshot.forbidden_actions):
                 return False, "mission actions or tools outside authorization snapshot"
             expected_root = str(scope.get("workspace_root", ""))
             if expected_root and str(snapshot.workspace_boundary.get("root", "")) != expected_root:
@@ -97,6 +102,32 @@ class MissionRuntime:
         if mission.authorization_snapshot:
             mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot.get("version", 1))
         mission.transition(MissionStatus.READY, "plan persisted")
+        return self.store.save(mission)
+
+    def create_graph(self, owner_request: str, objective: str, plan: Plan, *, max_parallel: int = 1, node_budget: int | None = None, max_runs: int | None = None, tool_budget: int | None = None, retry_budget: int | None = None, max_duration_seconds: int | None = 3600, **kwargs: Any) -> Mission:
+        """Create a mission whose plan is executed as a validated dependency graph."""
+        if max_parallel < 1 or max_parallel > 32 or (node_budget is not None and node_budget < 0):
+            raise ValueError("invalid graph execution budget")
+        criteria = kwargs.get("completion_criteria")
+        if not isinstance(criteria, list) or not criteria or any(not isinstance(item, dict) or not str(item.get("criterion_id", "")).strip() for item in criteria):
+            raise ValueError("DAG execution requires explicit deterministic completion criteria")
+        if len({str(item["criterion_id"]) for item in criteria}) != len(criteria):
+            raise ValueError("completion criterion identities must be unique")
+        planned_step_ids = {str(step.step_id) for step in plan.steps}
+        if {str(item["criterion_id"]) for item in criteria} - planned_step_ids:
+            raise ValueError("completion criteria must bind to stable plan step identities")
+        ExecutionGraph.from_plan("validation", "validation", plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        mission = self.create(owner_request, objective, plan, **kwargs)
+        authorization_ok, reason = self._mission_authorization(mission, actions=set())
+        if not authorization_ok:
+            raise PermissionError("mission graph requires a valid authorization snapshot: " + reason)
+        run_id = hashlib.sha256((mission.mission_id + "\0" + mission.request_id + "\0" + mission.plan.fingerprint).encode()).hexdigest()[:24]
+        graph = ExecutionGraph.from_plan(mission.mission_id, run_id, mission.plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        default_runs = max(1, len(graph.nodes) + sum(node.retry_limit for node in graph.nodes))
+        state = DeterministicScheduler.initial_state(graph, authorization_hash=self._graph_authorization_hash(mission), node_budget=node_budget, max_parallel=max_parallel, max_runs=default_runs if max_runs is None else max_runs, tool_budget=tool_budget, retry_budget=retry_budget, max_duration_seconds=max_duration_seconds)
+        mission.progress["execution_mode"] = "dag"
+        mission.progress["execution_run_id"] = run_id
+        mission.checkpoint = {**mission.checkpoint, "status": "graph_initialized", "execution_run_id": run_id, "plan_hash": graph.plan_hash, "orchestration": state}
         return self.store.save(mission)
 
     def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None) -> Mission:
@@ -245,6 +276,8 @@ class MissionRuntime:
         from tools.registry import execute as execute_tool
 
         mission = self._load(mission_id)
+        if mission.progress.get("execution_mode") == "dag":
+            raise PermissionError("model tool proposals cannot bypass the authorized deterministic execution graph")
         if mission.is_terminal:
             return mission
         if (mission.checkpoint or {}).get("status") in {"in_flight", "in_flight_parallel"}:
@@ -439,10 +472,330 @@ class MissionRuntime:
             return
         mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
 
+    @staticmethod
+    def _graph_authorization_hash(mission: Mission) -> str:
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        return snapshot.authorization_hash
+
+    def _sync_graph_events(self, mission: Mission, state: dict[str, Any]) -> None:
+        """Mirror durable scheduling decisions into the existing hash-chained trajectory."""
+        start = int(state.get("trajectory_event_count", 0))
+        events = list(state.get("events", []))
+        for item in events[start:]:
+            mission.emit(EventType.SCHEDULER_DECISION, step_id=str(item.get("step_id", "")), data=dict(item))
+            if item.get("event") in {"NODE_REJECTED", "AUTHORIZATION_BLOCKED", "BUDGET_BLOCKED", "RECOVERY_RECONCILED", "NODE_CANCELLED"}:
+                mission.evidence.append({
+                    "criterion_id": f"scheduler:{item.get('event')}:{item.get('node_id', '')}:{len(mission.evidence)}",
+                    "passed": False,
+                    "source": "deterministic_scheduler",
+                    "result": dict(item),
+                    "provenance": {"mission_id": mission.mission_id, "execution_run_id": state.get("execution_run_id"), "plan_hash": state.get("plan_hash"), "authorization_hash": state.get("authorization_hash")},
+                })
+        state["trajectory_event_count"] = len(events)
+
+    def _authorize_graph_node(self, mission: Mission, step: PlanStep) -> tuple[bool, str]:
+        valid, reason = self._mission_authorization(mission, actions={step.action} if step.action != "__planning_failure__" else set())
+        if not valid:
+            return False, reason
+        try:
+            decision = self.authorizer(mission, step)
+        except Exception as exc:
+            return False, f"authorization check failed closed: {type(exc).__name__}"
+        if not isinstance(decision, tuple) or len(decision) != 2 or not bool(decision[0]):
+            return False, str(decision[1] if isinstance(decision, tuple) and len(decision) > 1 else "authorization denied")
+        return True, str(decision[1])
+
+    def run_graph(self, mission_id: str, *, execution_run_id: str = "", max_parallel: int | None = None, node_budget: int | None = None, max_batches: int = 1) -> Mission:
+        """Run a deterministic, bounded DAG slice through the existing durable MissionStore.
+
+        Authorization is checked again immediately before each node dispatch. A crash
+        marks outstanding work UNKNOWN and requires reconciliation rather than replay.
+        """
+        if max_batches < 1:
+            raise ValueError("max_batches must be at least one")
+        if max_parallel is not None and not 1 <= max_parallel <= 32:
+            raise ValueError("max_parallel must be between one and the hard runtime cap of 32")
+        mission = self._load(mission_id)
+        if mission.is_terminal:
+            return mission
+        auth_ok, auth_reason = self._mission_authorization(mission, actions=set())
+        if not auth_ok:
+            mission.error = auth_reason
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": auth_reason})
+            if not mission.is_terminal:
+                mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, auth_reason)
+            return self.store.save(mission)
+        authorization_hash = self._graph_authorization_hash(mission)
+        run_id = execution_run_id or str(mission.progress.get("execution_run_id") or hashlib.sha256((mission.mission_id + "\0" + mission.request_id + "\0" + mission.plan.fingerprint).encode()).hexdigest()[:24])
+        graph = ExecutionGraph.from_plan(mission.mission_id, run_id, mission.plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        state = dict(mission.checkpoint.get("orchestration", {})) if isinstance(mission.checkpoint, dict) else {}
+        if not state:
+            state = DeterministicScheduler.initial_state(graph, authorization_hash=authorization_hash, node_budget=node_budget, max_parallel=max_parallel or 1)
+        DeterministicScheduler.check_identity(state, graph, authorization_hash)
+        if state.get("running_nodes") and not state.get("recovery_required"):
+            DeterministicScheduler.recover(state)
+        mission.progress["execution_run_id"] = run_id
+        if state.get("recovery_required"):
+            if mission.status is not MissionStatus.RECOVERY_REQUIRED:
+                mission.error = "unknown node outcome requires reconciliation before graph continuation"
+                if not mission.is_terminal:
+                    mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+            mission.checkpoint = {**mission.checkpoint, "orchestration": state}
+            self._sync_graph_events(mission, state)
+            return self.store.save(mission)
+        if state.get("paused") or state.get("cancel_requested"):
+            if state.get("cancel_requested") and not mission.is_terminal:
+                mission.transition(MissionStatus.CANCELLED, "Owner cancellation prevents future node starts")
+            elif state.get("paused") and mission.status is not MissionStatus.PAUSED:
+                mission.transition(MissionStatus.PAUSED, "Owner pause prevents future node starts")
+            mission.checkpoint = {**mission.checkpoint, "orchestration": state}
+            self._sync_graph_events(mission, state)
+            return self.store.save(mission)
+        if len(state.get("completed_nodes", [])) == len(graph.nodes):
+            mission.progress["graph_completed"] = True
+            if mission.status is not MissionStatus.READY:
+                mission.transition(MissionStatus.READY, "all execution graph nodes were already completed")
+            self._sync_graph_events(mission, state)
+            mission.checkpoint = {**mission.checkpoint, "orchestration": state, "status": "graph_checkpointed", "execution_run_id": run_id, "plan_hash": graph.plan_hash}
+            return self.store.save(mission)
+        if not DeterministicScheduler.start_run(state):
+            mission.error = "execution run budget exhausted"
+            mission.checkpoint = {**mission.checkpoint, "orchestration": state}
+            self._sync_graph_events(mission, state)
+            if not mission.is_terminal:
+                mission.transition(MissionStatus.BUDGET_BLOCKED, mission.error)
+            return self.store.save(mission)
+
+        steps = {str(step.step_id): step for step in mission.plan.steps}
+        for _ in range(max_batches):
+            effective_parallelism = min(int(max_parallel or state["budget_state"]["max_parallel"]), int(state["budget_state"]["max_parallel"]))
+            batch = DeterministicScheduler.reserve_batch(graph, state, limit=effective_parallelism)
+            if not batch:
+                break
+            mission.checkpoint = {**mission.checkpoint, "orchestration": state, "status": "graph_batch_in_flight", "execution_run_id": run_id, "plan_hash": graph.plan_hash}
+            self._sync_graph_events(mission, state)
+            self.store.save(mission)
+
+            def execute_one(node: ExecutionNode) -> tuple[str, dict[str, Any], str]:
+                step = copy.deepcopy(steps[node.step_id])
+                worker_mission = copy.deepcopy(mission)
+                allowed, reason = self._authorize_graph_node(worker_mission, step)
+                if not allowed:
+                    return "AUTHORIZATION", {}, reason
+                action_id = hashlib.sha256(f"{mission.mission_id}\0{run_id}\0{graph.plan_hash}\0{node.node_id}".encode()).hexdigest()
+                try:
+                    result = copy.deepcopy(dict(self.executor(worker_mission, step, action_id) or {}))
+                except Exception as exc:
+                    return "UNKNOWN_OUTCOME", {}, f"{type(exc).__name__}: execution outcome is unknown"
+                return "RESULT", result, ""
+
+            futures: dict[str, Any] = {}
+            with ThreadPoolExecutor(max_workers=min(effective_parallelism, len(batch)), thread_name_prefix="mission-dag") as pool:
+                for node in batch:
+                    futures[node.node_id] = pool.submit(execute_one, node)
+                for node in batch:
+                    future = futures[node.node_id]
+                    try:
+                        result_kind, observation, detail = future.result()
+                    except Exception as exc:
+                        result_kind, observation, detail = "UNKNOWN_OUTCOME", {}, f"{type(exc).__name__}: worker outcome is unknown"
+                    latest = self._load(mission_id)
+                    latest_state = dict(latest.checkpoint.get("orchestration", {})) if isinstance(latest.checkpoint, dict) else {}
+                    if latest_state.get("plan_hash") != graph.plan_hash or latest_state.get("execution_run_id") != run_id:
+                        raise GraphValidationError("execution checkpoint changed identity while node was running")
+                    mission = latest
+                    state = latest_state
+                    if result_kind == "AUTHORIZATION":
+                        DeterministicScheduler.finish(state, node, success=False, error=detail, failure_class="AUTHORIZATION")
+                    elif result_kind == "UNKNOWN_OUTCOME":
+                        DeterministicScheduler.finish(state, node, success=False, error=detail, failure_class="UNKNOWN_OUTCOME")
+                    else:
+                        success = observation.get("success", observation.get("ok", False)) is True
+                        failure_class = str(observation.get("failure_class", FailureClass.UNKNOWN.value))
+                        DeterministicScheduler.finish(state, node, success=success, result=observation, error=str(observation.get("error", "")), failure_class=failure_class)
+                        enriched = {**observation, "mission_id": mission.mission_id, "execution_run_id": run_id, "node_id": node.node_id, "step_id": node.step_id, "plan_hash": graph.plan_hash}
+                        if success:
+                            mission.evidence.append({"criterion_id": node.step_id, "passed": True, "source": steps[node.step_id].action, "result": enriched, "provenance": {"mission_id": mission.mission_id, "execution_run_id": run_id, "node_id": node.node_id, "plan_hash": graph.plan_hash, "authorization_hash": authorization_hash}})
+                            action_id = hashlib.sha256(f"{mission.mission_id}\0{run_id}\0{graph.plan_hash}\0{node.node_id}".encode()).hexdigest()
+                            mission.record_action(action_id, node.step_id, "completed", enriched)
+                    self._sync_graph_events(mission, state)
+                    mission.checkpoint = {**mission.checkpoint, "orchestration": state, "status": "graph_batch_in_flight" if state.get("running_nodes") else "graph_checkpointed", "execution_run_id": run_id, "plan_hash": graph.plan_hash}
+                    self.store.save(mission)
+            if state.get("recovery_required"):
+                mission.error = "unknown node outcome requires reconciliation; no blind retry was attempted"
+                mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "execution_run_id": run_id})
+                mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+                self._sync_graph_events(mission, state)
+                return self.store.save(mission)
+            if state.get("cancel_requested"):
+                if mission.status is not MissionStatus.CANCELLED:
+                    mission.transition(MissionStatus.CANCELLED, "Owner cancellation prevents future node starts")
+                self._sync_graph_events(mission, state)
+                return self.store.save(mission)
+            if state.get("paused"):
+                if mission.status is not MissionStatus.PAUSED:
+                    mission.transition(MissionStatus.PAUSED, "Owner pause took effect after in-flight nodes settled")
+                self._sync_graph_events(mission, state)
+                mission.checkpoint = {**mission.checkpoint, "orchestration": state, "status": "graph_paused", "execution_run_id": run_id, "plan_hash": graph.plan_hash}
+                return self.store.save(mission)
+        self._sync_graph_events(mission, state)
+        mission.checkpoint = {**mission.checkpoint, "orchestration": state, "status": "graph_checkpointed", "execution_run_id": run_id, "plan_hash": graph.plan_hash}
+        rejected = [item for item in state.get("nodes", {}).values() if item.get("state") == NodeState.REJECTED.value]
+        if rejected:
+            mission.error = "execution graph contains a node rejected by authorization or validation"
+            failure_classes = {str(item.get("failure_class", "")) for item in rejected}
+            target = MissionStatus.SCOPE_BLOCKED if "SCOPE" in failure_classes else MissionStatus.AUTHORIZATION_BLOCKED if "AUTHORIZATION" in failure_classes else MissionStatus.SAFETY_BLOCKED
+            if not mission.is_terminal:
+                mission.transition(target, mission.error)
+        elif state.get("failed_nodes") or state.get("blocked_nodes"):
+            mission.error = "execution graph contains failed or dependency-blocked nodes"
+            if not mission.is_terminal:
+                mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
+        elif len(state.get("completed_nodes", [])) == len(graph.nodes):
+            mission.progress["graph_completed"] = True
+            if not mission.is_terminal:
+                mission.transition(MissionStatus.READY, "all execution graph nodes completed")
+        else:
+            budget = state.get("budget_state", {})
+            tool_limit = budget.get("tool_budget", {}).get("dispatch_limit")
+            node_limit = budget.get("node_budget")
+            budget_exhausted = bool(state.get("budget_expired") or state.get("run_budget_exhausted"))
+            budget_exhausted = budget_exhausted or (tool_limit is not None and int(budget["tool_budget"]["dispatches_started"]) >= int(tool_limit))
+            budget_exhausted = budget_exhausted or (node_limit is not None and int(budget["nodes_started"]) >= int(node_limit))
+            if budget_exhausted:
+                mission.error = "execution graph budget exhausted with nodes remaining"
+                if not mission.is_terminal:
+                    mission.transition(MissionStatus.BUDGET_BLOCKED, mission.error)
+            elif not mission.is_terminal:
+                mission.transition(MissionStatus.READY, "graph slice checkpointed for durable continuation")
+        return self.store.save(mission)
+
+    def _require_owner_graph_control(self, mission: Mission, authorization_context: Any) -> None:
+        from security.authorization_context import AuthorizationContext
+        from security.owner_policy import policy_fingerprint
+        if not isinstance(authorization_context, AuthorizationContext):
+            raise TypeError("graph controls require typed Owner AuthorizationContext")
+        if not authorization_context.owner_evidence.is_valid(authorization_context.request_id, authorization_context.session_id):
+            raise PermissionError("Owner control evidence expired or is invalid")
+        if authorization_context.policy_fingerprint != policy_fingerprint():
+            raise PermissionError("Owner control policy is stale")
+        if authorization_context.request_id != mission.request_id:
+            raise PermissionError("Owner control context belongs to another request")
+        if authorization_context.owner_evidence_fingerprint != mission.owner_identity_ref:
+            raise PermissionError("Owner control context does not match mission identity")
+        expected_policy = str((mission.policy_snapshot or {}).get("owner_policy_fingerprint", ""))
+        if expected_policy and authorization_context.policy_fingerprint != expected_policy:
+            raise PermissionError("Owner control context has stale policy")
+        expected_instruction = str((mission.policy_snapshot or {}).get("owner_instruction_fingerprint", ""))
+        if expected_instruction and authorization_context.instruction_fingerprint != expected_instruction:
+            raise PermissionError("Owner control instruction does not match the mission")
+
+    def replan_graph(self, mission_id: str, new_plan: Plan, *, authorization_context: Any, completion_criteria: list[dict[str, Any]] | None = None) -> Mission:
+        """Accept an Owner-authorized graph revision only before any dispatch.
+
+        A plan revision receives a new run identity/hash, revalidates every action
+        against the unchanged authorization snapshot, and inherits all remaining
+        durable budgets. Mid-run replanning is deliberately refused until side
+        effects have been explicitly reconciled by a separate safe workflow.
+        """
+        mission = self._load(mission_id)
+        self._require_owner_graph_control(mission, authorization_context)
+        if mission.is_terminal:
+            raise ValueError("terminal mission cannot be replanned")
+        if new_plan.objective != mission.objective:
+            raise PermissionError("replanning cannot change the Owner objective")
+        if new_plan.version <= mission.plan.version:
+            raise ValueError("replanned plan version must increase monotonically")
+        prior_state = dict(mission.checkpoint.get("orchestration", {}))
+        if not prior_state or prior_state.get("running_nodes") or prior_state.get("recovery_required"):
+            raise ValueError("graph can only be replanned from a quiescent initialized checkpoint")
+        if prior_state.get("paused") or prior_state.get("cancel_requested"):
+            raise ValueError("resume a paused graph before replanning; cancelled graphs cannot be replanned")
+        budget = prior_state.get("budget_state", {})
+        if int(budget.get("nodes_started", 0)) or any(int(item.get("attempts", 0)) for item in prior_state.get("nodes", {}).values()):
+            raise ValueError("replan refused after dispatch; reconcile side effects before creating a new run")
+        criteria = completion_criteria if completion_criteria is not None else list(mission.completion_criteria)
+        new_step_ids = {str(step.step_id) for step in new_plan.steps}
+        if not criteria or any(not isinstance(item, dict) or not str(item.get("criterion_id", "")).strip() for item in criteria):
+            raise ValueError("replanned graph requires explicit deterministic completion criteria")
+        if len({str(item["criterion_id"]) for item in criteria}) != len(criteria) or {str(item["criterion_id"]) for item in criteria} - new_step_ids:
+            raise ValueError("replanned completion criteria must uniquely bind to new step identities")
+        ExecutionGraph.from_plan("validation", "validation", new_plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        mission.plan = new_plan
+        mission.completion_criteria = [dict(item) for item in criteria]
+        mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": "Owner-authorized DAG replan"})
+        run_id = hashlib.sha256(f"{mission.mission_id}\0{mission.request_id}\0{prior_state['execution_run_id']}\0{new_plan.fingerprint}\0{len(mission.plan_history)}".encode()).hexdigest()[:24]
+        graph = ExecutionGraph.from_plan(mission.mission_id, run_id, new_plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        new_state = DeterministicScheduler.initial_state(graph, authorization_hash=self._graph_authorization_hash(mission), node_budget=budget.get("node_budget"), max_parallel=int(budget.get("max_parallel", 1)), max_runs=int(budget.get("run_budget", {}).get("run_limit", mission.max_iterations)), tool_budget=budget.get("tool_budget", {}).get("dispatch_limit"), retry_budget=budget.get("retry_budget", {}).get("retry_limit"), max_duration_seconds=None)
+        new_state["budget_state"] = budget
+        allowed, reason = self._mission_authorization(mission, actions={step.action for step in new_plan.steps if step.action != "__planning_failure__"})
+        if not allowed:
+            raise PermissionError("replanned actions exceed current authorization: " + reason)
+        mission.progress["execution_run_id"] = run_id
+        mission.checkpoint = {**mission.checkpoint, "status": "graph_initialized", "execution_run_id": run_id, "plan_hash": graph.plan_hash, "orchestration": new_state}
+        mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint, "execution_run_id": run_id, "authorization_hash": new_state["authorization_hash"]})
+        return self.store.save(mission)
+
+    def control_graph(self, mission_id: str, command: str, *, authorization_context: Any) -> Mission:
+        mission = self._load(mission_id)
+        self._require_owner_graph_control(mission, authorization_context)
+        if mission.is_terminal:
+            raise ValueError("terminal mission cannot be controlled")
+        state = dict(mission.checkpoint.get("orchestration", {})) if isinstance(mission.checkpoint, dict) else {}
+        if not state:
+            raise ValueError("mission has no initialized execution graph")
+        if command == "resume" and state.get("running_nodes"):
+            raise ValueError("cannot resume until in-flight nodes settle")
+        DeterministicScheduler.set_control(state, command)
+        if command == "cancel" and not state.get("running_nodes"):
+            mission.transition(MissionStatus.CANCELLED, "Owner cancelled execution graph")
+        elif command == "cancel":
+            mission.transition(MissionStatus.CANCELLING, "Owner cancellation requested; in-flight nodes will settle")
+        elif command == "pause" and not state.get("running_nodes"):
+            mission.transition(MissionStatus.PAUSED, "Owner paused execution graph")
+        elif command == "pause":
+            mission.transition(MissionStatus.PAUSED, "Owner pause requested; in-flight nodes will settle")
+        elif command == "resume" and mission.status is MissionStatus.PAUSED:
+            mission.transition(MissionStatus.READY, "Owner resumed execution graph")
+        self._sync_graph_events(mission, state)
+        mission.checkpoint = {**mission.checkpoint, "orchestration": state, "status": "graph_checkpointed"}
+        return self.store.save(mission)
+
+    def reconcile_graph_node(self, mission_id: str, node_id: str, *, executed: bool, result: Any = None, authorization_context: Any) -> Mission:
+        mission = self._load(mission_id)
+        self._require_owner_graph_control(mission, authorization_context)
+        authorization_hash = self._graph_authorization_hash(mission)
+        run_id = str(mission.progress.get("execution_run_id", ""))
+        graph = ExecutionGraph.from_plan(mission.mission_id, run_id, mission.plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        state = dict(mission.checkpoint.get("orchestration", {}))
+        DeterministicScheduler.check_identity(state, graph, authorization_hash)
+        DeterministicScheduler.reconcile(state, graph, node_id, executed=executed, result=result)
+        if executed:
+            node = graph.by_id[node_id]
+            receipt = {**dict(result or {}), "mission_id": mission.mission_id, "execution_run_id": run_id, "node_id": node.node_id, "step_id": node.step_id, "plan_hash": graph.plan_hash, "reconciled_by_owner": True}
+            mission.evidence.append({"criterion_id": node.step_id, "passed": True, "source": "owner_reconciliation", "result": receipt, "provenance": {"mission_id": mission.mission_id, "execution_run_id": run_id, "node_id": node.node_id, "plan_hash": graph.plan_hash, "authorization_hash": authorization_hash, "owner_evidence_fingerprint": authorization_context.owner_evidence_fingerprint}})
+            action_id = hashlib.sha256(f"{mission.mission_id}\0{run_id}\0{graph.plan_hash}\0{node.node_id}".encode()).hexdigest()
+            mission.record_action(action_id, node.step_id, "reconciled", receipt)
+        if not state.get("recovery_required") and mission.status is MissionStatus.RECOVERY_REQUIRED:
+            if state.get("cancel_requested"):
+                mission.transition(MissionStatus.READY, "Owner reconciled unknown outcome; cancellation remains in effect")
+                mission.transition(MissionStatus.CANCELLED, "Owner cancellation remains in effect after reconciliation")
+            elif state.get("paused"):
+                mission.transition(MissionStatus.READY, "Owner reconciled unknown outcome; pause remains in effect")
+                mission.transition(MissionStatus.PAUSED, "Owner pause remains in effect after reconciliation")
+            else:
+                mission.transition(MissionStatus.READY, "Owner reconciled unknown graph outcome")
+        self._sync_graph_events(mission, state)
+        mission.checkpoint = {**mission.checkpoint, "orchestration": state, "status": "graph_checkpointed"}
+        return self.store.save(mission)
+
     def run_slice(self, mission_id: str) -> Mission:
         mission = self._load(mission_id)
         if mission.is_terminal:
             return mission
+        if mission.progress.get("execution_mode") == "dag":
+            return self.run_graph(mission_id)
         authorization_ok, authorization_reason = self._mission_authorization(mission)
         if not authorization_ok:
             mission.error = authorization_reason
@@ -594,7 +947,39 @@ class MissionRuntime:
         return self.store.save(mission)
 
     def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:
-        limit = max_slices or self._load(mission_id).max_iterations
+        initial = self._load(mission_id)
+        limit = max_slices or initial.max_iterations
+        if initial.progress.get("execution_mode") == "dag":
+            for _ in range(limit):
+                if heartbeat is not None:
+                    heartbeat()
+                mission = self.run_graph(mission_id, max_batches=1)
+                state = dict(mission.checkpoint.get("orchestration", {}))
+                if mission.is_terminal or state.get("paused") or state.get("cancel_requested") or state.get("recovery_required"):
+                    return mission
+                if len(state.get("completed_nodes", [])) == len(state.get("nodes", {})):
+                    verification = self.verifier(mission)
+                    mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
+                    if verification.verified:
+                        mission.transition(MissionStatus.GOAL_COMPLETED, "execution DAG completed with deterministic evidence")
+                        mission.emit(EventType.GOAL_VERIFIED, data=mission.verification_state)
+                        mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state, "execution_run_id": state.get("execution_run_id")})
+                    else:
+                        mission.error = "execution graph completed without all required evidence"
+                        mission.transition(MissionStatus.VERIFICATION_BLOCKED, mission.error)
+                    return self.store.save(mission)
+                budget = state.get("budget_state", {})
+                node_limit = budget.get("node_budget")
+                tool_limit = budget.get("tool_budget", {}).get("dispatch_limit")
+                tool_exhausted = tool_limit is not None and int(budget.get("tool_budget", {}).get("dispatches_started", 0)) >= int(tool_limit) and bool(state.get("ready_nodes"))
+                node_exhausted = node_limit is not None and int(budget.get("nodes_started", 0)) >= int(node_limit) and bool(state.get("ready_nodes"))
+                if tool_exhausted or node_exhausted or state.get("budget_expired") or state.get("run_budget_exhausted"):
+                    return mission
+                # No ready/running work means budget exhaustion or a blocked graph;
+                # retain the durable checkpoint and stop instead of spinning.
+                if not state.get("ready_nodes") and not state.get("running_nodes"):
+                    return mission
+            return self._load(mission_id)
         for _ in range(limit):
             if heartbeat is not None:
                 heartbeat()
