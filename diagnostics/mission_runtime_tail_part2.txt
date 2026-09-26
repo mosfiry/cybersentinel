@@ -1,4 +1,53 @@
-{}).get("status") == "in_flight":
+e retry budget stays enforced (LOGIC/COMPILATION/TEST_FAILURE ->
+        bounded replan, AUTHORIZATION -> owner input, exhausted ->
+        FAILED_RETRY_EXHAUSTED).
+        """
+        mission.error = f"{code}: {reason}"
+        mission.failures.append({"class": failure_class.value, "reason": mission.error, "step_id": step.step_id, "action_id": action_id})
+        mission.emit(EventType.EXECUTION_REJECTED, step_id=step.step_id, data={"code": code, "reason": reason, "action_id": action_id})
+        mission.emit(EventType.FAILURE_DETECTED, step_id=step.step_id, data={"class": failure_class.value, "reason": mission.error, "code": code})
+        mission.retry_count += 1
+        action = self.recovery_policy.action_for(failure_class, mission.retry_count - 1)
+        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=step.step_id, data={"class": failure_class.value, "recovery": action.value})
+        if action is RecoveryAction.OWNER_INPUT_REQUIRED:
+            mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "canonical execution plan rejection requires owner input")
+        elif action is RecoveryAction.SCOPE_BLOCKED:
+            mission.transition(MissionStatus.SCOPE_BLOCKED, "scope blocked")
+        elif action is RecoveryAction.RESOURCE_BLOCKED:
+            mission.transition(MissionStatus.RESOURCE_BLOCKED, "resource blocked")
+        elif action is RecoveryAction.REPLAN:
+            mission.transition(MissionStatus.REPLANNING, "action rejected by the canonical execution plan")
+            mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data={"reason": mission.error, "code": code})
+            new_plan = self.replanner(mission, {"type": "execution_rejected", "success": False, "error": mission.error, "code": code, "action_id": action_id, "step_id": step.step_id})
+            if new_plan.objective != mission.objective:
+                mission.error = "replanner attempted to change Owner objective"
+                mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                return self.store.save(mission)
+            mission.replan_history.append({"from_version": mission.plan.version, "to_version": new_plan.version, "reason": mission.error, "trigger": {"code": code, "action_id": action_id}})
+            mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": mission.error})
+            mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": mission.error})
+            mission.plan = new_plan
+            mission.progress.pop("execution_plan", None)  # B3-C5-A: replan drops the stale canonical binding; proofs bound to the previous canonical identity fail closed
+            mission.current_step = 0
+            mission.retry_count = 0
+            mission.transition(MissionStatus.READY, "new plan persisted", plan_version=new_plan.version)
+        elif action is RecoveryAction.RETRY:
+            mission.transition(MissionStatus.READY, "bounded retry selected")
+        else:
+            mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, "recovery budget exhausted")
+        return self.store.save(mission)
+
+    def run_slice(self, mission_id: str) -> Mission:
+        mission = self._load(mission_id)
+        if mission.is_terminal:
+            return mission
+        authorization_ok, authorization_reason = self._mission_authorization(mission)
+        if not authorization_ok:
+            mission.error = authorization_reason
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
+            return self.store.save(mission)
+        if (mission.checkpoint or {}).get("status") == "in_flight":
             action_id = str(mission.checkpoint.get("action_id", ""))
             mission.error = "in-flight action outcome is unknown; reconciliation required"
             mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id})
@@ -47,24 +96,24 @@
         # a compatibility representation: any step that is not part of the
         # derived canonical plan is deterministically rejected BEFORE the
         # executor is called (no Owner -> Legacy Plan -> Handler path).
-        from security.execution_plan_runtime import bind_execution_plan, gate_action_against_plan, legacy_plan_effective_tools, owner_budget_from_snapshot
+        from security.execution_plan_runtime import bind_execution_plan, gate_action_against_plan, legacy_plan_effective_tools, registered_owner_budget_from_snapshot
+        from security.owner_budget import KNOWN_TOOLS
         try:
-            owner_budget = owner_budget_from_snapshot(mission)
+            owner_budget = registered_owner_budget_from_snapshot(mission)
             _effective_tools, canonical_plan = legacy_plan_effective_tools(owner_budget, mission.plan, request_id=mission.request_id)
         except Exception as exc:
-            mission.error = f"canonical execution plan derivation failed: {exc}"
-            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission.error, "step_id": step.step_id})
-            mission.emit(EventType.EXECUTION_REJECTED, step_id=step.step_id, data={"code": "PLAN_INVALID", "reason": mission.error})
-            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission.error)
-            return self.store.save(mission)
+            # Deterministic fail closed: the canonical authority view cannot be
+            # derived, so nothing may execute (executor/handler never called).
+            return self._reject_action_outside_canonical_plan(mission, step, action_id, "PLAN_INVALID", f"canonical execution plan derivation failed: {exc}", FailureClass.AUTHORIZATION)
         if canonical_plan is None:
-            mission.error = "no canonical ExecutionPlan can be derived from the current legacy plan; execution fails closed"
-            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission.error, "step_id": step.step_id})
-            mission.emit(EventType.EXECUTION_REJECTED, step_id=step.step_id, data={"code": "PLAN_MISMATCH", "reason": mission.error})
-            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission.error)
-            return self.store.save(mission)
+            # B3-H3: the legacy plan cannot enter any canonical ExecutionPlan;
+            # the malformed proposal fails closed without execution.
+            return self._reject_action_outside_canonical_plan(mission, step, action_id, "PLAN_MISMATCH", "no canonical ExecutionPlan can be derived from the current legacy plan; execution fails closed", FailureClass.LOGIC)
         stored_plan = mission.progress.get("execution_plan") or {}
         if not isinstance(stored_plan, dict) or stored_plan.get("plan_fingerprint") != canonical_plan.plan_fingerprint:
+            # The bound plan identity is always the freshly derived canonical
+            # plan: a tampered, stale, or forged stored binding is re-bound to
+            # ground truth and can never widen what may execute.
             bind_execution_plan(mission, canonical_plan)
         step_arguments = dict(step.retry_policy or {}).get("arguments")
         if not isinstance(step_arguments, dict):
@@ -72,11 +121,13 @@
         gate_ok, gate_code, gate_reason = gate_action_against_plan(canonical_plan, action_id=step.step_id, tool_name=step.action, arguments=step_arguments)
         mission.emit(EventType.AUTHORIZATION_CHECKED, step_id=step.step_id, data={"allowed": gate_ok, "reason": gate_reason if not gate_ok else "canonical execution plan membership verified"})
         if not gate_ok:
-            mission.error = f"{gate_code}: {gate_reason}"
-            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission.error, "step_id": step.step_id})
-            mission.emit(EventType.EXECUTION_REJECTED, step_id=step.step_id, data={"code": gate_code, "reason": gate_reason})
-            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission.error)
-            return self.store.save(mission)
+            # B3-H3: an action that is not part of the derived canonical plan
+            # is rejected BEFORE the executor is called (handler_calls == 0).
+            # An unregistered tool is a malformed legacy proposal (LOGIC ->
+            # bounded replan); a registered tool outside the Owner-derived
+            # plan is an authorization failure (owner input required).
+            rejection_class = FailureClass.LOGIC if str(step.action or "").strip() not in KNOWN_TOOLS else FailureClass.AUTHORIZATION
+            return self._reject_action_outside_canonical_plan(mission, step, action_id, gate_code, gate_reason, rejection_class)
 
         allowed, reason = self.authorizer(mission, step)
         mission.emit(EventType.AUTHORIZATION_CHECKED, step_id=step.step_id, data={"allowed": allowed, "reason": reason})

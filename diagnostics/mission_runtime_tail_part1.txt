@@ -118,14 +118,12 @@ c:
         mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
         progress["tool_results"].extend(result.to_dict() for result in results)
 
-    def run_slice(self, mission_id: str) -> Mission:
-        mission = self._load(mission_id)
-        if mission.is_terminal:
-            return mission
-        authorization_ok, authorization_reason = self._mission_authorization(mission)
-        if not authorization_ok:
-            mission.error = authorization_reason
-            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
-            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
-            return self.store.save(mission)
-        if (mission.checkpoint or 
+    def _reject_action_outside_canonical_plan(self, mission: Mission, step: PlanStep, action_id: str, code: str, reason: str, failure_class: FailureClass) -> Mission:
+        """B3-H2/H3 deterministic rejection without execution.
+
+        The action is not part of the derived canonical ExecutionPlan, so
+        the executor is never called and no tool handler runs
+        (handler_calls == 0). The rejection flows through the same bounded
+        recovery machinery as any other action failure: the Owner objective
+        can never change, a replan drops the stale canonical binding, and
+        th
