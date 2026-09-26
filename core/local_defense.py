@@ -54,23 +54,42 @@ def local_system_info():
     return info
 
 def local_process_info():
+    import shutil
     import subprocess
-    completed=subprocess.run(
-        ["ps","-eo","pid=,ppid=,user=,comm=","--no-headers"],
-        capture_output=True,text=True,timeout=10,check=False,
-    )
+    resolved=shutil.which("ps")
+    if not resolved:
+        raise RuntimeError("local process listing unavailable: required binary 'ps' not found on PATH (fail closed)")
+    try:
+        completed=subprocess.run(
+            [resolved,"-eo","pid=,ppid=,user=,comm=","--no-headers"],
+            capture_output=True,text=True,timeout=10,check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("local process listing timed out after 10 seconds")
     if completed.returncode!=0 or not completed.stdout:
         raise RuntimeError("local process listing unavailable: ps failed")
+    stdout=completed.stdout
     processes=[]
-    for line in completed.stdout.splitlines():
+    rows_truncated=False
+    command_truncated=False
+    for line in stdout.splitlines():
         parts=line.split(None,3)
         if len(parts)!=4:
             continue
         try:
-            processes.append({"pid":int(parts[0]),"ppid":int(parts[1]),"user":parts[2],"command":parts[3]})
+            command=parts[3]
+            if len(command)>256:
+                command=command[:256]
+                command_truncated=True
+            processes.append({"pid":int(parts[0]),"ppid":int(parts[1]),"user":parts[2],"command":command})
         except ValueError:
             continue
-    info={"processes":processes,"count":len(processes)}
+        if len(processes)>=4096:
+            rows_truncated=True
+            break
+    info={"processes":processes,"count":len(processes),
+          "output_truncated":rows_truncated or command_truncated,
+          "binary":resolved}
     add_event("local_check","Local process listing",
               __import__("json").dumps(info,ensure_ascii=False),
               "local:runtime","info",True,info)
