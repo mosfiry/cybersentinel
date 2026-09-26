@@ -1,4 +1,4 @@
-r.interpret(
+f.interpreter.interpret(
             mission=mission.to_dict(),
             plan=mission.plan.to_dict(),
             current_step=step.to_dict(),
@@ -225,5 +225,4 @@ r.interpret(
                         try:
                             proof = self._derive_execution_proof(mission, proposal, argument, decision, plan_hash=plan.plan_fingerprint if plan is not None else None)
                             mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
-                        except Exception as exc:
-         
+                        except Exception as ex

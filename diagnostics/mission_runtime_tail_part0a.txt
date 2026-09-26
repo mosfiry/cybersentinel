@@ -1,4 +1,4 @@
-LEN 57266
+LEN 61343
 from __future__ import annotations
 
 from dataclasses import replace
@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 import hashlib
 import json
+import uuid
 
 from .mission import Mission, MissionStatus, MissionStore
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
@@ -246,4 +247,4 @@ class MissionRuntime:
         previous = mission.observations[-2] if len(mission.observations) > 1 else None
         if not should_interpret_observation(observation, previous=previous):
             return None
-        proposal = self.interprete
+        proposal = sel

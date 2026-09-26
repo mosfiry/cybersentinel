@@ -1,4 +1,4 @@
-tus") == "in_flight":
+{}).get("status") == "in_flight":
             action_id = str(mission.checkpoint.get("action_id", ""))
             mission.error = "in-flight action outcome is unknown; reconciliation required"
             mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id})
@@ -38,6 +38,44 @@ tus") == "in_flight":
         if any(item.get("action_id") == action_id and item.get("status") == "completed" for item in mission.action_history):
             mission.current_step += 1
             mission.transition(MissionStatus.READY, "idempotent action already completed")
+            return self.store.save(mission)
+
+        # B3-C5-A/B (B3-H2, B3-H3): the legacy slice path executes only
+        # through the canonical typed ExecutionPlan derived from the Owner
+        # budget (reconstructed from the Owner-minted snapshot) intersected
+        # with the validated legacy plan steps. The legacy Plan/PlanStep is
+        # a compatibility representation: any step that is not part of the
+        # derived canonical plan is deterministically rejected BEFORE the
+        # executor is called (no Owner -> Legacy Plan -> Handler path).
+        from security.execution_plan_runtime import bind_execution_plan, gate_action_against_plan, legacy_plan_effective_tools, owner_budget_from_snapshot
+        try:
+            owner_budget = owner_budget_from_snapshot(mission)
+            _effective_tools, canonical_plan = legacy_plan_effective_tools(owner_budget, mission.plan, request_id=mission.request_id)
+        except Exception as exc:
+            mission.error = f"canonical execution plan derivation failed: {exc}"
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission.error, "step_id": step.step_id})
+            mission.emit(EventType.EXECUTION_REJECTED, step_id=step.step_id, data={"code": "PLAN_INVALID", "reason": mission.error})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission.error)
+            return self.store.save(mission)
+        if canonical_plan is None:
+            mission.error = "no canonical ExecutionPlan can be derived from the current legacy plan; execution fails closed"
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission.error, "step_id": step.step_id})
+            mission.emit(EventType.EXECUTION_REJECTED, step_id=step.step_id, data={"code": "PLAN_MISMATCH", "reason": mission.error})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission.error)
+            return self.store.save(mission)
+        stored_plan = mission.progress.get("execution_plan") or {}
+        if not isinstance(stored_plan, dict) or stored_plan.get("plan_fingerprint") != canonical_plan.plan_fingerprint:
+            bind_execution_plan(mission, canonical_plan)
+        step_arguments = dict(step.retry_policy or {}).get("arguments")
+        if not isinstance(step_arguments, dict):
+            step_arguments = {}
+        gate_ok, gate_code, gate_reason = gate_action_against_plan(canonical_plan, action_id=step.step_id, tool_name=step.action, arguments=step_arguments)
+        mission.emit(EventType.AUTHORIZATION_CHECKED, step_id=step.step_id, data={"allowed": gate_ok, "reason": gate_reason if not gate_ok else "canonical execution plan membership verified"})
+        if not gate_ok:
+            mission.error = f"{gate_code}: {gate_reason}"
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission.error, "step_id": step.step_id})
+            mission.emit(EventType.EXECUTION_REJECTED, step_id=step.step_id, data={"code": gate_code, "reason": gate_reason})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission.error)
             return self.store.save(mission)
 
         allowed, reason = self.authorizer(mission, step)
@@ -101,6 +139,7 @@ tus") == "in_flight":
                 mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": strategy_decision.reason})
                 mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": strategy_decision.reason})
                 mission.plan = new_plan
+                mission.progress.pop("execution_plan", None)  # B3-C5-A: replan drops the stale canonical binding; proofs bound to the previous canonical identity fail closed
                 mission.current_step = 0
                 mission.retry_count = 0
                 mission.transition(MissionStatus.READY, "informative observation caused replan", plan_version=new_plan.version)
@@ -133,6 +172,7 @@ tus") == "in_flight":
             mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": "failure observation"})
             mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint})
             mission.plan = new_plan
+            mission.progress.pop("execution_plan", None)  # B3-C5-A: replan drops the stale canonical binding; proofs bound to the previous canonical identity fail closed
             mission.current_step = 0
             mission.retry_count = 0
             mission.transition(MissionStatus.READY, "new plan persisted", plan_version=new_plan.version)
@@ -143,7 +183,15 @@ tus") == "in_flight":
         return self.store.save(mission)
 
     def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:
-        limit = max_slices or self._load(mission_id).max_iterations
+        mission = self._load(mission_id)
+        limit = max_slices or mission.max_iterations
+        if not mission.is_terminal:
+            # B3-C5-D: one fresh execution run identity per completion run.
+            # MissionExecutionBoundary reads this live run id into every
+            # slice-path proof, so a proof issued in one run can never
+            # validate or execute in a later run of the same mission.
+            mission.progress["execution_run_id"] = "run-" + hashlib.sha256((mission.mission_id + ":" + mission.request_id + ":" + uuid.uuid4().hex).encode()).hexdigest()[:20]
+            self.store.save(mission)
         for _ in range(limit):
             if heartbeat is not None:
                 heartbeat()
