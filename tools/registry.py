@@ -58,8 +58,7 @@ class ToolSpec:
             "output_schema": self.output_schema or {"type": "object"},
             "risk_class": self.risk_class,
             "required_authorization": self.required_authorization,
-            "network
-_access": self.network_access,
+            "network_access": self.network_access,
             "filesystem_access": self.filesystem_access,
             "process_access": self.process_access,
             "credential_access": self.credential_access,
@@ -121,8 +120,7 @@ def _search(argument):
     if ":" in query:
         parts = query.split(":", 1)
         scope_str = parts[0].lower()
-        query
- = parts[1].strip()
+        query = parts[1].strip()
 
         # Map scope string to SearchScope
         scope_map = {
@@ -185,8 +183,7 @@ def _watch(argument):
 def _unwatch(argument):
     from core.db import remove_watch, watches
     remove_watch(argument or "")
-    return {"keyword": argument, "watches": w
-atches()}
+    return {"keyword": argument, "watches": watches()}
 
 
 def _run_project_tests(argument, *, workspace=None):
@@ -225,23 +222,22 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
-        registry[spec.n
-ame] = spec
+        registry[spec.name] = spec
     return registry
 
 
 REGISTRY = build_registry([
-    ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status),
-    ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel),
-    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel),
-    ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security),
-    ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info),
-    ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search),
-    ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch),
-    ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch),
-    ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests),
-    ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
-    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True),
+    ToolSpec("status", "ÙØ±Ø§Ø¡Ø© Ø­Ø§ÙØ© Ø§ÙØ®Ø¯ÙØ© ÙØ§ÙØ£Ø­Ø¯Ø§Ø« Ø§ÙØªØ¯ÙÙÙÙØ© Ø§ÙØ£Ø®ÙØ±Ø©", "read", True, None, _status),
+    ToolSpec("latest_intel", "ÙØ±Ø§Ø¡Ø© Ø§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø§ÙØªÙØ¯ÙØ¯Ø§Øª Ø§ÙÙØ¬ÙØ¹Ø©", "read", True, None, _latest_intel),
+    ToolSpec("refresh_intel", "Ø¬ÙØ¹ Ø§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø¯ÙØ§Ø¹ÙØ© Ø¶Ø¯ Ø§ÙØªÙØ¯ÙØ¯Ø§Øª", "network-read", True, None, _refresh_intel),
+    ToolSpec("local_security_check", "ÙØ­Øµ ÙØ³ØªÙØ¹Ù TCP Ø§ÙÙØ­ÙÙØ©", "read", True, None, _local_security),
+    ToolSpec("local_system_info", "ÙØ±Ø§Ø¡Ø© ÙØ¹ÙÙÙØ§Øª Ø§ÙÙØ¸Ø§Ù Ø§ÙÙØ­ÙÙ", "read", True, None, _system_info),
+    ToolSpec("search", "Ø¨Ø­Ø« ÙÙ Ø§ÙØ£Ø­Ø¯Ø§Ø« ÙØ§ÙØ§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø§ÙÙØ­ÙÙØ©", "read", True, str, _search),
+    ToolSpec("watch", "Ø¥Ø¶Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _watch),
+    ToolSpec("unwatch", "Ø¥Ø²Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _unwatch),
+    ToolSpec("run_project_tests", "ØªØ´ØºÙÙ pytest -q Ø¯Ø§Ø®Ù Ø¬Ø°Ø± Ø§Ø®ØªØ¨Ø§Ø± Ø§ÙÙØ´Ø±ÙØ¹ Ø§ÙÙØ­Ø¯Ø¯", "bounded-exec", True, str, _run_project_tests),
+    ToolSpec("red_team_assess", "ØªÙÙÙÙ ÙØ¬ÙÙÙ Ø¯ÙØ§Ø¹Ù ÙÙÙØ§ÙÙ ÙÙØ·; ÙØ§ ÙÙÙØ° Ø§Ø³ØªØºÙØ§ÙØ§Ù Ø£Ù Ø£ÙØ±Ø© ÙØ¸Ø§Ù", "analysis", True, str, _red_team_assess, True),
+    ToolSpec("scoped_http_probe", "ÙØ±Ø§ÙØ¨Ø© HTTP ÙØ­Ø¯ÙØ¯Ø© ÙØ§ ØªØ¹ÙÙ Ø¥ÙØ§ ÙØ¹ Scope Snapshot ÙTarget ÙØµØ§Ø¯Ù Ø¹ÙÙÙ", "network-read", True, str, _scoped_http_probe, False, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -264,8 +260,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             parameters["required"] = ["query"]
         definitions.append({
             "name": spec.name,
-            "descriptio
-n": spec.description[:512],
+            "description": spec.description[:512],
             "risk_class": spec.risk_class,
             "owner_required": spec.requires_owner,
             "parameters": parameters,
@@ -295,8 +290,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
         raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: {resolved_class} execution requires an ExecutionAuthorizationProof")
     proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id, run_id=execution_run_id)
     if not proof_ok:
-   
-     raise PermissionError(f"{proof_code}: {proof_reason}")
+        raise PermissionError(f"{proof_code}: {proof_reason}")
     if str(getattr(execution_proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != resolved_class:
         raise PermissionError(f"{RejectionCode.EXECUTION_CLASS_MISMATCH.value}: proof execution class {getattr(execution_proof, 'execution_class', '')} does not match {resolved_class} execution")
     decision_valid = False
@@ -319,7 +313,6 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     if spec.scope_required:
         if not isinstance(scope_context, dict):
             raise PermissionError("scope context required")
-
         required = {"program_id", "target_id", "scope_snapshot_id", "url"}
         if not required.issubset(scope_context):
             raise PermissionError("incomplete scope context")
@@ -349,8 +342,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     if not valid:
         raise ValueError(reason)
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix
-=f"cybersentinel-{name}")
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
         # Legacy compatibility snapshot minting was removed: the registry must
         # never create authorization from a decision field. A governed

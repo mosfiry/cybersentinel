@@ -47,8 +47,7 @@ class MissionExecutionBoundary:
         live_run = str((progress.get("model_run_id") if isinstance(progress, dict) else "") or ((progress.get("execution_run_id") if isinstance(progress, dict) else "")) or "")
         return ExecutionAuthorizationProof.derive(
             execution_class=ExecutionClass.MISSION_BOUND.value,
-            mission_id=missio
-n.mission_id,
+            mission_id=mission.mission_id,
             request_id=mission.request_id,
             tool=tool,
             argument=argument,
@@ -88,8 +87,7 @@ class OwnerDirectBoundary:
     """
 
     @staticmethod
-    def derive(*, tool: str, argument
-: Any, decision: Any, request_id: str, tool_call_id: str = "", scope_context: Any = None) -> ExecutionAuthorizationProof:
+    def derive(*, tool: str, argument: Any, decision: Any, request_id: str, tool_call_id: str = "", scope_context: Any = None) -> ExecutionAuthorizationProof:
         return ExecutionAuthorizationProof.derive(
             execution_class=ExecutionClass.OWNER_DIRECT.value,
             mission_id="",

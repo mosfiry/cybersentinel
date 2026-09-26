@@ -49,8 +49,7 @@ class RejectionCode(str, Enum):
     SNAPSHOT_MISSING = "SNAPSHOT_MISSING"
     SNAPSHOT_INVALID = "SNAPSHOT_INVALID"
     SNAPSHOT_EXPIRED = "SNAPSHOT_EXPIRED"
-    SN
-APSHOT_MISMATCH = "SNAPSHOT_MISMATCH"
+    SNAPSHOT_MISMATCH = "SNAPSHOT_MISMATCH"
     TOOL_NOT_ALLOWED = "TOOL_NOT_ALLOWED"
     ACTION_NOT_ALLOWED = "ACTION_NOT_ALLOWED"
     FORBIDDEN_ACTION = "FORBIDDEN_ACTION"
@@ -106,8 +105,7 @@ def classify_snapshot_reason(reason: str) -> RejectionCode:
     text = str(reason)
     if "expired" in text or "not active" in text:
         return RejectionCode.SNAPSHOT_EXPIRED
- 
-   if "actions or tools outside" in text:
+    if "actions or tools outside" in text:
         return RejectionCode.TOOL_NOT_ALLOWED
     if "workspace boundary mismatch" in text:
         return RejectionCode.WORKSPACE_BOUNDARY_MISMATCH
@@ -150,8 +148,7 @@ class ExecutionProofError(PermissionError):
     """Raised when proof derivation cannot bind an execution to its authorization."""
 
     def __init__(self, code: str, reason: str):
-        super
-().__init__(f"{code}: {reason}")
+        super().__init__(f"{code}: {reason}")
         self.code = str(code)
         self.reason = str(reason)
 
@@ -211,8 +208,7 @@ class ExecutionAuthorizationProof:
 
     def is_expired(self, *, at: str | None = None) -> bool:
         moment = _parse(at or _now())
-        return not (_parse(self.create
-d_at) <= moment < _parse(self.expires_at))
+        return not (_parse(self.created_at) <= moment < _parse(self.expires_at))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -248,8 +244,7 @@ d_at) <= moment < _parse(self.expires_at))
           status and revision, the plan fingerprint, the scope fingerprint and
           the typed Owner-minted MissionAuthorizationSnapshot (embedded for
           boundary re-validation) are all mandatory. The AuthorizationDecision
-          is boun
-d when one exists.
+          is bound when one exists.
         - OWNER_DIRECT: the owner-authenticated non-mission execution class
           (chat / task paths). The typed AuthorizationDecision that authorized
           the execution and its request identity are mandatory; the decision
@@ -276,8 +271,7 @@ d when one exists.
                 raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires mission identity")
             if not str(mission_status):
                 raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires mission lifecycle status")
-            if not str(plan_hash 
-or ""):
+            if not str(plan_hash or ""):
                 raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires the mission plan fingerprint")
             if not snapshot.is_active(at=at):
                 raise ExecutionProofError(RejectionCode.SNAPSHOT_EXPIRED.value, "authorization snapshot expired or not active")
@@ -306,8 +300,7 @@ or ""):
             embedded = {}
             bounded = moment + timedelta(seconds=max(1, int(ttl_seconds)))
             expires_at = bounded.isoformat()
-            mission_
-id = ""
+            mission_id = ""
             proof_status = ExecutionClass.OWNER_DIRECT.value
             proof_revision = 0
             proof_run = ""
@@ -347,8 +340,7 @@ id = ""
         if not isinstance(proof, ExecutionAuthorizationProof):
             return False, "execution proof is not a typed ExecutionAuthorizationProof", RejectionCode.PROOF_INVALID.value
         if proof._computed_binding_hash() != proof.execution_binding_hash:
-            return False, "execution binding hash mis
-match", RejectionCode.PROOF_INVALID.value
+            return False, "execution binding hash mismatch", RejectionCode.PROOF_INVALID.value
         expected = hmac.new(_DECISION_SECRET, proof.execution_binding_hash.encode("utf-8"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, proof.proof_signature):
             return False, "execution proof signature mismatch", RejectionCode.PROOF_INVALID.value
@@ -374,8 +366,7 @@ match", RejectionCode.PROOF_INVALID.value
         if not proof.plan_hash:
             return False, "mission-bound proof is missing its plan binding", RejectionCode.PROOF_INCOMPLETE.value
         if proof.mission_status not in EXECUTION_ALLOWED_MISSION_STATUSES:
-  
-          return False, f"mission status {proof.mission_status} cannot execute tools", RejectionCode.LIFECYCLE_MISMATCH.value
+            return False, f"mission status {proof.mission_status} cannot execute tools", RejectionCode.LIFECYCLE_MISMATCH.value
         try:
             embedded = MissionAuthorizationSnapshot.from_dict(dict(proof.snapshot or {}))
         except (MissionAuthorizationError, KeyError, TypeError, ValueError, PermissionError):
@@ -398,8 +389,7 @@ match", RejectionCode.PROOF_INVALID.value
         if not isinstance(proof, ExecutionAuthorizationProof):
             return False, "execution proof is not a typed ExecutionAuthorizationProof", RejectionCode.PROOF_INVALID.value
         if str(getattr(proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != ExecutionClass.MISSION_BOUND.value:
-            return 
-False, "owner-direct proof cannot execute mission-bound tools", RejectionCode.EXECUTION_CLASS_MISMATCH.value
+            return False, "owner-direct proof cannot execute mission-bound tools", RejectionCode.EXECUTION_CLASS_MISMATCH.value
         if str(mission.mission_id) != proof.mission_id:
             return False, "execution proof belongs to another mission", RejectionCode.PROOF_BINDING_MISMATCH.value
         if getattr(mission, "request_id", "") and proof.request_id != str(mission.request_id):
@@ -424,8 +414,7 @@ False, "owner-direct proof cannot execute mission-bound tools", RejectionCode.EX
         if current.authorization_hash != proof.snapshot_hash or int(current.version) != proof.snapshot_version:
             return False, "mission authorization snapshot changed after proof derivation", RejectionCode.SNAPSHOT_MISMATCH.value
         if not current.is_active(at=at):
-            return False, "authorization snapsho
-t expired or not active", RejectionCode.SNAPSHOT_EXPIRED.value
+            return False, "authorization snapshot expired or not active", RejectionCode.SNAPSHOT_EXPIRED.value
         return True, "authorized", ""
 
 
