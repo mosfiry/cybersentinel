@@ -156,7 +156,7 @@ def test_live_local_reachability_full_chain(tmp_path, execute_spy):
     proposal = _proposal(mission, execution_run_id="run-1")
     bridge = OffensiveActionBridge()
     record = bridge.run(proposal, mission=mission, adapter=LOCAL_PROCESS_INFO_ADAPTER)
-    assert record.status == "EXECUTED"
+    assert record.status == "EXECUTED", record.result.error_state
     assert record.executed is True
     assert execute_spy == ["local_process_info"]
     result = record.result
@@ -183,7 +183,7 @@ def test_live_network_reachability_scope_authorized(tmp_path, execute_spy, count
         risk_class="network_read",
     )
     record = OffensiveActionBridge().run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
-    assert record.status == "EXECUTED"
+    assert record.status == "EXECUTED", record.result.error_state
     assert counting_handler.calls == 1
     assert execute_spy == ["scoped_http_probe"]
     # The GUARD's canonical url is the executed argument (never the raw text).
@@ -338,7 +338,7 @@ def test_tool_output_is_observation_not_authority(tmp_path, execute_spy, countin
     proposal = _proposal(mission, tool="scoped_http_probe", target_kind="network", target_url="https://target.example/", target_id="t1")
     bridge = OffensiveActionBridge()
     record = bridge.run(proposal, mission=mission, adapter=ScopedHttpProbeAdapter(), scope_snapshot=saved_scope_snapshot)
-    assert record.status == "EXECUTED"
+    assert record.status == "EXECUTED", record.result.error_state
     # A second action pointing at an endpoint the OBSERVED output mentions
     # is refused: observation is never authorization (INV-OFF-2/INV-OFF-5).
     smuggled = _proposal(
