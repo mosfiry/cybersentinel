@@ -1,0 +1,228 @@
+f.interpreter.interpret(
+            mission=mission.to_dict(),
+            plan=mission.plan.to_dict(),
+            current_step=step.to_dict(),
+            action=step.action,
+            observation=observation,
+            evidence=mission.evidence,
+            hypothesis_state=mission.hypotheses,
+            knowledge_context=mission.knowledge_context,
+            conversation_context=(),
+        )
+        engine = HypothesisEngine(HypothesisState.from_dict(item) for item in mission.hypotheses)
+        hypothesis_updates = engine.apply(proposal, goal_verified=False, deterministic_validation=False)
+        mission.hypotheses = engine.snapshot()
+        if proposal.new_evidence:
+            for item in proposal.new_evidence:
+                normalized = dict(item)
+                normalized.setdefault("criterion_id", str(normalized.get("evidence_id") or proposal.observation_id))
+                normalized.setdefault("passed", True)
+                normalized.setdefault("source", "observation_interpreter")
+                normalized.setdefault("result", dict(item))
+                normalized.setdefault("provenance", {"mission_id": mission.mission_id, "observation_id": proposal.observation_id, "authority": None})
+                mission.evidence.append(normalized)
+        mission.knowledge_context = list(mission.knowledge_context)
+        mission.interpretations.append(proposal.to_dict())
+        mission.emit(EventType.OBSERVATION_INTERPRETED, step_id=step.step_id, data=proposal.to_dict())
+        if hypothesis_updates:
+            mission.emit(EventType.HYPOTHESIS_UPDATED, step_id=step.step_id, data={"updates": hypothesis_updates})
+        scope_blocked = False
+        target = observation.get("target")
+        allowed_targets = (mission.scope_snapshot or {}).get("allowed_targets") if isinstance(mission.scope_snapshot, dict) else None
+        if target and isinstance(allowed_targets, (list, tuple, set)) and str(target) not in {str(item) for item in allowed_targets}:
+            scope_blocked = True
+        decision = decide_strategy(proposal, action_success=success, scope_blocked=scope_blocked)
+        mission.strategy_decisions.append(decision.to_dict())
+        strategy = StrategyState.from_dict(mission.strategy_state, objective=mission.objective)
+        if decision.next_strategy:
+            strategy.current_strategy = decision.next_strategy
+            strategy.version += 1
+        strategy.known_facts.extend(proposal.facts)
+        strategy.unknowns.extend(proposal.unknowns)
+        strategy.required_evidence.extend(proposal.required_next_evidence)
+        mission.strategy_state = strategy.to_dict()
+        mission.emit(EventType.STRATEGY_DECIDED, step_id=step.step_id, data=decision.to_dict())
+        return decision
+
+    def reconcile_in_flight(self, mission_id: str, *, executed: bool, observation: dict[str, Any] | None = None) -> Mission:
+        """Resolve an ambiguous external side effect without silently replaying it.
+
+        ``executed=True`` records the external receipt as completed.  ``False``
+        records that reconciliation found no side effect and permits one safe
+        retry.  The runtime never infers either outcome from a process crash.
+        """
+        mission = self._load(mission_id)
+        checkpoint = dict(mission.checkpoint or {})
+        if checkpoint.get("status") != "in_flight":
+            raise ValueError("mission has no in-flight action requiring reconciliation")
+        action_id = str(checkpoint.get("action_id", ""))
+        step_id = str(checkpoint.get("step_id", ""))
+        if executed:
+            result = dict(observation or {"success": True, "source": "external_reconciliation"})
+            result.setdefault("success", True)
+            result.update({"action_id": action_id, "step_id": step_id, "type": "reconciled_observation"})
+            mission.record_observation(result)
+            mission.record_action(action_id, step_id, "completed", result)
+            mission.checkpoint = {**checkpoint, "status": "completed", "reconciled": True}
+            mission.evidence.append({"criterion_id": result.get("criterion_id", step_id), "passed": bool(result.get("success")), "source": result.get("source", "external_reconciliation"), "result": result, "provenance": {"mission_id": mission.mission_id, "action_id": action_id, "reconciled": True}})
+            mission.current_step += 1
+            mission.transition(MissionStatus.READY, "in-flight action reconciled as executed", action_id=action_id)
+        else:
+            mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
+            mission.transition(MissionStatus.READY, "in-flight action reconciled as not executed", action_id=action_id)
+        return self.store.save(mission)
+
+    def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20) -> Mission:
+        """Run a real model/tool/observation loop for a durable mission."""
+        from security.authorization import authorize_tool
+        from security.authorization_context import AuthorizationContext
+        from security.execution_proof import ExecutionAuthorizationProof
+        from tools.registry import execute as execute_tool
+
+        mission = self._load(mission_id)
+        if mission.is_terminal:
+            return mission
+        if (mission.checkpoint or {}).get("status") in {"in_flight", "in_flight_parallel"}:
+            mission.error = "in-flight native tool outcome is unknown; reconciliation required"
+            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+            return self.store.save(mission)
+        authorization_ok, authorization_reason = self._mission_authorization(mission)
+        if not authorization_ok:
+            from security.execution_proof import classify_snapshot_reason
+            code = classify_snapshot_reason(authorization_reason).value
+            mission.error = f"{code}: {authorization_reason}"
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
+            mission.emit(EventType.EXECUTION_REJECTED, data={"code": code, "reason": authorization_reason})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
+            return self.store.save(mission)
+        run_id = run_id or str(mission.progress.get("model_run_id") or hashlib.sha256((mission.mission_id + mission.request_id).encode()).hexdigest()[:20])
+        mission.progress["model_run_id"] = run_id
+        progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
+        seen = set(str(item) for item in progress.setdefault("seen_call_ids", []))
+        auth_context = None
+        if mission.authorization_context:
+            try:
+                auth_context = AuthorizationContext.from_dict(dict(mission.authorization_context))
+            except (KeyError, TypeError, ValueError, PermissionError):
+                auth_context = None
+
+        for _ in range(max_turns):
+            turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
+            current_step = mission.current_plan_step
+            assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools)
+            progress["last_context_hash"] = assembled.context_hash
+            progress["context_compaction"] = {
+                "compacted": assembled.compacted,
+                "compacted_items": assembled.compacted_items,
+                "owner_objective": mission.objective,
+                "mission_id": mission.mission_id,
+                "scope_snapshot": mission.scope_snapshot,
+                "authorization_context": mission.authorization_context,
+                "evidence_provenance": [item.get("provenance", {}) for item in mission.evidence],
+                "tool_call_ids": [item.get("tool_call_id", "") for item in progress.get("tool_results", ())],
+            }
+            messages = assembled.messages
+            try:
+                turn = model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version)
+            except ProviderError as exc:
+                kind = getattr(exc, "kind", "PROVIDER_FAILURE")
+                failure = {"class": FailureClass.PROVIDER.value, "kind": str(kind), "reason": str(exc), "turn_id": turn_id, "run_id": run_id}
+                mission.failures.append(failure)
+                mission.progress.setdefault("model_failures", []).append(failure)
+                mission.emit(EventType.FAILURE_DETECTED, data=failure)
+                mission.error = f"model provider failure: {kind}"
+                mission.retry_count += 1
+                action = self.recovery_policy.action_for(FailureClass.PROVIDER, mission.retry_count - 1)
+                mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.PROVIDER.value, "kind": str(kind), "recovery": action.value})
+                if action is RecoveryAction.RETRY:
+                    mission.transition(MissionStatus.READY, "provider failure; bounded retry selected")
+                elif action is RecoveryAction.REPLAN:
+                    mission.transition(MissionStatus.REPLANNING, "provider failure; replan selected")
+                else:
+                    mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
+                self.store.save(mission)
+                if mission.is_terminal:
+                    return mission
+                continue
+            if auth_context is not None and turn.tool_calls:
+                from dataclasses import replace as replace_dataclass
+                turn = replace_dataclass(turn, tool_calls=tuple(
+                    replace_dataclass(
+                        proposal,
+                        request_id=mission.request_id,
+                        authorization_context_id=auth_context.owner_evidence_fingerprint,
+                        scope_snapshot_id=auth_context.scope_snapshot.snapshot_id if auth_context.scope_snapshot else "",
+                    )
+                    for proposal in turn.tool_calls
+                ))
+            progress["turns"].append(turn.to_dict())
+            mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
+            if not turn.tool_calls:
+                progress["last_model_content"] = turn.content
+                progress["last_model_finish_reason"] = turn.finish_reason
+                verification = self.verifier(mission)
+                mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
+                if verification.verified:
+                    mission.transition(MissionStatus.GOAL_COMPLETED, "model final accepted with deterministic evidence", verification=mission.verification_state)
+                    mission.emit(EventType.GOAL_VERIFIED, data=mission.verification_state)
+                    mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state, "model_final": turn.content})
+                else:
+                    mission.error = "model final lacked deterministic goal evidence"
+                    mission.transition(MissionStatus.READY, mission.error)
+                return self.store.save(mission)
+            plan = None
+            if turn.tool_calls:
+                # B3-C4B: model proposals become executable only by deriving
+                # the canonical ExecutionPlan (Owner Budget intersect
+                # validated ActionIntents) and executing against it.
+                survivors = self._turn_survivors(mission, turn.tool_calls, run_id, seen)
+                if survivors:
+                    try:
+                        plan = self._turn_execution_plan(mission, survivors)
+                    except Exception as exc:
+                        self._reject_turn_plan_derivation(mission, survivors, exc, progress)
+                        return self.store.save(mission)
+            if len(turn.tool_calls) > 1:
+                self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, current_step=current_step, progress=progress, seen=seen, plan=plan)
+                self.store.save(mission)
+                continue
+            for proposal in turn.tool_calls:
+                if proposal.mission_id and proposal.mission_id != mission.mission_id:
+                    result = ToolCallResult(proposal, False, error="tool call belongs to another mission")
+                elif proposal.run_id and proposal.run_id != run_id:
+                    result = ToolCallResult(proposal, False, error="tool call belongs to another run")
+                elif proposal.tool_call_id in seen:
+                    result = ToolCallResult(proposal, False, error="duplicate tool call rejected; prior result is authoritative")
+                else:
+                    seen.add(proposal.tool_call_id)
+                    progress["seen_call_ids"].append(proposal.tool_call_id)
+                    argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
+                    snapshot_ok, snapshot_code, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+                    if not snapshot_ok:
+                        mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+                        mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{snapshot_code}: {snapshot_reason}"})
+                        mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": snapshot_code, "reason": snapshot_reason})
+                        result = ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}")
+                        progress["tool_results"].append(result.to_dict())
+                        continue
+                    if plan is not None:
+                        from security.execution_plan_runtime import gate_action_against_plan, proposal_action_identity
+                        gate_ok, gate_code, gate_reason = gate_action_against_plan(plan, action_id=proposal_action_identity(proposal), tool_name=proposal.name, arguments=proposal.arguments if isinstance(proposal.arguments, dict) else {})
+                        if not gate_ok:
+                            mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+                            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{gate_code}: {gate_reason}"})
+                            mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": gate_code, "reason": gate_reason})
+                            result = ToolCallResult(proposal, False, error=f"{gate_code}: {gate_reason}")
+                            progress["tool_results"].append(result.to_dict())
+                            continue
+                    decision = authorize_tool([proposal.name, argument], context=auth_context)
+                    mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+                    mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
+                    if not decision.allowed:
+                        result = ToolCallResult(proposal, False, error=decision.reason)
+                    else:
+                        result = ToolCallResult(proposal, False)
+                        try:
+                            proof = self._derive_execution_proof(mission, proposal, argument, decision, plan_hash=plan.plan_fingerprint if plan is not None else None)
+                            mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+                        except Exception as ex
