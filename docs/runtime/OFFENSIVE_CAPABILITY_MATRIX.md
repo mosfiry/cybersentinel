@@ -1,6 +1,6 @@
 # Offensive Capability Matrix — CyberSentinel X
 
-Branch: `security/b3-four-layer-intent` · Last verified CI: 1263 passed / 1 skipped / 0 failed at `a01fd4fd1308` (2026-09-26).
+Branch: `security/b3-four-layer-intent` · Last verified CI: 1278 passed / 1 skipped / 0 failed at `45fefef721ae` (2026-09-26).
 
 This matrix separates REASONING capability from EXECUTABLE capability and states the exact authorization path each capability requires. A capability is LIVE only when the live runtime can reach it through the full chain:
 
@@ -17,7 +17,8 @@ OWNER_INSTRUCTION > SYSTEM_PLATFORM > OWNER_POLICY > DETERMINISTIC_ENFORCEMENT >
 | Offensive planning / ScopeGuard | cyber/offensive.py | DETERMINISTIC GUARD | n/a (enforced by the bridge) | mandatory for network actions | typed ScopeSnapshot; canonical url only | guard decision in the bridge record | LIVE (enforced by the bridge; battery-tested) |
 | Local process observation | tools/registry.py `local_process_info` + security/tool_adapter.py LocalProcessInfoAdapter | EXECUTABLE (local, read-only) | bridge → proof → registry → real `ps` execution | MissionAuthorizationSnapshot + ExecutionAuthorizationProof (MISSION_BOUND) | not network; mission-bound | adapter evidence envelope | LIVE |
 | Scoped HTTP observation | tools/registry.py `scoped_http_probe` (real bounded GET) | EXECUTABLE (network, read-only) | bridge → ScopeGuard → owner AuthorizationDecision → proof → registry scope re-resolution → bounded GET | AuthorizationDecision + ExecutionAuthorizationProof (MISSION_BOUND or OWNER_DIRECT) | typed ScopeSnapshot persisted in the scope store; redirects observed, never followed | adapter evidence envelope | LIVE |
-| DNS resolution / TLS inspection / port & service enumeration / technology fingerprinting | not present | EXECUTABLE (planned) | — | — | — | — | PLANNED (not registered; not claimed) |
+| Scoped DNS observation | tools/registry.py `scoped_dns_lookup` (real bounded resolution at a single seam) | EXECUTABLE (network, read-only) | bridge → ScopeGuard → owner AuthorizationDecision → proof → registry scope re-resolution → bounded resolution of the canonical url's host | AuthorizationDecision + ExecutionAuthorizationProof (MISSION_BOUND or OWNER_DIRECT) | typed ScopeSnapshot persisted in the scope store; the canonical url's host is the only name resolved; resolved addresses are observed data, never targets | adapter evidence envelope | LIVE |
+| TLS inspection / port & service enumeration / technology fingerprinting | not present | EXECUTABLE (planned) | — | — | — | — | PLANNED (not registered; not claimed) |
 | Reverse engineering / artifact analysis (PE/ELF metadata, strings, imports, entropy) | static malware triage exists (cyber/malware.py) | ANALYSIS (local) | not wired into the bridge | — | — | — | ANALYSIS-ONLY (no execution claim) |
 | Vulnerability validation (bounded proof of finding) | not present | EXECUTABLE (planned) | — | — | — | — | PLANNED |
 | Dynamic malware analysis | not present | EXECUTABLE (planned, sandbox-bound) | DynamicAnalysisBackend interface only; NEVER execute samples on the host | — | — | — | PLANNED (interface not yet designed in code) |
@@ -38,4 +39,5 @@ OWNER_INSTRUCTION > SYSTEM_PLATFORM > OWNER_POLICY > DETERMINISTIC_ENFORCEMENT >
 
 - tests/test_offensive_bridge.py (17 tests): live reachability through the real registry for both adapters, the feedback loop into OffensiveMind.adapt, and 13 negatives asserting zero execution attempts (execute spy and handler spy empty).
 - tests/test_scoped_http_probe.py (9 tests): real handler bounds at its single network seam — no redirect following, hard timeout, hard size cap, fail-closed classification, argument validation, no authority keys in observations.
-- CI: 1263 passed / 1 skipped / 0 failed at `a01fd4fd1308`.
+- tests/test_scoped_dns_lookup.py (15 tests): real handler bounds at its single DNS seam (deduplication, deterministic ordering, hard record cap, fail-closed resolver errors, argument validation before the seam, no authority keys), plus live bridge reachability with a real typed Owner AuthorizationDecision and a persisted scope snapshot, observed-address scope-smuggling rejection, wrong-tool decision rejection at proof derivation, dry-run. No test performs a real network call.
+- CI: 1278 passed / 1 skipped / 0 failed at `45fefef721ae`.
