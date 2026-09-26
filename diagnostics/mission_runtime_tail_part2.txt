@@ -92,23 +92,35 @@ e retry budget stays enforced (LOGIC/COMPILATION/TEST_FAILURE ->
         # B3-C5-A/B (B3-H2, B3-H3): the legacy slice path executes only
         # through the canonical typed ExecutionPlan derived from the Owner
         # budget (reconstructed from the Owner-minted snapshot) intersected
-        # with the validated legacy plan steps. The legacy Plan/PlanStep is
+        # with the validated current legacy step. The legacy Plan/PlanStep is
         # a compatibility representation: any step that is not part of the
         # derived canonical plan is deterministically rejected BEFORE the
         # executor is called (no Owner -> Legacy Plan -> Handler path).
-        from security.execution_plan_runtime import bind_execution_plan, gate_action_against_plan, legacy_plan_effective_tools, registered_owner_budget_from_snapshot
+        from security.execution_plan_runtime import bind_execution_plan, gate_action_against_plan, legacy_step_execution_plan, registered_owner_budget_from_snapshot
         from security.owner_budget import KNOWN_TOOLS
         try:
             owner_budget = registered_owner_budget_from_snapshot(mission)
-            _effective_tools, canonical_plan = legacy_plan_effective_tools(owner_budget, mission.plan, request_id=mission.request_id)
         except Exception as exc:
             # Deterministic fail closed: the canonical authority view cannot be
             # derived, so nothing may execute (executor/handler never called).
             return self._reject_action_outside_canonical_plan(mission, step, action_id, "PLAN_INVALID", f"canonical execution plan derivation failed: {exc}", FailureClass.AUTHORIZATION)
+        # B3-C5: canonical conversion of the CURRENT legacy step. The C3
+        # ExecutionPlan is first-seen-unique per tool (INV-C4-H1-4), so a
+        # whole-plan conversion collapses repeated same-tool steps into a
+        # single action and every later identical step would fail the
+        # strict identity gate forever. Per-step conversion keeps
+        # acceptance identical (a step may execute iff its tool is
+        # registered and inside the Owner budget: intersection at
+        # derivation, B3-H4) while each repeated step derives its own fresh
+        # canonical identity (INV-C4-H1-5: repetition is a new derivation,
+        # never implicit plan multiplicity).
+        canonical_plan = legacy_step_execution_plan(owner_budget, mission.plan, step, request_id=mission.request_id)
         if canonical_plan is None:
-            # B3-H3: the legacy plan cannot enter any canonical ExecutionPlan;
-            # the malformed proposal fails closed without execution.
-            return self._reject_action_outside_canonical_plan(mission, step, action_id, "PLAN_MISMATCH", "no canonical ExecutionPlan can be derived from the current legacy plan; execution fails closed", FailureClass.LOGIC)
+            # B3-H3: the legacy step cannot enter any canonical
+            # ExecutionPlan (unregistered tool or empty Owner budget
+            # intersection); the proposal fails closed without execution.
+            rejection_class = FailureClass.LOGIC if str(step.action or "").strip() not in KNOWN_TOOLS else FailureClass.AUTHORIZATION
+            return self._reject_action_outside_canonical_plan(mission, step, action_id, "PLAN_MISMATCH", "no canonical ExecutionPlan can be derived for the current legacy step; execution fails closed", rejection_class)
         stored_plan = mission.progress.get("execution_plan") or {}
         if not isinstance(stored_plan, dict) or stored_plan.get("plan_fingerprint") != canonical_plan.plan_fingerprint:
             # The bound plan identity is always the freshly derived canonical
