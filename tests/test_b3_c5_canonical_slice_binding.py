@@ -196,3 +196,51 @@ def test_slice_stale_plan_binding_rejected_after_replan(tmp_path):
     reloaded = runtime._load(mission.mission_id)
     ok, _reason, code = ExecutionAuthorizationProof.validate_against_mission(proof, reloaded)
     assert ok is False and code == RejectionCode.PLAN_MISMATCH.value
+
+
+def test_slice_repeated_same_tool_steps_each_execute(tmp_path):
+    # INV-C4-H1-5: the C3 plan is first-seen-unique per tool, so the slice
+    # path converts the CURRENT legacy step; repeated same-tool steps each
+    # derive their own fresh canonical identity instead of collapsing into
+    # one action that later steps can never match.
+    executor = RecordingExecutor()
+    runtime = _runtime(tmp_path, executor)
+    mission = _mission(runtime, actions=("status", "status", "status"))
+    result = runtime.run_to_completion(mission.mission_id, max_slices=8)
+    assert [call[0] for call in executor.calls] == ["s1", "s2", "s3"]
+    assert result.status is MissionStatus.GOAL_COMPLETED
+
+
+def test_slice_authority_shaped_legacy_arguments_fail_closed_owner_input(tmp_path):
+    # Registered tool inside the Owner budget, but the legacy step carries
+    # authority-shaped arguments (an attempted budget smuggled through
+    # retry_policy): the canonical conversion fails closed, the executor is
+    # never called, and the registered-tool rejection class requests owner
+    # input instead of executing or replanning the smuggled arguments.
+    executor = RecordingExecutor()
+    runtime = _runtime(tmp_path, executor)
+    steps = (PlanStep("s1", "objective", action="status", retry_policy={"arguments": {"owner_budget": ["watch"]}}),)
+    plan = Plan.initial("objective").replan(steps=steps, reason="test")
+    mission = runtime.create("request", "objective", plan, completion_criteria=[{"criterion_id": "goal"}])
+    result = runtime.run_to_completion(mission.mission_id, max_slices=4)
+    assert executor.calls == []
+    assert result.status is MissionStatus.OWNER_INPUT_REQUIRED
+    assert "PLAN_MISMATCH" in str(result.error)
+
+
+def test_slice_legacy_plan_widening_attempt_is_blocked_at_entry(tmp_path):
+    # B3-H3: swapping in a legacy plan whose steps use a tool the Owner
+    # snapshot never allowed is rejected at the mission authorization gate
+    # before any execution (no legacy-plan widening; handler not called).
+    executor = RecordingExecutor()
+    runtime = _runtime(tmp_path, executor)
+    mission = _mission(runtime, actions=("status",))
+    runtime.run_slice(mission.mission_id)
+    assert [call[1] for call in executor.calls] == ["status"]
+    widened = runtime._load(mission.mission_id)
+    widened.plan = Plan.initial("objective").replan(steps=(PlanStep("w1", "objective", action="watch"),), reason="widening")
+    widened.current_step = 0
+    runtime.store.save(widened)
+    result = runtime.run_slice(mission.mission_id)
+    assert [call[1] for call in executor.calls] == ["status"]
+    assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
