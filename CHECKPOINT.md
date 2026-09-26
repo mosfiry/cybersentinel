@@ -223,3 +223,26 @@ ion): e168da58d93b "feat(security): Stage A typed security tool inventory (Layer
 
 - NEXT_SESSION_FIRST_ACTION: verify diagnostics/ci-<this-checkpoint-commit-sha>.md is green at branch HEAD (expected 1263 passed / 1 skipped), then begin P1 reconnaissance family: design and register dns_lookup as a bounded, owner-authorized, scope-bound tool (catalog definition AND runtime registration kept disjoint; adapter + adversarial battery + live bridge test; do NOT build any scheduler/DAG/worker runtime; do NOT touch main; no reset/rebase/squash/force-push).
 - EXACT_RESUME_POINT: Offensive Capability Activation P0 COMPLETE (live bridge + real scoped_http_probe + 17-test bridge battery + 9-test probe battery + phase6c seam fix + capability matrix and checkpoint docs + CI green 1263/1). First incomplete step: P1 dns_lookup observation family per docs/runtime/OFFENSIVE_CAPABILITY_CHECKPOINT.md NEXT_ACTION.
+
+## SESSION 5 (continued) — Offensive Capability Activation, P1: Real Scoped DNS Observation (COMPLETE)
+
+- Branch: security/b3-four-layer-intent
+- Session resumed from the verified checkpoint state 098b9cfe5c26 (CI 1263/1 green; the two later commits were inspected and preserved: d5aa6bdb / b5fe9cd9 are CI status markers only).
+- The local workspace had been reset between sessions; byte-exactness discipline was re-applied from scratch: tools/registry.py rebuilt from its 20-commit patch chain (EVERY intermediate blob SHA verified; final blob 6a794f848f3e11b63c4fa2001a5ae75db1d8b461), agent/offensive_bridge.py from its 4-commit chain (blob 1fb3695a34f553e6f24b5b6117dbe80b5b7f1c31), and docs/runtime/OFFENSIVE_CAPABILITY_MATRIX.md (blob e6dbc0b02579e2078761b7fe5b9140edbb3977f3) — all verified BEFORE any edit.
+
+### Milestone — scoped_dns_lookup is REAL (P1)
+- tools/registry.py: `_scoped_dns_lookup` — a REAL bounded DNS observation behind the same gate sequence as scoped_http_probe. The executed argument is the ScopeGuard's CANONICAL url; the handler extracts the host from that url and resolves exactly that host. Records are deduplicated and deterministically ordered by (family, address); hard record cap SCOPED_DNS_MAX_RECORDS=32; deterministic fail-closed classification (DNS_ARGUMENT_INVALID / DNS_FAILED); a single DNS seam `_dns_resolve` (no shell, no other resolver surface); the time bound is enforced by the registry executor (adapter timeout_seconds=10). Registered as a scope_required, owner+decision-bound network-read tool. Resolved addresses are OBSERVED data only — they can never widen scope (INV-OFF-2).
+- agent/offensive_bridge.py: `ScopedDnsLookupAdapter` — same contract as the probe adapter (bound typed scope context + bound typed Owner AuthorizationDecision; execution ONLY through tools.registry.execute, which re-resolves the persisted scope snapshot and re-verifies the decision binding).
+- tests/test_scoped_dns_lookup.py (15 tests): handler bounds at the faked single seam; catalog/runtime disjointness via DEFAULT_SECURITY_TOOL_INVENTORY; LIVE bridge reachability with a real typed Owner AuthorizationDecision and a persisted scope snapshot (no real network in any test); dry-run; negatives (no scope snapshot, no owner decision, out-of-scope host, observed DNS address never widens scope, wrong-tool decision rejected at proof derivation) — every negative proven pre-execution (execute/handler/seam spies empty).
+
+### Commits and CI (this milestone)
+- b139c07c2c3e feat(tools): scoped_dns_lookup handler + adapter (CI GREEN 1263/1)
+- 9852e2ef0545 test battery (CI RED 2 failed — both test-side defects: the wrong-tool decision is rejected even earlier, at proof derivation, raising ExecutionProofError PROOF_BINDING_MISMATCH instead of returning a REJECTED record; the observed-address test used the counting fixture's empty records instead of the real handler with the faked seam. Production fail-closed correctly in both cases.)
+- 45fefef721ae test fix (CI GREEN 1278/1 — 15 new tests)
+- ec13940c5966 docs: OFFENSIVE_CAPABILITY_MATRIX.md (scoped_dns_lookup LIVE; TLS/port/technology still PLANNED, not claimed) + OFFENSIVE_CAPABILITY_CHECKPOINT.md P1 milestone record
+
+### Security invariants re-verified (evidence-backed)
+- INV-OFF-1..7 unchanged and retested for the DNS family; single execution path; fail-closed before any execution; dry-run executes nothing; catalog/runtime disjointness asserted; observed DNS records are observations, never authorization (adversarial test proves a second action against a resolved address is rejected pre-execution).
+
+- NEXT_SESSION_FIRST_ACTION: verify diagnostics/ci-<this-checkpoint-commit-sha>.md is green at branch HEAD (expected 1278 passed / 1 skipped), then continue P1: design and register the TLS inspection observation family (same bounded, owner-authorized, scope-bound pattern; single seam fakeable in tests; adapter reuse; adversarial + live bridge battery; CI green; checkpoint update), per docs/runtime/OFFENSIVE_CAPABILITY_CHECKPOINT.md NEXT_ACTION. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime.
+- EXACT_RESUME_POINT: P0 + P1(dns_lookup) COMPLETE. First incomplete step: TLS observation family.
