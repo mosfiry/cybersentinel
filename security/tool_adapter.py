@@ -75,7 +75,9 @@ __all__ = [
     "AdapterErrorCode",
     "AdapterPhase",
     "AdapterResult",
+    "LOCAL_PROCESS_INFO_ADAPTER",
     "LOCAL_SYSTEM_INFO_ADAPTER",
+    "LocalProcessInfoAdapter",
     "LocalSystemInfoAdapter",
     "PreparedExecution",
     "ToolAdapter",
@@ -158,10 +160,11 @@ def _rejection_code_from_message(message: str) -> str:
 TOOL_NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
 
 AUTHORITY_OUTPUT_TOKENS = (
-    "authorization", "authorisation", "owner_token", "owner_evidence",
-    "execution_proof", "proof_signature", "authorization_decision",
-    "permission", "grant", "allowed_tools", "scope_expansion",
-    "credential", "secret", "password", "token",
+    "authorization", "authorisation", "owner", "owner_token", "owner_evidence",
+    "execution_proof", "proof", "proof_signature", "authorization_decision",
+    "permission", "grant", "allowed_tools", "scope", "scope_expansion",
+    "policy", "budget", "plan_hash", "plan_fingerprint", "execution_plan",
+    "execution_class", "credential", "secret", "password", "token",
 )
 
 
@@ -681,3 +684,60 @@ class LocalSystemInfoAdapter(ToolAdapter):
 
 
 LOCAL_SYSTEM_INFO_ADAPTER = LocalSystemInfoAdapter()
+
+
+class LocalProcessInfoAdapter(ToolAdapter):
+    """Second concrete adapter: the registered local_process_info tool.
+
+    Local, informational, read-only, non-destructive. Lists local processes
+    through the registered handler (ps -eo, no arguments are ever accepted, so
+    there is no injection or widening surface). It requires the external ps
+    binary: when the binary is unavailable the adapter fails CLOSED in the
+    PREPARE phase (no fallback execution, INV-ADP-4). It reaches execution
+    only through tools.registry.execute with a mission-bound or owner-direct
+    proof; catalog membership plays no role in this authority.
+    """
+
+    tool_name = "local_process_info"
+    required_binary = "ps"
+    timeout_seconds = 15
+
+    def _validate_argument(self, request: ToolAdapterRequest) -> None:
+        # The tool is strictly informational and argument-free: any argument is
+        # an attempt to widen the execution surface and fails closed here.
+        if request.argument is not None:
+            raise ToolAdapterError(
+                AdapterPhase.VALIDATE_INPUT,
+                AdapterErrorCode.INPUT_INVALID,
+                "local_process_info is informational and accepts no argument (widening rejected)",
+                tool=request.tool,
+            )
+
+    def _normalize(self, raw: Any) -> dict[str, Any]:
+        normalized = super()._normalize(raw)
+        processes = normalized.get("processes")
+        if not isinstance(processes, list) or not all(
+            isinstance(record, dict)
+            and isinstance(record.get("pid"), int)
+            and isinstance(record.get("ppid"), int)
+            and isinstance(record.get("user"), str)
+            and isinstance(record.get("command"), str)
+            for record in processes
+        ):
+            raise ToolAdapterError(
+                AdapterPhase.NORMALIZE_OUTPUT,
+                AdapterErrorCode.NORMALIZATION_FAILED,
+                "process listing must be a deterministic list of process records (pid, ppid, user, command)",
+                tool=self.tool_name,
+            )
+        if normalized.get("count") != len(processes):
+            raise ToolAdapterError(
+                AdapterPhase.NORMALIZE_OUTPUT,
+                AdapterErrorCode.NORMALIZATION_FAILED,
+                "process listing count is inconsistent with the record list",
+                tool=self.tool_name,
+            )
+        return normalized
+
+
+LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()
