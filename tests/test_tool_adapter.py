@@ -118,7 +118,9 @@ class CountingHandler:
             time.sleep(self.delay)
         if self.exc is not None:
             raise self.exc
-        return dict(self.result)
+        # Non-dict payloads must pass through untouched so that the failure is
+        # attributed to the NORMALIZE_OUTPUT phase, not to the handler.
+        return dict(self.result) if isinstance(self.result, dict) else self.result
 
 
 def _patch_handler(monkeypatch, **handler_kwargs):
@@ -949,7 +951,19 @@ def test_stage_b_adapter_never_mutates_the_registry():
 
 
 def test_stage_b_adapter_defines_no_subprocess_or_process_surface():
-    source = MODULE_PATH.read_text(encoding="utf-8")
-    for forbidden in ("subprocess", "os.system", "popen", "eval(", "exec("):
-        assert forbidden not in source, f"adapter module must not contain process surface: {forbidden}"
+    """INV-ADP-2/INV-ADP-4: the adapter module has NO process-execution
+    surface. Asserted on the AST, not on substrings: the docstrings may (and
+    must) mention 'subprocess' as a prohibition, but the module may never
+    import a process facility or call one."""
+    forbidden_imports = {"subprocess", "os", "sys", "multiprocessing", "pty", "signal"}
+    forbidden_calls = {"system", "popen", "Popen", "spawn", "spawnl", "spawnv", "run", "call", "check_call", "check_output", "eval", "exec", "__import__"}
+    for node in ast.walk(_adapter_ast()):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name.split(".")[0] not in forbidden_imports, f"forbidden process import: {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            assert (node.module or "").split(".")[0] not in forbidden_imports, f"forbidden process import: {node.module}"
+        elif isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else (node.func.attr if isinstance(node.func, ast.Attribute) else "")
+            assert name not in forbidden_calls, f"forbidden process call: {name}"
 
