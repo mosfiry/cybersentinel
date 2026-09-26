@@ -56,7 +56,7 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
     assert not resolve("snapshot-1", "target-1", "https://target.example.com/api/private").allowed
 
 
-def test_direct_registry_execution_cannot_bypass_scope(snapshot):
+def test_direct_registry_execution_cannot_bypass_scope(snapshot, monkeypatch):
     from security.execution_boundary import OwnerDirectBoundary
 
     # No proof at all: the registry is fail-closed before scope is consulted.
@@ -75,6 +75,29 @@ def test_direct_registry_execution_cannot_bypass_scope(snapshot):
             scope_context=context("https://other.example.com/api"),
         )
     allowed = authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context)
+    # The probe is a REAL bounded observation; the suite never performs real
+    # network calls. The handler's single network seam is faked here so the
+    # allowed execution observes a deterministic in-scope response.
+    class _FakeHeaders:
+        def __init__(self, data):
+            self._data = {str(k).lower(): v for k, v in dict(data).items()}
+
+        def get(self, key, default=None):
+            return self._data.get(str(key).lower(), default)
+
+    class _FakeResponse:
+        def __init__(self, status, headers, body):
+            self.status = status
+            self.headers = _FakeHeaders(headers)
+            self._body = body
+
+        def read(self, n=-1):
+            return self._body[:n] if n >= 0 else self._body
+
+    monkeypatch.setattr(
+        "tools.registry._probe_fetch",
+        lambda request, timeout: _FakeResponse(200, {"Server": "test"}, b"<html>ok</html>"),
+    )
     result = OwnerDirectBoundary.execute(
         tool="scoped_http_probe",        argument="https://target.example.com/api",
         decision=allowed.decision,
