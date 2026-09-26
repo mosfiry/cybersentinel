@@ -230,11 +230,18 @@ class AdapterAuthorization:
 
 @dataclass(frozen=True)
 class PreparedExecution:
-    """Deterministic preparation record; no side effects."""
+    """Deterministic preparation record; no side effects.
+
+    resolved_binary is the ABSOLUTE path resolved once via shutil.which at
+    PREPARE time (fail-closed when unresolvable). It is DISCLOSURE ONLY:
+    the handler independently resolves and pins its own binary path, so this
+    field never drives execution and can never widen authority.
+    """
 
     tool: str
     timeout: int
     required_binary: str | None
+    resolved_binary: str | None = None
     handler_source: str = "tools.registry"
 
 
@@ -393,8 +400,9 @@ class ToolAdapter:
                 "required runtime binary is unavailable: " + str(self.required_binary) + " (fail closed; no fallback execution)",
                 tool=request.tool,
             )
+        resolved = shutil.which(self.required_binary) if self.required_binary is not None else None
         timeout = int(self.timeout_seconds) if self.timeout_seconds is not None else int(spec.timeout)
-        return PreparedExecution(tool=request.tool, timeout=timeout, required_binary=self.required_binary)
+        return PreparedExecution(tool=request.tool, timeout=timeout, required_binary=self.required_binary, resolved_binary=resolved)
 
     # -- Phase 4: dry run (never executes anything) --------------------------
 
@@ -406,6 +414,7 @@ class ToolAdapter:
             "proof_fingerprint": authorization.proof_fingerprint,
             "timeout": prepared.timeout,
             "required_binary": prepared.required_binary,
+            "resolved_binary": prepared.resolved_binary,
             "handler_source": prepared.handler_source,
             "would_execute": True,
         }
