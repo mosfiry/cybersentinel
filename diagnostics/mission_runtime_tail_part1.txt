@@ -1,0 +1,131 @@
+LEN 57266
+                   mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution proof derivation failed: {type(exc).__name__}"})
+                            result = ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution proof derivation failed: {type(exc).__name__}")
+                            proof = None
+                        if proof is None:
+                            progress["tool_results"].append(result.to_dict())
+                            continue
+                        try:
+                            proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.validate_against_mission(proof, mission)
+                            mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": proof_reason})
+                            if not proof_ok:
+                                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": proof_code, "reason": proof_reason})
+                                result = ToolCallResult(proposal, False, error=f"{proof_code}: {proof_reason}")
+                            else:
+                                mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
+                                self.store.save(mission)
+                                raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, execution_proof=proof)
+                                observation = dict(raw or {})
+                                observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+                                mission.record_observation(observation)
+                                if current_step is not None:
+                                    self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
+                                if bool(observation.get("success", observation.get("ok", True))):
+                                    criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
+                                    mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
+                                mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
+                                mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
+                                result = ToolCallResult(proposal, True, result=observation)
+                        except Exception as exc:
+                            mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
+                            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+                            return self.store.save(mission)
+                progress["tool_results"].append(result.to_dict())
+            self.store.save(mission)
+        mission.error = "model turn budget exhausted"
+        mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
+        return self.store.save(mission)
+
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str], plan: Any = None) -> None:
+        """Authorize and execute independent proposals concurrently, then fold results deterministically.
+
+        B3-C4B: the parallel path obeys exactly the same canonical
+        ExecutionPlan gate as the serial path. Every executed proposal maps
+        to a concrete action of the current derived plan (identity, tool and
+        canonical arguments); there is no parallel bypass (INV-C4-10).
+        """
+        from security.authorization import authorize_tool
+        from security.execution_proof import ExecutionAuthorizationProof
+        from tools.registry import execute as execute_tool
+        identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
+        authorized: list[tuple[Any, Any, Any, Any]] = []
+        results: list[ToolCallResult] = []
+        for proposal in proposals:
+            mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+            if any(proposal.tool_call_id == error.split(":", 1)[0] for error in identity_errors) or proposal.tool_call_id in seen:
+                results.append(ToolCallResult(proposal, False, error="invalid, stale, or duplicate tool call"))
+                continue
+            seen.add(proposal.tool_call_id)
+            progress["seen_call_ids"].append(proposal.tool_call_id)
+            argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
+            snapshot_ok, snapshot_code, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+            if not snapshot_ok:
+                mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{snapshot_code}: {snapshot_reason}"})
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": snapshot_code, "reason": snapshot_reason})
+                results.append(ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}"))
+                continue
+            if plan is not None:
+                from security.execution_plan_runtime import gate_action_against_plan, proposal_action_identity
+                gate_ok, gate_code, gate_reason = gate_action_against_plan(plan, action_id=proposal_action_identity(proposal), tool_name=proposal.name, arguments=proposal.arguments if isinstance(proposal.arguments, dict) else {})
+                if not gate_ok:
+                    mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"{gate_code}: {gate_reason}"})
+                    mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": gate_code, "reason": gate_reason})
+                    results.append(ToolCallResult(proposal, False, error=f"{gate_code}: {gate_reason}"))
+                    continue
+            decision = authorize_tool([proposal.name, argument], context=auth_context)
+            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
+            if decision.allowed:
+                try:
+                    proof = self._derive_execution_proof(mission, proposal, argument, decision, plan_hash=plan.plan_fingerprint if plan is not None else None)
+                    mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+                    authorized.append((proposal, argument, decision, proof))
+                except Exception as exc:
+                    mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution proof derivation failed: {type(exc).__name__}"})
+                    results.append(ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution proof derivation failed: {type(exc).__name__}"))
+            else:
+                results.append(ToolCallResult(proposal, False, error=decision.reason))
+        mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
+        self.store.save(mission)
+        def execute_one(item: tuple[Any, Any, Any, Any]) -> dict[str, Any]:
+            proposal, argument, decision, proof = item
+            proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.validate_against_mission(proof, mission)
+            if not proof_ok:
+                return {"proof_ok": False, "proof_code": proof_code, "proof_reason": proof_reason, "raw": None}
+            try:
+                return {"proof_ok": True, "proof_code": "", "proof_reason": proof_reason, "raw": dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, execution_proof=proof) or {})}
+            except Exception as exc:
+                return {"proof_ok": True, "proof_code": "", "proof_reason": proof_reason, "raw": {"success": False, "error": str(exc), "failure_class": FailureClass.TOOL.value, "exception": type(exc).__name__}}
+        raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
+        for item, raw in zip(authorized, raw_results):
+            proposal = item[0]
+            proof_ok = bool(raw.get("proof_ok"))
+            mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": str(raw.get("proof_reason", ""))})
+            if not proof_ok:
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": raw.get("proof_code"), "reason": raw.get("proof_reason")})
+                results.append(ToolCallResult(proposal, False, error=f"{raw.get('proof_code')}: {raw.get('proof_reason')}"))
+                continue
+            observation = dict(raw.get("raw") or {})
+            observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+            mission.record_observation(observation)
+            success = bool(observation.get("success", observation.get("ok", True)))
+            if current_step is not None:
+                self._interpret_observation(mission, current_step, observation, success=success)
+            if success:
+                criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
+                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
+            mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
+            results.append(ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", ""))))
+        mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
+        progress["tool_results"].extend(result.to_dict() for result in results)
+
+    def run_slice(self, mission_id: str) -> Mission:
+        mission = self._load(mission_id)
+        if mission.is_terminal:
+            return mission
+        authorization_ok, authorization_reason = self._mission_authorization(mission)
+        if not authorization_ok:
+            mission.error = authorization_reason
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
+            return self.store.save(mission)
+        if (mission.checkpoint or {}).get("sta
