@@ -1,4 +1,5 @@
-e retry budget stays enforced (LOGIC/COMPILATION/TEST_FAILURE ->
+ drops the stale canonical binding, and
+        the retry budget stays enforced (LOGIC/COMPILATION/TEST_FAILURE ->
         bounded replan, AUTHORIZATION -> owner input, exhausted ->
         FAILED_RETRY_EXHAUSTED).
         """
