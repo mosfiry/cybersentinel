@@ -65,6 +65,7 @@ jobs:
         run: |
           if [ -f diagnostics/.dump_mission_runtime_tail ]; then
             python -c "from pathlib import Path; d=Path('agent/mission_runtime.py').read_text(); Path('diagnostics/mission_runtime_tail_part0a.txt').write_text('LEN ' + str(len(d)) + '\n' + d[0:16350]); Path('diagnostics/mission_runtime_tail_part0b.txt').write_text(d[16350:32700]); Path('diagnostics/mission_runtime_tail_part1.txt').write_text(d[32700:45000]); Path('diagnostics/mission_runtime_tail_part2.txt').write_text(d[45000:])"
+            python -c "from pathlib import Path; d=Path('security/execution_proof.py').read_text(); Path('diagnostics/execution_proof_part1.txt').write_text('LEN ' + str(len(d)) + '\n' + d[0:12000]); Path('diagnostics/execution_proof_part2.txt').write_text(d[12000:])"
           fi
       - name: Write status
         if: always()

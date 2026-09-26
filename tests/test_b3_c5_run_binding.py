@@ -108,12 +108,17 @@ def test_run_id_is_bound_in_schema_serialization_and_signature(tmp_path):
 def test_legacy_proof_dict_without_run_id_deserializes_with_empty_run(tmp_path):
     runtime = _runtime(tmp_path)
     mission = _mission(runtime)
-    data = _proof(mission, run_id="run-a").to_dict()
+    data = _proof(mission, run_id="").to_dict()
     data.pop("run_id")
     legacy = ExecutionAuthorizationProof.from_dict(data)
     assert legacy.run_id == ""
     ok, _reason, code = ExecutionAuthorizationProof.verify(legacy, name="status", argument=None, run_id="run-a")
     assert ok is False and code == RejectionCode.RUN_MISMATCH.value
+    tampered = _proof(mission, run_id="run-a").to_dict()
+    tampered.pop("run_id")
+    stripped = ExecutionAuthorizationProof.from_dict(tampered)
+    ok, _reason, code = ExecutionAuthorizationProof.verify(stripped, name="status", argument=None, run_id="run-a")
+    assert ok is False and code == RejectionCode.PROOF_INVALID.value
 
 
 def test_verify_rejects_cross_run_proof(tmp_path):

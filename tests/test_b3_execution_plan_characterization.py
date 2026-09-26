@@ -95,7 +95,7 @@ def test_b3c1_h4_owner_budget_intersection_is_outside_action_intent():
 
 
 def test_b3c1_h5_current_proof_binds_legacy_plan_snapshot_and_lifecycle():
-    """Current proof binds live mission data, but has no run_id/revision field."""
+    """B3-C5-D closed the run-binding half: the proof binds the execution run id."""
     proof_fields = {item.name for item in fields(ExecutionAuthorizationProof)}
     for required in (
         "mission_id",
@@ -108,7 +108,7 @@ def test_b3c1_h5_current_proof_binds_legacy_plan_snapshot_and_lifecycle():
         "lifecycle_revision",
     ):
         assert required in proof_fields
-    assert "run_id" not in proof_fields
+    assert "run_id" in proof_fields
     assert "authorization_revision" not in proof_fields
 
 
