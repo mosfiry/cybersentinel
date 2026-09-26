@@ -366,7 +366,7 @@ def test_out_of_scope_host_is_rejected_before_execution(tmp_path, execute_spy, c
     assert counting_handler.calls == 0
 
 
-def test_observed_dns_address_never_widens_scope(tmp_path, execute_spy, saved_scope_snapshot, owner_decision, dns_seam, counting_handler):
+def test_observed_dns_address_never_widens_scope(tmp_path, execute_spy, saved_scope_snapshot, owner_decision, dns_seam):
     """A resolved address is OBSERVED data: it can never become a target."""
     runtime = _runtime(tmp_path)
     mission = _mission(runtime)
@@ -381,19 +381,28 @@ def test_observed_dns_address_never_widens_scope(tmp_path, execute_spy, saved_sc
     )
     assert record.status == "EXECUTED", record.result.error_state
     observed_address = record.result.normalized_output["records"][0]["address"]
-    assert counting_handler.calls == 1
+    assert observed_address == "203.0.113.10"
+    assert execute_spy == ["scoped_dns_lookup"]
 
     # A second action pointing at the OBSERVED address is refused: observation
     # is never authorization (INV-OFF-2 / INV-OFF-5).
     smuggled = _proposal(mission, proposal_id="prop-2", target_url="https://" + observed_address + "/", target_id="t1")
     with pytest.raises(OffensiveActionRejected, match="scope"):
         bridge.run(smuggled, mission=mission, adapter=ScopedDnsLookupAdapter(), scope_snapshot=saved_scope_snapshot)
-    assert counting_handler.calls == 1
+    # No second execution, no second resolution: the rejection is pre-execution.
     assert execute_spy == ["scoped_dns_lookup"]
+    assert dns_seam == ["target.example"]
 
 
 def test_decision_issued_for_another_tool_is_rejected(tmp_path, execute_spy, saved_scope_snapshot, counting_handler, dns_seam):
-    """A valid Owner decision for scoped_http_probe cannot authorize dns."""
+    """A valid Owner decision for scoped_http_probe cannot authorize dns.
+
+    The rejection happens even BEFORE the adapter contract: the existing
+    proof chain refuses to derive an ExecutionAuthorizationProof from a
+    decision that does not match the tool (fail closed at derivation).
+    """
+    from security.execution_proof import ExecutionProofError
+
     context = make_test_authorization_context(request_id="req-1", state_dir=tmp_path)
     wrong_tool_decision = AuthorizationDecision.issue(
         context,
@@ -406,14 +415,14 @@ def test_decision_issued_for_another_tool_is_rejected(tmp_path, execute_spy, sav
     runtime = _runtime(tmp_path)
     mission = _mission(runtime)
     mission.progress["model_run_id"] = "run-1"
-    record = OffensiveActionBridge().run(
-        _proposal(mission),
-        mission=mission,
-        adapter=ScopedDnsLookupAdapter(),
-        scope_snapshot=saved_scope_snapshot,
-        authorization_decision=wrong_tool_decision,
-    )
-    assert record.status == "REJECTED"
-    assert record.executed is False
+    with pytest.raises(ExecutionProofError, match="PROOF_BINDING_MISMATCH"):
+        OffensiveActionBridge().run(
+            _proposal(mission),
+            mission=mission,
+            adapter=ScopedDnsLookupAdapter(),
+            scope_snapshot=saved_scope_snapshot,
+            authorization_decision=wrong_tool_decision,
+        )
     assert counting_handler.calls == 0
+    assert execute_spy == []
     assert dns_seam == []
