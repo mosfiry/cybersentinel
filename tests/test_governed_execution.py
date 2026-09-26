@@ -273,7 +273,9 @@ def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):
     mission_db = tmp_path / "missions.sqlite3"
     queue_db = tmp_path / "queue.sqlite3"
     evidence_db = tmp_path / "evidence.sqlite3"
-    plan = Plan.initial("restart objective").replan(steps=(PlanStep("s1", "write", action="write"),), reason="test")
+    # B3-C5/B3-H3: legacy plans must use registered tools only; the stub
+    # executor performs the actual workspace write itself.
+    plan = Plan.initial("restart objective").replan(steps=(PlanStep("s1", "write", action="status"),), reason="test")
     evidence_store = EvidenceChainStore(evidence_db)
 
     def execute(mission, _step, _action):

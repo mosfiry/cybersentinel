@@ -43,8 +43,6 @@ def test_malformed_or_unknown_action_replans_instead_of_silent_success(tmp_path)
     calls = {"n": 0}
     def execute(mission, step, action_id):
         calls["n"] += 1
-        if calls["n"] == 1:
-            return {"success": False, "failure_class": "LOGIC", "error": "unknown tool"}
         return {"success": True, "criterion_id": "mission-goal", "source": "status"}
     def replan(mission, observation):
         return mission.plan.replan(steps=(PlanStep("recovered", "recover", action="status"),), reason="malformed proposal")
@@ -55,7 +53,11 @@ def test_malformed_or_unknown_action_replans_instead_of_silent_success(tmp_path)
     assert result.plan.version >= 2
     assert result.status is MissionStatus.GOAL_COMPLETED
     assert any(event["event"] == "ReplanTriggered" for event in result.trajectory)
-    assert calls["n"] >= 2
+    # B3-C5/B3-H3: the unknown action is rejected by the canonical execution
+    # plan gate BEFORE the executor is called, so only the recovered
+    # registered action ever executes; the rejected action has exactly zero
+    # executor/handler calls.
+    assert calls["n"] == 1
 
 
 def test_dead_loop_becomes_explicit_failure(tmp_path):

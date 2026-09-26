@@ -25,7 +25,7 @@ class, the decision binding and the live snapshot agreement.
 
 from typing import Any
 
-from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass
+from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, canonical_mission_plan_identity
 from security.mission_authorization import MissionAuthorizationSnapshot
 
 
@@ -42,8 +42,6 @@ class MissionExecutionBoundary:
         bound into the proof, so a proof issued for one run can never be
         reused in another run.
         """
-        from security.execution_plan_runtime import canonical_mission_plan_identity
-
         snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
         progress = getattr(mission, "progress", None)
         live_run = str((progress.get("model_run_id") if isinstance(progress, dict) else "") or ((progress.get("execution_run_id") if isinstance(progress, dict) else "")) or "")

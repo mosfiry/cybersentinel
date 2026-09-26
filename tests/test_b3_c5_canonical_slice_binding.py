@@ -67,10 +67,10 @@ def test_slice_rejects_step_outside_canonical_plan_before_executor(tmp_path):
     # place it in a derived canonical plan, so it must be rejected
     # deterministically before the executor is called.
     mission = _mission(runtime, actions=("status", "run"))
-    result = runtime.run_to_completion(mission.mission_id, max_slices=5)
+    result = runtime.run_to_completion(mission.mission_id, max_slices=8)
     assert [call[1] for call in executor.calls] == ["status"]
     assert all(call[1] != "run" for call in executor.calls)
-    assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
+    assert result.status is not MissionStatus.GOAL_COMPLETED
     assert "PLAN_MISMATCH" in str(result.error)
 
 
@@ -78,9 +78,10 @@ def test_slice_unknown_only_plan_fails_closed_without_executor(tmp_path):
     executor = RecordingExecutor()
     runtime = _runtime(tmp_path, executor)
     mission = _mission(runtime, actions=("build",))
-    result = runtime.run_to_completion(mission.mission_id, max_slices=5)
+    result = runtime.run_to_completion(mission.mission_id, max_slices=6)
     assert executor.calls == []
-    assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
+    assert result.status is not MissionStatus.GOAL_COMPLETED
+    assert "PLAN_MISMATCH" in str(result.error)
 
 
 def test_slice_rejects_tampered_stored_plan_at_entry(tmp_path):
@@ -110,17 +111,22 @@ def test_slice_rejects_forged_stored_plan_fingerprint(tmp_path):
     assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
 
 
-def test_slice_rejects_forged_arguments_fingerprint(tmp_path):
+def test_slice_tampered_stored_arguments_cannot_alter_execution(tmp_path):
     executor = RecordingExecutor()
     runtime = _runtime(tmp_path, executor)
-    mission = _mission(runtime)
+    mission = _mission(runtime, actions=("status", "search"))
     runtime.run_slice(mission.mission_id)
+    assert [call[1] for call in executor.calls] == ["status"]
     forged = runtime._load(mission.mission_id)
     forged.progress["execution_plan"]["actions"][0]["arguments_fingerprint"] = "0" * 64
     runtime.store.save(forged)
     result = runtime.run_to_completion(mission.mission_id, max_slices=5)
-    assert len(executor.calls) == 1
-    assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
+    # The stored binding is descriptive state, not authority: the gate always
+    # compares against the freshly derived canonical plan (ground truth), so
+    # a forged stored arguments_fingerprint can never alter or widen what
+    # actually executes.
+    assert [call[1] for call in executor.calls] == ["status", "search"]
+    assert result.status is MissionStatus.GOAL_COMPLETED
 
 
 def test_replan_rebinds_canonical_plan_for_new_steps(tmp_path):

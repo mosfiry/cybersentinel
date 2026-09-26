@@ -79,13 +79,13 @@ __all__ = [
     "adapt_model_proposals",
     "bind_execution_plan",
     "canonical_plan_identity",
-    "canonical_mission_plan_identity",
     "derive_mission_execution_plan",
     "gate_action_against_plan",
     "legacy_plan_effective_tools",
     "mission_binding_fingerprint",
     "owner_budget_from_snapshot",
     "proposal_action_identity",
+    "registered_owner_budget_from_snapshot",
     "reconstruct_execution_plan",
     "runtime_task_intents",
     "validate_stored_execution_plan",
@@ -192,6 +192,38 @@ def owner_budget_from_snapshot(mission: Any) -> OwnerAuthorizedToolBudget:
     )
 
 
+def registered_owner_budget_from_snapshot(mission: Any) -> OwnerAuthorizedToolBudget:
+    """B3-C5: registered-only reconstruction of the snapshot tool budget.
+
+    Compatibility-era snapshots may name tools that predate the registry
+    (for example legacy "write" fixtures). The OwnerAuthorizedToolBudget
+    constructor fails closed on unknown tools, so reconstructing the budget
+    directly from such a snapshot would block the whole mission path before
+    any deterministic narrowing can happen. This variant intersects the
+    snapshot allowlist with the registry KNOWN_TOOLS first:
+
+    - pure narrowing: registered = snapshot allowlist & KNOWN_TOOLS, so the
+      reconstructed budget is a subset of the Owner-minted view and can
+      never mint or widen authority;
+    - fail closed preserved: malformed snapshots still raise the same
+      snapshot validation errors, and an empty registered set still yields
+      an empty budget (empty intersection -> empty effective scope, never
+      a fallback grant).
+    """
+    from security.mission_authorization import MissionAuthorizationSnapshot
+    from security.owner_budget import KNOWN_TOOLS
+
+    snapshot = MissionAuthorizationSnapshot.from_dict(dict(getattr(mission, "authorization_snapshot", None) or {}))
+    allowed = frozenset(str(item) for item in snapshot.allowed_tools)
+    registered = allowed & KNOWN_TOOLS
+    return OwnerAuthorizedToolBudget(
+        registered,
+        source="mission_snapshot+registered",
+        policy_version=str(snapshot.policy_version),
+        owner_approval=str(snapshot.owner_approval),
+    )
+
+
 def derive_mission_execution_plan(mission: Any, proposals: Iterable[Any]) -> ExecutionPlan:
     """Derive the canonical per-turn ExecutionPlan for a Mission model turn.
 
@@ -280,19 +312,6 @@ def canonical_plan_identity(mission: Any) -> str:
         if fingerprint:
             return fingerprint
     return mission.plan.fingerprint
-
-
-def canonical_mission_plan_identity(mission: Any) -> str:
-    """B3-C5-A canonical plan identity for ALL mission execution paths.
-
-    Single implementation: the bound canonical ExecutionPlan fingerprint is
-    the mission plan identity, with the legacy Plan fingerprint as the
-    fallback only when nothing canonical is bound. An alias of
-    canonical_plan_identity so the two names can never diverge; the slice /
-    owner-direct path and the model path derive proofs against the same
-    canonical identity (B3-H2).
-    """
-    return canonical_plan_identity(mission)
 
 
 def reconstruct_execution_plan(data: Any) -> ExecutionPlan:
