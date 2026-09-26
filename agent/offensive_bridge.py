@@ -168,7 +168,7 @@ class OffensiveActionBridge:
     def validate_proposal(self, proposal: OffensiveActionProposal) -> None:
         if not isinstance(proposal, OffensiveActionProposal):
             raise OffensiveActionRejected("proposal must be a typed OffensiveActionProposal")
-        for required in ("proposal_id", "mission_id", "request_id", "tool_id", "plan_hash", "risk_class"):
+        for required in ("proposal_id", "mission_id", "tool_id", "plan_hash", "risk_class"):
             if not str(getattr(proposal, required, "") or ""):
                 raise OffensiveActionRejected("proposal field is required: " + required)
         if proposal.target_kind not in TARGET_KINDS:
