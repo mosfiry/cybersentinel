@@ -211,8 +211,82 @@ def _red_team_assess(argument):
 
 
 def _scoped_http_probe(argument):
-    """Metadata-only bounded probe placeholder; network execution comes after Scope Firewall."""
-    return {"ok": True, "operation": "scoped_http_probe", "url": argument, "note": "scope-authorized observation placeholder"}
+    """Real bounded HTTP observation behind the Scope Firewall and proof chain.
+
+    The registry invokes this handler ONLY after: the ScopeGuard canonicalized
+    the target against the typed ScopeSnapshot, the typed Owner
+    AuthorizationDecision matched tool + argument fingerprint + request
+    identity, the ExecutionAuthorizationProof verified, and the scope
+    resolver re-resolved the request against the persisted typed snapshot.
+    This handler then performs exactly ONE bounded observation:
+
+    - ONE GET; redirects are NEVER followed (a redirect Location is recorded
+      as OBSERVED data only — observation never widens scope)
+    - hard timeout and hard response-size cap
+    - deterministic fail-closed classification of network failures
+    - the body is never returned, only its size and sha256
+    """
+    url = argument if isinstance(argument, str) else ""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return {"ok": False, "operation": "scoped_http_probe", "error": "PROBE_ARGUMENT_INVALID", "reason": "the probe accepts exactly one canonical http(s) url"}
+    return _probe_http_observation(url)
+
+
+SCOPED_PROBE_TIMEOUT_SECONDS = 10
+SCOPED_PROBE_MAX_BYTES = 65536
+
+
+def _probe_fetch(request, timeout):
+    """The single network seam of the probe: no shell, no sockets elsewhere."""
+    import urllib.request
+
+    class _NeverRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None  # redirects are observed, never followed
+
+    return urllib.request.build_opener(_NeverRedirect).open(request, timeout=timeout)
+
+
+def _probe_http_observation(url, *, timeout=SCOPED_PROBE_TIMEOUT_SECONDS, max_bytes=SCOPED_PROBE_MAX_BYTES):
+    import hashlib
+    import time
+    from urllib.error import URLError
+    from urllib.request import Request
+
+    started = time.monotonic()
+    try:
+        request = Request(url, method="GET", headers={"User-Agent": "CyberSentinel-X-ScopedProbe/1.0", "Accept": "*/*"})
+        response = _probe_fetch(request, timeout)
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        return {"ok": False, "operation": "scoped_http_probe", "url": url, "error": "PROBE_FAILED", "reason": str(exc), "elapsed_ms": int((time.monotonic() - started) * 1000)}
+    try:
+        body = response.read(max_bytes + 1)
+    except (TimeoutError, OSError, ValueError) as exc:
+        return {"ok": False, "operation": "scoped_http_probe", "url": url, "error": "PROBE_READ_FAILED", "reason": str(exc), "elapsed_ms": int((time.monotonic() - started) * 1000)}
+    truncated = len(body) > max_bytes
+    if truncated:
+        body = body[:max_bytes]
+    status_code = int(getattr(response, "status", 0) or 0)
+    headers: dict[str, str] = {}
+    for key in ("server", "content-type", "content-length", "location"):
+        try:
+            value = response.headers.get(key) if response.headers is not None else None
+        except Exception:
+            value = None
+        if value:
+            headers[key] = str(value)[:512]
+    return {
+        "ok": True,
+        "operation": "scoped_http_probe",
+        "url": url,
+        "status_code": status_code,
+        "headers": headers,
+        "body_size": len(body),
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+        "truncated": truncated,
+        "redirect_location": headers.get("location", ""),
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }
 
 
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
