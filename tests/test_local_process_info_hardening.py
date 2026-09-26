@@ -145,7 +145,7 @@ def test_evidence_event_records_structured_info(monkeypatch):
     assert len(events) == 1
     args, _kwargs = events[0]
     assert args[0] == "local_check"
-    recorded = args[4]
+    recorded = args[6]
     assert recorded == info
     assert recorded["binary"] == "/usr/bin/ps"
     for key in recorded:
