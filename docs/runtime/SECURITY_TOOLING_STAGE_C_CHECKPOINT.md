@@ -10,13 +10,13 @@
   > AUTHORIZATION_SCOPE > TOOL_RUNTIME > MODEL_OUTPUT > EXTERNAL_DATA
   is immutable and is never weakened, reordered, or made configurable.
 - BRANCH: security/b3-four-layer-intent
-- HEAD (before this milestone): babddb3a6af2a3bf816605f14025c0f7dcd0a4ab
-- HEAD (after this milestone): b61909ad64c063ae7f646d46ad498d7c58a306c7
-  (plus this checkpoint commit)
-- LAST VERIFIED CI (before this milestone): SUCCESS — 1219 passed / 1 skipped /
-  0 failed (diagnostics/ci-babddb3a6af2.md), verified from the report at branch HEAD.
-- STAGE: Stage C hardening continuation (Session 4). Stage A (typed tool
-  inventory) and Stage B (adapter contract + battery) are complete and CI-green.
+- HEAD (start of Session 4): babddb3a6af2a3bf816605f14025c0f7dcd0a4ab
+- HEAD (latest verified): b74ac77b52001d3543da6312e362792a5b436f36
+- LAST VERIFIED CI: SUCCESS — 1239 passed / 1 skipped / 0 failed
+  (diagnostics/ci-b74ac77b5200.md).
+- STAGE: Stage C hardening milestones 1 and 2 COMPLETE. Stage A (typed tool
+  inventory) and Stage B (adapter contract + battery) are complete and
+  CI-green.
 
 ## COMPLETED STEPS (prior sessions)
 
@@ -32,78 +32,66 @@
    explicit, separate, deterministic operation; the catalog alone can never
    grant execution authority).
 
-## CURRENT MILESTONE (Session 4): external-binary handler hardening
+## MILESTONE 1 (Session 4, part 1): external-binary handler hardening
 
 Gaps identified by Stage C archaeology in the only subprocess-backed runtime
-handler (core/local_defense.py::local_process_info):
+handler (core/local_defense.py::local_process_info), all closed:
 
-1. The handler executed the bare PATH-relative name "ps", leaving a
-   resolution-at-spawn window (PATH hijacking between the adapter's
-   availability check and the spawn). Fix: resolve once via shutil.which
-   inside the handler and execute the RESOLVED ABSOLUTE PATH; fail closed with
-   a deterministic error if unresolvable (no spawn).
-2. A subprocess timeout surfaced as an unclassified TimeoutExpired. Fix:
-   classified deterministic RuntimeError ("timed out") — never a partial
-   result.
-3. Parsed output was unbounded. Fix: deterministic bounds — row cap (4096
-   parsed rows) and command-string cap (256 chars), both surfaced as explicit
-   output_truncated flags in the structured result (raw output remains
-   untrusted data; the flags are computed, never taken from tool output).
-4. Evidence hardening: the resolved binary identity is recorded in the
-   structured info (auditable binary provenance, local read-only data only).
+1. Binary identity pinning: the handler resolves `ps` ONCE via shutil.which
+   at entry and executes the RESOLVED ABSOLUTE PATH (closing the PATH-hijack
+   window between the adapter's availability check and the spawn); an
+   unresolvable binary fails closed BEFORE any spawn.
+2. Deterministic timeout classification: subprocess.TimeoutExpired becomes a
+   classified RuntimeError — never a partial result, never swallowed.
+3. Output bounding: row cap (4096 parsed rows) and command-string cap (256
+   chars) with explicit computed output_truncated flags; flags are computed
+   by the handler, never taken from tool output.
+4. Evidence: the resolved binary identity is recorded in the structured info
+   (auditable binary provenance; local read-only data only).
 
-Adversarial battery: tests/test_local_process_info_hardening.py — resolved
-path executed, fail-closed unresolvable binary (no spawn), fixed argv vector
-with no shell, non-zero exit / empty stdout / timeout classified, malformed
-rows skipped, row cap, command truncation, shell metacharacters in output are
-DATA, evidence event structured and authority/secret-free.
+Battery: tests/test_local_process_info_hardening.py (12 tests) — resolved
+path executed, fail-closed unresolvable binary (spawn count == 0), fixed argv
+vector with no shell, non-zero exit / empty stdout / timeout classified,
+malformed rows skipped, row cap, command truncation, shell metacharacters
+are DATA, evidence structured and authority/secret-free.
 
-## CURRENT STEP
+## MILESTONE 2 (Session 4, part 2): PREPARE resolved-binary disclosure
 
-Push the hardening commit, then the adversarial battery, then this checkpoint;
-verify CI (target: previous 1219 passed / 1 skipped + new battery items, 0
-failed) after each commit.
-
-## NEXT_ACTION
-
-After CI is verified green at this milestone's final commit: (1) reconstruct
-the root CHECKPOINT.md byte-exactly (git blob sha verified) and append the
-Session 4 record; (2) next hardening candidates within Stage C scope —
-adapter-level dry-run binary-resolution disclosure (requires byte-exact
-reconstruction of security/tool_adapter.py, ~32.8KB, via commit-patch chain)
-and a binding-layer decision only if a real integration need appears (Path A
-currently requires none).
-
-## KNOWN RISKS
-
-- The adapter dry_run report discloses the required binary NAME, not the
-  resolved absolute path (prepare fail-closes on availability via
-  shutil.which; the handler independently resolves and pins the absolute
-  path — defense in depth holds, disclosure is a transparency gap only).
-- Replay semantics for proofs are single-RUN, not single-USE (recorded for
-  Owner review; a single-use nonce changes proof semantics and needs an
-  Owner decision).
-- Adapter wiring into MissionRuntime/AgentCore slice execution is deferred
-  (Stage D); the Stage B/C batteries prove no parallel authority path exists
-  meanwhile.
+- security/tool_adapter.py was reconstructed byte-exactly from the commit
+  patch chain f4fbbf64 → b06d7ba3 → e0a10680 (git blob sha 13561c10...:
+  verified BEFORE modification) and then extended:
+  - PreparedExecution gains resolved_binary (absolute path resolved once at
+    PREPARE via shutil.which; DISCLOSURE ONLY — the handler independently
+    resolves and pins its own path; the field never drives execution).
+  - dry_run() discloses resolved_binary; dry-run still never spawns, never
+    calls tools.registry.execute, never reaches a handler (INV-ADP-5).
+  - resolved_binary is sourced exclusively from shutil.which inside
+    prepare(); requests are frozen dataclasses with no binary/path field;
+    tool output cannot appear in the dry-run plan.
+- Battery: tests/test_tool_adapter_resolved_binary.py (8 tests).
+- Engineering method note: the trusted retrieval paths are (a) github
+  contents API base64 + JSON unescape + git blob sha verification (< ~30KB),
+  (b) commit full_patch chain application with cumulative hunk-offset
+  tracking + git blob sha verification (larger files). raw.githubusercontent
+  and truncated open_url output are NEVER pushed.
 
 ## ARCHITECTURAL DECISIONS
 
-- Path A (Session 3, standing): catalog and runtime registry remain fully
-  disjoint; registering a runtime tool is an explicit, deterministic,
-  authority-free operation; catalog definitions can never become executable
-  implicitly. Binding a catalog capability to a runtime tool would require a
-  NEW explicit trusted binding layer (owner-controlled, model-output-proof);
-  no such binding exists today and none is required by current adapters.
-- Handler-layer binary pinning (this milestone): execution identity is
-  resolved at handler entry and pinned; the adapter PREPARE check and the
-  handler resolution are independent controls.
+- Path A (standing): catalog and runtime registry remain fully disjoint;
+  registering a runtime tool is an explicit, deterministic, authority-free
+  operation; catalog definitions can never become executable implicitly.
+  No binding layer is required by the current adapters.
+- Handler-layer binary pinning (Milestone 1) and PREPARE disclosure
+  (Milestone 2) are independent controls (defense in depth).
 
-## FILES CHANGED (this milestone)
+## FILES CHANGED (Session 4)
 
 - core/local_defense.py (modified: hardened local_process_info)
 - tests/test_local_process_info_hardening.py (NEW: adversarial battery)
-- docs/runtime/SECURITY_TOOLING_STAGE_C_CHECKPOINT.md (NEW: this checkpoint)
+- security/tool_adapter.py (modified: resolved_binary disclosure)
+- tests/test_tool_adapter_resolved_binary.py (NEW: adversarial battery)
+- docs/runtime/SECURITY_TOOLING_STAGE_C_CHECKPOINT.md (this checkpoint)
+- CHECKPOINT.md (Session 4 record)
 
 ## TEST COMMANDS
 
@@ -112,13 +100,40 @@ currently requires none).
 ## TEST RESULTS
 
 - Baseline: 1219 passed / 1 skipped / 0 failed (babddb3a).
-- 5a8cd492 (handler hardening): VERIFIED — SUCCESS, 1219 passed / 1 skipped.
-- f09291c8 (adversarial battery): 1 failed / 1230 passed — the single failure
-  was a test-fixture defect (the structured info payload is the 7th positional
-  argument of add_event, not the 5th); no production change required.
-- b61909ad (fixture fix): VERIFIED — SUCCESS, 1231 passed / 1 skipped /
-  0 failed (diagnostics/ci-b61909ad64c0.md).
+- 5a8cd492 (handler hardening): VERIFIED — SUCCESS, 1219/1.
+- f09291c8 (handler battery): 1 failed / 1230 passed — single test-fixture
+  defect (info payload is the 7th positional argument of add_event); no
+  production change required.
+- b61909ad (fixture fix): VERIFIED — SUCCESS, 1231/1.
+- 0e6c9c92 (this checkpoint doc, part 1): VERIFIED — SUCCESS, 1231/1.
+- f09e6b60 (PREPARE disclosure): VERIFIED — SUCCESS, 1231/1.
+- 6c4305b6 (disclosure battery): VERIFIED — SUCCESS, 1239/1.
+- b74ac77b (root CHECKPOINT.md Session 4 record): VERIFIED — SUCCESS,
+  1239 passed / 1 skipped / 0 failed.
 
 ## LAST VERIFIED COMMIT
 
-- b61909ad64c063ae7f646d46ad498d7c58a306c7 (CI SUCCESS, 1231 passed / 1 skipped).
+- b74ac77b52001d3543da6312e362792a5b436f36 (CI SUCCESS, 1239 passed / 1
+  skipped).
+
+## KNOWN RISKS
+
+- Replay semantics for proofs are single-RUN, not single-USE (recorded for
+  Owner review; a single-use nonce changes proof semantics and needs an
+  Owner decision).
+- Adapter wiring into MissionRuntime/AgentCore slice execution is deferred
+  (Stage D); the Stage B/C batteries prove no parallel authority path
+  exists meanwhile.
+- Duplicate-execution / cancellation-boundary contracts live in the
+  mission-orchestration track owned by the parallel engineering agent; no
+  scheduler/DAG/worker runtime is built in this track.
+
+## NEXT_ACTION
+
+Stage D design: wire the adapter layer into MissionRuntime slice execution
+through the existing proof chain (read security/tool_adapter.py,
+agent/mission_runtime.py, and the Stage B/C batteries first). Keep
+catalog/registry disjoint (Path A). Do NOT touch main, B3-C6, Phase A, or
+R2. Do NOT build any scheduler/DAG/worker runtime (parallel agent's track);
+if an interface contract with that track becomes necessary, design it as a
+small, low-coupling contract only.
