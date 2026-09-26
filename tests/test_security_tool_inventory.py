@@ -52,20 +52,33 @@ MODULE_PATH = REPO_ROOT / "security" / "tool_inventory.py"
 
 
 def _minimal_definition(**overrides) -> SecurityToolDefinition:
-    """Build the least-privileged valid definition; overrides break invariants."""
+    """Build the least-privileged valid definition; overrides break invariants.
+
+    The authorization class defaults to the deterministic mapping of the
+    (possibly overridden) risk class, exactly like the seed builder, so each
+    test can vary risk_class without tripping the mapping rule accidentally.
+    """
+    risk = overrides.get("risk_class", ToolRiskClass.INFORMATIONAL)
+    try:
+        default_authorization_class = RISK_AUTHORIZATION_CLASS[risk]
+    except KeyError:
+        # Invalid risk value: let the module itself reject it (fail closed),
+        # rather than failing in this helper with the wrong exception type.
+        default_authorization_class = ToolAuthorizationClass.PUBLIC_INFORMATION
     values: dict = {
         "tool_id": "unit.tool",
         "canonical_name": "Unit Tool",
         "category": ToolCategory.SECURITY_RESOURCES,
         "description": "Unit-test definition.",
         "capabilities": (ToolCapability.DATA_TRANSFORMATION,),
-        "risk_class": ToolRiskClass.INFORMATIONAL,
-        "authorization_class": ToolAuthorizationClass.PUBLIC_INFORMATION,
+        "risk_class": risk,
+        "authorization_class": default_authorization_class,
         "availability": ToolAvailability.PLANNED,
         "process_execution": ToolAccessLevel.NONE,
         "required_runtime": "builtin",
         "network_required": False,
         "external_target_capability": False,
+        "lab_only": risk in tool_inventory.OFFENSIVE_RISK_CLASSES,
     }
     values.update(overrides)
     return SecurityToolDefinition(**values)
