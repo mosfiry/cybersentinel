@@ -280,7 +280,7 @@ def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):
 
     def execute(mission, _step, _action):
         snapshot = MissionAuthorizationSnapshot.from_dict(mission.authorization_snapshot)
-        workspace = Workspace(tmp_path, authorization_snapshot=snapshot).bind(mission_id=mission.mission_id, request_id=mission.request_id, tool_id="write", authorization_snapshot=snapshot, evidence_store=evidence_store)
+        workspace = Workspace(tmp_path, authorization_snapshot=snapshot).bind(mission_id=mission.mission_id, request_id=mission.request_id, tool_id="status", authorization_snapshot=snapshot, evidence_store=evidence_store)
         workspace.write("artifact.txt", "persisted")
         return {"success": True, "criterion_id": "write", "source": "workspace"}
 

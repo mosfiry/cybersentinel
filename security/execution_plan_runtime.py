@@ -82,6 +82,7 @@ __all__ = [
     "derive_mission_execution_plan",
     "gate_action_against_plan",
     "legacy_plan_effective_tools",
+    "legacy_step_execution_plan",
     "mission_binding_fingerprint",
     "owner_budget_from_snapshot",
     "proposal_action_identity",
@@ -434,3 +435,55 @@ def legacy_plan_effective_tools(owner_budget: OwnerAuthorizedToolBudget, plan: A
     except (ExecutionPlanError, ActionIntentError, TaskIntentError, OwnerBudgetError, ValueError, PermissionError):
         return (), None
     return tuple(action.tool_name for action in derived.actions), derived
+
+
+def legacy_step_execution_plan(owner_budget: OwnerAuthorizedToolBudget, plan: Any, step: Any, *, request_id: str = "") -> ExecutionPlan | None:
+    """B3-C5: canonical per-step conversion of one legacy PlanStep.
+
+    The C3 ExecutionPlan represents effective actions first-seen-unique per
+    tool (INV-C4-H1-4), so converting a whole legacy plan collapses repeated
+    same-tool steps into a single action and every later identical step
+    would fail the strict identity gate forever. The slice path therefore
+    converts the CURRENT legacy step only:
+
+    - acceptance is identical to whole-plan conversion: a step may execute
+      iff its tool is registered and inside the Owner budget (intersection
+      at derivation, B3-H4); unknown, malformed, or out-of-budget steps
+      return None and fail closed;
+    - repeated same-tool steps each derive their own fresh canonical
+      identity (INV-C4-H1-5: legitimate repetition is a new derivation,
+      never implicit plan multiplicity);
+    - derivation is still only derive_execution_plan(owner_budget,
+      validated ActionIntent): no caller-supplied plan, no widening.
+    """
+    from agent.model_intelligence.conversation import MissionIntent
+    from tools.registry import KNOWN_TOOLS
+
+    action = str(getattr(step, "action", "") or "").strip()
+    if not action or action == "__planning_failure__" or action not in KNOWN_TOOLS:
+        return None
+    binding = canonical_execution_fingerprint({
+        "request_id": str(request_id or ""),
+        "objective": str(getattr(plan, "objective", "") or ""),
+    })
+    intent = MissionIntent(objective=str(getattr(plan, "objective", "") or ""), semantic_fingerprint=binding, source="deterministic_fallback")
+    tasks = derive_task_intents(intent)
+    arguments = dict(getattr(step, "retry_policy", None) or {}).get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+    item = {
+        "action_id": str(getattr(step, "step_id", "") or "").strip(),
+        "task_id": tasks[0].task_id,
+        "tool_name": action,
+        "arguments": dict(arguments),
+        "dependencies": (),
+        "description": "",
+    }
+    ok, _reason = validate_action_intent_proposal([item], frozenset(task.task_id for task in tasks))
+    if not ok:
+        return None
+    try:
+        intents = derive_action_intents(tasks, [item])
+        return derive_execution_plan(owner_budget, intents)
+    except (ExecutionPlanError, ActionIntentError, TaskIntentError, OwnerBudgetError, ValueError, PermissionError):
+        return None

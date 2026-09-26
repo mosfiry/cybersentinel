@@ -9,6 +9,8 @@ from agent.planning import FailureClass, Plan, PlanStep
 
 
 def runtime(tmp_path, executor, **kwargs):
+    # B3-C5/B3-H3: legacy fixtures use registered tools only; unregistered
+    # tool names are rejected deterministically before any execution.
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=executor, **kwargs, authorization_snapshot_factory=make_test_snapshot)
 
 
@@ -21,7 +23,7 @@ def test_end_to_end_observation_failure_replan_verify_and_persistence(tmp_path):
             return {"success": False, "failure_class": "COMPILATION", "error": "compiler error", "source": "build"}
         return {"success": True, "criterion_id": "tests", "source": "pytest", "result": {"passed": 3}}
 
-    plan = Plan.initial("build and verify artifact").replan(steps=(PlanStep("build", "build", action="build", verification=("tests",)),), reason="initial plan")
+    plan = Plan.initial("build and verify artifact").replan(steps=(PlanStep("build", "build", action="status", verification=("tests",)),), reason="initial plan")
     rt = runtime(tmp_path, execute)
     mission = rt.create("build it", "build and verify artifact", plan, completion_criteria=[{"criterion_id": "tests", "description": "tests pass", "check": "pytest"}])
     after_failure = rt.run_slice(mission.mission_id)
@@ -47,7 +49,7 @@ def test_new_runtime_instance_resumes_after_simulated_process_crash(tmp_path):
             raise RuntimeError("simulated crash")
         return {"success": True, "criterion_id": "step", "source": "executor"}
 
-    plan = Plan.initial("resume").replan(steps=(PlanStep("step", "step", action="run"),), reason="initial")
+    plan = Plan.initial("resume").replan(steps=(PlanStep("step", "step", action="status"),), reason="initial")
     first = runtime(tmp_path, crashing_executor)
     mission = first.create("resume", "resume", plan)
     crashed = first.run_slice(mission.mission_id)
@@ -75,7 +77,7 @@ def test_in_flight_receipt_reconciliation_prevents_duplicate_side_effect(tmp_pat
         calls.append(action_id)
         raise RuntimeError("crash after external side effect")
 
-    plan = Plan.initial("receipt").replan(steps=(PlanStep("step", "step", action="run"),), reason="initial")
+    plan = Plan.initial("receipt").replan(steps=(PlanStep("step", "step", action="status"),), reason="initial")
     rt = runtime(tmp_path, execute)
     mission = rt.create("receipt", "receipt", plan)
     rt.run_slice(mission.mission_id)
@@ -91,7 +93,7 @@ def test_goal_verification_blocks_completion_until_required_evidence(tmp_path):
     def execute(mission, step, action_id):
         return {"success": True, "criterion_id": "implementation", "source": "builder"}
 
-    plan = Plan.initial("deliver").replan(steps=(PlanStep("implementation", "implementation", action="build"),), reason="initial")
+    plan = Plan.initial("deliver").replan(steps=(PlanStep("implementation", "implementation", action="status"),), reason="initial")
     rt = runtime(tmp_path, execute)
     mission = rt.create("deliver", "deliver", plan, completion_criteria=[
         {"criterion_id": "implementation", "required": True},
@@ -112,7 +114,7 @@ def test_authorization_intervention_persists_and_allow_resumes(tmp_path, monkeyp
         executed.append(action_id)
         return {"success": True, "criterion_id": "sensitive", "source": "tool"}
 
-    plan = Plan.initial("sensitive").replan(steps=(PlanStep("sensitive", "sensitive", action="tool", authorization_requirement="owner"),), reason="initial")
+    plan = Plan.initial("sensitive").replan(steps=(PlanStep("sensitive", "sensitive", action="status", authorization_requirement="owner"),), reason="initial")
     rt = runtime(tmp_path, execute)
     mission = rt.create("do sensitive", "sensitive", plan, completion_criteria=[{"criterion_id": "sensitive"}])
     blocked = rt.run_slice(mission.mission_id)
@@ -144,7 +146,7 @@ def test_idempotency_does_not_repeat_completed_sensitive_action(tmp_path):
         calls.append(action_id)
         return {"success": True, "criterion_id": "step", "source": "tool"}
 
-    plan = Plan.initial("once").replan(steps=(PlanStep("step", "step", action="tool"),), reason="initial")
+    plan = Plan.initial("once").replan(steps=(PlanStep("step", "step", action="status"),), reason="initial")
     rt = runtime(tmp_path, execute)
     mission = rt.create("once", "once", plan)
     rt.run_slice(mission.mission_id)
