@@ -10,7 +10,11 @@ from cyber_knowledge.models import KnowledgeObject, normalize
 def load_jsonl(path: str | Path, *, source: str, source_type: str) -> list[KnowledgeObject]:
     objects = []
     seen: set[str] = set()
-    for line_number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), start=1):
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"unable to read knowledge file: {exc}") from exc
+    for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
