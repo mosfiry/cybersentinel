@@ -1,0 +1,6 @@
+# B3-C5 temporary archaeology marker.
+# The authoring environment cannot read agent/mission_runtime.py beyond byte
+# 32793 (web fetch cap). This marker asks CI to publish the file tail to
+# diagnostics/mission_runtime_tail.txt once, so the slice path (run_slice)
+# can be put through the canonical ExecutionPlan binding (B3-H2/H3).
+# Remove this marker and the workflow step after C5-A/B land.

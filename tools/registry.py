@@ -58,7 +58,8 @@ class ToolSpec:
             "output_schema": self.output_schema or {"type": "object"},
             "risk_class": self.risk_class,
             "required_authorization": self.required_authorization,
-            "network_access": self.network_access,
+            "network
+_access": self.network_access,
             "filesystem_access": self.filesystem_access,
             "process_access": self.process_access,
             "credential_access": self.credential_access,
@@ -120,7 +121,8 @@ def _search(argument):
     if ":" in query:
         parts = query.split(":", 1)
         scope_str = parts[0].lower()
-        query = parts[1].strip()
+        query
+ = parts[1].strip()
 
         # Map scope string to SearchScope
         scope_map = {
@@ -183,7 +185,8 @@ def _watch(argument):
 def _unwatch(argument):
     from core.db import remove_watch, watches
     remove_watch(argument or "")
-    return {"keyword": argument, "watches": watches()}
+    return {"keyword": argument, "watches": w
+atches()}
 
 
 def _run_project_tests(argument, *, workspace=None):
@@ -222,7 +225,8 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
-        registry[spec.name] = spec
+        registry[spec.n
+ame] = spec
     return registry
 
 
@@ -260,7 +264,8 @@ def tool_definitions() -> list[dict[str, Any]]:
             parameters["required"] = ["query"]
         definitions.append({
             "name": spec.name,
-            "description": spec.description[:512],
+            "descriptio
+n": spec.description[:512],
             "risk_class": spec.risk_class,
             "owner_required": spec.requires_owner,
             "parameters": parameters,
@@ -273,7 +278,7 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None, execution_class: str | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None, execution_class: str | None = None, execution_run_id: str | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
@@ -288,9 +293,10 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     resolved_class = str(execution_class or (ExecutionClass.MISSION_BOUND.value if mission_bound else ExecutionClass.OWNER_DIRECT.value))
     if execution_proof is None:
         raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: {resolved_class} execution requires an ExecutionAuthorizationProof")
-    proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id)
+    proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id, run_id=execution_run_id)
     if not proof_ok:
-        raise PermissionError(f"{proof_code}: {proof_reason}")
+   
+     raise PermissionError(f"{proof_code}: {proof_reason}")
     if str(getattr(execution_proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != resolved_class:
         raise PermissionError(f"{RejectionCode.EXECUTION_CLASS_MISMATCH.value}: proof execution class {getattr(execution_proof, 'execution_class', '')} does not match {resolved_class} execution")
     decision_valid = False
@@ -313,6 +319,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     if spec.scope_required:
         if not isinstance(scope_context, dict):
             raise PermissionError("scope context required")
+
         required = {"program_id", "target_id", "scope_snapshot_id", "url"}
         if not required.issubset(scope_context):
             raise PermissionError("incomplete scope context")
@@ -342,7 +349,8 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     if not valid:
         raise ValueError(reason)
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix
+=f"cybersentinel-{name}")
     if name == "run_project_tests":
         # Legacy compatibility snapshot minting was removed: the registry must
         # never create authorization from a decision field. A governed

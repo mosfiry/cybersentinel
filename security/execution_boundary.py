@@ -37,18 +37,25 @@ class MissionExecutionBoundary:
         """Derive the MISSION_BOUND proof for exactly one execution.
 
         All bindings come from the live Mission object and the Owner-minted
-        snapshot; none of them can be supplied by model output.
+        snapshot; none of them can be supplied by model output. B3-C5: the
+        live execution run identity (model_run_id / execution_run_id) is
+        bound into the proof, so a proof issued for one run can never be
+        reused in another run.
         """
         snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        progress = getattr(mission, "progress", None)
+        live_run = str((progress.get("model_run_id") if isinstance(progress, dict) else "") or ((progress.get("execution_run_id") if isinstance(progress, dict) else "")) or "")
         return ExecutionAuthorizationProof.derive(
             execution_class=ExecutionClass.MISSION_BOUND.value,
-            mission_id=mission.mission_id,
+            mission_id=missio
+n.mission_id,
             request_id=mission.request_id,
             tool=tool,
             argument=argument,
             snapshot=snapshot,
             decision=decision,
             tool_call_id=tool_call_id,
+            run_id=live_run,
             plan_hash=plan_hash if plan_hash is not None else mission.plan.fingerprint,
             scope=scope if scope is not None else mission.scope_snapshot,
             mission_status=mission.status.value,
@@ -81,7 +88,8 @@ class OwnerDirectBoundary:
     """
 
     @staticmethod
-    def derive(*, tool: str, argument: Any, decision: Any, request_id: str, tool_call_id: str = "", scope_context: Any = None) -> ExecutionAuthorizationProof:
+    def derive(*, tool: str, argument
+: Any, decision: Any, request_id: str, tool_call_id: str = "", scope_context: Any = None) -> ExecutionAuthorizationProof:
         return ExecutionAuthorizationProof.derive(
             execution_class=ExecutionClass.OWNER_DIRECT.value,
             mission_id="",
