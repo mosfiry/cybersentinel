@@ -143,6 +143,37 @@ def test_concurrent_workers_claim_a_mission_once(tmp_path):
     assert queue.get("mission-once").attempts == 1
 
 
+def test_worker_does_not_mark_mission_failed_after_lease_takeover(tmp_path):
+    import sqlite3
+
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-taken-over", available_at="2026-01-01T00:00:00+00:00")
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            with sqlite3.connect(queue.db_path) as db:
+                db.execute("UPDATE mission_queue SET lease_owner=? WHERE mission_id=?", ("replacement-worker", mission_id))
+            heartbeat()
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="stale-worker").run_once(now="2026-01-01T00:00:00+00:00")
+    assert result.state is WorkerMissionState.EXECUTING
+    assert result.lease_owner == "replacement-worker"
+    assert result.last_error == ""
+
+
+def test_worker_records_runtime_permission_error_as_failure(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-auth-error", available_at="2026-01-01T00:00:00+00:00")
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            raise PermissionError("authorization denied")
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once(now="2026-01-01T00:00:00+00:00")
+    assert result.state is WorkerMissionState.FAILED
+    assert result.last_error == "PermissionError: authorization denied"
+
+
 def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-recovery", available_at="2026-01-01T00:00:00+00:00")

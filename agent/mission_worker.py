@@ -29,6 +29,10 @@ class WorkerMissionState(str, Enum):
     SCHEDULED = "scheduled"
 
 
+class LeaseLostError(PermissionError):
+    """Raised when a worker heartbeat no longer owns the queue lease."""
+
+
 @dataclass(frozen=True)
 class QueueItem:
     mission_id: str
@@ -101,7 +105,7 @@ class MissionQueue:
         with sqlite3.connect(self.db_path) as db:
             updated = db.execute("UPDATE mission_queue SET lease_expires_at=? WHERE mission_id=? AND state=? AND lease_owner=?", (expiry, mission_id, WorkerMissionState.EXECUTING.value, worker_id))
             if updated.rowcount != 1:
-                raise PermissionError("worker lease is not owned")
+                raise LeaseLostError("worker lease is not owned")
         return self.get(mission_id)
 
     def recover_expired(self, *, now: str | None = None) -> list[QueueItem]:
@@ -155,6 +159,10 @@ class MissionWorker:
                 if "heartbeat" not in str(exc):
                     raise
                 mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices)
+        except LeaseLostError:
+            # A lease may be reclaimed while this worker is between slices. The
+            # stale worker must not overwrite the queue outcome or report FAILED.
+            return self.queue.get(item.mission_id)
         except Exception as exc:
             return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}", worker_id=self.worker_id)
         state = {
