@@ -1,0 +1,249 @@
+LEN 57266
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Callable
+import hashlib
+import json
+
+from .mission import Mission, MissionStatus, MissionStore
+from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
+from .trajectory import EventType
+from .observation import Observation
+from .observation_intelligence import ObservationInterpreter, should_interpret_observation
+from .hypotheses import HypothesisEngine, HypothesisState
+from .strategy import StrategyState, decide as decide_strategy
+from .model_protocol import ConversationTurn, NativeModel, ToolCallResult
+from .provider_api import ProviderError
+from .model_intelligence.context import ContextAssembler
+from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
+
+
+class MissionRuntime:
+    """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
+
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None):
+        self.store = store
+        self.executor = executor
+        self.authorizer = authorizer or self._default_authorizer
+        self.replanner = replanner or self._default_replanner
+        self.verifier = verifier or self._default_verifier
+        self.recovery_policy = recovery_policy or RecoveryPolicy()
+        self.interpreter = interpreter or ObservationInterpreter()
+        self.require_authorization_snapshot = require_authorization_snapshot
+        self.authorization_snapshot_factory = authorization_snapshot_factory
+
+    def _mission_authorization(self, mission: Mission) -> tuple[bool, str]:
+        if not self.require_authorization_snapshot:
+            raise RuntimeError("authorization snapshot bypass is not supported")
+        try:
+            from security.mission_authorization import MissionAuthorizationSnapshot
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+            scope = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+            target = str(scope.get("target_id") or snapshot.target_identity)
+            expected_version = int(mission.provenance.get("authorization_snapshot_version", 1))
+            valid, reason = snapshot.validate_for_mission(mission_id=mission.mission_id, owner_identity=mission.owner_identity_ref, target_identity=target, version=expected_version)
+            if not valid:
+                return False, reason
+            from security.execution_plan_runtime import validate_stored_execution_plan
+            plan_ok, plan_reason = validate_stored_execution_plan(mission)
+            if not plan_ok:
+                return False, plan_reason
+            actions = {step.action for step in mission.plan.steps if step.action != "__planning_failure__"}
+            if actions - set(snapshot.allowed_actions) or actions - set(snapshot.allowed_tools) or actions.intersection(snapshot.forbidden_actions):
+                return False, "mission actions or tools outside authorization snapshot"
+            expected_root = str(scope.get("workspace_root", ""))
+            if expected_root and str(snapshot.workspace_boundary.get("root", "")) != expected_root:
+                return False, "workspace boundary mismatch"
+            expected_network = set(scope.get("allowed_networks", ()))
+            if expected_network != set(snapshot.network_boundary.get("allowed", ())):
+                return False, "network boundary mismatch"
+            expected_credentials = set(scope.get("allowed_credentials", ()))
+            if expected_credentials != set(snapshot.credential_boundary.get("allowed", ())):
+                return False, "credential boundary mismatch"
+            return True, "authorized"
+        except (KeyError, TypeError, ValueError, PermissionError) as exc:
+            return False, f"authorization snapshot invalid: {type(exc).__name__}"
+
+    @staticmethod
+    def _default_authorizer(mission: Mission, step: PlanStep) -> tuple[bool, str]:
+        if step.authorization_requirement and not mission.authorization_context:
+            return False, "owner authorization required"
+        if step.authorization_requirement:
+            try:
+                from security.authorization_context import AuthorizationContext
+                AuthorizationContext.from_dict(dict(mission.authorization_context or {}))
+            except (KeyError, TypeError, ValueError, PermissionError):
+                return False, "owner authorization evidence is invalid or stale"
+        if step.scope_requirement and not mission.scope_snapshot:
+            return False, "scope snapshot required"
+        return True, "authorized"
+
+    def _proposal_snapshot_gate(self, mission: Mission, tool_name: str) -> tuple[bool, str, str]:
+        """Deterministic MissionAuthorizationSnapshot gate for model-proposed tools.
+
+        Model output proposes tools but can never widen this gate: membership is
+        checked only against the Owner-minted mission snapshot. This gate is not
+        an alternative to authorize_tool(); it runs before it. Rejections carry a
+        structured RejectionCode so behavior never depends on human-readable
+        message text.
+        """
+        from security.execution_proof import RejectionCode
+        from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
+        if not (mission.authorization_snapshot or {}):
+            return False, RejectionCode.SNAPSHOT_MISSING.value, "mission authorization snapshot missing"
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        except (MissionAuthorizationError, KeyError, TypeError, ValueError, PermissionError) as exc:
+            return False, RejectionCode.SNAPSHOT_INVALID.value, f"authorization snapshot invalid: {type(exc).__name__}"
+        if not snapshot.is_active():
+            return False, RejectionCode.SNAPSHOT_EXPIRED.value, "authorization snapshot expired or not yet active"
+        if tool_name in snapshot.forbidden_actions:
+            return False, RejectionCode.FORBIDDEN_ACTION.value, f"tool {tool_name} is forbidden by authorization snapshot"
+        if tool_name not in snapshot.allowed_tools or tool_name not in snapshot.allowed_actions:
+            return False, RejectionCode.TOOL_NOT_ALLOWED.value, f"tool {tool_name} outside authorization snapshot allowlist"
+        return True, "", "authorized"
+
+    def _derive_execution_proof(self, mission: Mission, proposal: Any, argument: Any, decision: Any, plan_hash: str | None = None) -> Any:
+        """Derive the deterministic ExecutionAuthorizationProof for one proposal.
+
+        The proof is derived evidence of the authorization already granted by
+        the Owner-minted snapshot and authorize_tool(). It never creates or
+        widens authority, and model output can never construct one. Derivation
+        is delegated to the canonical MissionExecutionBoundary so no caller
+        re-implements half of the binding process. When the current derived
+        ExecutionPlan is available its fingerprint is the canonical plan
+        identity bound into the proof (B3-C4B section 8); otherwise the
+        boundary binds the legacy Plan fingerprint unchanged.
+        """
+        from security.execution_boundary import MissionExecutionBoundary
+        return MissionExecutionBoundary.derive(
+            mission,
+            tool=proposal.name,
+            argument=argument,
+            decision=decision.decision if decision is not None and decision.allowed else None,
+            tool_call_id=proposal.tool_call_id,
+            **({} if plan_hash is None else {"plan_hash": str(plan_hash)}),
+        )
+
+    def _turn_survivors(self, mission: Mission, proposals: tuple[Any, ...], run_id: str, seen: set[str]) -> list[Any]:
+        """Deterministic pre-filter: proposals eligible for plan derivation.
+
+        Only proposals with valid identity (mission, run, not already seen)
+        that also pass the Owner snapshot gate enter the canonical
+        ExecutionPlan derivation. Rejected proposals are handled by the
+        existing per-proposal fail-closed paths and never reach execution.
+        """
+        survivors: list[Any] = []
+        pre_seen = set(seen)
+        for proposal in proposals:
+            if proposal.mission_id and proposal.mission_id != mission.mission_id:
+                continue
+            if proposal.run_id and proposal.run_id != run_id:
+                continue
+            if proposal.tool_call_id in pre_seen:
+                continue
+            snapshot_ok, _code, _reason = self._proposal_snapshot_gate(mission, proposal.name)
+            if snapshot_ok:
+                pre_seen.add(proposal.tool_call_id)
+                survivors.append(proposal)
+        return survivors
+
+    def _turn_execution_plan(self, mission: Mission, survivors: list[Any]) -> Any:
+        """Derive and bind the canonical per-turn ExecutionPlan (B3-C4B).
+
+        The runtime obtains ExecutionPlan objects only through the trusted
+        derive_execution_plan boundary (Owner Budget intersect validated
+        ActionIntents). Derivation failure fails closed for the whole turn:
+        no tool executes, no empty executable plan is created, and there is
+        no fallback to model tools, policy tools, registered tools, or the
+        legacy Plan (INV-C4-11).
+        """
+        from security.execution_plan_runtime import bind_execution_plan, derive_mission_execution_plan
+        plan = derive_mission_execution_plan(mission, survivors)
+        bind_execution_plan(mission, plan)
+        return plan
+
+    def _reject_turn_plan_derivation(self, mission: Mission, survivors: list[Any], exc: Exception, progress: dict[str, Any]) -> None:
+        """Map ExecutionPlanError at the runtime to a durable authorization denial."""
+        reason = f"execution plan derivation failed closed: {type(exc).__name__}: {exc}"
+        for proposal in survivors:
+            mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": f"TOOL_NOT_ALLOWED: {reason}"})
+            mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "TOOL_NOT_ALLOWED", "reason": reason})
+            progress["tool_results"].append(ToolCallResult(proposal, False, error=f"TOOL_NOT_ALLOWED: {reason}").to_dict())
+        mission.error = f"TOOL_NOT_ALLOWED: {reason}"
+        mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": reason})
+        mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "model proposals cannot derive a valid ExecutionPlan; authorization denied")
+
+    @staticmethod
+    def _default_replanner(mission: Mission, observation: dict[str, Any]) -> Plan:
+        step = mission.current_plan_step
+        repair = PlanStep(step_id=f"repair-{mission.plan.version}-{mission.current_step + 1}", objective=f"Repair after observation: {observation.get('error', 'failure')}", action=step.action, expected_observation="successful retry", authorization_requirement=step.authorization_requirement, scope_requirement=step.scope_requirement, verification=step.verification) if step else PlanStep("repair", "recover mission", action="recover")
+        return mission.plan.replan(steps=(repair,), assumptions=("previous action failed; repair strategy selected",), reason="observation invalidated prior assumption")
+
+    @staticmethod
+    def _default_verifier(mission: Mission) -> GoalVerification:
+        criteria = tuple(VerificationCriterion(item["criterion_id"], item.get("description", item["criterion_id"]), item.get("check", "runtime"), item.get("required", True)) for item in mission.completion_criteria)
+        evidence = tuple(evidence_for(item["criterion_id"], item.get("passed", False), item.get("source", "mission"), item.get("result", {}), provenance={"mission_id": mission.mission_id}) for item in mission.evidence)
+        return GoalVerification.evaluate(mission.objective, criteria, evidence)
+
+    def create(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> Mission:
+        snapshot_factory = kwargs.pop("authorization_snapshot_factory", None) or self.authorization_snapshot_factory
+        mission = Mission.create(owner_request, objective, plan, **kwargs)
+        if mission.authorization_snapshot is None and snapshot_factory is not None:
+            snapshot = snapshot_factory(mission)
+            if snapshot is not None:
+                mission.authorization_snapshot = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        if mission.authorization_snapshot:
+            mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot.get("version", 1))
+        mission.transition(MissionStatus.READY, "plan persisted")
+        return self.store.save(mission)
+
+    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None) -> Mission:
+        """Create a Mission without allowing model understanding to rewrite the Owner objective."""
+        from security.authorization_context import AuthorizationContext
+        if not isinstance(authorization_context, AuthorizationContext):
+            raise TypeError("Owner Instruction requires typed AuthorizationContext")
+        objective = str(instruction).strip()
+        if not objective:
+            raise ValueError("Owner Instruction cannot be empty")
+        return self.create(
+            objective,
+            objective,
+            plan,
+            request_id=authorization_context.request_id,
+            owner_identity_ref=owner_identity_ref or authorization_context.owner_evidence_fingerprint,
+            owner_instruction=objective,
+            authorization_context=authorization_context.to_dict(),
+            scope_snapshot=scope_snapshot,
+            policy_snapshot=authorization_context.policy_snapshot.to_dict(),
+            completion_criteria=completion_criteria,
+            provenance={"source": "owner_instruction", **(provenance or {})},
+            authorization_snapshot_factory=authorization_snapshot_factory,
+        )
+
+    def provide_owner_decision(self, mission_id: str, *, allow: bool, authorization_context: dict[str, Any] | None = None) -> Mission:
+        mission = self._load(mission_id)
+        if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
+            raise ValueError("mission is not waiting for owner input")
+        if not allow:
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": "owner denied action"})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "owner denied")
+        else:
+            mission.authorization_context = authorization_context or {"owner_decision": "allow"}
+            mission.transition(MissionStatus.READY, "owner allowed action")
+        return self.store.save(mission)
+
+    def _load(self, mission_id: str) -> Mission:
+        mission = self.store.load(mission_id)
+        if mission is None:
+            raise KeyError("unknown_mission")
+        return mission
+
+    def _interpret_observation(self, mission: Mission, step: PlanStep, observation: dict[str, Any], *, success: bool):
+        previous = mission.observations[-2] if len(mission.observations) > 1 else None
+        if not should_interpret_observation(observation, previous=previous):
+            return None
+        proposal = self.interprete

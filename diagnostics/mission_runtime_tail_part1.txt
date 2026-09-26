@@ -1,4 +1,3 @@
-LEN 57266
                    mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution proof derivation failed: {type(exc).__name__}"})
                             result = ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution proof derivation failed: {type(exc).__name__}")
                             proof = None
