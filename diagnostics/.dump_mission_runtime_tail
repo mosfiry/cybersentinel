@@ -1,0 +1,1 @@
+temporary archaeology shim marker (B3-C5 final hardening): dump agent/mission_runtime.py to diagnostics parts for byte-exact fetch; remove this file and the workflow dump step when done
