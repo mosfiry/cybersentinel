@@ -243,7 +243,9 @@ class AgentCore:
             if not proof_ok:
                 mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": action_id, "code": proof_code, "reason": proof_reason})
                 return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{proof_code}: {proof_reason}", "execution_id": action_id}
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_proof=proof)
+                        progress = mission.progress if isinstance(mission.progress, dict) else {}
+            live_run_id = str(progress.get("model_run_id") or progress.get("execution_run_id") or "")
+value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_proof=proof, execution_run_id=live_run_id)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except PermissionError as exc:
             return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
