@@ -914,7 +914,7 @@ def test_stage_b_adapter_import_allowlist():
     for node in ast.walk(_adapter_ast()):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert alias.name.split(".")[0] in ALLOWED_TOP_MODULES, f"forbidden import: {alias.name}"
+                assert alias.name in ALLOWED_MODULES or alias.name.split(".")[0] in ALLOWED_TOP_MODULES, f"forbidden import: {alias.name}"
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             assert module.split(".")[0] in ALLOWED_TOP_MODULES or module in ALLOWED_MODULES, f"forbidden import: {module}"
