@@ -142,3 +142,50 @@ ion): e168da58d93b "feat(security): Stage A typed security tool inventory (Layer
 
 - NEXT_SESSION_FIRST_ACTION: verify diagnostics/ci-<this-checkpoint-commit-sha>.md is green at branch HEAD (1219 passed / 1 skipped), then begin Stage D design: wire the adapter layer into MissionRuntime slice execution through the existing proof chain (read security/tool_adapter.py, runtime slice execution path, and the Stage B/C batteries first); keep catalog/registry disjoint (Path A); do NOT touch main, B3-C6, Phase A, or R2.
 - EXACT_RESUME_POINT: Stage C COMPLETE (second adapter + ~83-item adversarial battery + CI green 1219/1 + Path A decision + checkpoint). First incomplete step: Stage D — adapter integration into MissionRuntime slice execution through the existing proof chain.
+
+## SESSION 4 — Security Tooling Expansion, Stage C: External-Binary Hardening + Dry-Run Transparency (COMPLETE)
+
+- Branch: security/b3-four-layer-intent
+- Start HEAD (session): 0e6c9c92462d4db0d7c5e1264d447d320a49004e (verified from repository before any modification; CI SUCCESS 1231/1)
+- Final HEAD (session): 6c4305b697b6fbe7b02133867fbfcb72e73c3700 (plus this checkpoint commit)
+- Stage: Stage C hardening continuation. No agent-parallel work was overwritten; commits between checkpoints were CI-generated markers only.
+
+### Milestone 1 — external-binary handler hardening (core/local_defense.py)
+- Binary identity pinning: local_process_info now resolves `ps` ONCE via shutil.which at handler entry and executes the RESOLVED ABSOLUTE PATH (closing the PATH-hijack window between the adapter PREPARE availability check and the spawn); unresolvable binary fails closed BEFORE any spawn.
+- Deterministic timeout classification: subprocess.TimeoutExpired is converted to a classified RuntimeError (never a partial result, never swallowed).
+- Output bounding: row cap (4096 parsed rows) and command-string cap (256 chars) with explicit computed output_truncated flags; flags are computed by the handler, never taken from tool output.
+- Evidence: the resolved binary identity is recorded in the structured info (auditable binary provenance; local read-only data only).
+- Battery: tests/test_local_process_info_hardening.py (12 tests) — resolved path executed, fail-closed unresolvable binary (spawn count == 0), fixed argv vector with no shell, non-zero exit / empty stdout / timeout classified, malformed rows skipped, row cap, command truncation, shell metacharacters are DATA, evidence structured and authority/secret-free.
+
+### Milestone 2 — PREPARE resolved-binary disclosure (security/tool_adapter.py)
+- Byte-exact reconstruction of security/tool_adapter.py from the commit-patch chain f4fbbf64 → b06d7ba3 → e0a10680 (git blob sha 13561c10f58560b18c3d07e4fea3e9abe08f1633 verified BEFORE any modification).
+- PreparedExecution gains resolved_binary (absolute path resolved once at PREPARE via shutil.which). DISCLOSURE ONLY: the handler independently resolves and pins its own path (defense in depth); the field never drives execution and can never widen authority.
+- dry_run() plan now discloses resolved_binary alongside required_binary/handler_source/would_execute. Dry-run still never calls tools.registry.execute, never spawns, never reaches a handler (INV-ADP-5 unchanged).
+- resolved_binary is sourced EXCLUSIVELY from shutil.which inside prepare(); the request is a frozen dataclass with no binary/path field, and tool output cannot appear in the dry-run plan (the plan is derived before any execution exists).
+- Battery: tests/test_tool_adapter_resolved_binary.py (8 tests) — prepare discloses resolved absolute path; None when no binary required; dry-run disclosure with execute_spy == []; missing binary fails closed at PREPARE; resolved path follows which() not request fields; immune to forged tool output; authorization failure (PROOF_REQUIRED) never reaches prepare/handler; existing dry-run plan keys and PreparedExecution positional construction preserved.
+
+### Commits (this session)
+- 5a8cd492ef56 "feat(security): pin resolved binary path, classify timeout, bound output in local_process_info handler" (CI GREEN: 1219/1)
+- f09291c8891f "test(security): adversarial battery for hardened local_process_info handler" (CI RED: 1 failed / 1230 — single test-side fixture defect: the structured info payload is the 7th positional argument of add_event, not the 5th)
+- b61909ad64c0 "test(security): fix evidence-event fixture" (CI GREEN: 1231/1)
+- 0e6c9c92462d "docs(runtime): Stage C hardening checkpoint" (CI GREEN: 1231/1; NEW dedicated checkpoint docs/runtime/SECURITY_TOOLING_STAGE_C_CHECKPOINT.md created per Stage C mission requirement)
+- f09e6b60e5af "feat(security): resolve required binary once at PREPARE and disclose absolute path in dry-run plan" (CI GREEN: 1231/1)
+- 6c4305b697b6 "test(security): adversarial battery for PREPARE resolved-binary disclosure" (CI GREEN: 1239 passed / 1 skipped / 0 failed)
+
+### Engineering method note (byte-exactness discipline)
+- The trusted retrieval paths this session: (a) github contents API base64 + JSON unescape + git blob sha verification for files under ~30KB; (b) commit full_patch chain application with hunk-offset tracking and git blob sha verification for larger files (security/tool_adapter.py 36866 bytes reconstructed and verified against 13561c10...); (c) raw.githubusercontent and truncated open_url output are NEVER pushed.
+- The patch applier required cumulative hunk-offset tracking (hunk old-start lines refer to the pre-image; later hunks shift by earlier deltas) — a 3-line desync was caught by context verification before any push.
+
+### Security invariants upheld
+- No parallel authority path: execution only through tools.registry.execute; adapter never mints proofs, never mutates the registry, no process-execution surface in the adapter module (AST-enforced, unchanged).
+- Dry-run is real: disclosure-only fields cannot spawn, mutate, or reach a handler; INV-ADP-1..8 unchanged.
+- Catalog/registry disjointness (Path A) untouched; the authority hierarchy is untouched and was never reordered, weakened, or made configurable.
+- No tests weakened; every rejection proven pre-handler (spy counters) in both new batteries.
+
+### Unresolved risks / deferred items (for Owner)
+- Replay semantics remain single-RUN, not single-USE (single-use nonce needs an Owner decision; it changes proof semantics).
+- Adapter wiring into MissionRuntime/AgentCore slice execution remains deferred to Stage D (boundary proven closed by the Stage B/C batteries).
+- Duplicate-execution / cancellation-boundary contracts live in the mission-orchestration track owned by the parallel engineering agent; no scheduler/DAG/worker runtime was built here (out of this track's scope).
+
+- NEXT_SESSION_FIRST_ACTION: verify diagnostics/ci-<this-checkpoint-commit-sha>.md is green at branch HEAD (expected 1239 passed / 1 skipped), then begin Stage D design: wire the adapter layer into MissionRuntime slice execution through the existing proof chain (read security/tool_adapter.py, agent/mission_runtime.py slice path, and the Stage B/C batteries first); keep catalog/registry disjoint (Path A); do NOT touch main, B3-C6, Phase A, or R2; do not build any scheduler/DAG/worker runtime (parallel agent's track).
+- EXACT_RESUME_POINT: Stage C hardening milestones 1 and 2 COMPLETE (handler binary pinning + PREPARE resolved-binary disclosure + 20 new adversarial tests + CI green 1239/1 + root checkpoint updated). First incomplete step: Stage D — adapter integration into MissionRuntime slice execution through the existing proof chain.
