@@ -59,15 +59,6 @@ jobs:
             { echo "## secret-scan match:"; echo "$MATCHES"; } >> diag.txt
             exit 1
           fi
-      - name: B3-C5 source tail dump (temporary archaeology shim)
-        if: always()
-        shell: bash
-        run: |
-          if [ -f diagnostics/.dump_mission_runtime_tail ]; then
-            python -c "from pathlib import Path; d=Path('agent/mission_runtime.py').read_text(); Path('diagnostics/mission_runtime_tail_part0a.txt').write_text('LEN ' + str(len(d)) + '\n' + d[0:16350]); Path('diagnostics/mission_runtime_tail_part0b.txt').write_text(d[16350:32700]); Path('diagnostics/mission_runtime_tail_part1.txt').write_text(d[32700:45000]); Path('diagnostics/mission_runtime_tail_part2.txt').write_text(d[45000:])"
-            python -c "from pathlib import Path; import base64; d=base64.b64encode(Path('agent/agent_core.py').read_bytes()).decode('ascii'); Path('diagnostics/agent_core_b64_part1.txt').write_text('LEN ' + str(len(d)) + '\n' + d[0:21000]); Path('diagnostics/agent_core_b64_part2.txt').write_text(d[21000:])"
-            python -c "from pathlib import Path; import base64; d=base64.b64encode(Path('.github/workflows/tests.yml').read_bytes()).decode('ascii'); Path('diagnostics/tests_yml_b64.txt').write_text('LEN ' + str(len(d)) + '\n' + d)"
-          fi
       - name: Write status
         if: always()
         shell: bash
