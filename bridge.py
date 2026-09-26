@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from http.cookies import SimpleCookie
@@ -26,16 +30,38 @@ from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 from security.public_session import DEFAULT_PUBLIC_SESSIONS
 from api.missions import MissionService
-from agent.mission_worker import MissionQueue, MissionScheduler
+from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker
 from agent.mission_runtime import MissionRuntime
 from agent.mission import MissionStore
 from agent.agent_core import AgentCore
 from agent.planning import Plan, PlanStep
-from security.mission_authorization import MissionAuthorizationSnapshot
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
+
+
+def mission_worker_supervisor(stop: threading.Event, *, poll_seconds: float = 0.5) -> None:
+    """Run durable queued/scheduled missions while the bridge server is alive."""
+    db_path = DB_PATH.with_name("missions.sqlite3")
+    queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"))
+    scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
+
+    def runtime_factory() -> MissionRuntime:
+        core = AgentCore(RUNTIME.router, db_path=db_path)
+        return MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True)
+
+    worker = MissionWorker(queue, runtime_factory, worker_id=f"bridge-{os.getpid()}")
+    while not stop.is_set():
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            queue.recover_expired(now=now)
+            scheduler.dispatch_due(now=now)
+            if worker.run_once() is None:
+                stop.wait(poll_seconds)
+        except Exception as exc:
+            print(f"[mission-worker] {type(exc).__name__}: {exc}")
+            stop.wait(poll_seconds)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -92,15 +118,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, {"ok": False, "error": reason})
             return None
         return owner_token, owner_session, owner_challenge
-
-    def _mission_snapshot_factory(self, owner_identity: str, scope_context: dict | None = None):
-        scope_context = scope_context or {}
-        target = str(scope_context.get("target_id") or "api-target")
-        root = str(scope_context.get("workspace_root") or Path.cwd().resolve())
-        def factory(mission):
-            actions = tuple(step.action for step in mission.plan.steps if step.action != "__planning_failure__")
-            return MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity=target, scope=("workspace",), allowed_actions=actions, forbidden_actions=tuple(scope_context.get("forbidden_actions", ())), allowed_tools=actions, time_window={"timezone": "UTC"}, max_duration=max(300, mission.max_iterations * 60), rate_limits={action: 10 for action in actions}, network_boundary={"allowed": tuple(scope_context.get("allowed_networks", ()))}, data_boundary={"allowed": (target,)}, credential_boundary={"allowed": tuple(scope_context.get("allowed_credentials", ()))}, workspace_boundary={"root": root}, policy_version="api-owner-policy", owner_approval=owner_identity)
-        return factory
 
     def _public_enabled(self):
         return PUBLIC_WEB_ENABLED
@@ -248,15 +265,36 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 owner_token, owner_session, owner_challenge = auth
                 if isinstance(payload.get("plan"), dict):
-                    objective = str(payload.get("objective") or payload.get("text") or "").strip()
-                    if not objective:
+                    instruction = str(payload.get("text") or payload.get("objective") or "").strip()
+                    if not instruction:
                         raise ValueError("objective_required")
                     raw_plan = payload["plan"]
                     raw_steps = raw_plan.get("steps", [])
                     steps = tuple(PlanStep(step_id=str(item["step_id"]), objective=str(item.get("objective", item["step_id"])), prerequisites=tuple(item.get("prerequisites", ())), action=str(item.get("action", "")), expected_observation=str(item.get("expected_observation", "")), authorization_requirement=str(item.get("authorization_requirement", "owner")), scope_requirement=str(item.get("scope_requirement", "")), retry_policy=dict(item.get("retry_policy", {})), verification=tuple(item.get("verification", ()))) for item in raw_steps)
-                    plan = Plan(version=int(raw_plan.get("version", 1)), objective=objective, assumptions=tuple(raw_plan.get("assumptions", ())), steps=steps, dependencies=tuple(raw_plan.get("dependencies", ())), completion_criteria=tuple(raw_plan.get("completion_criteria", ())), risk=str(raw_plan.get("risk", "unknown")), created_from=str(raw_plan.get("created_from", "api")))
-                    owner_identity = "owner-session" if owner_session else "owner-token"
-                    mission = self._mission_service().create_mission(objective, objective, plan, owner_identity_ref=owner_identity, scope_snapshot=payload.get("scope_context"), completion_criteria=payload.get("completion_criteria") or [], authorization_snapshot_factory=self._mission_snapshot_factory(owner_identity, payload.get("scope_context")))
+                    plan = Plan(version=int(raw_plan.get("version", 1)), objective=instruction, assumptions=tuple(raw_plan.get("assumptions", ())), steps=steps, dependencies=tuple(raw_plan.get("dependencies", ())), completion_criteria=tuple(raw_plan.get("completion_criteria", ())), risk=str(raw_plan.get("risk", "unknown")), created_from=str(raw_plan.get("created_from", "owner-api")))
+                    request_id = str(payload.get("request_id") or uuid.uuid4().hex)
+                    core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
+                    authorization_context, _ = core._auth(instruction, owner_token, request_id, owner_session, owner_challenge)
+                    scope_context = core._normalize_scope_context(payload.get("scope_context"))
+                    if scope_context and scope_context.get("scope_snapshot_id"):
+                        from security.scope_store import get_snapshot
+                        scope = get_snapshot(scope_context["scope_snapshot_id"])
+                        if scope is None:
+                            raise PermissionError("Owner-approved scope snapshot not found")
+                        authorization_context = type(authorization_context)(authorization_context.request_id, authorization_context.owner_evidence, authorization_context.policy_snapshot, scope_snapshot=scope, session_id=authorization_context.session_id)
+                    allowed_tools = set(core._owner_allowed_tools(instruction))
+                    requested_tools = {step.action for step in steps}
+                    if not requested_tools or requested_tools - allowed_tools:
+                        raise PermissionError("plan actions exceed the deterministic Owner-instruction tool allowlist")
+                    if any(not core._owner_proposal_allowed(instruction, step)[0] for step in steps):
+                        raise PermissionError("plan tool arguments exceed the deterministic Owner-instruction boundary")
+                    service = self._mission_service()
+                    snapshot_factory = core._authorization_snapshot_factory(authorization_context, tuple(sorted(allowed_tools)), scope_context)
+                    criteria = [{"criterion_id": step.step_id, "description": f"Owner-requested step {step.step_id} completed", "check": "tool observation", "required": True} for step in steps]
+                    mission = service.runtime.create_owner_graph(instruction, plan, authorization_context=authorization_context, scope_snapshot=scope_context, completion_criteria=criteria, owner_identity_ref=authorization_context.owner_evidence.proof_fingerprint, provenance={"source": "authenticated_mission_api"}, authorization_snapshot_factory=snapshot_factory, max_parallel=1)
+                    mission.progress["mission_api_created"] = True
+                    service.runtime.store.save(mission)
+                    mission = mission.to_dict()
                     return self._send(201, {"ok": True, "mission": mission, "mission_id": mission["mission_id"], "status": mission["status"]})
                 result = chat(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge)
                 return self._send(201, {"ok": True, "mission": result.get("mission"), "mission_id": result.get("mission_id"), "status": result.get("status")})
@@ -273,16 +311,19 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 service = self._mission_service()
                 owner_token, owner_session, owner_challenge = auth
-                if action == "start" or action == "resume":
-                    result = service.start_mission(mission_id) if action == "start" else service.resume_mission(mission_id)
+                core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
+                mission = service.runtime.store.load(mission_id)
+                if mission is None:
+                    raise KeyError("unknown_mission")
+                owner_context = core.owner_context_for_mission(mission, owner_token=owner_token)
+                if action == "start":
+                    result = service.start_mission(mission_id, authorization_context=owner_context)
                     return self._send(200, {"ok": True, "mission": result})
-                if action == "pause":
-                    return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id)})
-                if action == "cancel":
-                    return self._send(200, {"ok": True, "mission": service.cancel_mission(mission_id)})
+                if action in {"pause", "cancel", "resume"}:
+                    return self._send(200, {"ok": True, "mission": service.control_mission(mission_id, action, authorization_context=owner_context)})
                 if action == "schedule":
                     payload = self._read_json()
-                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
+                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)), authorization_context=owner_context)})
                 return self._send(404, {"ok": False, "error": "unknown_mission_action"})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -398,9 +439,17 @@ def main():
     if not BRIDGE_TOKEN:
         raise SystemExit("BRIDGE_TOKEN is required in .env")
     server = ThreadingHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
+    stop = threading.Event()
+    worker_thread = threading.Thread(target=mission_worker_supervisor, args=(stop,), name="cybersentinel-mission-worker", daemon=True)
+    worker_thread.start()
     print(f"{PRODUCT_NAME} {VERSION}: http://{BRIDGE_HOST}:{BRIDGE_PORT}")
-    print("Local-only defensive engine, threat intelligence, planner and audit enabled.")
-    server.serve_forever()
+    print("Local-only defensive engine, governed mission scheduler, threat intelligence, planner and audit enabled.")
+    try:
+        server.serve_forever()
+    finally:
+        stop.set()
+        worker_thread.join(timeout=5)
+        server.server_close()
 
 
 if __name__ == "__main__":

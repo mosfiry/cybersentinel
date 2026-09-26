@@ -335,6 +335,7 @@ def authority_snapshot() -> dict[str, Any]:
         "tool_output_authority": "none",
         "system_safety_boundary": policy.system_safety_boundary,
         "policy_fingerprint": policy_fingerprint(),
+        "current_owner_instruction": current,
         "owner_instruction_fingerprint": owner_instruction_fingerprint(current),
         "invariant": invariant_snapshot(),
     }
@@ -378,27 +379,50 @@ def authentication_from_session(context: dict[str, Any], request_id: str = "") -
     from security.owner_session import verify_owner_session_proof
     if not verify_owner_session_proof(str(context["owner_session_id"]), request_id, str(context["session_proof"])):
         raise PermissionError("invalid, stale, or replayed Owner session proof")
-    return _issue_evidence(OwnerInstructionSource.OWNER_SESSION.value, request_id, str(context["session_proof"]), str(context["owner_session_id"]))
+    # The session proof authenticates this request; the configured Owner token
+    # supplies the stable principal identity shared with token-authenticated controls.
+    principal = OWNER_TOKEN or str(context["session_proof"])
+    return _issue_evidence(OwnerInstructionSource.OWNER_SESSION.value, request_id, principal, str(context["owner_session_id"]))
 
 
-def capture_policy_snapshot(request_id: str, authentication: OwnerAuthenticationEvidence) -> OwnerPolicySnapshot:
+def capture_policy_snapshot(request_id: str, authentication: OwnerAuthenticationEvidence, *, instruction: str | None = None) -> OwnerPolicySnapshot:
     if not authentication.is_valid(request_id):
         raise PermissionError("cannot snapshot with stale or mismatched Owner evidence")
     state = load_state()
-    instruction = state.get("current_owner_instruction") or ""
+    global_instruction = state.get("current_owner_instruction") or ""
+    captured_instruction = global_instruction if instruction is None else str(instruction).strip()
+    if instruction is not None and not captured_instruction:
+        raise ValueError("request Owner instruction cannot be empty")
     from security.authority import authority_snapshot as invariant_snapshot
     captured_at = datetime.now(timezone.utc).isoformat()
-    record = dict(state.get("current_owner_instruction_record") or {})
+    record = dict(state.get("current_owner_instruction_record") or {}) if instruction is None else {
+        "version": int((state.get("current_owner_instruction_record") or {}).get("version", 0)) + 1,
+        "text": captured_instruction,
+        "instruction": captured_instruction,
+        "created_at": captured_at,
+        "updated_at": captured_at,
+        "fingerprint": owner_instruction_fingerprint(captured_instruction),
+        "instruction_fingerprint": owner_instruction_fingerprint(captured_instruction),
+        "authentication": authentication.to_dict(),
+        "request_id": str(request_id),
+        "source": authentication.method,
+        "previous_version": (state.get("current_owner_instruction_record") or {}).get("version"),
+        "status": OwnerInstructionStatus.ACTIVE.value,
+        "request_scoped": True,
+    }
+    authority = invariant_snapshot()
+    authority["current_owner_instruction"] = global_instruction
+    authority["current_owner_instruction_fingerprint"] = owner_instruction_fingerprint(global_instruction)
     return OwnerPolicySnapshot(
         request_id=str(request_id),
-        owner_instruction=instruction,
-        owner_instruction_fingerprint=owner_instruction_fingerprint(instruction),
+        owner_instruction=captured_instruction,
+        owner_instruction_fingerprint=owner_instruction_fingerprint(captured_instruction),
         owner_policy_fingerprint=policy_fingerprint(),
-        authority_snapshot=invariant_snapshot(),
+        authority_snapshot=authority,
         authentication=authentication.to_dict(),
         captured_at=captured_at,
         instruction_record=record,
-        owner_instruction_id=str(record.get("fingerprint") or owner_instruction_fingerprint(instruction)),
+        owner_instruction_id=str(record.get("fingerprint") or owner_instruction_fingerprint(captured_instruction)),
         policy_version=str(load_policy().version),
         created_at=captured_at,
     )

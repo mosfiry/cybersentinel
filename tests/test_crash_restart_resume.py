@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 """Round 2 P0-5 - crash / restart / resume on the canonical MissionRuntime.
 
 The mission state is durable SQLite. A simulated process crash (unhandled
@@ -27,15 +27,17 @@ def _runtime(db):
     return MissionRuntime(MissionStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime):
+def _mission(runtime, *, authenticated=True):
     plan = Plan.initial("audit the asset").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
+    authority = make_test_owner_kwargs("audit the asset", "crash-restart-test") if authenticated else {}
     return runtime.create(
         "audit the asset",
         "audit the asset",
         plan,
         completion_criteria=[{"criterion_id": "goal"}],
+        **authority,
     )
 
 
@@ -177,7 +179,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
 
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal"})
     runtime = _runtime(_db(tmp_path))
-    mission = _mission(runtime)
+    mission = _mission(runtime, authenticated=False)
     assert mission.authorization_context is None, "fixture mission intentionally carries no Owner authorization"
 
     class PrivilegeEscalationModel:
@@ -220,10 +222,8 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
                 )
             return ModelTurn(turn_id, content="mission complete", finish_reason="stop")
 
-    result = runtime.run_model_loop(mission.mission_id, PrivilegeEscalationModel(), tools=[], max_turns=5)
-    tool_results = result.progress["model_loop"]["tool_results"]
-    assert tool_results[0]["error"] == "sensitive tool requires AuthorizationContext"
-    assert tool_results[1]["error"] == "scope-bound tool requires AuthorizationContext with ScopeSnapshot"
-    assert result.status is not MissionStatus.GOAL_COMPLETED
-    assert result.status is MissionStatus.READY
-    assert "lacked deterministic goal evidence" in result.error
+    model = PrivilegeEscalationModel()
+    result = runtime.run_model_loop(mission.mission_id, model, tools=[], max_turns=5)
+    assert model.count == 0
+    assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
+    assert "valid Owner AuthorizationContext required" in result.error

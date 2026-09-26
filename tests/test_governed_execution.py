@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Thread
 import json
 import time
 
@@ -242,11 +242,13 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
         connection.close()
         return response.status, body
 
-    plan = {"version": 1, "objective": "api mission", "steps": [{"step_id": "s1", "objective": "status", "action": "status"}]}
+    plan = {"version": 1, "objective": "Check status for api mission", "steps": [{"step_id": "s1", "objective": "status", "action": "status"}]}
     try:
-        status, created = request("POST", "/api/missions", {"objective": "api mission", "plan": plan})
+        status, created = request("POST", "/api/missions", {"objective": "Check status for api mission", "plan": plan})
         assert status == 201
         mission_id = created["mission_id"]
+        assert created["mission"]["progress"]["execution_mode"] == "dag"
+        assert created["mission"]["owner_instruction"] == "Check status for api mission"
         for suffix in ("", "/status", "/timeline", "/evidence", "/artifacts", "/logs"):
             code, body = request("GET", f"/api/missions/{mission_id}{suffix}")
             assert code == 200 and body["ok"] is True
@@ -265,6 +267,111 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_bridge_worker_executes_owner_graph_end_to_end(tmp_path, monkeypatch):
+    import bridge
+    import security.owner_policy as owner_policy
+    monkeypatch.setattr(bridge, "BRIDGE_TOKEN", "bridge-test")
+    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "owner-test")
+    monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "api.sqlite3")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    http_thread = Thread(target=server.serve_forever, daemon=True)
+    stop = Event()
+    worker_thread = Thread(target=bridge.mission_worker_supervisor, args=(stop,), kwargs={"poll_seconds": 0.02}, daemon=True)
+    http_thread.start()
+    worker_thread.start()
+
+    def request(method, path, payload=None):
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        headers = {"X-CyberSentinel-Token": "bridge-test", "X-CyberSentinel-Owner-Token": "owner-test"}
+        raw = None
+        if payload is not None:
+            raw = json.dumps(payload).encode()
+            headers["Content-Type"] = "application/json"
+        connection.request(method, path, body=raw, headers=headers)
+        response = connection.getresponse()
+        body = json.loads(response.read() or b"{}")
+        connection.close()
+        return response.status, body
+
+    instruction = "Check status for durable worker integration"
+    plan = {"version": 1, "objective": instruction, "steps": [{"step_id": "status-1", "objective": "read current status", "action": "status"}]}
+    try:
+        code, created = request("POST", "/api/missions", {"text": instruction, "plan": plan})
+        assert code == 201
+        mission_id = created["mission_id"]
+        code, queued = request("POST", f"/api/missions/{mission_id}/start")
+        assert code == 200 and queued["mission"]["state"] == "queued"
+        deadline = time.monotonic() + 5
+        result = None
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            code, state = request("GET", f"/api/missions/{mission_id}/status")
+            assert code == 200
+            result = state["status"]
+            if result["status"] in {MissionStatus.GOAL_COMPLETED.value, MissionStatus.AUTHORIZATION_BLOCKED.value, MissionStatus.FAILED_RETRY_EXHAUSTED.value}:
+                break
+        assert result is not None
+        assert result["status"] == MissionStatus.GOAL_COMPLETED.value
+        assert result["observations"]
+        assert result["checkpoint"]["orchestration"]["completed_nodes"]
+        queue = MissionQueue(tmp_path / "mission_queue.sqlite3")
+        assert queue.get(mission_id).state is WorkerMissionState.COMPLETED
+    finally:
+        stop.set()
+        server.shutdown()
+        server.server_close()
+        worker_thread.join(timeout=2)
+        http_thread.join(timeout=2)
+
+
+def test_http_chat_reaches_agent_core_and_deterministic_scheduler(tmp_path, monkeypatch):
+    import bridge
+    import api.chat as chat_module
+    import security.owner_policy as owner_policy
+    from agent.agent_core import AgentCore
+    from agent.model_router import ModelRouter
+    from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
+
+    class Provider:
+        name = "http-e2e-test"
+        model = "deterministic"
+        capabilities = ProviderCapabilities(generate=True, tool_calling=True)
+
+        def tool_calling(self, messages, tools, **kwargs):
+            return ProviderResponse(tool_calls=[ToolCall("status", {}, "http-status")])
+
+        def generate(self, messages, **kwargs):
+            return {"content": json.dumps({"type": "final", "content": "verified"})}
+
+    monkeypatch.setattr(bridge, "BRIDGE_TOKEN", "bridge-test")
+    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "owner-test")
+    monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "api.sqlite3")
+    core = AgentCore(ModelRouter([Provider()]), store=MissionStore(tmp_path / "chat-missions.sqlite3"))
+    monkeypatch.setattr(chat_module, "_agent_core", lambda: core)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    instruction = "Check status and verify the HTTP chat route"
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+        body = json.dumps({"text": instruction, "conversation_id": "http-dag-e2e"}).encode()
+        connection.request("POST", "/api/chat", body=body, headers={"Content-Type": "application/json", "X-CyberSentinel-Token": "bridge-test", "X-CyberSentinel-Owner-Token": "owner-test"})
+        response = connection.getresponse()
+        payload = json.loads(response.read() or b"{}")
+        connection.close()
+        assert response.status == 200 and payload["ok"] is True
+        mission = payload["mission"]
+        assert mission["owner_instruction"] == instruction
+        assert mission["progress"]["execution_mode"] == "dag"
+        assert mission["checkpoint"]["orchestration"]["completed_nodes"]
+        assert mission["status"] == MissionStatus.GOAL_COMPLETED.value
+        assert mission["observations"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):

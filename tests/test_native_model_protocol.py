@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 
 from pathlib import Path
 
@@ -31,7 +31,7 @@ def test_native_loop_executes_tool_then_models_again(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.registry, "execute", lambda *args, **kwargs: {"ok": True, "criterion_id": "goal", "source": "fixture-result"})
     runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("investigate").replan(steps=(PlanStep("observe", "observe", action="status"),), reason="test")
-    mission = runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}])
+    mission = runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}], **make_test_owner_kwargs("investigate", "native-protocol-valid"))
     model = ScriptedModel(mission.mission_id)
 
     result = runtime.run_model_loop(mission.mission_id, model, tools=[{"name": "status"}], max_turns=3)
@@ -54,7 +54,7 @@ def test_native_loop_rejects_cross_mission_call_without_execution(tmp_path, monk
             return ModelTurn(turn_id, tool_calls=(ToolCallProposal.create("status", {}, mission_id="other-mission", run_id=run_id, turn_id=turn_id, plan_version=plan_version, tool_call_id="call-old"),))
 
     runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
-    mission = runtime.create("check", "check", Plan.initial("check").replan(steps=(PlanStep("s", "s", action="status"),), reason="test"))
+    mission = runtime.create("check", "check", Plan.initial("check").replan(steps=(PlanStep("s", "s", action="status"),), reason="test"), **make_test_owner_kwargs("check", "native-protocol-cross-mission"))
     result = runtime.run_model_loop(mission.mission_id, MaliciousModel(), tools=[], max_turns=1)
 
     assert calls == []

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 
 from pathlib import Path
 
@@ -17,7 +17,7 @@ def _mission(db: Path):
     store = MissionStore(db)
     runtime = MissionRuntime(store, executor=lambda *args, **kwargs: {"success": True, "criterion_id": "goal", "source": "fixture"}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("resume objective").replan(steps=(PlanStep("status", "status", action="status", authorization_requirement="owner"),), reason="test")
-    mission = runtime.create("resume objective", "resume objective", plan, completion_criteria=[{"criterion_id": "goal"}], request_id="resume-request")
+    mission = runtime.create("resume objective", "resume objective", plan, completion_criteria=[{"criterion_id": "goal"}], **make_test_owner_kwargs("resume objective", "resume-request", principal="valid-owner"))
     return store, mission
 
 

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 """Round 2 P0-4 - deterministic failure -> recovery -> replan semantics.
 
 Exercises the real MissionRuntime with the real RecoveryPolicy. Invariants:
@@ -41,6 +41,7 @@ def _mission(runtime):
         "recover the mission",
         plan,
         completion_criteria=[{"criterion_id": "goal"}],
+        **make_test_owner_kwargs("recover the mission", "failure-recovery-test"),
     )
 
 
@@ -255,5 +256,5 @@ def test_unavailable_tool_is_rejected_at_authorization(tmp_path, monkeypatch):
 
     result = runtime.run_model_loop(mission.mission_id, UnknownToolModel(), tools=[], max_turns=1)
     assert calls == [], "an unknown tool must never reach execution"
-    assert result.progress["model_loop"]["tool_results"][0]["error"] == "unknown tool"
+    assert result.progress["model_loop"]["tool_results"][0]["error"] == "mission actions or tools outside authorization snapshot"
     assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -16,7 +16,7 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 from tools.registry import get_tool, tool_definitions
 from workspace.environment import Workspace, WorkspaceBoundaryError, WorkspacePolicy, WorkspacePolicyError
 from api.missions import MissionService
-from agent.planning import Plan
+from agent.planning import Plan, PlanStep
 
 
 def snapshot(*, root: str = "/workspace/project", actions=None, tools=None, live: bool = False, forbidden=None) -> MissionAuthorizationSnapshot:
@@ -205,6 +205,7 @@ def test_self_repair_records_bounded_cycle():
 
 
 def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path):
+    from security.authorization_context import AuthorizationContext
     from agent.mission import MissionStore
 
     store = MissionStore(Path(tmp_path) / "missions.sqlite3")
@@ -212,10 +213,15 @@ def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     scheduler = MissionScheduler(Path(tmp_path) / "scheduler.sqlite3", queue)
     service = MissionService(runtime, queue, scheduler)
-    mission = service.create_mission("build", "build", Plan.initial("build"))
-    started = service.start_mission(mission["mission_id"])
+    owner_kwargs = make_test_owner_kwargs("Check status for build", "service-build-test")
+    owner_context = AuthorizationContext.from_dict(owner_kwargs["authorization_context"])
+    plan = Plan.initial("Check status for build").replan(steps=(PlanStep("status", "read status", action="status"),), reason="test")
+    mission = service.create_mission("Check status for build", "Check status for build", plan, authorization_context=owner_context, authorization_snapshot_factory=make_test_snapshot)
+    started = service.start_mission(mission["mission_id"], authorization_context=owner_context)
     assert started["state"] == WorkerMissionState.QUEUED
-    service.pause_mission(mission["mission_id"])
-    assert service.status(mission["mission_id"])["checkpoint"]["status"] == "paused"
-    scheduled = service.schedule_mission(mission["mission_id"], run_at="2026-01-01T00:00:00+00:00", schedule_id="svc")
+    service.pause_mission(mission["mission_id"], authorization_context=owner_context)
+    paused = service.status(mission["mission_id"])
+    assert paused["checkpoint"]["orchestration"]["paused"] is True
+    assert queue.get(mission["mission_id"]).state is WorkerMissionState.PAUSED
+    scheduled = service.schedule_mission(mission["mission_id"], run_at="2026-01-01T00:00:00+00:00", schedule_id="svc", authorization_context=owner_context)
     assert scheduled["schedule_id"] == "svc"

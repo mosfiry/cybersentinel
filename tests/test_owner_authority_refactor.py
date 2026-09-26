@@ -65,6 +65,18 @@ def test_policy_snapshot_has_provenance_and_survives_update(monkeypatch, tmp_pat
     assert snapshot.owner_instruction == "privacy policy A"
 
 
+def test_request_policy_snapshot_binds_exact_authenticated_owner_instruction(monkeypatch, tmp_path):
+    import security.owner_policy as policy
+    monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
+    auth = evidence(policy, "request-local", "proof")
+    set_current_owner_instruction("global organization policy", auth_evidence=auth, request_id="request-local")
+    snapshot = capture_policy_snapshot("request-local", auth, instruction="Check status only")
+    assert snapshot.owner_instruction == "Check status only"
+    assert snapshot.owner_instruction_fingerprint == owner_instruction_fingerprint("Check status only")
+    assert snapshot.instruction_record["request_scoped"] is True
+    assert snapshot.authority_snapshot["current_owner_instruction"] == "global organization policy"
+
+
 def test_owner_update_persists_after_restart(monkeypatch, tmp_path):
     import security.owner_policy as policy
     state = Path(tmp_path) / "state.json"
@@ -108,10 +120,10 @@ def test_owner_instruction_creates_mission_with_exact_objective(monkeypatch, tmp
     request_id = "owner-mission"
     auth = evidence(policy, request_id, "proof")
     set_current_owner_instruction("Owner instruction: build the defensive prototype", auth_evidence=auth, request_id=request_id)
-    snapshot = capture_policy_snapshot(request_id, auth)
+    instruction = "Build the defensive prototype inside the authorized scope."
+    snapshot = capture_policy_snapshot(request_id, auth, instruction=instruction)
     context = AuthorizationContext(request_id, auth, snapshot)
     rt = MissionRuntime(MissionStore(Path(tmp_path) / "m.sqlite"), executor=lambda m, s, a: {"success": True}, authorization_snapshot_factory=make_test_snapshot)
-    instruction = "Build the defensive prototype inside the authorized scope."
     mission = rt.create_from_owner_instruction(instruction, Plan.initial(instruction), authorization_context=context)
     assert mission.objective == instruction
     assert mission.owner_instruction == instruction

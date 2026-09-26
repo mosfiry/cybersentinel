@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 """Round 2 P1 - deterministic goal verification.
 
 A MODEL CLAIM alone can never complete a mission. Completion requires
@@ -32,7 +32,7 @@ def _mission(runtime, criteria):
     plan = Plan.initial("prove the goal").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
-    return runtime.create("prove the goal", "prove the goal", plan, completion_criteria=criteria)
+    return runtime.create("prove the goal", "prove the goal", plan, completion_criteria=criteria, **make_test_owner_kwargs("prove the goal", "goal-verification-test"))
 
 
 def test_goal_verification_requires_all_required_criteria():

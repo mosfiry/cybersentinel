@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 """Round 2 P1 - tool result continuity on the canonical model loop.
 
 Every tool result is bound to mission_id / run_id / turn_id / tool_call_id.
@@ -25,7 +25,7 @@ def _mission(runtime):
     plan = Plan.initial("maintain continuity").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
-    return runtime.create("maintain continuity", "maintain continuity", plan)
+    return runtime.create("maintain continuity", "maintain continuity", plan, **make_test_owner_kwargs("maintain continuity", "tool-continuity-test"))
 
 
 def _call(mission_id, run_id, turn_id, plan_version, n, tool_call_id=None):

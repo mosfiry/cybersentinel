@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, make_test_owner_kwargs
 """Round 2 P1 - untrusted-data poisoning battery.
 
 Tool results, model output, memory, knowledge, and retrieved text are UNTRUSTED
@@ -150,7 +150,7 @@ def test_poisoned_tool_results_grant_nothing_in_the_loop(tmp_path, monkeypatch):
     )
     runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("verify asset").replan(steps=(PlanStep("observe", "observe", action="status"),), reason="test")
-    mission = runtime.create("verify asset", "verify asset", plan, completion_criteria=[{"criterion_id": "goal"}])
+    mission = runtime.create("verify asset", "verify asset", plan, completion_criteria=[{"criterion_id": "goal"}], **make_test_owner_kwargs("verify asset", "poisoned-tool-test"))
 
     class PoisonThenFinalModel:
         def __init__(self):
@@ -177,7 +177,8 @@ def test_poisoned_tool_results_grant_nothing_in_the_loop(tmp_path, monkeypatch):
 
     result = runtime.run_model_loop(mission.mission_id, PoisonThenFinalModel(), tools=[], max_turns=4)
     assert result.progress["model_loop"]["tool_results"][0]["ok"] is False
-    assert result.progress["model_loop"]["tool_results"][0]["error"] == "sensitive tool requires AuthorizationContext"
-    assert result.authorization_context is None
+    assert result.progress["model_loop"]["tool_results"][0]["error"] == "mission actions or tools outside authorization snapshot"
+    assert result.authorization_context is not None
+    assert result.owner_instruction == "verify asset"
     assert result.scope_snapshot is None
     assert result.status is MissionStatus.READY

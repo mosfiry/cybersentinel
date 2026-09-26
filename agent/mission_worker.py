@@ -150,7 +150,12 @@ class MissionWorker:
         queue_state = {"pause": WorkerMissionState.PAUSED, "resume": WorkerMissionState.QUEUED, "cancel": WorkerMissionState.CANCELLED}.get(command)
         if queue_state is None:
             raise ValueError("unknown graph control")
-        current = self.queue.get(mission_id)
+        try:
+            current = self.queue.get(mission_id)
+        except KeyError:
+            if command in {"pause", "cancel"}:
+                return mission
+            current = self.queue.enqueue(mission_id, state=WorkerMissionState.PAUSED)
         if command == "resume" and current.state is not WorkerMissionState.PAUSED:
             raise ValueError("only a paused queue item can be resumed")
         self.queue.update(mission_id, queue_state, error="")
@@ -173,6 +178,11 @@ class MissionWorker:
             return None
         runtime = self.runtime_factory()
         try:
+            store = getattr(runtime, "store", None)
+            if store is not None:
+                mission_record = store.load(item.mission_id)
+                if mission_record is None or mission_record.progress.get("execution_mode") != "dag":
+                    return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error="worker refuses to execute a mission without a persisted deterministic DAG", worker_id=self.worker_id)
             try:
                 mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id))
             except TypeError as exc:

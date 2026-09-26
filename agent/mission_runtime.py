@@ -104,11 +104,10 @@ class MissionRuntime:
         mission.transition(MissionStatus.READY, "plan persisted")
         return self.store.save(mission)
 
-    def create_graph(self, owner_request: str, objective: str, plan: Plan, *, max_parallel: int = 1, node_budget: int | None = None, max_runs: int | None = None, tool_budget: int | None = None, retry_budget: int | None = None, max_duration_seconds: int | None = 3600, **kwargs: Any) -> Mission:
-        """Create a mission whose plan is executed as a validated dependency graph."""
+    @staticmethod
+    def _validate_graph_request(plan: Plan, criteria: Any, *, max_parallel: int, node_budget: int | None) -> None:
         if max_parallel < 1 or max_parallel > 32 or (node_budget is not None and node_budget < 0):
             raise ValueError("invalid graph execution budget")
-        criteria = kwargs.get("completion_criteria")
         if not isinstance(criteria, list) or not criteria or any(not isinstance(item, dict) or not str(item.get("criterion_id", "")).strip() for item in criteria):
             raise ValueError("DAG execution requires explicit deterministic completion criteria")
         if len({str(item["criterion_id"]) for item in criteria}) != len(criteria):
@@ -116,8 +115,10 @@ class MissionRuntime:
         planned_step_ids = {str(step.step_id) for step in plan.steps}
         if {str(item["criterion_id"]) for item in criteria} - planned_step_ids:
             raise ValueError("completion criteria must bind to stable plan step identities")
-        ExecutionGraph.from_plan("validation", "validation", plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
-        mission = self.create(owner_request, objective, plan, **kwargs)
+
+    def _initialize_graph(self, mission: Mission, *, max_parallel: int = 1, node_budget: int | None = None, max_runs: int | None = None, tool_budget: int | None = None, retry_budget: int | None = None, max_duration_seconds: int | None = 3600) -> Mission:
+        self._validate_graph_request(mission.plan, mission.completion_criteria, max_parallel=max_parallel, node_budget=node_budget)
+        ExecutionGraph.from_plan("validation", "validation", mission.plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
         authorization_ok, reason = self._mission_authorization(mission, actions=set())
         if not authorization_ok:
             raise PermissionError("mission graph requires a valid authorization snapshot: " + reason)
@@ -130,6 +131,20 @@ class MissionRuntime:
         mission.checkpoint = {**mission.checkpoint, "status": "graph_initialized", "execution_run_id": run_id, "plan_hash": graph.plan_hash, "orchestration": state}
         return self.store.save(mission)
 
+    def create_graph(self, owner_request: str, objective: str, plan: Plan, *, max_parallel: int = 1, node_budget: int | None = None, max_runs: int | None = None, tool_budget: int | None = None, retry_budget: int | None = None, max_duration_seconds: int | None = 3600, **kwargs: Any) -> Mission:
+        """Create a mission whose plan is executed as a validated dependency graph."""
+        self._validate_graph_request(plan, kwargs.get("completion_criteria"), max_parallel=max_parallel, node_budget=node_budget)
+        ExecutionGraph.from_plan("validation", "validation", plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        mission = self.create(owner_request, objective, plan, **kwargs)
+        return self._initialize_graph(mission, max_parallel=max_parallel, node_budget=node_budget, max_runs=max_runs, tool_budget=tool_budget, retry_budget=retry_budget, max_duration_seconds=max_duration_seconds)
+
+    def create_owner_graph(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, max_parallel: int = 1, node_budget: int | None = None, max_runs: int | None = None, tool_budget: int | None = None, retry_budget: int | None = None, max_duration_seconds: int | None = 3600) -> Mission:
+        """Persist authenticated Owner intent, then initialize its deterministic execution graph."""
+        self._validate_graph_request(plan, completion_criteria, max_parallel=max_parallel, node_budget=node_budget)
+        ExecutionGraph.from_plan("validation", "validation", plan, retry_policy_by_step=self.orchestration_retry_policies, resource_policy_by_step=self.orchestration_resource_policies)
+        mission = self.create_from_owner_instruction(instruction, plan, authorization_context=authorization_context, scope_snapshot=scope_snapshot, completion_criteria=completion_criteria, owner_identity_ref=owner_identity_ref, provenance=provenance, authorization_snapshot_factory=authorization_snapshot_factory)
+        return self._initialize_graph(mission, max_parallel=max_parallel, node_budget=node_budget, max_runs=max_runs, tool_budget=tool_budget, retry_budget=retry_budget, max_duration_seconds=max_duration_seconds)
+
     def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None) -> Mission:
         """Create a Mission without allowing model understanding to rewrite the Owner objective."""
         from security.authorization_context import AuthorizationContext
@@ -138,12 +153,15 @@ class MissionRuntime:
         objective = str(instruction).strip()
         if not objective:
             raise ValueError("Owner Instruction cannot be empty")
+        from security.owner_policy import owner_instruction_fingerprint
+        if authorization_context.instruction_fingerprint != owner_instruction_fingerprint(objective):
+            raise PermissionError("AuthorizationContext is not bound to this exact Owner instruction")
         return self.create(
             objective,
             objective,
             plan,
             request_id=authorization_context.request_id,
-            owner_identity_ref=owner_identity_ref or authorization_context.owner_evidence_fingerprint,
+            owner_identity_ref=owner_identity_ref or authorization_context.owner_evidence.proof_fingerprint,
             owner_instruction=objective,
             authorization_context=authorization_context.to_dict(),
             scope_snapshot=scope_snapshot,
@@ -294,6 +312,17 @@ class MissionRuntime:
                 auth_context = AuthorizationContext.from_dict(dict(mission.authorization_context))
             except (KeyError, TypeError, ValueError, PermissionError):
                 auth_context = None
+        if auth_context is None:
+            mission.error = "valid Owner AuthorizationContext required for native tool execution"
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission.error})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission.error)
+            return self.store.save(mission)
+        mission_allowed, mission_reason = self._mission_authorization(mission, actions=set())
+        if not mission_allowed:
+            mission.error = mission_reason
+            mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": mission_reason})
+            mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, mission_reason)
+            return self.store.save(mission)
 
         for _ in range(max_turns):
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
@@ -376,16 +405,22 @@ class MissionRuntime:
                     seen.add(proposal.tool_call_id)
                     progress["seen_call_ids"].append(proposal.tool_call_id)
                     argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
-                    decision = authorize_tool([proposal.name, argument], context=auth_context)
+                    mission_allowed, mission_reason = self._mission_authorization(mission, actions={proposal.name})
+                    decision = authorize_tool([proposal.name, argument], context=auth_context) if mission_allowed else None
                     mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
-                    mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
-                    if not decision.allowed:
-                        result = ToolCallResult(proposal, False, error=decision.reason)
+                    allowed = bool(decision and decision.allowed)
+                    reason = decision.reason if decision is not None else mission_reason
+                    mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": allowed, "reason": reason})
+                    if not allowed:
+                        result = ToolCallResult(proposal, False, error=reason)
                     else:
                         try:
+                            from security.mission_authorization import MissionAuthorizationSnapshot
+                            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+                            target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
                             mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                             self.store.save(mission)
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
+                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, mission_id=mission.mission_id, target_identity=target_identity)
                             observation = dict(raw or {})
                             observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
                             mission.record_observation(observation)
@@ -412,6 +447,11 @@ class MissionRuntime:
         from security.authorization import authorize_tool
         from tools.registry import execute as execute_tool
         identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        try:
+            mission_authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        except (KeyError, TypeError, ValueError, PermissionError):
+            mission_authorization = None
         authorized: list[tuple[Any, Any, Any]] = []
         results: list[ToolCallResult] = []
         for proposal in proposals:
@@ -422,18 +462,22 @@ class MissionRuntime:
             seen.add(proposal.tool_call_id)
             progress["seen_call_ids"].append(proposal.tool_call_id)
             argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
-            decision = authorize_tool([proposal.name, argument], context=auth_context)
-            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
-            if decision.allowed:
+            mission_allowed, mission_reason = self._mission_authorization(mission, actions={proposal.name})
+            decision = authorize_tool([proposal.name, argument], context=auth_context) if mission_allowed and mission_authorization is not None else None
+            allowed = bool(decision and decision.allowed)
+            reason = decision.reason if decision is not None else mission_reason
+            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": allowed, "reason": reason})
+            if allowed:
                 authorized.append((proposal, argument, decision))
             else:
-                results.append(ToolCallResult(proposal, False, error=decision.reason))
+                results.append(ToolCallResult(proposal, False, error=reason))
         mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
         self.store.save(mission)
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
             proposal, argument, decision = item
             try:
-                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id) or {})
+                target_identity = str((mission.scope_snapshot or {}).get("target_id") or mission_authorization.target_identity) if isinstance(mission.scope_snapshot, dict) else mission_authorization.target_identity
+                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=mission_authorization, mission_id=mission.mission_id, target_identity=target_identity) or {})
             except Exception as exc:
                 # An exception after dispatch cannot prove that the external side effect did not happen.
                 # Preserve ambiguity so recovery cannot blindly replay this proposal.
@@ -615,6 +659,7 @@ class MissionRuntime:
                         failure_class = str(observation.get("failure_class", FailureClass.UNKNOWN.value))
                         DeterministicScheduler.finish(state, node, success=success, result=observation, error=str(observation.get("error", "")), failure_class=failure_class)
                         enriched = {**observation, "mission_id": mission.mission_id, "execution_run_id": run_id, "node_id": node.node_id, "step_id": node.step_id, "plan_hash": graph.plan_hash}
+                        mission.record_observation(enriched)
                         if success:
                             mission.evidence.append({"criterion_id": node.step_id, "passed": True, "source": steps[node.step_id].action, "result": enriched, "provenance": {"mission_id": mission.mission_id, "execution_run_id": run_id, "node_id": node.node_id, "plan_hash": graph.plan_hash, "authorization_hash": authorization_hash}})
                             action_id = hashlib.sha256(f"{mission.mission_id}\0{run_id}\0{graph.plan_hash}\0{node.node_id}".encode()).hexdigest()
@@ -682,7 +727,7 @@ class MissionRuntime:
             raise PermissionError("Owner control policy is stale")
         if authorization_context.request_id != mission.request_id:
             raise PermissionError("Owner control context belongs to another request")
-        if authorization_context.owner_evidence_fingerprint != mission.owner_identity_ref:
+        if mission.owner_identity_ref not in {authorization_context.owner_evidence_fingerprint, authorization_context.owner_evidence.proof_fingerprint}:
             raise PermissionError("Owner control context does not match mission identity")
         expected_policy = str((mission.policy_snapshot or {}).get("owner_policy_fingerprint", ""))
         if expected_policy and authorization_context.policy_fingerprint != expected_policy:
