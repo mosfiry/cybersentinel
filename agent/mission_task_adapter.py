@@ -37,14 +37,16 @@ class MissionTaskAdapter:
         TaskManager.update_task(task)
         return task
 
-    def resume_task(self, task_id: str, *, owner_token: str, max_slices: int | None = None) -> Task:
+    def resume_task(self, task_id: str, *, owner_token: str | None = None, owner_session_id: str | None = None, max_slices: int | None = None) -> Task:
         task = TaskManager.get_task(task_id)
         if task is None:
             raise KeyError("unknown_task")
+        if task.owner_session_id and task.owner_session_id != (owner_session_id or ""):
+            raise PermissionError("task access denied")
         mission_id = str(task.execution_state.get("mission_id", ""))
         if not mission_id:
             raise ValueError("task is not bound to canonical mission")
-        mission = self.core.resume_mission(mission_id, owner_token=owner_token, max_slices=max_slices)
+        mission = self.core.resume_mission(mission_id, owner_token=owner_token, owner_session_id=owner_session_id, max_slices=max_slices)
         task.execution_state["mission"] = mission.to_dict()
         task.result = {"mission_id": mission.mission_id, "mission_status": mission.status.value}
         task.update_status(self._status(mission.status))

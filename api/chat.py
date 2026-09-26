@@ -63,7 +63,7 @@ def resume_task(task_id: str, *, owner_token: str, owner_session_id: str | None 
     if task is None:
         raise KeyError("unknown_task")
     if run:
-        task = _runtime().resume_task(task_id, owner_token=owner_token)
+        task = _runtime().resume_task(task_id, owner_token=owner_token, owner_session_id=owner_session_id)
     return {"task": _task_public(task)}
 
 
@@ -106,11 +106,12 @@ def chat(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | N
     # All chat modes now enter the same durable MissionRuntime.  The legacy
     # task/core-engine branch remains available only through the explicit task
     # compatibility endpoints below; it is not a chat execution path.
-    _validate_chat_entry(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
+    if not (payload.get("mission_id") and owner_session_id):
+        _validate_chat_entry(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
     core = _agent_core()
     ensure_conversation(conversation_id, owner_session_id or "")
     add_conversation_message(conversation_id, "user", text)
-    mission = core.resume_mission(str(payload["mission_id"]), owner_token=owner_token) if payload.get("mission_id") else core.run_owner_mission(
+    mission = core.resume_mission(str(payload["mission_id"]), owner_token=owner_token, owner_session_id=owner_session_id) if payload.get("mission_id") else core.run_owner_mission(
         text,
         owner_token=owner_token,
         owner_session_id=owner_session_id,

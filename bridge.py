@@ -181,10 +181,32 @@ class Handler(BaseHTTPRequestHandler):
             mission_id, action = parts[0], parts[1] if len(parts) > 1 else "status"
             try:
                 service = self._mission_service()
+                owner_token, owner_session, _owner_challenge = auth
+                mission = service.runtime.store.load(mission_id)
+                if mission is None:
+                    raise KeyError("unknown_mission")
+                if owner_session:
+                    from security.authorization_context import AuthorizationContext
+                    from security.owner_session import DEFAULT_OWNER_SESSIONS
+                    if not DEFAULT_OWNER_SESSIONS.is_active(owner_session):
+                        raise PermissionError("Owner session is expired or inactive")
+                    try:
+                        saved_context = AuthorizationContext.from_dict(dict(mission.authorization_context or {}))
+                    except (KeyError, TypeError, ValueError, PermissionError) as exc:
+                        raise PermissionError("mission has no valid Owner session context") from exc
+                    if saved_context.session_id != owner_session or not saved_context.owner_evidence.is_valid(mission.request_id, owner_session):
+                        raise PermissionError("Owner session does not match the mission creator")
+                elif mission.owner_identity_ref:
+                    from security.owner_policy import authenticate_owner
+                    evidence = authenticate_owner("Owner mission read", owner_token, mission.request_id)
+                    if evidence.proof_fingerprint != mission.owner_identity_ref:
+                        raise PermissionError("Owner identity does not match the mission creator")
                 values = {"status": service.status, "timeline": service.timeline, "evidence": service.evidence, "artifacts": service.artifacts, "logs": service.logs}
                 if action not in values:
                     return self._send(404, {"ok": False, "error": "unknown_mission_action"})
                 return self._send(200, {"ok": True, "mission_id": mission_id, action: values[action](mission_id)})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
             except KeyError:
                 return self._send(404, {"ok": False, "error": "unknown_mission"})
         if parsed.path == "/api/tools":
@@ -315,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                 mission = service.runtime.store.load(mission_id)
                 if mission is None:
                     raise KeyError("unknown_mission")
-                owner_context = core.owner_context_for_mission(mission, owner_token=owner_token)
+                owner_context = core.owner_context_for_mission(mission, owner_token=owner_token, owner_session_id=owner_session)
                 if action == "start":
                     result = service.start_mission(mission_id, authorization_context=owner_context)
                     return self._send(200, {"ok": True, "mission": result})

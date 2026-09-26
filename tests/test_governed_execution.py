@@ -374,6 +374,65 @@ def test_http_chat_reaches_agent_core_and_deterministic_scheduler(tmp_path, monk
         thread.join(timeout=2)
 
 
+def test_http_mission_controls_accept_the_authenticated_owner_session(tmp_path, monkeypatch):
+    import bridge
+    import api.chat as chat_module
+    import security.owner_policy as owner_policy
+    from agent.agent_core import AgentCore
+    from core.engine import RUNTIME
+    monkeypatch.setattr(bridge, "BRIDGE_TOKEN", "bridge-test")
+    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "owner-test")
+    monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "session-api.sqlite3")
+    monkeypatch.setattr(chat_module, "_agent_core", lambda: AgentCore(RUNTIME.router, db_path=bridge.DB_PATH.with_name("missions.sqlite3")))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def request(method, path, payload=None, *, owner_session=None, owner_challenge=None):
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        headers = {"X-CyberSentinel-Token": "bridge-test", "X-CyberSentinel-Owner-Token": "owner-test"}
+        if owner_session:
+            headers["X-CyberSentinel-Owner-Session"] = owner_session
+        if owner_challenge:
+            headers["X-CyberSentinel-Owner-Challenge"] = owner_challenge
+        raw = None
+        if payload is not None:
+            raw = json.dumps(payload).encode()
+            headers["Content-Type"] = "application/json"
+        connection.request(method, path, body=raw, headers=headers)
+        response = connection.getresponse()
+        body = json.loads(response.read() or b"{}")
+        connection.close()
+        return response.status, body
+
+    try:
+        code, session_body = request("POST", "/api/owner/session")
+        assert code == 201
+        owner_session = session_body["session"]["session_id"]
+        owner_challenge = session_body["session"]["challenge"]
+        instruction = f"{owner_challenge} Check status for session mission"
+        plan = {"version": 1, "objective": instruction, "steps": [{"step_id": "status-1", "objective": "read status", "action": "status"}]}
+        code, created = request("POST", "/api/missions", {"text": instruction, "plan": plan}, owner_session=owner_session, owner_challenge=owner_challenge)
+        assert code == 201
+        mission_id = created["mission_id"]
+        assert request("GET", f"/api/missions/{mission_id}/status", owner_session="not-the-owner-session", owner_challenge=owner_challenge)[0] == 403
+        assert request("GET", f"/api/missions/{mission_id}/status", owner_session=owner_session, owner_challenge=owner_challenge)[0] == 200
+        for action in ("start", "pause", "resume"):
+            code, result = request("POST", f"/api/missions/{mission_id}/{action}", owner_session=owner_session, owner_challenge=owner_challenge)
+            assert code == 200, result
+        code, resumed = request(
+            "POST",
+            "/api/chat",
+            {"text": "Resume the authenticated mission", "mission_id": mission_id, "conversation_id": "owner-session-resume"},
+            owner_session=owner_session,
+        )
+        assert code == 200 and resumed["status"] == MissionStatus.GOAL_COMPLETED.value, resumed
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):
     mission_db = tmp_path / "missions.sqlite3"
     queue_db = tmp_path / "queue.sqlite3"

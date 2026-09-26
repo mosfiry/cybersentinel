@@ -316,8 +316,24 @@ class AgentCore:
             )
         return factory
 
-    def owner_context_for_mission(self, mission: Mission, *, owner_token: str) -> AuthorizationContext:
-        evidence = authenticate_owner("Owner mission control", owner_token, mission.request_id)
+    def owner_context_for_mission(self, mission: Mission, *, owner_token: str | None = None, owner_session_id: str | None = None) -> AuthorizationContext:
+        session_id = None
+        if owner_session_id:
+            from security.owner_session import DEFAULT_OWNER_SESSIONS
+            if not DEFAULT_OWNER_SESSIONS.is_active(owner_session_id):
+                raise PermissionError("Owner session is expired or inactive")
+            try:
+                saved_context = AuthorizationContext.from_dict(dict(mission.authorization_context or {}))
+            except (KeyError, TypeError, ValueError, PermissionError) as exc:
+                raise PermissionError("mission has no valid Owner session context") from exc
+            if saved_context.session_id != owner_session_id:
+                raise PermissionError("Owner session does not match the mission creator")
+            evidence = saved_context.owner_evidence
+            if not evidence.is_valid(mission.request_id, owner_session_id):
+                raise PermissionError("Owner session evidence is stale or invalid")
+            session_id = owner_session_id
+        else:
+            evidence = authenticate_owner("Owner mission control", owner_token, mission.request_id)
         if evidence.proof_fingerprint != mission.owner_identity_ref:
             raise PermissionError("Owner identity does not match the mission creator")
         policy = capture_policy_snapshot(mission.request_id, evidence, instruction=mission.owner_instruction or mission.owner_request)
@@ -342,7 +358,7 @@ class AgentCore:
             scope = get_snapshot(scope_id)
             if scope is None:
                 raise PermissionError("mission scope snapshot no longer exists")
-        context = AuthorizationContext(mission.request_id, evidence, policy, scope_snapshot=scope)
+        context = AuthorizationContext(mission.request_id, evidence, policy, scope_snapshot=scope, session_id=session_id)
         mission.authorization_context = context.to_dict()
         mission.policy_snapshot = policy.to_dict()
         mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot.get("version", 1))
@@ -467,12 +483,20 @@ class AgentCore:
                 pass
         return result
 
-    def resume_mission(self, mission_id: str, *, owner_token: str, max_slices: int | None = None) -> Mission:
+    def resume_mission(self, mission_id: str, *, owner_token: str | None = None, owner_session_id: str | None = None, max_slices: int | None = None) -> Mission:
         mission = self.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
+        session_id = None
         try:
-            evidence = authenticate_owner("Owner resume mission", owner_token, mission.request_id)
+            if owner_session_id:
+                control_context = self.owner_context_for_mission(mission, owner_session_id=owner_session_id)
+                evidence = control_context.owner_evidence
+                fresh_snapshot = control_context.policy_snapshot
+                fresh_scope = control_context.scope_snapshot
+                session_id = owner_session_id
+            else:
+                evidence = authenticate_owner("Owner resume mission", owner_token, mission.request_id)
         except PermissionError as exc:
             if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
                 if mission.status is MissionStatus.RECOVERY_REQUIRED:
@@ -484,28 +508,34 @@ class AgentCore:
             raise
         if evidence.proof_fingerprint != mission.owner_identity_ref:
             raise PermissionError("Owner identity does not match the mission creator")
-        fresh_snapshot = capture_policy_snapshot(mission.request_id, evidence, instruction=mission.owner_instruction or mission.owner_request)
-        try:
-            old_authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
-            mission.authorization_snapshot = old_authorization.amend(owner_approval=evidence.proof_fingerprint, changes={}, expires_at=evidence.expires_at).to_dict()
-            mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot["version"])
-        except (KeyError, TypeError, ValueError, PermissionError):
-            if mission.authorization_snapshot:
-                mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "authorization snapshot cannot be renewed")
-                self.store.save(mission)
-                raise PermissionError("authorization snapshot cannot be renewed")
-            allowed_tools = tuple(self._owner_allowed_tools(mission.owner_instruction))
-            owner_identity = mission.owner_identity_ref or evidence.proof_fingerprint
-            mission.owner_identity_ref = owner_identity
-            renewed = MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity="local-workspace", scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=(), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(60, mission.max_iterations * 60), rate_limits={tool: 1 for tool in allowed_tools}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("local-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(Path.cwd().resolve())}, policy_version="owner-policy", owner_approval=evidence.proof_fingerprint, expires_at=evidence.expires_at)
-            mission.authorization_snapshot = renewed.to_dict()
-            mission.provenance["authorization_snapshot_version"] = int(renewed.version)
-        old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
-        fresh_scope = get_snapshot(str(old_scope_id)) if old_scope_id else None
-        fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope)
+        if owner_session_id:
+            # owner_context_for_mission already renewed the scheduler identity
+            # once and persisted the matching checkpoint authorization hash.
+            fresh_context = control_context
+            fresh_snapshot = control_context.policy_snapshot
+        else:
+            fresh_snapshot = capture_policy_snapshot(mission.request_id, evidence, instruction=mission.owner_instruction or mission.owner_request)
+            try:
+                old_authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+                mission.authorization_snapshot = old_authorization.amend(owner_approval=evidence.proof_fingerprint, changes={}, expires_at=evidence.expires_at).to_dict()
+                mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot["version"])
+            except (KeyError, TypeError, ValueError, PermissionError):
+                if mission.authorization_snapshot:
+                    mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "authorization snapshot cannot be renewed")
+                    self.store.save(mission)
+                    raise PermissionError("authorization snapshot cannot be renewed")
+                allowed_tools = tuple(self._owner_allowed_tools(mission.owner_instruction))
+                owner_identity = mission.owner_identity_ref or evidence.proof_fingerprint
+                mission.owner_identity_ref = owner_identity
+                renewed = MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity="local-workspace", scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=(), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(60, mission.max_iterations * 60), rate_limits={tool: 1 for tool in allowed_tools}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("local-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(Path.cwd().resolve())}, policy_version="owner-policy", owner_approval=evidence.proof_fingerprint, expires_at=evidence.expires_at)
+                mission.authorization_snapshot = renewed.to_dict()
+                mission.provenance["authorization_snapshot_version"] = int(renewed.version)
+            old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
+            fresh_scope = get_snapshot(str(old_scope_id)) if old_scope_id else None
+            fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope, session_id=session_id)
         mission.authorization_context = fresh_context.to_dict()
         mission.policy_snapshot = fresh_snapshot.to_dict()
-        mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "owner_token", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})
+        mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "owner_session" if owner_session_id else "owner_token", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})
         if mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
             mission.transition(MissionStatus.READY, "owner authorization revalidated")
         self.store.save(mission)
