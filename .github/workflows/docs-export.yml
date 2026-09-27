@@ -10,17 +10,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: export files + legacy-auth inventory through the base64 integrity channel
+      - name: comprehensive legacy-auth inventory
         run: |
           set -euo pipefail
           TAG=$(git rev-parse --short=12 HEAD)
           mkdir -p diagnostics
-          for f in docs/OWNER_CHARTER.md docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md agent/agent_core.py agent/mission_task_adapter.py agent/loop.py agent/task.py agent/task_manager.py agent/state.py api/chat.py api/missions.py agent/task_runtime.py core/engine.py core/context.py security/owner_policy.py security/owner_password.py security/authorization_context.py security/program_adapters/models.py security/scope.py security/scope_store.py bridge.py "tests/test_agent_core_integration.py" "tests/test_agent_platform.py" "tests/test_governed_execution.py" "tests/test_message0003_auth.py" "tests/test_owner_auth.py" "tests/test_phase21_restart_authorization.py" "tests/test_phase3_context.py" "tests/test_phase5_long_horizon.py" "tests/test_phase5e_runtime.py" "tests/test_phase6a1_hardening.py" "tests/test_phase6b_program_adapters.py" "tests/test_phase6c_scope_firewall.py" "tests/test_phase6k5_core.py" "tests/test_phase6k6_unified.py" "tests/test_public_web_boundary.py" "tests/test_scope_firewall_battery.py" "tests/test_security_integrity_adversarial.py" "tests/test_v50_owner_session.py" "agent/loop.py" "security/authorization_context.py" "security/program_adapters/models.py" "security/scope.py" "security/scope_store.py" "core/context.py" "agent/task.py" "agent/task_manager.py" "agent/state.py"; do
-            if [ -f "$f" ]; then
-              out="diagnostics/b64-head-$(echo "$f" | tr '/' '-')-${TAG}"
-              base64 -w0 "$f" | fold -w 30000 | split -l 1 -d --additional-suffix=.txt - "${out}.part"
-            fi
-          done
+          {
+            echo "# comprehensive legacy auth inventory (run $TAG)"
+            echo "## ALL files containing lowercase owner_token identifier/string:"
+            git grep -l -I 'owner_token' -- ':!diagnostics' || echo "(none)"
+            echo "## files containing _issue_evidence:"
+            git grep -l -I '_issue_evidence' -- ':!diagnostics' || echo "(none)"
+            echo "## files containing authentication_from_session or consume_owner_challenge:"
+            git grep -l -I -E 'authentication_from_session|consume_owner_challenge' -- ':!diagnostics' || echo "(none)"
+            echo "## per-file owner_token line counts:"
+            for f in $(git grep -l -I 'owner_token' -- ':!diagnostics' || true); do
+              echo "$f: $(git grep -c 'owner_token' -- "$f")"
+            done
+          } > "diagnostics/legacy-auth-inventory-${TAG}.md"
       - name: publish
         run: |
           set -euo pipefail
@@ -28,5 +35,5 @@ jobs:
           git config user.email "msfiry36@gmail.com"
           git add diagnostics || true
           if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
-          git commit -m "ci diagnostics: docs + runtime export $(git rev-parse --short=12 HEAD)"
+          git commit -m "ci diagnostics: comprehensive legacy-auth inventory $(git rev-parse --short=12 HEAD)"
           git push
