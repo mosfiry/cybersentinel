@@ -27,7 +27,7 @@ jobs:
           mkdir -p diagnostics
           S="${GITHUB_SHA:0:12}"
           rm -f diagnostics/b64-*
-          for f in core/db.py bridge.py api/chat.py api/missions.py security/owner_policy.py security/owner_session.py security/authority.py security/authorization.py security/authorization_context.py security/scope.py security/mission_authorization.py core/policy.py core/trust.py core/config.py agent/task_runtime.py agent/mission_runtime.py agent/mission_worker.py agent/mission.py agent/task_manager.py core/engine.py core/lifecycle.py; do
+          for f in core/db.py bridge.py api/chat.py api/missions.py security/owner_policy.py security/authority.py security/authorization.py security/authorization_context.py security/scope.py security/mission_authorization.py core/policy.py core/trust.py core/config.py agent/task_runtime.py agent/mission_runtime.py agent/mission_worker.py agent/mission.py agent/task_manager.py core/engine.py core/lifecycle.py; do
             if git show "origin/main:$f" > /tmp/export 2>/dev/null; then
               name=$(echo "$f" | tr '/' '-')
               base64 -w0 /tmp/export > /tmp/b64.txt
@@ -39,7 +39,7 @@ jobs:
               fi
             fi
           done
-          for f in core/db.py bridge.py security/owner_password.py security/owner_password_bootstrap.py tests/test_owner_password_auth.py .github/workflows/tests.yml; do
+          for f in core/db.py bridge.py api/chat.py security/owner_password.py security/owner_password_bootstrap.py tests/test_owner_password_auth.py security/owner_policy.py security/scope_store.py core/engine.py core/context.py agent/agent_core.py agent/loop.py agent/task.py agent/task_manager.py agent/task_runtime.py agent/mission_task_adapter.py tests/test_agent_core_integration.py tests/test_agent_platform.py tests/test_governed_execution.py tests/test_message0003_auth.py tests/test_owner_auth.py tests/test_owner_authority_refactor.py tests/test_phase21_restart_authorization.py tests/test_phase3_context.py tests/test_phase5_long_horizon.py tests/test_phase5e_runtime.py tests/test_phase6a1_hardening.py tests/test_phase6b_program_adapters.py tests/test_phase6c_scope_firewall.py tests/test_phase6k4_deep_hardening.py tests/test_phase6k5_core.py tests/test_phase6k6_unified.py tests/test_phase6k7b_mission_runtime.py tests/test_scope_firewall_battery.py tests/test_security_integrity_adversarial.py tests/test_v47_red_team.py tests/test_v50_owner_session.py .github/workflows/tests.yml; do
             if [ -f "$f" ]; then
               name=$(echo "$f" | tr '/' '-')
               base64 -w0 "$f" > /tmp/b64.txt
