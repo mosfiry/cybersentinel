@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from owner_session_testutils import allow_owner_sessions
 from pathlib import Path
 
 import pytest
@@ -88,11 +89,11 @@ def test_behavioral_harness_reaches_scope_firewall(tmp_path, monkeypatch):
     from agent.provider_api import ProviderResponse, ToolCall
 
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "bench-owner")
+    allow_owner_sessions(monkeypatch, "bench-owner")
     init_scope_store()
     auth = ProgramAuthorization("bench-program", "test", "v1", "2026-09-21T00:00:00+00:00", ({"host": "target-a.example", "schemes": ["https"], "ports": [443], "paths": ["/api"]},))
     target = TargetIdentity("target-a", "bench-program", "target-a.example", allowed_ports=(443,), allowed_paths=("/api",))
-    save_snapshot(make_snapshot("bench-snapshot", auth, [target]), owner_token="bench-owner")
+    save_snapshot(make_snapshot("bench-snapshot", auth, [target]), owner_session_token="bench-owner")
 
     class Provider:
         name = "bench"

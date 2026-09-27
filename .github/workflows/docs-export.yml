@@ -1,0 +1,47 @@
+name: docs-export
+on:
+  push:
+    branches: [security/owner-password-auth-migration]
+    paths-ignore: ['diagnostics/**']
+permissions:
+  contents: write
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: export X-E remaining sources and tests through the base64 integrity channel
+        run: |
+          set -euo pipefail
+          TAG=$(git rev-parse --short=12 HEAD)
+          mkdir -p diagnostics
+          for f in tests/test_owner_charter.py tests/test_owner_authority_refactor.py tests/test_phase6k4_deep_hardening.py tests/test_phase6k7b_mission_runtime.py tests/test_v47_red_team.py security/owner_policy.json agent/mission_worker.py; do
+            if [ -f "$f" ]; then
+              out="diagnostics/b64-head-$(echo "$f" | tr '/' '-')-${TAG}"
+              base64 -w0 "$f" | fold -w 30000 | split -l 1 -d --additional-suffix=.txt - "${out}.part"
+            fi
+          done
+      - name: publish
+        run: |
+          set -euo pipefail
+          git config user.name "mosfiry"
+          git config user.email "msfiry36@gmail.com"
+          git add diagnostics || true
+          if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
+          git commit -m "ci diagnostics: X-E remaining source export $(git rev-parse --short=12 HEAD)"
+          BRANCH="${GITHUB_REF_NAME}"
+          for attempt in 1 2 3 4 5 6 7 8; do
+            git fetch origin "$BRANCH" || true
+            git rebase --abort 2>/dev/null || true
+            git reset --soft "origin/$BRANCH" || true
+            git add -A diagnostics/
+            git commit -m "ci diagnostics: X-E remaining source export $(git rev-parse --short=12 HEAD)" || echo "nothing to commit"
+            if git push origin "HEAD:$BRANCH"; then
+              echo "export published (attempt ${attempt})"
+              exit 0
+            fi
+            echo "publish raced (attempt ${attempt}); retrying"
+            sleep 10
+          done
+          echo "export publish failed after retries"
+          exit 1

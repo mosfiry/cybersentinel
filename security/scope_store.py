@@ -42,11 +42,9 @@ def init_scope_store() -> None:
 init_scope_store()
 
 
-def save_snapshot(snapshot: ScopeSnapshot, *, owner_token: str | None = None) -> ScopeSnapshot:
-    from .owner_policy import verify_owner
-    owner_ok, reason = verify_owner("Owner approve scope snapshot", owner_token)
-    if not owner_ok:
-        raise PermissionError(reason)
+def save_snapshot(snapshot: ScopeSnapshot, *, owner_session_token: str | None = None) -> ScopeSnapshot:
+    from .owner_policy import authenticate_owner
+    authenticate_owner(owner_session_token)
     payload = json.dumps(snapshot.to_dict(), ensure_ascii=False, sort_keys=True)
     with _LOCK, _connect() as conn:
         try:

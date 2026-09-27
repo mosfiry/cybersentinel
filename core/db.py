@@ -78,6 +78,30 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_messages ON conversation_messages(conversation_id, id);
+
+CREATE TABLE IF NOT EXISTS owner_accounts (
+    owner_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    kdf_algorithm TEXT NOT NULL,
+    kdf_params_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS owner_sessions (
+    session_id TEXT PRIMARY KEY,
+    owner_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    authenticated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    auth_method TEXT NOT NULL DEFAULT 'username_password',
+    FOREIGN KEY(owner_id) REFERENCES owner_accounts(owner_id)
+);
+CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner ON owner_sessions(owner_id);
+CREATE INDEX IF NOT EXISTS idx_owner_sessions_status ON owner_sessions(status);
 """
 
 def connect():

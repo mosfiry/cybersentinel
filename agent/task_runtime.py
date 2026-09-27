@@ -18,7 +18,6 @@ from core.db import add_conversation_message, conversation_messages, ensure_conv
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.owner_policy import current_owner_policy_context, policy_context_from_snapshot
-from security.owner_session import DEFAULT_OWNER_SESSIONS
 from tools.registry import REGISTRY, execute as execute_tool, get_tool
 
 
@@ -31,7 +30,7 @@ class AgentTaskRuntime:
         self.limits = runtime_limits or RuntimeLimits.from_owner_policy()
 
     @staticmethod
-    def _default_executor(command: str, *, owner_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None, authorization_decision: Any = None) -> dict[str, Any]:
+    def _default_executor(command: str, *, owner_session_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None, authorization_decision: Any = None) -> dict[str, Any]:
         parts = command.split(" ", 2)
         name = parts[1] if len(parts) > 1 else ""
         argument = parts[2] if len(parts) > 2 else None
@@ -84,7 +83,7 @@ class AgentTaskRuntime:
             return "tool_calls", [ToolCall(value["name"], value.get("arguments") or {}, uuid.uuid4().hex)]
         return "final", content
 
-    def create_task(self, conversation_id: str, objective: str, *, owner_session_id: str = "", authentication_method: str = "owner_token", scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None) -> Task:
+    def create_task(self, conversation_id: str, objective: str, *, owner_session_id: str = "", authentication_method: str = "username_password", scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None) -> Task:
         if authorization_context is not None and owner_session_id and authorization_context.session_id != owner_session_id:
             raise ValueError("task owner session does not match AuthorizationContext")
         if authorization_context is not None:
@@ -109,19 +108,15 @@ class AgentTaskRuntime:
         TaskManager.update_task(task)
         return task
 
-    def _valid_owner_session(self, task: Task, owner_session_id: str | None, owner_token: str) -> bool:
+    def _valid_owner_session(self, task: Task, owner_session_token: str | None) -> bool:
         if isinstance(task.execution_state, dict) and task.execution_state.get("authorization_context"):
             try:
                 self._authorization_context(task)
                 return True
             except (PermissionError, ValueError, TypeError):
                 return False
-        if owner_token:
-            from security.owner_policy import verify_owner
-            ok, _ = verify_owner("Owner task execution", owner_token)
-            if ok:
-                return True
-        return bool(owner_session_id and owner_session_id == task.owner_session_id and DEFAULT_OWNER_SESSIONS.is_active(owner_session_id))
+        from security import owner_password
+        return owner_password.resolve_session(owner_session_token) is not None
 
     def _context(self, task: Task) -> Any:
         state = ExecutionState(
@@ -178,7 +173,7 @@ class AgentTaskRuntime:
         value = call.arguments.get("query")
         return value if isinstance(value, str) else None
 
-    def _run_one(self, task: Task, call: ToolCall, owner_token: str, owner_session_id: str | None) -> dict[str, Any]:
+    def _run_one(self, task: Task, call: ToolCall, owner_session_token: str, owner_session_id: str | None) -> dict[str, Any]:
         if call.call_id and task.has_tool_call(call.call_id):
             existing = next(item for item in task.tool_calls if item.get("tool_call_id") == call.call_id)
             return existing.get("result") or {"ok": False, "error": "replayed_tool_call"}
@@ -217,7 +212,7 @@ class AgentTaskRuntime:
             if spec is not None and spec.scope_required:
                 result = {"ok": True, "result": execute_tool(call.name, argument, authorization_decision=decision.decision, scope_context=scope_context, request_id=task.request_id)}
             else:
-                result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_token=owner_token, owner_session_id=owner_session_id, scope_context=scope_context, authorization_context=authorization_context, authorization_decision=decision.decision)
+                result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_session_token=owner_session_token, owner_session_id=owner_session_id, scope_context=scope_context, authorization_context=authorization_context, authorization_decision=decision.decision)
             result = result if isinstance(result, dict) else {"ok": True, "result": result}
             status = "completed" if result.get("ok", True) else "failed"
         except Exception as exc:
@@ -246,11 +241,11 @@ class AgentTaskRuntime:
         task.execution_state["last_signature"] = signature
         return None
 
-    def run_slice(self, task_id: str, *, owner_token: str = "", owner_session_id: str | None = None) -> Task:
+    def run_slice(self, task_id: str, *, owner_session_token: str = "", owner_session_id: str | None = None) -> Task:
         task = TaskManager.get_task(task_id)
         if task is None:
             raise KeyError("unknown_task")
-        if not self._valid_owner_session(task, owner_session_id, owner_token):
+        if not self._valid_owner_session(task, owner_session_token):
             raise PermissionError("owner authentication required")
         claimed = TaskManager.claim_task(task_id, task.owner_session_id, allow_paused=True)
         if claimed is None:
@@ -311,14 +306,14 @@ class AgentTaskRuntime:
                     self._event(task, "task.failed", {"reason": guarded})
                 elif len(value) > 1 and all((get_tool(call.name) and get_tool(call.name).risk_class in {"read", "network-read"}) for call in value):
                     with ThreadPoolExecutor(max_workers=min(len(value), 8)) as pool:
-                        list(pool.map(lambda call: self._run_one(task, call, owner_token, owner_session_id), value))
+                        list(pool.map(lambda call: self._run_one(task, call, owner_session_token, owner_session_id), value))
                 else:
                     for call in value:
                         if task.cancel_requested:
                             task.update_status(TaskStatus.CANCELLED)
                             self._event(task, "task.cancelled")
                             break
-                        self._run_one(task, call, owner_token, owner_session_id)
+                        self._run_one(task, call, owner_session_token, owner_session_id)
                 if not task.is_terminal and task.status == TaskStatus.WAITING_FOR_TOOL:
                     task.update_status(TaskStatus.WAITING_FOR_MODEL)
                 if not task.is_terminal:
@@ -331,10 +326,10 @@ class AgentTaskRuntime:
         TaskManager.update_task(task)
         return task
 
-    def run_to_completion(self, task_id: str, *, owner_token: str = "", owner_session_id: str | None = None, max_slices: int | None = None) -> Task:
+    def run_to_completion(self, task_id: str, *, owner_session_token: str = "", owner_session_id: str | None = None, max_slices: int | None = None) -> Task:
         slices = 0
         while slices < (max_slices or self.limits.max_execution_steps):
-            task = self.run_slice(task_id, owner_token=owner_token, owner_session_id=owner_session_id)
+            task = self.run_slice(task_id, owner_session_token=owner_session_token, owner_session_id=owner_session_id)
             slices += 1
             if task.is_terminal or task.pause_requested or task.cancel_requested:
                 return task

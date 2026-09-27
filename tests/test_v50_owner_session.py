@@ -1,49 +1,34 @@
-import importlib
-from datetime import datetime, timedelta, timezone
+from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
-import security.owner_policy as owner_policy
-from security.owner_session import OwnerSessionManager
+import api.chat as chat_mod
+import core.engine as engine_mod
+import security.owner_password as owner_password
 
 
-def configured_manager(monkeypatch):
-    monkeypatch.setenv("OWNER_TOKEN", "owner-secret")
-    importlib.reload(owner_policy)
-    return OwnerSessionManager(ttl_seconds=10)
+def test_legacy_challenge_names_are_absent_from_live_path_modules():
+    chat_source = Path(chat_mod.__file__).read_text(encoding="utf-8")
+    engine_source = Path(engine_mod.__file__).read_text(encoding="utf-8")
+    for source in (chat_source, engine_source):
+        assert "owner_challenge" not in source
+        assert "owner_session_challenge" not in source
+        assert "verify_owner" not in source
 
 
-def test_owner_session_creation_and_context(monkeypatch):
-    manager = configured_manager(monkeypatch)
-    session = manager.create("owner-secret")
-    context = manager.consume(session.session_id, session.challenge, f"{session.challenge} حلل الحالة")
-    assert context["owner_authenticated"] is True
-    assert context["owner_session_id"] == session.session_id
-    assert context["authentication_method"] == "owner_session_challenge"
+def test_resolve_session_rejects_empty_and_unknown_tokens():
+    assert owner_password.resolve_session("") is None
+    assert owner_password.resolve_session("unknown-session-token") is None
 
 
-def test_owner_challenge_is_single_use_and_rejects_invalid(monkeypatch):
-    manager = configured_manager(monkeypatch)
-    session = manager.create("owner-secret")
-    with pytest.raises(PermissionError, match="invalid owner challenge"):
-        manager.consume(session.session_id, "CSO-invalid", "CSO-invalid test")
-    manager.consume(session.session_id, session.challenge, session.challenge)
-    with pytest.raises(PermissionError, match="already used"):
-        manager.consume(session.session_id, session.challenge, session.challenge)
+def test_owner_password_auth_method_is_username_password():
+    assert owner_password.AUTH_METHOD == "username_password"
 
 
-def test_owner_challenge_is_bound_to_session_and_expires(monkeypatch):
-    manager = configured_manager(monkeypatch)
-    first = manager.create("owner-secret")
-    second = manager.create("owner-secret")
-    with pytest.raises(PermissionError, match="invalid owner challenge"):
-        manager.consume(second.session_id, first.challenge, first.challenge)
-    first.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-    with pytest.raises(PermissionError, match="expired"):
-        manager.consume(first.session_id, first.challenge, first.challenge)
+def test_owner_session_module_is_deleted():
+    import importlib
 
-
-def test_non_owner_cannot_create_session(monkeypatch):
-    manager = configured_manager(monkeypatch)
-    with pytest.raises(PermissionError):
-        manager.create("wrong-token")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("security.owner_session")

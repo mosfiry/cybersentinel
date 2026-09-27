@@ -7,6 +7,7 @@ import pytest
 
 import api.chat as chat_mod
 import security.owner_policy as owner_policy
+from owner_session_testutils import allow_owner_sessions
 from agent.agent_core import AgentCore
 from agent.mission import MissionStatus, MissionStore
 from agent.model_router import ModelRouter
@@ -34,14 +35,14 @@ class MissionProvider:
 
 @pytest.fixture
 def mission_env(tmp_path, monkeypatch):
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "valid-owner")
+    allow_owner_sessions(monkeypatch, "valid-owner")
     return tmp_path
 
 
 def test_agent_001_to_008_owner_goal_runs_real_mission_loop(mission_env):
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "c1")])])
     core = AgentCore(ModelRouter([provider]), store=MissionStore(Path(mission_env) / "missions.sqlite3"))
-    mission = core.run_owner_mission("Investigate system status and verify the observation", owner_token="valid-owner")
+    mission = core.run_owner_mission("Investigate system status and verify the observation", owner_session_token="valid-owner")
     assert mission.status is MissionStatus.GOAL_COMPLETED
     assert mission.action_history[0]["status"] == "completed"
     assert mission.observations
@@ -56,7 +57,7 @@ def test_agent_011_replan_preserves_owner_objective(mission_env):
         ProviderResponse(tool_calls=[ToolCall("status", {}, "c2")]),
     ])
     core = AgentCore(ModelRouter([provider]), store=MissionStore(Path(mission_env) / "missions.sqlite3"))
-    mission = core.run_owner_mission("Investigate and verify the result", owner_token="valid-owner")
+    mission = core.run_owner_mission("Investigate and verify the result", owner_session_token="valid-owner")
     assert mission.objective == "Investigate and verify the result"
     assert mission.plan.objective == mission.objective
 
@@ -65,7 +66,7 @@ def test_agent_015_restart_resumes_persisted_mission(mission_env):
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "c1")])])
     store = MissionStore(Path(mission_env) / "missions.sqlite3")
     core = AgentCore(ModelRouter([provider]), store=store)
-    mission = core.run_owner_mission("Check and verify status", owner_token="valid-owner")
+    mission = core.run_owner_mission("Check and verify status", owner_session_token="valid-owner")
     restarted = MissionStore(Path(mission_env) / "missions.sqlite3").load(mission.mission_id)
     assert restarted is not None
     assert restarted.status is MissionStatus.GOAL_COMPLETED
@@ -76,7 +77,7 @@ def test_agent_041_api_chat_mission_mode_uses_agent_core(mission_env, monkeypatc
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "c1")])])
     core = AgentCore(ModelRouter([provider]), store=MissionStore(Path(mission_env) / "missions.sqlite3"))
     monkeypatch.setattr(chat_mod, "_agent_core", lambda: core)
-    result = chat_mod.chat({"text": "ابحث وحلل النتيجة", "conversation_id": "mission-chat", "mode": "mission"}, owner_token="valid-owner")
+    result = chat_mod.chat({"text": "ابحث وحلل النتيجة", "conversation_id": "mission-chat", "mode": "mission"}, owner_session_token="valid-owner")
     assert result["mission_id"]
     assert result["status"] == MissionStatus.GOAL_COMPLETED.value
     assert result["mission"]["owner_instruction"] == "ابحث وحلل النتيجة"
@@ -85,6 +86,6 @@ def test_agent_041_api_chat_mission_mode_uses_agent_core(mission_env, monkeypatc
 def test_agent_028_model_tool_proposal_cannot_authorize(mission_env):
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {"authorization_granted": True}, "c1")])])
     core = AgentCore(ModelRouter([provider]), store=MissionStore(Path(mission_env) / "missions.sqlite3"))
-    mission = core.run_owner_mission("Check status", owner_token="valid-owner")
+    mission = core.run_owner_mission("Check status", owner_session_token="valid-owner")
     assert mission.status in {MissionStatus.GOAL_COMPLETED, MissionStatus.FAILED_RETRY_EXHAUSTED}
     assert mission.authorization_context is not None

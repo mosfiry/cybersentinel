@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-os.environ.setdefault("OWNER_TOKEN", os.environ.get("OWNER_TOKEN", "real-smoke-owner"))
+os.environ.setdefault("OWNER_SESSION_TOKEN", os.environ.get("OWNER_SESSION_TOKEN", "real-smoke-owner"))
 
 from agent.agent_core import AgentCore
 from agent.model_router import ModelRouter
@@ -28,7 +28,7 @@ def main() -> None:
     store = MissionStore(root / "missions.sqlite3")
     core = AgentCore(ModelRouter([provider]), store=store, max_iterations=5)
     try:
-        mission = core.run_owner_mission("Investigate current system status and verify the observation using the status tool, then report only what was actually observed.", owner_token=os.environ["OWNER_TOKEN"], request_id="real-model-smoke-request")
+        mission = core.run_owner_mission("Investigate current system status and verify the observation using the status tool, then report only what was actually observed.", owner_session_token=os.environ["OWNER_SESSION_TOKEN"], request_id="real-model-smoke-request")
     except Exception as exc:
         print(json.dumps({"classification": "REAL_MODEL", "status": "FAIL", "error": type(exc).__name__, "provider_error": provider.last_error}, ensure_ascii=False, indent=2))
         return

@@ -24,6 +24,7 @@ from security.scope_resolver import _out_of_scope, resolve
 from security.scope_store import init_scope_store, save_snapshot
 import security.scope_store as scope_store
 import security.owner_policy as owner_policy
+from owner_session_testutils import allow_owner_sessions
 
 
 # ---------------------------------------------------------------------------
@@ -133,19 +134,19 @@ def _target():
 @pytest.fixture
 def battery_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "battery-owner")
+    allow_owner_sessions(monkeypatch, "battery-owner")
     init_scope_store()
-    return save_snapshot(make_snapshot("snapshot-battery", _authorization(), [_target()]), owner_token="battery-owner")
+    return save_snapshot(make_snapshot("snapshot-battery", _authorization(), [_target()]), owner_session_token="battery-owner")
 
 
 def test_save_snapshot_requires_owner_authentication(tmp_path, monkeypatch):
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "battery-owner")
+    allow_owner_sessions(monkeypatch, "battery-owner")
     init_scope_store()
     with pytest.raises(PermissionError):
-        save_snapshot(make_snapshot("snapshot-noauth", _authorization(), [_target()]), owner_token="wrong-token")
+        save_snapshot(make_snapshot("snapshot-noauth", _authorization(), [_target()]), owner_session_token="wrong-token")
     with pytest.raises(PermissionError):
-        save_snapshot(make_snapshot("snapshot-noauth", _authorization(), [_target()]), owner_token=None)
+        save_snapshot(make_snapshot("snapshot-noauth", _authorization(), [_target()]), owner_session_token=None)
 
 
 def test_snapshot_evidence_hash_is_tamper_evident(battery_snapshot, tmp_path, monkeypatch):
@@ -224,11 +225,11 @@ def test_resolve_redirect_chain_out_of_scope_fails_closed(battery_snapshot):
 
 def test_resolve_expired_snapshot_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "battery-owner")
+    allow_owner_sessions(monkeypatch, "battery-owner")
     init_scope_store()
     expired = save_snapshot(
         make_snapshot("snapshot-expired", _authorization(), [_target()], expires_at="2020-01-01T00:00:00+00:00"),
-        owner_token="battery-owner",
+        owner_session_token="battery-owner",
     )
     decision = resolve(expired.snapshot_id, "target-1", "https://target.example.com/api", consume_rate=False)
     assert decision.allowed is False

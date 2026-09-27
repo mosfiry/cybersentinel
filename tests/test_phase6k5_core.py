@@ -22,34 +22,36 @@ from security.authorization import authorize_plan
 def test_owner_evidence_is_request_bound_and_replay_protected(monkeypatch, tmp_path):
     import security.owner_policy as policy
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
-    evidence = policy._issue_evidence("owner_token", "request-a", "proof")
+    evidence = policy._issue_evidence("username_password", "request-a", "proof")
     set_current_owner_instruction("Owner instruction A", auth_evidence=evidence, request_id="request-a")
     with pytest.raises(PermissionError, match="replay"):
         set_current_owner_instruction("Owner instruction B", auth_evidence=evidence, request_id="request-a")
-    other_request = policy._issue_evidence("owner_token", "request-a", "proof-other")
+    other_request = policy._issue_evidence("username_password", "request-a", "proof-other")
     with pytest.raises(PermissionError, match="request-mismatched"):
         set_current_owner_instruction("Owner instruction B", auth_evidence=other_request, request_id="request-b")
 
 
-def test_session_evidence_requires_manager_issued_proof(monkeypatch):
+def test_password_session_evidence_requires_server_side_session(monkeypatch):
+    import security.owner_password as owner_password
     import security.owner_policy as policy
-    import security.owner_session as sessions
-    monkeypatch.setattr(sessions, "verify_owner", lambda text, token: (True, "test"))
-    manager = sessions.OwnerSessionManager(ttl_seconds=30)
-    session = manager.create("token")
-    context = manager.consume(session.session_id, session.challenge, f"CS {session.challenge}", "request-session")
-    monkeypatch.setattr(sessions, "DEFAULT_OWNER_SESSIONS", manager)
-    evidence = policy.authentication_from_session(context, "request-session")
-    assert evidence.session_id == session.session_id
-    fake = dict(context, session_proof="fake")
-    with pytest.raises(PermissionError, match="proof"):
-        policy.authentication_from_session(fake, "request-session")
+
+    def _resolve(token):
+        if token == "live-session":
+            return {"session_id": "session-live", "owner_id": 1, "username": "mosfiry", "auth_method": "username_password", "expires_at": "2999-01-01T00:00:00+00:00"}
+        return None
+
+    monkeypatch.setattr(owner_password, "resolve_session", _resolve)
+    evidence = policy.authenticate_owner("live-session", "request-session")
+    assert evidence.session_id == "session-live"
+    assert evidence.method == "username_password"
+    with pytest.raises(PermissionError, match="owner authentication required"):
+        policy.authenticate_owner("forged-session", "request-session")
 
 
 def test_tampered_and_stale_evidence_is_deterministically_rejected(monkeypatch, tmp_path):
     import security.owner_policy as policy
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
-    evidence = policy._issue_evidence("owner_token", "request-a", "proof")
+    evidence = policy._issue_evidence("username_password", "request-a", "proof")
     tampered = replace(evidence, proof_fingerprint="changed")
     with pytest.raises(PermissionError, match="stale|forged|mismatched"):
         set_current_owner_instruction("Owner instruction", auth_evidence=tampered, request_id="request-a")
@@ -61,10 +63,10 @@ def test_tampered_and_stale_evidence_is_deterministically_rejected(monkeypatch, 
 def test_policy_snapshot_does_not_change_when_current_instruction_changes(monkeypatch, tmp_path):
     import security.owner_policy as policy
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
-    first = policy._issue_evidence("owner_token", "request-a", "first")
+    first = policy._issue_evidence("username_password", "request-a", "first")
     set_current_owner_instruction("Owner instruction A", auth_evidence=first, request_id="request-a")
     snapshot = capture_policy_snapshot("request-a", first)
-    second = policy._issue_evidence("owner_token", "request-b", "second")
+    second = policy._issue_evidence("username_password", "request-b", "second")
     set_current_owner_instruction("Owner instruction B", auth_evidence=second, request_id="request-b")
     assert snapshot.owner_instruction == "Owner instruction A"
     assert snapshot.owner_instruction_fingerprint == owner_instruction_fingerprint("Owner instruction A")
@@ -74,7 +76,7 @@ def test_policy_snapshot_does_not_change_when_current_instruction_changes(monkey
 def test_tool_firewall_requires_valid_evidence_for_sensitive_plan(monkeypatch, tmp_path):
     import security.owner_policy as policy
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
-    evidence = policy._issue_evidence("owner_token", "request-firewall", "firewall")
+    evidence = policy._issue_evidence("username_password", "request-firewall", "firewall")
     accepted, errors = authorize_plan([["red_team_assess", "assess safely"]], owner_evidence=evidence, request_id="request-firewall")
     assert accepted == [("red_team_assess", "assess safely")]
     assert errors == []
@@ -93,7 +95,7 @@ def test_concurrent_owner_updates_leave_valid_state_and_history(monkeypatch, tmp
 
     def update(index: int):
         request_id = f"race-{index}"
-        evidence = policy._issue_evidence("owner_token", request_id, f"race-proof-{index}")
+        evidence = policy._issue_evidence("username_password", request_id, f"race-proof-{index}")
         return set_current_owner_instruction(f"Owner race instruction {index}", auth_evidence=evidence, request_id=request_id)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
