@@ -144,7 +144,16 @@ jobs:
           git config user.email "msfiry36@gmail.com"
           git add -A diagnostics/
           git commit -m "ci diagnostics: export + test result ${GITHUB_SHA:0:12}" || echo "nothing to commit"
-          git pull --rebase --no-edit || true
-          git push
+          for attempt in 1 2 3 4 5 6; do
+            git pull --rebase --no-edit || true
+            if git push; then
+              echo "diagnostics published (attempt ${attempt})"
+              exit 0
+            fi
+            echo "publish raced with concurrent workflow commit (attempt ${attempt}); retrying"
+            sleep 10
+          done
+          echo "diagnostics publish failed after retries"
+          exit 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
