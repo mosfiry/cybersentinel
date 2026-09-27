@@ -56,7 +56,7 @@ def test_agent_loop_denies_unknown_tool_without_execution(monkeypatch, tmp_path)
     assert all(item["status"] == "denied" for item in result["activity"])
 
 
-def test_owner_token_method_is_recorded_in_execution_context(monkeypatch, tmp_path):
+def test_owner_password_method_is_recorded_in_execution_context(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "engine.sqlite3")
     allow_owner_sessions(monkeypatch, "owner-secret")
     from core.engine import handle

@@ -8,7 +8,7 @@ V4.7 tests additionally verify that `red_team_assess` is inaccessible without Ow
 
 V4.9 tests verify safe case generation from reference knowledge, deterministic critic findings, benchmark-gate rejection when unsupported claims increase, Owner-only reasoning-memory access, and persistence of the case/critic record without adding executable attack capabilities.
 
-For a local smoke test, configure separate `BRIDGE_TOKEN` and `OWNER_TOKEN`, run `python bridge.py`, request `/api/health`, then call `/api/status` with the bridge header and `/api/command` with both headers. Never place real credentials in GitHub Actions or source control.
+For a local smoke test, set a strong random `BRIDGE_TOKEN`, run `python bridge.py`, request `/api/health`, then call `/api/status` with the bridge header. Owner-authenticated endpoints require a server-side session created by `POST /api/auth/login` with the Owner username and password (bootstrap: `python -m security.owner_password_bootstrap`); pass the returned session id in the `X-CyberSentinel-Owner-Session` header. Never place real credentials in GitHub Actions or source control.
 
 
 ## Agent Core Fusion validation
@@ -29,7 +29,7 @@ The automated audit command uses the existing configured provider route when env
 LLM_BASE_URL="$OPENAI_API_BASE" \
 LLM_MODEL="gpt-5-mini" \
 LLM_API_KEY="$OPENAI_API_KEY" \
-OWNER_TOKEN="<owner-secret>" \
+OWNER_SESSION_TOKEN="<owner-session-id-created-by-POST-/api/auth/login>" \
 python scripts/run_agent_intelligence_audit.py
 ```
 

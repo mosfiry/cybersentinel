@@ -60,11 +60,11 @@ jobs:
         env:
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OWNER_TOKEN: ${{ secrets.OWNER_TOKEN }}
+          OWNER_SESSION_TOKEN: ${{ secrets.OWNER_SESSION_TOKEN }}
           REAL_PROVIDER_MODEL: ${{ secrets.REAL_PROVIDER_MODEL }}
         run: |
           set -euo pipefail
-          if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_API_KEY:-}" || -z "${OWNER_TOKEN:-}" ]]; then
+          if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_API_KEY:-}" || -z "${OWNER_SESSION_TOKEN:-}" ]]; then
             cat > "$POC_OUTPUT/real-mission.json" <<'EOF'
           {
             "status": "NOT EXECUTED — credentials unavailable",
@@ -90,7 +90,7 @@ jobs:
           if [[ -f "$POC_OUTPUT/real-mission.json" ]]; then
             sha256sum "$POC_OUTPUT/real-mission.json" > "$POC_OUTPUT/real-mission.sha256"
           fi
-          if grep -RInE 'gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|OWNER_TOKEN|BRIDGE_TOKEN|OPENAI_API_KEY' "$POC_OUTPUT"; then
+          if grep -RInE 'gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|OWNER_TOKEN|OWNER_SESSION_TOKEN|BRIDGE_TOKEN|OPENAI_API_KEY' "$POC_OUTPUT"; then
             echo "Potential secret material found in proof output; refusing artifact publication."
             exit 1
           fi

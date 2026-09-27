@@ -64,7 +64,7 @@ The GitHub mechanism must not bypass the existing chain:
 
 > `SYSTEM_PLATFORM → OWNER_POLICY → OWNER_INSTRUCTION → DETERMINISTIC_ENFORCEMENT → AUTHORIZATION_SCOPE → TOOL_RUNTIME → MODEL_OUTPUT → EXTERNAL_DATA`
 
-A Pages asset cannot contain `OWNER_TOKEN`, `BRIDGE_TOKEN`, provider keys, session secrets, or HMAC material. An Actions secret can be used only within a bounded workflow and must never be emitted into logs, artifacts, generated JavaScript, or Pages output. A workflow completion is not a MissionRuntime completion; the proof must show the process, runtime, provider, tool execution, evidence, and verification independently.
+A Pages asset cannot contain owner credentials, `BRIDGE_TOKEN`, provider keys, session secrets, or HMAC material. An Actions secret can be used only within a bounded workflow and must never be emitted into logs, artifacts, generated JavaScript, or Pages output. A workflow completion is not a MissionRuntime completion; the proof must show the process, runtime, provider, tool execution, evidence, and verification independently.
 
 ## Closest executable architecture
 
@@ -85,7 +85,7 @@ This is a **batch/POC architecture**, not a public backend. The current branch a
 ## Owner decisions required
 
 - Configure a secure workflow-dispatch caller credential; do not put it in frontend JavaScript.
-- Supply and approve `OWNER_TOKEN` and real provider credentials if a real mission is to run.
+- Supply and approve an Owner session (`OWNER_SESSION_TOKEN`, created by an authenticated local login) and real provider credentials if a real mission is to run.
 - Decide whether a public Pages site is appropriate given that all published assets are public.
 - Decide artifact retention and any durable evidence store beyond GitHub's retention window.
 - Approve any private-repository Actions quota, billing, external provider cost, or separately managed persistent runtime.

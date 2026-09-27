@@ -9,7 +9,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp .env.example .env
-# Set different random BRIDGE_TOKEN and OWNER_TOKEN values in .env
+# Set a strong random BRIDGE_TOKEN value in .env. Owner sign-in is username+password only
+# (bootstrap locally with: python -m security.owner_password_bootstrap)
 python -m compileall -q .
 pytest -q
 python bridge.py

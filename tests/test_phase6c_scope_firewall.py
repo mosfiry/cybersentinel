@@ -123,7 +123,7 @@ def test_registry_rejects_scoped_namespace_without_firewall_metadata():
         build_registry([ToolSpec("recon.http_probe", "probe", "network-read", True, str, lambda value: value)])
 
 
-def test_scope_snapshot_write_requires_owner_token(tmp_path, monkeypatch):
+def test_scope_snapshot_write_requires_owner_authorization(tmp_path, monkeypatch):
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
     init_scope_store()
     auth = ProgramAuthorization("p-write", "test", "v1", "2026-09-21T00:00:00+00:00", ({"host": "target.example.com", "schemes": ["https"]},))
