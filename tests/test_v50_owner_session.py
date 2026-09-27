@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import api.chat as chat_mod
 import core.engine as engine_mod
 import security.owner_password as owner_password
@@ -23,3 +25,10 @@ def test_resolve_session_rejects_empty_and_unknown_tokens():
 
 def test_owner_password_auth_method_is_username_password():
     assert owner_password.AUTH_METHOD == "username_password"
+
+
+def test_owner_session_module_is_deleted():
+    import importlib
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("security.owner_session")
