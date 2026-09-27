@@ -60,11 +60,11 @@ jobs:
         env:
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OWNER_TOKEN: ${{ secrets.OWNER_TOKEN }}
+          OWNER_SESSION_TOKEN: ${{ secrets.OWNER_SESSION_TOKEN }}
           REAL_PROVIDER_MODEL: ${{ secrets.REAL_PROVIDER_MODEL }}
         run: |
           set -euo pipefail
-          if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_API_KEY:-}" || -z "${OWNER_TOKEN:-}" ]]; then
+          if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_API_KEY:-}" || -z "${OWNER_SESSION_TOKEN:-}" ]]; then
             cat > "$POC_OUTPUT/real-mission.json" <<'EOF'
           {
             "status": "NOT EXECUTED — credentials unavailable",

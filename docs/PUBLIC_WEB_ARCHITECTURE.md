@@ -33,7 +33,7 @@ A browser visit creates no Owner authority. A public session, if enabled, identi
 
 The gateway must reject protected operations unless the request carries a valid gateway session and the operation's required CyberSentinel authorization has independently succeeded. The gateway must not accept the words “Owner” or any frontend state as proof of Owner authority.
 
-The current internal `BRIDGE_TOKEN` and `OWNER_TOKEN` remain server-side configuration. They must never be returned to the browser, rendered into public assets, stored in browser storage, or written to logs.
+The current internal `BRIDGE_TOKEN` and the Owner account password remain server-side configuration. They must never be returned to the browser, rendered into public assets, stored in browser storage, or written to logs.
 
 For the current Owner-only chat semantics, an unresolved decision remains: a production-facing Owner login mechanism must be selected before browser users can invoke Owner-authorized chat. Possible choices include an approved identity provider mapped to a CyberSentinel Owner policy, or a private operator-only gateway. The gateway must not silently turn an anonymous public session into an Owner session.
 
@@ -69,7 +69,7 @@ The browser is not trusted to choose authorization scope, Owner status, provider
 
 ## 6. Secret boundary
 
-Secrets remain exclusively in server-side runtime configuration or a managed secret-injection mechanism. This includes `BRIDGE_TOKEN`, `OWNER_TOKEN`, API keys, LLM credentials, provider credentials, session-signing secrets, HMAC secrets, and deployment credentials.
+Secrets remain exclusively in server-side runtime configuration or a managed secret-injection mechanism. This includes `BRIDGE_TOKEN`, Owner account credentials, API keys, LLM credentials, provider credentials, session-signing secrets, HMAC secrets, and deployment credentials.
 
 The frontend must contain none of these names as operational values and must not prompt for them. Public responses and logs must use redacted error categories and correlation identifiers only.
 
@@ -180,7 +180,7 @@ Controls are server-side secret storage, HttpOnly/Secure cookies, CSRF checks, e
 - `AgentCore`, `MissionRuntime`, and `ModelRouter` remain the system of record.
 - A Firebase project and production origin are not yet known.
 - No production provider credentials are available for this phase.
-- Existing local `BRIDGE_TOKEN` and `OWNER_TOKEN` semantics must remain valid internally.
+- Existing local `BRIDGE_TOKEN` and Owner-session semantics must remain valid internally.
 - The public browser should not be able to perform Owner-only operations until an approved Owner identity flow exists.
 - Long-session/1000-message continuity is out of scope and will not be claimed.
 - Current local tests require installation of project/test dependencies before execution.
