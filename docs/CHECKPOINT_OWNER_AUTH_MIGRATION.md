@@ -1,102 +1,116 @@
 # CYBERSENTINEL X — Owner Authentication Migration Checkpoint
 
 Branch: security/owner-password-auth-migration
-Updated: 2026-09-27 (session 2 of the auth migration)
+Updated: 2026-09-27 (session 2 end — repository repair COMPLETE, CI GREEN, X-E design finalized)
 Base: main @ 5ed08d9
 
 ## CURRENT_PHASE
-Repository repair + canonical auth foundation. CI GREEN as of run 4f68d379022f
-(diagnostics/ci-4f68d379022f.md: result SUCCESS — full pytest, compileall,
-git diff --check, secret scan all passed).
+Foundation complete. Next phase: X-E live-path integration (OWNER_TOKEN removal).
 
 ## CRITICAL OPERATIONAL DISCOVERY (all agents MUST read)
-The raw.githubusercontent fetch channel CORRUPTS file content (inserts line
-breaks at unexpected points). NEVER push content fetched via raw URLs, and
-NEVER trust raw-fetched content. Two verified channels exist:
-1. github_app.get_file_contents returns the blob SHA (trustworthy identity).
-2. The CI base64 export channel: .github/workflows/pytest-diagnostics.yml
-   exports exact file contents (base64, single line) from main and from the
-   branch HEAD into diagnostics/b64-*.txt. Strip whitespace, base64-decode,
-   then verify gitBlobSha(content) against the known/expected blob SHA.
-Additionally: after EVERY push_files, verify the pushed blob via
-get_file_contents SHA comparison (gitBlobSha = sha1("blob <len>\0" + content)).
+1. The raw.githubusercontent fetch channel CORRUPTS content: it inserts line breaks
+   AND deterministically TRUNCATES files around ~32KB (32793 bytes observed).
+   NEVER trust raw-fetched content without verification; files >~32KB CANNOT be
+   fetched whole.
+2. Verified channels:
+   a. github_app.get_file_contents returns the blob SHA (trustworthy identity).
+   b. CI base64 export channel (.github/workflows/pytest-diagnostics.yml): exports
+      exact file contents as base64 CHUNKED at 30000 bytes
+      (diagnostics/b64-{main,head}-<file>-<sha12>.partNNN.txt). Fetch all parts,
+      strip whitespace, concatenate, base64-decode, verify gitBlobSha(decoded)
+      == the blob SHA from get_file_contents.
+   c. After EVERY push_files: verify pushed blob SHA == locally computed
+      gitBlobSha (sha1 of "blob <utf8len>\0" + content). Retry push on mismatch
+      or on "Reference cannot be updated" (concurrent CI commit races; retry works).
+3. B64 decode/SHA-1 code: pure TS implementations exist in this session's history;
+   the sandbox has no atob/TextDecoder.
 
-## LAST_VERIFIED_COMMIT
-fbe88f849f7c — bridge.py restored (exact main + /api/auth/login + /api/auth/logout)
-+ tests.yml restored byte-exact from main.
-Then 4f68d379022f (diagnostics widening) and cfce7e0d0126 (paths-ignore fix).
-All pushed blobs SHA-verified against locally computed git blob SHAs.
+## LAST_VERIFIED_STATE
+Branch tip after session 2: CI run dd25c31ecbfb (see diagnostics/ci-dd25c31ecbfb.md).
+Full suite GREEN on: core/db.py fixed, bridge.py fixed (+/api/auth/login,/api/auth/logout),
+security/owner_password.py + bootstrap + 26 adversarial tests, tests.yml exact main,
+pytest-diagnostics.yml chunked export.
+All pushed files runner-side verified via b64-head-* exports (sha equality).
 
-## COMPLETED UNITS
-- X-A: core/db.py restored byte-exact from main + owner_accounts/owner_sessions
-  schema (fb22545105cc). Verified blob de0c44aac5aa.
-- X-B: security/owner_password.py — canonical Owner username+password auth:
-  scrypt verifier (N=16384,r=8,p=1,dklen=32, per-account random salt), generic
-  failures, anti-enumeration dummy verify, random server-side sessions,
-  authenticated_owner() as the only identity source (a5a86910c4a2).
-- X-B2: security/owner_password_bootstrap.py — interactive getpass bootstrap,
-  idempotent, --reset requires current password.
-- X-B3: tests/test_owner_password_auth.py — 26 adversarial tests (isolated
-  test-only password; verifier-only storage; plaintext absent from DB and logs;
-  session forgery/expiry/revocation; magic strings + client claims rejection;
-  reset fail-closed; unique salts; malformed KDF params rejection).
-- X-C: bridge.py restored + POST /api/auth/login (generic 403) and
-  POST /api/auth/logout (idempotent revocation) (fbe88f849f7c).
-- X-D: tests.yml restored byte-exact from main; pytest-diagnostics.yml widened
-  (paths-ignore on diagnostics/** to break the publish/trigger loop).
+## COMPLETED UNITS (session 2)
+- X-A: core/db.py = exact main + owner_accounts/owner_sessions schema. blob de0c44aa.
+- X-B: owner_password.py (scrypt, sessions, authenticated_owner) blob db2435619;
+  bootstrap blob 8ebfa235; 26 adversarial tests blob b46e502f.
+- X-C: bridge.py = exact main + /api/auth/login + /api/auth/logout. blob ad7f9c18.
+- X-D: tests.yml = exact main (blob 588cf31e). pytest-diagnostics.yml chunked
+  (blob c0cc35c5), with paths-ignore on diagnostics/** and origin/main export ref.
 
-## CI_STATUS
-GREEN (run 4f68d379022f). pytest full suite passed, including the 26 new
-adversarial auth tests.
+## VERIFIED MAIN FILE BLOBS (for rebuilding bases in X-E)
+- core/db.py: c234349cb21b39bbf961c45051f81aea4301ef6d
+- bridge.py: c9f4cc95fc42d1cedd1485a666df80872af736b5
+- api/chat.py: 659fb2ee0f21f377a0762217500768f79d6f0843
+- api/missions.py: 2fb757317b1ed9995c90aecd236ba3b856fa6ed6
+- security/owner_policy.py: afc1833630e9c0eeafb7f5c2d8579bb428e66b0c
+- security/owner_session.py: 9a79fc3e45d8d8e9449b6ad39df9bbc676b4d378
+- agent/task_runtime.py: d2d799be481d3b58e246d5146cba19f87b7cbeff
+- agent/mission_runtime.py: 82460d0431f9bde3759b01a159024888ea509d01 (auth-agnostic, NO changes needed)
+- tests.yml: 588cf31efa97d548103d5aaefec84d593eca1fa1
 
-## INVARIANTS_PROVEN (with tests)
-- Correct credentials authenticate; wrong password / unknown username fail
-  generically (anti-enumeration).
-- Client-supplied booleans/roles/magic strings/OWNER_TOKEN never authenticate.
-- Sessions are random, server-side, expiring, revocable; forged/expired/
-  revoked/corrupt sessions are rejected.
-- Verifier-only storage; plaintext password absent from DB and logs.
-- Reset requires the current password and revokes all sessions.
-- BRIDGE_TOKEN remains a transport credential, never Owner identity.
+## X-E INTEGRATION DESIGN (finalized from source archaeology)
+Legacy auth topology to REMOVE:
+- bridge.py: _chat_auth/_mission_owner read X-CyberSentinel-Owner-Token /
+  -Session / -Challenge headers; /api/owner/session route creates in-memory
+  challenge sessions gated by verify_owner(OWNER_TOKEN).
+- api/chat.py: _validate_chat_entry (line ~16) accepts token OR challenge;
+  create_task/resume/pause/cancel take owner_token=...; default
+  authentication_method="owner_token".
+- agent/task_runtime.py: _valid_owner_session (line ~112) accepts EITHER
+  verify_owner(OWNER_TOKEN) OR DEFAULT_OWNER_SESSIONS.is_active (in-memory
+  challenge session); executor receives owner_token.
+- security/owner_policy.py: verify_owner = OWNER_TOKEN comparison.
+- security/owner_session.py: OwnerSessionManager (in-memory, token-gated,
+  challenge-based) — to be deleted entirely.
+- NOTE: agent/mission_runtime.py has ZERO auth references — auth-agnostic.
 
-## NEXT_SESSION_FIRST_ACTION (exact resume point)
-Unit X-E: integrate Owner password sessions into ALL live Owner paths.
-1. Fetch diagnostics/b64-main-*.txt exports from the latest pytest-diagnostics
-   run (cfce7e0d0126 run exports: api/chat.py, api/missions.py,
-   security/owner_policy.py, security/owner_session.py, agent/task_runtime.py,
-   agent/mission_runtime.py, agent/mission_worker.py, agent/mission.py,
-   agent/task_manager.py, core/engine.py, core/lifecycle.py, core/config.py).
-   Decode + sha-verify, then rebuild each file from the verified base content.
-2. Replace token/challenge-based Owner auth (security.owner_policy.verify_owner,
-   /api/owner/session, X-CyberSentinel-Owner-Token headers) with
-   security.owner_password.authenticated_owner(session) in: /api/chat,
-   /api/missions*, /api/tasks, /api/cancel, mission start/pause/resume/replan.
-3. Remove OWNER_TOKEN as a human Owner authentication mechanism entirely
-   (52-file inventory in the section below; classify each before removal).
-4. Add adversarial tests for each live path (forged/expired/revoked session,
-   client claim forgery, worker forgery, model escalation, external-data
-   injection claiming Owner).
-5. After each file: push + SHA verify + wait for CI diagnostics commit.
-6. Update this checkpoint, then docs/SECURITY_MODEL.md / OPERATIONS.md /
-   README / .env*.example.
+X-E implementation order (each step: rebuild from verified base, push,
+sha-verify, wait for CI diagnostics commit, then next):
+1. bridge.py: replace _chat_auth/_mission_owner with resolution of
+   X-CyberSentinel-Owner-Session header via security.owner_password.
+   authenticated_owner(session_id); remove /api/owner/session route;
+   keep /api/auth/login + /api/auth/logout. Pass owner_session (password
+   session id) + authenticated owner identity into api layer.
+2. api/chat.py: _validate_chat_entry -> require password session; thread
+   session identity (owner_id, session_id, auth_method="username_password")
+   through create/resume/pause/cancel/chat/stream; authentication_method
+   values: "username_password".
+3. agent/task_runtime.py: _valid_owner_session -> owner_password.
+   resolve_session(owner_session_id) only (delete verify_owner branch and
+   DEFAULT_OWNER_SESSIONS usage); executor no longer receives owner_token.
+4. Delete security/owner_session.py; strip verify_owner from
+   security/owner_policy.py (keep policy functions); remove OWNER_TOKEN from
+   core/config.py and .env*.example (BRIDGE_TOKEN stays: transport only).
+5. Update affected tests: test_message0003_auth.py, test_phase21_canonical_paths.py,
+   test_public_web_boundary.py, test_agent_platform.py, test_agent_core_integration.py,
+   test_directive_acceptance.py, test_phase6k6_unified.py (+ any other
+   OWNER_TOKEN-using tests; search repository).
+6. New adversarial live-path tests: login->chat with valid session; expired/
+   revoked/forged session rejected on every Owner route; client claim forgery;
+   worker queue item cannot forge owner identity; model escalation rejected
+   before executor; BRIDGE_TOKEN alone never grants Owner identity.
+
+## NEXT_SESSION_FIRST_ACTION (exact)
+Start X-E step 1 (bridge.py). Fetch the latest diagnostics/b64-main-* chunked
+exports for bridge.py + api/chat.py + agent/task_runtime.py, verify blob SHAs
+against the list above, then implement X-E steps 1-3 as separate sha-verified
+commits. Branch is GREEN at dd25c31ecbfb state; keep it green after every step.
 
 ## OPEN_ISSUES
-- pytest-diagnostics.yml publishes a diagnostics commit on every non-main
-  push (paths-ignore now prevents re-trigger loops).
-- main's tests.yml also runs on the branch pushes (it publishes diagnostics
-  only on main).
-- Owner bootstrap has NOT been run against the production DB yet: the Owner
-  must run "python -m security.owner_password_bootstrap" locally. NEVER ask
-  for the password in chat; it must only be entered interactively.
+- OWNER_TOKEN still authenticates on live paths (X-E pending — THE core migration).
+- Bootstrap not yet run by the Owner (local interactive command required:
+  python -m security.owner_password_bootstrap). Never ask for the password in chat.
+- Diagnostics dir accumulates ci-*.md history; harmless.
 
-## FILES_CHANGED (this session)
+## INVARIANTS_PROVEN (tests green in CI)
+See tests/test_owner_password_auth.py: verifier-only storage, anti-enumeration,
+session forgery/expiry/revocation rejection, client-claims/magic-string rejection,
+reset fail-closed, unique salts, malformed-KDF rejection.
+
+## FILES_CHANGED (session 2)
 core/db.py, security/owner_password.py, security/owner_password_bootstrap.py,
 tests/test_owner_password_auth.py, bridge.py, .github/workflows/tests.yml,
 .github/workflows/pytest-diagnostics.yml, docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md
-
-## AUTH-RELATED OCCURRENCE INVENTORY (from session 1, to classify/remove in X-E)
-OWNER_TOKEN / verify_owner / owner_token occurrences across ~52 files on main.
-Classification pending per-file during X-E: active-correct / migration /
-documentation / test-only / unrelated / obsolete. Target: ZERO production
-paths where OWNER_TOKEN, a magic Owner string, or client claims establish
-Owner identity.
