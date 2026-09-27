@@ -1,306 +1,263 @@
-from __future__ import annotations
+"""Canonical Owner username+password authentication for CyberSentinel.
 
-"""Canonical human Owner authentication: USERNAME + PASSWORD.
+This module implements the ONLY mechanism that authenticates the human
+Owner. Owner identity always originates from a server-side session created
+here after successful password verification.
 
-This module is the ONLY mechanism that may authenticate the human Owner of
-CyberSentinel. Legacy OWNER_TOKEN / owner-challenge schemes never establish
-Owner identity.
-
-Mandatory invariants:
-- Plaintext passwords are never stored, logged, echoed, or persisted anywhere.
-  Only a memory-hard scrypt verifier with a per-user random salt is stored.
-- Login failures are generic; no username enumeration, equalized timing.
-- Session identifiers are cryptographically random (secrets.token_urlsafe) and
-  never derived from username, password, timestamps, request ids or counters.
-- Owner identity originates exclusively from the server-side session store.
-  Client-supplied owner claims (booleans, roles, methods, ids, tokens, magic
-  strings) are untrusted input and never authenticate anyone.
-- OWNER_TOKEN and bridge tokens are transport credentials; they never imply
-  Owner identity.
+Invariants:
+- The plaintext password is never stored, logged, echoed, or returned.
+- Only a scrypt verifier (salt + KDF parameters + digest) is persisted.
+- Login failures are generic to prevent account enumeration.
+- Client-supplied claims (booleans, roles, tokens, magic strings) are never
+  consulted and can never authenticate anyone.
+- BRIDGE_TOKEN is a transport credential and never implies Owner identity.
 """
+from __future__ import annotations
 
 import hashlib
 import hmac
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any
+
+import core.db as core_db
 
 OWNER_USERNAME = "mosfiry"
-AUTHENTICATION_METHOD = "username_password"
 KDF_ALGORITHM = "scrypt"
 KDF_N = 16384
 KDF_R = 8
 KDF_P = 1
 KDF_DKLEN = 32
-SESSION_TTL_SECONDS = 3600
-GENERIC_FAILURE = "invalid_credentials"
+SALT_BYTES = 16
+SESSION_TTL_SECONDS = 8 * 3600
+AUTH_METHOD = "username_password"
 
 
-class OwnerAuthenticationError(PermissionError):
-    """Raised when human Owner authentication fails."""
-
-
-def _connect():
-    from core.db import connect
-
-    return connect()
-
-
-def _utcnow() -> datetime:
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def hash_password(password: str) -> dict[str, Any]:
-    """Return a password verifier record. Never returns or stores plaintext."""
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat()
+
+
+def hash_password(password: str, salt: bytes | None = None) -> dict:
+    """Return the persisted verifier fields for a password (never plaintext)."""
     if not isinstance(password, str) or not password:
-        raise ValueError("password_required")
-    salt = secrets.token_bytes(16)
+        raise ValueError("invalid_password")
+    if salt is None:
+        salt = secrets.token_bytes(SALT_BYTES)
     digest = hashlib.scrypt(
-        password.encode("utf-8"), salt=salt, n=KDF_N, r=KDF_R, p=KDF_P, dklen=KDF_DKLEN
+        password.encode("utf-8"),
+        salt=salt,
+        n=KDF_N,
+        r=KDF_R,
+        p=KDF_P,
+        dklen=KDF_DKLEN,
     )
-    record = {
-        "password_hash": "$".join(
-            [KDF_ALGORITHM, str(KDF_N), str(KDF_R), str(KDF_P), salt.hex(), digest.hex()]
-        ),
+    return {
+        "password_hash": digest.hex(),
         "kdf_algorithm": KDF_ALGORITHM,
-        "kdf_params": json.dumps(
-            {"n": KDF_N, "r": KDF_R, "p": KDF_P, "dklen": KDF_DKLEN}, sort_keys=True
+        "kdf_params_json": json.dumps(
+            {"n": KDF_N, "p": KDF_P, "r": KDF_R, "dklen": KDF_DKLEN, "salt_hex": salt.hex()},
+            sort_keys=True,
         ),
     }
-    # Defense in depth: refuse to return any record that could carry plaintext.
-    if password in json.dumps(record):
-        raise RuntimeError("plaintext_password_leak_detected")
-    return record
 
 
-def verify_password(stored_hash: str, password: str) -> bool:
-    """Constant-time verification of a password against a stored verifier."""
+def _verify(password: str, password_hash: str, kdf_algorithm: str, kdf_params_json: str) -> bool:
+    if kdf_algorithm != KDF_ALGORITHM:
+        return False
     try:
-        algo, n, r, p, salt_hex, digest_hex = str(stored_hash).split("$")
-        if algo != KDF_ALGORITHM:
-            return False
-        stored_bytes = bytes.fromhex(digest_hex)
-        if not stored_bytes:
-            return False
+        params = json.loads(kdf_params_json)
+        salt = bytes.fromhex(params["salt_hex"])
         digest = hashlib.scrypt(
-            str(password).encode("utf-8"),
-            salt=bytes.fromhex(salt_hex),
-            n=int(n),
-            r=int(r),
-            p=int(p),
-            dklen=len(stored_bytes),
+            password.encode("utf-8"),
+            salt=salt,
+            n=int(params["n"]),
+            r=int(params["r"]),
+            p=int(params["p"]),
+            dklen=int(params["dklen"]),
         )
-        return hmac.compare_digest(digest.hex(), digest_hex)
     except Exception:
         return False
+    return hmac.compare_digest(digest.hex(), password_hash)
 
 
-_DUMMY_HASH: str | None = None
+# Timing-equalization verifier used when the account does not exist so that
+# unknown-username and wrong-password failures take a comparable code path.
+_DUMMY = hash_password("cybersentinel-dummy-verifier")
 
 
 def _dummy_verify(password: str) -> None:
-    """Burn equivalent KDF time for unknown accounts (anti-enumeration)."""
-    global _DUMMY_HASH
-    if _DUMMY_HASH is None:
-        _DUMMY_HASH = hash_password(secrets.token_urlsafe(24))["password_hash"]
-    verify_password(_DUMMY_HASH, password)
+    _verify(password, _DUMMY["password_hash"], _DUMMY["kdf_algorithm"], _DUMMY["kdf_params_json"])
 
 
-def get_owner_account(username: str) -> dict[str, Any] | None:
-    with _connect() as con:
-        row = con.execute(
-            "SELECT * FROM owner_accounts WHERE username=?", (str(username or "").strip(),)
-        ).fetchone()
-    return dict(row) if row is not None else None
+def owner_account_exists() -> bool:
+    with core_db.connect() as con:
+        row = con.execute("SELECT 1 FROM owner_accounts LIMIT 1").fetchone()
+    return row is not None
 
 
-def owner_account_exists(username: str = OWNER_USERNAME) -> bool:
-    return get_owner_account(username) is not None
-
-
-def create_owner_account(username: str, password: str) -> dict[str, Any]:
-    """Idempotent-safe creation of the single canonical Owner account."""
-    username = str(username or "").strip()
+def create_owner_account(username: str, password: str) -> int:
+    """Create the single canonical Owner account (bootstrap only)."""
     if username != OWNER_USERNAME:
-        raise OwnerAuthenticationError("unknown_owner_username")
-    record = hash_password(password)
-    with _connect() as con:
-        try:
-            con.execute(
-                "INSERT INTO owner_accounts(username,password_hash,kdf_algorithm,kdf_params)"
-                " VALUES(?,?,?,?)",
-                (
-                    username,
-                    record["password_hash"],
-                    record["kdf_algorithm"],
-                    record["kdf_params"],
-                ),
-            )
-        except Exception as exc:  # UNIQUE constraint => already initialized
-            raise OwnerAuthenticationError("owner_account_already_initialized") from exc
-    return {"username": username}
-
-
-def login(
-    username: str, password: str, *, ttl_seconds: int = SESSION_TTL_SECONDS
-) -> dict[str, Any]:
-    """Canonical login. Returns a secure server-side Owner session.
-
-    Never logs or persists the submitted password. Generic failure for both
-    unknown username and wrong password.
-    """
-    username = str(username or "").strip()
-    password = str(password or "")
-    if ttl_seconds <= 0:
-        raise ValueError("invalid_ttl")
-    account = get_owner_account(username)
-    if account is None:
-        _dummy_verify(password)
-        raise OwnerAuthenticationError(GENERIC_FAILURE)
-    if str(account.get("status") or "active") != "active":
-        _dummy_verify(password)
-        raise OwnerAuthenticationError(GENERIC_FAILURE)
-    if not verify_password(account["password_hash"], password):
-        raise OwnerAuthenticationError(GENERIC_FAILURE)
-    now = _utcnow()
-    expires_at = now + timedelta(seconds=ttl_seconds)
-    # Cryptographically random session id: never derived from username,
-    # password, timestamp, request id, or any counter.
-    session_id = secrets.token_urlsafe(32)
-    with _connect() as con:
-        con.execute(
-            "INSERT INTO owner_sessions"
-            "(session_id,owner_id,created_at,expires_at,authenticated_at,status,authentication_method)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (
-                session_id,
-                account["id"],
-                now.isoformat(),
-                expires_at.isoformat(),
-                now.isoformat(),
-                "active",
-                AUTHENTICATION_METHOD,
-            ),
+        raise PermissionError("owner_username_mismatch")
+    with core_db.connect() as con:
+        row = con.execute(
+            "SELECT owner_id FROM owner_accounts WHERE username = ?", (username,)
+        ).fetchone()
+        if row is not None:
+            raise PermissionError("owner_account_already_exists")
+        verifier = hash_password(password)
+        cur = con.execute(
+            "INSERT INTO owner_accounts (username, password_hash, kdf_algorithm, kdf_params_json, status)"
+            " VALUES (?, ?, ?, ?, 'active')",
+            (username, verifier["password_hash"], verifier["kdf_algorithm"], verifier["kdf_params_json"]),
         )
+        con.commit()
+        return int(cur.lastrowid)
+
+
+def _create_session(owner_id: int) -> dict:
+    session_id = secrets.token_urlsafe(32)
+    now = _now()
+    expires = now + timedelta(seconds=SESSION_TTL_SECONDS)
+    with core_db.connect() as con:
+        con.execute(
+            "INSERT INTO owner_sessions (session_id, owner_id, created_at, authenticated_at, expires_at, status, auth_method)"
+            " VALUES (?, ?, ?, ?, ?, 'active', ?)",
+            (session_id, owner_id, _iso(now), _iso(now), _iso(expires), AUTH_METHOD),
+        )
+        con.commit()
     return {
         "session_id": session_id,
-        "owner_id": account["id"],
-        "username": account["username"],
-        "authenticated_at": now.isoformat(),
-        "expires_at": expires_at.isoformat(),
-        "authentication_method": AUTHENTICATION_METHOD,
+        "owner_id": owner_id,
+        "auth_method": AUTH_METHOD,
+        "authenticated_at": _iso(now),
+        "expires_at": _iso(expires),
     }
 
 
-def resolve_session(session_id: str) -> dict[str, Any] | None:
-    """Resolve Owner identity exclusively from the server-side session store."""
-    session_id = str(session_id or "").strip()
-    if not session_id:
-        return None
-    with _connect() as con:
+def login(username: str, password: str) -> dict:
+    """The single human Owner authentication entry point.
+
+    Returns a server-side session dict on success; raises PermissionError
+    with a generic message on ANY failure (unknown username, wrong
+    password, disabled account, malformed input).
+    """
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise PermissionError("invalid_credentials")
+    with core_db.connect() as con:
         row = con.execute(
-            "SELECT s.session_id, s.owner_id, s.expires_at, s.authenticated_at,"
-            " s.status, s.authentication_method, a.username, a.status AS account_status"
-            " FROM owner_sessions s JOIN owner_accounts a ON a.id = s.owner_id"
-            " WHERE s.session_id=?",
+            "SELECT owner_id, username, password_hash, kdf_algorithm, kdf_params_json, status"
+            " FROM owner_accounts WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if row is None or row["status"] != "active":
+        _dummy_verify(password)
+        raise PermissionError("invalid_credentials")
+    if not _verify(password, row["password_hash"], row["kdf_algorithm"], row["kdf_params_json"]):
+        raise PermissionError("invalid_credentials")
+    return _create_session(int(row["owner_id"]))
+
+
+def resolve_session(session_id) -> dict | None:
+    """Resolve a server-side Owner session; None when unknown/expired/revoked."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    with core_db.connect() as con:
+        row = con.execute(
+            "SELECT s.session_id, s.owner_id, s.status, s.expires_at, s.auth_method,"
+            " a.username, a.status AS account_status"
+            " FROM owner_sessions s JOIN owner_accounts a ON a.owner_id = s.owner_id"
+            " WHERE s.session_id = ?",
             (session_id,),
         ).fetchone()
-    if row is None:
+    if row is None or row["status"] != "active" or row["account_status"] != "active":
         return None
-    item = dict(row)
     try:
-        expires = datetime.fromisoformat(item["expires_at"])
+        expires = datetime.fromisoformat(row["expires_at"])
     except (TypeError, ValueError):
         return None
-    if (
-        item["status"] != "active"
-        or item["account_status"] != "active"
-        or item["authentication_method"] != AUTHENTICATION_METHOD
-        or expires <= _utcnow()
-    ):
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires <= _now():
         return None
     return {
-        "session_id": item["session_id"],
-        "owner_id": item["owner_id"],
-        "username": item["username"],
-        "authenticated_at": item["authenticated_at"],
-        "authentication_method": item["authentication_method"],
+        "session_id": row["session_id"],
+        "owner_id": int(row["owner_id"]),
+        "username": row["username"],
+        "auth_method": row["auth_method"],
+        "expires_at": row["expires_at"],
     }
 
 
-def revoke_session(session_id: str) -> bool:
-    with _connect() as con:
-        cur = con.execute(
-            "UPDATE owner_sessions SET status='revoked' WHERE session_id=?",
-            (str(session_id or "").strip(),),
-        )
-        return cur.rowcount == 1
+def authenticated_owner(session_id) -> dict | None:
+    """The ONLY way any caller obtains an authenticated Owner identity.
+
+    Accepts ONLY a server-side session reference. Client-supplied booleans,
+    roles, tokens, and magic strings are irrelevant by construction: there
+    is no parameter through which they could authenticate anyone.
+    """
+    session = resolve_session(session_id)
+    if session is None:
+        return None
+    return {
+        "owner_id": session["owner_id"],
+        "username": session["username"],
+        "session_id": session["session_id"],
+        "auth_method": session["auth_method"],
+    }
 
 
-def revoke_owner_sessions(owner_id: int) -> int:
-    with _connect() as con:
+def revoke_session(session_id) -> bool:
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    with core_db.connect() as con:
         cur = con.execute(
-            "UPDATE owner_sessions SET status='revoked' WHERE owner_id=? AND status='active'",
-            (int(owner_id),),
+            "UPDATE owner_sessions SET status = 'revoked'"
+            " WHERE session_id = ? AND status = 'active'",
+            (session_id,),
         )
-        return cur.rowcount
+        con.commit()
+        return cur.rowcount > 0
+
+
+def revoke_owner_sessions(owner_id: int) -> None:
+    with core_db.connect() as con:
+        con.execute(
+            "UPDATE owner_sessions SET status = 'revoked' WHERE owner_id = ? AND status = 'active'",
+            (owner_id,),
+        )
+        con.commit()
 
 
 def reset_password(username: str, current_password: str, new_password: str) -> None:
-    """Authenticated password rotation. Requires the current password.
-
-    This is never a login bypass: without the correct current password the
-    rotation fails closed with a generic error.
-    """
-    account = get_owner_account(username)
-    if account is None or not verify_password(
-        account["password_hash"], str(current_password or "")
+    """Rotate the Owner password; requires the CURRENT password (never a login bypass)."""
+    if username != OWNER_USERNAME:
+        raise PermissionError("invalid_credentials")
+    with core_db.connect() as con:
+        row = con.execute(
+            "SELECT owner_id, password_hash, kdf_algorithm, kdf_params_json FROM owner_accounts WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if row is None or not _verify(
+        current_password, row["password_hash"], row["kdf_algorithm"], row["kdf_params_json"]
     ):
-        raise OwnerAuthenticationError(GENERIC_FAILURE)
-    record = hash_password(new_password)
-    with _connect() as con:
+        _dummy_verify(current_password)
+        raise PermissionError("invalid_credentials")
+    verifier = hash_password(new_password)
+    with core_db.connect() as con:
         con.execute(
-            "UPDATE owner_accounts SET password_hash=?, kdf_algorithm=?, kdf_params=?,"
-            " updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (
-                record["password_hash"],
-                record["kdf_algorithm"],
-                record["kdf_params"],
-                account["id"],
-            ),
+            "UPDATE owner_accounts SET password_hash = ?, kdf_algorithm = ?, kdf_params_json = ?,"
+            " updated_at = CURRENT_TIMESTAMP WHERE owner_id = ?",
+            (verifier["password_hash"], verifier["kdf_algorithm"], verifier["kdf_params_json"], row["owner_id"]),
         )
-    revoke_owner_sessions(account["id"])
+        con.commit()
+    revoke_owner_sessions(int(row["owner_id"]))
 
 
-# Client-supplied keys that must NEVER influence authentication. They are
-# untrusted input only; Owner identity comes exclusively from the server-side
-# session store resolved by resolve_session().
-IGNORED_CLIENT_CLAIM_KEYS = (
-    "owner_authenticated",
-    "role",
-    "is_owner",
-    "owner",
-    "authentication_method",
-    "owner_id",
-    "owner_token",
-    "OWNER_TOKEN",
-    "owner_session",
-    "owner_proof",
-)
-
-
-def authenticated_owner(
-    session_id: str, client_claims: dict[str, Any] | None = None
-) -> dict[str, Any] | None:
-    """Return the authenticated human Owner, if any.
-
-    ALL client-supplied owner claims are ignored: booleans, roles,
-    authentication methods, ids, tokens and magic strings never authenticate
-    anyone. Only a valid server-side session establishes Owner identity.
-    """
-    # Deliberately discard untrusted claims; they are never consulted.
-    if isinstance(client_claims, dict):
-        for _key in IGNORED_CLIENT_CLAIM_KEYS:
-            client_claims.pop(_key, None)
-    return resolve_session(session_id)
+def logout(session_id) -> bool:
+    """Revoke a session. Idempotent and safe to call repeatedly."""
+    return revoke_session(session_id)
