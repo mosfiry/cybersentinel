@@ -1,0 +1,30 @@
+name: docs-export
+on:
+  push:
+    branches: [security/owner-password-auth-migration]
+    paths-ignore: ['diagnostics/**']
+permissions:
+  contents: write
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: export docs through the base64 integrity channel
+        run: |
+          set -euo pipefail
+          TAG=$(git rev-parse --short=12 HEAD)
+          mkdir -p diagnostics
+          for f in docs/OWNER_CHARTER.md docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md docs/OWNER_CHARTER_AUDIT_2026-09-27.md; do
+            out="diagnostics/b64-head-$(echo "$f" | tr '/' '-')-${TAG}"
+            base64 -w0 "$f" | fold -w 30000 | split -l 1 -d --additional-suffix=.txt - "${out}.part"
+          done
+      - name: publish
+        run: |
+          set -euo pipefail
+          git config user.name "mosfiry"
+          git config user.email "msfiry36@gmail.com"
+          git add diagnostics || true
+          if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
+          git commit -m "ci diagnostics: docs export $(git rev-parse --short=12 HEAD)"
+          git push
