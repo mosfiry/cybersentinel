@@ -74,12 +74,11 @@ jobs:
             echo
             echo "## Model output authority mentions:"
             git grep -n -I -E "MODEL_OUTPUT" -- ':!diagnostics' | head -100 || echo "(none)"
-          } > "diagnostics/charter-audit-$S.md"
-          split -b 28000 -d -a 3 "diagnostics/charter-audit-$S.md" "diagnostics/charter-audit-$S.part"
-          if [ -f "diagnostics/charter-audit-$S.part000" ]; then
-            for p in diagnostics/charter-audit-$S.part*; do mv "$p" "$p.txt"; done
-            rm -f "diagnostics/charter-audit-$S.md"
-            for p in diagnostics/charter-audit-$S.part*.txt; do mv "$p" "${p%.txt}.md"; done
+          } > /tmp/audit.md
+          base64 -w0 /tmp/audit.md > /tmp/audit.b64
+          split -b 30000 -d -a 3 /tmp/audit.b64 "diagnostics/b64-charter-audit-$S.part"
+          if [ -f "diagnostics/b64-charter-audit-$S.part000" ]; then
+            for p in diagnostics/b64-charter-audit-$S.part*; do mv "$p" "$p.txt"; done
           fi
       - name: pip install
         run: |
