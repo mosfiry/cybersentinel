@@ -114,3 +114,25 @@ reset fail-closed, unique salts, malformed-KDF rejection.
 core/db.py, security/owner_password.py, security/owner_password_bootstrap.py,
 tests/test_owner_password_auth.py, bridge.py, .github/workflows/tests.yml,
 .github/workflows/pytest-diagnostics.yml, docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md
+
+---
+
+## SESSION 3 (2026-09-27) — OWNER_INSTRUCTION charter implementation + full-repo audit — COMPLETE
+
+- Constitutional module: security/owner_charter.py (blob ea7a21e4) — commit 70b618f193e8.
+- Adversarial battery: tests/test_owner_charter.py — commit 3725c7b5fc13 (blob 6d86bc9d).
+  Drift fixed: removed the "tightening exception" — a system rule forbidding what the
+  Owner explicitly allowed is ALSO OWNER_INSTRUCTION_CONFLICT (regression asserts classification).
+- Full-repo audit (371 files, CI charter-audit reports, run 70b618f193e8): NO rival
+  legislative authority found anywhere in the codebase.
+- Audit closure doc: docs/OWNER_CHARTER_AUDIT_2026-09-27.md (commit 024f5cef935d).
+- CI evidence: diagnostics/ci-3725c7b5fc13.md = SUCCESS; ci-024f5cef935d.md = SUCCESS.
+- New workflow: .github/workflows/docs-export.yml (ed94d5b4fe3a) — docs exported through
+  the b64 integrity channel (GitHub API contents endpoint is rate-limited; raw fetch corrupts).
+
+NEXT (resume X-E live-path integration per session 2 design):
+1. bridge.py already has POST /api/auth/login + /api/auth/logout. Next: wire the
+   authenticated owner session into api/chat.py + api/missions.py + agent/task_runtime
+   (delete security/owner_session.py, verify_owner, OWNER_TOKEN) — main blob SHAs:
+   api/chat.py 659fb2ee, api/missions.py 2fb75731, task_runtime d2d799be.
+2. Owner must run `python -m security.owner_password_bootstrap` locally (never in chat).
