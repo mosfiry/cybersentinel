@@ -1,4 +1,42 @@
+from types import SimpleNamespace
+
 import core.engine as engine
+
+
+def test_handle_once_replays_completed_lifecycle_without_reexecution(monkeypatch):
+    final_result = {"ok": True, "decision": "allow", "request_id": "replay-request"}
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(
+            status="completed", final_result=final_result, claimed=False
+        ),
+    )
+
+    result = engine._handle_once("status", source="test", request_id="replay-request")
+
+    assert result == {**final_result, "idempotent_replay": True}
+    assert final_result == {"ok": True, "decision": "allow", "request_id": "replay-request"}
+
+
+def test_handle_once_does_not_reexecute_unclaimed_lifecycle(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(
+            status="executing", final_result=None, claimed=False
+        ),
+    )
+
+    result = engine._handle_once("status", source="test", request_id="active-request")
+
+    assert result == {
+        "ok": False,
+        "decision": "in_progress",
+        "request_id": "active-request",
+        "lifecycle": "executing",
+        "answer": "الطلب قيد التنفيذ أو يحتاج إلى recovery؛ لن تتم إعادة تنفيذه.",
+    }
 
 
 def test_summarize_covers_local_and_tool_result_branches():
