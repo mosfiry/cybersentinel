@@ -39,7 +39,7 @@ class RuntimeLimitsConfig:
 @dataclass(frozen=True)
 class OwnerPolicy:
     version: str
-    require_owner_token: bool
+    require_owner_password: bool
     owner_phrase: str
     evidence_required: bool
     sandbox_by_default: bool
