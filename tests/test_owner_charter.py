@@ -215,8 +215,13 @@ def test_compliant_system_rule_passes():
     )
     assert_charter_compliance(charter, system_rule(CharterDomain.POLICY, "tool_use", Stance.ALLOWED))
     assert_charter_compliance(charter, system_rule(CharterDomain.SCOPE, "lab_only", Stance.REQUIRED))
-    # tightening is allowed, loosening is not
-    assert_charter_compliance(charter, system_rule(CharterDomain.POLICY, "tool_use", Stance.FORBIDDEN))
+    # A system rule may never contradict the Owner charter in either direction.
+    # Forbidding what the Owner explicitly allowed is also implementation drift:
+    # the system has no independent authority to restrict the Owner's allowance
+    # (no "tightening exception" — the Owner defines the permitted and the forbidden).
+    with pytest.raises(OwnerInstructionConflict) as excinfo:
+        assert_charter_compliance(charter, system_rule(CharterDomain.POLICY, "tool_use", Stance.FORBIDDEN))
+    assert excinfo.value.classification == "OWNER_INSTRUCTION_CONFLICT"
 
 
 def test_different_domain_or_behavior_never_conflicts():
