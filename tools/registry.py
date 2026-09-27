@@ -590,6 +590,14 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
         raise PermissionError(f"{proof_code}: {proof_reason}")
     if str(getattr(execution_proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != resolved_class:
         raise PermissionError(f"{RejectionCode.EXECUTION_CLASS_MISMATCH.value}: proof execution class {getattr(execution_proof, 'execution_class', '')} does not match {resolved_class} execution")
+    if resolved_class == ExecutionClass.OWNER_DIRECT.value and authorization_decision is None:
+        # B3-C5 second-pass attacker review: an OWNER_DIRECT execution must
+        # carry the typed AuthorizationDecision that authorized it. Before
+        # this check a captured owner-direct proof for a tool that is not
+        # owner_only/scope_required could be replayed at the registry with
+        # no decision at all, contradicting the documented OWNER_DIRECT
+        # contract. Fail closed before any handler runs.
+        raise PermissionError(f"{RejectionCode.PROOF_INCOMPLETE.value}: OWNER_DIRECT execution requires the typed AuthorizationDecision that authorized it")
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
