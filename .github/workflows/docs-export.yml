@@ -10,15 +10,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: export docs through the base64 integrity channel
+      - name: export files + legacy-auth inventory through the base64 integrity channel
         run: |
           set -euo pipefail
           TAG=$(git rev-parse --short=12 HEAD)
           mkdir -p diagnostics
-          for f in docs/OWNER_CHARTER.md docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md docs/OWNER_CHARTER_AUDIT_2026-09-27.md; do
-            out="diagnostics/b64-head-$(echo "$f" | tr '/' '-')-${TAG}"
-            base64 -w0 "$f" | fold -w 30000 | split -l 1 -d --additional-suffix=.txt - "${out}.part"
+          for f in docs/OWNER_CHARTER.md docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md docs/OWNER_CHARTER_AUDIT_2026-09-27.md agent/agent_core.py agent/mission_task_adapter.py api/chat.py api/missions.py agent/task_runtime.py core/engine.py security/owner_policy.py security/owner_session.py security/owner_password.py bridge.py; do
+            if [ -f "$f" ]; then
+              out="diagnostics/b64-head-$(echo "$f" | tr '/' '-')-${TAG}"
+              base64 -w0 "$f" | fold -w 30000 | split -l 1 -d --additional-suffix=.txt - "${out}.part"
+            else
+              echo "(missing $f)" >> "diagnostics/b64-head-$(echo "$f" | tr '/' '-')-${TAG}.missing.txt"
+            fi
           done
+          {
+            echo "# legacy auth usage inventory (run $TAG)"
+            echo "## files referencing OWNER_TOKEN / verify_owner / owner_session / owner_challenge:"
+            git grep -l -I -E "OWNER_TOKEN|verify_owner|owner_session|owner_challenge" -- ':!diagnostics' || echo "(none)"
+            echo "## test files referencing legacy auth:"
+            git grep -l -I -E "OWNER_TOKEN|verify_owner|owner_session|owner_challenge" -- 'tests/' || echo "(none)"
+          } > "diagnostics/legacy-auth-inventory-${TAG}.md"
       - name: publish
         run: |
           set -euo pipefail
@@ -26,5 +37,5 @@ jobs:
           git config user.email "msfiry36@gmail.com"
           git add diagnostics || true
           if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
-          git commit -m "ci diagnostics: docs export $(git rev-parse --short=12 HEAD)"
+          git commit -m "ci diagnostics: docs + runtime export $(git rev-parse --short=12 HEAD)"
           git push
