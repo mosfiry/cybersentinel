@@ -101,6 +101,11 @@ class Mission:
     def transition(self, target: MissionStatus, reason: str, **data: Any) -> None:
         if not isinstance(target, MissionStatus):
             raise TypeError("mission transition requires MissionStatus")
+        # SYSTEM INVARIANT (truthfulness T2): GOAL_COMPLETED is impossible without
+        # the deterministic goal-verification state written by MissionRuntime.
+        # No caller (model, API, worker, library) can complete a mission by assertion.
+        if target is MissionStatus.GOAL_COMPLETED and self.verification_state.get("verified") is not True:
+            raise ValueError("GOAL_COMPLETED is a system invariant: deterministic goal verification state is required")
         if self.status is MissionStatus.RECOVERY_REQUIRED and target not in {MissionStatus.RECOVERY_REQUIRED, MissionStatus.READY}:
             raise ValueError("recovery requires reconciliation before continuation")
         recovery_reconciled = self.status is MissionStatus.RECOVERY_REQUIRED and target is MissionStatus.READY
@@ -168,6 +173,11 @@ class MissionStore:
         import json, sqlite3
         with sqlite3.connect(self.db_path) as db:
             payload = mission.to_dict()
+            # SYSTEM INVARIANT (truthfulness T2): a GOAL_COMPLETED mission cannot be
+            # persisted without deterministic verification, even via direct status
+            # assignment on an in-memory mission object.
+            if payload.get("status") == MissionStatus.GOAL_COMPLETED.value and (payload.get("verification_state") or {}).get("verified") is not True:
+                raise ValueError("refusing to persist GOAL_COMPLETED without deterministic verification")
             encoded = json.dumps(payload, ensure_ascii=False)
             existing = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
             if existing is None:

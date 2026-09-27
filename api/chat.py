@@ -12,6 +12,7 @@ from agent.mission import MissionStatus
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
 from core.engine import RUNTIME
 from security import owner_password
+from security.truthfulness import mission_truth_payload
 
 
 def _owner_session(owner_session_token: str) -> dict[str, Any]:
@@ -136,6 +137,9 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
         "status": mission.status.value,
         "activity": activity,
         "mission": mission.to_dict(),
+        # SYSTEM TRUTH (truthfulness T2): the answer is MODEL_OUTPUT (a claim);
+        # completion truth comes only from deterministic verification state.
+        "truth": mission_truth_payload(mission.status.value, mission.verification_state),
     }
 
 
