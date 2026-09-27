@@ -67,3 +67,37 @@ step verdicts and "Invalid workflow file" annotations without the API.
 PHASE 7: fetch workspace/environment.py via contents-API b64 channel, confirm
 ProcessManager/ProcessHandle are dead code (no callers), remove them, add a
 regression test asserting absence, push, verify CI on the exact SHA.
+
+## UPDATE 2026-09-27 — PHASE 7 (F6) COMPLETE (VERIFIED)
+
+- f8e07736fb8c (PHASE 7 attempt) and 2e20acb78047 (fix attempt) were BOTH BROKEN:
+  the diff reconstruction of workspace/environment.py deleted LIVE code
+  (resolve() logic, _hash, edit(), create()/delete() bodies, run() call,
+  ProcessResult fields) and mangled indentation -> IndentationError line 80.
+  Evidence: diagnostics/ci-2e20acb78047.md "result: FAILURE" (compileall exit 1,
+  pytest exit 2). Both commits remain in history (fix-forward, no revert).
+- Root cause identified by replaying the f8e07736 unified diff (all 7 hunks
+  matched the TRUE pre-F6 state line-for-line): the pushed file diverged from
+  the intended minimal dead-code removal.
+- 13c6a74652ec (fix-forward): workspace/environment.py REBUILT from the
+  verified pre-F6 state (raw fetch at 8a697ef22aab + wrap-repair, validated by
+  exact context match of all 7 f8e07736 hunks) with ONLY the intended change:
+  subprocess import reduced to "from subprocess import CompletedProcess, run";
+  ProcessHandle + ProcessManager classes removed (dead code, no callers);
+  __all__ updated. workspace/__init__.py exports updated accordingly.
+  Round-trip re-fetch verified content. Live Workspace logic (resolve/_authorize/
+  _record/list/read/write/edit/create/move/delete/run_process/run_shell/develop,
+  ProcessResult) fully preserved.
+- tests/test_no_process_manager.py (3 regression tests) unchanged and passing.
+- CI VERIFIED on 13c6a74652ec: workflow "test" succeeded Sep 27, 2026 in 33s;
+  diagnostics/ci-13c6a74652ec.md "result: SUCCESS" (published by marker commit
+  a257a3269f34 — CI-authored, preserved).
+- HEAD after this checkpoint push: see the commit containing this update.
+
+## NEXT_ACTION (supersedes previous)
+PHASE 9 (F8): OWNER_TOKEN terminology reconciliation in active docs
+(README.md, docs/TESTING.md, docs/OPERATIONS.md, docs/SECURITY_MODEL.md,
+.env.example, .env.agent.example) + classification of the remaining
+occurrences (tests = negative cases, historical records stay) + CI guard
+against legacy terminology re-entering active docs. Then PHASE 6 (F5), PHASE 8
+(F7), PHASE 2, PHASE 10/11.
