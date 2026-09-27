@@ -1,4 +1,4 @@
-# CI run b96c13766e33
+# CI run 2b4bdacbd300
 result: FAILURE
 
 ## pytest failed (exit 1)
@@ -26,7 +26,7 @@ ______________ test_terminal_and_recovery_transitions_are_closed _______________
 tests/test_security_integrity_adversarial.py:114: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
 
-self = Mission(mission_id='44a04d9e7308497a897a044b5aa6f574', owner_request='owner', objective='objective', status=<MissionSt...gy_decisions=[], replan_history=[], verification_history=[], recovery_events=[], semantic_intent={}, integrity_hash='')
+self = Mission(mission_id='7c36f682a8b34111a859dbda748f27d7', owner_request='owner', objective='objective', status=<MissionSt...gy_decisions=[], replan_history=[], verification_history=[], recovery_events=[], semantic_intent={}, integrity_hash='')
 target = <MissionStatus.GOAL_COMPLETED: 'GOAL_COMPLETED'>
 reason = 'forged completion', data = {}
 
@@ -59,4 +59,4 @@ tests/test_security_integrity_adversarial.py:113: AssertionError
 FAILED tests/test_security_integrity_adversarial.py::test_terminal_and_recovery_transitions_are_closed - AssertionError: Regex pattern did not match.
  Regex: 'reconciliation'
  Input: 'GOAL_COMPLETED is a system invariant: deterministic goal verification state is required'
-1 failed, 759 passed, 1 skipped in 19.30s
+1 failed, 759 passed, 1 skipped in 20.53s
