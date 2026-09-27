@@ -18,6 +18,8 @@ jobs:
         python-version: ["3.13"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -38,14 +40,29 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest -q 2>&1 | tee pytest_out.txt
-      - name: git diff check
+      - name: Commit-range whitespace check
+        shell: bash
         run: |
           set +e
-          git diff --check > diff_out.txt 2>&1
-          code=$?
-          if [ "$code" -ne 0 ]; then
-            { echo "## git diff --check failed (whitespace error, exit $code)"; cat diff_out.txt; } >> diag.txt
-            exit 1
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && git rev-parse --verify --quiet "$BEFORE^{commit}" >/dev/null 2>&1; then
+              BASE="$BEFORE"
+            else
+              BASE=$(git rev-parse --quiet --verify "HEAD~1^{commit}" 2>/dev/null || echo "")
+            fi
+          fi
+          if [ -n "$BASE" ]; then
+            git diff --check "$BASE" "$GITHUB_SHA" > diff_out.txt 2>&1
+            code=$?
+            if [ "$code" -ne 0 ]; then
+              { echo "## commit-range whitespace check failed (range $BASE..$GITHUB_SHA, exit $code)"; cat diff_out.txt; } >> diag.txt
+              exit 1
+            fi
+          else
+            { echo "## commit-range whitespace check skipped: no comparable base commit"; } >> diag.txt
           fi
       - name: Secret and sensitive-file scan
         shell: bash
