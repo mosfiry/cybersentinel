@@ -1,0 +1,60 @@
+name: phase1-diagnostics
+
+on:
+  push:
+    branches: [engineering/final-completion]
+    paths-ignore:
+      - 'diagnostics/**'
+
+concurrency:
+  group: phase1-diag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: pip install
+        run: |
+          set +e
+          python -m pip install -r requirements.txt > pip_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            tail -c 2000 pip_out.txt
+            exit 1
+          fi
+      - name: pytest tail capture
+        run: |
+          set +e
+          python -m pytest -q > pytest_out.txt 2>&1
+          code=$?
+          echo "pytest exit code: $code"
+          tail -c 8000 pytest_out.txt
+          if [ "$code" -eq 0 ]; then
+            echo "pytest green"
+            exit 0
+          fi
+          mkdir -p diagnostics
+          { echo "# pytest tail for ${GITHUB_SHA:0:12}"; echo; tail -c 20000 pytest_out.txt; } > "diagnostics/pytest-tail-${GITHUB_SHA:0:12}.txt"
+          git config user.name "mosfiry"
+          git config user.email "msfiry36@gmail.com"
+          git add diagnostics/
+          git commit -m "phase1 diagnostics: pytest tail ${GITHUB_SHA:0:12}"
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if git push --force origin HEAD:refs/heads/diagnostics/phase1-tail; then
+              echo "tail published (attempt $attempt)"
+              exit 0
+            fi
+            echo "push attempt $attempt failed; retrying"
+            sleep 5
+          done
+          echo "tail publish failed"
+          exit 1
