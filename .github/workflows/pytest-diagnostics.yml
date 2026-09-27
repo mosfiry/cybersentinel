@@ -28,7 +28,7 @@ jobs:
           S="${GITHUB_SHA:0:12}"
           rm -f diagnostics/b64-*.txt
           for f in core/db.py bridge.py api/chat.py api/missions.py security/owner_policy.py security/owner_session.py agent/task_runtime.py agent/mission_runtime.py agent/mission_worker.py agent/mission.py agent/task_manager.py core/engine.py core/lifecycle.py core/config.py; do
-            if git show "main:$f" > /tmp/export 2>/dev/null; then
+            if git show "origin/main:$f" > /tmp/export 2>/dev/null; then
               name=$(echo "$f" | tr '/' '-')
               base64 -w0 /tmp/export > "diagnostics/b64-main-$name-$S.txt"
             fi
