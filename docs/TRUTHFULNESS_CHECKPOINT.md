@@ -141,3 +141,21 @@ regression test asserting absence, push, verify CI on the exact SHA.
   (chat response classification seam + completion gate), replace name-based
   origins with verifiable provenance, then production-path adversarial
   suite. NOTHING in T0 is COMPLETE.
+
+## UPDATE 2026-09-27 — PHASE T1 + T2: PRODUCTION TRUTHFULNESS ENFORCEMENT (VERIFIED)
+
+- T1 design doc: docs/TRUTHFULNESS_ENFORCEMENT_DESIGN.md (44bf31fec567, CI
+  green). T2 implementation: f132d82b0d27 (truthfulness v2: HMAC provenance
+  issuer, fail-closed CI claims, exact completion gates, API status
+  semantics; CI green 33s) + 6e987908b30c (GOAL_COMPLETED system invariant
+  in Mission.transition + MissionStore.save; truth payload in api/chat.py;
+  web/app.js completion-invention fallbacks removed; enforcement battery
+  tests/test_truthfulness_enforcement.py; CI green 37s). CI-authored
+  diagnostics markers preserved (67c59033, 885e7b1550).
+- Bypasses B1-B8 from the T0 audit: FIXED with regression + adversarial
+  tests; remaining limitations recorded in the audit doc (no runtime CI
+  minting boundary yet; persistence-time guard for direct status writes).
+- NEXT (PLANNED, NOT RUN): wire the SystemEvidenceIssuer into
+  MissionRuntime action recording (execution_runtime evidence minting),
+  memory/external-data labeling seams, and the CI trusted-provider
+  boundary design decision (requires Owner decision on secret management).
