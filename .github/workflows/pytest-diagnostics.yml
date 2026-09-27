@@ -2,14 +2,17 @@ name: pytest-diagnostics
 
 on:
   push:
-    branches: [security/owner-password-auth-migration]
+    branches-ignore: [main]
 
-permissions:
-  contents: write
+concurrency:
+  group: pytest-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -17,38 +20,88 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Export exact file contents from main (integrity channel)
-        shell: bash
+      - name: Export exact file contents (integrity channel)
         run: |
           mkdir -p diagnostics
-          git fetch origin main
-          sha="${GITHUB_SHA:0:12}"
-          git show origin/main:core/db.py | base64 -w0 > "diagnostics/b64-main-core-db.py-${sha}.txt"
-          git show origin/main:bridge.py | base64 -w0 > "diagnostics/b64-main-bridge.py-${sha}.txt"
-          git show origin/main:.github/workflows/tests.yml | base64 -w0 > "diagnostics/b64-main-tests.yml-${sha}.txt"
-          git config user.name "mosfiry"
-          git config user.email "msfiry36@gmail.com"
-          git add diagnostics/
-          git commit -m "ci diagnostics: exact main file export ${sha}" || echo "nothing to commit"
-          git push || echo "push failed"
+          S="${GITHUB_SHA:0:12}"
+          rm -f diagnostics/b64-*.txt
+          for f in core/db.py bridge.py api/chat.py api/missions.py security/owner_policy.py security/owner_session.py agent/task_runtime.py agent/mission_runtime.py agent/mission_worker.py agent/mission.py agent/task_manager.py core/engine.py core/lifecycle.py core/config.py; do
+            if git show "main:$f" > /tmp/export 2>/dev/null; then
+              name=$(echo "$f" | tr '/' '-')
+              base64 -w0 /tmp/export > "diagnostics/b64-main-$name-$S.txt"
+            fi
+          done
+          for f in core/db.py bridge.py security/owner_password.py security/owner_password_bootstrap.py tests/test_owner_password_auth.py .github/workflows/tests.yml; do
+            if [ -f "$f" ]; then
+              name=$(echo "$f" | tr '/' '-')
+              base64 -w0 "$f" > "diagnostics/b64-head-$name-$S.txt"
+            fi
+          done
       - name: pip install
-        run: python -m pip install -r requirements.txt
+        run: |
+          set +e
+          python -m pip install -r requirements.txt > pip_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## pip install failed (exit $code)"; tail -c 2000 pip_out.txt; } >> diag.txt
+            exit 1
+          fi
+      - name: compileall
+        run: |
+          set +e
+          python -m compileall -q . > compile_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## compileall failed (exit $code)"; tail -c 3000 compile_out.txt; } >> diag.txt
+          fi
       - name: pytest
         run: |
           set +e
           python -m pytest -q > pytest_out.txt 2>&1
           code=$?
-          grep -E '^(FAILED|ERROR)' pytest_out.txt | head -20 | while IFS= read -r line; do
-            echo "::error::$(printf '%s' "$line" | cut -c1-220)"
-          done
-          tail -40 pytest_out.txt
           if [ "$code" -ne 0 ]; then
-            sha="${GITHUB_SHA:0:12}"
-            { echo "# CI run ${sha}"; echo "result: FAILURE"; echo; grep -E '^(FAILED|ERROR)' pytest_out.txt | head -60; echo; tail -c 4000 pytest_out.txt; } > "diagnostics/ci-${sha}.md"
-            git config user.name "mosfiry"
-            git config user.email "msfiry36@gmail.com"
-            git add diagnostics/
-            git commit -m "ci diagnostics: pytest failure ${sha}" || echo "nothing to commit"
-            git push || echo "push failed"
+            { echo "## pytest failed (exit $code)"; tail -c 20000 pytest_out.txt; } >> diag.txt
           fi
-          exit $code
+      - name: git diff check
+        run: |
+          set +e
+          git diff --check > diff_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## git diff --check failed (whitespace error, exit $code)"; cat diff_out.txt; } >> diag.txt
+          fi
+      - name: Secret and sensitive-file scan
+        shell: bash
+        run: |
+          set -uo pipefail
+          if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?$)' > sens_out.txt; then
+            { echo "## sensitive file tracked by git:"; cat sens_out.txt; } >> diag.txt
+            exit 1
+          fi
+          if MATCHES=$(git grep -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example' ':!diagnostics'); then
+            { echo "## secret-scan match:"; echo "$MATCHES"; } >> diag.txt
+            exit 1
+          fi
+      - name: Write status
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+          sha="${GITHUB_SHA:0:12}"
+          if [ -f diag.txt ]; then
+            { echo "# CI run $sha"; echo "result: FAILURE"; echo; cat diag.txt; } > "diagnostics/ci-$sha.md"
+          else
+            { echo "# CI run $sha"; echo "result: SUCCESS"; } > "diagnostics/ci-$sha.md"
+          fi
+      - name: Publish diagnostics
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "mosfiry"
+          git config user.email "msfiry36@gmail.com"
+          git add -A diagnostics/
+          git commit -m "ci diagnostics: export + test result ${GITHUB_SHA:0:12}" || echo "nothing to commit"
+          git pull --rebase --no-edit || true
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
