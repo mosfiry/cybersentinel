@@ -33,6 +33,9 @@ class LeaseLostError(PermissionError):
     """Raised when a worker heartbeat no longer owns the queue lease."""
 
 
+DEFAULT_WORKER_LEASE_SECONDS = 120
+
+
 @dataclass(frozen=True)
 class QueueItem:
     mission_id: str
@@ -94,7 +97,7 @@ class MissionQueue:
                 else:
                     updated = db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=? WHERE mission_id=? AND lease_owner=?", (state.value, available_at, error, mission_id, worker_id))
                 if updated.rowcount != 1:
-                    raise PermissionError("worker lease is not owned")
+                    raise LeaseLostError("worker lease is not owned")
             else:
                 db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, state.value, state.value, state.value, mission_id))
         return self.get(mission_id)
@@ -136,10 +139,13 @@ class MissionQueue:
 class MissionWorker:
     """Single-step worker adapter; a supervisor may call run_once repeatedly."""
 
-    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker"):
+    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker", lease_seconds: int = DEFAULT_WORKER_LEASE_SECONDS):
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         self.queue = queue
         self.runtime_factory = runtime_factory
         self.worker_id = worker_id
+        self.lease_seconds = lease_seconds
 
     def enqueue(self, mission_id: str) -> QueueItem:
         return self.queue.enqueue(mission_id)
@@ -148,13 +154,13 @@ class MissionWorker:
         return self.queue.recover_after_restart()
 
     def run_once(self, *, now: str | None = None, max_slices: int | None = None) -> QueueItem | None:
-        item = self.queue.claim_next(now=now, worker_id=self.worker_id)
+        item = self.queue.claim_next(now=now, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
         if item is None:
             return None
         runtime = self.runtime_factory()
         try:
             try:
-                mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id))
+                mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds))
             except TypeError as exc:
                 if "heartbeat" not in str(exc):
                     raise
@@ -175,7 +181,12 @@ class MissionWorker:
             MissionStatus.SCOPE_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
         }.get(mission.status, WorkerMissionState.PARTIAL_SUCCESS if mission.evidence else WorkerMissionState.FAILED)
-        return self.queue.update(item.mission_id, state, error=mission.error, worker_id=self.worker_id)
+        try:
+            return self.queue.update(item.mission_id, state, error=mission.error, worker_id=self.worker_id)
+        except LeaseLostError:
+            # A long-running handler may finish after another worker reclaimed
+            # the lease; never let the stale result overwrite that worker.
+            return self.queue.get(item.mission_id)
 
 
 @dataclass(frozen=True)

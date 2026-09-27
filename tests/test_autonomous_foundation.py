@@ -161,6 +161,25 @@ def test_worker_does_not_mark_mission_failed_after_lease_takeover(tmp_path):
     assert result.last_error == ""
 
 
+def test_worker_does_not_overwrite_requeued_mission_after_handler_lease_expiry(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-expired-handler", available_at="2026-01-01T00:00:00+00:00")
+
+    class Mission:
+        status = MissionStatus.GOAL_COMPLETED
+        evidence = [{"criterion_id": "done"}]
+        error = ""
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            queue.recover_expired(now="2026-01-01T00:01:01+00:00")
+            return Mission()
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="expired-worker", lease_seconds=60).run_once(now="2026-01-01T00:00:00+00:00")
+    assert result.state is WorkerMissionState.QUEUED
+    assert result.last_error == "worker lease expired"
+
+
 def test_worker_records_runtime_permission_error_as_failure(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-auth-error", available_at="2026-01-01T00:00:00+00:00")
@@ -172,6 +191,27 @@ def test_worker_records_runtime_permission_error_as_failure(tmp_path):
     result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once(now="2026-01-01T00:00:00+00:00")
     assert result.state is WorkerMissionState.FAILED
     assert result.last_error == "PermissionError: authorization denied"
+
+
+def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-lease-config", available_at="2026-01-01T00:00:00+00:00")
+
+    class Mission:
+        status = MissionStatus.GOAL_COMPLETED
+        evidence = [{"criterion_id": "done"}]
+        error = ""
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            item = queue.get(mission_id)
+            assert item.lease_expires_at == "2026-01-01T00:00:17+00:00"
+            return Mission()
+
+    with pytest.raises(ValueError, match="lease_seconds"):
+        MissionWorker(queue, lambda: Runtime(), lease_seconds=0)
+    result = MissionWorker(queue, lambda: Runtime(), lease_seconds=17).run_once(now="2026-01-01T00:00:00+00:00")
+    assert result.state is WorkerMissionState.COMPLETED
 
 
 def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
