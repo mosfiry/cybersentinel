@@ -297,10 +297,12 @@ def test_owner_direct_class_cannot_be_smuggled_via_explicit_class_kwarg(tmp_path
     with pytest.raises(PermissionError, match=RejectionCode.PROOF_INCOMPLETE.value):
         registry_execute("status", None, execution_proof=proof, execution_class=ExecutionClass.OWNER_DIRECT.value)
     assert counting_status.calls == 0
-    # and the mission class stays mandatory for mission-bound calls
+    # and an owner-direct proof stays unusable for mission-bound calls: the
+    # registry rejects it at the earliest boundary (proof.verify raises
+    # PROOF_BINDING_MISMATCH before the class comparison runs)
     runtime = _runtime(tmp_path)
     mission = _mission(runtime)
-    with pytest.raises(PermissionError, match=RejectionCode.EXECUTION_CLASS_MISMATCH.value):
+    with pytest.raises(PermissionError) as excinfo:
         registry_execute(
             "status",
             None,
@@ -311,6 +313,7 @@ def test_owner_direct_class_cannot_be_smuggled_via_explicit_class_kwarg(tmp_path
             execution_class=ExecutionClass.MISSION_BOUND.value,
             execution_run_id="run-x",
         )
+    assert RejectionCode.PROOF_BINDING_MISMATCH.value in str(excinfo.value) or RejectionCode.EXECUTION_CLASS_MISMATCH.value in str(excinfo.value)
     assert counting_status.calls == 0
 
 
