@@ -1,6 +1,4 @@
 from .environment import (
-    ProcessHandle,
-    ProcessManager,
     ProcessResult,
     Workspace,
     WorkspaceAuditEvent,
@@ -10,8 +8,6 @@ from .environment import (
 )
 
 __all__ = [
-    "ProcessHandle",
-    "ProcessManager",
     "ProcessResult",
     "Workspace",
     "WorkspaceAuditEvent",
