@@ -38,6 +38,16 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest -q 2>&1 | tee pytest_out.txt
+      - name: Annotate test failures
+        if: failure()
+        shell: bash
+        run: |
+          # Publish failing test summary as check-run annotations so the
+          # diagnosis is visible without log download permissions.
+          grep -E '^(FAILED|ERROR)' pytest_out.txt | head -20 | while IFS= read -r line; do
+            msg=$(printf '%s' "$line" | cut -c1-200)
+            echo "::error title=pytest::${msg}"
+          done || true
       - name: git diff check
         run: |
           set +e
@@ -60,7 +70,8 @@ jobs:
             exit 1
           fi
       - name: Write status
-        if: always()
+     
+   if: always()
         shell: bash
         run: |
           mkdir -p diagnostics
