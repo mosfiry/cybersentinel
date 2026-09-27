@@ -62,3 +62,22 @@ def test_reasoning_memory_and_watch_list_round_trip(monkeypatch, tmp_path):
     assert db.watches() == ["Database", "Gateway", "gateway"]
     db.remove_watch(" gateway ")
     assert db.watches() == ["Database"]
+
+
+def test_conversation_messages_preserve_owner_and_chronological_order(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
+
+    assert db.conversation_info("missing") is None
+    db.ensure_conversation("conv-1", owner_session_id="session-1")
+    first_id = db.add_conversation_message("conv-1", "user", "first", {"turn": 1})
+    second_id = db.add_conversation_message("conv-1", "assistant", "second", {"turn": 2})
+
+    info = db.conversation_info("conv-1")
+    messages = db.conversation_messages("conv-1")
+
+    assert info["conversation_id"] == "conv-1"
+    assert info["owner_session_id"] == "session-1"
+    assert [message["id"] for message in messages] == [first_id, second_id]
+    assert [message["content"] for message in messages] == ["first", "second"]
+    assert messages[0]["metadata"] == {"turn": 1}
+    assert [message["content"] for message in db.conversation_messages("conv-1", limit=1)] == ["second"]
