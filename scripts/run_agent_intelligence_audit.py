@@ -121,7 +121,7 @@ def real_agent_mission() -> dict[str, Any]:
             core = AgentCore(router, store=MissionStore(Path(directory) / "missions.sqlite3"), max_iterations=8, knowledge_retriever=load_fixture())
             mission = core.run_owner_mission(
                 "Investigate whether CVE-2021-44228 was the initial access vector for Incident-A and determine the most supported hypothesis from available local evidence.",
-                owner_token=os.environ.get("OWNER_TOKEN", "audit-owner"),
+                owner_session_token=os.environ.get("OWNER_SESSION_TOKEN", "audit-owner"),
                 completion_criteria=[{"criterion_id": "mission-goal", "description": "A tool observation is recorded and verified", "check": "tool observation", "required": True}],
             )
             return {

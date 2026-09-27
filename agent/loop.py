@@ -105,7 +105,7 @@ class AgentLoop:
         self.runtime_limits = runtime_limits or RuntimeLimits.from_owner_policy()
         self.max_steps = self.runtime_limits.max_execution_steps
 
-    def run(self, conversation_id: str, text: str, *, owner_token: str, owner_session_id: str | None = None) -> dict[str, Any]:
+    def run(self, conversation_id: str, text: str, *, owner_session_token: str, owner_session_id: str | None = None) -> dict[str, Any]:
         """Run the agent loop with ContextEngine integration.
 
         This method now delegates context construction to ContextEngine,
@@ -233,7 +233,7 @@ class AgentLoop:
                 tool_results.append((name, result))
             else:
                 command = self._command_for(name, argument)
-                result = self.executor(command, owner_token=owner_token, owner_session_id=owner_session_id)
+                result = self.executor(command, owner_session_token=owner_session_token, owner_session_id=owner_session_id)
                 activity.append({
                     "step": step,
                     "type": "tool_call",

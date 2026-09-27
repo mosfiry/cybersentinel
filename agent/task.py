@@ -49,10 +49,10 @@ class Task:
     cancel_requested: bool = False
     pause_requested: bool = False
     resume_state: dict[str, Any] | None = None
-    authentication_method: str = "owner_token"
+    authentication_method: str = "username_password"
 
     @classmethod
-    def create(cls, conversation_id: str, request_id: str, owner_session_id: str, objective: str, provider: str = "", model: str = "", authentication_method: str = "owner_token") -> "Task":
+    def create(cls, conversation_id: str, request_id: str, owner_session_id: str, objective: str, provider: str = "", model: str = "", authentication_method: str = "username_password") -> "Task":
         now = datetime.now(timezone.utc).isoformat()
         return cls(uuid.uuid4().hex, conversation_id, request_id, owner_session_id, TaskStatus.QUEUED, now, now, objective=objective, provider=provider, model=model, authentication_method=authentication_method)
 
@@ -63,7 +63,7 @@ class Task:
     def from_dict(cls, data: dict[str, Any]) -> "Task":
         data = data.copy()
         data["status"] = TaskStatus(data["status"])
-        data.setdefault("authentication_method", "owner_token")
+        data.setdefault("authentication_method", "username_password")
         return cls(**data)
 
     def update_status(self, new_status: TaskStatus) -> None:

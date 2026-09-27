@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "security" / "owner_policy.json"
 STATE_PATH = ROOT / "security" / "owner_policy_state.json"
 OWNER_PHRASE = os.getenv("CYBERSENTINEL_OWNER_PHRASE", "Owner").strip()
-OWNER_TOKEN = os.getenv("OWNER_TOKEN", "").strip()
 _STATE_LOCK = threading.RLock()
 _EVIDENCE_SECRET = secrets.token_bytes(32)
 _EVIDENCE_TTL_SECONDS = 300
@@ -57,8 +56,7 @@ class OwnerPolicy:
 
 
 class OwnerInstructionSource(str, Enum):
-    OWNER_TOKEN = "owner_token"
-    OWNER_SESSION = "owner_session_challenge"
+    USERNAME_PASSWORD = "username_password"
 
 
 class OwnerInstructionStatus(str, Enum):
@@ -351,34 +349,13 @@ def policy_context_from_snapshot(snapshot: OwnerPolicySnapshot) -> str:
     )
 
 
-def verify_owner(text: str, presented_token: str | None = None) -> tuple[bool, str]:
-    policy = load_policy()
-    if policy.require_owner_token:
-        if not OWNER_TOKEN or not presented_token or not hmac.compare_digest(OWNER_TOKEN, presented_token):
-            return False, "owner authentication required"
-    if policy.owner_phrase and text.strip().casefold().startswith(policy.owner_phrase.casefold()):
-        return True, "owner-authenticated"
-    if not policy.require_owner_token:
-        return True, "local-owner-channel"
-    return True, "owner-authenticated"
-
-
-def authenticate_owner(text: str, presented_token: str | None = None, request_id: str = "") -> OwnerAuthenticationEvidence:
-    ok, reason = verify_owner(text, presented_token)
-    if not ok:
-        raise PermissionError(reason)
-    token_material = OWNER_TOKEN or presented_token or "local-owner-channel"
-    return _issue_evidence(OwnerInstructionSource.OWNER_TOKEN.value, request_id, token_material)
-
-
-def authentication_from_session(context: dict[str, Any], request_id: str = "") -> OwnerAuthenticationEvidence:
-    if context.get("authentication_method") != OwnerInstructionSource.OWNER_SESSION.value or not context.get("owner_session_id") or not context.get("session_proof"):
-        raise PermissionError("valid Owner session evidence required")
-    request_id = str(request_id or context.get("request_id") or "")
-    from security.owner_session import verify_owner_session_proof
-    if not verify_owner_session_proof(str(context["owner_session_id"]), request_id, str(context["session_proof"])):
-        raise PermissionError("invalid, stale, or replayed Owner session proof")
-    return _issue_evidence(OwnerInstructionSource.OWNER_SESSION.value, request_id, str(context["session_proof"]), str(context["owner_session_id"]))
+def authenticate_owner(session_token: str | None, request_id: str = "") -> OwnerAuthenticationEvidence:
+    from security import owner_password
+    session = owner_password.resolve_session(session_token)
+    if session is None or session.get("auth_method") != OwnerInstructionSource.USERNAME_PASSWORD.value:
+        raise PermissionError("owner authentication required")
+    session_id = str(session.get("session_id") or "")
+    return _issue_evidence(OwnerInstructionSource.USERNAME_PASSWORD.value, request_id, session_id, session_id)
 
 
 def capture_policy_snapshot(request_id: str, authentication: OwnerAuthenticationEvidence) -> OwnerPolicySnapshot:

@@ -5,6 +5,8 @@ import sqlite3
 
 import pytest
 
+from owner_session_testutils import allow_owner_sessions
+
 from agent.memory import MemoryItem, MemoryType, TrustClassification
 from agent.mission import Mission, MissionStatus, MissionStore
 from agent.planning import Plan
@@ -44,7 +46,7 @@ def test_authorization_decision_expires_with_owner_evidence():
     import hmac
     import security.authorization_context as authorization_context
 
-    evidence = owner_policy._issue_evidence("owner_token", "expiry-decision", "proof")
+    evidence = owner_policy._issue_evidence("username_password", "expiry-decision", "proof")
     context = AuthorizationContext("expiry-decision", evidence, owner_policy.capture_policy_snapshot("expiry-decision", evidence))
     decision = authorize_tool(["status", None], context=context).decision
     expired = replace(decision, expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
@@ -55,7 +57,7 @@ def test_authorization_decision_expires_with_owner_evidence():
 
 
 def test_authorization_decision_is_bound_to_request_identity():
-    evidence = owner_policy._issue_evidence("owner_token", "mission-1", "test-proof")
+    evidence = owner_policy._issue_evidence("username_password", "mission-1", "test-proof")
     context = AuthorizationContext("mission-1", evidence, owner_policy.capture_policy_snapshot("mission-1", evidence))
     decision = AuthorizationDecision.issue(context, allowed=True, reason="authorized", tool="status", risk_class="read")
     with pytest.raises(PermissionError, match="invalid"):
@@ -133,11 +135,11 @@ def test_scope_rejects_unbounded_redirect_chain():
 def test_scope_snapshot_id_cannot_be_replaced(monkeypatch, tmp_path):
     import security.owner_policy as owner_policy
     import security.scope_store as scope_store
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "scope-owner")
+    allow_owner_sessions(monkeypatch, "scope-owner")
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", tmp_path / "scope.sqlite3")
     init_scope_store()
     first_auth = ProgramAuthorization("program", "test", "v1", "2026-01-01T00:00:00+00:00", ({"host": "one.example", "schemes": ["https"]},))
     second_auth = ProgramAuthorization("program", "test", "v2", "2026-01-01T00:00:00+00:00", ({"host": "two.example", "schemes": ["https"]},))
-    save_snapshot(make_snapshot("immutable-id", first_auth, [TargetIdentity("one", "program", "one.example")]), owner_token="scope-owner")
+    save_snapshot(make_snapshot("immutable-id", first_auth, [TargetIdentity("one", "program", "one.example")]), owner_session_token="scope-owner")
     with pytest.raises(ValueError, match="already_exists"):
-        save_snapshot(make_snapshot("immutable-id", second_auth, [TargetIdentity("two", "program", "two.example")]), owner_token="scope-owner")
+        save_snapshot(make_snapshot("immutable-id", second_auth, [TargetIdentity("two", "program", "two.example")]), owner_session_token="scope-owner")

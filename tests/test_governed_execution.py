@@ -1,5 +1,6 @@
 from __future__ import annotations
 from runtime_authorization import make_test_snapshot
+from owner_session_testutils import allow_owner_sessions
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -56,7 +57,7 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
     workspace = Workspace(tmp_path)
     import security.owner_policy as owner_policy
     monkeypatch.setattr(owner_policy, "STATE_PATH", tmp_path / "owner-policy.json")
-    evidence = owner_policy._issue_evidence("owner_token", "req-1", "proof")
+    evidence = owner_policy._issue_evidence("username_password", "req-1", "proof")
     context = AuthorizationContext(request_id="req-1", owner_evidence=evidence, policy_snapshot=owner_policy.capture_policy_snapshot("req-1", evidence))
     decision = authorize_tool(["run_project_tests", "."], context=context)
     assert decision.allowed and decision.decision is not None
@@ -223,7 +224,7 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
     import bridge
     import security.owner_policy as owner_policy
     monkeypatch.setattr(bridge, "BRIDGE_TOKEN", "bridge-test")
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "owner-test")
+    allow_owner_sessions(monkeypatch, "owner-test")
     monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "api.sqlite3")
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -231,7 +232,7 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
 
     def request(method, path, payload=None, token="owner-test", bridge_token="bridge-test"):
         connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-        headers = {"X-CyberSentinel-Token": bridge_token, "X-CyberSentinel-Owner-Token": token}
+        headers = {"X-CyberSentinel-Token": bridge_token, "X-CyberSentinel-Owner-Session": token}
         raw = None
         if payload is not None:
             raw = json.dumps(payload).encode()

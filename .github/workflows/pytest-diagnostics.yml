@@ -1,0 +1,164 @@
+name: pytest-diagnostics
+
+on:
+  push:
+    branches-ignore: [main]
+    paths-ignore:
+      - 'diagnostics/**'
+
+concurrency:
+  group: pytest-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Export exact file contents (integrity channel)
+        run: |
+          mkdir -p diagnostics
+          S="${GITHUB_SHA:0:12}"
+          rm -f diagnostics/b64-*
+          for f in core/db.py bridge.py api/chat.py api/missions.py security/owner_policy.py security/authority.py security/authorization.py security/authorization_context.py security/scope.py security/mission_authorization.py core/policy.py core/trust.py core/config.py agent/task_runtime.py agent/mission_runtime.py agent/mission_worker.py agent/mission.py agent/task_manager.py core/engine.py core/lifecycle.py; do
+            if git show "origin/main:$f" > /tmp/export 2>/dev/null; then
+              name=$(echo "$f" | tr '/' '-')
+              base64 -w0 /tmp/export > /tmp/b64.txt
+              split -b 30000 -d -a 3 /tmp/b64.txt "diagnostics/b64-main-$name-$S.part"
+              if [ -f "diagnostics/b64-main-$name-$S.part000" ]; then
+                for p in diagnostics/b64-main-$name-$S.part*; do
+                  mv "$p" "$p.txt"
+                done
+              fi
+            fi
+          done
+          for f in core/db.py bridge.py api/chat.py security/owner_password.py security/owner_password_bootstrap.py tests/test_owner_password_auth.py security/owner_policy.py security/scope_store.py core/engine.py core/context.py agent/agent_core.py agent/loop.py agent/task.py agent/task_manager.py agent/task_runtime.py agent/mission_task_adapter.py tests/test_agent_core_integration.py tests/test_agent_platform.py tests/test_governed_execution.py tests/test_message0003_auth.py tests/test_owner_auth.py tests/test_owner_authority_refactor.py tests/test_phase21_restart_authorization.py tests/test_phase3_context.py tests/test_phase5_long_horizon.py tests/test_phase5e_runtime.py tests/test_phase6a1_hardening.py tests/test_phase6b_program_adapters.py tests/test_phase6c_scope_firewall.py tests/test_phase6k4_deep_hardening.py tests/test_phase6k5_core.py tests/test_phase6k6_unified.py tests/test_phase6k7b_mission_runtime.py tests/test_scope_firewall_battery.py tests/test_security_integrity_adversarial.py tests/test_v47_red_team.py tests/test_v50_owner_session.py tests/test_owner_charter.py tests/test_public_web_boundary.py scripts/real_chat_runner.py scripts/real_model_smoke.py scripts/run_agent_intelligence_audit.py scripts/run_real_provider_mission.py .github/workflows/tests.yml; do
+            if [ -f "$f" ]; then
+              name=$(echo "$f" | tr '/' '-')
+              base64 -w0 "$f" > /tmp/b64.txt
+              split -b 30000 -d -a 3 /tmp/b64.txt "diagnostics/b64-head-$name-$S.part"
+              if [ -f "diagnostics/b64-head-$name-$S.part000" ]; then
+                for p in diagnostics/b64-head-$name-$S.part*; do
+                  mv "$p" "$p.txt"
+                done
+              fi
+            fi
+          done
+      - name: OWNER charter audit (full repository scan)
+        run: |
+          S="${GITHUB_SHA:0:12}"
+          {
+            echo "# OWNER charter audit â run $S"
+            echo
+            echo "## Files scanned:"
+            git ls-files | wc -l
+            echo
+            echo "## Authority-ordering statements (precedence/priority/override):"
+            git grep -n -I -i -E "(takes? (precedence|priority)|overrides?|supersedes?|precedes|more restrictive|higher.authority|authority order|authority hierarchy|precedence)" -- ':!diagnostics' || echo "(none)"
+            echo
+            echo "## OWNER_INSTRUCTION / charter mentions:"
+            git grep -n -I -E "OWNER_INSTRUCTION|owner_instruction" -- ':!diagnostics' | head -200 || echo "(none)"
+            echo
+            echo "## Competing authority naming (MODEL_POLICY/SAFETY_POLICY/ETHICS_POLICY/TOOL_POLICY as independent sources):"
+            git grep -n -I -E "MODEL_POLICY|SAFETY_POLICY|ETHICS_POLICY|TOOL_POLICY|SYSTEM_PLATFORM" -- ':!diagnostics' | head -120 || echo "(none)"
+            echo
+            echo "## Ethics/safety/policy rule definition sites:"
+            git grep -n -I -E "(ethics|ethical|safety|safety_policy)" -- ':!diagnostics' | grep -v -i -E "test_|conftest" | head -120 || echo "(none)"
+            echo
+            echo "## Model output authority mentions:"
+            git grep -n -I -E "MODEL_OUTPUT" -- ':!diagnostics' | head -100 || echo "(none)"
+          } > /tmp/audit.md
+          base64 -w0 /tmp/audit.md > /tmp/audit.b64
+          split -b 30000 -d -a 3 /tmp/audit.b64 "diagnostics/b64-charter-audit-$S.part"
+          if [ -f "diagnostics/b64-charter-audit-$S.part000" ]; then
+            for p in diagnostics/b64-charter-audit-$S.part*; do mv "$p" "$p.txt"; done
+          fi
+      - name: pip install
+        run: |
+          set +e
+          python -m pip install -r requirements.txt > pip_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## pip install failed (exit $code)"; tail -c 2000 pip_out.txt; } >> diag.txt
+            exit 1
+          fi
+      - name: compileall
+        run: |
+          set +e
+          python -m compileall -q . > compile_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## compileall failed (exit $code)"; tail -c 3000 compile_out.txt; } >> diag.txt
+          fi
+      - name: pytest
+        run: |
+          set +e
+          python -m pytest -q > pytest_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## pytest failed (exit $code)"; tail -c 20000 pytest_out.txt; } >> diag.txt
+          fi
+      - name: git diff check
+        run: |
+          set +e
+          git diff --check > diff_out.txt 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## git diff --check failed (whitespace error, exit $code)"; cat diff_out.txt; } >> diag.txt
+          fi
+      - name: Secret and sensitive-file scan
+        shell: bash
+        run: |
+          set -uo pipefail
+          if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?$)' > sens_out.txt; then
+            { echo "## sensitive file tracked by git:"; cat sens_out.txt; } >> diag.txt
+            exit 1
+          fi
+          if MATCHES=$(git grep -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example' ':!diagnostics'); then
+            { echo "## secret-scan match:"; echo "$MATCHES"; } >> diag.txt
+            exit 1
+          fi
+      - name: Write status
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+          sha="${GITHUB_SHA:0:12}"
+          if [ -f diag.txt ]; then
+            { echo "# CI run $sha"; echo "result: FAILURE"; echo; cat diag.txt; } > "diagnostics/ci-$sha.md"
+          else
+            { echo "# CI run $sha"; echo "result: SUCCESS"; } > "diagnostics/ci-$sha.md"
+          fi
+      - name: Publish diagnostics
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "mosfiry"
+          git config user.email "msfiry36@gmail.com"
+          git add -A diagnostics/
+          git commit -m "ci diagnostics: export + test result ${GITHUB_SHA:0:12}" || echo "nothing to commit"
+          BRANCH="${GITHUB_REF_NAME}"
+          for attempt in 1 2 3 4 5 6 7 8; do
+            git fetch origin "$BRANCH" || true
+            git rebase --abort 2>/dev/null || true
+            git reset --soft "origin/$BRANCH" || true
+            git add -A diagnostics/
+            git commit -m "ci diagnostics: export + test result ${GITHUB_SHA:0:12}" || echo "nothing to commit"
+            if git push origin "HEAD:$BRANCH"; then
+              echo "diagnostics published (attempt ${attempt})"
+              exit 0
+            fi
+            echo "publish raced with concurrent workflow commit (attempt ${attempt}); retrying"
+            sleep 10
+          done
+          echo "diagnostics publish failed after retries"
+          exit 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

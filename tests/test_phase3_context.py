@@ -1353,13 +1353,13 @@ class TestIntegration:
             def chat(self, messages):
                 return {"content": '{"type": "final", "content": "test answer"}'}
         
-        def fake_executor(command, *, owner_token, owner_session_id=None):
+        def fake_executor(command, *, owner_session_token, owner_session_id=None):
             return {"ok": True, "request_id": "req-1"}
         
         loop = AgentLoop(FakeRouter(), fake_executor)
         
         # Run should use ContextEngine
-        result = loop.run("conv-1", "test query", owner_token="test-token")
+        result = loop.run("conv-1", "test query", owner_session_token="test-token")
         
         # Should return a result
         assert "conversation_id" in result
@@ -1381,11 +1381,11 @@ class TestRegression:
             def chat(self, messages):
                 return {"content": '{"type": "final", "content": "answer"}'}
         
-        def fake_executor(command, *, owner_token, owner_session_id=None):
+        def fake_executor(command, *, owner_session_token, owner_session_id=None):
             return {"ok": True}
         
         loop = AgentLoop(FakeRouter(), fake_executor)
-        result = loop.run("conv-1", "test", owner_token="token")
+        result = loop.run("conv-1", "test", owner_session_token="token")
         
         assert result["answer"] == "answer"
     

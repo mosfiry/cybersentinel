@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from owner_session_testutils import allow_owner_sessions
+
 from agent.model_router import ModelRouter
 from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 from agent.task_runtime import AgentTaskRuntime
@@ -21,7 +23,7 @@ from security.owner_policy import _issue_evidence, capture_policy_snapshot
 def snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
     import security.owner_policy as owner_policy
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "scope-owner")
+    allow_owner_sessions(monkeypatch, "scope-owner")
     init_scope_store()
     auth = ProgramAuthorization(
         program_id="program-1",
@@ -35,7 +37,7 @@ def snapshot(tmp_path, monkeypatch):
         rate_limits={"requests_per_minute": 2},
     )
     target = TargetIdentity("target-1", "program-1", "target.example.com", allowed_ports=(443,), allowed_paths=("/api",), excluded_paths=("/api/private",))
-    return save_snapshot(make_snapshot("snapshot-1", auth, [target]), owner_token="scope-owner")
+    return save_snapshot(make_snapshot("snapshot-1", auth, [target]), owner_session_token="scope-owner")
 
 
 def context(url="https://target.example.com/api/v1"):
@@ -59,7 +61,7 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
 def test_direct_registry_execution_cannot_bypass_scope(snapshot):
     with pytest.raises(PermissionError, match="scope-bound AuthorizationDecision"):
         execute("scoped_http_probe", "https://target.example.com/api")
-    evidence = _issue_evidence("owner_token", "scope-direct", "scope-direct")
+    evidence = _issue_evidence("username_password", "scope-direct", "scope-direct")
     auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
     denied = authorize_tool(["scoped_http_probe", "https://other.example.com/api"], context=auth_context)
     with pytest.raises(PermissionError, match="scope denied"):
@@ -86,7 +88,7 @@ def test_task_runtime_enforces_scope_before_custom_executor(snapshot, monkeypatc
     monkeypatch.setattr(core_db, "DB_PATH", Path(tmp_path) / "core.sqlite3")
     task_manager._init_db(); memory._init_memory_db(); core_db.connect().close()
     import security.owner_policy as owner_policy
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "owner")
+    allow_owner_sessions(monkeypatch, "owner")
 
     class Provider:
         name = "scope-test"
@@ -98,7 +100,7 @@ def test_task_runtime_enforces_scope_before_custom_executor(snapshot, monkeypatc
     executions = []
     runtime = AgentTaskRuntime(ModelRouter([Provider()]), executor=lambda command, **kwargs: executions.append(command) or {"ok": True})
     task = runtime.create_task("scope-conv", "probe", scope_context=context("https://other.example.com/api"))
-    result = runtime.run_slice(task.task_id, owner_token="owner", owner_session_id=None)
+    result = runtime.run_slice(task.task_id, owner_session_token="owner", owner_session_id=None)
     assert result.tool_calls[0]["status"] == "denied"
     assert executions == []
 

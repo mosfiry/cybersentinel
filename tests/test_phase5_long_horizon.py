@@ -963,7 +963,7 @@ class TestPhase5_Regression:
                 return {"content": '{"type": "final", "content": "test answer"}'}
         
         loop = AgentLoop(FakeRouter(), lambda *args, **kwargs: {"ok": True})
-        result = loop.run("conv-1", "test query", owner_token="test-token")
+        result = loop.run("conv-1", "test query", owner_session_token="test-token")
         
         assert "conversation_id" in result
         assert "answer" in result
