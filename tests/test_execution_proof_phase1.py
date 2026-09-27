@@ -296,7 +296,12 @@ def test_expired_snapshot_rejected_at_derivation_and_verify():
     assert err.value.code == RejectionCode.SNAPSHOT_EXPIRED.value
     ok, _, code = ExecutionAuthorizationProof.verify(proof, name=TEST_TOOL, argument=TEST_ARGUMENT, at=later)
     assert ok is False
-    assert code == RejectionCode.SNAPSHOT_EXPIRED.value
+    # Derivation bounds the proof TTL by the snapshot expiry (min(snapshot
+    # expiry, ttl)), so a proof never outlives its authorization snapshot:
+    # an expired snapshot therefore surfaces at the boundary as the
+    # fail-closed PROOF_EXPIRED rejection. The derivation-side gate above is
+    # what rejects the expired snapshot itself with SNAPSHOT_EXPIRED.
+    assert code == RejectionCode.PROOF_EXPIRED.value
 
 
 def test_verify_rejects_wrong_tool_mission_request_and_run():
