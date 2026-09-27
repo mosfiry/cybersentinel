@@ -182,3 +182,49 @@ NEXT (resume X-E live-path integration per session 2 design):
    security/owner_policy.json `require_owner_token` key (kept per session-2 decision),
    docs-export.yml export-list references, docs/OWNER_MASTER_DIRECTIVE_AUDIT history.
 3. Merging security/owner-password-auth-migration into main is an Owner decision.
+
+
+---
+
+## SESSION 5 (2026-09-27) — X-E CLOSURE — FINAL STATUS
+
+- X-E: COMPLETE
+- Owner authentication: COMPLETE (username+password server-side sessions;
+  live path bridge -> api/chat -> task_runtime/agent_core resolves identity
+  from the authenticated session only)
+- Legacy OWNER_TOKEN: REMOVED from the live path (audit session 5: zero
+  occurrences of OWNER_TOKEN/owner_token/verify_owner/owner_challenge/
+  X-CyberSentinel-Owner-Token in agent/agent_core.py, bridge.py, api/chat.py,
+  agent/task_runtime.py, core/context.py, security/owner_password.py;
+  security/owner_policy.py keeps only the inert require_owner_token config
+  field — zero consumers across the live path, kept per session-2 decision)
+- Legacy OwnerSession: REMOVED (security/owner_session.py deleted, commit
+  3cf5bccba037; regression test test_owner_session_module_is_deleted)
+- Owner password: VERIFIER ONLY (scrypt N=16384 r=8 p=1, verifier-only storage;
+  proven by tests/test_owner_password_auth.py — no plaintext, no reversible
+  encryption, anti-enumeration)
+- Live authenticated Owner path: VERIFIED (tests/test_owner_live_path_auth.py
+  adversarial battery + 19 migrated suites green in CI)
+- OWNER_INSTRUCTION constitutional knowledge: INSTALLED (immutable legislative
+  text in the project durable knowledge owner-charter; canonical in-repo doc
+  docs/OWNER_CHARTER.md blob ed088dac; constitutional module
+  security/owner_charter.py blob ea7a21e4)
+- OWNER_INSTRUCTION conflict invariant: TESTED (tests/test_owner_charter.py —
+  17 tests incl. POLICY/SCOPE/AUTHORIZATION/ETHICS/SECURITY conflicts
+  classified OWNER_INSTRUCTION_CONFLICT, MODEL_OUTPUT legislation rejected
+  and inert, FORBIDDEN_LEGISLATIVE_SOURCES incl. EXTERNAL_DATA; new
+  tests/test_owner_charter_knowledge_invariant.py commit ebcd47a7ba17 pins
+  the canonical charter document content + explicit EXTERNAL_DATA
+  cannot-legislate-or-amend test)
+- CI: GREEN (tests.yml success on ebcd47a7ba17 and every session commit;
+  pytest/compileall/secret-scan green per commit)
+
+### Remaining (outside this migration)
+
+1. Owner-local step: run `python -m security.owner_password_bootstrap`
+   interactively (username mosfiry). The password is prompted by the program
+   in the Owner local environment only — never in chat, code, Git, logs, or CI.
+2. Merge of security/owner-password-auth-migration into main: Owner decision.
+3. Inert non-code legacy mentions (documented, no security impact):
+   security/owner_policy.json require_owner_token key (zero consumers),
+   docs/OWNER_MASTER_DIRECTIVE_AUDIT_2026-09-22.md history.
