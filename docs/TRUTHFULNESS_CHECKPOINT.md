@@ -68,36 +68,46 @@ PHASE 7: fetch workspace/environment.py via contents-API b64 channel, confirm
 ProcessManager/ProcessHandle are dead code (no callers), remove them, add a
 regression test asserting absence, push, verify CI on the exact SHA.
 
-## UPDATE 2026-09-27 — PHASE 7 (F6) COMPLETE (VERIFIED)
+## UPDATE 2026-09-27 — PHASE 9 (F8) COMPLETE (VERIFIED)
 
-- f8e07736fb8c (PHASE 7 attempt) and 2e20acb78047 (fix attempt) were BOTH BROKEN:
-  the diff reconstruction of workspace/environment.py deleted LIVE code
-  (resolve() logic, _hash, edit(), create()/delete() bodies, run() call,
-  ProcessResult fields) and mangled indentation -> IndentationError line 80.
-  Evidence: diagnostics/ci-2e20acb78047.md "result: FAILURE" (compileall exit 1,
-  pytest exit 2). Both commits remain in history (fix-forward, no revert).
-- Root cause identified by replaying the f8e07736 unified diff (all 7 hunks
-  matched the TRUE pre-F6 state line-for-line): the pushed file diverged from
-  the intended minimal dead-code removal.
-- 13c6a74652ec (fix-forward): workspace/environment.py REBUILT from the
-  verified pre-F6 state (raw fetch at 8a697ef22aab + wrap-repair, validated by
-  exact context match of all 7 f8e07736 hunks) with ONLY the intended change:
-  subprocess import reduced to "from subprocess import CompletedProcess, run";
-  ProcessHandle + ProcessManager classes removed (dead code, no callers);
-  __all__ updated. workspace/__init__.py exports updated accordingly.
-  Round-trip re-fetch verified content. Live Workspace logic (resolve/_authorize/
-  _record/list/read/write/edit/create/move/delete/run_process/run_shell/develop,
-  ProcessResult) fully preserved.
-- tests/test_no_process_manager.py (3 regression tests) unchanged and passing.
-- CI VERIFIED on 13c6a74652ec: workflow "test" succeeded Sep 27, 2026 in 33s;
-  diagnostics/ci-13c6a74652ec.md "result: SUCCESS" (published by marker commit
-  a257a3269f34 — CI-authored, preserved).
-- HEAD after this checkpoint push: see the commit containing this update.
+- d35df98b7436 (CI VERIFIED: workflow "test (3.13)" succeeded Sep 27, 2026
+  in 31s on that exact SHA): Owner authentication terminology reconciled in
+  ALL active docs to the canonical live model (BRIDGE_TOKEN = channel auth
+  via X-CyberSentinel-Token; Owner identity = username/password login at
+  POST /api/auth/login -> server-side session carried in
+  X-CyberSentinel-Owner-Session).
+  Files: README.md, docs/OPERATIONS.md, docs/SECURITY_MODEL.md,
+  docs/TESTING.md, docs/OWNER_POLICY.md, docs/AGENT_ARCHITECTURE.md,
+  docs/PUBLIC_WEB_ARCHITECTURE.md, .env.example, .env.agent.example.
+- .github/workflows/github-only-poc.yml: was gating the real-provider mission
+  on the legacy OWNER_TOKEN secret while the live script
+  (scripts/run_real_provider_mission.py) requires OWNER_SESSION_TOKEN —
+  aligned the workflow env and gate to OWNER_SESSION_TOKEN.
+- CI guard added: tests/test_active_docs_terminology.py (3 tests) asserts
+  legacy terms (OWNER_TOKEN, X-CyberSentinel-Owner-Token) never re-enter the
+  ACTIVE_DOCS set and that the canonical model terms are present.
+- Classification of remaining occurrences (preserved, NOT modified):
+  - tests/test_owner_password_auth.py, tests/test_public_web_boundary.py:
+    TEST NEGATIVE CASES (bogus-value / legacy-header rejection lists).
+  - docs/AUDIT_PHASE0.md, docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md,
+    docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md, docs/GITHUB_ONLY_POC_RESULTS.md,
+    docs/TRUTHFULNESS_CHECKPOINT.md: HISTORICAL RECORDS / migration notes.
+  - security/owner_policy.py field "require_owner_token" + owner_policy.json
+    key: LIVE CODE with legacy FIELD NAME (policy flag semantics, not an
+    env/header token). Renaming the policy schema is DEFERRED to avoid a
+    breaking policy-schema change mid-track; documented as known limitation.
+  - github-only-poc.yml secret-leak grep pattern retains the literal
+    OWNER_TOKEN intentionally (security scan pattern).
+- PHASE 9 status: COMPLETE for active docs + guard. Known limitation:
+  "require_owner_token" policy field name (deferred).
 
 ## NEXT_ACTION (supersedes previous)
-PHASE 9 (F8): OWNER_TOKEN terminology reconciliation in active docs
-(README.md, docs/TESTING.md, docs/OPERATIONS.md, docs/SECURITY_MODEL.md,
-.env.example, .env.agent.example) + classification of the remaining
-occurrences (tests = negative cases, historical records stay) + CI guard
-against legacy terminology re-entering active docs. Then PHASE 6 (F5), PHASE 8
-(F7), PHASE 2, PHASE 10/11.
+1. PHASE 6 (F5): web Owner login (login form -> POST /api/auth/login ->
+   server-side session; NO bridge token in browser) or visibly disable the
+   403-returning chat path; update README accordingly.
+2. PHASE 8 (F7): SSRF/DNS TOCTOU boundary documentation (conditional risk
+   only; current endpoints fixed/documented before any user-controlled URL).
+3. PHASE 2: b3 module-by-module port evaluation (audit first, no merge).
+4. PHASE 10/11: full regression + evidence-first final report.
+5. F9 gaps (rate limiting / password policy in security/owner_password.py)
+   remain open.
