@@ -136,3 +136,49 @@ NEXT (resume X-E live-path integration per session 2 design):
    (delete security/owner_session.py, verify_owner, OWNER_TOKEN) — main blob SHAs:
    api/chat.py 659fb2ee, api/missions.py 2fb75731, task_runtime d2d799be.
 2. Owner must run `python -m security.owner_password_bootstrap` locally (never in chat).
+
+
+---
+
+## SESSION 4 (2026-09-27) — X-E live-path owner authentication integration — COMPLETE
+
+- Mega-commit b147722bdc55 (39 files, all pushed blobs post-push SHA-verified
+  byte-exact against local transforms, including Arabic-content files):
+  - security/owner_policy.py: authenticate_owner resolves server-side sessions via
+    security.owner_password (auth_method=username_password only); verify_owner,
+    authentication_from_session and OWNER_TOKEN identity removed.
+  - core/engine.py, agent/agent_core.py, agent/mission_task_adapter.py, agent/loop.py:
+    owner_session_token threading; legacy challenge path removed.
+  - api/chat.py: _owner_session gate; create/resume/pause/cancel/chat/stream require
+    owner_session_token. bridge.py: X-CyberSentinel-Owner-Session only; /api/owner/session
+    endpoint deleted; transport token (BRIDGE_TOKEN) is never Owner identity.
+  - agent/task_runtime.py: _valid_owner_session resolves server-side sessions.
+  - tests: 19 migrated to allow_owner_sessions helper (tests/owner_session_testutils.py),
+    3 rewritten (test_owner_auth.py, test_v50_owner_session.py, new
+    test_owner_live_path_auth.py live adversarial battery).
+  - scripts/{real_chat_runner,real_model_smoke,run_agent_intelligence_audit,
+    run_real_provider_mission}.py migrated to OWNER_SESSION_TOKEN env.
+- security/owner_session.py DELETED (commit 3cf5bccba037) + regression test
+  test_owner_session_module_is_deleted (commit bf388cad0e4e, blob f0738373e4e3)
+  asserting importlib.import_module("security.owner_session") raises ModuleNotFoundError.
+- CI publish-race hardening: pytest-diagnostics.yml + docs-export.yml publish steps
+  now use explicit fetch + rebase --abort + reset --soft to origin tip + re-commit +
+  push origin HEAD:branch with 8 retries (commits bf99d7404453, 4cd056ec0557);
+  wf-export.yml workflow removed (078c593e265f) — redundant publish racer.
+- CI evidence: tests.yml = success on b147722bdc55, 3cf5bccba037, bf388cad0e4e,
+  9149667a7d6b, bf99d7404453, 078c593e265f, 4cd056ec0557; pytest step green in every
+  pytest-diagnostics run; diagnostics/ci-bf99d7404453.md = result: SUCCESS (published
+  through the fixed publish step).
+- Channel lessons (session 4): api.github.com contents `?ref=<branch>` can serve a
+  STALE cached copy — always fetch by explicit commit SHA; the local sandbox bash
+  `base64`/`sha1sum` shims are lossy for non-ASCII bytes — never use them for blob
+  SHA verification of UTF-8 files (use cat + UTF-8-encode in TS instead).
+
+## REMAINING (X-E closure)
+
+1. Owner-only step: run `python -m security.owner_password_bootstrap` locally
+   (interactive, username mosfiry; password never stored outside the scrypt verifier).
+2. Deferred non-code legacy mentions (documented, no security impact):
+   security/owner_policy.json `require_owner_token` key (kept per session-2 decision),
+   docs-export.yml export-list references, docs/OWNER_MASTER_DIRECTIVE_AUDIT history.
+3. Merging security/owner-password-auth-migration into main is an Owner decision.
