@@ -55,8 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
 
 CREATE TABLE IF NOT EXISTS reasoning_memory (
     request_id TEXT PRIMARY KEY,
-    crea
-ted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     case_json TEXT NOT NULL,
     critic_json TEXT NOT NULL DEFAULT '{}'
 );
@@ -79,30 +78,30 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_messages ON conversation_messages(conversation_id, id);
+
 CREATE TABLE IF NOT EXISTS owner_accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     kdf_algorithm TEXT NOT NULL,
-    kdf_params TEXT NOT NULL,
+    kdf_params_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    status TEXT NOT NULL DEFAULT 'active'
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS owner_sessions (
     session_id TEXT PRIMARY KEY,
     owner_id INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     authenticated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
-    authentication_method TEXT NOT NULL DEFAULT 'username_password',
-    FOREIGN KEY(owner_id) REFERENCES owner_accounts(id)
+    auth_method TEXT NOT NULL DEFAULT 'username_password',
+    FOREIGN KEY(owner_id) REFERENCES owner_accounts(owner_id)
 );
 CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner ON owner_sessions(owner_id);
-CREATE INDEX IF NOT EXISTS idx_owner_sessions_expires ON owner_sessions(expires_at);
-
+CREATE INDEX IF NOT EXISTS idx_owner_sessions_status ON owner_sessions(status);
 """
 
 def connect():
@@ -133,8 +132,7 @@ def recent(limit=50):
             "SELECT * FROM events ORDER BY id DESC LIMIT ?", (int(limit),)
         )]
 
-def events_for_request(reque
-st_id, limit=500):
+def events_for_request(request_id, limit=500):
     needle = f'"request_id": "{request_id}"'
     with connect() as con:
         return [dict(r) for r in con.execute(
@@ -184,8 +182,7 @@ def save_reasoning_memory(request_id, case, critic):
     import json
     with connect() as con:
         con.execute(
-            "INSERT OR REPLACE INTO reasoning_memory(request_id,case_json,critic_json) VALUES(?,?,?)"
-,
+            "INSERT OR REPLACE INTO reasoning_memory(request_id,case_json,critic_json) VALUES(?,?,?)",
             (request_id, json.dumps(case, ensure_ascii=False), json.dumps(critic, ensure_ascii=False)),
         )
 
@@ -234,8 +231,7 @@ def add_conversation_message(conversation_id, role, content, metadata=None):
             "INSERT INTO conversation_messages(conversation_id,role,content,metadata_json) VALUES(?,?,?,?)",
             (str(conversation_id), str(role), str(content), json.dumps(metadata or {}, ensure_ascii=False)),
         )
-        con.execute("UPDATE conversations SET updated_at=CURRENT_T
-IMESTAMP WHERE conversation_id=?", (str(conversation_id),))
+        con.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?", (str(conversation_id),))
         return cur.lastrowid
 
 def conversation_messages(conversation_id, limit=40):
