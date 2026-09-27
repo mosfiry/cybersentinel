@@ -511,12 +511,13 @@ def test_validate_against_mission_rejects_plan_scope_run_lifecycle_and_snapshot_
     assert ExecutionAuthorizationProof.validate_against_mission(proof, make_mission(proof, amended))[2] == RejectionCode.SNAPSHOT_MISMATCH.value
 
 
-def test_validate_against_mission_rejects_cross_mission_and_owner_direct():
+def test_validate_against_mission_rejects_cross_mission_and_untyped():
     snapshot, proof = _mission_bound_proof()
     other = make_mission(proof, snapshot)
     other.mission_id = "mission-2"
     assert ExecutionAuthorizationProof.validate_against_mission(proof, other)[2] == RejectionCode.PROOF_BINDING_MISMATCH.value
-    assert ExecutionAuthorizationProof.validate_against_mission(proof, {"not": "a proof"})[2] == RejectionCode.PROOF_INVALID.value
+    mission = make_mission(proof, snapshot)
+    assert ExecutionAuthorizationProof.validate_against_mission({"not": "a proof"}, mission)[2] == RejectionCode.PROOF_INVALID.value
 
 
 def test_owner_direct_proof_cannot_execute_mission_bound(owner_decision):
