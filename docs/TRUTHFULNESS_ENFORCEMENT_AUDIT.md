@@ -342,3 +342,56 @@ Historical CI evidence referenced (OBSERVED):
 Nothing in PHASE T0 is COMPLETE. The next phase must wire the library into
 the production boundary and replace name-based origins with verifiable
 provenance, then prove it with production-path adversarial tests.
+
+--------------------------------------------------------------------------------
+## UPDATE 2026-09-27 — T1 (design) + T2 (implementation)
+
+- T1 design: docs/TRUTHFULNESS_ENFORCEMENT_DESIGN.md (commit 44bf31fec567,
+  CI "test (3.13)" succeeded) - BEFORE/AFTER call graphs, provenance model,
+  completion invariant design, bypass remediation plan B1-B8.
+- T2 implementation (two commits, both CI-VERIFIED "test (3.13)" succeeded):
+  - f132d82b0d27 (33s): security/truthfulness.py v2 - SystemEvidenceIssuer
+    (keyed HMAC provenance; claimed vs verified provenance separated),
+    is_authoritative() requires a provenance token (B2 fixed at library
+    level), verify_ci_claim no longer accepts caller strings - only
+    issuer-minted ci_runner records, and no trusted CI provider boundary
+    exists at runtime today so CI claims fail closed to UNVERIFIED/MISSING
+    (B3 fixed), evaluate_completion matches gates by exact claim_id and
+    requires issuer-verified evidence with CONTRADICTED reporting for
+    failed gates (B6 fixed), EVIDENCE_STATUS_SEMANTICS + PARTIAL/
+    CONTRADICTED/MISSING statuses (B8 fixed at semantics level),
+    mission_truth_payload (canonical API truth object). Unit battery
+    updated: bare trusted-name records are no longer authoritative;
+    caller-supplied execution data can never certify success.
+  - 6e987908b30c (37s): production wiring - agent/mission.py transition()
+    structurally blocks GOAL_COMPLETED without
+    verification_state["verified"] is True, and MissionStore.save() refuses
+    to persist an unverified GOAL_COMPLETED even after direct in-memory
+    status assignment (B1/B5 fixed: the completion gate is now a system
+    state-machine + persistence invariant, enforced for /api/chat,
+    /api/command, tasks, workers, and library use alike); api/chat.py
+    attaches the truth payload to every chat/command response (B4 fixed);
+    web/app.js fallbacks removed - activity status defaults to UNKNOWN and
+    an empty answer renders server truth instead of invented completion
+    text (B7 fixed); tests/test_truthfulness_enforcement.py integration +
+    adversarial battery (mission completes only with deterministic
+    verification state; model final text cannot complete; store refuses
+    unverified completion; forged tokens rejected; frontend/ API wiring
+    regression tests).
+- BYPASS STATUS AFTER T2: B1 FIXED (enforcement battery + wiring), B2 FIXED
+  (HMAC provenance), B3 FIXED (fail-closed; trusted CI minting boundary does
+  not exist yet and is NOT faked), B4 FIXED (truth payload on responses),
+  B5 FIXED (state-machine + persistence invariant), B6 FIXED (exact gate
+  ids), B7 FIXED (fallbacks removed + regression test), B8 FIXED
+  (EVIDENCE_STATUS_SEMANTICS + truth object).
+- REMAINING LIMITATIONS (explicit, NOT hidden):
+  - CI evidence minting boundary (a CI job signing its own result) is still
+    absent: runtime CI claims remain UNVERIFIED by design.
+  - In-memory direct attribute writes of mission.status (bypassing
+    transition()) are guarded at PERSISTENCE time only; the HTTP response
+    path always derives truth from the persisted/transitioned state.
+  - Full HTTP end-to-end exercise of the new truth object happens through
+    the existing bridge smoke tests' chat path; the new battery exercises
+    the same production objects (Mission, MissionStore, chat module wiring)
+    directly.
+- Nothing is claimed COMPLETE beyond what the gates prove.
