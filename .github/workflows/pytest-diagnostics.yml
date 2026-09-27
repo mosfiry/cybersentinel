@@ -27,7 +27,7 @@ jobs:
           mkdir -p diagnostics
           S="${GITHUB_SHA:0:12}"
           rm -f diagnostics/b64-*
-          for f in core/db.py bridge.py api/chat.py api/missions.py security/owner_policy.py security/owner_session.py agent/task_runtime.py agent/mission_runtime.py agent/mission_worker.py agent/mission.py agent/task_manager.py core/engine.py core/lifecycle.py core/config.py; do
+          for f in core/db.py bridge.py api/chat.py api/missions.py security/owner_policy.py security/owner_session.py security/authority.py security/authorization.py security/authorization_context.py security/scope.py security/mission_authorization.py core/policy.py core/trust.py core/config.py agent/task_runtime.py agent/mission_runtime.py agent/mission_worker.py agent/mission.py agent/task_manager.py core/engine.py core/lifecycle.py; do
             if git show "origin/main:$f" > /tmp/export 2>/dev/null; then
               name=$(echo "$f" | tr '/' '-')
               base64 -w0 /tmp/export > /tmp/b64.txt
@@ -51,6 +51,36 @@ jobs:
               fi
             fi
           done
+      - name: OWNER charter audit (full repository scan)
+        run: |
+          S="${GITHUB_SHA:0:12}"
+          {
+            echo "# OWNER charter audit — run $S"
+            echo
+            echo "## Files scanned:"
+            git ls-files | wc -l
+            echo
+            echo "## Authority-ordering statements (precedence/priority/override):"
+            git grep -n -I -i -E "(takes? (precedence|priority)|overrides?|supersedes?|precedes|more restrictive|higher.authority|authority order|authority hierarchy|precedence)" -- ':!diagnostics' || echo "(none)"
+            echo
+            echo "## OWNER_INSTRUCTION / charter mentions:"
+            git grep -n -I -E "OWNER_INSTRUCTION|owner_instruction" -- ':!diagnostics' | head -200 || echo "(none)"
+            echo
+            echo "## Competing authority naming (MODEL_POLICY/SAFETY_POLICY/ETHICS_POLICY/TOOL_POLICY as independent sources):"
+            git grep -n -I -E "MODEL_POLICY|SAFETY_POLICY|ETHICS_POLICY|TOOL_POLICY|SYSTEM_PLATFORM" -- ':!diagnostics' | head -120 || echo "(none)"
+            echo
+            echo "## Ethics/safety/policy rule definition sites:"
+            git grep -n -I -E "(ethics|ethical|safety|safety_policy)" -- ':!diagnostics' | grep -v -i -E "test_|conftest" | head -120 || echo "(none)"
+            echo
+            echo "## Model output authority mentions:"
+            git grep -n -I -E "MODEL_OUTPUT" -- ':!diagnostics' | head -100 || echo "(none)"
+          } > "diagnostics/charter-audit-$S.md"
+          split -b 28000 -d -a 3 "diagnostics/charter-audit-$S.md" "diagnostics/charter-audit-$S.part"
+          if [ -f "diagnostics/charter-audit-$S.part000" ]; then
+            for p in diagnostics/charter-audit-$S.part*; do mv "$p" "$p.txt"; done
+            rm -f "diagnostics/charter-audit-$S.md"
+            for p in diagnostics/charter-audit-$S.part*.txt; do mv "$p" "${p%.txt}.md"; done
+          fi
       - name: pip install
         run: |
           set +e
