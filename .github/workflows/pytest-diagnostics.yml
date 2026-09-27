@@ -55,7 +55,7 @@ jobs:
         run: |
           S="${GITHUB_SHA:0:12}"
           {
-            echo "# OWNER charter audit — run $S"
+            echo "# OWNER charter audit â run $S"
             echo
             echo "## Files scanned:"
             git ls-files | wc -l
@@ -147,7 +147,10 @@ jobs:
           BRANCH="${GITHUB_REF_NAME}"
           for attempt in 1 2 3 4 5 6 7 8; do
             git fetch origin "$BRANCH" || true
-            git rebase "origin/$BRANCH" || { git rebase --abort || true; }
+            git rebase --abort 2>/dev/null || true
+            git reset --soft "origin/$BRANCH" || true
+            git add -A diagnostics/
+            git commit -m "ci diagnostics: export + test result ${GITHUB_SHA:0:12}" || echo "nothing to commit"
             if git push origin "HEAD:$BRANCH"; then
               echo "diagnostics published (attempt ${attempt})"
               exit 0
