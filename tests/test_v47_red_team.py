@@ -16,7 +16,7 @@ def test_red_team_tool_requires_owner():
 
 
 def test_red_team_assessment_is_defensive_only():
-    evidence = _issue_evidence("owner_token", "red-team-test", "test")
+    evidence = _issue_evidence("username_password", "red-team-test", "test")
     context = AuthorizationContext("red-team-test", evidence, capture_policy_snapshot("red-team-test", evidence))
     decision = authorize_tool(["red_team_assess", "php-fpm -> sh -> curl"], context=context).decision
     result = execute("red_team_assess", "php-fpm -> sh -> curl", authorization_decision=decision, request_id="red-team-test")

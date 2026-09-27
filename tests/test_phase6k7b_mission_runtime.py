@@ -129,7 +129,7 @@ def test_authorization_intervention_persists_and_allow_resumes(tmp_path, monkeyp
     from security.authorization_context import AuthorizationContext
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "owner-policy.json")
     request_id = "mission-owner-request"
-    evidence = policy._issue_evidence("owner_token", request_id, "mission-proof")
+    evidence = policy._issue_evidence("username_password", request_id, "mission-proof")
     auth = AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=policy.capture_policy_snapshot(request_id, evidence))
     rt.provide_owner_decision(mission2.mission_id, allow=True, authorization_context=auth.to_dict())
     completed = rt.run_to_completion(mission2.mission_id)

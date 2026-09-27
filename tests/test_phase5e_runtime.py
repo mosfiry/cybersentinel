@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from owner_session_testutils import allow_owner_sessions
+
 import json
 from pathlib import Path
 
@@ -45,7 +47,7 @@ def isolated_dbs(tmp_path, monkeypatch):
 
 def runtime_for(provider, monkeypatch, owner="owner"):
     import security.owner_policy as policy
-    monkeypatch.setattr(policy, "OWNER_TOKEN", owner)
+    allow_owner_sessions(monkeypatch, owner)
     return AgentTaskRuntime(ModelRouter([provider]), executor=lambda command, **kwargs: {"ok": True, "request_id": "exec-1", "result": {"command": command}})
 
 
@@ -55,8 +57,8 @@ def test_task_backed_runtime_persists_multi_slice_context_memory_and_events(isol
         ProviderResponse(text=json.dumps({"type": "final", "content": "تم جمع الدليل وتحليل المهمة."}), finish_reason="stop"),
     ])
     runtime = runtime_for(provider, monkeypatch)
-    task = runtime.create_task("conv-1", "ابدأ تحقيقاً دفاعياً", authentication_method="owner_token")
-    completed = runtime.run_to_completion(task.task_id, owner_token="owner")
+    task = runtime.create_task("conv-1", "ابدأ تحقيقاً دفاعياً", authentication_method="username_password")
+    completed = runtime.run_to_completion(task.task_id, owner_session_token="owner")
     assert completed.status == TaskStatus.COMPLETED
     assert completed.current_step == 2
     assert completed.provider == "scripted"
@@ -74,13 +76,13 @@ def test_duplicate_tool_call_id_is_idempotent(isolated_dbs, monkeypatch):
         ProviderResponse(text="done"),
     ])
     import security.owner_policy as policy
-    monkeypatch.setattr(policy, "OWNER_TOKEN", "owner")
+    allow_owner_sessions(monkeypatch, "owner")
     executions = []
     runtime = AgentTaskRuntime(ModelRouter([provider]), executor=lambda command, **kwargs: executions.append(command) or {"ok": True})
-    task = runtime.create_task("conv-2", "investigate", authentication_method="owner_token")
-    runtime.run_slice(task.task_id, owner_token="owner")
+    task = runtime.create_task("conv-2", "investigate", authentication_method="username_password")
+    runtime.run_slice(task.task_id, owner_session_token="owner")
     # A replayed native id must not execute a second time.
-    runtime.run_slice(task.task_id, owner_token="owner")
+    runtime.run_slice(task.task_id, owner_session_token="owner")
     assert len(executions) == 1
     restored = TaskManager.get_task(task.task_id)
     assert len(restored.tool_calls) == 1
@@ -91,7 +93,7 @@ def test_task_owner_and_conversation_isolation(isolated_dbs, monkeypatch):
     runtime = runtime_for(provider, monkeypatch, owner="owner-a")
     task = runtime.create_task("conv-owner-a", "private objective")
     with pytest.raises(PermissionError):
-        runtime.run_slice(task.task_id, owner_token="wrong-owner")
+        runtime.run_slice(task.task_id, owner_session_token="wrong-owner")
     assert TaskManager.get_tasks_by_conversation("conv-owner-a", owner_session_id="other-session") == []
 
 
@@ -101,7 +103,7 @@ def test_cancel_before_slice_is_persisted(isolated_dbs, monkeypatch):
     task = runtime.create_task("conv-cancel", "cancel me")
     task.request_cancel()
     TaskManager.update_task(task)
-    cancelled = runtime.run_slice(task.task_id, owner_token="owner")
+    cancelled = runtime.run_slice(task.task_id, owner_session_token="owner")
     assert cancelled.status == TaskStatus.CANCELLED
     assert provider.calls == 0
 
@@ -116,7 +118,7 @@ def test_native_and_json_fallback_share_task_runtime(isolated_dbs, monkeypatch):
 
     runtime = runtime_for(Legacy(), monkeypatch)
     task = runtime.create_task("conv-fallback", "fallback objective")
-    result = runtime.run_slice(task.task_id, owner_token="owner")
+    result = runtime.run_slice(task.task_id, owner_session_token="owner")
     assert result.status == TaskStatus.COMPLETED
     assert result.result["answer"] == "fallback"
 

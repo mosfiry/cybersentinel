@@ -14,7 +14,7 @@ class ExecutionContext:
     model: str = "deterministic"
     authority: dict[str, Any] = field(default_factory=dict)
     owner_session_id: str | None = None
-    authentication_method: str = "owner_token"
+    authentication_method: str = "username_password"
     authenticated_at: str | None = None
     owner_instruction_snapshot: str = ""
     owner_instruction_fingerprint: str = ""

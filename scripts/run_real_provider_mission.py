@@ -52,13 +52,13 @@ def main() -> None:
     parser.add_argument("--db", default=os.environ.get("AUDIT_MISSION_DB", "/tmp/cybersentinel-real-audit.sqlite3"))
     parser.add_argument("--resume", help="resume an existing mission id")
     parser.add_argument("--max-iterations", type=int, default=8)
-    parser.add_argument("--owner-token", default=os.environ.get("OWNER_TOKEN", ""))
+    parser.add_argument("--owner-session-token", dest="owner_session_token", default=os.environ.get("OWNER_SESSION_TOKEN", ""))
     parser.add_argument("--artifact", default=os.environ.get("REAL_ARTIFACT", ""))
     args = parser.parse_args()
 
     model = configure_provider()
-    if not args.owner_token:
-        emit({"status": "BLOCKED", "reason": "OWNER_TOKEN_REQUIRED", "provider_model": model}, code=2)
+    if not args.owner_session_token:
+        emit({"status": "BLOCKED", "reason": "OWNER_SESSION_TOKEN_REQUIRED", "provider_model": model}, code=2)
 
     from agent.agent_core import AgentCore
     from agent.mission import MissionStore
@@ -74,11 +74,11 @@ def main() -> None:
     objects = [KnowledgeObject.create(**{**item, "kind": KnowledgeKind(item["kind"]), "trust_class": TrustClass(item["trust_class"]), "transformation_policy": TransformationPolicy(item["transformation_policy"])}) for item in fixture["objects"]]
     core = AgentCore(router, store=store, max_iterations=args.max_iterations, knowledge_retriever=TypedKnowledgeRetriever(objects, fallback_store=False))
     if args.resume:
-        mission = core.resume_mission(args.resume, owner_token=args.owner_token, max_slices=args.max_iterations)
+        mission = core.resume_mission(args.resume, owner_session_token=args.owner_session_token, max_slices=args.max_iterations)
     else:
         mission = core.run_owner_mission(
             "Investigate whether CVE-2021-44228 was the initial access vector for Incident-A and determine the most supported hypothesis from available local evidence.",
-            owner_token=args.owner_token,
+            owner_session_token=args.owner_session_token,
             completion_criteria=[{"criterion_id": "mission-goal", "description": "A tool observation is recorded and verified", "check": "tool observation", "required": True}],
         )
     result = {

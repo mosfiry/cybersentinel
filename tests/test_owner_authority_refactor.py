@@ -18,7 +18,7 @@ from security.owner_policy import capture_policy_snapshot, owner_instruction_fin
 
 
 def evidence(policy, request_id, material):
-    return policy._issue_evidence("owner_token", request_id, material)
+    return policy._issue_evidence("username_password", request_id, material)
 
 
 def test_owner_instruction_is_policy_input_not_keyword_veto():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from owner_session_testutils import allow_owner_sessions
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -32,7 +33,7 @@ class JsonProvider:
 def make_context(monkeypatch, tmp_path, request_id="req-6k6"):
     import security.owner_policy as policy
     monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "owner-policy.json")
-    evidence = policy._issue_evidence("owner_token", request_id, "proof-6k6")
+    evidence = policy._issue_evidence("username_password", request_id, "proof-6k6")
     snapshot = capture_policy_snapshot(request_id, evidence)
     return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot)
 
@@ -160,7 +161,7 @@ def test_task_without_context_cannot_execute_sensitive_model_proposal(monkeypatc
     monkeypatch.setattr(task_manager, "DB_PATH", Path(tmp_path) / "tasks.sqlite3")
     monkeypatch.setattr(memory, "MEMORY_DB_PATH", Path(tmp_path) / "memory.sqlite3")
     monkeypatch.setattr(core_db, "DB_PATH", Path(tmp_path) / "core.sqlite3")
-    monkeypatch.setattr(policy, "OWNER_TOKEN", "owner")
+    allow_owner_sessions(monkeypatch, "owner")
     task_manager._init_db(); memory._init_memory_db(); core_db.connect().close()
     class SensitiveProvider(JsonProvider):
         capabilities = ProviderCapabilities(generate=True, tool_calling=True)
@@ -171,5 +172,5 @@ def test_task_without_context_cannot_execute_sensitive_model_proposal(monkeypatc
     provider = SensitiveProvider({"intent": "SCOPED_TEST", "action_proposal": "red_team_assess", "arguments": {"query": "safe"}, "evidence_needed": []})
     runtime = AgentTaskRuntime(ModelRouter([provider]), executor=lambda command, **kwargs: pytest.fail("sensitive executor must not run"))
     task = runtime.create_task("conv-task", "red team")
-    result = runtime.run_slice(task.task_id, owner_token="owner")
+    result = runtime.run_slice(task.task_id, owner_session_token="owner")
     assert result.tool_calls[0]["status"] == "denied"

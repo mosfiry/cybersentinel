@@ -2,6 +2,7 @@ import importlib
 import json
 
 import core.db as db
+from owner_session_testutils import allow_owner_sessions
 import security.owner_policy as owner_policy
 from agent.loop import AgentLoop, tool_definitions
 
@@ -28,11 +29,11 @@ def test_agent_loop_executes_validated_tool_and_keeps_conversation_separate(monk
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
     calls = []
 
-    def executor(command, *, owner_token, owner_session_id=None):
-        calls.append((command, owner_token, owner_session_id))
+    def executor(command, *, owner_session_token, owner_session_id=None):
+        calls.append((command, owner_session_token, owner_session_id))
         return {"ok": True, "request_id": "req-1", "answer": "نتيجة محلية"}
 
-    result = AgentLoop(FakeRouter(), executor).run("conv-1", "ابحث عن CVE-2026", owner_token="owner-secret")
+    result = AgentLoop(FakeRouter(), executor).run("conv-1", "ابحث عن CVE-2026", owner_session_token="owner-secret")
     assert result["conversation_id"] == "conv-1"
     assert result["steps"] == 2
     assert result["activity"][0]["status"] == "completed"
@@ -49,7 +50,7 @@ def test_agent_loop_denies_unknown_tool_without_execution(monkeypatch, tmp_path)
             return {"content": '{"type":"tool_call","name":"delete_everything","arguments":{}}'}
 
     calls = []
-    result = AgentLoop(BadRouter(), lambda *args, **kwargs: calls.append(1)).run("conv-2", "اختبر", owner_token="owner-secret",)
+    result = AgentLoop(BadRouter(), lambda *args, **kwargs: calls.append(1)).run("conv-2", "اختبر", owner_session_token="owner-secret",)
     assert result["steps"] == 20
     assert not calls
     assert all(item["status"] == "denied" for item in result["activity"])
@@ -57,12 +58,11 @@ def test_agent_loop_denies_unknown_tool_without_execution(monkeypatch, tmp_path)
 
 def test_owner_token_method_is_recorded_in_execution_context(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "engine.sqlite3")
-    monkeypatch.setenv("OWNER_TOKEN", "owner-secret")
-    importlib.reload(owner_policy)
+    allow_owner_sessions(monkeypatch, "owner-secret")
     from core.engine import handle
 
-    result = handle("Owner status", source="test", owner_token="owner-secret", request_id="auth-context-1")
-    assert result["execution_context"]["authentication_method"] == "owner_token"
+    result = handle("Owner status", source="test", owner_session_token="owner-secret", request_id="auth-context-1")
+    assert result["execution_context"]["authentication_method"] == "username_password"
     assert result["execution_context"]["owner_authenticated"] is True
     assert result["execution_context"]["authorization_context"]["request_id"] == "auth-context-1"
     assert result["execution_context"]["authorization_decisions"]

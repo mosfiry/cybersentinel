@@ -10,13 +10,14 @@ from security.scope import TargetIdentity, make_snapshot
 from security.scope_resolver import resolve
 from security.scope_store import init_scope_store, save_snapshot
 import security.owner_policy as owner_policy
+from owner_session_testutils import allow_owner_sessions
 import security.scope_store as scope_store
 
 
 @pytest.fixture
 def scope_db(tmp_path, monkeypatch):
     monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
-    monkeypatch.setattr(owner_policy, "OWNER_TOKEN", "owner-6b")
+    allow_owner_sessions(monkeypatch, "owner-6b")
     init_scope_store()
 
 
@@ -61,7 +62,7 @@ def test_external_malicious_scope_never_becomes_authorized_without_owner_snapsho
     # Adapter output alone is not persisted and therefore cannot authorize a request.
     assert resolve("missing", "target-evil", "https://evil.example.com/api").allowed is False
     # Only explicit Owner approval can create the executable snapshot.
-    snapshot = save_snapshot(make_snapshot("snapshot-6b", authorization, [target]), owner_token="owner-6b")
+    snapshot = save_snapshot(make_snapshot("snapshot-6b", authorization, [target]), owner_session_token="owner-6b")
     assert resolve(snapshot.snapshot_id, target.target_id, "https://evil.example.com/api", consume_rate=False).allowed
 
 

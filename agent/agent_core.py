@@ -10,13 +10,10 @@ from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.owner_policy import (
     authenticate_owner,
-    authentication_from_session,
     capture_policy_snapshot,
     policy_context_from_snapshot,
-    verify_owner,
     OwnerPolicySnapshot,
 )
-from security.owner_session import consume_owner_challenge
 from security.scope_store import get_snapshot
 from tools.registry import REGISTRY, execute as execute_tool, get_tool
 from agent.evidence import EvidenceChainStore
@@ -191,18 +188,10 @@ class AgentCore:
             return json.loads(content[start:end + 1])
 
     @staticmethod
-    def _auth(text: str, owner_token: str, request_id: str, owner_session_id: str | None, owner_challenge: str | None) -> tuple[AuthorizationContext, dict[str, Any]]:
-        if owner_session_id or owner_challenge:
-            if not owner_session_id or not owner_challenge:
-                raise PermissionError("owner challenge required")
-            session_context = consume_owner_challenge(owner_session_id, owner_challenge, text, request_id)
-            evidence = authentication_from_session(session_context, request_id)
-            session_id = session_context.get("owner_session_id")
-        else:
-            evidence = authenticate_owner(text, owner_token, request_id)
-            session_id = None
+    def _auth(text: str, owner_session_token: str, request_id: str) -> tuple[AuthorizationContext, dict[str, Any]]:
+        evidence = authenticate_owner(owner_session_token, request_id)
         snapshot = capture_policy_snapshot(request_id, evidence)
-        return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=session_id), policy_context_from_snapshot(snapshot)
+        return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=evidence.session_id), policy_context_from_snapshot(snapshot)
 
     @staticmethod
     def _executor(mission: Mission, step: PlanStep, action_id: str) -> dict[str, Any]:
@@ -237,9 +226,9 @@ class AgentCore:
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
 
-    def run_owner_mission(self, instruction: str, *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True) -> Mission:
+    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True) -> Mission:
         request_id = request_id or uuid.uuid4().hex
-        authorization_context, policy_context = self._auth(instruction, owner_token, request_id, owner_session_id, owner_challenge)
+        authorization_context, policy_context = self._auth(instruction, owner_session_token, request_id)
         if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
             snapshot = get_snapshot(scope_context["scope_snapshot_id"])
             if snapshot is None:
@@ -340,12 +329,12 @@ class AgentCore:
                 pass
         return result
 
-    def resume_mission(self, mission_id: str, *, owner_token: str, max_slices: int | None = None) -> Mission:
+    def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
         mission = self.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
         try:
-            evidence = authenticate_owner("Owner resume mission", owner_token, mission.request_id)
+            evidence = authenticate_owner(owner_session_token, mission.request_id)
         except PermissionError as exc:
             if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
                 if mission.status is MissionStatus.RECOVERY_REQUIRED:
@@ -376,7 +365,7 @@ class AgentCore:
         fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope)
         mission.authorization_context = fresh_context.to_dict()
         mission.policy_snapshot = fresh_snapshot.to_dict()
-        mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "owner_token", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})
+        mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "username_password", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})
         if mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
             mission.transition(MissionStatus.READY, "owner authorization revalidated")
         self.store.save(mission)

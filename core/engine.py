@@ -11,10 +11,9 @@ from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
 from security.authorization_context import AuthorizationContext
 from security.owner_policy import (
-    authenticate_owner, authentication_from_session, capture_policy_snapshot,
+    authenticate_owner, capture_policy_snapshot,
     set_current_owner_instruction, load_state, load_policy, authority_snapshot, policy_context_from_snapshot,
 )
-from security.owner_session import consume_owner_challenge
 from security.scope_store import get_snapshot
 from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
@@ -55,7 +54,7 @@ def execute(tool: str, argument: str | None = None, *, authorization_decision=No
     return execute_tool(tool, argument, authorization_decision=authorization_decision, scope_context=scope_context)
 
 
-def _handle_once(text, source="web", presented_token=None, owner_token=None, request_id=None, owner_session_id=None, owner_challenge=None, scope_context=None):
+def _handle_once(text, source="web", presented_token=None, owner_session_token=None, request_id=None, scope_context=None):
     request_id = request_id or uuid.uuid4().hex
     lifecycle = begin_lifecycle(request_id, source)
     if lifecycle.status == "completed":
@@ -73,25 +72,17 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
         "authentication_method": "none",
         "authenticated_at": None,
     }
-    if owner_session_id or owner_challenge:
-        try:
-            auth_context = consume_owner_challenge(owner_session_id, owner_challenge, text, request_id)
-            auth_evidence = authentication_from_session(auth_context, request_id)
-            owner_ok, owner_reason = True, "owner-session-challenge"
-        except PermissionError as exc:
-            owner_reason = str(exc)
-    else:
-        try:
-            auth_evidence = authenticate_owner(text, owner_token, request_id)
-            owner_ok, owner_reason = True, "owner-authenticated"
-            auth_context = {
-                "owner_authenticated": True,
-                "owner_session_id": None,
-                "authentication_method": "owner_token",
-                "authenticated_at": auth_evidence.authenticated_at,
-            }
-        except PermissionError as exc:
-            owner_reason = str(exc)
+    try:
+        auth_evidence = authenticate_owner(owner_session_token, request_id)
+        owner_ok, owner_reason = True, "owner-authenticated"
+        auth_context = {
+            "owner_authenticated": True,
+            "owner_session_id": auth_evidence.session_id,
+            "authentication_method": "username_password",
+            "authenticated_at": auth_evidence.authenticated_at,
+        }
+    except PermissionError as exc:
+        owner_reason = str(exc)
     auth_event = add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
     if not owner_ok:
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}
@@ -228,10 +219,10 @@ def _handle_once(text, source="web", presented_token=None, owner_token=None, req
     return response
 
 
-def handle(text, source="web", presented_token=None, owner_token=None, request_id=None, owner_session_id=None, owner_challenge=None, scope_context=None):
+def handle(text, source="web", presented_token=None, owner_session_token=None, request_id=None, scope_context=None):
     request_id = request_id or uuid.uuid4().hex
     try:
-        return _handle_once(text, source, presented_token, owner_token, request_id, owner_session_id, owner_challenge, scope_context)
+        return _handle_once(text, source, presented_token, owner_session_token, request_id, scope_context)
     except Exception as exc:
         error = str(exc)[:500]
         current = get_lifecycle(request_id)

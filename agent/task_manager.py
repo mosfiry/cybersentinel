@@ -34,7 +34,7 @@ def _init_db():
     with _get_db() as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, request_id TEXT NOT NULL,
-            owner_session_id TEXT NOT NULL, authentication_method TEXT NOT NULL DEFAULT 'owner_token',
+            owner_session_id TEXT NOT NULL, authentication_method TEXT NOT NULL DEFAULT 'username_password',
             status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             started_at TEXT, finished_at TEXT, current_step INTEGER DEFAULT 0,
             tool_calls TEXT DEFAULT '[]', retry_count INTEGER DEFAULT 0, provider TEXT DEFAULT '', model TEXT DEFAULT '',
@@ -42,7 +42,7 @@ def _init_db():
             cancel_requested INTEGER DEFAULT 0, pause_requested INTEGER DEFAULT 0, resume_state TEXT)""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
         if "authentication_method" not in columns:
-            conn.execute("ALTER TABLE tasks ADD COLUMN authentication_method TEXT NOT NULL DEFAULT 'owner_token'")
+            conn.execute("ALTER TABLE tasks ADD COLUMN authentication_method TEXT NOT NULL DEFAULT 'username_password'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_conversation ON tasks(conversation_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner_session ON tasks(owner_session_id)")
@@ -67,7 +67,7 @@ def _from_row(row: sqlite3.Row) -> Task:
 
 class TaskManager:
     @staticmethod
-    def create_task(conversation_id: str, request_id: str, owner_session_id: str, objective: str, provider: str = "", model: str = "", authentication_method: str = "owner_token") -> Task:
+    def create_task(conversation_id: str, request_id: str, owner_session_id: str, objective: str, provider: str = "", model: str = "", authentication_method: str = "username_password") -> Task:
         task = Task.create(conversation_id, request_id, owner_session_id, objective, provider, model, authentication_method)
         TaskManager.update_task(task)
         return task

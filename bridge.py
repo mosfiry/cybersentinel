@@ -18,8 +18,7 @@ from core.config import (
 from core.engine import RUNTIME, status
 from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
-from security.owner_policy import verify_owner
-from security.owner_session import create_owner_session
+import security.owner_password as owner_password
 from security.owner_password import login as owner_password_login, logout as owner_password_logout
 from api.chat import chat, get_session, sse, stream, task_stream, create_task, resume_task, pause_task, cancel_task
 from agent.task_manager import TaskManager
@@ -72,7 +71,13 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}")
 
     def _chat_auth(self):
-        return self.headers.get("X-CyberSentinel-Owner-Token", ""), self.headers.get("X-CyberSentinel-Owner-Session"), self.headers.get("X-CyberSentinel-Owner-Challenge")
+        return self.headers.get("X-CyberSentinel-Owner-Session", "")
+
+    def _owner_session(self):
+        session = owner_password.resolve_session(self._chat_auth())
+        if session is None or session.get("auth_method") != "username_password":
+            return None
+        return session
 
     def _mission_service(self) -> MissionService:
         core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
@@ -85,14 +90,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._bridge_auth():
             self._send(401, {"ok": False, "error": "bridge authentication required"})
             return None
-        owner_token, owner_session, owner_challenge = self._chat_auth()
-        if owner_session and owner_challenge:
-            return owner_token, owner_session, owner_challenge
-        owner_ok, reason = verify_owner("Owner mission API", owner_token)
-        if not owner_ok:
-            self._send(403, {"ok": False, "error": reason})
+        owner_session = self._owner_session()
+        if owner_session is None:
+            self._send(403, {"ok": False, "error": "owner authentication required"})
             return None
-        return owner_token, owner_session, owner_challenge
+        return owner_session
 
     def _mission_snapshot_factory(self, owner_identity: str, scope_context: dict | None = None):
         scope_context = scope_context or {}
@@ -179,9 +181,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
             session_id = parsed.path[len("/api/session/"):]
-            owner_ok, reason = verify_owner("Owner conversation session", self.headers.get("X-CyberSentinel-Owner-Token", ""))
-            if not owner_ok:
-                return self._send(403, {"ok": False, "error": reason})
+            if self._owner_session() is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
             value = get_session(session_id)
             return self._send(200 if value else 404, {"ok": bool(value), "session": value} if value else {"ok": False, "error": "unknown_session"})
         if parsed.path == "/api/chat/stream":
@@ -189,26 +190,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
             query = parse_qs(parsed.query)
             payload = {"text": query.get("text", [""])[0], "conversation_id": query.get("conversation_id", [""])[0]}
-            owner_token, owner_session, owner_challenge = self._chat_auth()
-            return self._send_sse(stream(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge))
+            owner_session = self._owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
+            return self._send_sse(stream(payload, owner_session_token=owner_session["session_id"]))
         if parsed.path.startswith("/api/tasks/"):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
-            owner_token, owner_session, _ = self._chat_auth()
-            owner_ok, reason = verify_owner("Owner task access", owner_token)
-            if not owner_ok:
-                return self._send(403, {"ok": False, "error": reason})
+            owner_session = self._owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
             task_id = parsed.path[len("/api/tasks/"):]
             if task_id.endswith("/stream"):
                 task_id = task_id[:-len("/stream")].rstrip("/")
                 task = TaskManager.get_task(task_id)
                 if task is None:
                     return self._send(404, {"ok": False, "error": "unknown_task"})
-                return self._send_sse(task_stream(task_id, owner_token=owner_token, owner_session_id=owner_session))
+                return self._send_sse(task_stream(task_id, owner_session_token=self._chat_auth()))
             task = TaskManager.get_task(task_id)
             if task is None:
                 return self._send(404, {"ok": False, "error": "unknown_task"})
-            if owner_session and task.owner_session_id != owner_session:
+            if task.owner_session_id and task.owner_session_id != owner_session["session_id"]:
                 return self._send(403, {"ok": False, "error": "task access denied"})
             return self._send(200, {"ok": True, "task": task.to_dict()})
         if self.path in {"/app.js", "/style.css"}:
@@ -230,9 +232,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/reasoning/"):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
-            owner_ok, reason = verify_owner("Owner reasoning memory", self.headers.get("X-CyberSentinel-Owner-Token", ""))
-            if not owner_ok:
-                return self._send(403, {"ok": False, "error": reason})
+            if self._owner_session() is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
             request_id = self.path[len("/api/reasoning/"):]
             memory = reasoning_for_request(request_id)
             if memory is None:
@@ -247,7 +248,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 payload = self._read_json()
-                owner_token, owner_session, owner_challenge = auth
                 if isinstance(payload.get("plan"), dict):
                     objective = str(payload.get("objective") or payload.get("text") or "").strip()
                     if not objective:
@@ -256,10 +256,10 @@ class Handler(BaseHTTPRequestHandler):
                     raw_steps = raw_plan.get("steps", [])
                     steps = tuple(PlanStep(step_id=str(item["step_id"]), objective=str(item.get("objective", item["step_id"])), prerequisites=tuple(item.get("prerequisites", ())), action=str(item.get("action", "")), expected_observation=str(item.get("expected_observation", "")), authorization_requirement=str(item.get("authorization_requirement", "owner")), scope_requirement=str(item.get("scope_requirement", "")), retry_policy=dict(item.get("retry_policy", {})), verification=tuple(item.get("verification", ()))) for item in raw_steps)
                     plan = Plan(version=int(raw_plan.get("version", 1)), objective=objective, assumptions=tuple(raw_plan.get("assumptions", ())), steps=steps, dependencies=tuple(raw_plan.get("dependencies", ())), completion_criteria=tuple(raw_plan.get("completion_criteria", ())), risk=str(raw_plan.get("risk", "unknown")), created_from=str(raw_plan.get("created_from", "api")))
-                    owner_identity = "owner-session" if owner_session else "owner-token"
+                    owner_identity = "owner-password-session"
                     mission = self._mission_service().create_mission(objective, objective, plan, owner_identity_ref=owner_identity, scope_snapshot=payload.get("scope_context"), completion_criteria=payload.get("completion_criteria") or [], authorization_snapshot_factory=self._mission_snapshot_factory(owner_identity, payload.get("scope_context")))
                     return self._send(201, {"ok": True, "mission": mission, "mission_id": mission["mission_id"], "status": mission["status"]})
-                result = chat(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge)
+                result = chat(payload, owner_session_token=auth["session_id"])
                 return self._send(201, {"ok": True, "mission": result.get("mission"), "mission_id": result.get("mission_id"), "status": result.get("status")})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -273,7 +273,6 @@ class Handler(BaseHTTPRequestHandler):
             mission_id, action = parts[0], parts[1] if len(parts) > 1 else "start"
             try:
                 service = self._mission_service()
-                owner_token, owner_session, owner_challenge = auth
                 if action == "start" or action == "resume":
                     result = service.start_mission(mission_id) if action == "start" else service.resume_mission(mission_id)
                     return self._send(200, {"ok": True, "mission": result})
@@ -330,17 +329,13 @@ class Handler(BaseHTTPRequestHandler):
             session_id = str(payload.get("session_id", "")) if isinstance(payload, dict) else ""
             owner_password_logout(session_id)
             return self._send(200, {"ok": True})
-        if self.path == "/api/owner/session":
-            try:
-                session = create_owner_session(self.headers.get("X-CyberSentinel-Owner-Token", ""))
-                return self._send(201, {"ok": True, "session": session})
-            except PermissionError as exc:
-                return self._send(403, {"ok": False, "error": str(exc)})
         if self.path == "/api/chat":
             try:
                 payload = self._read_json()
-                owner_token, owner_session, owner_challenge = self._chat_auth()
-                result = chat(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge)
+                owner_session = self._owner_session()
+                if owner_session is None:
+                    raise PermissionError("owner authentication required")
+                result = chat(payload, owner_session_token=owner_session["session_id"])
                 return self._send(200, {"ok": True, **result})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -351,9 +346,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/tasks":
             try:
                 payload = self._read_json()
-                owner_token, owner_session, _ = self._chat_auth()
-                owner_challenge = self.headers.get("X-CyberSentinel-Owner-Challenge")
-                result = create_task(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge, authentication_method="owner_session_challenge" if owner_session else "owner_token", run=bool(payload.get("run", True)))
+                owner_session = self._owner_session()
+                if owner_session is None:
+                    raise PermissionError("owner authentication required")
+                result = create_task(payload, owner_session_token=owner_session["session_id"], run=bool(payload.get("run", True)))
                 return self._send(201, {"ok": True, **result})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -362,13 +358,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/tasks/"):
             try:
                 task_id, action = self.path[len("/api/tasks/"):].split("/", 1)
-                owner_token, owner_session, _ = self._chat_auth()
+                owner_session = self._owner_session()
+                if owner_session is None:
+                    raise PermissionError("owner authentication required")
                 if action == "resume":
-                    result = resume_task(task_id, owner_token=owner_token, owner_session_id=owner_session, run=True)
+                    result = resume_task(task_id, owner_session_token=owner_session["session_id"], run=True)
                 elif action == "pause":
-                    result = pause_task(task_id, owner_token=owner_token, owner_session_id=owner_session)
+                    result = pause_task(task_id, owner_session_token=owner_session["session_id"])
                 elif action == "cancel":
-                    result = cancel_task(task_id, owner_token=owner_token, owner_session_id=owner_session)
+                    result = cancel_task(task_id, owner_session_token=owner_session["session_id"])
                 else:
                     return self._send(404, {"ok": False, "error": "unknown_task_action"})
                 return self._send(200, {"ok": True, **result})
@@ -400,12 +398,12 @@ class Handler(BaseHTTPRequestHandler):
             request_id = str(data.get("request_id", self.headers.get("X-CyberSentinel-Request-ID", ""))).strip()
             if request_id and (len(request_id) > 128 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in request_id)):
                 return self._send(400, {"ok": False, "error": "invalid_request_id"})
-            owner_token, owner_session, owner_challenge = self._chat_auth()
+            owner_session = self._owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
             result = chat(
                 {**data, "text": text, "request_id": request_id or None},
-                owner_token=owner_token,
-                owner_session_id=owner_session,
-                owner_challenge=owner_challenge,
+                owner_session_token=owner_session["session_id"],
             )
             return self._send(200, {"ok": True, **result})
         except Exception:

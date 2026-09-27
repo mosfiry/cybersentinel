@@ -11,20 +11,14 @@ from agent.agent_core import AgentCore
 from agent.mission import MissionStatus
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
 from core.engine import RUNTIME
+from security import owner_password
 
 
-def _validate_chat_entry(text: str, *, owner_token: str, owner_session_id: str | None, owner_challenge: str | None) -> None:
-    """Validate chat credentials without consuming a single-use challenge."""
-    if owner_session_id or owner_challenge:
-        if not owner_session_id or not owner_challenge:
-            raise PermissionError("owner challenge required")
-        from security.owner_session import validate_owner_challenge
-        validate_owner_challenge(owner_session_id, owner_challenge, text)
-        return
-    from security.owner_policy import verify_owner
-    ok, reason = verify_owner("Owner chat", owner_token)
-    if not ok:
-        raise PermissionError(reason)
+def _owner_session(owner_session_token: str) -> dict[str, Any]:
+    session = owner_password.resolve_session(owner_session_token)
+    if session is None or session.get("auth_method") != "username_password":
+        raise PermissionError("owner authentication required")
+    return session
 
 
 def _runtime() -> MissionTaskAdapter:
@@ -48,34 +42,32 @@ def _conversation_id(payload: dict[str, Any]) -> str:
     return conversation_id
 
 
-def create_task(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None, authentication_method: str = "owner_token", run: bool = True) -> dict[str, Any]:
+def create_task(payload: dict[str, Any], *, owner_session_token: str, run: bool = True) -> dict[str, Any]:
     text = str(payload.get("text", payload.get("objective", ""))).strip()
     if not text:
         raise ValueError("text_required")
     conversation_id = _conversation_id(payload)
+    owner = _owner_session(owner_session_token)
     task_runtime = _runtime()
-    task = task_runtime.create_task(conversation_id, text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge, authentication_method=authentication_method, scope_context=payload.get("scope_context"), run=run)
+    task = task_runtime.create_task(conversation_id, text, owner_session_token=owner_session_token, owner_session_id=owner["session_id"], authentication_method="username_password", scope_context=payload.get("scope_context"), run=run)
     return {"task": _task_public(task)}
 
 
-def resume_task(task_id: str, *, owner_token: str, owner_session_id: str | None = None, run: bool = True) -> dict[str, Any]:
+def resume_task(task_id: str, *, owner_session_token: str, run: bool = True) -> dict[str, Any]:
     task = TaskManager.get_task(task_id)
     if task is None:
         raise KeyError("unknown_task")
     if run:
-        task = _runtime().resume_task(task_id, owner_token=owner_token)
+        task = _runtime().resume_task(task_id, owner_session_token=owner_session_token)
     return {"task": _task_public(task)}
 
 
-def pause_task(task_id: str, *, owner_token: str, owner_session_id: str | None = None) -> dict[str, Any]:
-    from security.owner_policy import verify_owner
-    ok, reason = verify_owner("Owner pause task", owner_token)
-    if not ok:
-        raise PermissionError(reason)
+def pause_task(task_id: str, *, owner_session_token: str) -> dict[str, Any]:
+    owner = _owner_session(owner_session_token)
     task = TaskManager.get_task(task_id)
     if task is None:
         raise KeyError("unknown_task")
-    if owner_session_id and task.owner_session_id != owner_session_id:
+    if task.owner_session_id and task.owner_session_id != owner["session_id"]:
         raise PermissionError("task access denied")
     task.request_pause()
     task.update_status(TaskStatus.PAUSED)
@@ -83,22 +75,19 @@ def pause_task(task_id: str, *, owner_token: str, owner_session_id: str | None =
     return {"task": _task_public(task)}
 
 
-def cancel_task(task_id: str, *, owner_token: str, owner_session_id: str | None = None) -> dict[str, Any]:
-    from security.owner_policy import verify_owner
-    ok, reason = verify_owner("Owner cancel task", owner_token)
-    if not ok:
-        raise PermissionError(reason)
+def cancel_task(task_id: str, *, owner_session_token: str) -> dict[str, Any]:
+    owner = _owner_session(owner_session_token)
     task = TaskManager.get_task(task_id)
     if task is None:
         raise KeyError("unknown_task")
-    if owner_session_id and task.owner_session_id != owner_session_id:
+    if task.owner_session_id and task.owner_session_id != owner["session_id"]:
         raise PermissionError("task access denied")
     task.request_cancel()
     TaskManager.update_task(task)
     return {"task": _task_public(task)}
 
 
-def chat(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None) -> dict[str, Any]:
+def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]:
     text = str(payload.get("text", "")).strip()
     if not text:
         raise ValueError("text_required")
@@ -106,15 +95,13 @@ def chat(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | N
     # All chat modes now enter the same durable MissionRuntime.  The legacy
     # task/core-engine branch remains available only through the explicit task
     # compatibility endpoints below; it is not a chat execution path.
-    _validate_chat_entry(text, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
+    owner = _owner_session(owner_session_token)
     core = _agent_core()
-    ensure_conversation(conversation_id, owner_session_id or "")
+    ensure_conversation(conversation_id, owner["session_id"])
     add_conversation_message(conversation_id, "user", text)
-    mission = core.resume_mission(str(payload["mission_id"]), owner_token=owner_token) if payload.get("mission_id") else core.run_owner_mission(
+    mission = core.resume_mission(str(payload["mission_id"]), owner_session_token=owner_session_token) if payload.get("mission_id") else core.run_owner_mission(
         text,
-        owner_token=owner_token,
-        owner_session_id=owner_session_id,
-        owner_challenge=owner_challenge,
+        owner_session_token=owner_session_token,
         request_id=str(payload.get("request_id") or uuid.uuid4().hex),
         scope_context=payload.get("scope_context"),
         completion_criteria=payload.get("completion_criteria"),
@@ -161,17 +148,17 @@ def get_session(conversation_id: str) -> dict[str, Any] | None:
     return info
 
 
-def stream(payload: dict[str, Any], *, owner_token: str, owner_session_id: str | None = None, owner_challenge: str | None = None) -> Iterator[dict[str, Any]]:
+def stream(payload: dict[str, Any], *, owner_session_token: str) -> Iterator[dict[str, Any]]:
     yield {"event": "started", "data": {"conversation_id": payload.get("conversation_id")}}
-    result = chat(payload, owner_token=owner_token, owner_session_id=owner_session_id, owner_challenge=owner_challenge)
+    result = chat(payload, owner_session_token=owner_session_token)
     for activity in result.get("activity", []):
         event_name = activity.get("event", "tool_activity") if isinstance(activity, dict) else "tool_activity"
         yield {"event": event_name, "data": activity}
     yield {"event": "completed", "data": result}
 
 
-def task_stream(task_id: str, *, owner_token: str, owner_session_id: str | None = None) -> Iterator[dict[str, Any]]:
-    result = resume_task(task_id, owner_token=owner_token, owner_session_id=owner_session_id, run=True)
+def task_stream(task_id: str, *, owner_session_token: str) -> Iterator[dict[str, Any]]:
+    result = resume_task(task_id, owner_session_token=owner_session_token, run=True)
     for event in result["task"].get("events", []):
         yield {"event": event["event"], "data": event}
     yield {"event": "task.completed", "data": result}

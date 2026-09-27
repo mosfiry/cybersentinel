@@ -13,14 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = Path(os.environ.get("REAL_RUN_ARTIFACT_DIR", "/tmp/cybersentinel-real-runs"))
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 RUNNER_TOKEN = os.environ.get("RUNNER_AUTH_TOKEN", "")
-OWNER_TOKEN = os.environ.get("OWNER_TOKEN", "")
+OWNER_SESSION_TOKEN = os.environ.get("OWNER_SESSION_TOKEN", "")
 HOST = os.environ.get("REAL_RUNNER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("REAL_RUNNER_PORT", "8788"))
 
-if not RUNNER_TOKEN or not OWNER_TOKEN:
-    raise RuntimeError("RUNNER_AUTH_TOKEN and OWNER_TOKEN must be supplied by the launcher, never committed")
+if not RUNNER_TOKEN or not OWNER_SESSION_TOKEN:
+    raise RuntimeError("RUNNER_AUTH_TOKEN and OWNER_SESSION_TOKEN must be supplied by the launcher, never committed")
 
-# Import only after OWNER_TOKEN is present: owner_policy snapshots it at import time.
+# Import the live chat path; the Owner session token is supplied by the launcher.
 from api.chat import chat  # noqa: E402
 from core.engine import RUNTIME  # noqa: E402
 
@@ -131,7 +131,7 @@ class Handler(BaseHTTPRequestHandler):
             received_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             # This is the actual CyberSentinel API path. No provider response is
             # fabricated or returned directly by this runner.
-            result = chat({"text": message, "request_id": request_id, "conversation_id": conversation_id}, owner_token=OWNER_TOKEN)
+            result = chat({"text": message, "request_id": request_id, "conversation_id": conversation_id}, owner_session_token=OWNER_SESSION_TOKEN)
             proof = _proof(result, request_id=request_id, conversation_id=conversation_id, received_at=received_at)
             proof["artifact_path"] = _write_artifact(request_id, request, proof)
             return self._send(200, proof)
