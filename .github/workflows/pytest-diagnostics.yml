@@ -3,6 +3,8 @@ name: pytest-diagnostics
 on:
   push:
     branches-ignore: [main]
+    paths-ignore:
+      - 'diagnostics/**'
 
 concurrency:
   group: pytest-diagnostics-${{ github.ref }}
