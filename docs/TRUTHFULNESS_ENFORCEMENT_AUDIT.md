@@ -306,11 +306,9 @@ owner-approval forgery, serialization, UI status pass-through.
 --------------------------------------------------------------------------------
 ## 9. CI EVIDENCE for this document
 
-This document was pushed to security/truthfulness-overhaul as commit:
-  c5afdac61df6679210aeb4dd26f22eee5a42a731
-CI verdict for that commit (fetched from the commit checks page, same day):
-  "test (3.13)" succeeded Sep 27, 2026 in 30s - VERIFIED.
-This amendment commit records that verdict.
+This document is pushed to security/truthfulness-overhaul as commit:
+  T0-AUDIT-COMMIT (see git log; exact SHA recorded after push).
+CI verdict for that commit: RECORDED AFTER PUSH (see below).
 Historical CI evidence referenced (OBSERVED):
 - f0d876ef75dc: workflow run 36339132634 "test (3.13)" success (introduced
   the library; prior session evidence, re-verified as VERIFIED only via the
