@@ -1,0 +1,77 @@
+# pytest tail for 16ae7e287643
+
+........................................................................ [  9%]
+........................................................................ [ 19%]
+........................................................................ [ 29%]
+........................F............................................... [ 39%]
+........................................................................ [ 48%]
+........................................................................ [ 58%]
+........................................................................ [ 68%]
+........................................................................ [ 78%]
+........................................................................ [ 87%]
+.....s.................................................................. [ 97%]
+.................                                                        [100%]
+=================================== FAILURES ===================================
+___________ test_expired_snapshot_rejected_at_derivation_and_verify ____________
+
+    def test_expired_snapshot_rejected_at_derivation_and_verify():
+        moment = datetime.now(timezone.utc)
+        snapshot = make_snapshot(expires_in_seconds=1)
+>       proof = ExecutionAuthorizationProof.derive(
+            mission_id="mission-1", request_id="phase-one-request", tool=TEST_TOOL,
+            argument=TEST_ARGUMENT, snapshot=snapshot, plan_hash="plan-fingerprint-1",
+            mission_status="READY", at=moment.isoformat(),
+        )
+
+tests/test_execution_proof_phase1.py:284: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'security.execution_proof.ExecutionAuthorizationProof'>
+
+    @classmethod
+    def derive(cls, *, mission_id: str, request_id: str, tool: str, argument: Any, snapshot: MissionAuthorizationSnapshot | None = None, decision: Any = None, tool_call_id: str = "", run_id: str = "", plan_hash: str = "", scope: Any = None, mission_status: str = "", lifecycle_revision: int = 0, policy_fingerprint: str = "", ttl_seconds: int = PROOF_TTL_SECONDS, at: str | None = None, execution_class: str = "MISSION_BOUND") -> "ExecutionAuthorizationProof":
+        """Derive a proof for exactly one execution. Never creates authority.
+    
+        The execution class is explicit and determines the required bindings:
+    
+        - MISSION_BOUND: mission identity, request identity, mission lifecycle
+          status and revision, the plan fingerprint, the scope fingerprint and
+          the typed Owner-minted MissionAuthorizationSnapshot (embedded for
+          boundary re-validation) are all mandatory. The AuthorizationDecision
+          is bound when one exists.
+        - OWNER_DIRECT: the owner-authenticated non-mission execution class
+          (chat / task paths). The typed AuthorizationDecision that authorized
+          the execution and its request identity are mandatory; the decision
+          signature and policy fingerprint are bound canonically.
+        """
+        klass = str(execution_class)
+        if klass not in {item.value for item in ExecutionClass}:
+            raise ExecutionProofError(RejectionCode.PROOF_INVALID.value, f"unknown execution class {klass}")
+        moment = _parse(at or _now())
+        decision_fingerprint = ""
+        effective_policy_fingerprint = str(policy_fingerprint or "")
+        if decision is not None:
+            from security.authorization_context import AuthorizationDecision
+            if not isinstance(decision, AuthorizationDecision):
+                raise ExecutionProofError(RejectionCode.PROOF_INVALID.value, "execution proof requires a typed AuthorizationDecision")
+            if not decision.is_valid_for(tool, argument, request_id):
+                raise ExecutionProofError(RejectionCode.PROOF_BINDING_MISMATCH.value, "authorization decision does not match tool, arguments, or request")
+            decision_fingerprint = decision.decision_signature
+            effective_policy_fingerprint = decision.policy_fingerprint
+        if klass == ExecutionClass.MISSION_BOUND.value:
+            if not isinstance(snapshot, MissionAuthorizationSnapshot):
+                raise ExecutionProofError(RejectionCode.SNAPSHOT_INVALID.value, "mission-bound proof requires a typed MissionAuthorizationSnapshot")
+            if not str(mission_id):
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires mission identity")
+            if not str(mission_status):
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires mission lifecycle status")
+            if not str(plan_hash or ""):
+                raise ExecutionProofError(RejectionCode.PROOF_INCOMPLETE.value, "mission-bound proof requires the mission plan fingerprint")
+            if not snapshot.is_active(at=at):
+>               raise ExecutionProofError(RejectionCode.SNAPSHOT_EXPIRED.value, "authorization snapshot expired or not active")
+E               security.execution_proof.ExecutionProofError: SNAPSHOT_EXPIRED: authorization snapshot expired or not active
+
+security/execution_proof.py:277: ExecutionProofError
+=========================== short test summary info ============================
+FAILED tests/test_execution_proof_phase1.py::test_expired_snapshot_rejected_at_derivation_and_verify - security.execution_proof.ExecutionProofError: SNAPSHOT_EXPIRED: authorization snapshot expired or not active
+1 failed, 735 passed, 1 skipped in 14.44s
