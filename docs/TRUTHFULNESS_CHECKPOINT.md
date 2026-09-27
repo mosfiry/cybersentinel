@@ -7,7 +7,7 @@ api.github.com (unauth, 60/hr) exhausts quickly; the commit checks page
 (https://github.com/mosfiry/cybersentinel/commit/<sha>/checks) renders
 step verdicts and "Invalid workflow file" annotations without the API.
 
-## Verified commit chain (all CI green, evidence recorded)
+## Verified commit chain (CI verdicts recorded from diagnostics artifacts, not agent claims)
 - 370bada47512 — PHASE 0 audit record (docs/AUDIT_PHASE0.md, findings F1-F10)
 - ea69d1db6834 — PHASE 1: owner-session + request-ownership binding on
   GET /api/execution/{id} and POST /api/cancel (bridge token + owner session +
@@ -150,11 +150,23 @@ regression test asserting absence, push, verify CI on the exact SHA.
   semantics; CI green 33s) + 6e987908b30c (GOAL_COMPLETED system invariant
   in Mission.transition + MissionStore.save; truth payload in api/chat.py;
   web/app.js completion-invention fallbacks removed; enforcement battery
-  tests/test_truthfulness_enforcement.py; CI green 37s). CI-authored
-  diagnostics markers preserved (67c59033, 885e7b1550).
+  tests/test_truthfulness_enforcement.py). CORRECTION (evidence-first):
+  6e987908b30c CI was FAILURE, not green - the "37s succeeded" row seen
+  was the pytest-diagnostics job; the authoritative artifact
+  diagnostics/ci-6e987908b30c.md (marker 885e7b1550) records
+  "result: FAILURE" (1 failed / 759 passed) because the GOAL_COMPLETED
+  guard preceded the recovery-reconciliation check. Fixed forward in
+  913ebd4e6625 (guard after recovery gate; closure test sets
+  verification_state before the legitimate transition).
+  diagnostics/ci-913ebd4e6625.md records "result: SUCCESS" (marker
+  17001527). CI-authored diagnostics markers preserved (67c59033,
+  885e7b1550, 0a74574e, 1d26fd8f, 17001527).
 - Bypasses B1-B8 from the T0 audit: FIXED with regression + adversarial
-  tests; remaining limitations recorded in the audit doc (no runtime CI
-  minting boundary yet; persistence-time guard for direct status writes).
+  tests, with enforcement evidence tied to 913ebd4e6625 (CI SUCCESS);
+  remaining limitations recorded in the audit doc (no runtime CI
+  minting boundary yet; persistence-time guard for direct status
+  writes). The earlier "CI green 37s" claim for 6e987908b30c in this
+  checkpoint was WRONG and is superseded by the correction above.
 - NEXT (PLANNED, NOT RUN): wire the SystemEvidenceIssuer into
   MissionRuntime action recording (execution_runtime evidence minting),
   memory/external-data labeling seams, and the CI trusted-provider

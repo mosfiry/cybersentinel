@@ -363,7 +363,8 @@ provenance, then prove it with production-path adversarial tests.
     mission_truth_payload (canonical API truth object). Unit battery
     updated: bare trusted-name records are no longer authoritative;
     caller-supplied execution data can never certify success.
-  - 6e987908b30c (37s): production wiring - agent/mission.py transition()
+  - 6e987908b30c (CI FAILURE at push time - see CI CORRECTION below):
+    production wiring - agent/mission.py transition()
     structurally blocks GOAL_COMPLETED without
     verification_state["verified"] is True, and MissionStore.save() refuses
     to persist an unverified GOAL_COMPLETED even after direct in-memory
@@ -378,7 +379,27 @@ provenance, then prove it with production-path adversarial tests.
     verification state; model final text cannot complete; store refuses
     unverified completion; forged tokens rejected; frontend/ API wiring
     regression tests).
-- BYPASS STATUS AFTER T2: B1 FIXED (enforcement battery + wiring), B2 FIXED
+- CI CORRECTION (2026-09-27, evidence-first): the earlier note that
+  6e987908b30c was "CI green 37s" was WRONG. The "succeeded 37s" row on
+  the commit checks page was the pytest-diagnostics job, not the test
+  job; the authoritative diagnostics artifact
+  diagnostics/ci-6e987908b30c.md (marker commit 885e7b1550) records
+  "result: FAILURE" (1 failed / 759 passed / 1 skipped, 26.16s): the
+  GOAL_COMPLETED guard was ordered BEFORE the recovery-reconciliation
+  check in Mission.transition(), so
+  test_terminal_and_recovery_transitions_are_closed received the
+  invariant error instead of the reconciliation error. Fixed forward in
+  913ebd4e6625: guard moved AFTER the recovery gate (recovery precedence
+  preserved), and the legitimate completion transition in that test now
+  sets the deterministic verification_state first (the test previously
+  relied on assertion-only completion, which the new invariant forbids).
+  CI evidence for 913ebd4e6625: diagnostics/ci-913ebd4e6625.md records
+  "result: SUCCESS" (marker commit 17001527, preserved). The docs
+  commits b96c13766e33 and 2b4bdacbd300 recorded the wrong green claim;
+  their own CI runs also FAILED
+  (diagnostics/ci-2b4bdacbd300.md: "result: FAILURE", same root cause).
+  This correction supersedes those claims.
+- BYPASS STATUS AFTER T2 (evidence tied to 913ebd4e6625, CI SUCCESS): B1 FIXED (enforcement battery + wiring), B2 FIXED
   (HMAC provenance), B3 FIXED (fail-closed; trusted CI minting boundary does
   not exist yet and is NOT faked), B4 FIXED (truth payload on responses),
   B5 FIXED (state-machine + persistence invariant), B6 FIXED (exact gate
