@@ -19,7 +19,7 @@ from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
 from security.plan_integrity import plan_hash
-from .lifecycle import begin as begin_lifecycle, complete as complete_lifecycle, get as get_lifecycle, is_cancelled, recover_incomplete, transition as transition_lifecycle
+from .lifecycle import begin as begin_lifecycle, bind_owner as bind_owner_lifecycle, release_unclaimed as release_unclaimed_lifecycle, complete as complete_lifecycle, get as get_lifecycle, is_cancelled, recover_incomplete, transition as transition_lifecycle
 from evaluation.critic import critique
 from .response import InternalDiagnostic
 
@@ -57,12 +57,42 @@ def execute(tool: str, argument: str | None = None, *, authorization_decision=No
 def _handle_once(text, source="web", presented_token=None, owner_session_token=None, request_id=None, scope_context=None):
     request_id = request_id or uuid.uuid4().hex
     lifecycle = begin_lifecycle(request_id, source)
-    if lifecycle.status == "completed":
-        replay = dict(lifecycle.final_result or {"ok": False, "decision": "failed", "request_id": request_id})
-        replay["idempotent_replay"] = True
-        return replay
-    if not lifecycle.claimed or lifecycle.status != "created":
-        return {"ok": False, "decision": "in_progress", "request_id": request_id, "lifecycle": lifecycle.status, "answer": "الطلب قيد التنفيذ أو يحتاج إلى recovery؛ لن تتم إعادة تنفيذه."}
+    fresh_claim = bool(lifecycle.claimed) and lifecycle.status == "created"
+    if not fresh_claim:
+        # Existing request: nothing about it may be returned before Owner
+        # authentication AND request ownership are proven (fail closed).
+        owner_ok = False
+        owner_reason = "owner authentication required"
+        auth_evidence = None
+        auth_context = {
+            "owner_authenticated": False,
+            "owner_session_id": None,
+            "authentication_method": "none",
+            "authenticated_at": None,
+        }
+        try:
+            auth_evidence = authenticate_owner(owner_session_token, request_id)
+            owner_ok, owner_reason = True, "owner-authenticated"
+            auth_context = {
+                "owner_authenticated": True,
+                "owner_session_id": auth_evidence.session_id,
+                "authentication_method": "username_password",
+                "authenticated_at": auth_evidence.authenticated_at,
+            }
+        except PermissionError as exc:
+            owner_reason = str(exc)
+        if not owner_ok:
+            return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}
+        existing = get_lifecycle(request_id)
+        if existing is None or not existing.owner_session_id:
+            return {"ok": False, "decision": "in_progress", "request_id": request_id, "lifecycle": "unknown_owner" if existing is None else existing.status, "answer": "الطلب غير مرتبط بمالك مثبت؛ لن تتم إعادة تنفيذه أو كشف نتائجه."}
+        if existing.owner_session_id != auth_context["owner_session_id"]:
+            return {"ok": False, "decision": "deny", "request_id": request_id, "answer": "الطلب مملوك لجلسة مالك أخرى؛ تم الرفض.", "plan": [], "results": [], "lifecycle": "completed"}
+        if existing.status == "completed":
+            replay = dict(existing.final_result or {"ok": False, "decision": "failed", "request_id": request_id})
+            replay["idempotent_replay"] = True
+            return replay
+        return {"ok": False, "decision": "in_progress", "request_id": request_id, "lifecycle": existing.status, "answer": "الطلب قيد التنفيذ أو يحتاج إلى recovery؛ لن تتم إعادة تنفيذه."}
     owner_ok = False
     owner_reason = "owner authentication required"
     auth_evidence = None
@@ -84,9 +114,17 @@ def _handle_once(text, source="web", presented_token=None, owner_session_token=N
     except PermissionError as exc:
         owner_reason = str(exc)
     auth_event = add_event("auth", "Owner authentication", owner_reason, source, "info" if owner_ok else "warning", owner_ok, {"request_id": request_id, "decision": "allow" if owner_ok else "deny"})
+    if owner_ok:
+        try:
+            bind_owner_lifecycle(request_id, str(auth_context["owner_session_id"]))
+        except PermissionError:
+            response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "الطلب مملوك لجلسة مالك أخرى؛ تم الرفض.", "plan": [], "results": [], "lifecycle": "completed"}
+            complete_lifecycle(request_id, response, success=False, error="request ownership mismatch")
+            return response
     if not owner_ok:
         response = {"ok": False, "decision": "deny", "request_id": request_id, "answer": "مصادقة المالك مطلوبة.", "plan": [], "results": [], "lifecycle": "completed"}
         complete_lifecycle(request_id, response, success=False, error=owner_reason)
+        release_unclaimed_lifecycle(request_id)
         return response
     if text.strip().casefold().startswith("owner instruction:"):
         instruction_text = text.split(":", 1)[1].strip()

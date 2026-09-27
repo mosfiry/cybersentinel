@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS executions (
     attempt INTEGER NOT NULL DEFAULT 1,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     final_result_json TEXT NOT NULL DEFAULT '',
-    error TEXT NOT NULL DEFAULT ''
+    error TEXT NOT NULL DEFAULT '',
+    owner_session_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
 
@@ -111,6 +112,10 @@ def connect():
     con.executescript(SCHEMA)
     try:
         con.execute("ALTER TABLE executions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        con.execute("ALTER TABLE executions ADD COLUMN owner_session_id TEXT NOT NULL DEFAULT ''")
     except sqlite3.OperationalError:
         pass
     return con

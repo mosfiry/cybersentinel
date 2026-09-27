@@ -32,13 +32,14 @@ class LifecycleRecord:
     cancel_requested: bool
     final_result: dict[str, Any] | None
     error: str
+    owner_session_id: str = ""
     claimed: bool = False
 
 
 def _decode(row) -> LifecycleRecord | None:
     if row is None:
         return None
-    return LifecycleRecord(row["request_id"], row["status"], row["source"], row["plan_hash"], row["provider"], row["model"], row["attempt"], bool(row["cancel_requested"]), json.loads(row["final_result_json"]) if row["final_result_json"] else None, row["error"])
+    return LifecycleRecord(row["request_id"], row["status"], row["source"], row["plan_hash"], row["provider"], row["model"], row["attempt"], bool(row["cancel_requested"]), json.loads(row["final_result_json"]) if row["final_result_json"] else None, row["error"], row["owner_session_id"] if "owner_session_id" in row.keys() else "")
 
 
 def request_cancel(request_id: str) -> LifecycleRecord:
@@ -60,16 +61,42 @@ def get(request_id: str) -> LifecycleRecord | None:
         return _decode(con.execute("SELECT * FROM executions WHERE request_id = ?", (request_id,)).fetchone())
 
 
-def begin(request_id: str, source: str) -> LifecycleRecord:
+def begin(request_id: str, source: str, owner_session_id: str = "") -> LifecycleRecord:
     """Atomically create a request; an existing request is never executed twice."""
     with connect() as con:
         try:
-            con.execute("INSERT INTO executions(request_id,source,status) VALUES(?,?,?)", (request_id, source, "created"))
+            con.execute("INSERT INTO executions(request_id,source,status,owner_session_id) VALUES(?,?,?,?)", (request_id, source, "created", str(owner_session_id or "")))
             row = con.execute("SELECT * FROM executions WHERE request_id = ?", (request_id,)).fetchone()
             return replace(_decode(row), claimed=True)
         except sqlite3.IntegrityError:
             row = con.execute("SELECT * FROM executions WHERE request_id = ?", (request_id,)).fetchone()
             return replace(_decode(row), claimed=False)
+
+
+def bind_owner(request_id: str, owner_session_id: str) -> LifecycleRecord:
+    """Bind an execution to the authenticated Owner session (never rebind to another owner)."""
+    owner_session_id = str(owner_session_id or "")
+    if not owner_session_id:
+        raise ValueError("owner_session_id required")
+    with connect() as con:
+        row = con.execute("SELECT * FROM executions WHERE request_id = ?", (request_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown request_id")
+        current = row["owner_session_id"] if "owner_session_id" in row.keys() else ""
+        if current and current != owner_session_id:
+            raise PermissionError("request already owned by another owner session")
+        if not current:
+            con.execute("UPDATE executions SET owner_session_id=?,updated_at=CURRENT_TIMESTAMP WHERE request_id=?", (owner_session_id, request_id))
+    record = get(request_id)
+    if record is None:
+        raise ValueError("unknown request_id")
+    return record
+
+
+def release_unclaimed(request_id: str) -> None:
+    """Remove a never-authorized, unbound execution row so the request_id can be retried."""
+    with connect() as con:
+        con.execute("DELETE FROM executions WHERE request_id=? AND owner_session_id='' AND status='created'", (request_id,))
 
 
 def transition(request_id: str, target: str, *, plan_hash: str = "", provider: str = "", model: str = "", error: str = "") -> LifecycleRecord:

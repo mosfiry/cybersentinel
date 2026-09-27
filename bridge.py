@@ -224,10 +224,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/execution/"):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            owner_session = self._owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
             request_id = self.path[len("/api/execution/"):]
             record = get_lifecycle(request_id)
             if record is None:
                 return self._send(404, {"ok": False, "error": "unknown_request_id"})
+            if not record.owner_session_id or record.owner_session_id != owner_session["session_id"]:
+                return self._send(403, {"ok": False, "error": "request ownership required"})
             return self._send(200, {"ok": True, "request_id": request_id, "lifecycle": record.__dict__, "events": events_for_request(request_id)})
         if self.path.startswith("/api/reasoning/"):
             if not self._bridge_auth():
@@ -375,12 +380,22 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, KeyError) as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
         if self.path == "/api/cancel":
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            owner_session = self._owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 data = json.loads(self.rfile.read(n) or b"{}")
                 request_id = str(data.get("request_id", "")).strip()
                 if not request_id:
                     return self._send(400, {"ok": False, "error": "request_id_required"})
+                record = get_lifecycle(request_id)
+                if record is None:
+                    return self._send(404, {"ok": False, "error": "unknown_request_id"})
+                if not record.owner_session_id or record.owner_session_id != owner_session["session_id"]:
+                    return self._send(403, {"ok": False, "error": "request ownership required"})
                 record = request_cancel(request_id)
                 return self._send(200, {"ok": True, "request_id": request_id, "lifecycle": record.status, "cancel_requested": record.cancel_requested})
             except ValueError:
