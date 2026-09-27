@@ -60,6 +60,10 @@ class WorkspaceAuditEvent:
     timestamp: float = field(default_factory=time.time)
 
 
+def _hash(value: Any) -> str:
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+
+
 class Workspace:
     """A root-confined, auditable operating environment for AgentCore tools."""
 
@@ -77,6 +81,11 @@ class Workspace:
 
     def resolve(self, relative: str | Path = ".") -> Path:
         candidate = Path(relative)
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        else:
+            resolved = (self.root / candidate).resolve()
+        if resolved != self.root and self.root not in resolved.parents:
             raise WorkspaceBoundaryError("path escapes workspace root")
         return resolved
 
@@ -110,6 +119,8 @@ class Workspace:
         path = self.resolve(relative)
         if not path.is_dir():
             raise NotADirectoryError(str(relative))
+        result = sorted(item.name for item in path.iterdir())
+        self._record("list", path=path, output_value=result)
         return result
 
     def read(self, relative: str | Path, *, encoding: str = "utf-8") -> str:
@@ -117,6 +128,8 @@ class Workspace:
         path = self.resolve(relative)
         if not path.is_file():
             raise FileNotFoundError(str(relative))
+        value = path.read_text(encoding=encoding)
+        self._record("read", path=path, output_value=value)
         return value
 
     def write(self, relative: str | Path, content: str, *, encoding: str = "utf-8", create_parents: bool = True) -> Path:
@@ -124,6 +137,15 @@ class Workspace:
         path = self.resolve(relative)
         if create_parents:
             path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding=encoding)
+        self._record("write", path=path, input_value=content)
+        return path
+
+    def edit(self, relative: str | Path, old: str, new: str, *, expected_count: int = 1) -> Path:
+        content = self.read(relative)
+        count = content.count(old)
+        if count != expected_count:
+            raise ValueError(f"edit expected {expected_count} matches, found {count}")
         return self.write(relative, content.replace(old, new), create_parents=False)
 
     def create(self, relative: str | Path, *, directory: bool = False) -> Path:
@@ -131,6 +153,10 @@ class Workspace:
         path = self.resolve(relative)
         if directory:
             path.mkdir(parents=True, exist_ok=False)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=False)
+        self._record("create", path=path)
         return path
 
     def move(self, source: str | Path, destination: str | Path) -> Path:
@@ -139,6 +165,9 @@ class Workspace:
         src, dst = self.resolve(source), self.resolve(destination)
         if not src.exists():
             raise FileNotFoundError(str(source))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil_move(str(src), str(dst))
+        self._record("move", path=src, input_value=str(destination))
         return dst
 
     def delete(self, relative: str | Path) -> None:
@@ -146,6 +175,16 @@ class Workspace:
         path = self.resolve(relative)
         if path == self.root:
             raise WorkspaceBoundaryError("cannot delete workspace root")
+        if path.is_dir():
+            for child in sorted(path.rglob("*"), reverse=True):
+                if child.is_file() or child.is_symlink():
+                    child.unlink()
+                elif child.is_dir():
+                    child.rmdir()
+            path.rmdir()
+        elif path.exists():
+            path.unlink()
+        self._record("delete", path=path)
 
     def run_shell(self, command: str, *, timeout: float | None = None, network: bool = False, credentials: bool = False) -> "ProcessResult":
         argv = tuple(shlex.split(command))
@@ -161,6 +200,8 @@ class Workspace:
         self.policy.authorize("process", command=command, network=network, credentials=credentials)
         workdir = self.resolve(cwd)
         started = time.time()
+        try:
+            completed = run(command, cwd=workdir, capture_output=True, text=True, timeout=timeout or self.policy.default_timeout, check=False, env={"PATH": os.environ.get("PATH", "")})
             result = ProcessResult(command, completed.stdout[-self.policy.max_output_bytes:], completed.stderr[-self.policy.max_output_bytes:], completed.returncode, False, time.time() - started)
         except subprocess.TimeoutExpired as exc:
             result = ProcessResult(command, str(exc.stdout or "")[-self.policy.max_output_bytes:], str(exc.stderr or "")[-self.policy.max_output_bytes:], None, True, time.time() - started)
@@ -180,6 +221,16 @@ class Workspace:
 
 
 @dataclass(frozen=True)
+class ProcessResult:
+    command: tuple[str, ...]
+    stdout: str
+    stderr: str
+    exit_code: int | None
+    timed_out: bool
+    duration_seconds: float
+
+    @property
+    def ok(self) -> bool:
         return self.exit_code == 0 and not self.timed_out
 
     def to_dict(self) -> dict[str, Any]:
