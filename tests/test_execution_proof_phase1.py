@@ -80,8 +80,8 @@ def owner_decision(owner_context):
     )
 
 
-def make_snapshot(*, mission_id: str = "mission-1", allowed_tools: tuple[str, ...] = (TEST_TOOL,), forbidden_actions: tuple[str, ...] = (), expires_in_seconds: int = 3600) -> MissionAuthorizationSnapshot:
-    now = datetime.now(timezone.utc)
+def make_snapshot(*, mission_id: str = "mission-1", allowed_tools: tuple[str, ...] = (TEST_TOOL,), forbidden_actions: tuple[str, ...] = (), expires_in_seconds: int = 3600, at: datetime | None = None) -> MissionAuthorizationSnapshot:
+    now = at or datetime.now(timezone.utc)
     return MissionAuthorizationSnapshot.create(
         owner_identity="mosfiry",
         mission_id=mission_id,
@@ -280,7 +280,10 @@ def test_snapshot_tool_outside_allowlist_rejected_at_derivation():
 
 def test_expired_snapshot_rejected_at_derivation_and_verify():
     moment = datetime.now(timezone.utc)
-    snapshot = make_snapshot(expires_in_seconds=1)
+    # Anchor the snapshot creation to moment: derive(at=moment) must see the
+    # snapshot as active (created_at <= moment < expires_at), not as one that
+    # does not exist yet at that instant.
+    snapshot = make_snapshot(expires_in_seconds=1, at=moment)
     proof = ExecutionAuthorizationProof.derive(
         mission_id="mission-1", request_id="phase-one-request", tool=TEST_TOOL,
         argument=TEST_ARGUMENT, snapshot=snapshot, plan_hash="plan-fingerprint-1",
