@@ -60,8 +60,7 @@ jobs:
             exit 1
           fi
       - name: Write status
-     
-   if: always()
+        if: always()
         shell: bash
         run: |
           mkdir -p diagnostics

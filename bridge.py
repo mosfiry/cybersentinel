@@ -20,16 +20,11 @@ from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 from security.owner_policy import verify_owner
 from security.owner_session import create_owner_session
+from security.owner_password import login as owner_password_login, logout as owner_password_logout
 from api.chat import chat, get_session, sse, stream, task_stream, create_task, resume_task, pause_task, cancel_task
 from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
-from security.owner_password import (
-    OwnerAuthenticationError,
-    login as owner_password_login,
-    resolve_session as resolve_owner_password_session,
-    revoke_session as revoke_owner_password_session,
-)
 from security.public_session import DEFAULT_PUBLIC_SESSIONS
 from api.missions import MissionService
 from agent.mission_worker import MissionQueue, MissionScheduler
@@ -52,8 +47,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Contr
-ol", "no-store")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
@@ -92,8 +86,7 @@ ol", "no-store")
             self._send(401, {"ok": False, "error": "bridge authentication required"})
             return None
         owner_token, owner_session, owner_challenge = self._chat_auth()
-        if owner_session and owner_
-challenge:
+        if owner_session and owner_challenge:
             return owner_token, owner_session, owner_challenge
         owner_ok, reason = verify_owner("Owner mission API", owner_token)
         if not owner_ok:
@@ -124,8 +117,7 @@ challenge:
         return morsel.value if morsel else ""
 
     def _public_guard(self, *, csrf=True):
-        if 
-not self._public_enabled():
+        if not self._public_enabled():
             self._send(404, {"ok": False, "error": "public_boundary_disabled"})
             return None
         if not self._public_origin_allowed():
@@ -169,7 +161,6 @@ not self._public_enabled():
             auth = self._mission_owner()
             if auth is None:
                 return
-
             parts = parsed.path[len("/api/missions/"):].split("/")
             mission_id, action = parts[0], parts[1] if len(parts) > 1 else "status"
             try:
@@ -197,8 +188,7 @@ not self._public_enabled():
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
             query = parse_qs(parsed.query)
-            payload = {"text": query.get("text", [""])[0], "conversation_id": query.get("conversation_id",
- [""])[0]}
+            payload = {"text": query.get("text", [""])[0], "conversation_id": query.get("conversation_id", [""])[0]}
             owner_token, owner_session, owner_challenge = self._chat_auth()
             return self._send_sse(stream(payload, owner_token=owner_token, owner_session_id=owner_session, owner_challenge=owner_challenge))
         if parsed.path.startswith("/api/tasks/"):
@@ -231,8 +221,7 @@ not self._public_enabled():
             return self._send(200, status())
         if self.path.startswith("/api/execution/"):
             if not self._bridge_auth():
-     
-           return self._send(401, {"ok": False, "error": "bridge authentication required"})
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
             request_id = self.path[len("/api/execution/"):]
             record = get_lifecycle(request_id)
             if record is None:
@@ -265,8 +254,7 @@ not self._public_enabled():
                         raise ValueError("objective_required")
                     raw_plan = payload["plan"]
                     raw_steps = raw_plan.get("steps", [])
-                    steps = tuple(PlanStep(step_id=str(item["step_id"]), objec
-tive=str(item.get("objective", item["step_id"])), prerequisites=tuple(item.get("prerequisites", ())), action=str(item.get("action", "")), expected_observation=str(item.get("expected_observation", "")), authorization_requirement=str(item.get("authorization_requirement", "owner")), scope_requirement=str(item.get("scope_requirement", "")), retry_policy=dict(item.get("retry_policy", {})), verification=tuple(item.get("verification", ()))) for item in raw_steps)
+                    steps = tuple(PlanStep(step_id=str(item["step_id"]), objective=str(item.get("objective", item["step_id"])), prerequisites=tuple(item.get("prerequisites", ())), action=str(item.get("action", "")), expected_observation=str(item.get("expected_observation", "")), authorization_requirement=str(item.get("authorization_requirement", "owner")), scope_requirement=str(item.get("scope_requirement", "")), retry_policy=dict(item.get("retry_policy", {})), verification=tuple(item.get("verification", ()))) for item in raw_steps)
                     plan = Plan(version=int(raw_plan.get("version", 1)), objective=objective, assumptions=tuple(raw_plan.get("assumptions", ())), steps=steps, dependencies=tuple(raw_plan.get("dependencies", ())), completion_criteria=tuple(raw_plan.get("completion_criteria", ())), risk=str(raw_plan.get("risk", "unknown")), created_from=str(raw_plan.get("created_from", "api")))
                     owner_identity = "owner-session" if owner_session else "owner-token"
                     mission = self._mission_service().create_mission(objective, objective, plan, owner_identity_ref=owner_identity, scope_snapshot=payload.get("scope_context"), completion_criteria=payload.get("completion_criteria") or [], authorization_snapshot_factory=self._mission_snapshot_factory(owner_identity, payload.get("scope_context")))
@@ -278,8 +266,7 @@ tive=str(item.get("objective", item["step_id"])), prerequisites=tuple(item.get("
             except (ValueError, KeyError) as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
         if self.path.startswith("/api/missions/"):
-  
-          auth = self._mission_owner()
+            auth = self._mission_owner()
             if auth is None:
                 return
             parts = self.path[len("/api/missions/"):].split("/")
@@ -306,8 +293,7 @@ tive=str(item.get("objective", item["step_id"])), prerequisites=tuple(item.get("
             if not self._public_enabled() or not self._public_origin_allowed():
                 return self._send(404, {"ok": False, "error": "public_boundary_disabled"})
             session = DEFAULT_PUBLIC_SESSIONS.create()
-            return self._send(201, {"ok": True, "session": session.public()}, headers={"Set-Cookie": self._public_cookie_header(session.session_id, PUBLIC_SE
-SSION_TTL_SECONDS)})
+            return self._send(201, {"ok": True, "session": session.public()}, headers={"Set-Cookie": self._public_cookie_header(session.session_id, PUBLIC_SESSION_TTL_SECONDS)})
         if self.path == "/api/public/logout":
             session = self._public_guard(csrf=False)
             if session is None:
@@ -325,28 +311,24 @@ SSION_TTL_SECONDS)})
         if not self._bridge_auth():
             return self._send(401, {"ok": False, "error": "bridge authentication required"})
         if self.path == "/api/auth/login":
-            # Canonical human Owner login: USERNAME + PASSWORD.
-            # BRIDGE_TOKEN above is a transport credential only and never
-            # implies Owner identity. Client-declared roles/booleans are
-            # never consulted; identity comes exclusively from the
-            # server-side session created by owner_password.login().
+            # Canonical human Owner authentication: username + password only.
+            # Generic 403 on ANY failure: never reveal whether the username exists.
             try:
                 payload = self._read_json()
                 session = owner_password_login(
                     str(payload.get("username", "")), str(payload.get("password", ""))
                 )
-            except (OwnerAuthenticationError, ValueError):
-                # Generic failure: never reveal whether the username exists.
+            except Exception:
                 return self._send(403, {"ok": False, "error": "invalid_credentials"})
-            # Never echo the submitted password or any verifier material.
             return self._send(200, {"ok": True, "session": session})
         if self.path == "/api/auth/logout":
-            session = resolve_owner_password_session(
-                self.headers.get("X-CyberSentinel-Owner-Session", "")
-            )
-            if session is None:
-                return self._send(401, {"ok": False, "error": "invalid_owner_session"})
-            revoke_owner_password_session(session["session_id"])
+            # Revoke the server-side session; idempotent and unauthenticated by design.
+            try:
+                payload = self._read_json()
+            except Exception:
+                payload = {}
+            session_id = str(payload.get("session_id", "")) if isinstance(payload, dict) else ""
+            owner_password_logout(session_id)
             return self._send(200, {"ok": True})
         if self.path == "/api/owner/session":
             try:
@@ -366,8 +348,7 @@ SSION_TTL_SECONDS)})
                 return self._send(400, {"ok": False, "error": str(exc)})
             except Exception:
                 return self._send(500, {"ok": False, "error": "chat_failed"})
-        if self.path == "/api/
-tasks":
+        if self.path == "/api/tasks":
             try:
                 payload = self._read_json()
                 owner_token, owner_session, _ = self._chat_auth()
@@ -398,8 +379,7 @@ tasks":
         if self.path == "/api/cancel":
             try:
                 n = int(self.headers.get("Content-Length", "0"))
-                data = js
-on.loads(self.rfile.read(n) or b"{}")
+                data = json.loads(self.rfile.read(n) or b"{}")
                 request_id = str(data.get("request_id", "")).strip()
                 if not request_id:
                     return self._send(400, {"ok": False, "error": "request_id_required"})
@@ -435,8 +415,7 @@ on.loads(self.rfile.read(n) or b"{}")
         print("[bridge]", fmt % args)
 
 
-def ma
-in():
+def main():
     if not BRIDGE_TOKEN:
         raise SystemExit("BRIDGE_TOKEN is required in .env")
     server = ThreadingHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
