@@ -38,6 +38,11 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest -q 2>&1 | tee pytest_out.txt
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            { echo "## pytest failed (exit $code)"; grep -E '^(FAILED|ERROR)' pytest_out.txt | head -40; echo; tail -c 3000 pytest_out.txt; } >> diag.txt
+          fi
+          exit $code
       - name: Annotate test failures
         if: failure()
         shell: bash
@@ -62,7 +67,8 @@ jobs:
         run: |
           set -uo pipefail
           if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?$)' > sens_out.txt; then
-            { echo "## sensitive file tracked by git:"; cat sens_out.txt; } >> diag.txt
+            { echo "## sensitive fi
+le tracked by git:"; cat sens_out.txt; } >> diag.txt
             exit 1
           fi
           if MATCHES=$(git grep -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example' ':!diagnostics'); then
@@ -82,7 +88,7 @@ jobs:
             { echo "# CI run $sha"; echo "result: SUCCESS"; } > "diagnostics/ci-$sha.md"
           fi
       - name: Publish diagnostics
-        if: always() && github.ref == 'refs/heads/main'
+        if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/security/owner-password-auth-migration')
         shell: bash
         run: |
           git config user.name "mosfiry"
