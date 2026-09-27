@@ -111,3 +111,33 @@ regression test asserting absence, push, verify CI on the exact SHA.
 4. PHASE 10/11: full regression + evidence-first final report.
 5. F9 gaps (rate limiting / password policy in security/owner_password.py)
    remain open.
+
+## UPDATE 2026-09-27 — PHASE T0: TRUTHFULNESS ENFORCEMENT AUDIT (VERIFIED, audit-only)
+
+- T0 executed as a fresh source-grounded audit (no production code changed).
+  Deliverable: docs/TRUTHFULNESS_ENFORCEMENT_AUDIT.md, pushed in
+  c5afdac61df6 (CI VERIFIED: "test (3.13)" succeeded 30s) with the SHA/CI
+  verdict recorded in-doc by 71ff304203 (CI VERIFIED: succeeded 28s).
+- Central verdict: PARTIAL - LIBRARY EXISTS, SYSTEM ENFORCEMENT NOT PROVEN.
+  security/truthfulness.py (introduced f0d876ef75dc with only its test) has
+  ZERO production callers (verified by commit-file inventory + direct scan
+  of bridge.py, api/, agent/ runtime files, core/engine.py).
+- Bypasses found (all OPEN): B1 library not wired (CRITICAL); B2
+  is_authoritative() is origin-NAME membership, forgeable (CRITICAL); B3
+  verify_ci_claim trusts caller-supplied run-id/conclusion/sha (CRITICAL);
+  B4 model answer has no EvidenceStatus labeling (HIGH); B5
+  evaluate_completion has no production caller (CRITICAL track-level); B6
+  gate matching by substring (MEDIUM); B7 UI fallbacks invent
+  "completed"/"اكتمل التحليل." (MEDIUM-HIGH); B8 no EvidenceStatus->API
+  mapping (MEDIUM).
+- Positive controls OBSERVED: GOAL_COMPLETED requires deterministic
+  GoalVerification (mission-scoped); VerificationEngine treats model claims
+  as proposals; Owner authority = server-side password sessions only;
+  action statuses written post-execution by MissionRuntime; doc terminology
+  guard is CI-enforced.
+- Test classification: 15 UNIT / 0 INTEGRATION / 0 ADVERSARIAL-production /
+  0 END_TO_END.
+- NEXT: implementation phase - wire truthfulness into a production boundary
+  (chat response classification seam + completion gate), replace name-based
+  origins with verifiable provenance, then production-path adversarial
+  suite. NOTHING in T0 is COMPLETE.
