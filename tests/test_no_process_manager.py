@@ -33,4 +33,4 @@ def test_no_raw_popen_outside_audited_path():
     source = (ROOT / "workspace" / "environment.py").read_text(encoding="utf-8")
     assert "Popen" not in source
     assert 'self._authorize("process"' in source
-    assert "self._record("process"" in source
+    assert 'self._record("process"' in source
