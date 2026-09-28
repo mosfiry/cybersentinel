@@ -113,6 +113,9 @@ def test_terminal_and_recovery_transitions_are_closed():
     with pytest.raises(ValueError, match="reconciliation"):
         mission.transition(MissionStatus.GOAL_COMPLETED, "forged completion")
     mission.transition(MissionStatus.READY, "reconciled")
+    # Legitimate completion path: the deterministic goal-verification state must be
+    # present (written by MissionRuntime) before GOAL_COMPLETED is accepted.
+    mission.verification_state = {"verified": True}
     mission.transition(MissionStatus.GOAL_COMPLETED, "verified")
     with pytest.raises(ValueError, match="terminal"):
         mission.transition(MissionStatus.RUNNING, "forged resurrection")

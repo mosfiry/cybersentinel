@@ -103,6 +103,13 @@ class Mission:
             raise TypeError("mission transition requires MissionStatus")
         if self.status is MissionStatus.RECOVERY_REQUIRED and target not in {MissionStatus.RECOVERY_REQUIRED, MissionStatus.READY}:
             raise ValueError("recovery requires reconciliation before continuation")
+        # SYSTEM INVARIANT (deterministic completion): GOAL_COMPLETED is
+        # impossible without the deterministic goal-verification state written
+        # by MissionRuntime. No caller (model, API, worker, library) can
+        # complete a mission by assertion. Ordered AFTER the recovery gate so
+        # recovery reconciliation keeps precedence.
+        if target is MissionStatus.GOAL_COMPLETED and self.verification_state.get("verified") is not True:
+            raise ValueError("GOAL_COMPLETED is a system invariant: deterministic goal verification state is required")
         recovery_reconciled = self.status is MissionStatus.RECOVERY_REQUIRED and target is MissionStatus.READY
         owner_intervention = self.status is MissionStatus.OWNER_INPUT_REQUIRED and target in {MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.READY}
         if self.is_terminal and target is not self.status and not recovery_reconciled and not owner_intervention:
