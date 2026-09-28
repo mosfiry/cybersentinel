@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, Callable
 import json
 import sqlite3
@@ -158,6 +159,20 @@ class MissionWorker:
         if item is None:
             return None
         runtime = self.runtime_factory()
+        renewal_stop = Event()
+        renewal_errors: list[Exception] = []
+        renewal_interval = max(0.1, self.lease_seconds / 3)
+
+        def renew_lease() -> None:
+            while not renewal_stop.wait(renewal_interval):
+                try:
+                    self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                except Exception as exc:
+                    renewal_errors.append(exc)
+                    return
+
+        renewal_thread = Thread(target=renew_lease, name=f"cybersentinel-lease-{self.worker_id}", daemon=True)
+        renewal_thread.start()
         try:
             try:
                 mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds))
@@ -170,7 +185,18 @@ class MissionWorker:
             # stale worker must not overwrite the queue outcome or report FAILED.
             return self.queue.get(item.mission_id)
         except Exception as exc:
-            return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}", worker_id=self.worker_id)
+            try:
+                return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}", worker_id=self.worker_id)
+            except LeaseLostError:
+                return self.queue.get(item.mission_id)
+        finally:
+            renewal_stop.set()
+            renewal_thread.join(timeout=max(1.0, renewal_interval * 2))
+        if renewal_errors:
+            error = renewal_errors[0]
+            if isinstance(error, LeaseLostError):
+                return self.queue.get(item.mission_id)
+            raise error
         state = {
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
             MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,

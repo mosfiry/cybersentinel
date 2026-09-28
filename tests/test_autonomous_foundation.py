@@ -161,6 +161,24 @@ def test_worker_does_not_mark_mission_failed_after_lease_takeover(tmp_path):
     assert result.last_error == ""
 
 
+def test_worker_does_not_mark_reclaimed_mission_failed_after_runtime_exception(tmp_path):
+    import sqlite3
+
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-runtime-error-taken-over", available_at="2026-01-01T00:00:00+00:00")
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            with sqlite3.connect(queue.db_path) as db:
+                db.execute("UPDATE mission_queue SET lease_owner=? WHERE mission_id=?", ("replacement-worker", mission_id))
+            raise RuntimeError("handler crashed")
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="stale-worker").run_once(now="2026-01-01T00:00:00+00:00")
+    assert result.state is WorkerMissionState.EXECUTING
+    assert result.lease_owner == "replacement-worker"
+    assert result.last_error == ""
+
+
 def test_worker_does_not_overwrite_requeued_mission_after_handler_lease_expiry(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-expired-handler", available_at="2026-01-01T00:00:00+00:00")
@@ -212,6 +230,38 @@ def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
         MissionWorker(queue, lambda: Runtime(), lease_seconds=0)
     result = MissionWorker(queue, lambda: Runtime(), lease_seconds=17).run_once(now="2026-01-01T00:00:00+00:00")
     assert result.state is WorkerMissionState.COMPLETED
+
+
+def test_worker_renews_lease_during_long_handler_and_stops_renewal_thread(tmp_path):
+    import threading
+    import time
+
+    class RecordingQueue(MissionQueue):
+        def __init__(self, db_path):
+            super().__init__(db_path)
+            self.heartbeat_count = 0
+
+        def heartbeat(self, *args, **kwargs):
+            self.heartbeat_count += 1
+            return super().heartbeat(*args, **kwargs)
+
+    queue = RecordingQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-long-handler", available_at="2026-01-01T00:00:00+00:00")
+
+    class Mission:
+        status = MissionStatus.GOAL_COMPLETED
+        evidence = [{"criterion_id": "done"}]
+        error = ""
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            time.sleep(1.2)
+            return Mission()
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="long-handler", lease_seconds=3).run_once(now="2026-01-01T00:00:00+00:00")
+    assert result.state is WorkerMissionState.COMPLETED
+    assert queue.heartbeat_count >= 1
+    assert not any(thread.name == "cybersentinel-lease-long-handler" for thread in threading.enumerate())
 
 
 def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
