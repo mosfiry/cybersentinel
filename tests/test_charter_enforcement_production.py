@@ -40,11 +40,10 @@ def test_conflicting_system_rule_is_authority_conflict():
 
 
 def test_missing_required_behavior_is_drift():
-    removal = CharterRule(CharterDomain.EXECUTION, "goal_completion_requires_deterministic_verification", Stance.REQUIRED, provenance=RuleProvenance.OWNER_INSTRUCTION)
-    reduced_charter = frozenset(r for r in ce.CHARTER_RULES if r != removal)
+    from security.owner_charter import assert_required_behaviors_present
+    reduced_system = [r for r in ce.SYSTEM_RULES if not (r.domain is CharterDomain.EXECUTION and r.behavior == "goal_completion_requires_deterministic_verification")]
     with pytest.raises(OwnerInstructionConflict):
-        from security.owner_charter import assert_required_behaviors_present
-        assert_required_behaviors_present(reduced_charter, list(ce.SYSTEM_RULES))
+        assert_required_behaviors_present(ce.CHARTER_RULES, reduced_system)
 
 
 def test_model_output_cannot_legislate():
