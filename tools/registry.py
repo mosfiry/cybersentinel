@@ -319,16 +319,15 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
-        workspace_authorization = mission_authorization
+        # Authority Constitution Article 8 (docs/AUTHORITY_CONSTITUTION.md):
+        # No Self-Minting Authority. The tool runtime is an execution boundary,
+        # never an authority source. It must consume an Owner-derived
+        # MissionAuthorizationSnapshot and a governed Workspace; it can never
+        # mint either for itself. Absence fails closed.
+        if mission_authorization is None:
+            raise PermissionError("run_project_tests requires an Owner-derived MissionAuthorizationSnapshot; tool runtime cannot mint authorization")
         if workspace is None:
-            from datetime import datetime, timedelta, timezone
-            from security.mission_authorization import MissionAuthorizationSnapshot
-            root = Path(os.getenv("CYBERSENTINEL_TEST_ROOT", Path.cwd())).expanduser().resolve()
-            legacy_owner = getattr(authorization_decision, "owner_evidence_fingerprint", "legacy-compatibility")
-            compatibility_snapshot = MissionAuthorizationSnapshot.create(owner_identity=legacy_owner, mission_id=str(request_id or "legacy-request"), target_identity="legacy-workspace", scope=("workspace",), allowed_actions=(name,), forbidden_actions=(), allowed_tools=(name,), time_window={"timezone": "UTC"}, max_duration=60, rate_limits={name: 1}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("legacy-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(root)}, policy_version="compatibility", owner_approval=legacy_owner, created_at=datetime.now(timezone.utc).isoformat(), expires_at=(datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat())
-            from workspace import Workspace
-            workspace = Workspace(root, authorization_snapshot=compatibility_snapshot)
-            workspace_authorization = compatibility_snapshot
+            raise PermissionError("run_project_tests requires a governed Workspace; tool runtime cannot create its own execution environment")
         workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
         future = executor.submit(spec.handler, argument, workspace=workspace)
     else:

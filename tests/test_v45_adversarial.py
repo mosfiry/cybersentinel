@@ -7,6 +7,8 @@ from agent.model_router import ModelRouter
 from agent.runtime import AgentRuntime
 from security.plan_integrity import plan_hash, validate_plan_object
 from tools.registry import ToolSpec, build_registry, execute
+from security.mission_authorization import MissionAuthorizationSnapshot
+from workspace import Workspace
 
 
 class ForgedProvider:
@@ -57,9 +59,34 @@ def test_unknown_tool_cannot_reach_handler():
         execute("delete_everything")
 
 
+def _v45_snapshot(root: str) -> MissionAuthorizationSnapshot:
+    return MissionAuthorizationSnapshot.create(
+        owner_identity="owner-proof",
+        mission_id="m-v45",
+        target_identity="local-workspace",
+        scope=("workspace",),
+        allowed_actions=("run_project_tests",),
+        forbidden_actions=(),
+        allowed_tools=("run_project_tests",),
+        time_window={"timezone": "UTC"},
+        max_duration=600,
+        rate_limits={"run_project_tests": 1},
+        network_boundary={"allowed": ()},
+        data_boundary={"allowed": ("local-workspace",)},
+        credential_boundary={"allowed": ()},
+        workspace_boundary={"root": root},
+        policy_version="policy-v1",
+        owner_approval="owner-approval",
+    )
+
+
 def test_run_project_tests_is_bounded_and_not_shell(tmp_path, monkeypatch):
     monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(tmp_path))
-    result = execute("run_project_tests", ".")
+    snapshot = _v45_snapshot(str(tmp_path))
+    workspace = Workspace(tmp_path)
+    result = execute("run_project_tests", ".", mission_authorization=snapshot, workspace=workspace, mission_id="m-v45", request_id="req-v45")
     assert set(result) == {"ok", "timed_out", "returncode", "output"}
     with pytest.raises(ValueError):
-        execute("run_project_tests", "../")
+        execute("run_project_tests", "../", mission_authorization=snapshot, workspace=workspace, mission_id="m-v45", request_id="req-v45")
+    with pytest.raises(PermissionError):
+        execute("run_project_tests", ".")
