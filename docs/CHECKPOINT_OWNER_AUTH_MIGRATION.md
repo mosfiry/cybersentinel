@@ -228,3 +228,80 @@ NEXT (resume X-E live-path integration per session 2 design):
 3. Inert non-code legacy mentions (documented, no security impact):
    security/owner_policy.json require_owner_token key (zero consumers),
    docs/OWNER_MASTER_DIRECTIVE_AUDIT_2026-09-22.md history.
+
+
+---
+
+## SESSION 6 (2026-09-28) — Repository-wide auth audit + residue removal + mission-path battery
+
+- AUDIT (full repository, every .py/.json/.yml under agent/, api/, core/, security/,
+  tools/, cyber/, cyber_data/, cyber_knowledge/, evaluation/, knowledge/, reasoning/,
+  retrieval/, search/, workspace/, scripts/, tests/, web/, root): ZERO occurrences of
+  OWNER_TOKEN / owner_token / verify_owner / owner_challenge /
+  X-CyberSentinel-Owner-Token in any live code. Owner identity on every live path =
+  server-side password session only. Full classification:
+  docs/OWNER_AUTH_AUDIT_2026-09-28.md.
+- Commit d9457ccbc1ba (CI GREEN — both checks success): X-F residue removal:
+  core/engine.py dead presented_token parameter removed (zero callers repo-wide);
+  security/owner_policy.py dead OWNER_PHRASE env constant removed (zero consumers);
+  .env.example / .env.agent.example no longer instruct OWNER_TOKEN /
+  CYBERSENTINEL_OWNER_PHRASE — now document username+password bootstrap +
+  POST /api/auth/login + X-CyberSentinel-Owner-Session; BRIDGE_TOKEN noted as
+  transport-only.
+- Commit 238889c5144d (CI GREEN — tests workflow run 36498913295: pytest step
+  completed SUCCESS on the full suite): tests/test_owner_mission_path_auth.py —
+  bridge mission-route adversarial battery: 13 Owner routes (GET
+  status/timeline/evidence/artifacts/logs, POST start/pause/resume/cancel/schedule,
+  POST create with plan, POST chat fallback) rejected with 403 on missing session,
+  unknown session, forged/legacy session values ("OWNER_TOKEN", magic "Owner",
+  "owner", "true", role/boolean JSON forgery, BRIDGE_TOKEN value as session),
+  revoked session; 401 on wrong bridge token; every rejection asserts
+  handler_calls == 0; per-route positive controls; real password-DB lifecycle test
+  (wrong password -> PermissionError, revocation, server-side expiry).
+- Commit 73da174603d9 (CI GREEN — both checks success): FUNCTIONAL DEFECT FIX:
+  .github/workflows/github-only-poc.yml gated the real-provider step on dead
+  secrets.OWNER_TOKEN while scripts/run_real_provider_mission.py requires
+  OWNER_SESSION_TOKEN (BLOCKED / OWNER_SESSION_TOKEN_REQUIRED) — the step could
+  NEVER execute. Aligned to secrets.OWNER_SESSION_TOKEN; secret-scan extended to
+  OWNER_SESSION_TOKEN.
+- NEW VERIFIED BYTE-EXACT CHANNEL: api.github.com contents endpoint base64
+  "content" field -> decode -> gitBlobSha == directory-listing blob sha (verified
+  on this checkpoint: b4db202a6dface5a64c4cee0bc48fa5f7c401ac9). NOTE:
+  raw.githubusercontent.com fetch inserted 6 spurious newlines into this file
+  (13,979 vs 13,973 bytes) — NEVER use raw fetch as a push base.
+- OPEN (next unit): active-docs reconciliation — README.md, docs/OPERATIONS.md,
+  SECURITY_MODEL.md, TESTING.md, OWNER_POLICY.md, AGENT_ARCHITECTURE.md,
+  PUBLIC_WEB_ARCHITECTURE.md, GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md still describe
+  the OWNER_TOKEN era (classified in docs/OWNER_AUTH_AUDIT_2026-09-28.md Section 5).
+
+### SESSION 6 CHECKPOINT FIELDS
+
+- CURRENT_PHASE: Mission 1 (owner auth migration) — code complete; docs reconciliation open
+- CURRENT_UNIT: X-G active-docs reconciliation
+- CURRENT_STEP: X-G.1 fetch byte-exact doc bases via the contents-API b64 channel
+- LAST_COMPLETED_STEP: X-F residue removal + mission-path battery + poc.yml fix (73da174603d9)
+- NEXT_STEP: reconcile active docs (see NEXT_SESSION_FIRST_ACTION)
+- LAST_VERIFIED_COMMIT: 73da174603d9 (both checks success)
+- TEST_STATUS: d9457ccbc1ba GREEN; 238889c5144d GREEN (tests run 36498913295 pytest
+  step success); 73da174603d9 GREEN
+- CI_STATUS: tests.yml success on all three session-6 commits; docs-export success;
+  pytest-diagnostics pytest green (marker publication may lag)
+- OPEN_ISSUES: (1) active-docs OWNER_TOKEN drift (operator-facing, no runtime
+  effect); (2) inert require_owner_token config key (zero consumers, session-2
+  decision); (3) Owner-local bootstrap not yet run
+  (python -m security.owner_password_bootstrap); (4) merge into main = Owner decision
+- INVARIANTS_PROVEN: username+password-only auth on ALL live paths; verifier-only
+  storage; client-claim/magic-string/OWNER_TOKEN rejection with handler_calls == 0
+  on chat AND mission routes; revoked/expired/forged session rejection; BRIDGE_TOKEN
+  never Owner identity
+- FILES_CHANGED (session 6): core/engine.py, security/owner_policy.py, .env.example,
+  .env.agent.example, tests/test_owner_mission_path_auth.py,
+  .github/workflows/github-only-poc.yml, docs/OWNER_AUTH_AUDIT_2026-09-28.md,
+  docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md
+- NEXT_SESSION_FIRST_ACTION: Start X-G.1: fetch README.md and the seven active docs
+  (OPERATIONS, SECURITY_MODEL, TESTING, OWNER_POLICY, AGENT_ARCHITECTURE,
+  PUBLIC_WEB_ARCHITECTURE, GITHUB_ONLY_DEPLOYMENT_ANALYSIS) via the api.github.com
+  contents base64 channel (verify gitBlobSha against the directory listing),
+  rewrite their Owner-auth sections to the username/password + session model,
+  push as one commit, then verify CI (tests.yml + diagnostics marker). Keep
+  historical/dated docs untouched.
