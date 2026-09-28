@@ -44,9 +44,7 @@ def make_snapshot(root: str, *, owner: str = "owner-proof", mission_id: str = "m
 
 def test_tool_cannot_mint_authorization_for_itself(tmp_path, monkeypatch):
     monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(tmp_path))
-    (tmp_path / "test_ok.py").write_text("def test_ok():
-    assert True
-")
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
     with pytest.raises(PermissionError, match="mint"):
         execute("run_project_tests", ".")
 
@@ -67,9 +65,7 @@ def test_authorization_without_governed_workspace_is_rejected(tmp_path, monkeypa
 
 def test_owner_derived_authorization_executes_and_binds_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(tmp_path))
-    (tmp_path / "test_ok.py").write_text("def test_ok():
-    assert True
-")
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
     from agent.evidence import EvidenceChainStore
     store = EvidenceChainStore(tmp_path / "evidence.sqlite3")
     snapshot = make_snapshot(str(tmp_path))
