@@ -15,7 +15,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "security" / "owner_policy.json"
 STATE_PATH = ROOT / "security" / "owner_policy_state.json"
-OWNER_PHRASE = os.getenv("CYBERSENTINEL_OWNER_PHRASE", "Owner").strip()
 _STATE_LOCK = threading.RLock()
 _EVIDENCE_SECRET = secrets.token_bytes(32)
 _EVIDENCE_TTL_SECONDS = 300

@@ -54,7 +54,7 @@ def execute(tool: str, argument: str | None = None, *, authorization_decision=No
     return execute_tool(tool, argument, authorization_decision=authorization_decision, scope_context=scope_context)
 
 
-def _handle_once(text, source="web", presented_token=None, owner_session_token=None, request_id=None, scope_context=None):
+def _handle_once(text, source="web", owner_session_token=None, request_id=None, scope_context=None):
     request_id = request_id or uuid.uuid4().hex
     lifecycle = begin_lifecycle(request_id, source)
     if lifecycle.status == "completed":
@@ -219,10 +219,10 @@ def _handle_once(text, source="web", presented_token=None, owner_session_token=N
     return response
 
 
-def handle(text, source="web", presented_token=None, owner_session_token=None, request_id=None, scope_context=None):
+def handle(text, source="web", owner_session_token=None, request_id=None, scope_context=None):
     request_id = request_id or uuid.uuid4().hex
     try:
-        return _handle_once(text, source, presented_token, owner_session_token, request_id, scope_context)
+        return _handle_once(text, source, owner_session_token, request_id, scope_context)
     except Exception as exc:
         error = str(exc)[:500]
         current = get_lifecycle(request_id)
