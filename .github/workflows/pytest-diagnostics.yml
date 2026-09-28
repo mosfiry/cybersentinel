@@ -55,7 +55,7 @@ jobs:
         run: |
           S="${GITHUB_SHA:0:12}"
           {
-            echo "# OWNER charter audit â run $S"
+            echo "# OWNER charter audit - run $S"
             echo
             echo "## Files scanned:"
             git ls-files | wc -l
@@ -105,13 +105,25 @@ jobs:
           if [ "$code" -ne 0 ]; then
             { echo "## pytest failed (exit $code)"; tail -c 20000 pytest_out.txt; } >> diag.txt
           fi
-      - name: git diff check
+      - name: Commit-range whitespace check
         run: |
           set +e
-          git diff --check > diff_out.txt 2>&1
-          code=$?
-          if [ "$code" -ne 0 ]; then
-            { echo "## git diff --check failed (whitespace error, exit $code)"; cat diff_out.txt; } >> diag.txt
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && git rev-parse --verify --quiet "$BEFORE^{commit}" >/dev/null 2>&1; then
+              BASE="$BEFORE"
+            else
+              BASE=$(git rev-parse --quiet --verify "HEAD~1^{commit}" 2>/dev/null || echo "")
+            fi
+          fi
+          if [ -n "$BASE" ]; then
+            git diff --check "$BASE" "$GITHUB_SHA" > diff_out.txt 2>&1
+            code=$?
+            if [ "$code" -ne 0 ]; then
+              { echo "## commit-range whitespace check failed (range $BASE..$GITHUB_SHA, exit $code)"; cat diff_out.txt; } >> diag.txt
+            fi
           fi
       - name: Secret and sensitive-file scan
         shell: bash
