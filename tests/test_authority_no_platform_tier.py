@@ -13,7 +13,8 @@ import pytest
 from security.authority import (
     AuthorityTier,
     FIXED_AUTHORITY_TIERS,
-    application_policy_order_guard,
+    authority_snapshot,
+    validate_tier_name,
 )
 
 
