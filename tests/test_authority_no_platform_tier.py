@@ -13,8 +13,7 @@ import pytest
 from security.authority import (
     AuthorityTier,
     FIXED_AUTHORITY_TIERS,
-    authority_snapshot,
-    validate_tier_name,
+    application_policy_order_guard,
 )
 
 
@@ -50,4 +49,3 @@ def test_numbering_gap_records_removed_drift():
     values = sorted(int(tier) for tier in AuthorityTier)
     assert 700 not in values
     assert values == [100, 200, 300, 400, 500, 600, 800]
-
