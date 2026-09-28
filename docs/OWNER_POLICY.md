@@ -29,9 +29,9 @@ MODEL / TOOLS
 
 ## Authentication
 
-`Owner` is a human-readable marker, not authentication. `OWNER_TOKEN` authenticates the Owner at the policy layer, while `BRIDGE_TOKEN` authenticates the local bridge channel.
+`Owner` is a human-readable marker, not authentication. The Owner account is created or reset interactively with `python -m security.owner_password_bootstrap`; authentication uses a username/password verifier and revocable server-side session. `BRIDGE_TOKEN` authenticates only the local HTTP transport. The browser receives an HttpOnly cookie that refers to the Owner session; the public CSRF session alone never grants Owner authority.
 
-Never commit tokens to source control or send them to the model.
+Never commit passwords, session identifiers, bridge tokens, or provider credentials to source control or send them to the model.
 
 ## Policy changes
 

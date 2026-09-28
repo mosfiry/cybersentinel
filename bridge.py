@@ -11,6 +11,7 @@ from core.config import (
     BRIDGE_TOKEN,
     PUBLIC_SESSION_COOKIE,
     PUBLIC_SESSION_TTL_SECONDS,
+    PUBLIC_OWNER_SESSION_COOKIE,
     PUBLIC_WEB_ENABLED,
     PUBLIC_WEB_ORIGIN,
     DB_PATH,
@@ -110,13 +111,37 @@ class Handler(BaseHTTPRequestHandler):
 
     def _public_origin_allowed(self):
         origin = self.headers.get("Origin", "").strip()
-        return not origin or (PUBLIC_WEB_ORIGIN and origin == PUBLIC_WEB_ORIGIN)
+        if not origin:
+            return True
+        if PUBLIC_WEB_ORIGIN:
+            return origin == PUBLIC_WEB_ORIGIN
+        parsed = urlparse(origin)
+        host = self.headers.get("Host", "").strip()
+        return (
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc.casefold() == host.casefold()
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
 
     def _public_cookie(self):
         cookie = SimpleCookie()
         cookie.load(self.headers.get("Cookie", ""))
         morsel = cookie.get(PUBLIC_SESSION_COOKIE)
         return morsel.value if morsel else ""
+
+    def _public_owner_cookie(self):
+        cookie = SimpleCookie()
+        cookie.load(self.headers.get("Cookie", ""))
+        morsel = cookie.get(PUBLIC_OWNER_SESSION_COOKIE)
+        return morsel.value if morsel else ""
+
+    def _public_owner_session(self):
+        session = owner_password.resolve_session(self._public_owner_cookie())
+        if session is None or session.get("auth_method") != "username_password":
+            return None
+        return session
 
     def _public_guard(self, *, csrf=True):
         if not self._public_enabled():
@@ -137,7 +162,10 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def _public_cookie_header(self, session_id, max_age):
-        return f"{PUBLIC_SESSION_COOKIE}={session_id}; Max-Age={max_age}; Path=/; HttpOnly; Secure; SameSite=Lax"
+        return f"{PUBLIC_SESSION_COOKIE}={session_id}; Max-Age={max_age}; Path=/api/public; HttpOnly; Secure; SameSite=Lax"
+
+    def _public_owner_cookie_header(self, session_id, max_age):
+        return f"{PUBLIC_OWNER_SESSION_COOKIE}={session_id}; Max-Age={max_age}; Path=/api/public; HttpOnly; Secure; SameSite=Lax"
 
     def _send_sse(self, events):
         self.send_response(200)
@@ -159,6 +187,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             return self._static("index.html")
         parsed = urlparse(self.path)
+        if parsed.path == "/api/public/auth/session":
+            public_session = self._public_guard(csrf=False)
+            if public_session is None:
+                return
+            owner_session = self._public_owner_session()
+            response = {"ok": True, "authenticated": owner_session is not None}
+            if owner_session is not None:
+                response["username"] = owner_session["username"]
+                response["expires_at"] = owner_session["expires_at"]
+            headers = None
+            if self._public_owner_cookie() and owner_session is None:
+                headers = {"Set-Cookie": self._public_owner_cookie_header("", 0)}
+            return self._send(200, response, headers=headers)
         if parsed.path.startswith("/api/missions/"):
             auth = self._mission_owner()
             if auth is None:
@@ -293,6 +334,47 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"ok": False, "error": "public_boundary_disabled"})
             session = DEFAULT_PUBLIC_SESSIONS.create()
             return self._send(201, {"ok": True, "session": session.public()}, headers={"Set-Cookie": self._public_cookie_header(session.session_id, PUBLIC_SESSION_TTL_SECONDS)})
+        if self.path == "/api/public/auth/login":
+            if self._public_guard(csrf=True) is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_credentials")
+                username = payload.get("username")
+                password = payload.get("password")
+                if (
+                    not isinstance(username, str)
+                    or not isinstance(password, str)
+                    or not username
+                    or not password
+                    or len(username) > 128
+                    or len(password) > 4096
+                ):
+                    raise ValueError("invalid_credentials")
+                session = owner_password_login(username, password)
+            except PermissionError:
+                return self._send(403, {"ok": False, "error": "invalid_credentials"})
+            except ValueError:
+                return self._send(400, {"ok": False, "error": "invalid_credentials"})
+            except Exception:
+                return self._send(500, {"ok": False, "error": "owner_login_failed"})
+            previous = self._public_owner_cookie()
+            if previous and previous != session["session_id"]:
+                owner_password_logout(previous)
+            owner = owner_password.resolve_session(session["session_id"])
+            if owner is None:
+                return self._send(500, {"ok": False, "error": "owner_login_failed"})
+            return self._send(
+                200,
+                {"ok": True, "authenticated": True, "username": owner["username"], "expires_at": owner["expires_at"]},
+                headers={"Set-Cookie": self._public_owner_cookie_header(session["session_id"], owner_password.SESSION_TTL_SECONDS)},
+            )
+        if self.path == "/api/public/auth/logout":
+            if self._public_guard(csrf=True) is None:
+                return
+            owner_password_logout(self._public_owner_cookie())
+            return self._send(200, {"ok": True, "authenticated": False}, headers={"Set-Cookie": self._public_owner_cookie_header("", 0)})
         if self.path == "/api/public/logout":
             session = self._public_guard(csrf=False)
             if session is None:
@@ -300,13 +382,23 @@ class Handler(BaseHTTPRequestHandler):
             DEFAULT_PUBLIC_SESSIONS.revoke(session.session_id)
             return self._send(200, {"ok": True}, headers={"Set-Cookie": self._public_cookie_header("", 0)})
         if self.path == "/api/public/chat":
-            session = self._public_guard(csrf=True)
-            if session is None:
+            if self._public_guard(csrf=True) is None:
                 return
-            # Public session identity is deliberately not Owner authority.
-            # Do not call the internal chat path until an Owner-approved
-            # identity-to-Owner mapping exists.
-            return self._send(403, {"ok": False, "error": "owner_authorization_required"})
+            owner_session = self._public_owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner_authorization_required"})
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_request")
+                result = chat(payload, owner_session_token=owner_session["session_id"])
+                return self._send(200, {"ok": True, **result})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+            except Exception:
+                return self._send(500, {"ok": False, "error": "chat_failed"})
         if not self._bridge_auth():
             return self._send(401, {"ok": False, "error": "bridge authentication required"})
         if self.path == "/api/auth/login":

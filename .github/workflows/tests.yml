@@ -1,18 +1,17 @@
 name: tests
-
 on:
   push:
   pull_request:
-
+permissions:
+  contents: read
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: false
-
 jobs:
   test:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     strategy:
       matrix:
         python-version: ["3.13"]
@@ -21,64 +20,60 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: pip install
-        run: |
-          set +e
-          python -m pip install -r requirements.txt > pip_out.txt 2>&1
-          code=$?
-          if [ "$code" -ne 0 ]; then
-            { echo "## pip install failed (exit $code)"; tail -c 2000 pip_out.txt; } >> diag.txt
-            exit 1
-          fi
-      - name: compileall
-        run: |
-          set -o pipefail
-          python -m compileall -q . 2>&1 | tee compile_out.txt
-      - name: pytest
-        run: |
-          set -o pipefail
-          python -m pytest -q 2>&1 | tee pytest_out.txt
-      - name: git diff check
-        run: |
-          set +e
-          git diff --check > diff_out.txt 2>&1
-          code=$?
-          if [ "$code" -ne 0 ]; then
-            { echo "## git diff --check failed (whitespace error, exit $code)"; cat diff_out.txt; } >> diag.txt
-            exit 1
-          fi
-      - name: Secret and sensitive-file scan
+      - name: Install dependencies
+        id: dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Compile Python sources
+        id: compile
+        run: python -m compileall -q .
+      - name: Run tests
+        id: tests
+        run: python -m pytest -q
+      - name: Check patch whitespace
+        id: diff
+        run: git diff --check
+      - name: Scan for secrets and sensitive files
+        id: secrets
         shell: bash
         run: |
-          set -uo pipefail
-          if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?$)' > sens_out.txt; then
-            { echo "## sensitive file tracked by git:"; cat sens_out.txt; } >> diag.txt
+          set -euo pipefail
+          if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?)$'; then
+            echo "A sensitive file is tracked; inspect the workflow log and remove the file from the proposed change."
             exit 1
           fi
-          if MATCHES=$(git grep -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example' ':!diagnostics'); then
-            { echo "## secret-scan match:"; echo "$MATCHES"; } >> diag.txt
+          if git grep -q -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example' ':!diagnostics'; then
+            echo "A secret-like pattern was found; details are intentionally not copied into diagnostics artifacts."
             exit 1
           fi
-      - name: Write status
+      - name: Write status report
         if: always()
-        shell: bash
-        run: |
-          mkdir -p diagnostics
-          sha="${GITHUB_SHA:0:12}"
-          if [ -f diag.txt ]; then
-            { echo "# CI run $sha"; echo "result: FAILURE"; echo; cat diag.txt; } > "diagnostics/ci-$sha.md"
-          else
-            { echo "# CI run $sha"; echo "result: SUCCESS"; } > "diagnostics/ci-$sha.md"
-          fi
-      - name: Publish diagnostics
-        if: always() && github.ref == 'refs/heads/main'
-        shell: bash
-        run: |
-          git config user.name "mosfiry"
-          git config user.email "msfiry36@gmail.com"
-          git add diagnostics/
-          git commit -m "ci status report (ci-skip-marker)" || echo "nothing to commit"
-          git pull --rebase --no-edit || true
-          git push
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          DIFF_OUTCOME: ${{ steps.diff.outcome }}
+          SECRETS_OUTCOME: ${{ steps.secrets.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci-output
+          cat > ci-output/status.md <<EOF
+          # CyberSentinel CI status
+
+          - Commit: ${GITHUB_SHA}
+          - Ref: ${GITHUB_REF}
+          - Dependencies: ${DEPENDENCIES_OUTCOME}
+          - Compile: ${COMPILE_OUTCOME}
+          - Tests: ${TESTS_OUTCOME}
+          - Whitespace: ${DIFF_OUTCOME}
+          - Secret scan: ${SECRETS_OUTCOME}
+
+          Full step output remains available in this Actions run. Diagnostics are uploaded as an artifact and are never committed back to a branch.
+          EOF
+      - name: Upload status artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cybersentinel-ci-${{ github.run_id }}
+          path: ci-output/status.md
+          if-no-files-found: error
+          retention-days: 14

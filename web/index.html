@@ -4,12 +4,15 @@
 <link rel="stylesheet" href="/style.css"></head><body>
 <div class="layout"><aside id="side"><div class="brand"><div class="logo">CS</div><div><b>CyberSentinel X</b><small>V5 Agent Platform</small></div></div>
 <div class="state"><i></i><span>جلسة عامة؛ صلاحيات المالك منفصلة</span></div>
+<section class="auth-card" aria-labelledby="authTitle"><b id="authTitle">مصادقة المالك</b><small id="authState" role="status">جارٍ التحقق من الجلسة...</small>
+<form id="loginForm"><label for="loginUsername">اسم المستخدم</label><input id="loginUsername" name="username" autocomplete="username" required maxlength="128"><label for="loginPassword">كلمة المرور</label><input id="loginPassword" name="password" type="password" autocomplete="current-password" required maxlength="4096"><button id="loginButton" type="submit">تسجيل الدخول</button></form>
+<button id="logoutButton" class="hidden" type="button">تسجيل الخروج</button><small id="authMessage" role="status" aria-live="polite"></small></section>
 <button class="nav active" data-action="chat">◉ المحادثة</button><button class="nav" data-action="intel">◈ استخبارات التهديد</button><button class="nav" data-action="local">⌁ فحص محلي</button><button class="nav" data-action="status">◌ حالة النظام</button>
 <div class="security"><b>Trust Boundary</b><small>المصادر الخارجية أدلة فقط؛ كل Tool Call يمر عبر السياسة والتفويض وسجل الأدلة.</small></div></aside>
-<main><header><button id="menu">☰</button><div><b>CyberSentinel X Agent</b><small id="conn">اتصال...</small></div><button id="reload">↻</button></header>
+<main><header><button id="menu" type="button">☰</button><div><b>CyberSentinel X Agent</b><small id="conn">اتصال...</small></div><button id="reload" type="button">↻</button></header>
 <section id="chat" class="page"><div id="messages"><div class="welcome"><div class="hero">CS</div><h1>CyberSentinel X</h1><p>محادثة أمنية طبيعية: أفهم السؤال، أطلب الأدلة، أستدعي الأدوات المصرح بها، ثم أوضح الفرضيات والثقة.</p><div class="cards"><button data-p="افحص آخر الأحداث وابحث عن نشاط مشبوه">تحليل الأحداث</button><button data-p="حدّث استخبارات التهديدات ثم اعرض الملخص">تحديث الاستخبارات</button><button data-p="افحص الجهاز محليًا">فحص محلي</button><button data-p="ما حالة النظام؟">حالة النظام</button></div></div></div>
-<form id="form"><textarea id="input" rows="1" placeholder="اكتب سؤالك الأمني بلغة طبيعية..."></textarea><button>➤</button></form><div class="hint">Conversation → Reasoning → Tool Call → Authorization → Evidence → Natural Response</div></section>
-<section id="intel" class="page hidden"><div class="panel"><h2>استخبارات التهديد</h2><button id="intelBtn">تحديث المصادر الآن</button><div id="intelOut"></div></div></section>
-<section id="local" class="page hidden"><div class="panel"><h2>الفحص المحلي</h2><button id="localBtn">فحص TCP على هذا الجهاز</button><div id="localOut"></div></div></section>
+<form id="form"><textarea id="input" rows="1" placeholder="اكتب سؤالك الأمني بلغة طبيعية..."></textarea><button type="submit">➤</button></form><div class="hint">Conversation → Reasoning → Tool Call → Authorization → Evidence → Natural Response</div></section>
+<section id="intel" class="page hidden"><div class="panel"><h2>استخبارات التهديد</h2><button id="intelBtn" type="button">تحديث المصادر الآن</button><div id="intelOut"></div></div></section>
+<section id="local" class="page hidden"><div class="panel"><h2>الفحص المحلي</h2><button id="localBtn" type="button">فحص TCP على هذا الجهاز</button><div id="localOut"></div></div></section>
 <section id="status" class="page hidden"><div class="panel"><h2>حالة النظام</h2><div id="statusOut"></div></div></section>
 </main></div><script src="/app.js"></script></body></html>

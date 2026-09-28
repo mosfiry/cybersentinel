@@ -2,13 +2,15 @@
 
 Install development dependencies with `python -m pip install -r requirements.txt`. Run the syntax check with `python -m compileall -q .` and the regression suite with `pytest -q`.
 
-The regression tests cover bridge/Owner credential separation, missing Owner authentication, planner policy propagation, provider/model provenance, deterministic fallback, unknown tools, malformed arguments, argument length limits, duplicate/invalid registry entries, closed plan schemas, canonical plan hashes, provider metadata forgery, tampered evidence, bounded `run_project_tests` execution, duplicate request claims, crash recovery, cancellation persistence, replay of completed requests, and per-tool timeout behavior. The HTTP smoke test also verifies that an identical request ID produces a replay instead of a second execution and that `/api/execution/<request_id>` reconstructs the durable record.
+The regression tests cover bridge/Owner credential separation, missing Owner authentication, planner policy propagation, provider/model provenance, deterministic fallback, unknown tools, malformed arguments, argument length limits, duplicate/invalid registry entries, closed plan schemas, canonical plan hashes, provider metadata forgery, tampered evidence, bounded `run_project_tests` execution, duplicate request claims, crash recovery, cancellation persistence, replay of completed requests, and per-tool timeout behavior. Browser-boundary integration tests exercise anonymous-session denial, CSRF and Origin checks, username/password login, HttpOnly Owner-cookie authentication, chat delegation through the canonical Owner session, generic login failure, and session revocation on logout.
 
 V4.7 tests additionally verify that `red_team_assess` is inaccessible without Owner authentication, emits hypotheses and evidence requirements rather than attack instructions, rejects prompt-injection fields in knowledge objects, preserves source hashes during retrieval, and keeps external knowledge separate from authorization.
 
 V4.9 tests verify safe case generation from reference knowledge, deterministic critic findings, benchmark-gate rejection when unsupported claims increase, Owner-only reasoning-memory access, and persistence of the case/critic record without adding executable attack capabilities.
 
-For a local smoke test, configure separate `BRIDGE_TOKEN` and `OWNER_TOKEN`, run `python bridge.py`, request `/api/health`, then call `/api/status` with the bridge header and `/api/command` with both headers. Never place real credentials in GitHub Actions or source control.
+For a local smoke test, configure `BRIDGE_TOKEN`, run `python -m security.owner_password_bootstrap`, and start `python bridge.py`. Open the local web page, sign in with the Owner username/password, and verify that status shows an authenticated session. Internal API clients use `X-CyberSentinel-Token` plus a valid `X-CyberSentinel-Owner-Session`; never place real credentials in GitHub Actions or source control.
+
+The main CI workflow has read-only repository permissions. It uploads a compact run-status artifact and does not commit diagnostics; the existing tracked `diagnostics/` history is retained unchanged. Full step logs remain attached to the Actions run.
 
 
 ## Agent Core Fusion validation
@@ -29,7 +31,7 @@ The automated audit command uses the existing configured provider route when env
 LLM_BASE_URL="$OPENAI_API_BASE" \
 LLM_MODEL="gpt-5-mini" \
 LLM_API_KEY="$OPENAI_API_KEY" \
-OWNER_TOKEN="<owner-secret>" \
+OWNER_SESSION_TOKEN="<authenticated-owner-session-id>" \
 python scripts/run_agent_intelligence_audit.py
 ```
 
