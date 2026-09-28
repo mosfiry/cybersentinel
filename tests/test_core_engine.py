@@ -39,6 +39,86 @@ def test_handle_once_does_not_reexecute_unclaimed_lifecycle(monkeypatch):
     }
 
 
+def test_handle_once_denies_request_when_owner_authentication_fails(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(status="created", claimed=True),
+    )
+    monkeypatch.setattr(
+        engine,
+        "authenticate_owner",
+        lambda text, owner_token, request_id: (_ for _ in ()).throw(
+            PermissionError("invalid owner credentials")
+        ),
+    )
+    events = []
+    completions = []
+    monkeypatch.setattr(
+        engine,
+        "add_event",
+        lambda *args, **kwargs: events.append((args, kwargs)) or "auth-event",
+    )
+    monkeypatch.setattr(
+        engine,
+        "complete_lifecycle",
+        lambda *args, **kwargs: completions.append((args, kwargs)),
+    )
+
+    result = engine._handle_once("status", source="test", request_id="auth-denied")
+
+    assert result == {
+        "ok": False,
+        "decision": "deny",
+        "request_id": "auth-denied",
+        "answer": "مصادقة المالك مطلوبة.",
+        "plan": [],
+        "results": [],
+        "lifecycle": "completed",
+    }
+    assert events[0][0][0:3] == ("auth", "Owner authentication", "invalid owner credentials")
+    assert completions == [
+        (("auth-denied", result), {"success": False, "error": "invalid owner credentials"})
+    ]
+
+
+def test_handle_once_does_not_fallback_after_owner_challenge_failure(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(status="created", claimed=True),
+    )
+    monkeypatch.setattr(
+        engine,
+        "consume_owner_challenge",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("expired owner challenge")),
+    )
+
+    def unexpected_token_fallback(*args, **kwargs):
+        raise AssertionError("owner token authentication must not be attempted after challenge failure")
+
+    monkeypatch.setattr(engine, "authenticate_owner", unexpected_token_fallback)
+    monkeypatch.setattr(engine, "add_event", lambda *args, **kwargs: "auth-event")
+    completions = []
+    monkeypatch.setattr(
+        engine,
+        "complete_lifecycle",
+        lambda *args, **kwargs: completions.append((args, kwargs)),
+    )
+
+    result = engine._handle_once(
+        "status",
+        source="test",
+        request_id="challenge-denied",
+        owner_session_id="session-1",
+        owner_challenge="challenge-1",
+    )
+
+    assert result["decision"] == "deny"
+    assert result["request_id"] == "challenge-denied"
+    assert completions[0][1] == {"success": False, "error": "expired owner challenge"}
+
+
 def test_summarize_covers_local_and_tool_result_branches():
     local = engine.summarize([], [], "local", "ignored")
     assert local == "يعمل النظام في الوضع المحلي المحدود؛ لم يتوفر مزود نموذج للمحادثة."
