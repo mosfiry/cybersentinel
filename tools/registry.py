@@ -328,7 +328,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             raise PermissionError("run_project_tests requires an Owner-derived MissionAuthorizationSnapshot; tool runtime cannot mint authorization")
         if workspace is None:
             raise PermissionError("run_project_tests requires a governed Workspace; tool runtime cannot create its own execution environment")
-        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
+        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=mission_authorization, evidence_store=evidence_store)
         future = executor.submit(spec.handler, argument, workspace=workspace)
     else:
         future = executor.submit(spec.handler, argument)
