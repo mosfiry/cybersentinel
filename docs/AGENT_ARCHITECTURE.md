@@ -75,29 +75,29 @@ The internal authority hierarchy of CyberSentinel X is fixed:
 
 ```text
 OWNER_INSTRUCTION (800)
-  > SYSTEM_PLATFORM (700)
   > OWNER_POLICY (600)
-  > DETERMINISTIC_ENFORCEMENT
-  > AUTHORIZATION_SCOPE
-  > TOOL_RUNTIME
-  > MODEL_OUTPUT
-  > EXTERNAL_DATA
+  > DETERMINISTIC_ENFORCEMENT (500)
+  > AUTHORIZATION_SCOPE (400)
+  > TOOL_RUNTIME (300)
+  > MODEL_OUTPUT (200)
+  > EXTERNAL_DATA (100)
 ```
 
 Semantics that remove a historical ambiguity:
 
-- `SYSTEM_PLATFORM` names the **internal CyberSentinel platform layer** — the
-  process boundary, credential separation (bridge token vs Owner token),
-  lifecycle persistence, audit-chain integrity, and deterministic enforcement.
-  It is an application-internal tier, **not** the external hosting or runtime
-  constraints of the machine/network the service happens to run on.
+- The platform layer (process boundary, credential separation, lifecycle
+  persistence, audit-chain integrity, deterministic enforcement) is a set of
+  **implementation and execution constraints**, never an internal legislative
+  tier. The historical `SYSTEM_PLATFORM (700)` tier was removed as authority
+  drift (DRIFT-2); the numbering gap in `security.authority.AuthorityTier`
+  records that removal (Authority Constitution, Article 6).
 - External platform constraints that CyberSentinel does not control (OS
   sandbox, host network policy, provider-side limits) are **outside** this
   hierarchy. No code path may claim to override them, and no Owner Instruction
   can be interpreted as overriding them.
-- `OWNER_INSTRUCTION` is the highest **application** authority. It is never
-  re-ordered below `SYSTEM_PLATFORM`, and `SYSTEM_PLATFORM` is never used to
-  synthesize a competing application objective.
+- `OWNER_INSTRUCTION` is the single internal legislative source and the highest
+  application authority. No platform, model, tool, knowledge, or external
+  source may legislate or synthesize a competing application objective.
 - Components that read `AuthorityTier` values must treat them as
   documentation of this ordering, not as an execution input. A clearer name
   (for example `INTERNAL_PLATFORM_LAYER`) may be introduced only if this

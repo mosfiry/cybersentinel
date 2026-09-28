@@ -5,8 +5,7 @@
 ## Order
 
 ```text
-SYSTEM_PLATFORM
-  > OWNER_INSTRUCTION
+OWNER_INSTRUCTION (single internal legislative source)
   > OWNER_POLICY
   > DETERMINISTIC_ENFORCEMENT
   > AUTHORIZATION_SCOPE
@@ -14,6 +13,10 @@ SYSTEM_PLATFORM
   > MODEL_OUTPUT
   > EXTERNAL_DATA
 ```
+
+System/platform constraints are immutable external execution boundaries on
+CyberSentinel; they are not internal legislation and never compete with
+OWNER_INSTRUCTION (Authority Constitution, Article 6).
 
 ## Authentication Evidence
 
