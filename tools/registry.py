@@ -429,6 +429,21 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
+def provider_tool_schemas(allowed_tools, *, scope_available: bool = True) -> list[dict[str, Any]]:
+    """Build native-provider schemas from available tools in the supplied allowlist."""
+    allowlist = frozenset(str(name) for name in (allowed_tools or ()))
+    result = []
+    for spec in REGISTRY.values():
+        if not spec.available or spec.name not in allowlist or (spec.scope_required and not scope_available):
+            continue
+        parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
+        if spec.argument_type is str:
+            parameters["properties"]["query"] = {"type": "string", "maxLength": MAX_ARG_LENGTH}
+            parameters["required"] = ["query"]
+        result.append({"type": "function", "function": {"name": spec.name, "description": spec.description[:512], "parameters": parameters}})
+    return result
+
+
 def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, tool_call_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None, execution_class: str | None = None):
     spec = get_tool(name)
     if spec is None:

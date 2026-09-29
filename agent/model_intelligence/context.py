@@ -7,7 +7,7 @@ from typing import Any, Iterable
 from .protocol import ConversationTurn
 
 
-STATE_KEYS = ("owner", "mission", "conversation", "plan", "completed_steps", "observation", "evidence", "hypothesis", "strategy", "reasoning_cases", "knowledge", "recovery_state", "tool", "verification", "memory", "compaction")
+STATE_KEYS = ("owner", "mission", "conversation", "plan", "completed_steps", "observation", "evidence", "hypothesis", "strategy", "reasoning_cases", "knowledge", "recovery_state", "tool", "verification", "memory", "compaction", "specialist")
 LIVE_TOOL_RESULT = "LIVE_TOOL_RESULT"
 COMPACTED_TOOL_METADATA = "COMPACTED_TOOL_METADATA"
 
@@ -59,7 +59,7 @@ class ContextAssembler:
             "provenance": record.get("provenance", {}),
         }
 
-    def build(self, mission: Any, *, conversation: Iterable[ConversationTurn] = (), tool_results: Iterable[dict[str, Any]] = (), tools: Iterable[dict[str, Any]] = (), max_chars: int = 24000) -> AssembledContext:
+    def build(self, mission: Any, *, conversation: Iterable[ConversationTurn] = (), tool_results: Iterable[dict[str, Any]] = (), tools: Iterable[dict[str, Any]] = (), specialist_context: dict[str, Any] | None = None, max_chars: int = 24000) -> AssembledContext:
         durable_tools = [dict(item, record_type=item.get("record_type", LIVE_TOOL_RESULT)) for item in tool_results]
         conversation_items = list(conversation)
         tool_definitions = [dict(item) for item in tools]
@@ -134,6 +134,8 @@ class ContextAssembler:
             }
             if memory_items:
                 sections["memory"] = memory_items
+            if specialist_context is not None:
+                sections["specialist"] = dict(specialist_context)
             return sections
 
         sections = make_sections()

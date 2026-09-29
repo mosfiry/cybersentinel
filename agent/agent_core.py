@@ -75,17 +75,8 @@ class AgentCore:
 
     @staticmethod
     def _schemas(allowed_tools: Iterable[str] | None = (), *, scope_available: bool = True) -> list[dict[str, Any]]:
-        allowlist = frozenset(str(name) for name in (allowed_tools or ()))
-        result = []
-        for spec in REGISTRY.values():
-            if not spec.available or spec.name not in allowlist or (spec.scope_required and not scope_available):
-                continue
-            parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
-            if spec.argument_type is str:
-                parameters["properties"]["query"] = {"type": "string", "maxLength": 256}
-                parameters["required"] = ["query"]
-            result.append({"type": "function", "function": {"name": spec.name, "description": spec.description[:512], "parameters": parameters}})
-        return result
+        from tools.registry import provider_tool_schemas
+        return provider_tool_schemas(allowed_tools, scope_available=scope_available)
 
     @staticmethod
     def _mission_model_tools(mission: Mission | dict[str, Any]) -> tuple[str, ...]:
@@ -428,6 +419,25 @@ class AgentCore:
             except Exception as exc:
                 logger.warning("presentation-only final response failed (%s)", type(exc).__name__)
         return result
+
+    def run_specialist(self, mission_id: str, *, specialist_id: str, task_id: str, question: str, owner_session_token: str, max_turns: int | None = None) -> Mission:
+        """Run a proposal-only specialist under the same authenticated, pinned mission runtime."""
+        self.resume_mission(mission_id, owner_session_token=owner_session_token, run=False)
+        runtime = MissionRuntime(
+            self.store,
+            executor=self._executor,
+            recovery_policy=RecoveryPolicy(),
+            interpreter=ObservationInterpreter(proposer=self._observation_proposal),
+            require_authorization_snapshot=True,
+        )
+        return runtime.run_specialist(
+            mission_id,
+            router=self.router,
+            profile_id=specialist_id,
+            task_id=task_id,
+            question=question,
+            max_turns=max_turns or self.max_iterations,
+        )
 
     def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None, run: bool = True) -> Mission:
         mission = self.store.load(mission_id)

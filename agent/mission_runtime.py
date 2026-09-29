@@ -753,11 +753,198 @@ class MissionRuntime:
             mission.transition(MissionStatus.READY, "in-flight action reconciled as not executed", action_id=action_id)
         return self.store.save(mission)
 
-    def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20) -> Mission:
+    @staticmethod
+    def _tool_definition_names(tools: list[dict[str, Any]]) -> frozenset[str]:
+        names = set()
+        for item in tools:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            name = function.get("name", item.get("name", ""))
+            if isinstance(name, str) and name:
+                names.add(name)
+        return frozenset(names)
+
+    @staticmethod
+    def _specialist_evidence_references(mission: Mission, tool_results: list[dict[str, Any]]) -> set[str]:
+        references: set[str] = set()
+        for item in mission.evidence:
+            if not isinstance(item, dict):
+                continue
+            for key in ("evidence_id", "id"):
+                if item.get(key):
+                    references.add(str(item[key]))
+            system_evidence = item.get("system_evidence")
+            if isinstance(system_evidence, dict) and system_evidence.get("provenance_token"):
+                references.add(str(system_evidence["provenance_token"]))
+        for item in [*mission.observations, *tool_results]:
+            if not isinstance(item, dict):
+                continue
+            for key in ("tool_call_id", "action_id", "observation_id"):
+                if item.get(key):
+                    references.add(str(item[key]))
+            nested = item.get("result", item.get("observation", {}))
+            if isinstance(nested, dict):
+                results = nested.get("results", ())
+                for entry in results if isinstance(results, list) else ():
+                    if isinstance(entry, dict):
+                        for key in ("id", "result_id", "source_id", "evidence_id"):
+                            if entry.get(key):
+                                references.add(str(entry[key]))
+        return references
+
+    def run_specialist(self, mission_id: str, *, router: Any, profile_id: str, task_id: str, question: str, max_turns: int = 20) -> Mission:
+        """Run one profile-bound proposal through this durable MissionRuntime and its existing model/tool gates."""
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        from tools.registry import REGISTRY, provider_tool_schemas
+        from .model_router import ModelRouter
+        from .model_protocol import RouterNativeModel
+        from .specialists import SpecialistContractError, SpecialistInput, SpecialistInvocation, get_specialist_profile
+
+        mission = self._load(mission_id)
+        if mission.is_terminal:
+            raise ValueError("specialists cannot run for a terminal mission")
+        if mission.status is MissionStatus.PAUSED:
+            raise ValueError("paused missions must be resumed before specialist execution")
+        profile = get_specialist_profile(profile_id)
+        authorized, reason = self._mission_authorization(mission)
+        if not authorized:
+            raise PermissionError("mission authorization blocked specialist: " + reason)
+        step = next((item for item in mission.plan.steps if item.step_id == str(task_id)), None)
+        if step is None or step.action not in profile.allowed_tools:
+            raise SpecialistContractError("task_outside_specialist_profile")
+        specialist_input = SpecialistInput(mission.mission_id, step.step_id, mission.plan.version, question)
+        specialist_input.validate()
+        budget = mission.provenance.get("owner_budget") if isinstance(mission.provenance, dict) else None
+        if not isinstance(budget, dict) or not isinstance(budget.get("tools"), (list, tuple)):
+            raise PermissionError("persisted Owner tool allowlist is unavailable")
+        owner_tools = {str(item) for item in budget["tools"]}
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        except (KeyError, TypeError, ValueError, PermissionError) as exc:
+            raise PermissionError("mission authorization snapshot is invalid") from exc
+        snapshot_tools = set(snapshot.allowed_tools).intersection(snapshot.allowed_actions).difference(snapshot.forbidden_actions)
+        authorization = mission.authorization_context if isinstance(mission.authorization_context, dict) else {}
+        scope_available = bool(authorization.get("scope_snapshot_id"))
+        task_tools = {step.action}
+        allowed_tools = tuple(
+            name for name in profile.allowed_tools
+            if name in owner_tools and name in snapshot_tools and name in task_tools
+            and name in REGISTRY and REGISTRY[name].available and callable(REGISTRY[name].handler)
+            and (not REGISTRY[name].scope_required or scope_available)
+        )
+        if not allowed_tools:
+            raise PermissionError("specialist has no tools within the Owner, mission, scope, and task intersections")
+        for key, value in (
+            ("owner_instruction", mission.owner_instruction or mission.owner_request),
+            ("mission_objective", mission.objective),
+            ("plan", mission.plan),
+            ("authorization_snapshot", mission.authorization_snapshot),
+            ("task_step", step),
+        ):
+            if value is None or value == "":
+                if key in profile.required_context:
+                    raise SpecialistContractError("required_context_missing")
+
+        selection = dict(mission.model_selection) if isinstance(mission.model_selection, dict) else {}
+        selection_mode = str(selection.get("mode") or "auto")
+        pinned_profile = str(selection.get("profile_id") or "auto")
+        if selection_mode not in {"auto", "explicit"} or (selection_mode == "explicit" and not selection.get("profile_fingerprint")):
+            raise PermissionError("persisted Owner model selection is invalid")
+        if not isinstance(router, ModelRouter):
+            raise TypeError("specialist routing requires the configured ModelRouter")
+        selected_router, resolved_selection = router.with_model_selection(
+            pinned_profile,
+            expected_fingerprint=str(selection["profile_fingerprint"]) if selection_mode == "explicit" else None,
+        )
+        if resolved_selection.get("mode") != selection_mode or resolved_selection.get("profile_id") != pinned_profile:
+            raise PermissionError("specialist model selection differs from the persisted Owner policy")
+        if not selection:
+            mission.model_selection = dict(resolved_selection)
+            mission = self.store.save(mission)
+
+        schemas = provider_tool_schemas(allowed_tools, scope_available=scope_available)
+        if self._tool_definition_names(schemas) != frozenset(allowed_tools):
+            raise PermissionError("specialist tool schemas do not match the authorized role intersection")
+        invocation = SpecialistInvocation(profile, specialist_input, allowed_tools)
+        specialist_context = invocation.context(resolved_selection)
+        specialist_context.update({
+            "owner_instruction": mission.owner_instruction or mission.owner_request,
+            "mission_objective": mission.objective,
+            "task_step": step.to_dict(),
+            "scope_snapshot": mission.scope_snapshot,
+            "effective_tool_intersection": list(allowed_tools),
+            "authorization_snapshot": {
+                "authorization_hash": snapshot.authorization_hash,
+                "target_identity": snapshot.target_identity,
+                "allowed_tools": list(allowed_tools),
+                "scope": list(snapshot.scope),
+            },
+        })
+        run_id = "specialist-" + hashlib.sha256(f"{mission_id}:{profile.profile_id}:{task_id}:{mission.plan.version}".encode()).hexdigest()[:20]
+        return self.run_model_loop(
+            mission_id,
+            RouterNativeModel(selected_router),
+            tools=schemas,
+            run_id=run_id,
+            max_turns=max_turns,
+            specialist=invocation,
+            specialist_context=specialist_context,
+        )
+
+    def _record_specialist_proposal(self, mission: Mission, invocation: Any, turn: Any, *, previous_checkpoint: dict[str, Any]) -> Mission:
+        from .specialists import SpecialistContractError, parse_specialist_output
+
+        progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
+        references = self._specialist_evidence_references(mission, progress.get("tool_results", []))
+        current_task = next((item for item in mission.plan.steps if item.step_id == invocation.specialist_input.task_id), None)
+        if mission.plan.version != invocation.specialist_input.plan_version or current_task is None or current_task.action not in invocation.allowed_tools:
+            proposal = None
+            rejection_reason = "task_boundary_changed"
+            accepted = False
+        else:
+            try:
+                output = parse_specialist_output(turn.content, evidence_refs=references)
+                proposal = output.to_dict()
+                rejection_reason = ""
+                accepted = True
+            except SpecialistContractError as exc:
+                proposal = None
+                rejection_reason = exc.code
+                accepted = False
+        record = {
+            "profile_id": invocation.profile.profile_id,
+            "role": invocation.profile.role,
+            "mission_id": mission.mission_id,
+            "task_id": invocation.specialist_input.task_id,
+            "plan_version": invocation.specialist_input.plan_version,
+            "accepted": accepted,
+            "authority": "proposal_only",
+            "model_selection_policy": invocation.profile.model_selection_policy,
+            "owner_model_selection": dict(mission.model_selection),
+            "provider": str(getattr(turn, "provider", "")),
+            "model": str(getattr(turn, "model", "")),
+            "proposal": proposal,
+            "rejection_reason": rejection_reason,
+        }
+        mission.progress.setdefault("specialist_proposals", []).append(record)
+        mission.progress["last_specialist_proposal"] = record
+        mission.checkpoint = previous_checkpoint
+        try:
+            return self.store.save(mission)
+        except MissionWriteConflictError:
+            latest = self._load(mission.mission_id)
+            return self._accept_pending_control(latest) or latest
+
+    def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20, specialist: Any = None, specialist_context: dict[str, Any] | None = None) -> Mission:
         """Run a real model/tool/observation loop for a durable mission."""
         from security.authorization import authorize_tool
         from security.authorization_context import AuthorizationContext
         from tools.registry import execute as execute_tool
+
+        allowed_tool_names = self._tool_definition_names(tools)
+        if specialist is not None and (specialist_context is None or allowed_tool_names != frozenset(specialist.allowed_tools)):
+            raise PermissionError("specialist context and tool schemas do not match the role intersection")
 
         mission = self._load(mission_id)
         if mission.is_terminal:
@@ -787,6 +974,10 @@ class MissionRuntime:
             mission = self._load(mission_id)
             if mission.is_terminal:
                 return mission
+            if specialist is not None:
+                task = next((item for item in mission.plan.steps if item.step_id == specialist.specialist_input.task_id), None)
+                if mission.plan.version != specialist.specialist_input.plan_version or task is None or task.action not in specialist.allowed_tools:
+                    raise PermissionError("specialist mission/task boundary changed during execution")
             checkpoint_status = str((mission.checkpoint or {}).get("status", ""))
             if checkpoint_status in {"model_in_flight", "verification_in_flight"}:
                 return self._require_reconciliation(
@@ -805,7 +996,7 @@ class MissionRuntime:
             progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
             seen = set(str(item) for item in progress.setdefault("seen_call_ids", []))
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
-            assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools)
+            assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools, specialist_context=specialist_context)
             progress["last_context_hash"] = assembled.context_hash
             progress["context_compaction"] = {
                 "compacted": assembled.compacted,
@@ -838,6 +1029,24 @@ class MissionRuntime:
                 mission = latest
                 progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")
+                if specialist is not None:
+                    checkpoint = mission.checkpoint if isinstance(mission.checkpoint, dict) else {}
+                    if checkpoint.get("status") != "model_in_flight" or checkpoint.get("turn_id") != turn_id:
+                        return mission
+                    mission.checkpoint = previous_checkpoint
+                    failure = {
+                        "profile_id": specialist.profile.profile_id,
+                        "task_id": specialist.specialist_input.task_id,
+                        "kind": str(kind),
+                        "run_id": run_id,
+                        "turn_id": turn_id,
+                    }
+                    mission.progress.setdefault("specialist_failures", []).append(failure)
+                    try:
+                        return self.store.save(mission)
+                    except MissionWriteConflictError:
+                        latest = self._load(mission_id)
+                        return self._accept_pending_control(latest) or latest
                 failure = {"class": FailureClass.PROVIDER.value, "kind": str(kind), "reason": str(exc), "turn_id": turn_id, "run_id": run_id}
                 mission.failures.append(failure)
                 mission.progress.setdefault("model_failures", []).append(failure)
@@ -935,6 +1144,8 @@ class MissionRuntime:
                     return latest
                 mission = latest
                 progress = mission.progress["model_loop"]
+                if specialist is not None:
+                    return self._record_specialist_proposal(mission, specialist, turn, previous_checkpoint=previous_checkpoint)
                 mission, claimed = self._claim_callback(
                     mission,
                     {"status": "verification_in_flight", "kind": "mission_verifier", "run_id": run_id, "turn_id": turn_id},
@@ -966,7 +1177,16 @@ class MissionRuntime:
                     latest = self._load(mission_id)
                     return self._accept_pending_control(latest) or latest
             if len(turn.tool_calls) > 1:
-                if not self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, progress=progress, seen=seen):
+                if specialist is not None:
+                    for proposal in turn.tool_calls:
+                        progress["tool_results"].append(ToolCallResult(proposal, False, error="specialist task permits one tool proposal per model turn").to_dict())
+                    try:
+                        self.store.save(mission)
+                    except MissionWriteConflictError:
+                        latest = self._load(mission_id)
+                        return self._accept_pending_control(latest) or latest
+                    continue
+                if not self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, progress=progress, seen=seen, allowed_tool_names=allowed_tool_names):
                     return self._load(mission_id)
                 try:
                     self.store.save(mission)
@@ -994,6 +1214,13 @@ class MissionRuntime:
                 else:
                     seen.add(proposal.tool_call_id)
                     progress["seen_call_ids"].append(proposal.tool_call_id)
+                    if specialist is not None:
+                        if proposal.name not in specialist.allowed_tools or proposal.name not in allowed_tool_names or (proposal.step_id and proposal.step_id != specialist.specialist_input.task_id):
+                            result = ToolCallResult(proposal, False, error="tool is outside the specialist task boundary")
+                            progress["tool_results"].append(result.to_dict())
+                            continue
+                        if not proposal.step_id:
+                            proposal = replace(proposal, step_id=specialist.specialist_input.task_id)
                     proposal, planned_step, binding_error = self._bind_proposal_to_ready_step(mission, proposal)
                     if binding_error:
                         mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PLAN_STEP_BLOCKED", "reason": binding_error})
@@ -1013,6 +1240,10 @@ class MissionRuntime:
                     if not decision.allowed:
                         result = ToolCallResult(proposal, False, error=decision.reason)
                     else:
+                        if proposal.name not in allowed_tool_names:
+                            result = ToolCallResult(proposal, False, error="tool is outside the supplied model tool schema allowlist")
+                            progress["tool_results"].append(result.to_dict())
+                            continue
                         proof = None
                         try:
                             proof = self._derive_execution_proof(mission, proposal, argument, decision)
@@ -1048,14 +1279,18 @@ class MissionRuntime:
                                 mission_id=mission.mission_id,
                                 tool_call_id=proposal.tool_call_id,
                             )
+                            if specialist is not None:
+                                observation["authority"] = "untrusted_observation"
+                                observation["specialist_profile_id"] = specialist.profile.profile_id
                             mission.record_observation(observation)
-                            if planned_step is not None:
+                            if planned_step is not None and specialist is None:
                                 mission, followup_claimed = self._claim_followup_callback(mission, f"observation_interpretation:{proposal.tool_call_id}")
                                 if not followup_claimed:
                                     return mission
                                 self._interpret_observation(mission, planned_step, observation, success=success)
-                            mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
-                            if success:
+                            if specialist is None:
+                                mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
+                            if success and specialist is None:
                                 self._record_verified_criterion_evidence(mission, action_id)
                                 ready_after = self._ready_plan_steps(mission)
                                 mission.current_step = ready_after[0][0] if ready_after else len(mission.plan.steps)
@@ -1076,11 +1311,23 @@ class MissionRuntime:
                 if str((latest.checkpoint or {}).get("status", "")) == "in_flight":
                     return self._require_reconciliation(mission_id, "in_flight", "native tool result was not durably committed")
                 return self._accept_pending_control(latest) or latest
+        mission = self._load(mission_id)
+        controlled = self._accept_pending_control(mission)
+        if controlled is not None:
+            return controlled
+        if specialist is not None:
+            mission.progress.setdefault("specialist_failures", []).append({
+                "profile_id": specialist.profile.profile_id,
+                "task_id": specialist.specialist_input.task_id,
+                "reason": "turn_budget_exhausted",
+                "run_id": run_id,
+            })
+            return self.store.save(mission)
         mission.error = "model turn budget exhausted"
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self.store.save(mission)
 
-    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, progress: dict[str, Any], seen: set[str]) -> bool:
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, progress: dict[str, Any], seen: set[str], allowed_tool_names: frozenset[str]) -> bool:
         """Authorize, proof-bind, and execute independent proposals in parallel."""
         from security.authorization import authorize_tool
         from security.execution_boundary import MissionExecutionBoundary
@@ -1123,6 +1370,9 @@ class MissionRuntime:
             mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
             if not decision.allowed:
                 results.append(ToolCallResult(proposal, False, error=decision.reason))
+                continue
+            if proposal.name not in allowed_tool_names:
+                results.append(ToolCallResult(proposal, False, error="tool is outside the supplied model tool schema allowlist"))
                 continue
             try:
                 proof = self._derive_execution_proof(mission, proposal, argument, decision)
