@@ -2,6 +2,11 @@
 
 **Baseline:** `0aa3848` — `Refactor owner authority and remove model policy veto`
 
+> Historical snapshot for the stated baseline commit. Its classifications describe
+> that earlier tree and are not current-state claims; see
+> [Current Runtime Truth](CURRENT_RUNTIME_TRUTH.md) for the verified request path,
+> capability status, and remaining gaps.
+
 ## Executive classification
 
 The baseline contains several strong deterministic components, but it is not yet a single native long-horizon execution core. The most important boundary is that `api/chat.py` currently routes provider-backed conversations through `AgentTaskRuntime`, while `MissionRuntime` is a separate durable loop. The `create_from_owner_instruction()` helper is therefore useful but, before this phase, was **PARTIAL / UNWIRED** from the production chat path.

@@ -4,6 +4,12 @@
 
 The checked-in production entrypoint is `python bridge.py`. It starts the loopback-only HTTP bridge, one durable mission worker, and the persistent schedule dispatcher. `BRIDGE_HOST` is intentionally fixed at `127.0.0.1`; the service refuses a different bind address. This repository does **not** contain a Docker/Compose, cloud-hosting, systemd, or other production deployment manifest. Do not treat the local bridge or a GitHub Actions run as a deployed service.
 
+## Read-only external hosting snapshot (2026-09-29 11:35–11:37 UTC)
+
+The separate Cloudflare Workers Builds integration for external service `cybersentinel` runs `npx wrangler preview`, but this repository contains no Wrangler configuration or Worker entrypoint. The read-only API snapshot returned four stopped/failed builds and no previews; the latest build (`d898f9d5-9a84-4f8c-98e1-e9ab445133d9`, source SHA `71ce3c9550ad258a9cb01f03a7dc5e337f08ce93`) has no preview URL. Its log reports a missing Wrangler `previews` block; that external diagnostic was recorded, not followed as a configuration instruction.
+
+The same snapshot returned three pre-existing deployments, with 100% traffic routed to version 3 (`39fb0620-a8a5-4566-b7e1-8b085529fa1b`). It did not establish that version's source relationship to this repository or verify its live health. The local Python bridge remains loopback-only. No Cloudflare settings, triggers, Worker configuration, or deployment were changed as part of this task.
+
 ## Reproducible local installation
 
 1. Use a supported Python version (CI currently uses Python 3.13) and Node.js for the shipped UI syntax check.
@@ -47,6 +53,8 @@ Configuration is loaded from the process environment and `.env`. See `.env.examp
 
 With no model provider, deterministic local behavior is used; that is not a live-provider acceptance result. General web search is not configured and must not be represented as an available capability.
 
+The Owner-only `run_project_tests` tool is enabled only when startup verifies `bubblewrap` and `prlimit` can establish an isolated user/PID/network namespace. It runs pytest from a filtered, read-only project snapshot with no inherited credentials, no network, disabled third-party pytest plugin autoload, and explicit CPU, memory, process, file, tmpfs, entry-count, and depth limits. Hosts that cannot satisfy the OS sandbox preflight expose the capability as unavailable; tests are never silently run as an ordinary application-user subprocess. See [Tool Execution](TOOL_EXECUTION.md) for the exact limits and evidence contract.
+
 The optional manually dispatched live-provider workflow is limited to `main`, validates its `max_iterations` input (1–16), and uses repository Actions secrets named `OPENAI_API_BASE`, `OPENAI_API_KEY`, and `CYBERSENTINEL_OWNER_PASSWORD`; `REAL_PROVIDER_MODEL` is optional. It creates a disposable Owner account/session in the workflow runner's temporary database. Do not put any of these values in source or workflow inputs. When a required secret is absent, the workflow records a `BLOCKED` artifact without starting a mission; this is not a passing live-provider test.
 
 ## Persistent state, permissions, and backup
@@ -57,7 +65,9 @@ For a consistent backup, stop the bridge first, then copy the complete database 
 
 ## Worker lifecycle and recovery
 
-The bridge runs one bounded mission worker alongside HTTP service. It claims durable SQLite queue leases, executes at most one mission slice at a time, heartbeats the lease, releases unfinished work for a later slice, recovers expired leases, and on process startup returns interrupted queue leases for checkpoint recovery. A process restart does not itself establish whether an external side effect happened: the runtime preserves an in-flight checkpoint and requires Owner reconciliation before retrying or accepting completion. Owner pause/cancel controls are honored at safe slice boundaries. Queue state is operational metadata; mission status/evidence remain the source of truth.
+The bridge runs one bounded mission worker alongside HTTP service. It accepts at most 10 active queue entries by default; an enqueue beyond that limit is rejected (`mission_queue_full`, HTTP 429) rather than growing the active backlog without bound. The worker claims durable SQLite leases and renews them on a daemon heartbeat while a model/tool call is running, executes at most one mission slice at a time, releases unfinished work for a later slice, recovers expired leases, and on process startup returns interrupted queue leases for checkpoint recovery. A process restart does not itself establish whether an external side effect happened: the runtime preserves an in-flight checkpoint and requires Owner reconciliation before retrying or accepting completion. Owner pause/cancel controls are intended to take effect at safe slice boundaries; a concurrent request/result race remains a separately tracked verification limitation. Queue state is operational metadata; mission status/evidence remain the source of truth.
+
+The persistent scheduler currently supports one-time dispatch only. It rejects recurring `interval_seconds` and nonzero `retry_limit` because it does not yet create a fresh execution per recurrence or retry failed schedule dispatches. It is not a general recurring automation system.
 
 `SIGTERM` and `SIGINT` request HTTP shutdown and signal the worker to stop; the worker join is bounded. If a host terminates the process during an external tool call, the persisted checkpoint and recovery flow remain authoritative. Standard output contains service/worker diagnostics. Keep host logs private and rotate them according to the host's retention policy.
 

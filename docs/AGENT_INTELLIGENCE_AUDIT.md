@@ -4,6 +4,11 @@ Generated at: `2026-09-21T16:54:18.542109+00:00`
 Commit: `de5c2c513648de7f552225681e39364717d1549f`
 Baseline: `25307b88960d7e9a04cb9ce14c3b00b8fbcee41e` with 276 tests before this upgrade.
 
+> Historical snapshot generated 2026-09-21 for commit `de5c2c5`. The provider
+> probe and mission outcomes below are records from that earlier environment,
+> not current provider acceptance or present runtime guarantees. See
+> [Current Runtime Truth](CURRENT_RUNTIME_TRUTH.md) for current verification.
+
 ## Scope
 
 This report records the adaptive-loop audit. It does not claim production readiness, full autonomy, or super-intelligence. External knowledge, model output, memory, and tool results remain untrusted data or proposals; Owner Instruction and deterministic enforcement remain authoritative.

@@ -3,6 +3,10 @@
 **Baseline:** `33f20a4`  
 **Status:** initial code audit, before Phase 6K.6 modifications.
 
+> Historical pre-Phase-6K.6 snapshot, retained for audit provenance. The paths,
+> authority findings, and placeholder benchmark metrics below are superseded;
+> see [Current Runtime Truth](CURRENT_RUNTIME_TRUTH.md) for current behavior.
+
 ## Current request/chat path
 
 ```text
