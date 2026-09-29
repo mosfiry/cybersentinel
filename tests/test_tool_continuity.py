@@ -165,10 +165,12 @@ def test_parallel_tool_exception_requires_reconciliation(tmp_path, monkeypatch):
     import tools.registry
 
     executions = []
+    failed_call_ids = []
 
     def fixture(name, argument, **kwargs):
         executions.append(name)
-        if len(executions) == 2:
+        if kwargs.get("tool_call_id") == "call_002":
+            failed_call_ids.append(kwargs.get("tool_call_id"))
             raise RuntimeError("worker crashed after external side effect")
         return {"ok": True, "source": "parallel-fixture"}
 
@@ -188,6 +190,7 @@ def test_parallel_tool_exception_requires_reconciliation(tmp_path, monkeypatch):
 
     result = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=2)
     assert len(executions) == 2
+    assert failed_call_ids == ["call_002"]
     assert result.status.name == "RECOVERY_REQUIRED"
     assert result.checkpoint.get("status") == "in_flight_parallel"
     assert result.checkpoint.get("ambiguous_tool_call_ids") == ["call_002"]
