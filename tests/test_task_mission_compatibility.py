@@ -38,7 +38,7 @@ class FakeCore:
         self._executor = lambda *args, **kwargs: {"success": True}
         self.owner_mission_run_flags = []
 
-    def run_owner_mission(self, objective: str, *, owner_session_token: str, scope_context=None, run: bool = True):
+    def run_owner_mission(self, objective: str, *, owner_session_token: str, scope_context=None, model_id: str = "auto", model_preference: str = "balanced", conversation_id: str | None = None, run: bool = True):
         self.owner_mission_run_flags.append(run)
         mission = _mission("task-created")
         mission.objective = objective

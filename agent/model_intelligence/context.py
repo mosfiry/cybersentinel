@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 from typing import Any, Iterable
 from .protocol import ConversationTurn
+from ..context import sanitize_model_data, sanitize_model_text
 
 
 STATE_KEYS = ("owner", "mission", "conversation", "plan", "completed_steps", "observation", "evidence", "hypothesis", "strategy", "reasoning_cases", "knowledge", "recovery_state", "tool", "verification", "memory", "compaction", "specialist")
@@ -60,9 +61,48 @@ class ContextAssembler:
         }
 
     def build(self, mission: Any, *, conversation: Iterable[ConversationTurn] = (), tool_results: Iterable[dict[str, Any]] = (), tools: Iterable[dict[str, Any]] = (), specialist_context: dict[str, Any] | None = None, max_chars: int = 24000) -> AssembledContext:
-        durable_tools = [dict(item, record_type=item.get("record_type", LIVE_TOOL_RESULT)) for item in tool_results]
-        conversation_items = list(conversation)
-        tool_definitions = [dict(item) for item in tools]
+        durable_tools = [sanitize_model_data(dict(item, record_type=item.get("record_type", LIVE_TOOL_RESULT))) for item in tool_results]
+        conversation_items = [
+            ConversationTurn(
+                item.role,
+                sanitize_model_text(item.content),
+                item.tool_call_id,
+                item.name,
+                tuple(sanitize_model_data(call) for call in item.tool_calls),
+            )
+            for item in conversation
+        ]
+        conversation_id = str((mission.provenance or {}).get("conversation_id", "")) if isinstance(mission.provenance, dict) else ""
+        owner_ref = str(getattr(mission, "owner_identity_ref", "") or "")
+        if conversation_id and owner_ref:
+            try:
+                from core.db import conversation_info, conversation_messages
+                if conversation_info(conversation_id, owner_id=owner_ref) is not None:
+                    for item in conversation_messages(conversation_id, limit=12):
+                        role = str(item.get("role", ""))
+                        if role in {"user", "assistant"}:
+                            conversation_items.append(ConversationTurn(role, sanitize_model_text(str(item.get("content", "")))))
+            except (OSError, ValueError, TypeError):
+                # A missing optional transcript never changes Mission state or
+                # authorization; durable Mission context remains available.
+                pass
+        tool_definitions = [sanitize_model_data(dict(item)) for item in tools]
+        raw_policy = mission.policy_snapshot if isinstance(mission.policy_snapshot, dict) else {}
+        safe_policy = {
+            "record_type": "POLICY_FINGERPRINT_ONLY",
+            "policy_version": str(raw_policy.get("policy_version", "")),
+            "fingerprint": str(raw_policy.get("owner_policy_fingerprint", "")),
+        }
+        raw_scope = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+        safe_scope = {
+            key: raw_scope[key]
+            for key in ("scope_snapshot_id", "target_id", "scope", "authorized_assets", "allowed_networks", "forbidden_actions")
+            if key in raw_scope
+        }
+        raw_snapshot = mission.authorization_snapshot if isinstance(mission.authorization_snapshot, dict) else {}
+        permitted_tools = sorted(set(str(item) for item in raw_snapshot.get("allowed_tools", ())).intersection(
+            str(item) for item in raw_snapshot.get("allowed_actions", ())
+        ).difference(set(str(item) for item in raw_snapshot.get("forbidden_actions", ()))))
         memory_items = self._memory_context(mission, max_chars=max_chars)
         reasoning_cases = list(mission.reasoning_cases[-8:])
         completed_steps = [
@@ -115,28 +155,28 @@ class ContextAssembler:
         # Compact based on the complete durable state, not merely tools plus chat.
         def make_sections() -> dict[str, Any]:
             sections = {
-                "owner": {"instruction": mission.owner_instruction or mission.owner_request, "policy_snapshot": mission.policy_snapshot},
-                "mission": {"mission_id": mission.mission_id, "objective": mission.objective, "status": mission.status.value},
-                "conversation": [item.to_dict() for item in conversation_items],
-                "plan": mission.plan.to_dict(),
+                "owner": {"instruction": sanitize_model_text(mission.owner_instruction or mission.owner_request), "policy_snapshot": safe_policy},
+                "mission": {"mission_id": mission.mission_id, "objective": sanitize_model_text(mission.objective), "status": mission.status.value, "scope_bounds": sanitize_model_data(safe_scope), "permitted_tools": permitted_tools},
+                "conversation": sanitize_model_data([item.to_dict() for item in conversation_items]),
+                "plan": sanitize_model_data(mission.plan.to_dict()),
                 **({"completed_steps": completed_steps} if completed_steps else {}),
-                "observation": list(mission.observations[-8:]),
-                "evidence": list(mission.evidence[-12:]),
-                "hypothesis": list(mission.hypotheses),
-                "strategy": dict(mission.strategy_state),
-                **({"reasoning_cases": reasoning_cases} if reasoning_cases else {}),
-                "knowledge": list(mission.knowledge_context[-8:]),
+                "observation": sanitize_model_data(list(mission.observations[-8:])),
+                "evidence": sanitize_model_data(list(mission.evidence[-12:])),
+                "hypothesis": sanitize_model_data(list(mission.hypotheses)),
+                "strategy": sanitize_model_data(dict(mission.strategy_state)),
+                **({"reasoning_cases": sanitize_model_data(reasoning_cases)} if reasoning_cases else {}),
+                "knowledge": sanitize_model_data(list(mission.knowledge_context[-8:])),
                 **({"recovery_state": recovery_state} if has_recovery_state else {}),
                 "tool": durable_tools,
                 "tool_definitions": tool_definitions,
-                "verification": dict(mission.verification_state),
+                "verification": sanitize_model_data(dict(mission.verification_state)),
                 "compaction": {"compacted": compacted, "compacted_items": compacted_items, "max_chars": max_chars, "metadata_is_untrusted": True},
             }
             if memory_items:
                 sections["memory"] = memory_items
             if specialist_context is not None:
-                sections["specialist"] = dict(specialist_context)
-            return sections
+                sections["specialist"] = sanitize_model_data(dict(specialist_context))
+            return sanitize_model_data(sections)
 
         sections = make_sections()
         if self._size(sections) > max_chars:
@@ -187,11 +227,11 @@ class ContextAssembler:
         # narrative arrays with explicit untrusted summaries.
         if self._size(sections) > max_chars:
             sections.pop("memory", None)
-            sections["owner"]["policy_snapshot"] = {"fingerprint": self._hash(mission.policy_snapshot or {}), "record_type": "POLICY_FINGERPRINT_ONLY"}
-            sections["mission"]["authorization_context"] = mission.authorization_context
-            sections["mission"]["scope_snapshot"] = mission.scope_snapshot
-            sections["observation"] = [{"record_type": "OBSERVATION_SUMMARY", "count": len(mission.observations), "last": mission.observations[-1] if mission.observations else {}}]
-            sections["evidence"] = [{"record_type": "EVIDENCE_PROVENANCE_SUMMARY", "count": len(mission.evidence), "provenance": [item.get("provenance", {}) for item in mission.evidence]}]
+            sections["owner"]["policy_snapshot"] = safe_policy
+            sections["mission"]["scope_bounds"] = sanitize_model_data(safe_scope)
+            sections["mission"]["permitted_tools"] = permitted_tools
+            sections["observation"] = sanitize_model_data([{"record_type": "OBSERVATION_SUMMARY", "count": len(mission.observations), "last": mission.observations[-1] if mission.observations else {}}])
+            sections["evidence"] = sanitize_model_data([{"record_type": "EVIDENCE_PROVENANCE_SUMMARY", "count": len(mission.evidence), "provenance": [item.get("provenance", {}) for item in mission.evidence]}])
             sections["hypothesis"] = [{"record_type": "HYPOTHESIS_SUMMARY", "count": len(mission.hypotheses), "ids": [item.get("hypothesis_id", item.get("id", "")) for item in mission.hypotheses]}]
             sections["strategy"] = {"record_type": "STRATEGY_SUMMARY", "state_hash": self._hash(mission.strategy_state)}
             if completed_steps:
@@ -250,7 +290,32 @@ class ContextAssembler:
             messages = (system, state, *tuple(conversation_items)) if not live_tools else (system, state, *tuple(conversation_items), assistant_continuation, *tool_messages)
         context_chars = sum(len(item.content) for item in messages)
         digest = sha256(json.dumps([item.to_dict() for item in messages], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        provenance = tuple({"section": key, "authoritative": key in {"owner", "mission", "plan", "verification"}} for key in STATE_KEYS)
+        provenance_records: list[dict[str, Any]] = [
+            {"section": key, "authoritative": key in {"owner", "mission", "verification"}}
+            for key in STATE_KEYS
+        ]
+        for item in sections.get("memory", ()):
+            if isinstance(item, dict):
+                provenance_records.append({
+                    "source": "memory",
+                    "memory_id": str(item.get("memory_id", "")),
+                    "source_mission_id": str(item.get("source_mission_id", "")),
+                    "content_hash": self._hash(item.get("content", "")),
+                    "system_evidence_refs": [dict(ref) for ref in item.get("system_evidence_refs", ()) if isinstance(ref, dict)],
+                    "validation_state": str(item.get("validation_state", "unverified_memory")),
+                    "authority": "none",
+                })
+        for item in sections.get("knowledge", ()):
+            if isinstance(item, dict):
+                provenance_records.append({
+                    "source": "knowledge",
+                    "object_id": str(item.get("object_id", "")),
+                    "knowledge_source": str(item.get("source", "")),
+                    "content_hash": str(item.get("content_hash", "")) or self._hash(item),
+                    "provenance": sanitize_model_data(item.get("provenance", {})),
+                    "authority": "untrusted_context_only",
+                })
+        provenance = tuple(provenance_records)
         return AssembledContext(messages, sections, digest, provenance, compacted, compacted_items, context_chars)
 
     def _memory_context(self, mission: Any, *, max_chars: int) -> list[dict[str, Any]]:
@@ -276,6 +341,7 @@ class ContextAssembler:
             entry = {
                 "label": "UNTRUSTED_CONTEXT_INPUT",
                 "content": item.content[:600],
+                "memory_id": item.memory_id,
                 "source_mission_id": item.source_mission_id,
                 "source_request_id": item.request_id,
                 "domain": item.domain.value,

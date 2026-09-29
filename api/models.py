@@ -10,6 +10,7 @@ _FORBIDDEN_MODEL_FIELDS = {
     "provider_id", "provider_name", "profile", "profile_id", "profile_name",
     "model", "model_selection",
 }
+_MODEL_PREFERENCES = frozenset({"fast", "balanced", "deep", "local"})
 
 
 def requested_model_id(payload: dict[str, Any], *, default: str | None = "auto") -> str | None:
@@ -26,6 +27,18 @@ def requested_model_id(payload: dict[str, Any], *, default: str | None = "auto")
     value = payload["model_id"]
     if type(value) is not str or len(value) > 64:
         raise ValueError("invalid_model_id")
+    return value
+
+
+def requested_model_preference(payload: dict[str, Any], *, default: str | None = "balanced") -> str | None:
+    """Accept only a high-level orchestration preference, never provider settings."""
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_request")
+    value = payload.get("model_preference", default)
+    if value is None:
+        return None
+    if type(value) is not str or value not in _MODEL_PREFERENCES:
+        raise ValueError("invalid_model_preference")
     return value
 
 

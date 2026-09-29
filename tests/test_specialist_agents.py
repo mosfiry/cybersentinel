@@ -200,7 +200,8 @@ def test_agent_core_specialist_facade_revalidates_owner_and_keeps_persisted_pin(
     )
 
     assert local.calls == 1
-    assert result.model_selection == mission.model_selection
+    assert {key: result.model_selection[key] for key in mission.model_selection} == mission.model_selection
+    assert result.model_selection["preference"] == "balanced"
     assert result.progress["last_specialist_proposal"]["accepted"] is True
     assert result.progress["last_specialist_proposal"]["authority"] == "proposal_only"
 

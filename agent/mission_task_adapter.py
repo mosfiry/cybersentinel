@@ -93,7 +93,7 @@ class MissionTaskAdapter:
         TaskManager.update_task(task)
         return task
 
-    def create_task(self, conversation_id: str, objective: str, *, owner_session_token: str, owner_session_id: str = "", authentication_method: str = "username_password", scope_context: dict[str, Any] | None = None, run: bool = True) -> Task:
+    def create_task(self, conversation_id: str, objective: str, *, owner_session_token: str, owner_session_id: str = "", authentication_method: str = "username_password", scope_context: dict[str, Any] | None = None, model_preference: str = "balanced", run: bool = True) -> Task:
         owner = self._live_owner(owner_session_token)
         if owner_session_id and owner_session_id != str(owner["session_id"]):
             raise PermissionError("task owner session does not match authenticated session")
@@ -101,7 +101,14 @@ class MissionTaskAdapter:
         ensure_conversation(conversation_id, owner_identity)
         # Task API work must enter the supervised durable queue; never execute
         # a long mission inside the request before its Task record exists.
-        mission = self.core.run_owner_mission(objective, owner_session_token=owner_session_token, scope_context=scope_context, run=False)
+        mission = self.core.run_owner_mission(
+            objective,
+            owner_session_token=owner_session_token,
+            scope_context=scope_context,
+            model_preference=model_preference,
+            conversation_id=conversation_id,
+            run=False,
+        )
         task = TaskManager.create_task(conversation_id, mission.request_id, str(owner["session_id"]), objective, authentication_method=authentication_method)
         task.execution_state = {"canonical_runtime": "MissionRuntime", "mission_id": mission.mission_id, "mission": mission.to_dict(), "owner_identity": owner_identity}
         task.result = {"mission_id": mission.mission_id, "mission_status": mission.status.value}

@@ -146,7 +146,14 @@ def test_agent_core_sends_only_budgeted_available_tools_and_rejects_widening(mis
     assert "search: " in provider.context_messages[0]
     assert executed == []
     assert any(event["event"] == "ExecutionRejected" for event in mission.trajectory)
-    assert "outside mission authorization snapshot allowlist" in mission.progress["model_loop"]["tool_results"][-1]["error"]
+    rejection = mission.progress["model_loop"]["tool_results"][-1]["error"]
+    # Mind schema filtering omits unauthorized actions from the plan; a later
+    # attempted call is therefore rejected as an unknown plan step. Older
+    # persisted plans may instead reach the authorization-snapshot rejection.
+    assert rejection in {
+        "tool call references an unknown plan step",
+        "tool call is outside mission authorization snapshot allowlist",
+    }
 
 
 def test_restart_replanning_keeps_the_mission_bound_tool_set(mission_env):
@@ -236,3 +243,67 @@ def test_explicit_model_profile_resume_fails_closed_on_fingerprint_drift(mission
 
     assert changed.value.code == "selected_model_configuration_changed"
     assert replacement.calls == 0
+
+
+def test_owner_switches_preference_and_profile_without_losing_durable_mission_state(mission_env):
+    local = MissionProvider([ProviderResponse(text=json.dumps({"content": "untrusted plan"}))])
+    remote = MissionProvider([ProviderResponse(text=json.dumps({"content": "unused"}))])
+    local.name, local.model = "local-provider", "local-test-model"
+    remote.name, remote.model = "remote-provider", "remote-test-model"
+    router = ModelRouter([local, remote], configured_profiles={"local": local, "remote": remote})
+    store = MissionStore(Path(mission_env) / "switch-missions.sqlite3")
+    core = AgentCore(router, store=store, max_iterations=1)
+    mission = core.run_owner_mission(
+        "Check service status",
+        owner_session_token="valid-owner",
+        model_id="local",
+        scope_context={"owner_allowed_tools": ["status"], "target_id": "test-service", "scope": ["test-service"]},
+        run=False,
+    )
+    mission.hypotheses = [{"hypothesis_id": "hypothesis-preserved", "status": "UNVALIDATED"}]
+    mission.interpretations = [{"reasoning_case": {"case_id": "case-preserved", "record_type": "REASONING_CASE"}}]
+    mission.knowledge_context = [{"object_id": "knowledge-preserved", "content_hash": "knowledge-hash", "text": "untrusted fixture"}]
+    mission.progress["memory_retrieval"] = [{"memory_id": "memory-preserved", "validation_state": "validated_by_system"}]
+    mission.progress["custom_durable_state"] = {"checkpoint": "preserved"}
+    store.save(mission)
+    before = store.load(mission.mission_id)
+    assert before is not None
+    plan_fingerprint = before.plan.fingerprint
+    evidence = list(before.evidence)
+    scope_snapshot = dict(before.scope_snapshot)
+    allowed_tools = tuple(before.authorization_snapshot["allowed_tools"])
+
+    restarted = AgentCore(router, store=MissionStore(Path(mission_env) / "switch-missions.sqlite3"), max_iterations=1)
+    preference_switched = restarted.resume_mission(
+        mission.mission_id,
+        owner_session_token="valid-owner",
+        model_preference="deep",
+        run=False,
+    )
+    assert preference_switched.model_selection["mode"] == "auto"
+    assert preference_switched.model_selection["preference"] == "deep"
+    assert preference_switched.plan.fingerprint == plan_fingerprint
+    assert preference_switched.evidence == evidence
+    assert preference_switched.scope_snapshot == scope_snapshot
+    assert tuple(preference_switched.authorization_snapshot["allowed_tools"]) == allowed_tools
+    assert preference_switched.hypotheses[0]["hypothesis_id"] == "hypothesis-preserved"
+    assert preference_switched.reasoning_cases[-1]["case_id"] == "case-preserved"
+    assert preference_switched.knowledge_context[0]["object_id"] == "knowledge-preserved"
+    assert preference_switched.progress["memory_retrieval"][0]["memory_id"] == "memory-preserved"
+    assert preference_switched.progress["custom_durable_state"] == {"checkpoint": "preserved"}
+
+    provider_switched = restarted.resume_mission(
+        mission.mission_id,
+        owner_session_token="valid-owner",
+        model_id="remote",
+        run=False,
+    )
+    assert provider_switched.model_selection["profile_id"] == "remote"
+    assert provider_switched.model_selection["preference"] == "deep"
+    assert provider_switched.plan.fingerprint == plan_fingerprint
+    assert provider_switched.evidence == evidence
+    assert provider_switched.scope_snapshot == scope_snapshot
+    assert tuple(provider_switched.authorization_snapshot["allowed_tools"]) == allowed_tools
+    assert len(provider_switched.progress["model_selection_history"]) == 2
+    assert [event["event"] for event in provider_switched.trajectory].count("ModelSelectionChanged") == 2
+    assert local.calls == 1 and remote.calls == 0

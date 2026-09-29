@@ -33,6 +33,51 @@ from typing import Any, Iterable
 from tools.registry import REGISTRY, get_tool
 
 
+_MODEL_SECRET_TEXT_PATTERNS = (
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer [REDACTED]"),
+    (re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|authorization)\b[\"']?\s*[:=]\s*[\"']?)[^\s,;\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b"), "[REDACTED_JWT]"),
+    (re.compile(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+)
+
+
+def sanitize_model_text(value: str) -> str:
+    result = str(value)
+    for pattern, replacement in _MODEL_SECRET_TEXT_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+def sanitize_model_data(value: Any) -> Any:
+    """Redact credential-bearing field names and token patterns recursively."""
+    if isinstance(value, dict):
+        result = {}
+        markers = ("apikey", "password", "secret", "credential", "sessionid", "ownersession", "accesstoken", "refreshtoken")
+        exact_sensitive = {
+            "auth", "authcontext", "ownerauth", "ownerauthorization", "authorization",
+            "authorizationcontext", "authorizationheader", "authorizationtoken",
+            "session", "sessiontoken", "sessioncookie", "ownertoken", "ownersessiontoken",
+            "token", "bearer", "cookie", "setcookie", "idtoken", "oauthtoken", "privatekey",
+        }
+        opaque_reference_keys = {"secretref", "secretreference", "credentialref", "vaultref"}
+        for key, item in value.items():
+            compact = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+            if compact in opaque_reference_keys:
+                # These identifiers are opaque Vault pointers, not credential material.
+                # Their string contents still pass through recognizable-token redaction.
+                result[str(key)] = sanitize_model_data(item)
+            elif compact in exact_sensitive or any(marker in compact for marker in markers):
+                result[str(key)] = "[REDACTED]"
+            else:
+                result[str(key)] = sanitize_model_data(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [sanitize_model_data(item) for item in value]
+    if isinstance(value, str):
+        return sanitize_model_text(value)
+    return value
+
+
 # =============================================================================
 # Context Source Classification
 # =============================================================================
@@ -137,11 +182,11 @@ class ExecutionState:
     model: str = ""
     
     @classmethod
-    def initial(cls, request_id: str, conversation_id: str, provider: str = "", model: str = "") -> ExecutionState:
+    def initial(cls, request_id: str, conversation_id: str, provider: str = "", model: str = "", task_id: str | None = None) -> ExecutionState:
         return cls(
             request_id=request_id,
             conversation_id=conversation_id,
-            task_id=None,
+            task_id=task_id,
             step=0,
             tool_calls_used=0,
             # Legacy factory compatibility; live task runtime supplies policy-derived remaining_steps explicitly.
@@ -265,17 +310,56 @@ class ConversationMemoryProvider(MemoryProvider):
 
 
 class DurableMemoryProvider(MemoryProvider):
-    """Adapter from the persistent structured memory database to ContextEngine."""
+    """Conversation memory plus owner-bound, system-validated prior experience."""
 
-    def __init__(self, conversation_id: str):
+    def __init__(self, conversation_id: str, *, owner_identity_ref: str = ""):
         self.conversation_id = conversation_id
+        self.owner_identity_ref = str(owner_identity_ref or "")
 
     def retrieve_relevant(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         from agent.memory import MemoryProvider as DurableProvider
-        return [
-            {"id": item.memory_id, "content": item.content, "memory_type": item.memory_type.value, "trust_classification": item.trust_classification.value, "provenance": item.provenance}
+        conversation_items = [
+            {
+                "id": item.memory_id,
+                "content": item.content,
+                "memory_type": item.memory_type.value,
+                "trust_classification": item.trust_classification.value,
+                "provenance": item.provenance,
+                "source_mission_id": item.source_mission_id,
+                "system_evidence_refs": [dict(ref) for ref in item.system_evidence_refs if isinstance(ref, dict)],
+                "content_hash": item.content_hash,
+            }
             for item in DurableProvider.get_relevant_memory(self.conversation_id, query=query, limit=limit)
         ]
+        # Cross-mission reuse is limited to this Owner's references that the
+        # memory subsystem re-verifies against system-issued evidence.
+        validated_items = []
+        if self.owner_identity_ref:
+            validated_items = [
+                {
+                    "id": item.memory_id,
+                    "content": item.content,
+                    "memory_type": item.memory_type.value,
+                    "trust_classification": item.trust_classification.value,
+                    "provenance": item.provenance,
+                    "source_mission_id": item.source_mission_id,
+                    "system_evidence_refs": [dict(ref) for ref in item.system_evidence_refs if isinstance(ref, dict)],
+                    "content_hash": item.content_hash,
+                    "validation_state": item.validation_state,
+                }
+                for item in DurableProvider.get_validated_experience(self.owner_identity_ref, query, limit=limit)
+            ]
+        combined = conversation_items + validated_items
+        result = []
+        seen: set[str] = set()
+        for item in combined:
+            memory_id = str(item.get("id", ""))
+            if memory_id and memory_id not in seen:
+                seen.add(memory_id)
+                result.append(item)
+            if len(result) >= max(0, limit):
+                break
+        return result
 
     def available(self) -> bool:
         return True
@@ -334,7 +418,7 @@ class ContextBuilder:
         execution_state: ExecutionState,
         runtime_limits: RuntimeLimits | None = None,
     ):
-        self.owner_policy_context = owner_policy_context
+        self.owner_policy_context = sanitize_model_text(owner_policy_context)
         self.execution_state = execution_state
         self.runtime_limits = runtime_limits or RuntimeLimits()
         self.budget = ContextBudget(limits=self.runtime_limits)
@@ -451,7 +535,7 @@ class ContextBuilder:
         added = 0
         for msg in messages[:limit]:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            content = sanitize_model_text(str(msg.get("content", "")))
             
             # Validate role
             if role not in self.ALLOWED_ROLES:
@@ -490,6 +574,7 @@ class ContextBuilder:
     
     def add_user_message(self, content: str) -> ContextBuilder:
         """Add current user message (highest priority user content)."""
+        content = sanitize_model_text(content)
         item = ContextItem(
             role="user",
             content=content,
@@ -545,7 +630,7 @@ class ContextBuilder:
         
         items = provider.retrieve_relevant(query, limit=limit)
         for item in items:
-            content = item.get("content", "")
+            content = sanitize_model_text(str(item.get("content", "")))
             if not content:
                 continue
             
@@ -564,6 +649,11 @@ class ContextBuilder:
                     "type": "retrieved",
                     "trust": "untrusted_data",
                     "chars": len(content) + 10,
+                    "memory_id": str(item.get("id", "")),
+                    "source_mission_id": str(item.get("source_mission_id", "")),
+                    "content_hash": str(item.get("content_hash", "")),
+                    "validation_state": str(item.get("validation_state", "unverified_memory")),
+                    "system_evidence_refs": [str(ref) for ref in item.get("system_evidence_refs", ()) if str(ref)],
                 })
         
         return self
@@ -572,7 +662,7 @@ class ContextBuilder:
         """Add relevant knowledge items."""
         items = provider.retrieve_relevant(query, limit=limit)
         for item in items:
-            content = item.get("content", "")
+            content = sanitize_model_text(str(item.get("content", "")))
             if not content:
                 continue
             
@@ -605,24 +695,7 @@ class ContextBuilder:
     
     def _sanitize_tool_result(self, result: dict[str, Any]) -> dict[str, Any]:
         """Remove sensitive data from tool results."""
-        sensitive_keys = {
-            'token', 'api_key', 'apikey', 'secret', 'password', 'credential',
-            'key', 'auth', 'authorization', 'header', 'headers',
-        }
-        
-        if isinstance(result, dict):
-            safe = {}
-            for k, v in result.items():
-                if any(sensitive in k.lower() for sensitive in sensitive_keys):
-                    safe[k] = "[REDACTED]"
-                elif isinstance(v, dict):
-                    safe[k] = self._sanitize_tool_result(v)
-                elif isinstance(v, list):
-                    safe[k] = [self._sanitize_tool_result(item) if isinstance(item, dict) else item for item in v]
-                else:
-                    safe[k] = v
-            return safe
-        return result
+        return sanitize_model_data(result)
     
     def apply_deterministic_truncation(self) -> ContextBuilder:
         """Apply deterministic truncation when limits exceeded."""
@@ -742,6 +815,7 @@ class ContextBuilder:
                 "execution_state": {
                     "request_id": self.execution_state.request_id,
                     "conversation_id": self.execution_state.conversation_id,
+                    "task_id": self.execution_state.task_id,
                     "step": self.execution_state.step,
                 },
             },

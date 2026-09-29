@@ -9,7 +9,8 @@ from agent.mission_task_adapter import MissionTaskAdapter
 
 def test_chat_uses_agentcore_mission_runtime():
     source = inspect.getsource(chat_api.chat)
-    assert "run_owner_mission" in source
+    assert "CyberSentinelMind" in source
+    assert "mind.chat" in source
     assert "AgentTaskRuntime" not in source
 
 

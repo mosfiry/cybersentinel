@@ -42,11 +42,21 @@ def _is_private_literal_endpoint(base_url: Any) -> bool:
         parsed = urlsplit(str(base_url or ""))
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             return False
-        host = parsed.hostname
+        host = parsed.hostname.casefold().rstrip(".")
+        if host == "localhost" or host.endswith(".localhost"):
+            return True
         address = ipaddress.ip_address(host.split("%", 1)[0])
         return bool(address.is_loopback or address.is_private)
     except (TypeError, ValueError):
         return False
+
+
+def _optional_nonnegative_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 and parsed < float("inf") else None
 
 
 def _capability_summary(provider: Any) -> dict[str, bool]:
@@ -55,6 +65,9 @@ def _capability_summary(provider: Any) -> dict[str, bool]:
         "generate": bool(capabilities.generate),
         "tool_calling": bool(capabilities.tool_calling),
         "native_chat": bool(capabilities.native_chat),
+        "structured_output": bool(capabilities.structured_output),
+        "stream": bool(capabilities.stream),
+        "long_context": bool(capabilities.long_context),
     }
 
 
@@ -76,6 +89,8 @@ def _profile_material(profile_id: str, provider: Any) -> dict[str, Any]:
         "endpoint": endpoint,
         "priority": int(getattr(provider, "priority", 100)),
         "capabilities": _capability_summary(provider),
+        "model_capabilities": sorted(str(item) for item in getattr(provider, "model_capabilities", ())),
+        "cost_per_1k_tokens_usd": getattr(provider, "cost_per_1k_tokens_usd", None),
     }
 
 
@@ -96,9 +111,21 @@ class ModelRouter:
         configured = dict(self.configured_profiles or {})
         for provider in self.providers:
             profile_id = getattr(provider, "profile_id", None)
-            if profile_id in PROFILE_ORDER:
+            if isinstance(profile_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile_id) and profile_id != "auto":
                 configured.setdefault(str(profile_id), provider)
-        self.configured_profiles = {key: configured[key] for key in PROFILE_ORDER if key in configured}
+        valid = {
+            str(key): provider
+            for key, provider in configured.items()
+            if isinstance(key, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", key)
+            and key != "auto"
+        }
+        ordered = [key for key in PROFILE_ORDER if key in valid]
+        ordered.extend(sorted(
+            (key for key in valid if key not in PROFILE_ORDER),
+            key=lambda key: (int(getattr(valid[key], "priority", 100)), key),
+        ))
+        self.configured_profiles = {key: valid[key] for key in ordered}
 
     @classmethod
     def from_env(cls):
@@ -120,6 +147,8 @@ class ModelRouter:
                     tool_calling=native, streaming=streaming,
                     structured_output=structured, priority=priority,
                     profile_id=profile_id,
+                    model_capabilities=os.getenv(f"{name}_LLM_CAPABILITIES", "").split(","),
+                    cost_per_1k_tokens_usd=_optional_nonnegative_float(os.getenv(f"{name}_LLM_COST_PER_1K_TOKENS_USD", "")),
                 )
                 providers.append(provider)
                 configured_profiles[profile_id] = provider
@@ -136,12 +165,49 @@ class ModelRouter:
                 tool_calling=native, streaming=streaming,
                 structured_output=structured, priority=1000,
                 profile_id="default",
+                model_capabilities=os.getenv("LLM_CAPABILITIES", "").split(","),
+                cost_per_1k_tokens_usd=_optional_nonnegative_float(os.getenv("LLM_COST_PER_1K_TOKENS_USD", "")),
             )
             configured_profiles["default"] = default_provider
             # Preserve the established automatic order: the generic LLM profile
             # joins auto failover only when no named profile is configured.
             if not providers:
                 providers.append(default_provider)
+
+        # Numbered OpenAI-compatible profiles let operators add providers without
+        # changing MissionRuntime or orchestration code. Non-OpenAI providers can
+        # register through ModelRouter's provider interface.
+        dynamic_profiles: dict[int, str] = {}
+        for env_name in os.environ:
+            match = re.fullmatch(r"MODEL_PROFILE_(\d+)_ID", env_name)
+            if match:
+                dynamic_profiles[int(match.group(1))] = os.environ.get(env_name, "").strip()
+        for position, profile_id in sorted(dynamic_profiles.items()):
+            if (
+                not profile_id
+                or profile_id == "auto"
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile_id)
+                or profile_id in configured_profiles
+            ):
+                continue
+            prefix = f"MODEL_PROFILE_{position}"
+            profile_base = os.getenv(f"{prefix}_BASE_URL", "").strip()
+            profile_model = os.getenv(f"{prefix}_MODEL", "").strip()
+            if not profile_base or not profile_model:
+                continue
+            provider = OpenAICompatibleProvider(
+                profile_id,
+                profile_base,
+                profile_model,
+                os.getenv(f"{prefix}_API_KEY", "").strip(),
+                tool_calling=os.getenv(f"{prefix}_TOOL_CALLING", "false").lower() == "true",
+                priority=int(os.getenv(f"{prefix}_PRIORITY", str(500 + position))),
+                profile_id=profile_id,
+                model_capabilities=os.getenv(f"{prefix}_CAPABILITIES", "").split(","),
+                cost_per_1k_tokens_usd=_optional_nonnegative_float(os.getenv(f"{prefix}_COST_PER_1K_TOKENS_USD", "")),
+            )
+            providers.append(provider)
+            configured_profiles[profile_id] = provider
 
         providers.sort(key=lambda item: int(getattr(item, "priority", 100)))
         return cls(providers, configured_profiles=configured_profiles)
@@ -153,7 +219,9 @@ class ModelRouter:
             "label": "Automatic · configured failover order",
             "mode": "auto",
         }]
-        for profile_id in PROFILE_ORDER:
+        profile_ids = list(PROFILE_ORDER)
+        profile_ids.extend(key for key in self.configured_profiles if key not in PROFILE_ORDER)
+        for profile_id in profile_ids:
             provider = self.configured_profiles.get(profile_id)
             if provider is None:
                 continue
@@ -165,6 +233,7 @@ class ModelRouter:
                 "adapter": "openai_compatible_http",
                 "private_endpoint": _is_private_literal_endpoint(getattr(provider, "base_url", "")),
                 "capabilities": _capability_summary(provider),
+                "model_capabilities": sorted(str(item) for item in getattr(provider, "model_capabilities", ())),
             })
         return result
 
@@ -188,7 +257,7 @@ class ModelRouter:
                 "profile_fingerprint": _fingerprint(automatic_material),
             }
             return self, metadata
-        if profile_id not in PROFILE_ORDER:
+        if profile_id == "auto" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile_id):
             raise ModelSelectionError("invalid_model_id")
         provider = self.configured_profiles.get(profile_id)
         if provider is None:
@@ -281,12 +350,12 @@ class ModelRouter:
             try:
                 fn = getattr(provider, "generate", None) or getattr(provider, "chat", None)
                 response = self._trusted(self._normalize(fn(messages, temperature=temperature, **kwargs), provider, "generate"), provider, "generate")
-                self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
+                self.last_trace.append({"provider": _safe_model_label(getattr(provider, "name", "unknown")), "model": _safe_model_label(getattr(provider, "model", "unknown")), "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return response
             except Exception as exc:
                 failure = self._classify(exc, provider)
                 errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
-                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
+                self.last_trace.append({"provider": _safe_model_label(getattr(provider, "name", "unknown")), "model": _safe_model_label(getattr(provider, "model", "unknown")), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": _safe_model_label(str(failure)), "capabilities": self._caps(provider).__dict__.copy()})
         raise ProviderFailure(self._failure_message(errors, capability="all model providers failed"))
 
     def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
@@ -302,12 +371,12 @@ class ModelRouter:
             try:
                 response = provider.tool_calling(messages, tools, temperature=temperature, **kwargs)
                 result = self._trusted(self._normalize(response, provider, "tool_calling"), provider, "tool_calling")
-                self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
+                self.last_trace.append({"provider": _safe_model_label(getattr(provider, "name", "unknown")), "model": _safe_model_label(getattr(provider, "model", "unknown")), "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return result
             except Exception as exc:
                 failure = self._classify(exc, provider)
                 errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
-                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
+                self.last_trace.append({"provider": _safe_model_label(getattr(provider, "name", "unknown")), "model": _safe_model_label(getattr(provider, "model", "unknown")), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": _safe_model_label(str(failure)), "capabilities": self._caps(provider).__dict__.copy()})
         if self.selected_profile_id and not errors:
             raise CapabilityUnsupported(f"selected model profile '{self.selected_profile_id}' does not support native tool calling")
         if errors:

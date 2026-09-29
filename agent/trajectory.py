@@ -34,6 +34,9 @@ class EventType(str, Enum):
     MISSION_COMPLETED = "MissionCompleted"
     RECOVERY_REQUIRED = "RecoveryRequired"
     MODEL_TURN = "ModelTurn"
+    MODEL_INVOCATION = "ModelInvocation"
+    MODEL_ORCHESTRATION = "ModelOrchestration"
+    MODEL_SELECTION_CHANGED = "ModelSelectionChanged"
 
 
 @dataclass(frozen=True)

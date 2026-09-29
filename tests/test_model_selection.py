@@ -90,12 +90,13 @@ def test_catalog_redacts_endpoint_like_or_secret_bearing_model_labels(monkeypatc
         ("http://127.0.0.1:8000/v1", True),
         ("http://10.20.30.40:8000/v1", True),
         ("https://[fd00::2]:8000/v1", True),
-        ("http://localhost:8000/v1", False),
+        ("http://localhost:8000/v1", True),
+        ("http://inference.localhost:8000/v1", True),
         ("https://models.example.test/v1", False),
         ("https://8.8.8.8/v1", False),
     ],
 )
-def test_local_endpoint_label_requires_literal_loopback_or_private_ip(base_url, expected):
+def test_local_endpoint_label_requires_private_address_or_reserved_localhost(base_url, expected):
     provider = OpenAICompatibleProvider("local", base_url, "model", profile_id="local")
     router = ModelRouter([provider], configured_profiles={"local": provider})
 

@@ -16,6 +16,7 @@ from .model_protocol import ConversationTurn, NativeModel, ToolCallResult
 from .provider_api import ProviderError
 from .model_intelligence.context import ContextAssembler
 from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
+from .context import sanitize_model_data, sanitize_model_text
 
 
 class MissionRuntime:
@@ -265,7 +266,7 @@ class MissionRuntime:
         mission.transition(MissionStatus.READY, "plan persisted")
         return self.store.save(mission)
 
-    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None) -> Mission:
+    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, mission_id: str | None = None) -> Mission:
         """Create a Mission without allowing model understanding to rewrite the Owner objective."""
         from security.authorization_context import AuthorizationContext
         if not isinstance(authorization_context, AuthorizationContext):
@@ -286,6 +287,7 @@ class MissionRuntime:
             completion_criteria=completion_criteria,
             provenance={"source": "owner_instruction", **(provenance or {})},
             authorization_snapshot_factory=authorization_snapshot_factory,
+            mission_id=mission_id,
         )
 
     def provide_owner_decision(self, mission_id: str, *, allow: bool, authorization_context: dict[str, Any] | None = None) -> Mission:
@@ -793,7 +795,7 @@ class MissionRuntime:
                                 references.add(str(entry[key]))
         return references
 
-    def run_specialist(self, mission_id: str, *, router: Any, profile_id: str, task_id: str, question: str, max_turns: int = 20) -> Mission:
+    def run_specialist(self, mission_id: str, *, router: Any, profile_id: str, task_id: str, question: str, max_turns: int = 20, mind: Any = None, preference: str = "balanced") -> Mission:
         """Run one profile-bound proposal through this durable MissionRuntime and its existing model/tool gates."""
         from security.mission_authorization import MissionAuthorizationSnapshot
         from tools.registry import REGISTRY, provider_tool_schemas
@@ -882,9 +884,14 @@ class MissionRuntime:
             },
         })
         run_id = "specialist-" + hashlib.sha256(f"{mission_id}:{profile.profile_id}:{task_id}:{mission.plan.version}".encode()).hexdigest()[:20]
+        if mind is None:
+            specialist_model = RouterNativeModel(selected_router)
+        else:
+            from .model_protocol import MindNativeModel
+            specialist_model = MindNativeModel(selected_router, mind, self.store, preference=preference)
         return self.run_model_loop(
             mission_id,
-            RouterNativeModel(selected_router),
+            specialist_model,
             tools=schemas,
             run_id=run_id,
             max_turns=max_turns,
@@ -998,13 +1005,28 @@ class MissionRuntime:
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
             assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools, specialist_context=specialist_context)
             progress["last_context_hash"] = assembled.context_hash
+            mission.progress["model_context_provenance"] = [dict(item) for item in assembled.provenance if isinstance(item, dict)]
+            mission.progress["memory_retrieval"] = [
+                {
+                    "memory_id": str(item.get("memory_id", "")),
+                    "source_mission_id": str(item.get("source_mission_id", "")),
+                    "content_hash": str(item.get("content_hash", "")),
+                    "system_evidence_refs": [dict(ref) if isinstance(ref, dict) else str(ref) for ref in item.get("system_evidence_refs", ())],
+                    "validation_state": str(item.get("validation_state", "unverified_memory")),
+                }
+                for item in assembled.provenance if isinstance(item, dict) and item.get("source") == "memory"
+            ]
             progress["context_compaction"] = {
                 "compacted": assembled.compacted,
                 "compacted_items": assembled.compacted_items,
-                "owner_objective": mission.objective,
+                "owner_objective": sanitize_model_text(mission.objective),
                 "mission_id": mission.mission_id,
-                "scope_snapshot": mission.scope_snapshot,
-                "authorization_context": mission.authorization_context,
+                "scope_bounds": sanitize_model_data({
+                    key: mission.scope_snapshot[key]
+                    for key in ("scope_snapshot_id", "target_id", "scope", "authorized_assets", "allowed_networks", "forbidden_actions")
+                    if isinstance(mission.scope_snapshot, dict) and key in mission.scope_snapshot
+                }),
+                "policy_fingerprint": str((mission.policy_snapshot or {}).get("owner_policy_fingerprint", "")) if isinstance(mission.policy_snapshot, dict) else "",
                 "evidence_provenance": [item.get("provenance", {}) for item in mission.evidence],
                 "tool_call_ids": [item.get("tool_call_id", "") for item in progress.get("tool_results", ())],
             }
@@ -1117,7 +1139,26 @@ class MissionRuntime:
                     for proposal in turn.tool_calls
                 ))
             progress["turns"].append(turn.to_dict())
-            mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
+            orchestration = turn.orchestration if isinstance(turn.orchestration, dict) else {}
+            for invocation in orchestration.get("invocations", ()):
+                if isinstance(invocation, dict):
+                    mission.emit(EventType.MODEL_INVOCATION, step_id=str(orchestration.get("task_id", "")), data={**invocation, "request_id": mission.request_id, "mission_id": mission.mission_id, "model_outputs_are_evidence": False})
+            if orchestration:
+                mission.emit(EventType.MODEL_ORCHESTRATION, step_id=str(orchestration.get("task_id", "")), data={
+                    "record_type": "MODEL_ORCHESTRATION",
+                    "status": orchestration.get("status", "unknown"),
+                    "request_id": mission.request_id,
+                    "mission_id": mission.mission_id,
+                    "task_id": orchestration.get("task_id", ""),
+                    "context_hash": orchestration.get("context_hash", ""),
+                    "preference": orchestration.get("preference", ""),
+                    "critic_status": orchestration.get("critic_status", "not_run"),
+                    "critic_report": orchestration.get("critic_report"),
+                    "budget": orchestration.get("budget", {}),
+                    "model_outputs_are_evidence": False,
+                    "can_change_authorization_or_completion": False,
+                })
+            mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason, "orchestration_status": orchestration.get("status", "not_available"), "context_hash": orchestration.get("context_hash", "")})
             mission.checkpoint = previous_checkpoint
             try:
                 mission = self.store.save(mission)

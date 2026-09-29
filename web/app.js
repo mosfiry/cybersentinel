@@ -24,8 +24,9 @@ const state = {
   conversationId: "",
   conversationTasks: [],
   connectionAvailable: false,
-  modelCatalog: [],
-  selectedModelId: "auto",
+  modelPreferences: [],
+  selectedModelPreference: "balanced",
+  continueSelectedMission: false,
   missions: [],
   selectedMissionId: "",
   selectedMission: null,
@@ -94,10 +95,13 @@ function errorText(error) {
     public_boundary_disabled: "واجهة المتصفح معطلة في إعدادات الخدمة.",
     unknown_mission: "المهمة غير موجودة أو غير متاحة لهذا الحساب.",
     not_found: "المورد غير موجود أو محجوب بسياسة مساحة العمل.",
-    invalid_model_id: "خيار النموذج غير صالح؛ حدّث قائمة النماذج وحاول مجددًا.",
+    invalid_model_id: "خيار النموذج غير صالح؛ حدّث الصفحة وحاول مجددًا.",
+    invalid_model_preference: "تفضيل التنسيق غير صالح؛ اختر أحد الخيارات المعروضة.",
+    model_id_and_preference_are_mutually_exclusive: "اختر إما ملفًا محددًا عبر API أو تفضيل التنسيق، لا كليهما.",
     selected_model_unavailable: "النموذج المختار لم يعد مُعدًا على الخادم.",
     selected_model_configuration_changed: "تغيّر إعداد النموذج المحفوظ؛ اختر نموذجًا جديدًا أو استخدم التلقائي.",
-    mission_model_selection_locked: "لا يمكن تغيير نموذج مهمة قائمة؛ يظل النموذج الأصلي مثبتًا عند الاستئناف.",
+    mission_not_resumable: "المهمة المكتملة لا يمكن استئنافها؛ أرسل طلبًا جديدًا لبدء مهمة جديدة.",
+    mission_busy: "المهمة قيد التنفيذ حاليًا؛ انتظر انتهاء العامل قبل إرسال متابعة أخرى.",
     only_model_id_is_accepted: "يُقبل معرّف النموذج من القائمة فقط.",
   };
   return messages[error.message] || `تعذر إكمال الطلب: ${error.message || "خطأ غير معروف"}`;
@@ -133,8 +137,7 @@ async function status() {
       api("/api/public/auth/session"),
     ]);
     updateAuthUI(auth);
-    if (state.ownerAuthenticated) await loadModelCatalog();
-    else resetModelCatalog();
+    loadModelPreferences();
     state.connectionAvailable = health.ok === true;
     const runtime = $("#runtimeState");
     runtime.classList.remove("offline");
@@ -170,75 +173,52 @@ function updateAuthUI(data) {
   $("#authMessage").textContent = "";
 }
 
-function resetModelCatalog(message = "سجّل الدخول لعرض خيارات النماذج المُعدّة.") {
-  state.modelCatalog = [];
-  state.selectedModelId = "auto";
-  const select = $("#modelProfileId");
+const MODEL_PREFERENCES = [
+  { id: "fast", label: "سريع · ملف واحد وأقل كمون" },
+  { id: "balanced", label: "متوازن · تحليل ومراجعة عند التهيئة" },
+  { id: "deep", label: "متعمق · تعاون نماذج أوسع ضمن الميزانية" },
+  { id: "local", label: "محلي/خاص فقط · لا يتجاوز نقطة نهاية خاصة مُعلنة" },
+];
+const RESUMABLE_MISSION_STATUSES = new Set([
+  "CREATED", "PLANNING", "READY", "RUNNING", "OBSERVING", "VERIFYING",
+  "REPLANNING", "PAUSED", "RECOVERY_REQUIRED", "OWNER_INPUT_REQUIRED", "AUTHORIZATION_BLOCKED",
+]);
+
+function resetModelPreferences(message = "اختر تفضيل التنسيق؛ لا يُكشف ملف المزوّد أو طرازه في المتصفح.") {
+  state.modelPreferences = MODEL_PREFERENCES;
+  state.selectedModelPreference = "balanced";
+  const select = $("#modelPreference");
   if (select) {
-    select.replaceChildren(new Option("تلقائي · ترتيب تجاوز الفشل المُعدّ", "auto"));
-    select.value = "auto";
-    select.disabled = true;
+    select.replaceChildren(...MODEL_PREFERENCES.map((item) => new Option(item.label, item.id)));
+    select.value = "balanced";
+    select.disabled = !state.ownerAuthenticated;
   }
-  const note = $("#modelCatalogNote");
+  const note = $("#modelPreferenceNote");
   if (note) note.textContent = message;
 }
 
-async function loadModelCatalog() {
-  const select = $("#modelProfileId");
-  const note = $("#modelCatalogNote");
-  if (!select || !state.ownerAuthenticated) {
-    resetModelCatalog();
-    return;
+function loadModelPreferences() {
+  const select = $("#modelPreference");
+  if (!select) return;
+  const previous = select.value || state.selectedModelPreference || "balanced";
+  if (!select.options.length || !MODEL_PREFERENCES.some((item) => item.id === select.options[0]?.value)) {
+    select.replaceChildren(...MODEL_PREFERENCES.map((item) => new Option(item.label, item.id)));
   }
-  select.disabled = true;
-  if (note) note.textContent = "جارٍ تحميل خيارات النماذج المُعدّة…";
-  try {
-    const data = await api("/api/public/model-catalog");
-    const allowedIds = new Set(["auto", "local", "colab", "hf", "default"]);
-    const catalog = Array.isArray(data.models)
-      ? data.models.filter((item) => item && typeof item === "object" && allowedIds.has(item.id) && (item.id === "auto" || item.mode === "explicit"))
-      : [];
-    if (!catalog.some((item) => item.id === "auto")) catalog.unshift({ id: "auto", mode: "auto" });
-    state.modelCatalog = catalog;
-    const previous = select.value || state.selectedModelId || "auto";
-    select.replaceChildren();
-    catalog.forEach((item) => {
-      const option = document.createElement("option");
-      option.value = item.id;
-      if (item.id === "auto") {
-        option.textContent = "تلقائي · ترتيب تجاوز الفشل المُعدّ";
-      } else {
-        const model = String(item.model || "نموذج مُعد").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 120);
-        const endpointLabel = item.private_endpoint === true
-          ? "نقطة نهاية خاصة/loopback"
-          : item.id === "local" ? "ملف local · نقطة نهاية غير خاصة" : `ملف ${item.id}`;
-        option.textContent = `${endpointLabel} · ${model}`;
-      }
-      select.appendChild(option);
-    });
-    select.value = catalog.some((item) => item.id === previous) ? previous : "auto";
-    state.selectedModelId = select.value;
-    select.disabled = false;
-    updateModelCatalogNote();
-  } catch (_) {
-    resetModelCatalog("تعذّر تحميل الكتالوج؛ ما يزال الخيار التلقائي متاحًا.");
-    select.disabled = false;
-  }
+  select.value = MODEL_PREFERENCES.some((item) => item.id === previous) ? previous : "balanced";
+  select.disabled = !state.ownerAuthenticated;
+  state.modelPreferences = MODEL_PREFERENCES;
+  updateModelPreferenceNote();
 }
 
-function updateModelCatalogNote() {
-  const note = $("#modelCatalogNote");
-  const select = $("#modelProfileId");
+function updateModelPreferenceNote() {
+  const note = $("#modelPreferenceNote");
+  const select = $("#modelPreference");
   if (!note || !select) return;
-  const selected = state.modelCatalog.find((item) => item.id === select.value);
-  state.selectedModelId = selected?.id || "auto";
-  if (!selected || selected.id === "auto") {
-    note.textContent = "التلقائي يحافظ على ترتيب تجاوز الفشل المُعدّ على الخادم.";
-  } else if (selected.private_endpoint === true) {
-    note.textContent = "نقطة نهاية HTTP متوافقة مع OpenAI على عنوان IP خاص/loopback؛ لا يثبت ذلك وجود Runtime محلي أصلي.";
-  } else {
-    note.textContent = "نقطة نهاية HTTP متوافقة مع OpenAI؛ لم يُثبت أنها خاصة أو محلية.";
-  }
+  const selected = MODEL_PREFERENCES.find((item) => item.id === select.value) || MODEL_PREFERENCES[1];
+  state.selectedModelPreference = selected.id;
+  note.textContent = selected.id === "local"
+    ? "لا يستخدم هذا الخيار إلا ملفات صرّح الخادم بأن نقطة نهايتها خاصة/loopback؛ لا يثبت وحده أن المزود محلي أصليًا."
+    : "يختار الخادم النماذج والأدوار من القدرات المهيأة؛ حدود المالك والتنفيذ والأدلة لا تتغير بهذا التفضيل.";
 }
 
 function resetWorkspaceState() {
@@ -248,7 +228,8 @@ function resetWorkspaceState() {
   state.selectedMission = null;
   state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [] };
   state.missions = [];
-  resetModelCatalog();
+  state.continueSelectedMission = false;
+  resetModelPreferences();
   $("#messages").replaceChildren();
   $("#missionHeader").classList.add("hidden");
   $("#missionTools").classList.add("hidden");
@@ -391,12 +372,24 @@ async function send(text) {
   button.disabled = true;
   const loading = bubble("bot", "جارٍ إرسال الطلب إلى الخادم...", "loading");
   try {
+    const selectedMissionId = state.continueSelectedMission
+      && RESUMABLE_MISSION_STATUSES.has(String(state.selectedMission?.status || ""))
+      ? state.selectedMissionId : undefined;
     const data = await api("/api/public/chat", {
       method: "POST",
-      body: JSON.stringify({ text, conversation_id: state.conversationId || undefined, model_id: $("#modelProfileId")?.value || "auto" }),
+      body: JSON.stringify({ text,
+        conversation_id: state.conversationId || undefined,
+        mission_id: selectedMissionId,
+        model_preference: $("#modelPreference")?.value || state.selectedModelPreference || "balanced",
+      }),
     });
     loading.remove();
     state.conversationId = String(data.conversation_id || "");
+    const returnedMissionId = String(data.mission_id || "");
+    if (returnedMissionId) {
+      state.selectedMissionId = returnedMissionId;
+      state.continueSelectedMission = RESUMABLE_MISSION_STATUSES.has(String(data.mission?.status || ""));
+    }
     rememberConversation(state.conversationId);
     (Array.isArray(data.activity) ? data.activity : []).forEach((item) => {
       const label = item.event || item.type || item.tool || item.name || "حدث من الخادم";
@@ -456,7 +449,7 @@ function renderMissions() {
       button.type = "button";
       button.className = `mission-item${mission.mission_id === state.selectedMissionId ? " selected" : ""}`;
       button.innerHTML = `<strong>${esc(mission.objective || mission.owner_request || mission.mission_id)}</strong><span>${esc(missionStatusLabel(mission))}</span><small>${esc(mission.request_id || "Request ID غير متاح")}</small>`;
-      button.addEventListener("click", () => selectMission(mission.mission_id));
+      button.addEventListener("click", () => selectMission(mission.mission_id, { explicit: true }));
       target.appendChild(button);
     });
   });
@@ -505,7 +498,8 @@ function missionEndpoint(action) {
   return `/api/public/missions/${encodeURIComponent(state.selectedMissionId)}/${encodeURIComponent(action)}`;
 }
 
-async function selectMission(missionId) {
+async function selectMission(missionId, { explicit = false } = {}) {
+  state.continueSelectedMission = explicit;
   state.selectedMissionId = String(missionId || "");
   state.filePath = ".";
   renderMissions();
@@ -831,7 +825,7 @@ $("#activityToggle").onclick = () => {
 $("#toolsLink").onclick = toolsPanel;
 $("#settingsLink").onclick = settingsPanel;
   $("#refreshMissions")?.addEventListener("click", loadMissions);
-$("#modelProfileId")?.addEventListener("change", updateModelCatalogNote);
+  $("#modelPreference")?.addEventListener("change", updateModelPreferenceNote);
 
 $("#missionForm").onsubmit = async (event) => {
   event.preventDefault();
@@ -842,7 +836,7 @@ $("#missionForm").onsubmit = async (event) => {
   try {
     const data = await api("/api/public/missions", {
       method: "POST",
-      body: JSON.stringify({ objective: $("#missionObjective").value.trim(), model_id: $("#modelProfileId")?.value || "auto" }),
+      body: JSON.stringify({ objective: $("#missionObjective").value.trim(), model_preference: $("#modelPreference")?.value || "balanced" }),
     });
     $("#missionObjective").value = "";
     state.selectedMissionId = data.mission_id || data.mission?.mission_id || "";

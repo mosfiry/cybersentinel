@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, Sequence
 import uuid
 
-from .provider_api import CapabilityUnsupported
+from .provider_api import CapabilityUnsupported, ProviderFailure
 
 
 @dataclass(frozen=True)
@@ -76,13 +76,17 @@ class ModelTurn:
     model: str = ""
     finish_reason: str = "stop"
     usage: dict[str, Any] = field(default_factory=dict)
+    orchestration: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_final(self) -> bool:
         return not self.tool_calls
 
     def to_dict(self) -> dict[str, Any]:
-        return {"turn_id": self.turn_id, "content": self.content, "tool_calls": [item.to_dict() for item in self.tool_calls], "provider": self.provider, "model": self.model, "finish_reason": self.finish_reason, "usage": dict(self.usage)}
+        result = {"turn_id": self.turn_id, "content": self.content, "tool_calls": [item.to_dict() for item in self.tool_calls], "provider": self.provider, "model": self.model, "finish_reason": self.finish_reason, "usage": dict(self.usage)}
+        if self.orchestration:
+            result["orchestration"] = dict(self.orchestration)
+        return result
 
 
 @dataclass(frozen=True)
@@ -111,7 +115,7 @@ def model_turn_from_provider(response: dict[str, Any], *, mission_id: str, run_i
         if not isinstance(raw, dict) or not isinstance(raw.get("name"), str):
             continue
         calls.append(ToolCallProposal.create(raw["name"], raw.get("arguments") if isinstance(raw.get("arguments"), dict) else {}, mission_id=mission_id, run_id=run_id, turn_id=turn_id, action_id=f"{mission_id}:{turn_id}:{raw.get('id') or uuid.uuid4().hex}", tool_call_id=str(raw.get("id") or "call_" + uuid.uuid4().hex), request_id=request_id, plan_version=plan_version, step_id=step_id))
-    return ModelTurn(turn_id=turn_id, content=str(response.get("content", "") or ""), tool_calls=tuple(calls), provider=str(response.get("provider", "")), model=str(response.get("model", "")), finish_reason=str(response.get("finish_reason", "tool_calls" if calls else "stop")), usage=dict(response.get("usage") or {}))
+    return ModelTurn(turn_id=turn_id, content=str(response.get("content", "") or ""), tool_calls=tuple(calls), provider=str(response.get("provider", "")), model=str(response.get("model", "")), finish_reason=str(response.get("finish_reason", "tool_calls" if calls else "stop")), usage=dict(response.get("usage") or {}), orchestration=dict(response.get("orchestration") or {}))
 
 
 class RouterNativeModel:
@@ -132,4 +136,56 @@ class RouterNativeModel:
         return model_turn_from_provider(response, mission_id=mission_id, run_id=run_id, turn_id=turn_id, request_id="", plan_version=plan_version)
 
 
-__all__ = ["ConversationTurn", "ModelFinal", "ModelTurn", "NativeModel", "ReasoningContinuation", "RouterNativeModel", "ToolCallProposal", "ToolCallResult", "model_turn_from_provider"]
+class MindNativeModel:
+    """Native MissionRuntime adapter that delegates each turn to CyberSentinelMind."""
+
+    def __init__(self, router: Any, mind: Any, store: Any, *, preference: str = "balanced"):
+        self.router = router
+        self.mind = mind
+        self.store = store
+        self.preference = preference
+
+    def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int) -> ModelTurn:
+        payload = [item.to_dict() for item in messages]
+        mission = self.store.load(mission_id)
+        if mission is None:
+            raise ProviderFailure("mission disappeared before Mind inference")
+        from .agent_core import AgentCore
+        mission_context, evidence_ids = AgentCore._mission_model_context(mission, task_id=turn_id)
+        task_id = str((mission.checkpoint or {}).get("step_id") or turn_id)
+        context_hash = str(mission.progress.get("last_context_hash", ""))
+        if not context_hash:
+            import hashlib
+            import json
+            context_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+        provenance = list(mission.progress.get("model_context_provenance", ()))
+        response = self.mind.orchestrate(
+            router=self.router,
+            messages=payload,
+            tools=list(tools),
+            objective=mission.objective,
+            request_id=mission.request_id,
+            mission_id=mission.mission_id,
+            task_id=task_id,
+            context_hash=context_hash,
+            context_provenance=provenance,
+            preference=self.preference,
+            verified_evidence_ids=evidence_ids,
+            require_tool_calling=True,
+        )
+        status = str((response.get("orchestration") or {}).get("status", ""))
+        if status in {"no_provider", "provider_unavailable", "synthesis_failed", "orchestrator_error"}:
+            raise ProviderFailure(f"Mind inference unavailable: {status}")
+        turn = model_turn_from_provider(
+            response,
+            mission_id=mission_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            request_id=mission.request_id,
+            plan_version=plan_version,
+            step_id=task_id,
+        )
+        return replace(turn, orchestration=dict(response.get("orchestration") or {}))
+
+
+__all__ = ["ConversationTurn", "MindNativeModel", "ModelFinal", "ModelTurn", "NativeModel", "ReasoningContinuation", "RouterNativeModel", "ToolCallProposal", "ToolCallResult", "model_turn_from_provider"]

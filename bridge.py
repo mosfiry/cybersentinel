@@ -26,8 +26,8 @@ from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 import security.owner_password as owner_password
 from security.owner_password import login as owner_password_login, logout as owner_password_logout
-from api.chat import chat, get_session, sse, stream, task_stream, create_task, get_task, resume_task, pause_task, cancel_task, _task_public
-from api.models import model_catalog, requested_model_id
+from api.chat import MissionBusyError, chat, get_session, sse, stream, task_stream, create_task, get_task, resume_task, pause_task, cancel_task, _task_public
+from api.models import model_catalog, requested_model_id, requested_model_preference
 from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
@@ -600,7 +600,19 @@ class Handler(BaseHTTPRequestHandler):
                 if criteria is not None and (not isinstance(criteria, list) or len(criteria) > 100):
                     raise ValueError("invalid_completion_criteria")
                 core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
-                mission = core.run_owner_mission(objective, owner_session_token=owner["session_id"], request_id=uuid.uuid4().hex, scope_context={"workspace_root": str(ROOT), "target_id": "cybersentinel-repository"}, completion_criteria=criteria, run=False, model_id=requested_model_id(payload) or "auto")
+                model_id = requested_model_id(payload, default=None)
+                if model_id is not None and "model_preference" in payload:
+                    raise ValueError("model_id_and_preference_are_mutually_exclusive")
+                mission = core.run_owner_mission(
+                    objective,
+                    owner_session_token=owner["session_id"],
+                    request_id=uuid.uuid4().hex,
+                    scope_context={"workspace_root": str(ROOT), "target_id": "cybersentinel-repository"},
+                    completion_criteria=criteria,
+                    run=False,
+                    model_id=model_id or "auto",
+                    model_preference=requested_model_preference(payload, default="balanced") or "balanced",
+                )
                 queued = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3")).enqueue(mission.mission_id)
                 return self._send(201, {"ok": True, "mission": mission.to_public_dict(), "mission_id": mission.mission_id, "queue": queued.__dict__})
             except QueueCapacityError:
@@ -717,6 +729,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, **result})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
+            except MissionBusyError:
+                return self._send(409, {"ok": False, "error": "mission_busy"})
             except ValueError as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
             except Exception:
@@ -753,6 +767,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, **result})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
+            except MissionBusyError:
+                return self._send(409, {"ok": False, "error": "mission_busy"})
             except ValueError as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
             except Exception:
@@ -820,6 +836,8 @@ class Handler(BaseHTTPRequestHandler):
                 owner_session_token=owner_session["session_id"],
             )
             return self._send(200, {"ok": True, **result})
+        except MissionBusyError:
+            return self._send(409, {"ok": False, "error": "mission_busy"})
         except Exception:
             return self._send(400, {"ok": False, "error": "invalid_request"})
 

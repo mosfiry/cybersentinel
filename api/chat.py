@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 from typing import Any, Iterator
 
 from agent.task import TaskStatus
 from agent.task_manager import TaskManager
 from agent.mission_task_adapter import MissionTaskAdapter, task_owner_matches
 from agent.agent_core import AgentCore
+from agent.mind import CyberSentinelMind
 from agent.mission import MissionStatus
-from agent.model_router import ModelSelectionError
+from agent.mission_worker import MissionQueue, WorkerMissionState
+from api.models import requested_model_preference
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
 from core.engine import RUNTIME
 from security import owner_password
-from api.models import requested_model_id
+
+
+class MissionBusyError(RuntimeError):
+    """A durable worker currently owns this Mission's execution lease."""
 
 
 def _owner_session(owner_session_token: str) -> dict[str, Any]:
@@ -58,7 +64,8 @@ def create_task(payload: dict[str, Any], *, owner_session_token: str, run: bool 
     conversation_id = _conversation_id(payload)
     owner = _owner_session(owner_session_token)
     task_runtime = _runtime()
-    task = task_runtime.create_task(conversation_id, text, owner_session_token=owner_session_token, owner_session_id=owner["session_id"], authentication_method="username_password", scope_context=payload.get("scope_context"), run=run)
+    preference = requested_model_preference(payload, default="balanced") or "balanced"
+    task = task_runtime.create_task(conversation_id, text, owner_session_token=owner_session_token, owner_session_id=owner["session_id"], authentication_method="username_password", scope_context=payload.get("scope_context"), model_preference=preference, run=run)
     return {"task": _task_public(task)}
 
 
@@ -100,33 +107,58 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
     # task/core-engine branch remains available only through the explicit task
     # compatibility endpoints below; it is not a chat execution path.
     owner = _owner_session(owner_session_token)
-    requested_profile = requested_model_id(payload, default=None)
     core = _agent_core()
     owner_id = str(owner["owner_id"])
     ensure_conversation(conversation_id, owner_id)
-    add_conversation_message(conversation_id, "user", text, owner_id=owner_id)
-    if payload.get("mission_id"):
-        mission_id = str(payload["mission_id"])
+    mission_id = str(payload.get("mission_id") or "").strip()
+    queue: MissionQueue | None = None
+    queue_item = None
+    run_mission = True
+    requeue_after_update = False
+    if mission_id:
         existing = core.store.load_for_owner(mission_id, owner_id)
         if existing is None:
             raise KeyError("unknown_mission")
-        pinned_profile = str((existing.model_selection or {}).get("profile_id") or "auto")
-        if requested_profile is not None and requested_profile != pinned_profile:
-            raise ModelSelectionError("mission_model_selection_locked")
-        mission = core.resume_mission(mission_id, owner_session_token=owner_session_token)
-    else:
-        mission = core.run_owner_mission(
-            text,
-            owner_session_token=owner_session_token,
-            request_id=str(payload.get("request_id") or uuid.uuid4().hex),
-            scope_context=payload.get("scope_context"),
-            completion_criteria=payload.get("completion_criteria"),
-            model_id=requested_profile if requested_profile is not None else "auto",
-        )
+        if existing.is_terminal:
+            raise ValueError("mission_not_resumable")
+        checkpoint_status = str((existing.checkpoint or {}).get("status", "")).casefold()
+        if checkpoint_status in {"model_in_flight", "tool_in_flight", "in_flight_parallel", "verification_in_flight"}:
+            raise MissionBusyError("mission_busy")
+        queue = MissionQueue(Path(core.store.db_path).with_name("mission_queue.sqlite3"))
+        try:
+            queue_item = queue.get(mission_id)
+        except KeyError:
+            queue_item = None
+        if queue_item is not None:
+            if queue_item.state is WorkerMissionState.EXECUTING:
+                raise MissionBusyError("mission_busy")
+            run_mission = False
+            requeue_after_update = queue_item.state not in {
+                WorkerMissionState.QUEUED,
+                WorkerMissionState.SCHEDULED,
+                WorkerMissionState.SLEEPING,
+            }
+    # Do not persist a message for a Mission whose live worker cannot accept it.
+    add_conversation_message(conversation_id, "user", text, owner_id=owner_id)
+    mind = CyberSentinelMind(core.router)
+    mission = mind.chat(
+        core=core,
+        payload=payload,
+        text=text,
+        owner_session_token=owner_session_token,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        run_mission=run_mission,
+    )
+    if requeue_after_update and queue is not None:
+        queue_item = queue.enqueue(mission.mission_id)
     if mission.provenance.get("conversation_id") != conversation_id:
         mission.provenance["conversation_id"] = conversation_id
         mission = core.store.save(mission)
-    answer = str(mission.progress.get("last_model_content") or "")
+    if not run_mission:
+        answer = "تم حفظ رسالتك ضمن المهمة. ستتابعها الخدمة عبر طابور التنفيذ القائم."
+    else:
+        answer = str(mission.progress.get("last_model_content") or "")
     if answer:
         try:
             parsed = json.loads(answer)
@@ -134,7 +166,7 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
                 answer = str(parsed.get("content", parsed.get("answer", answer)))
         except json.JSONDecodeError:
             pass
-    if not answer:
+    if run_mission and not answer:
         initial = mission.progress.get("initial_model_response") or {}
         answer = str(initial.get("content", "") or "")
         try:
@@ -143,6 +175,12 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
                 answer = str(parsed.get("content", parsed.get("answer", answer)))
         except json.JSONDecodeError:
             pass
+    if run_mission and not answer:
+        turns = ((mission.progress.get("model_loop") or {}).get("turns") or [])
+        for turn in reversed(turns):
+            if isinstance(turn, dict) and turn.get("content"):
+                answer = str(turn["content"])
+                break
     answer = answer or "Mission " + mission.status.value
     add_conversation_message(conversation_id, "assistant", answer, {"mission_id": mission.mission_id, "status": mission.status.value, "request_id": mission.request_id, "conversation_id": conversation_id}, owner_id=owner_id)
     activity = list(mission.trajectory)
@@ -154,6 +192,8 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
         "answer": answer,
         "mission_id": mission.mission_id,
         "status": mission.status.value,
+        "queued": not run_mission,
+        "queue_state": queue_item.state.value if queue_item is not None else None,
         "activity": activity,
         "mission": mission.to_public_dict(),
     }
