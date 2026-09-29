@@ -108,6 +108,63 @@ def test_cancel_before_slice_is_persisted(isolated_dbs, monkeypatch):
     assert provider.calls == 0
 
 
+def test_cancel_requested_during_parallel_batch_is_persisted(isolated_dbs, monkeypatch):
+    provider = ScriptedProvider([
+        ProviderResponse(tool_calls=[
+            ToolCall("search", {"query": "first"}, "parallel-1"),
+            ToolCall("search", {"query": "second"}, "parallel-2"),
+        ], finish_reason="tool_calls"),
+    ])
+
+    class CancellingRuntime(AgentTaskRuntime):
+        def _run_one(self, task, call, owner_session_token, owner_session_id):
+            result = super()._run_one(task, call, owner_session_token, owner_session_id)
+            persisted = TaskManager.get_task(task.task_id)
+            persisted.request_cancel()
+            TaskManager.update_task(persisted)
+            return result
+
+    allow_owner_sessions(monkeypatch, "owner")
+    runtime = CancellingRuntime(ModelRouter([provider]), executor=lambda command, **kwargs: {"ok": True})
+    task = runtime.create_task("conv-cancel-parallel", "cancel parallel batch")
+    cancelled = runtime.run_slice(task.task_id, owner_session_token="owner")
+
+    assert cancelled.status == TaskStatus.CANCELLED
+    assert cancelled.cancel_requested is True
+    assert len(cancelled.tool_calls) == 2
+    assert TaskManager.get_task(task.task_id).status == TaskStatus.CANCELLED
+    assert provider.calls == 1
+
+
+def test_cancel_requested_before_parallel_dispatch_skips_all_tools(isolated_dbs, monkeypatch):
+    provider = ScriptedProvider([
+        ProviderResponse(tool_calls=[
+            ToolCall("search", {"query": "first"}, "parallel-before-1"),
+            ToolCall("search", {"query": "second"}, "parallel-before-2"),
+        ], finish_reason="tool_calls"),
+    ])
+    executions = []
+    active_task_id = {"value": ""}
+
+    class CancellingRuntime(AgentTaskRuntime):
+        def _ask_model(self, context, objective=""):
+            response = super()._ask_model(context, objective)
+            persisted = TaskManager.get_task(active_task_id["value"])
+            persisted.request_cancel()
+            TaskManager.update_task(persisted)
+            return response
+
+    allow_owner_sessions(monkeypatch, "owner")
+    runtime = CancellingRuntime(ModelRouter([provider]), executor=lambda command, **kwargs: executions.append(command) or {"ok": True})
+    task = runtime.create_task("conv-cancel-before-parallel", "cancel before parallel batch")
+    active_task_id["value"] = task.task_id
+    cancelled = runtime.run_slice(task.task_id, owner_session_token="owner")
+
+    assert cancelled.status == TaskStatus.CANCELLED
+    assert executions == []
+    assert cancelled.tool_calls == []
+
+
 def test_native_and_json_fallback_share_task_runtime(isolated_dbs, monkeypatch):
     class Legacy:
         name = "legacy"

@@ -241,6 +241,15 @@ class AgentTaskRuntime:
         task.execution_state["last_signature"] = signature
         return None
 
+    @staticmethod
+    def _cancel_requested(task: Task) -> bool:
+        if task.cancel_requested:
+            return True
+        latest = TaskManager.get_task(task.task_id)
+        if latest is not None and latest.cancel_requested:
+            task.cancel_requested = True
+        return task.cancel_requested
+
     def run_slice(self, task_id: str, *, owner_session_token: str = "", owner_session_id: str | None = None) -> Task:
         task = TaskManager.get_task(task_id)
         if task is None:
@@ -304,17 +313,23 @@ class AgentTaskRuntime:
                     task.error = guarded
                     task.update_status(TaskStatus.PARTIAL_SUCCESS if task.tool_calls else TaskStatus.FAILED)
                     self._event(task, "task.failed", {"reason": guarded})
+                elif self._cancel_requested(task):
+                    task.update_status(TaskStatus.CANCELLED)
+                    self._event(task, "task.cancelled")
                 elif len(value) > 1 and all((get_tool(call.name) and get_tool(call.name).risk_class in {"read", "network-read"}) for call in value):
                     with ThreadPoolExecutor(max_workers=min(len(value), 8)) as pool:
                         list(pool.map(lambda call: self._run_one(task, call, owner_session_token, owner_session_id), value))
                 else:
                     for call in value:
-                        if task.cancel_requested:
+                        if self._cancel_requested(task):
                             task.update_status(TaskStatus.CANCELLED)
                             self._event(task, "task.cancelled")
                             break
                         self._run_one(task, call, owner_session_token, owner_session_id)
-                if not task.is_terminal and task.status == TaskStatus.WAITING_FOR_TOOL:
+                if self._cancel_requested(task) and not task.is_terminal:
+                    task.update_status(TaskStatus.CANCELLED)
+                    self._event(task, "task.cancelled")
+                elif not task.is_terminal and task.status == TaskStatus.WAITING_FOR_TOOL:
                     task.update_status(TaskStatus.WAITING_FOR_MODEL)
                 if not task.is_terminal:
                     task.save_resume_state({"next": "model", "step": task.current_step})
