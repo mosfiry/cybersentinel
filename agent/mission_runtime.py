@@ -303,7 +303,16 @@ class MissionRuntime:
         if mission.authorization_snapshot:
             mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot.get("version", 1))
         mission.transition(MissionStatus.READY, "plan persisted")
-        return self.store.save(mission)
+        saved = self.store.save(mission)
+        if isinstance(mission.authorization_context, dict):
+            try:
+                from security.authorization_context import AuthorizationContext
+                AuthorizationContext.from_dict(dict(mission.authorization_context))
+            except (KeyError, TypeError, ValueError, PermissionError):
+                pass
+            else:
+                self.activate_live_mission(mission)
+        return saved
 
     def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, mission_id: str | None = None) -> Mission:
         """Create a Mission without allowing model understanding to rewrite the Owner objective."""
