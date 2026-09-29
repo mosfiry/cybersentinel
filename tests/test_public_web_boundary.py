@@ -390,3 +390,35 @@ def test_bridge_serves_the_login_page_and_browser_assets(web_server):
         connection.close()
         assert response.status == 200
         assert marker in body
+
+
+def test_public_model_catalog_requires_owner_and_returns_only_catalog_payload(web_server, monkeypatch):
+    server, chat_calls = web_server
+    called_with = []
+    monkeypatch.setattr(
+        bridge,
+        "model_catalog",
+        lambda owner_session_token: called_with.append(owner_session_token) or {"models": [{"id": "auto", "mode": "auto"}]},
+    )
+
+    status, _, denied = request(server, "GET", "/api/public/model-catalog")
+    assert status == 401
+    assert denied["error"] == "public session required"
+
+    public_cookie, csrf = create_public_session(server)
+    status, _, denied = request(server, "GET", "/api/public/model-catalog", cookies=public_cookie)
+    assert status == 403
+    assert denied["error"] == "owner_authorization_required"
+
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    owner_session = owner_password.resolve_session(owner_cookie)
+    assert owner_session is not None
+    cookies = f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}"
+    status, _, payload = request(server, "GET", "/api/public/model-catalog", cookies=cookies)
+
+    assert status == 200
+    assert payload == {"ok": True, "models": [{"id": "auto", "mode": "auto"}]}
+    assert called_with == [owner_session["session_id"]]
+    assert chat_calls == []

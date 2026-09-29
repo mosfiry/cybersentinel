@@ -11,7 +11,7 @@ import security.owner_policy as owner_policy
 from owner_session_testutils import allow_owner_sessions
 from agent.agent_core import AgentCore
 from agent.mission import MissionStatus, MissionStore
-from agent.model_router import ModelRouter
+from agent.model_router import ModelRouter, ModelSelectionError
 from agent.provider_api import ProviderResponse, ToolCall
 
 
@@ -100,10 +100,12 @@ class SchemaCapturingProvider(MissionProvider):
         super().__init__(responses)
         self.capabilities = ProviderCapabilities(generate=True, tool_calling=True, native_chat=native)
         self.schema_names = []
+        self.context_messages = []
 
     def tool_calling(self, messages, tools, **kwargs):
         self.calls += 1
         self.schema_names.append([item["function"]["name"] for item in tools])
+        self.context_messages.append("\n".join(str(item.get("content", "")) for item in messages))
         return self.responses.pop(0)
 
 
@@ -138,6 +140,10 @@ def test_agent_core_sends_only_budgeted_available_tools_and_rejects_widening(mis
     assert mission.provenance["model_requested_tools"] == ["status"]
     assert "watch" not in provider.schema_names[0]
     assert "scoped_http_probe" not in provider.schema_names[0]
+    assert "watch: " not in provider.context_messages[0]
+    assert "scoped_http_probe: " not in provider.context_messages[0]
+    assert "status: " in provider.context_messages[0]
+    assert "search: " in provider.context_messages[0]
     assert executed == []
     assert any(event["event"] == "ExecutionRejected" for event in mission.trajectory)
     assert "outside mission authorization snapshot allowlist" in mission.progress["model_loop"]["tool_results"][-1]["error"]
@@ -164,3 +170,69 @@ def test_restart_replanning_keeps_the_mission_bound_tool_set(mission_env):
     assert set(provider.schema_names[0]) == {"status", "search"}
     assert provider.schema_names[1] == ["status"]
     assert [step.action for step in resumed.plan.steps] == ["__planning_failure__"]
+
+
+def test_explicit_model_profile_is_persisted_and_pinned_across_resume_and_replan(mission_env):
+    fallback = SchemaCapturingProvider([], native=False)
+    selected = SchemaCapturingProvider([
+        ProviderResponse(tool_calls=[ToolCall("status", {}, "selected-initial")]),
+        ProviderResponse(tool_calls=[ToolCall("status", {}, "selected-replan")]),
+    ], native=False)
+    router = ModelRouter(
+        [fallback, selected],
+        configured_profiles={"colab": fallback, "local": selected},
+    )
+    store = MissionStore(Path(mission_env) / "pinned-missions.sqlite3")
+    initial_core = AgentCore(router, store=store, max_iterations=1)
+    mission = initial_core.run_owner_mission(
+        "Check system status and verify the result",
+        owner_session_token="valid-owner",
+        model_id="local",
+        scope_context={"owner_allowed_tools": ["status"]},
+        run=False,
+    )
+
+    persisted = MissionStore(Path(mission_env) / "pinned-missions.sqlite3").load(mission.mission_id)
+    assert persisted is not None
+    assert persisted.model_selection["profile_id"] == "local"
+    assert persisted.model_selection["mode"] == "explicit"
+    assert persisted.model_selection["profile_fingerprint"]
+    assert selected.calls == 1
+    assert fallback.calls == 0
+
+    restarted_core = AgentCore(router, store=MissionStore(Path(mission_env) / "pinned-missions.sqlite3"), max_iterations=1)
+    restarted_core._executor = lambda *_: {"success": False, "failure_class": "COMPILATION", "error": "test-triggered replan"}
+    resumed = restarted_core.resume_mission(
+        mission.mission_id,
+        owner_session_token="valid-owner",
+        max_slices=1,
+    )
+
+    assert resumed.model_selection["profile_id"] == "local"
+    assert selected.calls >= 2
+    assert fallback.calls == 0
+
+
+def test_explicit_model_profile_resume_fails_closed_on_fingerprint_drift(mission_env):
+    original = SchemaCapturingProvider([
+        ProviderResponse(tool_calls=[ToolCall("status", {}, "selected-initial")]),
+    ], native=False)
+    original_router = ModelRouter([original], configured_profiles={"local": original})
+    database = Path(mission_env) / "changed-profile-missions.sqlite3"
+    mission = AgentCore(original_router, store=MissionStore(database), max_iterations=1).run_owner_mission(
+        "Check system status and verify the result",
+        owner_session_token="valid-owner",
+        model_id="local",
+        scope_context={"owner_allowed_tools": ["status"]},
+        run=False,
+    )
+
+    replacement = SchemaCapturingProvider([], native=False)
+    replacement.model = "different-configured-model"
+    changed_router = ModelRouter([replacement], configured_profiles={"local": replacement})
+    restarted = AgentCore(changed_router, store=MissionStore(database), max_iterations=1)
+    with pytest.raises(ModelSelectionError) as changed:
+        restarted.resume_mission(mission.mission_id, owner_session_token="valid-owner", run=False)
+
+    assert changed.value.code == "selected_model_configuration_changed"
+    assert replacement.calls == 0

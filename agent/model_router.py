@@ -1,25 +1,109 @@
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, response_from_legacy
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
 
 
+PROFILE_ORDER = ("local", "colab", "hf", "default")
+
+
+class ModelSelectionError(ValueError):
+    """Safe, stable selection error intended for authenticated API responses."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def _safe_model_label(value: Any) -> str:
+    text = str(value or "").replace("\x00", " ")
+    text = re.sub(r"https?://\S+", "[endpoint omitted]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+    text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[redacted]", text)
+    text = re.sub(r"[\r\n\t\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:120] or "Configured model"
+
+
+def _is_private_literal_endpoint(base_url: Any) -> bool:
+    """Classify only literal loopback/private IPs; never resolve hostnames."""
+    try:
+        parsed = urlsplit(str(base_url or ""))
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False
+        host = parsed.hostname
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+        return bool(address.is_loopback or address.is_private)
+    except (TypeError, ValueError):
+        return False
+
+
+def _capability_summary(provider: Any) -> dict[str, bool]:
+    capabilities = ModelRouter._caps(provider)
+    return {
+        "generate": bool(capabilities.generate),
+        "tool_calling": bool(capabilities.tool_calling),
+        "native_chat": bool(capabilities.native_chat),
+    }
+
+
+def _profile_material(profile_id: str, provider: Any) -> dict[str, Any]:
+    raw_base = str(getattr(provider, "base_url", "") or "")
+    try:
+        parsed = urlsplit(raw_base)
+        endpoint = {
+            "scheme": parsed.scheme.lower(),
+            "host": (parsed.hostname or "").lower(),
+            "port": parsed.port,
+            "path": parsed.path.rstrip("/"),
+        }
+    except ValueError:
+        endpoint = {"invalid": True}
+    return {
+        "id": profile_id,
+        "model": str(getattr(provider, "model", "") or ""),
+        "endpoint": endpoint,
+        "priority": int(getattr(provider, "priority", 100)),
+        "capabilities": _capability_summary(provider),
+    }
+
+
+def _fingerprint(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class ModelRouter:
     providers: list[Any]
-    last_trace: list[dict[str, Any]] = None
+    last_trace: list[dict[str, Any]] | None = None
+    configured_profiles: dict[str, Any] = field(default_factory=dict)
+    selected_profile_id: str | None = None
 
     def __post_init__(self):
         self.last_trace = []
+        configured = dict(self.configured_profiles or {})
+        for provider in self.providers:
+            profile_id = getattr(provider, "profile_id", None)
+            if profile_id in PROFILE_ORDER:
+                configured.setdefault(str(profile_id), provider)
+        self.configured_profiles = {key: configured[key] for key in PROFILE_ORDER if key in configured}
 
     @classmethod
     def from_env(cls):
         providers = []
+        configured_profiles: dict[str, Any] = {}
         for position, name in enumerate(("LOCAL", "COLAB", "HF")):
             base = os.getenv(f"{name}_LLM_BASE_URL", "").strip()
             default_model = "Qwen/Qwen3-Coder-Next" if name == "LOCAL" else ""
@@ -30,17 +114,101 @@ class ModelRouter:
                 streaming = os.getenv(f"{name}_LLM_STREAMING", "false").lower() == "true"
                 structured = os.getenv(f"{name}_LLM_STRUCTURED_OUTPUT", "false").lower() == "true"
                 priority = int(os.getenv(f"{name}_LLM_PRIORITY", str(position * 100 + 10)))
-                providers.append(OpenAICompatibleProvider(name.lower(), base, model, key, tool_calling=native, streaming=streaming, structured_output=structured, priority=priority))
+                profile_id = name.lower()
+                provider = OpenAICompatibleProvider(
+                    profile_id, base, model, key,
+                    tool_calling=native, streaming=streaming,
+                    structured_output=structured, priority=priority,
+                    profile_id=profile_id,
+                )
+                providers.append(provider)
+                configured_profiles[profile_id] = provider
+
         base = os.getenv("LLM_BASE_URL", "").strip()
         model = os.getenv("LLM_MODEL", "").strip()
         key = os.getenv("LLM_API_KEY", "").strip()
-        if base and model and not providers:
+        if base and model:
             native = os.getenv("LLM_TOOL_CALLING", "false").lower() == "true"
             streaming = os.getenv("LLM_STREAMING", "false").lower() == "true"
             structured = os.getenv("LLM_STRUCTURED_OUTPUT", "false").lower() == "true"
-            providers.append(OpenAICompatibleProvider("default", base, model, key, tool_calling=native, streaming=streaming, structured_output=structured, priority=1000))
+            default_provider = OpenAICompatibleProvider(
+                "default", base, model, key,
+                tool_calling=native, streaming=streaming,
+                structured_output=structured, priority=1000,
+                profile_id="default",
+            )
+            configured_profiles["default"] = default_provider
+            # Preserve the established automatic order: the generic LLM profile
+            # joins auto failover only when no named profile is configured.
+            if not providers:
+                providers.append(default_provider)
+
         providers.sort(key=lambda item: int(getattr(item, "priority", 100)))
-        return cls(providers)
+        return cls(providers, configured_profiles=configured_profiles)
+
+    def catalog(self) -> list[dict[str, Any]]:
+        """Return safe, browser-facing options; credentials and endpoint URLs stay server-side."""
+        result: list[dict[str, Any]] = [{
+            "id": "auto",
+            "label": "Automatic · configured failover order",
+            "mode": "auto",
+        }]
+        for profile_id in PROFILE_ORDER:
+            provider = self.configured_profiles.get(profile_id)
+            if provider is None:
+                continue
+            result.append({
+                "id": profile_id,
+                "label": f"{profile_id} · {_safe_model_label(getattr(provider, 'model', ''))}",
+                "model": _safe_model_label(getattr(provider, "model", "")),
+                "mode": "explicit",
+                "adapter": "openai_compatible_http",
+                "private_endpoint": _is_private_literal_endpoint(getattr(provider, "base_url", "")),
+                "capabilities": _capability_summary(provider),
+            })
+        return result
+
+    def with_model_selection(
+        self,
+        profile_id: str,
+        *,
+        expected_fingerprint: str | None = None,
+    ) -> tuple["ModelRouter", dict[str, str]]:
+        """Resolve only catalog IDs; explicit choices are pinned to one provider."""
+        if type(profile_id) is not str or len(profile_id) > 64:
+            raise ModelSelectionError("invalid_model_id")
+        if profile_id == "auto":
+            automatic_material = []
+            for index, provider in enumerate(self.providers):
+                known_id = next((key for key, item in self.configured_profiles.items() if item is provider), None)
+                automatic_material.append(_profile_material(known_id or f"auto-{index}", provider))
+            metadata = {
+                "mode": "auto",
+                "profile_id": "auto",
+                "profile_fingerprint": _fingerprint(automatic_material),
+            }
+            return self, metadata
+        if profile_id not in PROFILE_ORDER:
+            raise ModelSelectionError("invalid_model_id")
+        provider = self.configured_profiles.get(profile_id)
+        if provider is None:
+            raise ModelSelectionError("selected_model_unavailable" if expected_fingerprint else "invalid_model_id")
+        fingerprint = _fingerprint(_profile_material(profile_id, provider))
+        if expected_fingerprint and expected_fingerprint != fingerprint:
+            raise ModelSelectionError("selected_model_configuration_changed")
+        if self.selected_profile_id == profile_id and self.providers == [provider]:
+            selected_router = self
+        else:
+            selected_router = ModelRouter(
+                [provider],
+                configured_profiles=self.configured_profiles,
+                selected_profile_id=profile_id,
+            )
+        return selected_router, {
+            "mode": "explicit",
+            "profile_id": profile_id,
+            "profile_fingerprint": fingerprint,
+        }
 
     def status(self):
         result = []
@@ -93,6 +261,13 @@ class ModelRouter:
             return InvalidModelResponse(str(exc) or "invalid provider response", **details)
         return ProviderFailure(f"{type(exc).__name__}: {exc}", **details)
 
+    def _failure_message(self, errors: list[str], *, capability: str) -> str:
+        if self.selected_profile_id:
+            return f"selected model profile '{self.selected_profile_id}' failed; automatic failover is disabled"
+        if errors:
+            return f"{capability}: " + "; ".join(errors)
+        return "no model provider configured"
+
     def generate(self, messages: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
             temperature = reasoning_profile.temperature
@@ -112,7 +287,7 @@ class ModelRouter:
                 failure = self._classify(exc, provider)
                 errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
                 self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
-        raise ProviderFailure("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured")
+        raise ProviderFailure(self._failure_message(errors, capability="all model providers failed"))
 
     def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
@@ -133,8 +308,10 @@ class ModelRouter:
                 failure = self._classify(exc, provider)
                 errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
                 self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
+        if self.selected_profile_id and not errors:
+            raise CapabilityUnsupported(f"selected model profile '{self.selected_profile_id}' does not support native tool calling")
         if errors:
-            raise ProviderFailure("native tool providers failed: " + "; ".join(errors))
+            raise ProviderFailure(self._failure_message(errors, capability="native tool providers failed"))
         raise CapabilityUnsupported("no provider supports native tool calling")
 
     def chat(self, messages: list[dict], temperature: float | None = None, *, tools: list[dict] | None = None, reasoning_profile: ReasoningProfile | None = None) -> dict:

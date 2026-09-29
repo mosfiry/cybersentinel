@@ -9,9 +9,11 @@ from agent.task_manager import TaskManager
 from agent.mission_task_adapter import MissionTaskAdapter, task_owner_matches
 from agent.agent_core import AgentCore
 from agent.mission import MissionStatus
+from agent.model_router import ModelSelectionError
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
 from core.engine import RUNTIME
 from security import owner_password
+from api.models import requested_model_id
 
 
 def _owner_session(owner_session_token: str) -> dict[str, Any]:
@@ -98,17 +100,29 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
     # task/core-engine branch remains available only through the explicit task
     # compatibility endpoints below; it is not a chat execution path.
     owner = _owner_session(owner_session_token)
+    requested_profile = requested_model_id(payload, default=None)
     core = _agent_core()
     owner_id = str(owner["owner_id"])
     ensure_conversation(conversation_id, owner_id)
     add_conversation_message(conversation_id, "user", text, owner_id=owner_id)
-    mission = core.resume_mission(str(payload["mission_id"]), owner_session_token=owner_session_token) if payload.get("mission_id") else core.run_owner_mission(
-        text,
-        owner_session_token=owner_session_token,
-        request_id=str(payload.get("request_id") or uuid.uuid4().hex),
-        scope_context=payload.get("scope_context"),
-        completion_criteria=payload.get("completion_criteria"),
-    )
+    if payload.get("mission_id"):
+        mission_id = str(payload["mission_id"])
+        existing = core.store.load_for_owner(mission_id, owner_id)
+        if existing is None:
+            raise KeyError("unknown_mission")
+        pinned_profile = str((existing.model_selection or {}).get("profile_id") or "auto")
+        if requested_profile is not None and requested_profile != pinned_profile:
+            raise ModelSelectionError("mission_model_selection_locked")
+        mission = core.resume_mission(mission_id, owner_session_token=owner_session_token)
+    else:
+        mission = core.run_owner_mission(
+            text,
+            owner_session_token=owner_session_token,
+            request_id=str(payload.get("request_id") or uuid.uuid4().hex),
+            scope_context=payload.get("scope_context"),
+            completion_criteria=payload.get("completion_criteria"),
+            model_id=requested_profile if requested_profile is not None else "auto",
+        )
     if mission.provenance.get("conversation_id") != conversation_id:
         mission.provenance["conversation_id"] = conversation_id
         mission = core.store.save(mission)

@@ -131,12 +131,12 @@ class TestContextConstruction:
             execution_state=execution_state,
             runtime_limits=runtime_limits,
         )
-        builder.add_tool_definitions()
+        builder.add_tool_definitions(["status"])
         
         assert len(builder.items) == 1
         assert builder.items[0].source == ContextSource.TOOLS
         assert builder.items[0].trust_level == TrustLevel.VALIDATED
-        assert len(builder.tool_definitions) > 0
+        assert [item["name"] for item in builder.tool_definitions] == ["status"]
     
     def test_context_builder_adds_user_message(self, runtime_limits, execution_state):
         """Test adding user message."""
@@ -449,18 +449,18 @@ class TestToolDefinitions:
     
     def test_tool_definitions_from_registry(self, runtime_limits, execution_state):
         """Test that tool definitions come from registry."""
+        registry_names = {spec.name for spec in REGISTRY.values() if spec.available}
         builder = ContextBuilder(
             owner_policy_context="test",
             execution_state=execution_state,
             runtime_limits=runtime_limits,
         )
-        builder.add_tool_definitions()
+        builder.add_tool_definitions(registry_names)
         
         # Should have tool definitions
         assert len(builder.tool_definitions) > 0
         
         # Check that tools from REGISTRY are present
-        registry_names = {spec.name for spec in REGISTRY.values() if spec.available}
         defined_names = {t["name"] for t in builder.tool_definitions}
         
         # Every executable tool is included; unavailable placeholders are not advertised.
@@ -474,7 +474,8 @@ class TestToolDefinitions:
             execution_state=execution_state,
             runtime_limits=runtime_limits,
         )
-        builder.add_tool_definitions()
+        builder.add_tool_definitions(["status", "search"])
+        assert {item["name"] for item in builder.tool_definitions} == {"status", "search"}
         
         for tool in builder.tool_definitions:
             assert "name" in tool
@@ -1409,9 +1410,9 @@ class TestRegression:
         """Test that tool_definitions function still works."""
         from agent.loop import tool_definitions
         
-        defs = tool_definitions()
-        assert len(defs) > 0
-        assert all("name" in d for d in defs)
+        assert tool_definitions() == []
+        defs = tool_definitions(["status"])
+        assert [item["name"] for item in defs] == ["status"]
     
     def test_parse_response_still_works(self):
         """Test that _parse_response still works."""

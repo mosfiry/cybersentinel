@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from core.db import add_conversation_message, conversation_messages, ensure_conversation
 from security.authorization import authorize_tool
 from security.owner_policy import current_owner_policy_context
-from tools.registry import REGISTRY
+from tools.registry import REGISTRY, tool_definitions as registry_tool_definitions
 from .context import (
     ContextEngine,
     ExecutionState,
@@ -30,23 +30,17 @@ SYSTEM_PROMPT = (
 )
 
 
-def tool_definitions() -> list[dict[str, Any]]:
-    definitions = []
-    for spec in REGISTRY.values():
-        if not spec.available:
-            continue
-        parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
-        if spec.argument_type is str:
-            parameters["properties"]["query"] = {"type": "string", "maxLength": 256}
-            parameters["required"] = ["query"]
-        definitions.append({
-            "name": spec.name,
-            "description": spec.description,
-            "risk_class": spec.risk_class,
-            "owner_required": spec.requires_owner,
-            "parameters": parameters,
-        })
-    return definitions
+def tool_definitions(allowed_tools: Iterable[str] | None = (), *, scope_available: bool = False) -> list[dict[str, Any]]:
+    if isinstance(allowed_tools, str):
+        allowlist = {allowed_tools}
+    else:
+        allowlist = {str(name) for name in (allowed_tools or ())}
+    return [
+        item for item in registry_tool_definitions()
+        if item.get("name") in allowlist
+        and (spec := REGISTRY.get(str(item.get("name", "")))) is not None
+        and (scope_available or not spec.scope_required)
+    ]
 
 
 def _parse_response(content: str) -> dict[str, Any] | None:

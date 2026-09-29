@@ -19,7 +19,7 @@ class FakeRouter:
 
 
 def test_tool_definitions_are_registry_derived():
-    tools = {item["name"]: item for item in tool_definitions()}
+    tools = {item["name"]: item for item in tool_definitions(["search", "red_team_assess"])}
     assert "search" in tools
     assert tools["search"]["parameters"]["properties"]["query"]["maxLength"] == 256
     assert tools["red_team_assess"]["owner_required"] is True

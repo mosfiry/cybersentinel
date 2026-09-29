@@ -27,6 +27,7 @@ from core.db import events_for_request, reasoning_for_request
 import security.owner_password as owner_password
 from security.owner_password import login as owner_password_login, logout as owner_password_logout
 from api.chat import chat, get_session, sse, stream, task_stream, create_task, get_task, resume_task, pause_task, cancel_task, _task_public
+from api.models import model_catalog, requested_model_id
 from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
@@ -306,6 +307,16 @@ class Handler(BaseHTTPRequestHandler):
             if self._public_owner_cookie() and owner_session is None:
                 headers = {"Set-Cookie": self._public_owner_cookie_header("", 0)}
             return self._send(200, response, headers=headers)
+        if parsed.path == "/api/public/model-catalog":
+            owner = self._public_mission_owner()
+            if owner is None:
+                return
+            try:
+                return self._send(200, {"ok": True, **model_catalog(owner["session_id"])})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except Exception:
+                return self._send(503, {"ok": False, "error": "model_catalog_unavailable"})
         if parsed.path.startswith("/api/public/conversations/"):
             owner = self._public_mission_owner()
             if owner is None:
@@ -518,10 +529,12 @@ class Handler(BaseHTTPRequestHandler):
                     plan = Plan(version=int(raw_plan.get("version", 1)), objective=objective, assumptions=tuple(raw_plan.get("assumptions", ())), steps=steps, dependencies=tuple(raw_plan.get("dependencies", ())), completion_criteria=tuple(raw_plan.get("completion_criteria", ())), risk=str(raw_plan.get("risk", "unknown")), created_from=str(raw_plan.get("created_from", "api")))
                     owner_identity = str(auth["owner_id"])
                     request_id = str(payload.get("request_id") or uuid.uuid4().hex)
+                    model_id = requested_model_id(payload)
                     scope_context = dict(payload.get("scope_context") or {})
                     scope_context["workspace_root"] = str(Path(scope_context.get("workspace_root") or ROOT).expanduser().resolve())
                     core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
                     authorization_context, _ = core._auth(objective, auth["session_id"], request_id)
+                    _, model_selection = core.router.with_model_selection(model_id or "auto")
                     from security.owner_budget import OwnerAuthorizedToolBudget
                     budget = OwnerAuthorizedToolBudget.from_owner_declaration(scope_context, policy_version=authorization_context.policy_snapshot.policy_version, owner_approval=authorization_context.owner_evidence.proof_fingerprint)
                     requested = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
@@ -530,6 +543,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise PermissionError("plan includes tools outside the Owner-authorized tool budget")
                     runtime = MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True)
                     mission_obj = runtime.create_from_owner_instruction(objective, plan, authorization_context=authorization_context, scope_snapshot=scope_context, completion_criteria=payload.get("completion_criteria") or [], owner_identity_ref=owner_identity, provenance={"component": "authenticated_bridge_api", "owner_budget": budget.to_dict(), "effective_tools": list(effective)}, authorization_snapshot_factory=self._mission_snapshot_factory(owner_identity, scope_context, authorization_context.owner_evidence.proof_fingerprint))
+                    mission_obj.model_selection = dict(model_selection)
+                    core.store.save(mission_obj)
                     mission = mission_obj.to_public_dict()
                     return self._send(201, {"ok": True, "mission": mission, "mission_id": mission["mission_id"], "status": mission["status"]})
                 result = chat(payload, owner_session_token=auth["session_id"])
@@ -585,7 +600,7 @@ class Handler(BaseHTTPRequestHandler):
                 if criteria is not None and (not isinstance(criteria, list) or len(criteria) > 100):
                     raise ValueError("invalid_completion_criteria")
                 core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
-                mission = core.run_owner_mission(objective, owner_session_token=owner["session_id"], request_id=uuid.uuid4().hex, scope_context={"workspace_root": str(ROOT), "target_id": "cybersentinel-repository"}, completion_criteria=criteria, run=False)
+                mission = core.run_owner_mission(objective, owner_session_token=owner["session_id"], request_id=uuid.uuid4().hex, scope_context={"workspace_root": str(ROOT), "target_id": "cybersentinel-repository"}, completion_criteria=criteria, run=False, model_id=requested_model_id(payload) or "auto")
                 queued = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3")).enqueue(mission.mission_id)
                 return self._send(201, {"ok": True, "mission": mission.to_public_dict(), "mission_id": mission.mission_id, "queue": queued.__dict__})
             except QueueCapacityError:

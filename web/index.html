@@ -41,6 +41,13 @@
         <form id="missionForm">
           <label for="missionObjective">ماذا تريد أن تنجز؟</label>
           <textarea id="missionObjective" rows="3" maxlength="12000" required placeholder="صف هدف المهمة بلغة طبيعية…"></textarea>
+          <div class="model-choice">
+            <label for="modelProfileId">النموذج (اختياري)</label>
+            <select id="modelProfileId" aria-describedby="modelCatalogNote" disabled>
+              <option value="auto">تلقائي · ترتيب تجاوز الفشل المُعدّ</option>
+            </select>
+            <small id="modelCatalogNote" role="status">سجّل الدخول لعرض خيارات النماذج المُعدّة.</small>
+          </div>
           <button id="createMission" type="submit">إنشاء المهمة</button>
         </form>
         <div id="workspaceNotice" class="notice" role="status" aria-live="polite">سجّل الدخول بحساب المالك لعرض المهام وإنشائها.</div>

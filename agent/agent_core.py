@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import copy
 import uuid
 from pathlib import Path
 from typing import Any, Iterable
@@ -73,11 +74,11 @@ class AgentCore:
         return self.store.save(mission)
 
     @staticmethod
-    def _schemas(allowed_tools: Iterable[str] | None = None, *, scope_available: bool = True) -> list[dict[str, Any]]:
-        allowlist = None if allowed_tools is None else frozenset(str(name) for name in allowed_tools)
+    def _schemas(allowed_tools: Iterable[str] | None = (), *, scope_available: bool = True) -> list[dict[str, Any]]:
+        allowlist = frozenset(str(name) for name in (allowed_tools or ()))
         result = []
         for spec in REGISTRY.values():
-            if not spec.available or (allowlist is not None and spec.name not in allowlist) or (spec.scope_required and not scope_available):
+            if not spec.available or spec.name not in allowlist or (spec.scope_required and not scope_available):
                 continue
             parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
             if spec.argument_type is str:
@@ -87,14 +88,16 @@ class AgentCore:
         return result
 
     @staticmethod
-    def _mission_model_tools(mission: Mission) -> tuple[str, ...]:
+    def _mission_model_tools(mission: Mission | dict[str, Any]) -> tuple[str, ...]:
         """Return only currently available registry tools in this mission's authorization snapshot."""
+        raw_snapshot = mission.authorization_snapshot if isinstance(mission, Mission) else mission.get("authorization_snapshot")
+        raw_context = mission.authorization_context if isinstance(mission, Mission) else mission.get("authorization_context")
         try:
-            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(raw_snapshot or {}))
         except (KeyError, TypeError, ValueError, PermissionError):
             return ()
         authorized = set(snapshot.allowed_tools).intersection(snapshot.allowed_actions)
-        authorization = mission.authorization_context if isinstance(mission.authorization_context, dict) else {}
+        authorization = raw_context if isinstance(raw_context, dict) else {}
         scope_available = bool(authorization.get("scope_snapshot_id"))
         return tuple(
             spec.name for spec in REGISTRY.values()
@@ -125,6 +128,7 @@ class AgentCore:
 
     def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", allowed_tools: Iterable[str] | None = None, scope_available: bool = True) -> dict[str, Any]:
         profile = select_reasoning_profile(objective)
+        allowlist = tuple(dict.fromkeys(str(name) for name in (allowed_tools or ())))
         context = ContextEngine.build(
             user_text=objective,
             conversation_id=conversation_id or "agent-core",
@@ -132,27 +136,31 @@ class AgentCore:
             tool_results=[("observation", observation)] if observation else None,
             execution_state=ExecutionState.initial(request_id, conversation_id or "agent-core"),
             knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
+            allowed_tools=allowlist,
+            scope_available=scope_available,
         )
         messages = context.provider_messages()
         try:
-            return self.router.tool_calling(messages, self._schemas(allowed_tools, scope_available=scope_available), reasoning_profile=profile)
+            return self.router.tool_calling(messages, self._schemas(allowlist, scope_available=scope_available), reasoning_profile=profile)
         except CapabilityUnsupported:
             try:
                 return self.router.generate(messages, reasoning_profile=profile)
             except Exception as exc:
-                return {"content": "", "provider": "unavailable", "model": "unavailable", "error": type(exc).__name__}
+                error = "selected_model_failed" if getattr(self.router, "selected_profile_id", None) else type(exc).__name__
+                return {"content": "", "provider": "unavailable", "model": "unavailable", "error": error}
         except Exception as exc:
-            return {"content": "", "provider": "failed", "model": "failed", "error": type(exc).__name__}
+            error = "selected_model_failed" if getattr(self.router, "selected_profile_id", None) else type(exc).__name__
+            return {"content": "", "provider": "failed", "model": "failed", "error": error}
 
     def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", allowed_tools: Iterable[str] | None = None, scope_available: bool = True) -> Plan:
-        allowlist = None if allowed_tools is None else frozenset(str(name) for name in allowed_tools)
+        allowlist = frozenset(str(name) for name in (allowed_tools or ()))
         response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, allowed_tools=allowlist, scope_available=scope_available)
         self._last_model_response = dict(response)
         calls = self._calls(response)
         steps: list[PlanStep] = []
         for index, call in enumerate(calls, start=1):
             spec = get_tool(call.name)
-            if spec is None or not spec.available or (allowlist is not None and call.name not in allowlist) or (spec.scope_required and not scope_available):
+            if spec is None or not spec.available or call.name not in allowlist or (spec.scope_required and not scope_available):
                 continue
             steps.append(PlanStep(
                 step_id=f"step-{index}-{call.name}",
@@ -195,6 +203,7 @@ class AgentCore:
             owner_policy_context=policy_context,
             execution_state=ExecutionState.initial(str(mission.get("request_id", "")), str(mission.get("mission_id", "agent-core"))),
             mission_context={"objective": mission.get("objective"), "owner_instruction": mission.get("owner_instruction"), "scope_snapshot": mission.get("scope_snapshot")},
+            allowed_tools=self._mission_model_tools(mission),
             hypothesis_state=payload.get("hypothesis_state") or [],
             evidence_state=payload.get("evidence") or [],
             strategy_state=mission.get("strategy_state") or {},
@@ -263,7 +272,7 @@ class AgentCore:
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
 
-    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True) -> Mission:
+    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True, model_id: str = "auto") -> Mission:
         request_id = request_id or uuid.uuid4().hex
         authorization_context, policy_context = self._auth(instruction, owner_session_token, request_id)
         if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
@@ -277,6 +286,32 @@ class AgentCore:
                 scope_snapshot=snapshot,
                 session_id=authorization_context.session_id,
             )
+        selected_router, model_selection = self.router.with_model_selection(model_id)
+        execution_core = copy.copy(self)
+        execution_core.router = selected_router
+        return execution_core._run_owner_mission_authorized(
+            instruction,
+            request_id=request_id,
+            scope_context=scope_context,
+            completion_criteria=completion_criteria,
+            run=run,
+            authorization_context=authorization_context,
+            policy_context=policy_context,
+            model_selection=model_selection,
+        )
+
+    def _run_owner_mission_authorized(
+        self,
+        instruction: str,
+        *,
+        request_id: str,
+        scope_context: dict[str, Any] | None,
+        completion_criteria: list[dict[str, Any]] | None,
+        run: bool,
+        authorization_context: AuthorizationContext,
+        policy_context: str,
+        model_selection: dict[str, str],
+    ) -> Mission:
         owner_budget = OwnerAuthorizedToolBudget.from_owner_declaration(
             scope_context,
             policy_version=str(getattr(authorization_context.policy_snapshot, "policy_version", "owner-policy")),
@@ -347,6 +382,9 @@ class AgentCore:
         )
         if getattr(self, "_last_model_response", None):
             mission.progress["initial_model_response"] = dict(self._last_model_response)
+            if self._last_model_response.get("error") == "selected_model_failed":
+                mission.error = "Selected model profile failed; automatic failover is disabled."
+        mission.model_selection = dict(model_selection)
         mission.semantic_intent = NaturalLanguageUnderstanding().understand(instruction).to_dict()
         adaptive_knowledge = self.knowledge_retriever.retrieve_adaptive(instruction, required_evidence=("supporting evidence", "counter-evidence"), limit=5)
         mission.knowledge_context = list(adaptive_knowledge.get("results", ()))
@@ -382,7 +420,7 @@ class AgentCore:
         initial = result.progress.get("initial_model_response", {})
         if initial.get("tool_calls") and not result.progress.get("last_model_content"):
             try:
-                final_response = self._ask(result.objective, result.observations[-1] if result.observations else None, policy_context=policy_context, request_id=result.request_id, conversation_id=result.mission_id)
+                final_response = self._ask(result.objective, result.observations[-1] if result.observations else None, policy_context=policy_context, request_id=result.request_id, conversation_id=result.mission_id, allowed_tools=self._mission_model_tools(result), scope_available=bool((result.authorization_context or {}).get("scope_snapshot_id")))
                 if final_response.get("content"):
                     result.progress["last_model_content"] = str(final_response["content"])
                     result.progress["last_model_response"] = dict(final_response)
@@ -413,6 +451,34 @@ class AgentCore:
                 mission.recovery_events.append({"event": "owner_revalidation_failed", "reason": str(exc)})
                 self.store.save(mission)
             raise
+        stored_selection = mission.model_selection if isinstance(mission.model_selection, dict) else {}
+        profile_id = str(stored_selection.get("profile_id") or "auto")
+        expected_fingerprint = stored_selection.get("profile_fingerprint") if stored_selection.get("mode") == "explicit" else None
+        selected_router, model_selection = self.router.with_model_selection(
+            profile_id,
+            expected_fingerprint=str(expected_fingerprint) if expected_fingerprint else None,
+        )
+        resumed_core = copy.copy(self)
+        resumed_core.router = selected_router
+        return resumed_core._resume_mission_authorized(
+            mission,
+            evidence=evidence,
+            model_selection=model_selection,
+            max_slices=max_slices,
+            heartbeat=heartbeat,
+            run=run,
+        )
+
+    def _resume_mission_authorized(
+        self,
+        mission: Mission,
+        *,
+        evidence: Any,
+        model_selection: dict[str, str],
+        max_slices: int | None,
+        heartbeat: Callable[[], None] | None,
+        run: bool,
+    ) -> Mission:
         fresh_snapshot = capture_policy_snapshot(mission.request_id, evidence)
         try:
             old_authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
@@ -448,12 +514,14 @@ class AgentCore:
             mission.progress.pop("pause_requested", None)
             mission.transition(MissionStatus.READY, "Owner resumed mission")
             mission.checkpoint = {**mission.checkpoint, "status": "resumed"}
+        if not mission.model_selection:
+            mission.model_selection = dict(model_selection)
         self.store.save(mission)
         if not run:
             return mission
         policy_context = policy_context_from_snapshot(fresh_snapshot)
         runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id, allowed_tools=self._mission_model_tools(current)), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True)
-        return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations, heartbeat=heartbeat)
+        return runtime.run_to_completion(mission.mission_id, max_slices=max_slices or self.max_iterations, heartbeat=heartbeat)
 
 
 __all__ = ["AgentCore"]

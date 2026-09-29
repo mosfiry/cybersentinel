@@ -49,10 +49,11 @@ class AgentTaskRuntime:
         return {"ok": True, "result": result}
 
     @staticmethod
-    def _schemas() -> list[dict[str, Any]]:
+    def _schemas(allowed_tools=()) -> list[dict[str, Any]]:
+        allowlist = {str(name) for name in (allowed_tools or ())}
         schemas = []
         for spec in REGISTRY.values():
-            if not spec.available:
+            if not spec.available or spec.name not in allowlist or spec.scope_required:
                 continue
             parameters = {"type": "object", "properties": {}, "additionalProperties": False}
             if spec.argument_type is str:
@@ -183,7 +184,7 @@ class AgentTaskRuntime:
         payload = context.to_provider_payload()
         reasoning_profile = select_reasoning_profile(objective)
         try:
-            return self.router.tool_calling(payload["messages"], self._schemas(), reasoning_profile=reasoning_profile)
+            return self.router.tool_calling(payload["messages"], self._schemas(item.get("name") for item in context.tools), reasoning_profile=reasoning_profile)
         except CapabilityUnsupported:
             return self.router.generate(payload["messages"], reasoning_profile=reasoning_profile)
 

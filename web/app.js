@@ -24,6 +24,8 @@ const state = {
   conversationId: "",
   conversationTasks: [],
   connectionAvailable: false,
+  modelCatalog: [],
+  selectedModelId: "auto",
   missions: [],
   selectedMissionId: "",
   selectedMission: null,
@@ -92,6 +94,11 @@ function errorText(error) {
     public_boundary_disabled: "واجهة المتصفح معطلة في إعدادات الخدمة.",
     unknown_mission: "المهمة غير موجودة أو غير متاحة لهذا الحساب.",
     not_found: "المورد غير موجود أو محجوب بسياسة مساحة العمل.",
+    invalid_model_id: "خيار النموذج غير صالح؛ حدّث قائمة النماذج وحاول مجددًا.",
+    selected_model_unavailable: "النموذج المختار لم يعد مُعدًا على الخادم.",
+    selected_model_configuration_changed: "تغيّر إعداد النموذج المحفوظ؛ اختر نموذجًا جديدًا أو استخدم التلقائي.",
+    mission_model_selection_locked: "لا يمكن تغيير نموذج مهمة قائمة؛ يظل النموذج الأصلي مثبتًا عند الاستئناف.",
+    only_model_id_is_accepted: "يُقبل معرّف النموذج من القائمة فقط.",
   };
   return messages[error.message] || `تعذر إكمال الطلب: ${error.message || "خطأ غير معروف"}`;
 }
@@ -126,6 +133,8 @@ async function status() {
       api("/api/public/auth/session"),
     ]);
     updateAuthUI(auth);
+    if (state.ownerAuthenticated) await loadModelCatalog();
+    else resetModelCatalog();
     state.connectionAvailable = health.ok === true;
     const runtime = $("#runtimeState");
     runtime.classList.remove("offline");
@@ -161,6 +170,77 @@ function updateAuthUI(data) {
   $("#authMessage").textContent = "";
 }
 
+function resetModelCatalog(message = "سجّل الدخول لعرض خيارات النماذج المُعدّة.") {
+  state.modelCatalog = [];
+  state.selectedModelId = "auto";
+  const select = $("#modelProfileId");
+  if (select) {
+    select.replaceChildren(new Option("تلقائي · ترتيب تجاوز الفشل المُعدّ", "auto"));
+    select.value = "auto";
+    select.disabled = true;
+  }
+  const note = $("#modelCatalogNote");
+  if (note) note.textContent = message;
+}
+
+async function loadModelCatalog() {
+  const select = $("#modelProfileId");
+  const note = $("#modelCatalogNote");
+  if (!select || !state.ownerAuthenticated) {
+    resetModelCatalog();
+    return;
+  }
+  select.disabled = true;
+  if (note) note.textContent = "جارٍ تحميل خيارات النماذج المُعدّة…";
+  try {
+    const data = await api("/api/public/model-catalog");
+    const allowedIds = new Set(["auto", "local", "colab", "hf", "default"]);
+    const catalog = Array.isArray(data.models)
+      ? data.models.filter((item) => item && typeof item === "object" && allowedIds.has(item.id) && (item.id === "auto" || item.mode === "explicit"))
+      : [];
+    if (!catalog.some((item) => item.id === "auto")) catalog.unshift({ id: "auto", mode: "auto" });
+    state.modelCatalog = catalog;
+    const previous = select.value || state.selectedModelId || "auto";
+    select.replaceChildren();
+    catalog.forEach((item) => {
+      const option = document.createElement("option");
+      option.value = item.id;
+      if (item.id === "auto") {
+        option.textContent = "تلقائي · ترتيب تجاوز الفشل المُعدّ";
+      } else {
+        const model = String(item.model || "نموذج مُعد").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 120);
+        const endpointLabel = item.private_endpoint === true
+          ? "نقطة نهاية خاصة/loopback"
+          : item.id === "local" ? "ملف local · نقطة نهاية غير خاصة" : `ملف ${item.id}`;
+        option.textContent = `${endpointLabel} · ${model}`;
+      }
+      select.appendChild(option);
+    });
+    select.value = catalog.some((item) => item.id === previous) ? previous : "auto";
+    state.selectedModelId = select.value;
+    select.disabled = false;
+    updateModelCatalogNote();
+  } catch (_) {
+    resetModelCatalog("تعذّر تحميل الكتالوج؛ ما يزال الخيار التلقائي متاحًا.");
+    select.disabled = false;
+  }
+}
+
+function updateModelCatalogNote() {
+  const note = $("#modelCatalogNote");
+  const select = $("#modelProfileId");
+  if (!note || !select) return;
+  const selected = state.modelCatalog.find((item) => item.id === select.value);
+  state.selectedModelId = selected?.id || "auto";
+  if (!selected || selected.id === "auto") {
+    note.textContent = "التلقائي يحافظ على ترتيب تجاوز الفشل المُعدّ على الخادم.";
+  } else if (selected.private_endpoint === true) {
+    note.textContent = "نقطة نهاية HTTP متوافقة مع OpenAI على عنوان IP خاص/loopback؛ لا يثبت ذلك وجود Runtime محلي أصلي.";
+  } else {
+    note.textContent = "نقطة نهاية HTTP متوافقة مع OpenAI؛ لم يُثبت أنها خاصة أو محلية.";
+  }
+}
+
 function resetWorkspaceState() {
   state.conversationId = "";
   state.conversationTasks = [];
@@ -168,6 +248,7 @@ function resetWorkspaceState() {
   state.selectedMission = null;
   state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [] };
   state.missions = [];
+  resetModelCatalog();
   $("#messages").replaceChildren();
   $("#missionHeader").classList.add("hidden");
   $("#missionTools").classList.add("hidden");
@@ -312,7 +393,7 @@ async function send(text) {
   try {
     const data = await api("/api/public/chat", {
       method: "POST",
-      body: JSON.stringify({ text, conversation_id: state.conversationId || undefined }),
+      body: JSON.stringify({ text, conversation_id: state.conversationId || undefined, model_id: $("#modelProfileId")?.value || "auto" }),
     });
     loading.remove();
     state.conversationId = String(data.conversation_id || "");
@@ -749,7 +830,8 @@ $("#activityToggle").onclick = () => {
 };
 $("#toolsLink").onclick = toolsPanel;
 $("#settingsLink").onclick = settingsPanel;
-$("#refreshMissions")?.addEventListener("click", loadMissions);
+  $("#refreshMissions")?.addEventListener("click", loadMissions);
+$("#modelProfileId")?.addEventListener("change", updateModelCatalogNote);
 
 $("#missionForm").onsubmit = async (event) => {
   event.preventDefault();
@@ -760,7 +842,7 @@ $("#missionForm").onsubmit = async (event) => {
   try {
     const data = await api("/api/public/missions", {
       method: "POST",
-      body: JSON.stringify({ objective: $("#missionObjective").value.trim() }),
+      body: JSON.stringify({ objective: $("#missionObjective").value.trim(), model_id: $("#modelProfileId")?.value || "auto" }),
     });
     $("#missionObjective").value = "";
     state.selectedMissionId = data.mission_id || data.mission?.mission_id || "";

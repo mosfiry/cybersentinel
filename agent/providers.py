@@ -9,8 +9,9 @@ from .provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, structured_output: bool = False, priority: int = 100, parallel_tool_calls: bool = False, reasoning: bool = False, reasoning_budget: bool = False, long_context: bool = False, vision: bool = False):
+    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, structured_output: bool = False, priority: int = 100, parallel_tool_calls: bool = False, reasoning: bool = False, reasoning_budget: bool = False, long_context: bool = False, vision: bool = False, profile_id: str | None = None):
         self.name = name
+        self.profile_id = profile_id
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key

@@ -40,6 +40,11 @@ button{font:inherit;cursor:pointer}
 .side-section h2{margin:0;font-size:11px;color:#7e8aa0;letter-spacing:.08em;border-bottom:1px solid #1c2636;padding-bottom:5px}
 #missionForm{display:grid;gap:7px}
 #missionForm textarea{width:100%;background:#080c12;border:1px solid #2a364a;border-radius:6px;color:#e9eef7;padding:7px;font:inherit;resize:vertical}
+.model-choice{display:grid;gap:4px}
+.model-choice label{font-size:11px;color:#bac5d6}
+.model-choice select{width:100%;background:#080c12;border:1px solid #2a364a;border-radius:6px;color:#cdd7e6;padding:6px;font:inherit}
+.model-choice select:disabled{opacity:.6;cursor:not-allowed}
+.model-choice small{color:#738198;font-size:10px;line-height:1.5}
 #createMission{border:0;border-radius:6px;background:#14311f;color:#7ee2a8;padding:7px;font-weight:600}
 #createMission:disabled{opacity:.6;cursor:wait}
 .notice{border:1px solid #263146;border-radius:6px;padding:7px;color:#9fb0c6;font-size:12px;line-height:1.5}
