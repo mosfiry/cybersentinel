@@ -60,19 +60,19 @@
 - البداية التشغيلية تكشف صفر ملفات مزوّد من `ModelRouter.from_env()`. يجب أن يظل الاختبار الحي `NOT VERIFIED` حتى يضبط Owner مزودًا فعليًا؛ لا يجوز اصطناع نجاح خارجي.
 - أُضيفت ملفات تعريف قدرات/نقل صريحة وقابلة للتوسعة و`CyberSentinelMind` و`ModelOrchestrator` بأدوار/نقد مستقل عند توافر القدرة، ميزانية ملفات/استدعاءات/رموز/وقت، حدود تكلفة اختيارية لا تُقدّر الأسعار المجهولة، مهلة HTTP، وتراجع مضبوط. جميع المخرجات والنقد تشخيصات غير موثوقة؛ سجل البصمات لا يصبح Evidence ولا يغيّر الإذن أو الإكمال.
 - يمر التخطيط والاستكمال وتفسير الملاحظة والمتخصص المؤهل وواجهات chat/command/task عبر Mind؛ ويُحافظ تغيير التفضيل/الملف على المهمة الدائمة والسياق/النطاق/تفويض Owner. اختُبرت مشاركة سياق Mission/Task/ReasoningCase والأدلة والذاكرة والمعرفة، واستمرار Mission، وحدود السلطة والخصوصية.
-- اجتازت بوابة المصدر المحلية: **915 passed, 1 skipped, 0 failed** على commit `4d42515`، مع `compileall` و`node --check` و`git diff --check` وفحص الأسرار. صفر ملفات مزوّد حيّة؛ لذلك القبول الحي وCI والنشر/Cloudflare `NOT VERIFIED`. تبقى موانع المنتج الأوسع أعلاه كما هي.
+- بعد دمج الشيفرة، اجتازت بوابة الاختبار المحلية على commit `b5259b850b5b1cc2bb5c1a6f728358c795b9e610`: **915 passed, 1 skipped, 0 failed** خلال 26.08 ثانية عبر `tools.registry._run_project_tests` و`_SubprocessWorkspace` و`bubblewrap`/`prlimit`. اختبر `tests/test_cybersentinel_mind.py::test_native_mission_model_shares_durable_reasoning_scope_and_knowledge_across_roles` مزوّدي analyst وcritic اصطناعيين مختلفين واستدعاءيهما داخل دورة Mission واحدة؛ هذا اختبار محلي حتمي، لا قبول حي.
 
 ## سجل التحقق المحلي — 2026-09-29
 
-- شيفرة التنفيذ والاختبارات موجودة في commit `4d42515` على `feat/cybersentinel-mind-orchestration`، مبني مباشرةً على `d7b5827a1a0a23a7656d442449d1e988211c3d59`.
-- النتيجة على الشيفرة: **915 passed, 1 skipped, 0 failed** خلال 26.06 ثانية، عبر `tools.registry._run_project_tests` ولقطة الاختبار المقروءة فقط مع `bubblewrap`/`prlimit` وتعطيل الشبكة.
-- نجح `python3 -m compileall -q .` و`node --check web/app.js` و`git diff --check`؛ فحص الأنماط الشبيهة بالأسرار في Python الإنتاجي المعدل نظيف، ولم تبقَ محددات ملفات المزوّد القديمة في واجهة المتصفح.
-- `ModelRouter.from_env()` يعيد **0 ملفات مزوّد**. لا استدلال حي، ولا اختبار هدف خارجي، ولا نتيجة CI أو نشر/Cloudflare من هذا العمل.
+- شيفرة المصدر `4d4251504ecdcc1afe8aa249b5458277505bec97` كانت مبنية مباشرةً على `d7b5827a1a0a23a7656d442449d1e988211c3d59`؛ دُمجت محليًا على الفرع المطلوب في commit الشيفرة `b5259b850b5b1cc2bb5c1a6f728358c795b9e610`.
+- أُعيدت المجموعة الكاملة على الشيفرة المدمجة: **915 passed, 1 skipped, 0 failed** خلال 26.08 ثانية عبر `tools.registry._run_project_tests` و`_SubprocessWorkspace` ولقطة read-only مع `bubblewrap`/`prlimit` وتعطيل الشبكة.
+- نجح `python3 -m compileall -q .` و`node --check web/app.js` و`git diff --check`؛ فحص الأنماط الشبيهة بالأسرار في إضافات Python الإنتاجية نظيف. اختبار `test_native_mission_model_shares_durable_reasoning_scope_and_knowledge_across_roles` يؤكد استدعاءات مزودين اصطناعيين مختلفين في Mission واحدة، ولا يمثل قبول مزوّد حي.
+- `ModelRouter.from_env()` يعيد **0 ملفات مزوّد**؛ تخطّى `tests/test_real_provider_long_horizon.py::test_real_provider_long_horizon` لغياب إعداد المزوّد الحي. لا استدلال حي أو اختبار هدف خارجي، ولا نتيجة CI أو نشر/Cloudflare من هذا العمل.
 - بقيت الخطة الأم **PARTIAL**: لم تُنفّذ متطلبات Vault/التزامن النظير-إلى-نظير/سير الموافقة على التفويض/IDOR-BOLA ذي الحسابين/سلسلة HTTP الكاملة/متحقق الثغرات المستقل/مسار الإفصاح؛ تبقى كما هي في الأقسام أعلاه.
 
 
 ## حدود التغيير والتحقق المرجعي
 
-- بقي التنفيذ في worktree منفصل على `feat/cybersentinel-mind-orchestration`؛ شيفرته commit `4d42515`، أساسه `d7b5827a1a0a23a7656d442449d1e988211c3d59`.
-- ظل `/workspace/cybersentinel` نظيفًا على `integration/cybersentinel-final-completion` عند `d7b5827a1a0a23a7656d442449d1e988211c3d59`، وظل مرجع `main` عند `8a3fd109c0e586db13ed48a7371ac9ad06465b74` وقت التدقيق النهائي.
-- لم يُدفع أي تغيير إلى remote، ولم يحدث تعديل خارج worktree الخاص بالميزة أو نشر/تغيير Cloudflare.
+- احتفظ worktree المصدر بفرع `feat/cybersentinel-mind-orchestration` وcommit المصدر `4d4251504ecdcc1afe8aa249b5458277505bec97`؛ حمل فرع الدمج المطلوب الشيفرة نفسها عبر cherry-pick محلي `b5259b850b5b1cc2bb5c1a6f728358c795b9e610`.
+- كان `/workspace/cybersentinel` نظيفًا على `integration/cybersentinel-final-completion` عند نقطة البداية `d7b5827a1a0a23a7656d442449d1e988211c3d59`؛ أُضيف فقط إيداع الشيفرة وإيداع التوثيق المحددان ثم سجل تصحيح توثيق محلي منفصل. لم يُعدّل `main` أو PR #17 أو remotes أو Cloudflare أو worktrees أخرى.
+- لم يُدفع أي تغيير إلى remote، ولم يحدث نشر أو تغيير Cloudflare.

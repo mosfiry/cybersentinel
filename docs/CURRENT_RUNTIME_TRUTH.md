@@ -1,6 +1,6 @@
 # CyberSentinel X — Current Runtime Truth
 
-**Snapshot date:** 2026-09-29. **Finalization status: PARTIAL.** The source implementation tested for this snapshot is commit `4d42515` on `feat/cybersentinel-mind-orchestration`, based directly on `d7b5827a1a0a23a7656d442449d1e988211c3d59`. This is repository evidence, not a provider, CI, production, or deployment attestation.
+**Snapshot date:** 2026-09-29. **Finalization status: PARTIAL.** The integrated code commit tested on `integration/cybersentinel-final-completion` is `b5259b850b5b1cc2bb5c1a6f728358c795b9e610`, cherry-picked from feature-source commit `4d4251504ecdcc1afe8aa249b5458277505bec97` and based directly on `d7b5827a1a0a23a7656d442449d1e988211c3d59`. This is repository evidence, not a provider, CI, production, or deployment attestation.
 
 ## Runtime, authority, and evidence boundaries
 
@@ -46,8 +46,8 @@ The following critical items are **not implemented**: a full manual program-auth
 
 ## Verification and external boundaries
 
-At source code SHA `4d42515`, the complete pytest suite ran through `tools.registry._run_project_tests` using a read-only project snapshot and `_SubprocessWorkspace`; pytest ran under `bubblewrap` plus `prlimit`, with network and inherited credentials removed. Result: **915 passed, 1 skipped, 0 failed** in 26.06 seconds. The live-provider test remains skipped because `ModelRouter.from_env()` reports zero configured profiles. No real provider call or live target was made.
+At integrated code SHA `b5259b850b5b1cc2bb5c1a6f728358c795b9e610`, the complete pytest suite was rerun through `tools.registry._run_project_tests` with the test `_SubprocessWorkspace` adapter. The registered runner created a read-only project snapshot and executed pytest under `bubblewrap` plus `prlimit`, without network or inherited credentials. Result: **915 passed, 1 skipped, 0 failed** in 26.08 seconds. The skipped test is `tests/test_real_provider_long_horizon.py::test_real_provider_long_horizon`; the runtime reported zero configured profiles, and the live harness's credentials/factory were unavailable. No real provider call or live target was made.
 
-`python3 -m compileall -q .`, `node --check web/app.js`, and `git diff --check` passed. A credential-pattern scan of changed production Python found no credential-like literals, and the browser source contains no stale provider-selector controls. No host pytest, network request, or live target was used for full-suite verification.
+The deterministic multi-model Mission test `tests/test_cybersentinel_mind.py::test_native_mission_model_shares_durable_reasoning_scope_and_knowledge_across_roles` runs one persisted Mission through `MissionRuntime.run_model_loop` and `MindNativeModel`, then asserts both distinct synthetic `analyst` and `critic` providers recorded calls with the same Mission context. This verifies the local adapter path, not live-provider acceptance. `python3 -m compileall -q .`, `node --check web/app.js`, `git diff --check`, and a credential-pattern scan of changed production Python passed. No host pytest, network request, or live target was used for full-suite verification.
 
 CI, live-provider behavior, production deployment, and Cloudflare are **NOT VERIFIED**. The historical hosted-CI namespace preflight failure was on an older SHA and is not a result for this integrated code SHA. No live provider credentials or source-backed Worker are known. The repository is not evidence of an active deployment; no CI, provider, Cloudflare, or deployment state was changed in this finalization.

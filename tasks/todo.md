@@ -66,7 +66,7 @@
 ## 10. بوابات التحقق النهائي والتوثيق — PARTIAL
 - [x] baseline قبل التنفيذ على `d7b5827a1a0a23a7656d442449d1e988211c3d59`: **887 passed, 1 skipped, 0 failed** خلال 24.97 ثانية؛ تخطّى `tests/test_real_provider_long_horizon.py` لعدم تهيئة مزوّد حي.
 - [x] أعد `python3 -m compileall -q .` و`node --check web/app.js` على مصدر الفرع بعد التغييرات.
-- [x] بعد التنفيذ، تحقّق من `git diff --check` وفحص الأسرار، وسجّل SHA الشيفرة `4d42515` والحالة النهائية قبل التسليم.
+- [x] بعد الدمج، أعد التحقق على SHA الشيفرة `b5259b850b5b1cc2bb5c1a6f728358c795b9e610`: الاختبارات الكاملة، `compileall`، `node --check`، `git diff --check` وفحص الأنماط الشبيهة بالأسرار.
 - [ ] أثبت نتيجة CI على SHA الحالي؛ النتيجة التاريخية على SHA أقدم لا تحل محل ذلك.
 - [ ] تحقق من مزوّد حي ونشر وإنتاج/Cloudflare بدليل مستقل؛ تبقى جميعها `NOT VERIFIED` ولا يُجرى نشر ضمن هذه المهمة.
 - [ ] أكمل البنود الحرجة أعلاه قبل تحويل الحالة من `PARTIAL` إلى مكتمل.
@@ -93,12 +93,12 @@
 - [x] أضف مراجعًا نقديًا مستقلًا ذا مخرجات منظمة حيث تتاح قدراته؛ خزّن البروڤينانس/البصمات فقط بما يلزم، ولا تسمح للناقد أو أي استدلال نموذجي بإصدار دليل أو اعتماد حقيقة/ثغرة/إكمال.
 - [x] استبدل قائمة ملفات المزوّد في واجهة chat وmission بتفضيلات اختيار عالية المستوى؛ أتح تبديل التفضيل/الملف عند الاستئناف دون إسقاط سجل المهمة أو تغيير التفويض/النطاق.
 - [x] اختبر المسار كاملًا بوحدات تكامل محلية مع مزوّدات اختبار معلّمة؛ لا تسمّها قبولًا حيًا ولا تشغّل الشبكة أو أنظمة/حسابات حقيقية.
-- [x] أعد المجموعة الكاملة المعزولة، `compileall`، `node --check`، `git diff --check` وفحص الأسرار؛ وثّق SHA الشيفرة النهائي `4d42515` وحالات ما بقي PARTIAL/NOT VERIFIED.
+- [x] أعد المجموعة الكاملة المعزولة، `compileall`، `node --check`، `git diff --check` وفحص الأسرار؛ وثّق SHA الشيفرة النهائي وحالات ما بقي PARTIAL/NOT VERIFIED.
 
 
 ## سجل التحقق النهائي لشريحة المصدر — 2026-09-29
 
-- commit الشيفرة `4d42515` على `feat/cybersentinel-mind-orchestration`، أساسه الدقيق `d7b5827a1a0a23a7656d442449d1e988211c3d59`.
-- الاختبارات الكاملة على نسخة الشيفرة: **915 passed, 1 skipped, 0 failed** خلال 26.06 ثانية؛ شُغّلت عبر لقطة read-only معزولة، `bubblewrap`/`prlimit`، والشبكة/الاعتمادات مقيّدة.
-- فحوص `python3 -m compileall -q .` و`node --check web/app.js` و`git diff --check` وفحص الأنماط الشبيهة بالأسرار في ملفات Python الإنتاجية المعدلة نجحت. واجهة الويب لا تعرض ملفات المزوّد.
-- لا توجد ملفات مزوّد مهيأة (`ModelRouter.from_env()`: **0**). لا تحقق حيّ، ولا نشر/Cloudflare، ولا CI مؤكد؛ يظل إكمال المنتج العام `PARTIAL`.
+- commit المصدر `4d4251504ecdcc1afe8aa249b5458277505bec97` على `feat/cybersentinel-mind-orchestration`، أساسه الدقيق `d7b5827a1a0a23a7656d442449d1e988211c3d59`؛ دُمج كـcommit الشيفرة `b5259b850b5b1cc2bb5c1a6f728358c795b9e610` على الفرع المطلوب.
+- أُعيدت الاختبارات الكاملة على SHA الشيفرة المدمجة: **915 passed, 1 skipped, 0 failed** خلال 26.08 ثانية؛ عبر `tools.registry._run_project_tests` و`_SubprocessWorkspace` مع لقطة read-only و`bubblewrap`/`prlimit` ومن دون شبكة أو اعتمادات موروثة.
+- يثبت `tests/test_cybersentinel_mind.py::test_native_mission_model_shares_durable_reasoning_scope_and_knowledge_across_roles` أن محللي/ناقدي الاختبار الاصطناعيين المختلفين كليهما سُجّلت لهما استدعاءات ضمن دورة `MissionRuntime` واحدة وسياق Mission مشترك؛ هذا اختبار adapter حتمي وليس قبول مزوّد حي.
+- تخطّى `tests/test_real_provider_long_horizon.py::test_real_provider_long_horizon` لغياب إعداد المزوّد الحي؛ `ModelRouter.from_env()` يعيد **0 ملفات مزوّد**، لذلك لا توجد استدعاءات حية أو قبول حي. نجحت فحوص `compileall` و`node --check` و`git diff --check` وفحص الأنماط الشبيهة بالأسرار في إضافات Python الإنتاجية. لا نشر/Cloudflare أو CI مؤكد؛ يظل إكمال المنتج العام `PARTIAL`.
