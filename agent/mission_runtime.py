@@ -161,6 +161,60 @@ class MissionRuntime:
         spec = get_tool(tool_name)
         return bool(spec and spec.risk_class in {"read", "analysis"})
 
+    @staticmethod
+    def _normalize_native_tool_result(raw: Any, *, tool_name: str, action_id: str, step_id: str, mission_id: str, tool_call_id: str) -> tuple[dict[str, Any], bool]:
+        """Normalize returned JSON data into an observation and execution status.
+
+        Explicit ``success`` (preferred) or ``ok`` booleans determine status.
+        Without either flag, ordinary returned data is a successful execution;
+        an error-only envelope is not. Useful data alongside provider errors is
+        retained as a visible partial success, not discarded as a failure.
+
+        Execution status is bookkeeping only and never supplies criterion
+        evidence or completion proof.
+        """
+        payload = dict(raw) if isinstance(raw, dict) else {"result": raw}
+        partial_success = False
+        if isinstance(raw, dict):
+            explicit_flag = "success" if "success" in raw else "ok" if "ok" in raw else None
+            has_error = any(bool(raw.get(key)) for key in ("error", "errors", "error_type", "failure_class"))
+            envelope_fields = {
+                "success", "ok", "error", "errors", "error_type", "failure_class", "exception",
+                "message", "reason", "detail", "details", "code", "status_code",
+                "query", "scope", "source", "type", "action_id", "step_id", "mission_id", "tool_call_id",
+            }
+
+            def carries_payload(key: str, value: Any) -> bool:
+                if key in envelope_fields or value is None or value == "" or value == [] or value == {}:
+                    return False
+                if key in {"results", "items", "data", "records", "entries"} and not value:
+                    return False
+                if key in {"total_results", "result_count"} and value == 0:
+                    return False
+                return True
+
+            has_data = any(carries_payload(key, value) for key, value in raw.items())
+            if explicit_flag is not None:
+                success = raw[explicit_flag] is True
+            else:
+                success = not (has_error and not has_data)
+            partial_success = success and has_error and has_data
+        else:
+            success = True
+
+        observation = {
+            **payload,
+            "success": success,
+            **({"partial_success": True} if partial_success else {}),
+            "type": "tool_observation",
+            "source": tool_name,
+            "action_id": action_id,
+            "step_id": step_id,
+            "mission_id": mission_id,
+            "tool_call_id": tool_call_id,
+        }
+        return observation, success
+
     @classmethod
     def _bind_proposal_to_ready_step(cls, mission: Mission, proposal: Any) -> tuple[Any, PlanStep | None, str]:
         if proposal.plan_version != mission.plan.version:
@@ -531,13 +585,18 @@ class MissionRuntime:
                             mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
                             self.store.save(mission)
                             raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, tool_call_id=proposal.tool_call_id, execution_proof=proof, execution_class="MISSION_BOUND", **registry_context)
-                            observation = dict(raw or {})
-                            observation.update({"type": "tool_observation", "source": proposal.name, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+                            action_id = proposal.action_id or proposal.tool_call_id
+                            observation, success = self._normalize_native_tool_result(
+                                raw,
+                                tool_name=proposal.name,
+                                action_id=action_id,
+                                step_id=proposal.step_id,
+                                mission_id=mission.mission_id,
+                                tool_call_id=proposal.tool_call_id,
+                            )
                             mission.record_observation(observation)
-                            success = bool(observation.get("success", observation.get("ok", False)))
                             if planned_step is not None:
                                 self._interpret_observation(mission, planned_step, observation, success=success)
-                            action_id = proposal.action_id or proposal.tool_call_id
                             mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
                             if success:
                                 self._record_verified_criterion_evidence(mission, action_id)
@@ -635,7 +694,7 @@ class MissionRuntime:
                     execution_class="MISSION_BOUND",
                     **registry_context,
                 )
-                return {"raw": dict(raw or {})}
+                return {"raw": raw}
             except Exception as exc:
                 return {"_ambiguous": True, "error": str(exc), "failure_class": FailureClass.UNKNOWN.value, "exception": type(exc).__name__}
 
@@ -650,14 +709,19 @@ class MissionRuntime:
             if wrapped.get("_ambiguous"):
                 ambiguous.append((proposal, wrapped))
                 continue
-            observation = dict(wrapped.get("raw") or {})
-            observation.update({"type": "tool_observation", "source": proposal.name, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+            action_id = proposal.action_id or proposal.tool_call_id
+            observation, success = self._normalize_native_tool_result(
+                wrapped.get("raw"),
+                tool_name=proposal.name,
+                action_id=action_id,
+                step_id=proposal.step_id,
+                mission_id=mission.mission_id,
+                tool_call_id=proposal.tool_call_id,
+            )
             mission.record_observation(observation)
-            success = bool(observation.get("success", observation.get("ok", False)))
             planned_step = next((step for step in mission.plan.steps if step.step_id == proposal.step_id), None)
             if planned_step is not None:
                 self._interpret_observation(mission, planned_step, observation, success=success)
-            action_id = proposal.action_id or proposal.tool_call_id
             mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
             if success:
                 self._record_verified_criterion_evidence(mission, action_id)
