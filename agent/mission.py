@@ -144,6 +144,15 @@ class Mission:
         self.progress["last_observation"] = observation.get("type", "observation")
         self.emit(EventType.OBSERVATION_RECEIVED, step_id=str(observation.get("step_id", "")), data={"status": observation.get("status", observation.get("success")), "action_id": observation.get("action_id", "")})
 
+    @property
+    def reasoning_cases(self) -> list[dict[str, Any]]:
+        """Read durable reasoning cases embedded in interpreted observations."""
+        return [
+            dict(item["reasoning_case"])
+            for item in self.interpretations
+            if isinstance(item, dict) and isinstance(item.get("reasoning_case"), dict)
+        ]
+
     def record_action(self, action_id: str, step_id: str, status: str, observation: dict[str, Any] | None = None, *, plan_fingerprint: str = "") -> None:
         existing = next((item for item in self.action_history if item.get("action_id") == action_id), None)
         if existing is not None:

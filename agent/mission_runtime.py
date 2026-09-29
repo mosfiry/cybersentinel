@@ -421,6 +421,225 @@ class MissionRuntime:
             mission.evidence.append(record)
             mission.emit(EventType.EVIDENCE_ADDED, data={"criterion_id": criterion_id, "provenance": "system-signed"})
 
+    @staticmethod
+    def _reasoning_case_for_observation(mission: Mission, observation: dict[str, Any], proposal: Any) -> dict[str, Any]:
+        """Build a durable, non-authoritative case from one canonical interpretation."""
+        import math
+        from evaluation.critic import critique
+        from reasoning.cases import make_case
+
+        def text_items(values: Any, *, limit: int = 8, width: int = 400) -> tuple[str, ...]:
+            if not isinstance(values, (tuple, list)):
+                return ()
+            return tuple(str(item).strip()[:width] for item in values[:limit] if str(item).strip())
+
+        def evidence_ids(values: Any) -> tuple[str, ...]:
+            if not isinstance(values, (tuple, list, set, frozenset)):
+                return ()
+            return tuple(dict.fromkeys(str(item).strip()[:128] for item in values if str(item).strip()))[:32]
+
+        def item_evidence_ids(values: Any) -> tuple[str, ...]:
+            if not isinstance(values, (tuple, list)):
+                return ()
+            return evidence_ids([item.get("evidence_id", "") for item in values if isinstance(item, dict)])
+
+        verified_records = mission._verified_system_evidence()
+        verified_ids = {
+            str(item.get("evidence_id") or (item.get("system_evidence") or {}).get("provenance_token", ""))
+            for item in verified_records
+        }
+        verified_ids.discard("")
+        claimed_support = set(evidence_ids(getattr(proposal, "supporting_evidence_ids", ())))
+        claimed_support.update(evidence_ids(observation.get("supporting_evidence_ids", ())))
+        claimed_support.update(item_evidence_ids(observation.get("evidence", ())))
+        claimed_counter = set(evidence_ids(getattr(proposal, "counter_evidence_ids", ())))
+        claimed_counter.update(evidence_ids(observation.get("counter_evidence_ids", ())))
+        claimed_counter.update(item_evidence_ids(observation.get("counter_evidence", observation.get("contradictions", ()))))
+        claimed_support.update(item_evidence_ids(getattr(proposal, "new_evidence", ())))
+        claimed_counter.update(item_evidence_ids(getattr(proposal, "contradictions", ())))
+        supporting = tuple(sorted(claimed_support & verified_ids))
+        contradicting = tuple(sorted(claimed_counter & verified_ids))
+        all_claimed_ids = claimed_support | claimed_counter
+        for updates in (getattr(proposal, "hypothesis_updates", ()), observation.get("hypothesis_updates", ())):
+            if isinstance(updates, (tuple, list)):
+                for update in updates[:8]:
+                    if isinstance(update, dict):
+                        all_claimed_ids.update(evidence_ids(update.get("supporting_evidence_ids", ())))
+                        all_claimed_ids.update(evidence_ids(update.get("counter_evidence_ids", ())))
+        proposal_changes = getattr(proposal, "confidence_changes", ())
+        observation_changes = observation.get("confidence_changes", ())
+        raw_changes = proposal_changes or observation_changes
+        for changes in (proposal_changes, observation_changes):
+            if not isinstance(changes, (tuple, list)):
+                continue
+            for change in changes[:8]:
+                if hasattr(change, "to_dict"):
+                    proposed = change.to_dict()
+                elif isinstance(change, dict):
+                    proposed = change
+                else:
+                    continue
+                all_claimed_ids.update(evidence_ids(proposed.get("supporting_evidence_ids", ())))
+                all_claimed_ids.update(evidence_ids(proposed.get("counter_evidence_ids", ())))
+        rejected_ids = tuple(sorted(all_claimed_ids - verified_ids))
+
+        candidates: list[dict[str, Any]] = []
+        for item in getattr(proposal, "hypothesis_updates", ())[:8]:
+            if not isinstance(item, dict):
+                continue
+            statement = str(item.get("statement") or item.get("hypothesis") or item.get("description") or "").strip()[:500]
+            candidates.append({
+                "record_type": "HYPOTHESIS_CANDIDATE",
+                "hypothesis_id": str(item.get("hypothesis_id", ""))[:120],
+                "statement": statement,
+                "status": "UNVALIDATED",
+                "model_claimed_status": str(item.get("status", ""))[:80],
+                "rationale": str(item.get("rationale") or item.get("reason") or "")[:300],
+                "assumptions": list(text_items(item.get("assumptions", ()), limit=4, width=250)),
+                "provenance": {"source": "model_proposal", "trust": "untrusted_claim"},
+            })
+
+        raw_confidence = observation.get("model_confidence", observation.get("confidence"))
+        try:
+            parsed_confidence = float(raw_confidence) if not isinstance(raw_confidence, bool) and raw_confidence is not None else None
+        except (TypeError, ValueError, OverflowError):
+            parsed_confidence = None
+        if parsed_confidence is not None and math.isfinite(parsed_confidence) and 0.0 <= parsed_confidence <= 1.0:
+            model_confidence = {
+                "claimed_value": parsed_confidence,
+                "source": "model_proposal" if "model_confidence" in observation else "raw_observation",
+                "trust": "untrusted_claim",
+            }
+        else:
+            model_confidence = {
+                "claimed_value": None,
+                "source": "untrusted_observation" if "confidence" in observation or "model_confidence" in observation else "not_provided",
+                "trust": "untrusted_claim",
+            }
+
+        model_confidence_changes: list[dict[str, Any]] = []
+        for change in raw_changes[:8] if isinstance(raw_changes, (tuple, list)) else ():
+            if hasattr(change, "to_dict"):
+                proposed = change.to_dict()
+            elif isinstance(change, dict):
+                proposed = change
+            else:
+                continue
+            proposed_support = evidence_ids(proposed.get("supporting_evidence_ids", ()))
+            proposed_counter = evidence_ids(proposed.get("counter_evidence_ids", ()))
+            model_confidence_changes.append({
+                "hypothesis_id": str(proposed.get("hypothesis_id", ""))[:120],
+                "delta": proposed.get("delta", 0.0),
+                "reason": str(proposed.get("reason", ""))[:300],
+                "verified_supporting_evidence_ids": [item for item in proposed_support if item in verified_ids],
+                "verified_counter_evidence_ids": [item for item in proposed_counter if item in verified_ids],
+                "claimed_unverified_evidence_ids": [item for item in (*proposed_support, *proposed_counter) if item not in verified_ids][:16],
+                "provenance": {"source": "model_proposal", "trust": "untrusted_claim"},
+            })
+
+        alternatives = text_items(observation.get("alternative_explanations", ()), limit=4, width=250)
+        if not alternatives:
+            alternatives = ("insufficient evidence for a determination", "tool or observation artifact", "benign or routine explanation")
+        required = text_items(getattr(proposal, "required_next_evidence", ()), limit=8, width=250)
+        if not required:
+            required = ("independent system evidence relevant to the observation",)
+        confidence_rationale = (
+            "NOT_ASSESSED: model/raw confidence is retained separately as an untrusted claim; "
+            "no evidence-derived confidence score was computed."
+        )
+
+        knowledge_sources: list[dict[str, Any]] = []
+        for item in mission.knowledge_context[-8:]:
+            if not isinstance(item, dict):
+                continue
+            source_provenance = item.get("provenance", {}) if isinstance(item.get("provenance"), dict) else {}
+            linked_ids = evidence_ids(item.get("evidence_ids", ()))
+            knowledge_sources.append({
+                "record_type": str(item.get("record_type", item.get("type", "knowledge")))[:80],
+                "source": str(item.get("source") or source_provenance.get("source") or "")[:160],
+                "trust": str(item.get("trust") or source_provenance.get("trust") or "unspecified")[:80],
+                "validation_state": str(item.get("validation_state") or item.get("status") or "unknown")[:80],
+                "verified_evidence_ids": [item_id for item_id in linked_ids if item_id in verified_ids],
+            })
+
+        case = make_case(
+            observation=str(getattr(proposal, "summary", "") or observation.get("summary") or "observation recorded")[:1000],
+            hypotheses=tuple(candidates),
+            supporting=supporting,
+            contradicting=contradicting,
+            alternatives=alternatives,
+            required=required,
+            techniques=text_items(observation.get("technique_mappings", ()), limit=8, width=120),
+            confidence=0.0,
+            confidence_rationale=confidence_rationale,
+            limitations=(
+                "Raw observation and model-authored claims are untrusted and not semantically validated.",
+                "Critic output is structural diagnosis/evidence request only; it cannot change confidence, validation, authorization, scope, or completion.",
+            ),
+            provenance={
+                "source": "mission_runtime_observation_interpretation",
+                "trust": str(getattr(proposal, "provenance", {}).get("trust", "untrusted_observation_data")),
+                "mission_id": mission.mission_id,
+                "observation_id": str(getattr(proposal, "observation_id", "")),
+                "action_id": str(observation.get("action_id", "")),
+                "tool": str(observation.get("source", "")),
+                "knowledge_sources": knowledge_sources,
+            },
+        )
+        case_record = case.to_dict()
+        audit = {
+            "verified_ids": sorted(verified_ids),
+            "claimed_ids": sorted(all_claimed_ids),
+            "rejected_ids": list(rejected_ids),
+        }
+        untrusted_claims = {
+            "facts": list(text_items(getattr(proposal, "facts", ()), limit=8, width=300)),
+            "candidate_hypothesis_count": len(candidates),
+            "new_evidence_claim_count": len(getattr(proposal, "new_evidence", ())),
+            "contradiction_claim_count": len(getattr(proposal, "contradictions", ())),
+            "confidence_changes": model_confidence_changes,
+            "model_rationale": str(getattr(proposal, "replan_reason", "") or getattr(proposal, "recommended_strategy_change", ""))[:500],
+            "provenance": dict(getattr(proposal, "provenance", {})),
+        }
+        diagnostics = critique({
+            "observations": list(case.observations),
+            "candidate_hypotheses": list(case.candidate_hypotheses),
+            "claims": untrusted_claims["facts"],
+            "untrusted_claims": untrusted_claims,
+            "tool_result_present": bool(observation.get("source") or observation.get("observation")),
+            "tool_interpretation_claims": [*case.observations, *untrusted_claims["facts"]],
+            "reasoning_rationale": untrusted_claims["model_rationale"],
+            "supporting_evidence": list(case.supporting_evidence),
+            "contradicting_evidence": list(case.contradicting_evidence),
+            "verified_evidence_ids": sorted(verified_ids),
+            "unverified_evidence_ids": list(rejected_ids),
+            "required_next_evidence": list(case.required_next_evidence),
+            "alternative_explanations": list(case.alternative_explanations),
+            "confidence": case.confidence,
+            "model_confidence": model_confidence,
+            "model_confidence_changes": model_confidence_changes,
+            "confidence_rationale": case.confidence_rationale,
+            "technique_mappings": list(case.technique_mappings),
+        }).to_dict()
+        return {
+            "record_type": "REASONING_CASE",
+            **case_record,
+            "model_confidence": model_confidence,
+            "evidence_confidence": {
+                "value": None,
+                "state": "NOT_ASSESSED",
+                "rationale": "This slice does not derive confidence from evidence quality; see system_validation separately.",
+            },
+            "system_validation": {
+                "state": "UNVALIDATED",
+                "verified_evidence_ids": list(supporting + contradicting),
+                "changed_by_critic": False,
+            },
+            "evidence_reference_audit": audit,
+            "untrusted_claims": untrusted_claims,
+            "critic": diagnostics,
+        }
+
     def _interpret_observation(self, mission: Mission, step: PlanStep, observation: dict[str, Any], *, success: bool):
         previous = mission.observations[-2] if len(mission.observations) > 1 else None
         if not should_interpret_observation(observation, previous=previous):
@@ -437,8 +656,15 @@ class MissionRuntime:
             conversation_context=(),
         )
         mission.knowledge_context = list(mission.knowledge_context)
-        mission.interpretations.append(proposal.to_dict())
-        mission.emit(EventType.OBSERVATION_INTERPRETED, step_id=step.step_id, data=proposal.to_dict())
+        interpreted_record = {
+            **proposal.to_dict(),
+            "record_type": "INTERPRETED_OBSERVATION",
+            "proposal_trust": str(proposal.provenance.get("trust", "untrusted_observation_data")),
+            "untrusted_claim_fields": ["facts", "new_evidence", "contradictions", "supporting_evidence_ids", "counter_evidence_ids", "hypothesis_updates", "confidence_changes"],
+            "reasoning_case": self._reasoning_case_for_observation(mission, observation, proposal),
+        }
+        mission.interpretations.append(interpreted_record)
+        mission.emit(EventType.OBSERVATION_INTERPRETED, step_id=step.step_id, data=interpreted_record)
         scope_blocked = False
         target = observation.get("target")
         allowed_targets = (mission.scope_snapshot or {}).get("allowed_targets") if isinstance(mission.scope_snapshot, dict) else None
