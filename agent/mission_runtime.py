@@ -32,6 +32,17 @@ class MissionRuntime:
         self.interpreter = interpreter or ObservationInterpreter()
         self.require_authorization_snapshot = require_authorization_snapshot
         self.authorization_snapshot_factory = authorization_snapshot_factory
+        self._live_missions: dict[str, Mission] = {}
+
+    def activate_live_mission(self, mission: Mission) -> None:
+        """Use this request's authenticated mission object without persisting its proof."""
+        if not isinstance(mission, Mission):
+            raise TypeError("live mission must be a Mission")
+        self._live_missions[mission.mission_id] = mission
+
+    def release_live_mission(self, mission_id: str) -> None:
+        """Discard transient authorization evidence when the request execution ends."""
+        self._live_missions.pop(str(mission_id), None)
 
     def _mission_authorization(self, mission: Mission) -> tuple[bool, str]:
         if not self.require_authorization_snapshot:
@@ -325,12 +336,25 @@ class MissionRuntime:
         if not allow:
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": "owner denied action"})
             mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "owner denied")
+            live_authorization = None
         else:
-            mission.authorization_context = authorization_context or {"owner_decision": "allow"}
+            if authorization_context:
+                from security.authorization_context import AuthorizationContext
+                live_authorization = AuthorizationContext.from_dict(dict(authorization_context))
+                mission.authorization_context = live_authorization.to_dict()
+            else:
+                live_authorization = None
+                mission.authorization_context = {"owner_decision": "allow"}
             mission.transition(MissionStatus.READY, "owner allowed action")
-        return self.store.save(mission)
+        saved = self.store.save(mission)
+        if live_authorization is not None:
+            self.activate_live_mission(saved)
+        return saved
 
     def _load(self, mission_id: str) -> Mission:
+        live = self._live_missions.get(str(mission_id))
+        if live is not None:
+            return live
         mission = self.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
@@ -1793,14 +1817,17 @@ class MissionRuntime:
         return self.store.save(mission)
 
     def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:
-        limit = max_slices or self._load(mission_id).max_iterations
-        for _ in range(limit):
-            if heartbeat is not None:
-                heartbeat()
-            mission = self.run_slice(mission_id)
-            if mission.is_terminal or mission.status is MissionStatus.PAUSED:
-                return mission
-        return self._load(mission_id)
+        try:
+            limit = max_slices or self._load(mission_id).max_iterations
+            for _ in range(limit):
+                if heartbeat is not None:
+                    heartbeat()
+                mission = self.run_slice(mission_id)
+                if mission.is_terminal or mission.status is MissionStatus.PAUSED:
+                    return mission
+            return self._load(mission_id)
+        finally:
+            self.release_live_mission(mission_id)
 
 
 __all__ = ["MissionRuntime"]

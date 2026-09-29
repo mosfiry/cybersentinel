@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .planning import Plan, GoalVerification
 from .trajectory import EventType, TrajectoryEvent, verify_trajectory
+from .redaction import sanitize_sensitive_data
 
 
 def _fingerprint(value: Any) -> str:
@@ -251,7 +252,32 @@ class Mission:
         return {"mission_id": self.mission_id, "owner_request": self.owner_request, "objective": self.objective, "status": self.status.value, "plan": self.plan.to_dict(), "current_step": self.current_step, "progress": self.progress, "observations": self.observations, "evidence": self.evidence, "artifacts": self.artifacts, "failures": self.failures, "authorization_context": self.authorization_context, "scope_snapshot": self.scope_snapshot, "completion_criteria": self.completion_criteria, "verification_state": self.verification_state, "completion_proof": self.completion_proof, "checkpoint": self.checkpoint, "plan_history": self.plan_history, "action_history": self.action_history, "transitions": self.transitions, "retry_count": self.retry_count, "max_iterations": self.max_iterations, "iteration_count": self.iteration_count, "error": self.error, "request_id": self.request_id, "owner_identity_ref": self.owner_identity_ref, "owner_instruction": self.owner_instruction, "policy_snapshot": self.policy_snapshot, "authorization_snapshot": self.authorization_snapshot, "provenance": self.provenance, "trajectory": self.trajectory, "hypotheses": self.hypotheses, "strategy_state": self.strategy_state, "knowledge_context": self.knowledge_context, "interpretations": self.interpretations, "strategy_decisions": self.strategy_decisions, "replan_history": self.replan_history, "verification_history": self.verification_history, "recovery_events": self.recovery_events, "semantic_intent": self.semantic_intent, "model_selection": self.model_selection}
 
     def to_dict(self) -> dict[str, Any]:
-        payload = self._unsigned_dict()
+        payload = sanitize_sensitive_data(self._unsigned_dict())
+        trajectory = payload.get("trajectory")
+        if (
+            isinstance(trajectory, list)
+            and trajectory != self.trajectory
+            and any(isinstance(item, dict) and "event_hash" in item for item in trajectory)
+        ):
+            if not verify_trajectory(self.trajectory):
+                raise ValueError("refusing to serialize a redacted mission with an invalid trajectory")
+            previous_hash = ""
+            resealed = []
+            for item in trajectory:
+                event = TrajectoryEvent(
+                    EventType(item["event"]),
+                    str(item["mission_id"]),
+                    str(item["request_id"]),
+                    step_id=str(item.get("step_id", "")),
+                    timestamp=str(item["timestamp"]),
+                    provenance=dict(item.get("provenance", {})),
+                    data=dict(item.get("data", {})),
+                    previous_hash=previous_hash,
+                )
+                serialized = event.to_dict()
+                resealed.append(serialized)
+                previous_hash = serialized["event_hash"]
+            payload["trajectory"] = resealed
         payload["integrity_hash"] = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
         return payload
 
@@ -287,6 +313,8 @@ class Mission:
         raw["plan"].validate_dependency_graph()
         raw["status"] = MissionStatus(raw["status"])
         raw["integrity_hash"] = supplied_hash
+        if raw.get("authorization_context") == "[REDACTED]":
+            raw["authorization_context"] = None
         mission = cls(**raw)
         if mission.status is MissionStatus.GOAL_COMPLETED and not mission.completion_proof_is_valid():
             raise ValueError("refusing to load GOAL_COMPLETED without a valid system-signed completion proof")

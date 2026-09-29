@@ -8,6 +8,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from .redaction import sanitize_sensitive_data
 
 
 @dataclass
@@ -71,7 +72,8 @@ class EvidenceChainStore:
             last = db.execute("SELECT sequence,current_hash FROM evidence_chain ORDER BY sequence DESC LIMIT 1").fetchone()
             sequence = int(last[0] if last else 0) + 1
             previous = str(last[1] if last else "")
-            payload = dict(item)
+            payload = sanitize_sensitive_data(dict(item))
+            payload.pop("current_hash", None)
             payload["sequence"] = sequence
             payload["previous_hash"] = previous
             record = Evidence(**payload)

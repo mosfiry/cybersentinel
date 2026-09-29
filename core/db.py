@@ -136,13 +136,23 @@ def connect():
     return con
 
 def add_event(kind, title, body, source, severity="info", trusted=False, metadata=None):
-    payload = metadata if isinstance(metadata, str) else __import__("json").dumps(metadata or {}, ensure_ascii=False)
+    import json
+    from agent.redaction import sanitize_sensitive_data, sanitize_sensitive_text
+    if isinstance(metadata, str):
+        try:
+            parsed_metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            payload = sanitize_sensitive_text(metadata)
+        else:
+            payload = json.dumps(sanitize_sensitive_data(parsed_metadata), ensure_ascii=False)
+    else:
+        payload = json.dumps(sanitize_sensitive_data(metadata or {}), ensure_ascii=False)
     with connect() as con:
         cur = con.execute(
             """INSERT INTO events
                (kind,severity,title,body,source,trusted,metadata_json)
                VALUES(?,?,?,?,?,?,?)""",
-            (kind, severity, title, body, source, int(trusted), payload),
+            (kind, severity, sanitize_sensitive_text(str(title)), sanitize_sensitive_text(str(body)), sanitize_sensitive_text(str(source)), int(trusted), payload),
         )
         return cur.lastrowid
 
@@ -200,10 +210,11 @@ def intel_recent(limit=100):
 
 def save_reasoning_memory(request_id, case, critic):
     import json
+    from agent.redaction import sanitize_sensitive_data
     with connect() as con:
         con.execute(
             "INSERT OR REPLACE INTO reasoning_memory(request_id,case_json,critic_json) VALUES(?,?,?)",
-            (request_id, json.dumps(case, ensure_ascii=False), json.dumps(critic, ensure_ascii=False)),
+            (request_id, json.dumps(sanitize_sensitive_data(case), ensure_ascii=False), json.dumps(sanitize_sensitive_data(critic), ensure_ascii=False)),
         )
 
 def reasoning_for_request(request_id):
@@ -250,11 +261,12 @@ def ensure_conversation(conversation_id, owner_id=""):
 
 def add_conversation_message(conversation_id, role, content, metadata=None, *, owner_id=""):
     import json
+    from agent.redaction import sanitize_sensitive_data, sanitize_sensitive_text
     ensure_conversation(conversation_id, owner_id)
     with connect() as con:
         cur = con.execute(
             "INSERT INTO conversation_messages(conversation_id,role,content,metadata_json) VALUES(?,?,?,?)",
-            (str(conversation_id), str(role), str(content), json.dumps(metadata or {}, ensure_ascii=False)),
+            (str(conversation_id), str(role), sanitize_sensitive_text(str(content)), json.dumps(sanitize_sensitive_data(metadata or {}), ensure_ascii=False)),
         )
         con.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?", (str(conversation_id),))
         return cur.lastrowid

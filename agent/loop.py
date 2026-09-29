@@ -15,6 +15,7 @@ from .context import (
     RuntimeLimits,
     AgentContext,
 )
+from .redaction import sanitize_sensitive_text
 
 
 # Legacy SYSTEM_PROMPT for backward compatibility
@@ -59,21 +60,8 @@ def _parse_response(content: str) -> dict[str, Any] | None:
 
 
 def _sanitize_for_logging(content: str, max_length: int = 200) -> str:
-    """Sanitize content for safe logging - never log full context."""
-    # Remove any potential secrets
-    sensitive_patterns = [
-        r'token["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-]+["\']?',
-        r'api[_-]?key["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-]+["\']?',
-        r'secret["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-]+["\']?',
-        r'password["\']?\s*[:=]\s*["\']?[^\s"\']+["\']?',
-        r'credential[s]?["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-]+["\']?',
-        r'auth["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-]+["\']?',
-    ]
-    sanitized = content
-    for pattern in sensitive_patterns:
-        sanitized = re.sub(pattern, '[REDACTED]', sanitized, flags=re.IGNORECASE)
-
-    # Truncate to max length
+    """Redact recognizable credentials and truncate before any caller logs text."""
+    sanitized = sanitize_sensitive_text(str(content))
     if len(sanitized) > max_length:
         sanitized = sanitized[:max_length] + "...[TRUNCATED]"
 

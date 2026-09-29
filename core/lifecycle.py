@@ -75,6 +75,8 @@ def begin(request_id: str, source: str) -> LifecycleRecord:
 def transition(request_id: str, target: str, *, plan_hash: str = "", provider: str = "", model: str = "", error: str = "") -> LifecycleRecord:
     if target not in STATES:
         raise ValueError("unknown lifecycle state")
+    from agent.redaction import sanitize_sensitive_text
+    error = sanitize_sensitive_text(str(error))
     with connect() as con:
         row = con.execute("SELECT * FROM executions WHERE request_id = ?", (request_id,)).fetchone()
         current = _decode(row)
@@ -92,6 +94,9 @@ def transition(request_id: str, target: str, *, plan_hash: str = "", provider: s
 
 
 def complete(request_id: str, result: dict[str, Any], *, success: bool, error: str = "") -> LifecycleRecord:
+    from agent.redaction import sanitize_sensitive_data, sanitize_sensitive_text
+    result = sanitize_sensitive_data(result)
+    error = sanitize_sensitive_text(str(error))
     current = get(request_id)
     if current is None:
         raise ValueError("unknown request_id")

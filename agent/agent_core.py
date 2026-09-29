@@ -704,8 +704,16 @@ class AgentCore:
         if any(getattr(item, "native_chat", False) and getattr(item, "tool_calling", False) for item in capabilities):
             from .model_protocol import MindNativeModel
             native_model = MindNativeModel(self.router, self.mind, self.store, preference=self.model_preference)
-            return runtime.run_model_loop(mission.mission_id, native_model, tools=self._schemas(self._mission_model_tools(mission)), max_turns=self.max_iterations)
-        result = runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
+            runtime.activate_live_mission(mission)
+            try:
+                return runtime.run_model_loop(mission.mission_id, native_model, tools=self._schemas(self._mission_model_tools(mission)), max_turns=self.max_iterations)
+            finally:
+                runtime.release_live_mission(mission.mission_id)
+        runtime.activate_live_mission(mission)
+        try:
+            result = runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
+        finally:
+            runtime.release_live_mission(mission.mission_id)
         last_response = getattr(self, "_last_model_response", None)
         if isinstance(last_response, dict) and last_response.get("content"):
             result.progress["last_model_content"] = str(last_response["content"])
@@ -913,13 +921,21 @@ class AgentCore:
         if any(getattr(item, "native_chat", False) and getattr(item, "tool_calling", False) for item in capabilities):
             from .model_protocol import MindNativeModel
             native_model = MindNativeModel(self.router, self.mind, self.store, preference=self.model_preference)
-            return runtime.run_model_loop(
-                mission.mission_id,
-                native_model,
-                tools=self._schemas(self._mission_model_tools(mission)),
-                max_turns=max_slices or self.max_iterations,
-            )
-        return runtime.run_to_completion(mission.mission_id, max_slices=max_slices or self.max_iterations, heartbeat=heartbeat)
+            runtime.activate_live_mission(mission)
+            try:
+                return runtime.run_model_loop(
+                    mission.mission_id,
+                    native_model,
+                    tools=self._schemas(self._mission_model_tools(mission)),
+                    max_turns=max_slices or self.max_iterations,
+                )
+            finally:
+                runtime.release_live_mission(mission.mission_id)
+        runtime.activate_live_mission(mission)
+        try:
+            return runtime.run_to_completion(mission.mission_id, max_slices=max_slices or self.max_iterations, heartbeat=heartbeat)
+        finally:
+            runtime.release_live_mission(mission.mission_id)
 
 
 __all__ = ["AgentCore"]

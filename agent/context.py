@@ -25,57 +25,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable
 
 from tools.registry import REGISTRY, get_tool
-
-
-_MODEL_SECRET_TEXT_PATTERNS = (
-    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer [REDACTED]"),
-    (re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|authorization)\b[\"']?\s*[:=]\s*[\"']?)[^\s,;\"']+"), r"\1[REDACTED]"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b"), "[REDACTED_JWT]"),
-    (re.compile(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
-)
-
-
-def sanitize_model_text(value: str) -> str:
-    result = str(value)
-    for pattern, replacement in _MODEL_SECRET_TEXT_PATTERNS:
-        result = pattern.sub(replacement, result)
-    return result
-
-
-def sanitize_model_data(value: Any) -> Any:
-    """Redact credential-bearing field names and token patterns recursively."""
-    if isinstance(value, dict):
-        result = {}
-        markers = ("apikey", "password", "secret", "credential", "sessionid", "ownersession", "accesstoken", "refreshtoken")
-        exact_sensitive = {
-            "auth", "authcontext", "ownerauth", "ownerauthorization", "authorization",
-            "authorizationcontext", "authorizationheader", "authorizationtoken",
-            "session", "sessiontoken", "sessioncookie", "ownertoken", "ownersessiontoken",
-            "token", "bearer", "cookie", "setcookie", "idtoken", "oauthtoken", "privatekey",
-        }
-        opaque_reference_keys = {"secretref", "secretreference", "credentialref", "vaultref"}
-        for key, item in value.items():
-            compact = re.sub(r"[^a-z0-9]", "", str(key).casefold())
-            if compact in opaque_reference_keys:
-                # These identifiers are opaque Vault pointers, not credential material.
-                # Their string contents still pass through recognizable-token redaction.
-                result[str(key)] = sanitize_model_data(item)
-            elif compact in exact_sensitive or any(marker in compact for marker in markers):
-                result[str(key)] = "[REDACTED]"
-            else:
-                result[str(key)] = sanitize_model_data(item)
-        return result
-    if isinstance(value, (list, tuple)):
-        return [sanitize_model_data(item) for item in value]
-    if isinstance(value, str):
-        return sanitize_model_text(value)
-    return value
+from .redaction import sanitize_sensitive_data as sanitize_model_data
+from .redaction import sanitize_sensitive_text as sanitize_model_text
 
 
 # =============================================================================

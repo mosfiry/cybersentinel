@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from .redaction import sanitize_sensitive_data
 
 
 # Database setup
@@ -391,6 +392,16 @@ class MemoryProvider:
 
     @staticmethod
     def _write_memory(item: MemoryItem) -> None:
+        original_payload = item.to_dict()
+        safe_payload = sanitize_sensitive_data(original_payload)
+        redaction_changed = json.dumps(safe_payload, ensure_ascii=False, sort_keys=True, default=str) != json.dumps(
+            original_payload, ensure_ascii=False, sort_keys=True, default=str
+        )
+        if redaction_changed:
+            if item.validation_state != "unvalidated":
+                raise ValueError("refusing to persist redacted memory with a signed validation binding")
+            safe_payload["content_hash"] = hashlib.sha256(str(safe_payload["content"]).encode("utf-8")).hexdigest()[:16]
+            item = MemoryItem.from_dict(safe_payload)
         with _memory_lock:
             with _get_memory_db() as conn:
                 conn.execute("""
