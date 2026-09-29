@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -75,6 +76,10 @@ class MemoryItem:
     metadata: dict[str, Any] = field(default_factory=dict)
     domain: MemoryDomain = MemoryDomain.CONVERSATION
     request_id: str = ""
+    owner_identity_ref: str = ""
+    source_mission_id: str = ""
+    system_evidence_refs: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    validation_state: str = "unvalidated"
 
     def __post_init__(self) -> None:
         expected_hash = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
@@ -86,6 +91,16 @@ class MemoryItem:
             raise ValueError("policy, authorization, scope, and evidence are separate stores")
         if str(self.metadata.get("classification", "")).casefold() in {"owner_policy", "authorization", "scope", "evidence"}:
             raise ValueError("memory metadata cannot claim policy, authorization, scope, or evidence authority")
+        if self.validation_state not in {"unvalidated", "validated_experience"}:
+            raise ValueError("unsupported memory validation state")
+        if self.validation_state == "validated_experience" and (
+            self.trust_classification is not TrustClassification.VALIDATED
+            or not self.owner_identity_ref
+            or not self.source_mission_id
+            or not self.request_id
+            or not self.system_evidence_refs
+        ):
+            raise ValueError("validated experience requires owner, mission, request, and system evidence provenance")
     
     @classmethod
     def create(
@@ -99,6 +114,10 @@ class MemoryItem:
         metadata: dict[str, Any] | None = None,
         domain: MemoryDomain = MemoryDomain.CONVERSATION,
         request_id: str = "",
+        owner_identity_ref: str = "",
+        source_mission_id: str = "",
+        system_evidence_refs: tuple[dict[str, Any], ...] = (),
+        validation_state: str = "unvalidated",
     ) -> MemoryItem:
         """Create a new memory item."""
         import uuid
@@ -118,6 +137,10 @@ class MemoryItem:
             metadata=metadata or {},
             domain=domain,
             request_id=request_id,
+            owner_identity_ref=owner_identity_ref,
+            source_mission_id=source_mission_id,
+            system_evidence_refs=tuple(system_evidence_refs),
+            validation_state=validation_state,
         )
     
     def to_dict(self) -> dict[str, Any]:
@@ -136,6 +159,10 @@ class MemoryItem:
             "metadata": self.metadata,
             "domain": self.domain.value,
             "request_id": self.request_id,
+            "owner_identity_ref": self.owner_identity_ref,
+            "source_mission_id": self.source_mission_id,
+            "system_evidence_refs": [dict(item) for item in self.system_evidence_refs],
+            "validation_state": self.validation_state,
         }
     
     @classmethod
@@ -145,7 +172,130 @@ class MemoryItem:
         data["memory_type"] = MemoryType(data["memory_type"])
         data["trust_classification"] = TrustClassification(data["trust_classification"])
         data["domain"] = MemoryDomain(data.get("domain", MemoryDomain.CONVERSATION.value))
+        data["system_evidence_refs"] = tuple(data.get("system_evidence_refs", ()))
         return cls(**data)
+
+
+def _memory_item_from_row(row: sqlite3.Row) -> MemoryItem:
+    """Load both migrated rows and legacy-shaped records without changing old callers."""
+    keys = set(row.keys())
+
+    def value(name: str, default: Any) -> Any:
+        return row[name] if name in keys and row[name] is not None else default
+
+    refs = json.loads(value("system_evidence_refs", "[]"))
+    metadata = json.loads(value("metadata", "{}"))
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return MemoryItem(
+        memory_id=row["memory_id"],
+        conversation_id=row["conversation_id"],
+        content=row["content"],
+        memory_type=MemoryType(row["memory_type"]),
+        trust_classification=TrustClassification(row["trust_classification"]),
+        source=row["source"],
+        provenance=row["provenance"],
+        content_hash=row["content_hash"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        metadata=metadata,
+        domain=MemoryDomain(value("domain", MemoryDomain.CONVERSATION.value)),
+        request_id=value("request_id", ""),
+        owner_identity_ref=value("owner_identity_ref", ""),
+        source_mission_id=value("source_mission_id", ""),
+        system_evidence_refs=tuple(refs) if isinstance(refs, list) else (),
+        validation_state=value("validation_state", "unvalidated"),
+    )
+
+
+def _evidence_fingerprint(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _supported_experience_result(check: str, result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if check == "system_online":
+        return (
+            set(result) == {"service", "version", "online"}
+            and result.get("online") is True
+            and isinstance(result.get("service"), str)
+            and 0 < len(result["service"]) <= 120
+            and isinstance(result.get("version"), str)
+            and 0 < len(result["version"]) <= 120
+            and not re.search(r"[\x00-\x1f\x7f]", result["service"] + result["version"])
+        )
+    if check == "project_tests_pass":
+        return (
+            set(result) == {"exit_code", "tool_id", "workspace_event_hash"}
+            and type(result.get("exit_code")) is int
+            and result["exit_code"] == 0
+            and result.get("tool_id") == "run_project_tests"
+            and isinstance(result.get("workspace_event_hash"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", result["workspace_event_hash"]) is not None
+        )
+    return False
+
+
+def _experience_content(check: str, criterion_id: str, result: dict[str, Any]) -> str:
+    payload = json.dumps(
+        {"check": check, "criterion_id": criterion_id, "result": result},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "Validated prior mission experience (untrusted context only): " + payload
+
+
+def _verified_memory_reference(item: MemoryItem) -> dict[str, Any] | None:
+    """Recheck that stored content is exactly derived from a signed supported check."""
+    if (
+        item.validation_state != "validated_experience"
+        or item.trust_classification is not TrustClassification.VALIDATED
+        or item.memory_type is not MemoryType.REASONING_CASE
+        or item.domain is not MemoryDomain.LEARNING
+        or not item.owner_identity_ref
+        or not item.source_mission_id
+        or not item.request_id
+        or len(item.system_evidence_refs) != 1
+    ):
+        return None
+    try:
+        from security.truthfulness import EvidenceRecord, system_issuer
+
+        ref = item.system_evidence_refs[0]
+        record = EvidenceRecord(**dict(ref["record"]))
+        result = ref["result"]
+        payload = record.payload
+        check = str(payload.get("check", ""))
+        criterion_id = str(payload.get("criterion_id", ""))
+        if (
+            not system_issuer().verify(record)
+            or record.origin != "execution_runtime"
+            or record.kind != "mission_criterion_evidence"
+            or item.source != "system_issuer"
+            or item.provenance != f"{record.origin}:{record.kind}"
+            or payload.get("owner_identity_ref") != item.owner_identity_ref
+            or payload.get("mission_id") != item.source_mission_id
+            or payload.get("request_id") != item.request_id
+            or payload.get("result_hash") != _evidence_fingerprint(result)
+            or not criterion_id
+            or not payload.get("verification_ref")
+            or not _supported_experience_result(check, result)
+            or item.content != _experience_content(check, criterion_id, result)
+        ):
+            return None
+        return {
+            "origin": record.origin,
+            "kind": record.kind,
+            "created_at": record.created_at,
+            "verification_ref": str(payload["verification_ref"]),
+            "criterion_id": criterion_id,
+            "check": check,
+        }
+    except (AttributeError, KeyError, OSError, TypeError, ValueError, PermissionError):
+        return None
 
 
 @contextmanager
@@ -181,6 +331,19 @@ def _init_memory_db():
                 metadata TEXT DEFAULT '{}'
             )
         """)
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)").fetchall()}
+        additions = {
+            "domain": "TEXT NOT NULL DEFAULT 'conversation'",
+            "request_id": "TEXT NOT NULL DEFAULT ''",
+            "owner_identity_ref": "TEXT NOT NULL DEFAULT ''",
+            "source_mission_id": "TEXT NOT NULL DEFAULT ''",
+            "system_evidence_refs": "TEXT NOT NULL DEFAULT '[]'",
+            "validation_state": "TEXT NOT NULL DEFAULT 'unvalidated'",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE memory_items ADD COLUMN {name} {declaration}")
         
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_conversation 
@@ -201,6 +364,10 @@ def _init_memory_db():
             CREATE INDEX IF NOT EXISTS idx_memory_content_hash 
             ON memory_items(content_hash)
         """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_owner_validation
+            ON memory_items(owner_identity_ref, validation_state, trust_classification)
+        """)
 
 
 # Initialize database on module load
@@ -212,15 +379,28 @@ class MemoryProvider:
     
     @staticmethod
     def store_memory(item: MemoryItem) -> None:
-        """Store a memory item."""
+        """Store raw or unvalidated memory; validated experience has a stricter path."""
+        if (
+            item.validation_state != "unvalidated"
+            or item.owner_identity_ref
+            or item.source_mission_id
+            or item.system_evidence_refs
+        ):
+            raise ValueError("reusable validated experience requires verified system evidence")
+        MemoryProvider._write_memory(item)
+
+    @staticmethod
+    def _write_memory(item: MemoryItem) -> None:
         with _memory_lock:
             with _get_memory_db() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO memory_items (
                         memory_id, conversation_id, content, memory_type,
                         trust_classification, source, provenance, content_hash,
-                        created_at, updated_at, metadata
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        created_at, updated_at, metadata, domain, request_id,
+                        owner_identity_ref, source_mission_id, system_evidence_refs,
+                        validation_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     item.memory_id,
                     item.conversation_id,
@@ -233,58 +413,145 @@ class MemoryProvider:
                     item.created_at,
                     item.updated_at,
                     json.dumps(item.metadata),
+                    item.domain.value,
+                    item.request_id,
+                    item.owner_identity_ref,
+                    item.source_mission_id,
+                    json.dumps(item.system_evidence_refs, ensure_ascii=False, sort_keys=True),
+                    item.validation_state,
                 ))
+
+    @staticmethod
+    def store_verified_mission_experience(mission: Any) -> int:
+        """Persist only experience derived from a currently verified system criterion record."""
+        owner_ref = str(getattr(mission, "owner_identity_ref", "") or "")
+        mission_id = str(getattr(mission, "mission_id", "") or "")
+        request_id = str(getattr(mission, "request_id", "") or "")
+        if not owner_ref or not mission_id or not request_id:
+            return 0
+        try:
+            from security.truthfulness import EvidenceRecord, system_issuer
+
+            issuer = system_issuer()
+            verified_items = mission._verified_system_evidence()
+        except (AttributeError, OSError, PermissionError, TypeError, ValueError):
+            return 0
+
+        stored = 0
+        for verified in verified_items:
+            raw_record = verified.get("verified_provenance") if isinstance(verified, dict) else None
+            if not isinstance(raw_record, dict):
+                continue
+            try:
+                record = EvidenceRecord(**dict(raw_record))
+                payload = record.payload
+                result = verified.get("result")
+                check = str(payload.get("check", ""))
+                criterion_id = str(payload.get("criterion_id", ""))
+                if (
+                    not issuer.verify(record)
+                    or record.origin != "execution_runtime"
+                    or record.kind != "mission_criterion_evidence"
+                    or payload.get("owner_identity_ref") != owner_ref
+                    or payload.get("mission_id") != mission_id
+                    or payload.get("request_id") != request_id
+                    or verified.get("criterion_id") != criterion_id
+                    or verified.get("source") != check
+                    or not criterion_id
+                    or not isinstance(result, dict)
+                    or payload.get("result_hash") != _evidence_fingerprint(result)
+                    or not _supported_experience_result(check, result)
+                ):
+                    continue
+
+                reference = {"record": dict(raw_record), "result": dict(result)}
+                content = _experience_content(check, criterion_id, result)
+                now = datetime.now(timezone.utc).isoformat()
+                memory_id = hashlib.sha256(
+                    "\0".join((owner_ref, mission_id, request_id, criterion_id, record.provenance_token)).encode("utf-8")
+                ).hexdigest()
+                memory_item = MemoryItem(
+                    memory_id=memory_id,
+                    conversation_id=f"mission:{mission_id}",
+                    content=content,
+                    memory_type=MemoryType.REASONING_CASE,
+                    trust_classification=TrustClassification.VALIDATED,
+                    source="system_issuer",
+                    provenance=f"{record.origin}:{record.kind}",
+                    content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
+                    created_at=now,
+                    updated_at=now,
+                    metadata={"experience_kind": "mission_criterion"},
+                    domain=MemoryDomain.LEARNING,
+                    request_id=request_id,
+                    owner_identity_ref=owner_ref,
+                    source_mission_id=mission_id,
+                    system_evidence_refs=(reference,),
+                    validation_state="validated_experience",
+                )
+                if _verified_memory_reference(memory_item) is None:
+                    continue
+                MemoryProvider._write_memory(memory_item)
+                stored += 1
+            except (KeyError, TypeError, ValueError, PermissionError):
+                continue
+        return stored
+
+    @staticmethod
+    def get_validated_experience(owner_identity_ref: str, query: str, *, limit: int = 4) -> list[MemoryItem]:
+        """Retrieve verified prior experiences for one owner using deterministic lexical overlap."""
+        owner_ref = str(owner_identity_ref or "")
+        query_tokens = set(re.findall(r"[^\W_]+", str(query or "").casefold(), flags=re.UNICODE))
+        result_limit = max(0, min(int(limit), 8))
+        if not owner_ref or not query_tokens or not result_limit:
+            return []
+        with _get_memory_db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_items WHERE owner_identity_ref = ? AND validation_state = ? "
+                "AND trust_classification = ? ORDER BY created_at DESC LIMIT 256",
+                (owner_ref, "validated_experience", TrustClassification.VALIDATED.value),
+            ).fetchall()
+        ranked: list[tuple[float, str, str, MemoryItem]] = []
+        for row in rows:
+            try:
+                item = _memory_item_from_row(row)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if _verified_memory_reference(item) is None:
+                continue
+            item_tokens = set(re.findall(r"[^\W_]+", item.content.casefold(), flags=re.UNICODE))
+            relevance = len(query_tokens & item_tokens) / len(query_tokens)
+            if relevance > 0:
+                ranked.append((relevance, item.updated_at, item.memory_id, item))
+        ranked.sort(key=lambda entry: (entry[0], entry[1], entry[2]), reverse=True)
+        return [entry[3] for entry in ranked[:result_limit]]
     
     @staticmethod
-    def get_memory_item(memory_id: str) -> MemoryItem | None:
-        """Get memory item by ID."""
+    def get_memory_item(memory_id: str, *, owner_identity_ref: str = "") -> MemoryItem | None:
+        """Get an item by ID; reusable experience additionally requires its Owner identity."""
         with _get_memory_db() as conn:
             row = conn.execute(
-                "SELECT * FROM memory_items WHERE memory_id = ?", (memory_id,)
+                "SELECT * FROM memory_items WHERE memory_id = ? "
+                "AND (validation_state != 'validated_experience' OR owner_identity_ref = ?)",
+                (memory_id, str(owner_identity_ref or "")),
             ).fetchone()
             
             if row is None:
                 return None
             
-            return MemoryItem(
-                memory_id=row["memory_id"],
-                conversation_id=row["conversation_id"],
-                content=row["content"],
-                memory_type=MemoryType(row["memory_type"]),
-                trust_classification=TrustClassification(row["trust_classification"]),
-                source=row["source"],
-                provenance=row["provenance"],
-                content_hash=row["content_hash"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-                metadata=json.loads(row["metadata"]),
-            )
+            return _memory_item_from_row(row)
     
     @staticmethod
     def get_memory_by_conversation(conversation_id: str) -> list[MemoryItem]:
         """Get all memory items for a conversation."""
         with _get_memory_db() as conn:
             rows = conn.execute(
-                "SELECT * FROM memory_items WHERE conversation_id = ? ORDER BY created_at DESC",
+                "SELECT * FROM memory_items WHERE conversation_id = ? "
+                "AND validation_state != 'validated_experience' ORDER BY created_at DESC",
                 (conversation_id,)
             ).fetchall()
             
-            return [
-                MemoryItem(
-                    memory_id=row["memory_id"],
-                    conversation_id=row["conversation_id"],
-                    content=row["content"],
-                    memory_type=MemoryType(row["memory_type"]),
-                    trust_classification=TrustClassification(row["trust_classification"]),
-                    source=row["source"],
-                    provenance=row["provenance"],
-                    content_hash=row["content_hash"],
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
-                    metadata=json.loads(row["metadata"]),
-                )
-                for row in rows
-            ]
+            return [_memory_item_from_row(row) for row in rows]
     
     @staticmethod
     def get_memory_by_type(
@@ -295,26 +562,11 @@ class MemoryProvider:
         with _get_memory_db() as conn:
             rows = conn.execute(
                 "SELECT * FROM memory_items WHERE conversation_id = ? AND memory_type = ? "
-                "ORDER BY created_at DESC",
+                "AND validation_state != 'validated_experience' ORDER BY created_at DESC",
                 (conversation_id, memory_type.value)
             ).fetchall()
             
-            return [
-                MemoryItem(
-                    memory_id=row["memory_id"],
-                    conversation_id=row["conversation_id"],
-                    content=row["content"],
-                    memory_type=MemoryType(row["memory_type"]),
-                    trust_classification=TrustClassification(row["trust_classification"]),
-                    source=row["source"],
-                    provenance=row["provenance"],
-                    content_hash=row["content_hash"],
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
-                    metadata=json.loads(row["metadata"]),
-                )
-                for row in rows
-            ]
+            return [_memory_item_from_row(row) for row in rows]
     
     @staticmethod
     def get_relevant_memory(

@@ -7,7 +7,7 @@ from typing import Any, Iterable
 from .protocol import ConversationTurn
 
 
-STATE_KEYS = ("owner", "mission", "conversation", "plan", "observation", "evidence", "hypothesis", "strategy", "knowledge", "tool", "verification", "compaction")
+STATE_KEYS = ("owner", "mission", "conversation", "plan", "observation", "evidence", "hypothesis", "strategy", "knowledge", "tool", "verification", "memory", "compaction")
 LIVE_TOOL_RESULT = "LIVE_TOOL_RESULT"
 COMPACTED_TOOL_METADATA = "COMPACTED_TOOL_METADATA"
 
@@ -38,12 +38,13 @@ class ContextAssembler:
         durable_tools = [dict(item, record_type=item.get("record_type", LIVE_TOOL_RESULT)) for item in tool_results]
         conversation_items = list(conversation)
         tool_definitions = [dict(item) for item in tools]
+        memory_items = self._memory_context(mission, max_chars=max_chars)
         compacted = False
         compacted_items = 0
 
         # Compact based on the complete durable state, not merely tools plus chat.
         def make_sections() -> dict[str, Any]:
-            return {
+            sections = {
                 "owner": {"instruction": mission.owner_instruction or mission.owner_request, "policy_snapshot": mission.policy_snapshot},
                 "mission": {"mission_id": mission.mission_id, "objective": mission.objective, "status": mission.status.value},
                 "conversation": [item.to_dict() for item in conversation_items],
@@ -58,6 +59,9 @@ class ContextAssembler:
                 "verification": dict(mission.verification_state),
                 "compaction": {"compacted": compacted, "compacted_items": compacted_items, "max_chars": max_chars, "metadata_is_untrusted": True},
             }
+            if memory_items:
+                sections["memory"] = memory_items
+            return sections
 
         sections = make_sections()
         if self._size(sections) > max_chars:
@@ -107,6 +111,7 @@ class ContextAssembler:
         # authoritative identity/security fields and replace only low-priority
         # narrative arrays with explicit untrusted summaries.
         if self._size(sections) > max_chars:
+            sections.pop("memory", None)
             sections["owner"]["policy_snapshot"] = {"fingerprint": self._hash(mission.policy_snapshot or {}), "record_type": "POLICY_FINGERPRINT_ONLY"}
             sections["mission"]["authorization_context"] = mission.authorization_context
             sections["mission"]["scope_snapshot"] = mission.scope_snapshot
@@ -152,6 +157,51 @@ class ContextAssembler:
         digest = sha256(json.dumps([item.to_dict() for item in messages], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         provenance = tuple({"section": key, "authoritative": key in {"owner", "mission", "plan", "verification"}} for key in STATE_KEYS)
         return AssembledContext(messages, sections, digest, provenance, compacted, compacted_items, context_chars)
+
+    def _memory_context(self, mission: Any, *, max_chars: int) -> list[dict[str, Any]]:
+        owner_ref = str(getattr(mission, "owner_identity_ref", "") or "")
+        if not owner_ref or max_chars < 1000:
+            return []
+        from ..memory import MemoryProvider
+
+        candidates = MemoryProvider.get_validated_experience(
+            owner_ref,
+            str(getattr(mission, "objective", "") or ""),
+            limit=4,
+        )
+        budget = min(3000, max_chars // 5)
+        included: list[dict[str, Any]] = []
+        used = 0
+        for item in candidates:
+            if len(item.system_evidence_refs) != 1:
+                continue
+            reference = item.system_evidence_refs[0]
+            record = reference.get("record", {}) if isinstance(reference, dict) else {}
+            payload = record.get("payload", {}) if isinstance(record, dict) else {}
+            entry = {
+                "label": "UNTRUSTED_CONTEXT_INPUT",
+                "content": item.content[:600],
+                "source_mission_id": item.source_mission_id,
+                "source_request_id": item.request_id,
+                "domain": item.domain.value,
+                "validation_state": item.validation_state,
+                "provenance": item.provenance,
+                "system_evidence_refs": [{
+                    "origin": str(record.get("origin", "")),
+                    "kind": str(record.get("kind", "")),
+                    "created_at": str(record.get("created_at", "")),
+                    "verification_ref": str(payload.get("verification_ref", ""))[:160],
+                }],
+                "authority": "none",
+                "reuse_warning": "Prior evidence does not transfer authority or prove current mission completion.",
+                "retrieval_method": "deterministic_lexical_overlap",
+            }
+            size = self._size(entry)
+            if used + size > budget:
+                break
+            included.append(entry)
+            used += size
+        return included
 
 
 __all__ = ["AssembledContext", "COMPACTED_TOOL_METADATA", "ContextAssembler", "LIVE_TOOL_RESULT", "STATE_KEYS"]

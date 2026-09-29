@@ -446,6 +446,9 @@ class MissionStore:
                 if updated.rowcount != 1:
                     raise MissionWriteConflictError("concurrent mission write rejected")
             mission.integrity_hash = str(payload["integrity_hash"])
+        if mission.owner_identity_ref and mission.request_id:
+            from .memory import MemoryProvider
+            MemoryProvider.store_verified_mission_experience(mission)
         return mission
 
     def load(self, mission_id: str) -> Mission | None:
