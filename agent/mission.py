@@ -91,6 +91,7 @@ class Mission:
 
     @classmethod
     def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50, request_id: str = "", owner_identity_ref: str = "", owner_instruction: str = "", policy_snapshot: dict[str, Any] | None = None, authorization_snapshot: dict[str, Any] | None = None, provenance: dict[str, Any] | None = None) -> "Mission":
+        plan.validate_dependency_graph()
         mission = cls(mission_id or uuid.uuid4().hex, owner_request, objective, MissionStatus.CREATED, plan, authorization_context=authorization_context, scope_snapshot=scope_snapshot, completion_criteria=completion_criteria or [], max_iterations=max_iterations, request_id=request_id, owner_identity_ref=owner_identity_ref, owner_instruction=owner_instruction or owner_request, policy_snapshot=policy_snapshot, authorization_snapshot=authorization_snapshot, provenance=provenance or {})
         mission.plan_history = [{"version": plan.version, "fingerprint": plan.fingerprint, "reason": "created"}]
         mission.transition(MissionStatus.PLANNING, "mission created")
@@ -138,10 +139,27 @@ class Mission:
         self.progress["last_observation"] = observation.get("type", "observation")
         self.emit(EventType.OBSERVATION_RECEIVED, step_id=str(observation.get("step_id", "")), data={"status": observation.get("status", observation.get("success")), "action_id": observation.get("action_id", "")})
 
-    def record_action(self, action_id: str, step_id: str, status: str, observation: dict[str, Any] | None = None) -> None:
-        if any(item.get("action_id") == action_id for item in self.action_history):
+    def record_action(self, action_id: str, step_id: str, status: str, observation: dict[str, Any] | None = None, *, plan_fingerprint: str = "") -> None:
+        existing = next((item for item in self.action_history if item.get("action_id") == action_id), None)
+        if existing is not None:
+            existing_fingerprint = str(existing.get("plan_fingerprint", ""))
+            if existing_fingerprint and plan_fingerprint and existing_fingerprint != plan_fingerprint:
+                raise ValueError("action ID is already bound to a different plan")
+            if existing.get("status") == "completed":
+                if not existing_fingerprint and plan_fingerprint:
+                    existing["plan_fingerprint"] = plan_fingerprint
+                return
+            if status != "completed":
+                return
+            existing.update({"step_id": step_id, "status": status, "observation": observation or {}})
+            if plan_fingerprint:
+                existing["plan_fingerprint"] = plan_fingerprint
+            self.emit(EventType.TOOL_EXECUTED, step_id=step_id, data={"action_id": action_id, "status": status})
             return
-        self.action_history.append({"action_id": action_id, "step_id": step_id, "status": status, "observation": observation or {}})
+        item = {"action_id": action_id, "step_id": step_id, "status": status, "observation": observation or {}}
+        if plan_fingerprint:
+            item["plan_fingerprint"] = plan_fingerprint
+        self.action_history.append(item)
         self.emit(EventType.TOOL_EXECUTED, step_id=step_id, data={"action_id": action_id, "status": status})
 
     def _verified_system_evidence(self) -> list[dict[str, Any]]:
@@ -252,6 +270,7 @@ class Mission:
         from .planning import PlanStep
         steps = tuple(PlanStep(**{**step, "prerequisites": tuple(step.get("prerequisites", ())), "verification": tuple(step.get("verification", ()))}) for step in plan_data.get("steps", []))
         raw["plan"] = Plan(version=plan_data["version"], objective=plan_data["objective"], assumptions=tuple(plan_data.get("assumptions", ())), steps=steps, dependencies=tuple(plan_data.get("dependencies", ())), completion_criteria=tuple(plan_data.get("completion_criteria", ())), risk=plan_data.get("risk", "unknown"), created_from=plan_data.get("created_from", ""))
+        raw["plan"].validate_dependency_graph()
         raw["status"] = MissionStatus(raw["status"])
         raw["integrity_hash"] = supplied_hash
         mission = cls(**raw)

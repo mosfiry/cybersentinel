@@ -174,6 +174,42 @@ class Plan:
     def fingerprint(self) -> str:
         return hashlib.sha256(json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
+    def validate_dependency_graph(self) -> None:
+        """Reject ambiguous or unschedulable step prerequisites before execution."""
+        ids = [str(step.step_id) for step in self.steps]
+        if any(not step_id.strip() or step_id != step_id.strip() for step_id in ids):
+            raise ValueError("plan step IDs must be non-empty and have no surrounding whitespace")
+        if len(ids) != len(set(ids)):
+            raise ValueError("plan step IDs must be unique")
+        known = set(ids)
+        for step in self.steps:
+            prerequisites = tuple(str(item) for item in step.prerequisites)
+            if len(prerequisites) != len(set(prerequisites)):
+                raise ValueError(f"duplicate prerequisite in plan step {step.step_id}")
+            missing = [item for item in prerequisites if item not in known]
+            if missing:
+                raise ValueError(f"unknown prerequisite in plan step {step.step_id}")
+            if step.step_id in prerequisites:
+                raise ValueError(f"plan step cannot depend on itself: {step.step_id}")
+
+        by_id = {step.step_id: step for step in self.steps}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(step_id: str) -> None:
+            if step_id in visiting:
+                raise ValueError("plan step dependencies must be acyclic")
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            for prerequisite in by_id[step_id].prerequisites:
+                visit(str(prerequisite))
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in ids:
+            visit(step_id)
+
 
 @dataclass(frozen=True)
 class PlanRevision:

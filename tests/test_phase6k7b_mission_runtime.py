@@ -158,3 +158,60 @@ def test_idempotency_does_not_repeat_completed_sensitive_action(tmp_path):
     MissionStore(Path(tmp_path) / "missions.sqlite3").save(loaded)
     rt.run_slice(mission.mission_id)
     assert len(calls) == 1
+
+
+def test_runtime_runs_ready_prerequisite_before_dependent_step(tmp_path):
+    calls = []
+    plan = Plan.initial("dependency order").replan(
+        steps=(
+            PlanStep("dependent", "dependent", action="run_dependent", prerequisites=("prerequisite",)),
+            PlanStep("prerequisite", "prerequisite", action="run_prerequisite"),
+        ),
+        reason="reverse topological order regression",
+    )
+    rt = runtime(
+        tmp_path,
+        lambda _mission, step, _action_id: calls.append(step.step_id) or {"success": True},
+    )
+    mission = rt.create("dependency order", "dependency order", plan)
+
+    rt.run_slice(mission.mission_id)
+
+    assert calls == ["prerequisite"]
+
+
+def test_runtime_rejects_missing_cyclic_and_duplicate_step_dependencies(tmp_path):
+    import pytest
+
+    invalid_plans = (
+        Plan.initial("missing prerequisite").replan(
+            steps=(PlanStep("step", "step", prerequisites=("absent",)),), reason="invalid fixture"
+        ),
+        Plan.initial("cyclic dependencies").replan(
+            steps=(
+                PlanStep("a", "a", prerequisites=("b",)),
+                PlanStep("b", "b", prerequisites=("a",)),
+            ),
+            reason="invalid fixture",
+        ),
+        Plan.initial("duplicate identifiers").replan(
+            steps=(PlanStep("same", "first"), PlanStep("same", "second")), reason="invalid fixture"
+        ),
+    )
+    rt = runtime(tmp_path, lambda *_args: {"success": True})
+    for plan in invalid_plans:
+        with pytest.raises(ValueError):
+            rt.create("invalid dependency plan", "invalid dependency plan", plan)
+
+
+def test_failed_action_retry_can_become_completed_for_dag_progress(tmp_path):
+    from agent.mission import Mission
+
+    plan = Plan.initial("retry action").replan(steps=(PlanStep("step", "step", action="status"),), reason="test")
+    mission = Mission.create("retry action", "retry action", plan)
+    mission.record_action("action-1", "step", "failed", {"success": False}, plan_fingerprint=plan.fingerprint)
+    mission.record_action("action-1", "step", "completed", {"success": True}, plan_fingerprint=plan.fingerprint)
+
+    assert len(mission.action_history) == 1
+    assert mission.action_history[0]["status"] == "completed"
+    assert mission.action_history[0]["plan_fingerprint"] == plan.fingerprint
