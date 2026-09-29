@@ -27,6 +27,7 @@ def test_tool_definitions_are_registry_derived():
 
 def test_agent_loop_executes_validated_tool_and_keeps_conversation_separate(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
+    allow_owner_sessions(monkeypatch, "owner-secret")
     calls = []
 
     def executor(command, *, owner_session_token, owner_session_id=None):
@@ -44,6 +45,7 @@ def test_agent_loop_executes_validated_tool_and_keeps_conversation_separate(monk
 
 def test_agent_loop_denies_unknown_tool_without_execution(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
+    allow_owner_sessions(monkeypatch, "owner-secret")
 
     class BadRouter:
         def chat(self, messages):

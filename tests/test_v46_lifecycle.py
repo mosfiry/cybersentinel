@@ -52,11 +52,30 @@ def test_completed_request_replays_one_final_result(monkeypatch, tmp_path):
     assert replay.final_result["ok"] is False
 
 
-def test_tool_timeout_is_explicit(monkeypatch):
+def test_tool_timeout_is_explicit(monkeypatch, tmp_path):
+    from runtime_authorization import signed_test_owner_kwargs
+    from security.authorization import authorize_tool
+    from security.authorization_context import AuthorizationContext
+    from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass
+
     def slow(_):
         import time
         time.sleep(0.05)
         return {"ok": True}
-    monkeypatch.setitem(registry.REGISTRY, "slow_test", ToolSpec("slow_test", "test", "read", True, None, slow))
+    # Reuse an Owner-budgeted registry name while substituting only its local handler.
+    monkeypatch.setitem(registry.REGISTRY, "status", ToolSpec("status", "test", "read", True, None, slow))
+    kwargs = signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="timeout-proof-test")
+    context = AuthorizationContext.from_dict(kwargs["authorization_context"])
+    decision = authorize_tool(["status", None], context=context)
+    assert decision.allowed and decision.decision is not None
+    proof = ExecutionAuthorizationProof.derive(
+        mission_id="",
+        request_id="timeout-proof-test",
+        tool="status",
+        argument=None,
+        decision=decision.decision,
+        tool_call_id="call-timeout-test",
+        execution_class=ExecutionClass.OWNER_DIRECT.value,
+    )
     with __import__("pytest").raises(ToolTimeout):
-        execute("slow_test", timeout=0.001)
+        execute("status", timeout=0.001, authorization_decision=decision.decision, request_id="timeout-proof-test", tool_call_id="call-timeout-test", execution_proof=proof, execution_class=ExecutionClass.OWNER_DIRECT.value)

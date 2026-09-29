@@ -1345,8 +1345,12 @@ class TestIntegration:
         assert "ContextEngine" in source
         assert "ContextEngine.build" in source
     
-    def test_agent_loop_builds_context(self):
+    def test_agent_loop_builds_context(self, monkeypatch, tmp_path):
         """Test that AgentLoop builds context using ContextEngine."""
+        import core.db as db
+        from owner_session_testutils import allow_owner_sessions
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
+        allow_owner_sessions(monkeypatch, "test-token")
         from agent.loop import AgentLoop
         
         class FakeRouter:
@@ -1373,8 +1377,12 @@ class TestIntegration:
 class TestRegression:
     """Regression tests to ensure Phase 3 doesn't break existing functionality."""
     
-    def test_agent_loop_still_works(self):
+    def test_agent_loop_still_works(self, monkeypatch, tmp_path):
         """Test that AgentLoop still works as before."""
+        import core.db as db
+        from owner_session_testutils import allow_owner_sessions
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
+        allow_owner_sessions(monkeypatch, "token")
         from agent.loop import AgentLoop
         
         class FakeRouter:

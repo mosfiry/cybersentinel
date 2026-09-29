@@ -50,8 +50,19 @@ def status():
     }
 
 
-def execute(tool: str, argument: str | None = None, *, authorization_decision=None, scope_context: dict | None = None):
-    return execute_tool(tool, argument, authorization_decision=authorization_decision, scope_context=scope_context)
+def execute(tool: str, argument: str | None = None, *, authorization_decision=None, scope_context: dict | None = None, request_id: str | None = None, tool_call_id: str | None = None):
+    from security.execution_boundary import OwnerDirectBoundary
+    if not request_id or not tool_call_id:
+        raise PermissionError("OwnerDirect execution requires request and tool-call identities")
+    return OwnerDirectBoundary.execute(
+        tool=tool,
+        argument=argument,
+        decision=authorization_decision,
+        request_id=request_id,
+        tool_call_id=tool_call_id,
+        scope_context=scope_context,
+        execute=execute_tool,
+    )
 
 
 def _handle_once(text, source="web", presented_token=None, owner_session_token=None, request_id=None, scope_context=None):
@@ -167,7 +178,7 @@ def _handle_once(text, source="web", presented_token=None, owner_session_token=N
             continue
         try:
             decision_for_tool = next((item for item in plan_result.decisions if item.allowed and item.tool == name and item.request_id == request_id), None)
-            result = execute(name, argument, authorization_decision=decision_for_tool, scope_context=scope_context)
+            result = execute(name, argument, authorization_decision=decision_for_tool, scope_context=scope_context, request_id=request_id, tool_call_id=f"{request_id}:{sequence}:{name}")
             if name == "red_team_assess" and isinstance(result, dict):
                 result["critic"] = critique(result).to_dict()
                 save_reasoning_memory(request_id, result, result["critic"])

@@ -273,18 +273,36 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, tool_call_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None, execution_class: str | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+    from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, RejectionCode
+    mission_bound = mission_authorization is not None or workspace is not None or evidence_store is not None or bool(mission_id)
+    resolved_class = str(execution_class or (ExecutionClass.MISSION_BOUND.value if mission_bound else ExecutionClass.OWNER_DIRECT.value))
+    if not str(tool_call_id or ""):
+        raise PermissionError("execution requires a unique tool-call identity")
+    if execution_proof is None:
+        raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: {resolved_class} execution requires an ExecutionAuthorizationProof")
+    proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(
+        execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id, tool_call_id=tool_call_id,
+    )
+    if not proof_ok:
+        raise PermissionError(f"{proof_code}: {proof_reason}")
+    if str(getattr(execution_proof, "execution_class", "")) != resolved_class:
+        raise PermissionError(f"{RejectionCode.EXECUTION_CLASS_MISMATCH.value}: proof execution class does not match governed execution")
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
         decision_valid = bool(request_id) and isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.is_valid_for(name, argument, request_id)
         if not decision_valid:
             raise PermissionError("invalid or argument-mismatched AuthorizationDecision")
-    if spec.owner_only and not decision_valid:
-        raise PermissionError("AuthorizationDecision required for this tool")
+        if str(authorization_decision.decision_signature) != str(execution_proof.decision_fingerprint):
+            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: proof is not bound to the supplied authorization decision")
+        if str(authorization_decision.policy_fingerprint) != str(execution_proof.policy_fingerprint):
+            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: proof policy binding does not match the authorization decision")
+    if spec.requires_owner and not decision_valid:
+        raise PermissionError("Owner AuthorizationDecision required for this tool")
     if spec.scope_required and not decision_valid:
         raise PermissionError("scope-bound AuthorizationDecision required")
     if spec.scope_required:
@@ -310,26 +328,24 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     if mission_authorization is not None:
         from security.mission_authorization import MissionAuthorizationSnapshot
         snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
+        if str(snapshot.authorization_hash) != str(getattr(execution_proof, "snapshot_hash", "")):
+            raise PermissionError(f"{RejectionCode.SNAPSHOT_MISMATCH.value}: live mission snapshot differs from proof-bound snapshot")
         allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
         if not allowed:
             raise PermissionError("mission authorization blocked: " + reason)
+    elif mission_bound:
+        raise PermissionError(f"{RejectionCode.SNAPSHOT_MISSING.value}: mission-bound execution requires the Owner authorization snapshot")
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)
+    from security.execution_proof import consume_execution_proof_once
+    consume_execution_proof_once(execution_proof)
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
-        workspace_authorization = mission_authorization
-        if workspace is None:
-            from datetime import datetime, timedelta, timezone
-            from security.mission_authorization import MissionAuthorizationSnapshot
-            root = Path(os.getenv("CYBERSENTINEL_TEST_ROOT", Path.cwd())).expanduser().resolve()
-            legacy_owner = getattr(authorization_decision, "owner_evidence_fingerprint", "legacy-compatibility")
-            compatibility_snapshot = MissionAuthorizationSnapshot.create(owner_identity=legacy_owner, mission_id=str(request_id or "legacy-request"), target_identity="legacy-workspace", scope=("workspace",), allowed_actions=(name,), forbidden_actions=(), allowed_tools=(name,), time_window={"timezone": "UTC"}, max_duration=60, rate_limits={name: 1}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("legacy-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(root)}, policy_version="compatibility", owner_approval=legacy_owner, created_at=datetime.now(timezone.utc).isoformat(), expires_at=(datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat())
-            from workspace import Workspace
-            workspace = Workspace(root, authorization_snapshot=compatibility_snapshot)
-            workspace_authorization = compatibility_snapshot
-        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
+        if workspace is None or mission_authorization is None or not mission_id:
+            raise PermissionError("run_project_tests requires a mission-bound Workspace and Owner authorization snapshot")
+        workspace.bind(mission_id=str(mission_id), request_id=str(request_id or ""), tool_id=name, action_id=str(tool_call_id or ""), authorization_snapshot=mission_authorization, evidence_store=evidence_store)
         future = executor.submit(spec.handler, argument, workspace=workspace)
     else:
         future = executor.submit(spec.handler, argument)

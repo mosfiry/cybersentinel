@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 
 from dataclasses import replace
 from pathlib import Path
@@ -104,12 +104,13 @@ def test_mission_owner_provenance_is_persisted(tmp_path):
 
 def test_owner_instruction_creates_mission_with_exact_objective(monkeypatch, tmp_path):
     import security.owner_policy as policy
-    monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
     request_id = "owner-mission"
-    auth = evidence(policy, request_id, "proof")
-    set_current_owner_instruction("Owner instruction: build the defensive prototype", auth_evidence=auth, request_id=request_id)
-    snapshot = capture_policy_snapshot(request_id, auth)
-    context = AuthorizationContext(request_id, auth, snapshot)
+    monkeypatch.setattr(policy, "STATE_PATH", Path(tmp_path) / "state.json")
+    owner_kwargs = signed_test_owner_kwargs(monkeypatch, tmp_path, request_id=request_id)
+    context = AuthorizationContext.from_dict(owner_kwargs["authorization_context"])
+    set_current_owner_instruction("Owner instruction: build the defensive prototype", auth_evidence=context.owner_evidence, request_id=request_id)
+    snapshot = capture_policy_snapshot(request_id, context.owner_evidence)
+    context = AuthorizationContext(request_id, context.owner_evidence, snapshot)
     rt = MissionRuntime(MissionStore(Path(tmp_path) / "m.sqlite"), executor=lambda m, s, a: {"success": True}, authorization_snapshot_factory=make_test_snapshot)
     instruction = "Build the defensive prototype inside the authorized scope."
     mission = rt.create_from_owner_instruction(instruction, Plan.initial(instruction), authorization_context=context)

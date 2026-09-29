@@ -14,7 +14,7 @@ import pytest
 
 from agent.evidence import EvidenceChainStore
 from agent.mission_worker import MissionQueue, WorkerMissionState
-from agent.mission import MissionStatus, MissionStore
+from agent.mission import Mission, MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.planning import Plan, PlanStep
 from agent.self_repair import BoundedSelfRepair
@@ -22,6 +22,7 @@ from agent.filesystem_verification import FilesystemVerifier
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.mission_authorization import MissionAuthorizationSnapshot
+from security.execution_boundary import MissionExecutionBoundary
 from tools.registry import execute
 from workspace import Workspace, WorkspaceBoundaryError, WorkspacePolicyError
 
@@ -61,7 +62,11 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
     context = AuthorizationContext(request_id="req-1", owner_evidence=evidence, policy_snapshot=owner_policy.capture_policy_snapshot("req-1", evidence))
     decision = authorize_tool(["run_project_tests", "."], context=context)
     assert decision.allowed and decision.decision is not None
-    result = execute("run_project_tests", ".", authorization_decision=decision.decision, request_id="req-1", mission_authorization=snapshot, workspace=workspace, evidence_store=store, mission_id="m1")
+    plan = Plan.initial("run tests").replan(steps=(PlanStep("tests", "run project tests", action="run_project_tests"),), reason="test")
+    mission = Mission.create("run tests", "run tests", plan, mission_id="m1", request_id="req-1", owner_identity_ref="owner-proof", authorization_context=context.to_dict(), authorization_snapshot=snapshot.to_dict())
+    mission.transition(MissionStatus.READY, "test execution is ready")
+    proof = MissionExecutionBoundary.derive(mission, tool="run_project_tests", argument=".", decision=decision.decision, tool_call_id="call-tests-1")
+    result = execute("run_project_tests", ".", authorization_decision=decision.decision, request_id="req-1", tool_call_id="call-tests-1", execution_proof=proof, execution_class="MISSION_BOUND", mission_authorization=snapshot, workspace=workspace, evidence_store=store, mission_id="m1")
     assert result["ok"] is True
     assert result["returncode"] == 0
     records = store.list(request_id="req-1")
@@ -70,6 +75,7 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
     assert provenance["mission_id"] == "m1"
     assert provenance["request_id"] == "req-1"
     assert provenance["tool_id"] == "run_project_tests"
+    assert provenance["action_id"] == "call-tests-1"
     assert provenance["authorization_snapshot_hash"] == snapshot.authorization_hash
 
 
@@ -268,16 +274,16 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
         server.server_close()
 
 
-def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):
+def test_restart_e2e_does_not_promote_generic_tool_success_to_goal_completion(tmp_path):
     mission_db = tmp_path / "missions.sqlite3"
     queue_db = tmp_path / "queue.sqlite3"
     evidence_db = tmp_path / "evidence.sqlite3"
     plan = Plan.initial("restart objective").replan(steps=(PlanStep("s1", "write", action="write"),), reason="test")
     evidence_store = EvidenceChainStore(evidence_db)
 
-    def execute(mission, _step, _action):
+    def execute(mission, _step, action_id):
         snapshot = MissionAuthorizationSnapshot.from_dict(mission.authorization_snapshot)
-        workspace = Workspace(tmp_path, authorization_snapshot=snapshot).bind(mission_id=mission.mission_id, request_id=mission.request_id, tool_id="write", authorization_snapshot=snapshot, evidence_store=evidence_store)
+        workspace = Workspace(tmp_path, authorization_snapshot=snapshot).bind(mission_id=mission.mission_id, request_id=mission.request_id, tool_id="write", action_id=action_id, authorization_snapshot=snapshot, evidence_store=evidence_store)
         workspace.write("artifact.txt", "persisted")
         return {"success": True, "criterion_id": "write", "source": "workspace"}
 
@@ -288,17 +294,17 @@ def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):
     worker_item = queue.claim_next(worker_id="worker-a", lease_seconds=60)
     assert worker_item is not None
     result = first.run_to_completion(mission.mission_id, max_slices=3, heartbeat=lambda: queue.heartbeat(mission.mission_id, worker_id="worker-a"))
-    assert result.status is MissionStatus.GOAL_COMPLETED
-    queue.update(mission.mission_id, WorkerMissionState.COMPLETED, worker_id="worker-a")
+    assert result.status is MissionStatus.RUNNING
+    assert result.completion_proof is None
     assert (tmp_path / "artifact.txt").read_text() == "persisted"
     assert evidence_store.verify() and evidence_store.list(request_id="restart-request")
 
     restarted_store = MissionStore(mission_db)
     restarted_queue = MissionQueue(queue_db)
     restarted_evidence = EvidenceChainStore(evidence_db)
-    assert restarted_store.load(mission.mission_id).status is MissionStatus.GOAL_COMPLETED
+    assert restarted_store.load(mission.mission_id).status is MissionStatus.RUNNING
     assert restarted_evidence.verify()
-    assert restarted_queue.get(mission.mission_id).state is WorkerMissionState.COMPLETED
+    assert restarted_queue.get(mission.mission_id).state is not WorkerMissionState.COMPLETED
 
 
 def test_expiry_after_restart_blocks_before_workspace(tmp_path):

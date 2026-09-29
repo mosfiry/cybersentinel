@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 """Round 2 P0-5 - crash / restart / resume on the canonical MissionRuntime.
 
 The mission state is durable SQLite. A simulated process crash (unhandled
@@ -27,15 +27,21 @@ def _runtime(db):
     return MissionRuntime(MissionStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime):
-    plan = Plan.initial("audit the asset").replan(
-        steps=(PlanStep("observe", "observe", action="status"),), reason="test"
-    )
+def _mission(runtime, tmp_path, monkeypatch, *, authorized=True, include_sensitive=False):
+    steps = [PlanStep("observe", "observe", action="status")]
+    if include_sensitive:
+        steps.extend((
+            PlanStep("red-team", "red-team", action="red_team_assess"),
+            PlanStep("probe", "probe", action="scoped_http_probe"),
+        ))
+    plan = Plan.initial("audit the asset").replan(steps=tuple(steps), reason="test")
+    kwargs = signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="crash-restart-test") if authorized else {}
     return runtime.create(
         "audit the asset",
         "audit the asset",
         plan,
-        completion_criteria=[{"criterion_id": "goal"}],
+        completion_criteria=[{"criterion_id": "goal", "check": "system_online"}],
+        **kwargs,
     )
 
 
@@ -62,7 +68,7 @@ def test_state_survives_process_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.registry, "execute", fixture)
 
     runtime = _runtime(_db(tmp_path))
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch)
 
     class CrashingModel:
         """Performs two tool turns, then the process dies mid-loop."""
@@ -104,7 +110,7 @@ def test_resume_after_restart_completes_from_persisted_state(tmp_path, monkeypat
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal", "source": "fixture"})
     db = _db(tmp_path)
     runtime = _runtime(db)
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch)
 
     class CrashAfterTwoTurns:
         def __init__(self):
@@ -140,7 +146,7 @@ def test_restart_never_continues_in_flight_without_reconciliation(tmp_path, monk
 
     db = _db(tmp_path)
     runtime = _runtime(db)
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch)
 
     def boom(*a, **k):
         raise RuntimeError("crash during side effect")
@@ -177,7 +183,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
 
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal"})
     runtime = _runtime(_db(tmp_path))
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch, authorized=False, include_sensitive=True)
     assert mission.authorization_context is None, "fixture mission intentionally carries no Owner authorization"
 
     class PrivilegeEscalationModel:

@@ -1,24 +1,24 @@
 # CyberSentinel X Agent Architecture
 
-CyberSentinel X is a local defensive agent. The active request path is:
+CyberSentinel X is a local defensive agent. The browser and internal-client paths converge on the same server-side Owner session and authorization code:
 
 ```text
-Bridge authentication
-  -> Owner authentication
-  -> current Owner policy
-  -> AgentRuntime planner
-  -> ModelRouter / provider fallback
-  -> JSON extraction and schema validation
-  -> deterministic tool authorization
-  -> bounded tool execution
-  -> evidence and audit response
+Browser: public CSRF session + username/password login
+  -> HttpOnly Owner-session cookie
+  -> POST /api/public/chat (CSRF + Owner session validation)
+Internal client: X-CyberSentinel-Token + X-CyberSentinel-Owner-Session
+  -> POST /api/chat
+Both paths
+  -> api.chat.chat -> AgentCore -> MissionRuntime
+  -> ModelRouter proposal -> deterministic authorization
+  -> bounded tool execution -> evidence and audit response
 ```
 
-The bridge accepts `X-CyberSentinel-Token` only for the local HTTP channel. Owner authority requires `X-CyberSentinel-Owner-Token`, which is checked against `OWNER_TOKEN`. There is no fallback between the two credentials.
+`BRIDGE_TOKEN` authenticates only the internal/local HTTP transport. Owner authority comes from a valid server-side session issued by `security/owner_password.py`; internal clients pass its ID using `X-CyberSentinel-Owner-Session`, while the browser receives that ID only inside an HttpOnly cookie. A public CSRF session is not Owner authority, and browser access remains disabled unless `PUBLIC_WEB_ENABLED=true`.
 
-`AgentRuntime.plan()` is the only planner entry point. It supplies the authenticated Owner policy context to an optional OpenAI-compatible model. A model can propose a plan, but it cannot execute tools or authorize itself. `tools/registry.py` is the single source of tool metadata, handlers, risk classes, and argument schemas; `security/authorization.py` applies the registry policy, maximum argument length, and maximum plan size before execution.
+Browser `/api/public/chat`, internal `/api/chat`, the legacy-named `/api/command` handler, and mission-backed `/api/tasks` all reach the same `api.chat.chat -> AgentCore -> MissionRuntime` execution path. `/api/tasks` keeps a compatibility `Task` envelope but stores and controls the canonical mission; it is not a second execution runtime. `core.engine.handle()` and `agent/runtime.py` remain historical/direct compatibility APIs with no current bridge route caller. A model can propose a plan, but it cannot execute tools or authorize itself. `tools/registry.py` is the single source of tool metadata, handlers, risk classes, and argument schemas; `security/authorization.py` applies the registry policy, maximum argument length, and maximum plan size before execution.
 
-Each accepted request receives an `ExecutionContext` containing the request ID, authenticated Owner identity, policy fingerprint, and provider/model provenance. Planner responses use a closed schema and accepted plans are canonicalized and hashed before execution. The same hash is checked immediately before each handler call. Every tool receives an explicit authorization decision record containing its risk class, Owner requirement, policy version, and decision reason.
+All bridge chat paths pass the authenticated Owner session into the canonical mission facade, where typed authorization snapshots, mission/run/tool-call identity, and one-use execution proofs are validated before dispatch. Planner responses remain untrusted proposals; the model cannot authorize itself or create Owner identity.
 
 Audit event IDs link authentication, policy, plan, authorization, execution, and response. Evidence objects carry the same request ID and a tamper-evident chain of `sequence`, `previous_hash`, and `current_hash`; `verify_chain()` detects later modification.
 
@@ -87,7 +87,8 @@ OWNER_INSTRUCTION (800)
 Semantics that remove a historical ambiguity:
 
 - `SYSTEM_PLATFORM` names the **internal CyberSentinel platform layer** — the
-  process boundary, credential separation (bridge token vs Owner token),
+  process boundary, credential separation (bridge transport token vs
+  username/password-backed Owner session),
   lifecycle persistence, audit-chain integrity, and deterministic enforcement.
   It is an application-internal tier, **not** the external hosting or runtime
   constraints of the machine/network the service happens to run on.
@@ -103,37 +104,35 @@ Semantics that remove a historical ambiguity:
   (for example `INTERNAL_PLATFORM_LAYER`) may be introduced only if this
   documented order is preserved exactly.
 
-## Runtime inventory — canonical vs compatibility status (2026-09-22 audit)
+## Runtime inventory — canonical vs compatibility status (2026-09-29 review)
 
 The audit established the live call graph (bridge → api → agent → tools) by
 reading every entrypoint. Status:
 
 | Module | Role | Live reachability |
 | --- | --- | --- |
-| `agent/mission_runtime.py` (`MissionRuntime`) | Canonical persistent mission engine | `AgentCore.run_owner_mission` / `resume_mission` — mission mode of `/api/chat` |
-| `agent/agent_core.py` (`AgentCore`) | Facade/orchestration boundary over `MissionRuntime` | `api/chat.py` mission mode |
-| `agent/task_runtime.py` (`AgentTaskRuntime`) | Live compatibility task engine | `api/chat.py` **default** mode (`create_task` / `run_to_completion`); each step routes through `core.engine.handle()` |
-| `agent/runtime.py` (`AgentRuntime`) | Planner for the command engine | `core/engine.py` `handle()` (`/api/command`), also the planner under the task path |
+| `agent/mission_runtime.py` (`MissionRuntime`) | Canonical persistent mission engine | Owner chat through `api.chat.chat` and `AgentCore.run_owner_mission` / `resume_mission` |
+| `agent/agent_core.py` (`AgentCore`) | Facade/orchestration boundary over `MissionRuntime` | Every `/api/chat` request, including browser `/api/public/chat` |
+| `agent/mission_task_adapter.py` (`MissionTaskAdapter`) | Compatibility Task envelope over canonical missions | `/api/tasks`; creation persists via AgentCore before supervised queueing, reads hydrate from MissionStore, and resume/pause/cancel/ownership delegate to AgentCore/MissionService |
+| `agent/task_runtime.py` (`AgentTaskRuntime`) | Legacy task runtime retained for compatibility/tests | No current bridge/API production caller |
+| `agent/runtime.py` (`AgentRuntime`) | Legacy planner for direct command-engine callers | No current bridge `/api/command` caller |
 | `agent/loop.py` (`AgentLoop`) | Legacy conversational loop | Not reachable from bridge/api except `tool_definitions()` imported by `bridge.py` for `/api/tools`; still imported by legacy tests |
-| `agent/conversation.py` (`ConversationParser`) | Deterministic intent baseline (not dead) | `core/engine.py` `_handle_once()` |
+| `agent/conversation.py` (`ConversationParser`) | Deterministic intent baseline for legacy direct callers | `core/engine.py` `_handle_once()` |
 | `agent/conversation_provider.py` | Model adapter for the conversation schema | Tests only (not imported by bridge/api/engine) |
 | `agent/model_intelligence/conversation.py` | Live NLU (`NaturalLanguageUnderstanding` → `MissionIntent`) | `AgentCore.understand_mission_intent` / `run_owner_mission` |
 
-Honest gaps against the "one canonical runtime" goal:
+Honest remaining gaps against the full workspace architecture goal:
 
-1. `/api/chat` in **default** (non-mission) mode executes through
-   `AgentTaskRuntime` + `core.engine.handle()`, **not** `MissionRuntime`. The
-   directive target (chat → AgentCore → MissionRuntime only) is therefore
-   **not yet satisfied**; mission mode is opt-in via `{"mission": true}` or
-   `mode: "mission"`.
-2. `agent/loop.py` still contains an independent conversational loop
-   (`AgentLoop.run`). It holds no independent security authority —
-   `authorize_tool(item)` there is a structural preflight and real
-   authentication happens inside `core.engine.handle()` via typed
-   `OwnerAuthenticationEvidence` — but it remains a second loop that legacy
-   tests depend on. Removing it requires migrating those tests, moving
-   `tool_definitions()` into `tools/registry.py`, and updating the
-   `bridge.py` import.
+1. `/api/tasks` remains a compatibility API envelope, though its mission-backed
+   execution and lifecycle now use the canonical MissionRuntime. `agent/loop.py`
+   still contains a legacy conversational loop and exports tool
+   metadata used by `/api/tools`; removing it requires a separate compatibility
+   migration.
+2. The generic mission plan now validates DAG dependencies and blocks native or
+   deterministic execution of a step until its prerequisites are complete. It
+   does not yet spawn independent specialist agents; the existing
+   `core.expert_modes` functions are deterministic analysis templates, not
+   independent provider-backed experts.
 3. No `owner_authenticated=True` trust path exists anymore:
    `security/authorization.py` explicitly rejects a bare boolean
    ("typed Owner authentication evidence required") and forbids mixing legacy
@@ -190,3 +189,37 @@ and a private IP at connection. Full mitigation requires **IP pinning**
 this is not implemented. Until then, treat the SSRF check as a strong filter
 with a known rebinding residual risk, and constrain network egress at the
 platform layer.
+
+
+## Product Workspace, authorization proofs, and durable recovery (2026-09-29)
+
+The public browser workspace is a view/controller over server-owned mission state; browser state is not mission truth. Its flow is:
+
+```text
+Public CSRF session + authenticated Owner cookie
+  -> owner-scoped mission list/status/timeline/evidence/artifact/log APIs
+  -> exact mission-bound workspace snapshot
+  -> Owner-authorized mission start/pause/resume/cancel
+  -> durable queue lease + one bounded runtime slice
+  -> signed action/criterion evidence
+  -> deterministic goal verification + signed completion proof
+  -> persisted result displayed after reload
+```
+
+Mutating public calls remain same-origin, Owner-session authenticated, and CSRF checked. New browser missions bind to the server's fixed repository workspace; the request cannot select an arbitrary file root. Mission ownership is the stable authenticated account identity rather than a bearer session ID. Conversations are account-scoped; a different account cannot adopt an existing conversation by guessing its ID. Raw Owner-session identifiers are excluded from the public serializers.
+
+The workspace presents backend mission status, current action/checkpoint, queue state, timeline, evidence, artifacts, logs, file contents, repository identity, and read-only Git status/log/diff. Mission state and evidence are reloaded from the service rather than inferred from JavaScript defaults. The Findings tab is deliberately derived only from existing signed system criterion-evidence records, with criterion/action/verification links; there is no separate persisted finding object, and the UI says so explicitly. Empty evidence is displayed as no signed evidence—not as a passing finding. Conversation IDs exist only in page memory; the page does not persist session/mission authority in browser storage.
+
+File reads are mission-root-relative, bounded, UTF-8 checked, and reject absolute paths, traversal, symlink escapes, secret/database patterns, and missing/out-of-scope missions. Git access is read-only; credential-bearing remote userinfo and sensitive diff paths are omitted. Neither browser workspace nor Git view offers a write or deploy control.
+
+### Owner authority and one-use execution proofs
+
+The current registered tool surface is intersected with the explicit captured Owner tool budget. Model proposals cannot widen that budget. Production tool execution is routed through an Owner-direct or mission execution boundary carrying a typed Owner authorization decision, canonical request/mission/tool/argument/action binding, and a one-use signed proof. The final registry validates and consumes that proof before invoking a handler; missing, forged, modified, replayed, wrong-call, wrong-mission, and out-of-budget requests fail closed. The legacy command/task paths remain compatibility paths but still go through the same final governed registry boundary.
+
+System completion requires nonempty required criteria, unambiguous verification, independently checked criterion evidence, and a system-signed completion proof bound to the mission state. A model statement, tool-returned `success`, Owner-supplied recovery narrative, boolean `verified`, or frontend fallback is not sufficient. The supported automatic checks are intentionally narrow (such as an independent current core-status read and an exact successful locally recorded project-test event); other criteria remain unverified until an independent verifier exists.
+
+### Queue and restart behavior
+
+The bridge starts one worker and the persistent scheduler from `bridge.main`. A queue lease is not the mission result: the worker executes bounded slices, releases nonterminal work, recovers expired leases while the process is running, and requeues interrupted leases after restart. A stale worker cannot overwrite a lease it no longer owns. An ambiguous `in_flight` checkpoint is never retried silently; it is shown for explicit Owner reconciliation, with the retry consequence disclosed. Owner reauthentication renews the existing account-bound snapshot and does not bypass mission scope or proof verification. Pause, cancellation, authorization failure, and queue status remain distinct from goal completion.
+
+Owner, mission, queue/scheduler, and evidence data use private local storage files; Owner and system-evidence keys are persistent, local, and separate from model credentials. Back up the matching databases and signing keys together. The bridge binds to loopback only; no production reverse proxy or external hosting target is configured by this repository.

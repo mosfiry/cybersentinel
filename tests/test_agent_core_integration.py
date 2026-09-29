@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import api.chat as chat_mod
+import core.db as core_db
 import security.owner_policy as owner_policy
 from owner_session_testutils import allow_owner_sessions
 from agent.agent_core import AgentCore
@@ -36,6 +37,7 @@ class MissionProvider:
 @pytest.fixture
 def mission_env(tmp_path, monkeypatch):
     allow_owner_sessions(monkeypatch, "valid-owner")
+    monkeypatch.setattr(core_db, "DB_PATH", Path(tmp_path) / "conversations.sqlite3")
     return tmp_path
 
 
@@ -66,7 +68,7 @@ def test_agent_015_restart_resumes_persisted_mission(mission_env):
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "c1")])])
     store = MissionStore(Path(mission_env) / "missions.sqlite3")
     core = AgentCore(ModelRouter([provider]), store=store)
-    mission = core.run_owner_mission("Check and verify status", owner_session_token="valid-owner")
+    mission = core.run_owner_mission("Check system status and verify", owner_session_token="valid-owner")
     restarted = MissionStore(Path(mission_env) / "missions.sqlite3").load(mission.mission_id)
     assert restarted is not None
     assert restarted.status is MissionStatus.GOAL_COMPLETED
@@ -77,10 +79,10 @@ def test_agent_041_api_chat_mission_mode_uses_agent_core(mission_env, monkeypatc
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "c1")])])
     core = AgentCore(ModelRouter([provider]), store=MissionStore(Path(mission_env) / "missions.sqlite3"))
     monkeypatch.setattr(chat_mod, "_agent_core", lambda: core)
-    result = chat_mod.chat({"text": "ابحث وحلل النتيجة", "conversation_id": "mission-chat", "mode": "mission"}, owner_session_token="valid-owner")
+    result = chat_mod.chat({"text": "تحقق من حالة النظام", "conversation_id": "mission-chat", "mode": "mission"}, owner_session_token="valid-owner")
     assert result["mission_id"]
     assert result["status"] == MissionStatus.GOAL_COMPLETED.value
-    assert result["mission"]["owner_instruction"] == "ابحث وحلل النتيجة"
+    assert result["mission"]["owner_instruction"] == "تحقق من حالة النظام"
 
 
 def test_agent_028_model_tool_proposal_cannot_authorize(mission_env):

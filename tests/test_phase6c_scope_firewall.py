@@ -13,6 +13,7 @@ from security.scope import ProgramAuthorization, TargetIdentity, make_snapshot
 from security.scope_resolver import resolve
 from security.scope_store import init_scope_store, save_snapshot
 from tools.registry import execute
+from security.execution_boundary import OwnerDirectBoundary
 import security.scope_store as scope_store
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
@@ -59,15 +60,15 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
 
 
 def test_direct_registry_execution_cannot_bypass_scope(snapshot):
-    with pytest.raises(PermissionError, match="scope-bound AuthorizationDecision"):
+    with pytest.raises(PermissionError, match="unique tool-call identity"):
         execute("scoped_http_probe", "https://target.example.com/api")
     evidence = _issue_evidence("username_password", "scope-direct", "scope-direct")
     auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
     denied = authorize_tool(["scoped_http_probe", "https://other.example.com/api"], context=auth_context)
     with pytest.raises(PermissionError, match="scope denied"):
-        execute("scoped_http_probe", "https://other.example.com/api", authorization_decision=denied.decision, scope_context=context("https://other.example.com/api"), request_id="scope-direct")
+        OwnerDirectBoundary.execute(tool="scoped_http_probe", argument="https://other.example.com/api", decision=denied.decision, request_id="scope-direct", tool_call_id="scope-call-denied", scope_context=context("https://other.example.com/api"))
     allowed = authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context)
-    result = execute("scoped_http_probe", "https://target.example.com/api", authorization_decision=allowed.decision, scope_context=context(), request_id="scope-direct")
+    result = OwnerDirectBoundary.execute(tool="scoped_http_probe", argument="https://target.example.com/api", decision=allowed.decision, request_id="scope-direct", tool_call_id="scope-call-allowed", scope_context=context())
     assert result["ok"] is True
 
 

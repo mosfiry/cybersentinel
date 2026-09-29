@@ -50,7 +50,9 @@ def test_successful_observation_that_changes_hypothesis_replans(tmp_path):
     mission.hypotheses = [HypothesisState("H1", "CVE caused initial access", HypothesisStatus.ACTIVE, 0.8).to_dict()]
     rt.store.save(mission)
     result = rt.run_to_completion(mission.mission_id)
-    assert result.status is MissionStatus.GOAL_COMPLETED
+    assert result.status is not MissionStatus.GOAL_COMPLETED
+    assert not result.completion_proof
+    assert "goal" in result.verification_state.get("missing_criteria", [])
     assert result.hypotheses[0]["status"] == "WEAKENED"
     assert result.plan.version == 3
     assert len(result.replan_history) == 1
@@ -199,13 +201,14 @@ def test_twenty_one_turn_trajectory_retains_observations_and_events(tmp_path):
     steps = tuple(PlanStep(f"turn-{index}", f"turn {index}", action="status") for index in range(turn_count))
 
     def execute(mission, step, action_id):
-        return {"success": True, "source": "retention-fixture", "criterion_id": step.step_id, "turn": mission.current_step}
+        return {"success": True, "source": "status", "criterion_id": step.step_id, "turn": mission.current_step}
 
     rt = make_runtime(tmp_path, execute)
     mission = rt.create(
         "retain trajectory",
         "retain trajectory",
         Plan.initial("retain trajectory").replan(steps=steps, reason="retention test"),
+        completion_criteria=[{"criterion_id": "service-online", "check": "system_online"}],
         max_iterations=turn_count + 5,
     )
     result = rt.run_to_completion(mission.mission_id, max_slices=turn_count + 5)

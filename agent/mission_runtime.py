@@ -62,6 +62,54 @@ class MissionRuntime:
             return False, f"authorization snapshot invalid: {type(exc).__name__}"
 
     @staticmethod
+    def _proposal_snapshot_gate(mission: Mission, tool_name: str) -> tuple[bool, str, str]:
+        from security.execution_proof import RejectionCode
+        from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
+        if not mission.authorization_snapshot:
+            return False, RejectionCode.SNAPSHOT_MISSING.value, "mission authorization snapshot missing"
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+        except (MissionAuthorizationError, KeyError, TypeError, ValueError, PermissionError):
+            return False, RejectionCode.SNAPSHOT_INVALID.value, "mission authorization snapshot invalid"
+        if not snapshot.is_active():
+            return False, RejectionCode.SNAPSHOT_EXPIRED.value, "mission authorization snapshot expired or not active"
+        if tool_name in snapshot.forbidden_actions:
+            return False, RejectionCode.FORBIDDEN_ACTION.value, "tool is forbidden by mission authorization snapshot"
+        if tool_name not in snapshot.allowed_tools or tool_name not in snapshot.allowed_actions:
+            return False, RejectionCode.TOOL_NOT_ALLOWED.value, "tool is outside mission authorization snapshot allowlist"
+        return True, "", "authorized"
+
+    @staticmethod
+    def _derive_execution_proof(mission: Mission, proposal: Any, argument: Any, decision: Any) -> Any:
+        from security.execution_boundary import MissionExecutionBoundary
+        return MissionExecutionBoundary.derive(
+            mission,
+            tool=proposal.name,
+            argument=argument,
+            decision=decision.decision if decision is not None and decision.allowed else None,
+            tool_call_id=proposal.tool_call_id,
+        )
+
+    def _registry_context(self, mission: Mission, tool_name: str) -> dict[str, Any]:
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        scope = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+        result: dict[str, Any] = {
+            "mission_id": mission.mission_id,
+            "mission_authorization": snapshot,
+            "target_identity": str(scope.get("target_id") or snapshot.target_identity),
+        }
+        if tool_name == "run_project_tests":
+            from agent.evidence import EvidenceChainStore
+            from workspace import Workspace
+            root = str(snapshot.workspace_boundary.get("root", ""))
+            if not root:
+                raise PermissionError("mission workspace boundary required")
+            result["workspace"] = Workspace(root)
+            result["evidence_store"] = EvidenceChainStore(Path(self.store.db_path).with_name("evidence_chain.db"))
+        return result
+
+    @staticmethod
     def _default_authorizer(mission: Mission, step: PlanStep) -> tuple[bool, str]:
         if step.authorization_requirement and not mission.authorization_context:
             return False, "owner authorization required"
@@ -84,8 +132,73 @@ class MissionRuntime:
     @staticmethod
     def _default_verifier(mission: Mission) -> GoalVerification:
         criteria = tuple(VerificationCriterion(item["criterion_id"], item.get("description", item["criterion_id"]), item.get("check", "runtime"), item.get("required", True)) for item in mission.completion_criteria)
-        evidence = tuple(evidence_for(item["criterion_id"], item.get("passed", False), item.get("source", "mission"), item.get("result", {}), provenance={"mission_id": mission.mission_id}) for item in mission.evidence)
+        evidence = tuple(evidence_for(item["criterion_id"], True, item.get("source", "system"), item.get("result", {}), provenance=item.get("provenance", {})) for item in mission._verified_system_evidence())
         return GoalVerification.evaluate(mission.objective, criteria, evidence)
+
+    @staticmethod
+    def _completed_plan_steps(mission: Mission) -> set[str]:
+        fingerprint = mission.plan.fingerprint
+        return {
+            str(item.get("step_id", ""))
+            for item in mission.action_history
+            if item.get("status") == "completed"
+            and item.get("plan_fingerprint") == fingerprint
+            and item.get("step_id")
+        }
+
+    @classmethod
+    def _ready_plan_steps(cls, mission: Mission) -> list[tuple[int, PlanStep]]:
+        completed = cls._completed_plan_steps(mission)
+        return [
+            (index, step)
+            for index, step in enumerate(mission.plan.steps)
+            if step.step_id not in completed and set(step.prerequisites).issubset(completed)
+        ]
+
+    @staticmethod
+    def _is_repeatable_observation(tool_name: str) -> bool:
+        from tools.registry import get_tool
+        spec = get_tool(tool_name)
+        return bool(spec and spec.risk_class in {"read", "analysis"})
+
+    @classmethod
+    def _bind_proposal_to_ready_step(cls, mission: Mission, proposal: Any) -> tuple[Any, PlanStep | None, str]:
+        if proposal.plan_version != mission.plan.version:
+            return proposal, None, "tool call belongs to a stale plan version"
+        completed = cls._completed_plan_steps(mission)
+        by_id = {step.step_id: step for step in mission.plan.steps}
+        if proposal.step_id:
+            step = by_id.get(proposal.step_id)
+            if step is None:
+                return proposal, None, "tool call references an unknown plan step"
+            if step.action != proposal.name:
+                return proposal, None, "tool name does not match the referenced plan step"
+            if proposal.step_id in completed:
+                if cls._is_repeatable_observation(proposal.name):
+                    from dataclasses import replace
+                    return replace(proposal, step_id=""), step, ""
+                return proposal, None, "plan step is already completed"
+            missing = sorted(set(step.prerequisites) - completed)
+            if missing:
+                return proposal, None, f"plan step prerequisite not completed: {', '.join(missing)}"
+            return proposal, step, ""
+
+        matching = [step for step in mission.plan.steps if step.action == proposal.name]
+        if not matching:
+            # Mission-authorized auxiliary observations need not be plan steps,
+            # but they can never satisfy a plan prerequisite.
+            return proposal, None, ""
+        ready = [step for _, step in cls._ready_plan_steps(mission) if step.action == proposal.name]
+        if len(ready) == 1:
+            from dataclasses import replace
+            bound = replace(proposal, step_id=ready[0].step_id)
+            return bound, ready[0], ""
+        if not ready:
+            unfinished = [step for step in matching if step.step_id not in completed]
+            if not unfinished and cls._is_repeatable_observation(proposal.name):
+                return proposal, None, ""
+            return proposal, None, "no matching plan step is ready; prerequisite or completion gate blocked the tool call"
+        return proposal, None, "tool call ambiguously matches multiple ready plan steps"
 
     def create(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> Mission:
         snapshot_factory = kwargs.pop("authorization_snapshot_factory", None) or self.authorization_snapshot_factory
@@ -112,7 +225,7 @@ class MissionRuntime:
             objective,
             plan,
             request_id=authorization_context.request_id,
-            owner_identity_ref=owner_identity_ref or authorization_context.owner_evidence_fingerprint,
+            owner_identity_ref=owner_identity_ref or str(getattr(authorization_context.owner_evidence, "owner_id", "") or authorization_context.owner_evidence_fingerprint),
             owner_instruction=objective,
             authorization_context=authorization_context.to_dict(),
             scope_snapshot=scope_snapshot,
@@ -140,6 +253,17 @@ class MissionRuntime:
             raise KeyError("unknown_mission")
         return mission
 
+    def _record_verified_criterion_evidence(self, mission: Mission, action_id: str) -> None:
+        for criterion in mission.completion_criteria:
+            criterion_id = str(criterion.get("criterion_id", ""))
+            if not criterion_id:
+                continue
+            record = self.store.issue_criterion_evidence(mission, criterion_id, action_id)
+            if record is None:
+                continue
+            mission.evidence.append(record)
+            mission.emit(EventType.EVIDENCE_ADDED, data={"criterion_id": criterion_id, "provenance": "system-signed"})
+
     def _interpret_observation(self, mission: Mission, step: PlanStep, observation: dict[str, Any], *, success: bool):
         previous = mission.observations[-2] if len(mission.observations) > 1 else None
         if not should_interpret_observation(observation, previous=previous):
@@ -158,15 +282,6 @@ class MissionRuntime:
         engine = HypothesisEngine(HypothesisState.from_dict(item) for item in mission.hypotheses)
         hypothesis_updates = engine.apply(proposal, goal_verified=False, deterministic_validation=False)
         mission.hypotheses = engine.snapshot()
-        if proposal.new_evidence:
-            for item in proposal.new_evidence:
-                normalized = dict(item)
-                normalized.setdefault("criterion_id", str(normalized.get("evidence_id") or proposal.observation_id))
-                normalized.setdefault("passed", True)
-                normalized.setdefault("source", "observation_interpreter")
-                normalized.setdefault("result", dict(item))
-                normalized.setdefault("provenance", {"mission_id": mission.mission_id, "observation_id": proposal.observation_id, "authority": None})
-                mission.evidence.append(normalized)
         mission.knowledge_context = list(mission.knowledge_context)
         mission.interpretations.append(proposal.to_dict())
         mission.emit(EventType.OBSERVATION_INTERPRETED, step_id=step.step_id, data=proposal.to_dict())
@@ -209,13 +324,17 @@ class MissionRuntime:
             if executed:
                 base_observation = dict(observation or {"success": True, "source": "external_reconciliation"})
                 base_observation.setdefault("success", True)
+                bindings = checkpoint.get("call_bindings", {}) if isinstance(checkpoint.get("call_bindings"), dict) else {}
                 for tool_call_id in ambiguous_ids:
-                    result = {**base_observation, "tool_call_id": tool_call_id, "type": "reconciled_observation"}
+                    binding = bindings.get(tool_call_id, {}) if isinstance(bindings.get(tool_call_id), dict) else {}
+                    action_id = str(binding.get("action_id") or tool_call_id)
+                    step_id = str(binding.get("step_id", ""))
+                    result = {**base_observation, "tool_call_id": tool_call_id, "action_id": action_id, "step_id": step_id, "type": "reconciled_observation"}
                     mission.record_observation(result)
-                    mission.record_action(tool_call_id, str(checkpoint.get("step_id", "")), "completed", result)
-                    mission.evidence.append({"criterion_id": result.get("criterion_id", str(checkpoint.get("step_id", ""))), "passed": bool(result.get("success")), "source": result.get("source", "external_reconciliation"), "result": result, "provenance": {"mission_id": mission.mission_id, "tool_call_id": tool_call_id, "reconciled": True}})
+                    mission.record_action(action_id, step_id, "completed", result, plan_fingerprint=str(checkpoint.get("plan_fingerprint", "")))
                 mission.checkpoint = {**checkpoint, "status": "completed", "reconciled": True}
-                mission.current_step += 1
+                ready = self._ready_plan_steps(mission)
+                mission.current_step = ready[0][0] if ready else len(mission.plan.steps)
                 mission.transition(MissionStatus.READY, "parallel in-flight actions reconciled as executed", tool_call_ids=ambiguous_ids)
             else:
                 mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
@@ -228,10 +347,10 @@ class MissionRuntime:
             result.setdefault("success", True)
             result.update({"action_id": action_id, "step_id": step_id, "type": "reconciled_observation"})
             mission.record_observation(result)
-            mission.record_action(action_id, step_id, "completed", result)
+            mission.record_action(action_id, step_id, "completed", result, plan_fingerprint=str(checkpoint.get("plan_fingerprint", "")))
             mission.checkpoint = {**checkpoint, "status": "completed", "reconciled": True}
-            mission.evidence.append({"criterion_id": result.get("criterion_id", step_id), "passed": bool(result.get("success")), "source": result.get("source", "external_reconciliation"), "result": result, "provenance": {"mission_id": mission.mission_id, "action_id": action_id, "reconciled": True}})
-            mission.current_step += 1
+            ready = self._ready_plan_steps(mission)
+            mission.current_step = ready[0][0] if ready else len(mission.plan.steps)
             mission.transition(MissionStatus.READY, "in-flight action reconciled as executed", action_id=action_id)
         else:
             mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
@@ -247,6 +366,12 @@ class MissionRuntime:
         mission = self._load(mission_id)
         if mission.is_terminal:
             return mission
+        try:
+            mission.plan.validate_dependency_graph()
+        except ValueError as exc:
+            mission.error = f"invalid plan dependency graph: {type(exc).__name__}"
+            mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+            return self.store.save(mission)
         if (mission.checkpoint or {}).get("status") in {"in_flight", "in_flight_parallel"}:
             mission.error = "in-flight native tool outcome is unknown; reconciliation required"
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
@@ -264,7 +389,6 @@ class MissionRuntime:
 
         for _ in range(max_turns):
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
-            current_step = mission.current_plan_step
             assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools)
             progress["last_context_hash"] = assembled.context_hash
             progress["context_compaction"] = {
@@ -319,7 +443,8 @@ class MissionRuntime:
                 verification = self.verifier(mission)
                 mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
                 if verification.verified:
-                    mission.transition(MissionStatus.GOAL_COMPLETED, "model final accepted with deterministic evidence")
+                    mission.verification_state = self.store.issue_completion_proof(mission)
+                    mission.transition(MissionStatus.GOAL_COMPLETED, "model final accepted with deterministic evidence", verification=mission.verification_state)
                     mission.emit(EventType.GOAL_VERIFIED, data=mission.verification_state)
                     mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state, "model_final": turn.content})
                 else:
@@ -327,7 +452,7 @@ class MissionRuntime:
                     mission.transition(MissionStatus.READY, mission.error)
                 return self.store.save(mission)
             if len(turn.tool_calls) > 1:
-                self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, current_step=current_step, progress=progress, seen=seen)
+                self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, progress=progress, seen=seen)
                 self.store.save(mission)
                 if mission.is_terminal:
                     return mission
@@ -342,28 +467,61 @@ class MissionRuntime:
                 else:
                     seen.add(proposal.tool_call_id)
                     progress["seen_call_ids"].append(proposal.tool_call_id)
+                    proposal, planned_step, binding_error = self._bind_proposal_to_ready_step(mission, proposal)
+                    if binding_error:
+                        mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PLAN_STEP_BLOCKED", "reason": binding_error})
+                        result = ToolCallResult(proposal, False, error=binding_error)
+                        progress["tool_results"].append(result.to_dict())
+                        continue
                     argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
+                    snapshot_ok, snapshot_code, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+                    if not snapshot_ok:
+                        mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": snapshot_code, "reason": snapshot_reason})
+                        result = ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}")
+                        progress["tool_results"].append(result.to_dict())
+                        continue
                     decision = authorize_tool([proposal.name, argument], context=auth_context)
                     mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
                     mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
                     if not decision.allowed:
                         result = ToolCallResult(proposal, False, error=decision.reason)
                     else:
+                        proof = None
                         try:
-                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
+                            proof = self._derive_execution_proof(mission, proposal, argument, decision)
+                            mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+                            from security.execution_boundary import MissionExecutionBoundary
+                            proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
+                            mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": proof_reason})
+                            if not proof_ok:
+                                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": proof_code, "reason": proof_reason})
+                                result = ToolCallResult(proposal, False, error=f"{proof_code}: {proof_reason}")
+                                progress["tool_results"].append(result.to_dict())
+                                continue
+                            registry_context = self._registry_context(mission, proposal.name)
+                        except Exception as exc:
+                            mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution authorization rejected: {type(exc).__name__}"})
+                            result = ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution authorization rejected: {type(exc).__name__}")
+                            progress["tool_results"].append(result.to_dict())
+                            continue
+                        try:
+                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
                             self.store.save(mission)
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
+                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, tool_call_id=proposal.tool_call_id, execution_proof=proof, execution_class="MISSION_BOUND", **registry_context)
                             observation = dict(raw or {})
-                            observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+                            observation.update({"type": "tool_observation", "source": proposal.name, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
                             mission.record_observation(observation)
-                            if current_step is not None:
-                                self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
-                            if bool(observation.get("success", observation.get("ok", True))):
-                                criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
-                                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
-                            mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
-                            mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
-                            result = ToolCallResult(proposal, True, result=observation)
+                            success = bool(observation.get("success", observation.get("ok", False)))
+                            if planned_step is not None:
+                                self._interpret_observation(mission, planned_step, observation, success=success)
+                            action_id = proposal.action_id or proposal.tool_call_id
+                            mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
+                            if success:
+                                self._record_verified_criterion_evidence(mission, action_id)
+                                ready_after = self._ready_plan_steps(mission)
+                                mission.current_step = ready_after[0][0] if ready_after else len(mission.plan.steps)
+                            mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": action_id, "step_id": proposal.step_id, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
+                            result = ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", "")))
                         except Exception as exc:
                             mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
                             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
@@ -374,70 +532,128 @@ class MissionRuntime:
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self.store.save(mission)
 
-    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str]) -> None:
-        """Authorize and execute independent proposals concurrently, then fold results deterministically."""
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, progress: dict[str, Any], seen: set[str]) -> None:
+        """Authorize, proof-bind, and execute independent proposals in parallel."""
         from security.authorization import authorize_tool
+        from security.execution_boundary import MissionExecutionBoundary
         from tools.registry import execute as execute_tool
+
         identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
-        authorized: list[tuple[Any, Any, Any]] = []
+        authorized: list[tuple[Any, Any, Any, Any, dict[str, Any]]] = []
         results: list[ToolCallResult] = []
+        claimed_step_ids: set[str] = set()
         for proposal in proposals:
             mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
-            if any(proposal.tool_call_id == error.split(":", 1)[0] for error in identity_errors) or proposal.tool_call_id in seen:
+            invalid_id = any(proposal.tool_call_id == error.split(":", 1)[0] for error in identity_errors)
+            if invalid_id or proposal.tool_call_id in seen:
                 results.append(ToolCallResult(proposal, False, error="invalid, stale, or duplicate tool call"))
                 continue
             seen.add(proposal.tool_call_id)
             progress["seen_call_ids"].append(proposal.tool_call_id)
+            proposal, planned_step, binding_error = self._bind_proposal_to_ready_step(mission, proposal)
+            if binding_error:
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PLAN_STEP_BLOCKED", "reason": binding_error})
+                results.append(ToolCallResult(proposal, False, error=binding_error))
+                continue
+            if planned_step is not None and planned_step.step_id in claimed_step_ids:
+                if self._is_repeatable_observation(proposal.name):
+                    from dataclasses import replace
+                    proposal = replace(proposal, step_id="")
+                else:
+                    results.append(ToolCallResult(proposal, False, error="plan step cannot be executed twice in one parallel batch"))
+                    continue
+            if planned_step is not None:
+                claimed_step_ids.add(planned_step.step_id)
             argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
+            snapshot_ok, snapshot_code, snapshot_reason = self._proposal_snapshot_gate(mission, proposal.name)
+            if not snapshot_ok:
+                mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": snapshot_reason})
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": snapshot_code, "reason": snapshot_reason})
+                results.append(ToolCallResult(proposal, False, error=f"{snapshot_code}: {snapshot_reason}"))
+                continue
             decision = authorize_tool([proposal.name, argument], context=auth_context)
             mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
-            if decision.allowed:
-                authorized.append((proposal, argument, decision))
-            else:
+            if not decision.allowed:
                 results.append(ToolCallResult(proposal, False, error=decision.reason))
-        mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
-        self.store.save(mission)
-        def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
-            proposal, argument, decision = item
+                continue
             try:
-                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id) or {})
+                proof = self._derive_execution_proof(mission, proposal, argument, decision)
+                mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+                proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
+                mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": proof_reason})
+                if not proof_ok:
+                    mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": proof_code, "reason": proof_reason})
+                    results.append(ToolCallResult(proposal, False, error=f"{proof_code}: {proof_reason}"))
+                    continue
+                registry_context = self._registry_context(mission, proposal.name)
+                authorized.append((proposal, argument, decision, proof, registry_context))
             except Exception as exc:
-                # An exception after dispatch cannot prove that the external side effect did not happen.
-                # Preserve ambiguity so recovery cannot blindly replay this proposal.
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution authorization rejected: {type(exc).__name__}"})
+                results.append(ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution authorization rejected: {type(exc).__name__}"))
+
+        all_ids = [item[0].tool_call_id for item in authorized]
+        call_bindings = {item[0].tool_call_id: {"action_id": item[0].action_id or item[0].tool_call_id, "step_id": item[0].step_id} for item in authorized}
+        mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": all_ids, "call_bindings": call_bindings, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
+        self.store.save(mission)
+
+        def execute_one(item: tuple[Any, Any, Any, Any, dict[str, Any]]) -> dict[str, Any]:
+            proposal, argument, decision, proof, registry_context = item
+            proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
+            if not proof_ok:
+                return {"_proof_rejected": True, "proof_code": proof_code, "proof_reason": proof_reason}
+            try:
+                raw = execute_tool(
+                    proposal.name, argument,
+                    authorization_decision=decision.decision,
+                    scope_context=mission.scope_snapshot,
+                    request_id=mission.request_id,
+                    tool_call_id=proposal.tool_call_id,
+                    execution_proof=proof,
+                    execution_class="MISSION_BOUND",
+                    **registry_context,
+                )
+                return {"raw": dict(raw or {})}
+            except Exception as exc:
                 return {"_ambiguous": True, "error": str(exc), "failure_class": FailureClass.UNKNOWN.value, "exception": type(exc).__name__}
+
         raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
         ambiguous: list[tuple[Any, dict[str, Any]]] = []
-        for item, raw in zip(authorized, raw_results):
-            if raw.get("_ambiguous"):
-                ambiguous.append((item[0], raw))
-                continue
+        for item, wrapped in zip(authorized, raw_results):
             proposal = item[0]
-            observation = dict(raw)
-            observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+            if wrapped.get("_proof_rejected"):
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": wrapped.get("proof_code"), "reason": wrapped.get("proof_reason")})
+                results.append(ToolCallResult(proposal, False, error=f"{wrapped.get('proof_code')}: {wrapped.get('proof_reason')}"))
+                continue
+            if wrapped.get("_ambiguous"):
+                ambiguous.append((proposal, wrapped))
+                continue
+            observation = dict(wrapped.get("raw") or {})
+            observation.update({"type": "tool_observation", "source": proposal.name, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
             mission.record_observation(observation)
-            success = bool(observation.get("success", observation.get("ok", True)))
-            if current_step is not None:
-                self._interpret_observation(mission, current_step, observation, success=success)
+            success = bool(observation.get("success", observation.get("ok", False)))
+            planned_step = next((step for step in mission.plan.steps if step.step_id == proposal.step_id), None)
+            if planned_step is not None:
+                self._interpret_observation(mission, planned_step, observation, success=success)
+            action_id = proposal.action_id or proposal.tool_call_id
+            mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
             if success:
-                criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
-                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
-            mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
+                self._record_verified_criterion_evidence(mission, action_id)
+                ready_after = self._ready_plan_steps(mission)
+                mission.current_step = ready_after[0][0] if ready_after else len(mission.plan.steps)
             results.append(ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", ""))))
+
+        proposal_order = {proposal.tool_call_id: index for index, proposal in enumerate(proposals)}
+        results.sort(key=lambda result: proposal_order.get(result.proposal.tool_call_id, len(proposal_order)))
         progress["tool_results"].extend(result.to_dict() for result in results)
         if ambiguous:
             ambiguous_ids = [proposal.tool_call_id for proposal, _ in ambiguous]
             mission.error = "parallel tool outcome is ambiguous; reconciliation required"
             mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "tool_call_ids": ambiguous_ids})
             mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "tool_call_ids": ambiguous_ids})
-            mission.checkpoint = {
-                "status": "in_flight_parallel",
-                "tool_call_ids": [item[0].tool_call_id for item in authorized],
-                "ambiguous_tool_call_ids": ambiguous_ids,
-                "run_id": run_id,
-            }
+            mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": all_ids, "ambiguous_tool_call_ids": ambiguous_ids, "call_bindings": call_bindings, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
             return
-        mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
+        mission.checkpoint = {"status": "completed", "tool_call_ids": all_ids, "call_bindings": call_bindings, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
 
     def run_slice(self, mission_id: str) -> Mission:
         mission = self._load(mission_id)
@@ -456,27 +672,49 @@ class MissionRuntime:
             mission.emit(EventType.FAILURE_DIAGNOSED, step_id=str(mission.checkpoint.get("step_id", "")), data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "action_id": action_id})
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
             return self.store.save(mission)
+        if mission.progress.get("cancel_requested"):
+            mission.progress.pop("cancel_requested", None)
+            mission.transition(MissionStatus.CANCELLED, "Owner cancellation request accepted at a safe execution boundary")
+            mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+            return self.store.save(mission)
+        if mission.progress.get("pause_requested") or mission.status is MissionStatus.PAUSED:
+            mission.transition(MissionStatus.PAUSED, "Owner pause request accepted at a safe execution boundary")
+            mission.checkpoint = {**mission.checkpoint, "status": "paused"}
+            return self.store.save(mission)
         if mission.iteration_count >= mission.max_iterations:
             mission.error = "iteration budget exhausted"
             mission.emit(EventType.FAILURE_DETECTED, data={"class": FailureClass.RESOURCE.value, "reason": mission.error})
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
             return self.store.save(mission)
         mission.iteration_count += 1
-        if mission.current_step >= len(mission.plan.steps):
+        ready_steps = self._ready_plan_steps(mission)
+        completed_steps = self._completed_plan_steps(mission)
+        pending_steps = [step for step in mission.plan.steps if step.step_id not in completed_steps]
+        if not pending_steps:
             mission.transition(MissionStatus.VERIFYING, "all plan steps observed")
             mission.emit(EventType.GOAL_VERIFICATION_STARTED)
             verification = self.verifier(mission)
             mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
             if verification.verified:
                 mission.emit(EventType.GOAL_VERIFIED, data={"evidence_count": len(verification.evidence)})
-                mission.transition(MissionStatus.GOAL_COMPLETED, "required verification evidence present")
+                mission.verification_state = self.store.issue_completion_proof(mission)
+                mission.transition(MissionStatus.GOAL_COMPLETED, "required verification evidence present", verification=mission.verification_state)
                 mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state})
             else:
                 mission.transition(MissionStatus.RUNNING, "required verification evidence missing")
             return self.store.save(mission)
 
-        step = mission.current_plan_step
-        action_id = f"{mission.mission_id}:{mission.plan.version}:{step.step_id}:{mission.current_step}"
+        if not ready_steps:
+            mission.error = "plan dependency graph has no executable step"
+            mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+            return self.store.save(mission)
+
+        step_index, step = ready_steps[0]
+        mission.current_step = step_index
+        action_id = f"{mission.mission_id}:{mission.plan.version}:{step.step_id}:{step_index}"
+        prior_action = next((item for item in mission.action_history if item.get("action_id") == action_id and item.get("status") == "completed"), None)
+        if prior_action and prior_action.get("plan_fingerprint") not in {None, "", mission.plan.fingerprint}:
+            action_id = f"{action_id}:plan:{mission.plan.fingerprint[:12]}"
         mission.emit(EventType.STEP_SELECTED, step_id=step.step_id, data={"action_id": action_id, "plan_version": mission.plan.version})
         signatures = mission.progress.setdefault("loop_signatures", {})
         signature = hashlib.sha256(json.dumps({"plan": mission.plan.fingerprint, "step": step.step_id, "action": step.action}, sort_keys=True).encode()).hexdigest()
@@ -487,7 +725,9 @@ class MissionRuntime:
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
             return self.store.save(mission)
         if any(item.get("action_id") == action_id and item.get("status") == "completed" for item in mission.action_history):
-            mission.current_step += 1
+            mission.record_action(action_id, step.step_id, "completed", prior_action.get("observation", {}) if prior_action else {}, plan_fingerprint=mission.plan.fingerprint)
+            next_steps = self._ready_plan_steps(mission)
+            mission.current_step = next_steps[0][0] if next_steps else len(mission.plan.steps)
             mission.transition(MissionStatus.READY, "idempotent action already completed")
             return self.store.save(mission)
 
@@ -501,7 +741,7 @@ class MissionRuntime:
             return self.store.save(mission)
 
         mission.transition(MissionStatus.RUNNING, "step started", step_id=step.step_id)
-        mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "in_flight", "plan_version": mission.plan.version}
+        mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "in_flight", "plan_version": mission.plan.version, "plan_fingerprint": mission.plan.fingerprint}
         self.store.save(mission)
         try:
             result = self.executor(mission, step, action_id)
@@ -513,6 +753,7 @@ class MissionRuntime:
 
         observation = dict(result or {})
         observation.setdefault("type", "tool_observation")
+        observation.setdefault("source", step.action)
         observation.setdefault("action_id", action_id)
         observation.setdefault("step_id", step.step_id)
         observation.setdefault("mission_id", mission.mission_id)
@@ -521,8 +762,8 @@ class MissionRuntime:
         mission.transition(MissionStatus.OBSERVING, "action returned observation", action_id=action_id)
         mission.record_observation(observation)
         success = bool(observation.get("success", observation.get("ok", False)))
-        mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation)
-        mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version}
+        mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
+        mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version, "plan_fingerprint": mission.plan.fingerprint}
         try:
             strategy_decision = self._interpret_observation(mission, step, observation, success=success)
         except (TypeError, ValueError, KeyError) as exc:
@@ -538,14 +779,19 @@ class MissionRuntime:
             mission.transition(MissionStatus.SCOPE_BLOCKED, mission.error)
             return self.store.save(mission)
         if success:
-            mission.evidence.append({"criterion_id": observation.get("criterion_id", step.step_id), "passed": True, "source": observation.get("source", step.action), "result": observation, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id}})
-            mission.emit(EventType.EVIDENCE_ADDED, step_id=step.step_id, data={"criterion_id": observation.get("criterion_id", step.step_id)})
+            self._record_verified_criterion_evidence(mission, action_id)
             if strategy_decision is not None and strategy_decision.decision.value in {"REPLAN", "CHANGE_HYPOTHESIS", "ADD_EVIDENCE"}:
                 mission.transition(MissionStatus.REPLANNING, strategy_decision.reason)
                 mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data=strategy_decision.to_dict())
                 new_plan = self.replanner(mission, {**observation, "interpretation": mission.interpretations[-1], "strategy_decision": strategy_decision.to_dict()})
                 if new_plan.objective != mission.objective:
                     mission.error = "replanner attempted to change Owner objective"
+                    mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                    return self.store.save(mission)
+                try:
+                    new_plan.validate_dependency_graph()
+                except ValueError:
+                    mission.error = "replanner returned an invalid dependency graph"
                     mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
                     return self.store.save(mission)
                 mission.replan_history.append({"from_version": mission.plan.version, "to_version": new_plan.version, "reason": strategy_decision.reason, "trigger": strategy_decision.to_dict()})
@@ -556,7 +802,8 @@ class MissionRuntime:
                 mission.retry_count = 0
                 mission.transition(MissionStatus.READY, "informative observation caused replan", plan_version=new_plan.version)
                 return self.store.save(mission)
-            mission.current_step += 1
+            next_steps = self._ready_plan_steps(mission)
+            mission.current_step = next_steps[0][0] if next_steps else len(mission.plan.steps)
             mission.retry_count = 0
             mission.transition(MissionStatus.READY, "observation accepted")
             return self.store.save(mission)
@@ -581,6 +828,12 @@ class MissionRuntime:
                 mission.error = "replanner attempted to change Owner objective"
                 mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
                 return self.store.save(mission)
+            try:
+                new_plan.validate_dependency_graph()
+            except ValueError:
+                mission.error = "replanner returned an invalid dependency graph"
+                mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                return self.store.save(mission)
             mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": "failure observation"})
             mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint})
             mission.plan = new_plan
@@ -599,7 +852,7 @@ class MissionRuntime:
             if heartbeat is not None:
                 heartbeat()
             mission = self.run_slice(mission_id)
-            if mission.is_terminal:
+            if mission.is_terminal or mission.status is MissionStatus.PAUSED:
                 return mission
         return self._load(mission_id)
 

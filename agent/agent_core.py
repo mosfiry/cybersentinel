@@ -19,6 +19,8 @@ from tools.registry import REGISTRY, execute as execute_tool, get_tool
 from agent.evidence import EvidenceChainStore
 from workspace import Workspace
 from security.mission_authorization import MissionAuthorizationSnapshot
+from security.owner_budget import OwnerAuthorizedToolBudget
+from security.execution_boundary import MissionExecutionBoundary
 
 from .mission import Mission, MissionStatus, MissionStore
 from .mission_runtime import MissionRuntime
@@ -193,14 +195,17 @@ class AgentCore:
         snapshot = capture_policy_snapshot(request_id, evidence)
         return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=evidence.session_id), policy_context_from_snapshot(snapshot)
 
-    @staticmethod
-    def _executor(mission: Mission, step: PlanStep, action_id: str) -> dict[str, Any]:
+    def _executor(self, mission: Mission, step: PlanStep, action_id: str) -> dict[str, Any]:
         if step.action == "__planning_failure__":
             return {"success": False, "failure_class": dict(step.retry_policy).get("failure_class", "LOGIC"), "error": "malformed, empty, or unknown tool proposal"}
         arguments = dict(step.retry_policy).get("arguments", {})
         argument = arguments.get("query") if isinstance(arguments, dict) else None
         raw = mission.authorization_context or {}
         context = AuthorizationContext.from_dict(raw)
+        from security import owner_password
+        live_owner = owner_password.resolve_session(context.session_id)
+        if live_owner is None or str(live_owner.get("owner_id", "")) != str(context.owner_evidence.owner_id):
+            raise PermissionError("live Owner session is no longer valid")
         spec = get_tool(step.action)
         if spec is None:
             return {"success": False, "failure_class": "TOOL", "error": "unknown tool"}
@@ -219,10 +224,20 @@ class AgentCore:
             if not workspace_root:
                 raise PermissionError("mission workspace boundary required")
             workspace = Workspace(workspace_root)
-            evidence_store = EvidenceChainStore(DB_PATH.with_name("evidence_chain.db"))
+            evidence_store = EvidenceChainStore(Path(self.store.db_path).with_name("evidence_chain.db"))
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity)
-            return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
+            proof = MissionExecutionBoundary.derive(mission, tool=step.action, argument=argument, decision=decision.decision, tool_call_id=action_id)
+            from .trajectory import EventType
+            mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": action_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
+            proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
+            mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": action_id, "allowed": proof_ok, "reason": proof_reason})
+            if not proof_ok:
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": action_id, "code": proof_code, "reason": proof_reason})
+                return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{proof_code}: {proof_reason}", "execution_id": action_id}
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, tool_call_id=action_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_proof=proof, execution_class="MISSION_BOUND")
+            return {"success": True, "source": step.action, "result": value, "execution_id": action_id}
+        except PermissionError as exc:
+            return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
 
@@ -252,7 +267,31 @@ class AgentCore:
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
-        allowed_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
+        owner_budget = OwnerAuthorizedToolBudget.from_owner_declaration(
+            scope_context,
+            policy_version=str(getattr(authorization_context.policy_snapshot, "policy_version", "owner-policy")),
+            owner_approval=authorization_context.owner_evidence.proof_fingerprint,
+        )
+        model_requested_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
+        allowed_tools = owner_budget.intersect(model_requested_tools)
+        workspace_capabilities = ("workspace_read", "git_read")
+        snapshot_tools = tuple(dict.fromkeys((*allowed_tools, *workspace_capabilities)))
+        if completion_criteria is None:
+            status_intent = any(token in instruction.casefold() for token in (
+                "system status", "check status", "check the status", "service health", "health check", "online status",
+                "حالة النظام", "حالة الخدمة", "تحقق من الحالة", "تحقق من حالة", "افحص الحالة",
+            ))
+            if status_intent and any(step.action == "status" for step in plan.steps):
+                effective_criteria = [{
+                    "criterion_id": "system-status",
+                    "description": "The live CyberSentinel service status endpoint reports a healthy service and version.",
+                    "check": "system_online",
+                    "required": True,
+                }]
+            else:
+                effective_criteria = [{"criterion_id": "mission-goal", "description": "The Owner objective has a supported, independently verified result.", "check": "tool observation", "required": True}]
+        else:
+            effective_criteria = list(completion_criteria)
 
         def authorization_snapshot_factory(created_mission: Mission) -> MissionAuthorizationSnapshot:
             return MissionAuthorizationSnapshot.create(
@@ -260,12 +299,12 @@ class AgentCore:
                 mission_id=created_mission.mission_id,
                 target_identity=target_identity,
                 scope=tuple((scope_context or {}).get("scope", ("workspace",))),
-                allowed_actions=allowed_tools,
+                allowed_actions=snapshot_tools,
                 forbidden_actions=tuple((scope_context or {}).get("forbidden_actions", ())),
-                allowed_tools=allowed_tools,
+                allowed_tools=snapshot_tools,
                 time_window={"timezone": "UTC"},
                 max_duration=max(60, created_mission.max_iterations * 60),
-                rate_limits={tool: 1 for tool in allowed_tools},
+                rate_limits={tool: max(1, created_mission.max_iterations) for tool in allowed_tools},
                 network_boundary={"allowed": tuple((scope_context or {}).get("allowed_networks", ()))},
                 data_boundary={"allowed": (target_identity,)},
                 credential_boundary={"allowed": tuple((scope_context or {}).get("allowed_credentials", ()))},
@@ -279,8 +318,8 @@ class AgentCore:
             plan,
             authorization_context=authorization_context,
             scope_snapshot=scope_context,
-            completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
-            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
+            completion_criteria=effective_criteria,
+            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict(), "owner_budget": owner_budget.to_dict(), "model_requested_tools": list(model_requested_tools), "effective_tools": list(allowed_tools)},
             authorization_snapshot_factory=authorization_snapshot_factory,
         )
         if getattr(self, "_last_model_response", None):
@@ -329,25 +368,39 @@ class AgentCore:
                 pass
         return result
 
-    def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
+    def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None, run: bool = True) -> Mission:
         mission = self.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
+        from security import owner_password
+        live_owner = owner_password.resolve_session(owner_session_token)
+        if live_owner is None:
+            if not mission.is_terminal and mission.status is not MissionStatus.RECOVERY_REQUIRED:
+                mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "live Owner session expired or was revoked")
+                mission.recovery_events.append({"event": "owner_session_unavailable"})
+                self.store.save(mission)
+            raise PermissionError("mission access requires a live Owner session")
+        if mission.owner_identity_ref != str(live_owner.get("owner_id", "")):
+            raise PermissionError("mission access denied")
         try:
             evidence = authenticate_owner(owner_session_token, mission.request_id)
         except PermissionError as exc:
-            if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
-                if mission.status is MissionStatus.RECOVERY_REQUIRED:
-                    mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation required after restore")
-                else:
-                    mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation failed after restore")
+            if not mission.is_terminal:
+                mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation failed after restore")
                 mission.recovery_events.append({"event": "owner_revalidation_failed", "reason": str(exc)})
                 self.store.save(mission)
             raise
         fresh_snapshot = capture_policy_snapshot(mission.request_id, evidence)
         try:
             old_authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
-            mission.authorization_snapshot = old_authorization.amend(owner_approval=evidence.proof_fingerprint, changes={}, expires_at=evidence.expires_at).to_dict()
+            current_budget = OwnerAuthorizedToolBudget.from_owner_policy(
+                policy_version=str(getattr(fresh_snapshot, "policy_version", "owner-policy")),
+                owner_approval=evidence.proof_fingerprint,
+            )
+            effective_tools = current_budget.intersect(old_authorization.allowed_tools)
+            read_capabilities = tuple(name for name in ("workspace_read", "git_read") if name in old_authorization.allowed_tools and name in old_authorization.allowed_actions)
+            renewed_tools = tuple(dict.fromkeys((*effective_tools, *read_capabilities)))
+            mission.authorization_snapshot = old_authorization.amend(owner_approval=evidence.proof_fingerprint, changes={"allowed_tools": renewed_tools, "allowed_actions": renewed_tools}, expires_at=evidence.expires_at).to_dict()
             mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot["version"])
         except (KeyError, TypeError, ValueError, PermissionError):
             if mission.authorization_snapshot:
@@ -357,7 +410,7 @@ class AgentCore:
             allowed_tools = tuple(step.action for step in mission.plan.steps if step.action != "__planning_failure__")
             owner_identity = mission.owner_identity_ref or evidence.proof_fingerprint
             mission.owner_identity_ref = owner_identity
-            renewed = MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity="local-workspace", scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=(), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(60, mission.max_iterations * 60), rate_limits={tool: 1 for tool in allowed_tools}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("local-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(Path.cwd().resolve())}, policy_version="owner-policy", owner_approval=evidence.proof_fingerprint, expires_at=evidence.expires_at)
+            renewed = MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity="local-workspace", scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=(), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(60, mission.max_iterations * 60), rate_limits={tool: max(1, mission.max_iterations) for tool in allowed_tools}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("local-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(Path.cwd().resolve())}, policy_version="owner-policy", owner_approval=evidence.proof_fingerprint, expires_at=evidence.expires_at)
             mission.authorization_snapshot = renewed.to_dict()
             mission.provenance["authorization_snapshot_version"] = int(renewed.version)
         old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
@@ -366,12 +419,18 @@ class AgentCore:
         mission.authorization_context = fresh_context.to_dict()
         mission.policy_snapshot = fresh_snapshot.to_dict()
         mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "username_password", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})
-        if mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
+        if mission.status is MissionStatus.OWNER_INPUT_REQUIRED or mission.status is MissionStatus.AUTHORIZATION_BLOCKED:
             mission.transition(MissionStatus.READY, "owner authorization revalidated")
+        elif mission.status is MissionStatus.PAUSED:
+            mission.progress.pop("pause_requested", None)
+            mission.transition(MissionStatus.READY, "Owner resumed mission")
+            mission.checkpoint = {**mission.checkpoint, "status": "resumed"}
         self.store.save(mission)
+        if not run:
+            return mission
         policy_context = policy_context_from_snapshot(fresh_snapshot)
         runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True)
-        return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations)
+        return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations, heartbeat=heartbeat)
 
 
 __all__ = ["AgentCore"]

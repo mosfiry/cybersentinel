@@ -59,7 +59,7 @@ def test_unknown_tool_cannot_reach_handler():
 
 def test_run_project_tests_is_bounded_and_not_shell(tmp_path, monkeypatch):
     monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(tmp_path))
-    result = execute("run_project_tests", ".")
-    assert set(result) == {"ok", "timed_out", "returncode", "output"}
-    with pytest.raises(ValueError):
+    with pytest.raises(PermissionError, match="unique tool-call identity"):
+        execute("run_project_tests", ".")
+    with pytest.raises(PermissionError):
         execute("run_project_tests", "../")

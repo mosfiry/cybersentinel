@@ -112,10 +112,15 @@ class AgentLoop:
         maintaining clear separation of concerns.
         """
         conversation_id = conversation_id or uuid.uuid4().hex
-        ensure_conversation(conversation_id, owner_session_id or "")
+        from security.owner_password import resolve_session
+        owner = resolve_session(owner_session_token)
+        if owner is None or (owner_session_id and owner_session_id != owner["session_id"]):
+            raise PermissionError("owner authentication required")
+        owner_identity = str(owner["owner_id"])
+        ensure_conversation(conversation_id, owner_identity)
 
         # Store user message
-        add_conversation_message(conversation_id, "user", text)
+        add_conversation_message(conversation_id, "user", text, owner_id=owner_identity)
 
         # Get owner policy context (authoritative source)
         owner_policy = current_owner_policy_context()
@@ -193,7 +198,7 @@ class AgentLoop:
                 answer = parsed.get("content", content) if parsed else content
                 add_conversation_message(
                     conversation_id, "assistant", answer,
-                    {"step": step, "provider": response.get("provider"), "model": response.get("model")}
+                    {"step": step, "provider": response.get("provider"), "model": response.get("model")}, owner_id=owner_identity
                 )
                 return {
                     "conversation_id": conversation_id,
@@ -246,7 +251,7 @@ class AgentLoop:
 
             # Store tool message in conversation
             tool_message = json.dumps({"tool": name, "result": result}, ensure_ascii=False)
-            add_conversation_message(conversation_id, "tool", tool_message, {"step": step, "name": name})
+            add_conversation_message(conversation_id, "tool", tool_message, {"step": step, "name": name}, owner_id=owner_identity)
 
             # Update conversation messages for next iteration
             conv_messages.append({
@@ -262,7 +267,7 @@ class AgentLoop:
 
         # Max steps reached
         answer = "\u062a\u0648\u0642\u0641\u062a \u062d\u0644\u0642\u0627\u062a \u0627\u0644\u0648\u0643\u064a\u0644 \u0628\u0639\u062f \u0628\u0644\u0648\u063a \u0627\u0641\u0623\u0642\u0635\u0649 \u0644\u0644\u062e\u0637\u0648\u0627\u062a •u0627\u0644\u0645\u0633\u0645\u0648\u062d \u0628\u0647\u0627. \u064a\u0631\u062c\u0649 \u0625\u0639\u0627\u062f\u0629 \u0635\u064a\u0627\u063a\u0629 \u0637\u0644\u0628\u0643 \u0623\u0648 •u062a\u0642\u0633\u064a\u0645\u0647 •u0625\u0644\u0649 •u0623\u062c\u0632\u0627\u0621 •u0623\u0635\u0631."
-        add_conversation_message(conversation_id, "assistant", answer, {"stopped": "max_steps"})
+        add_conversation_message(conversation_id, "assistant", answer, {"stopped": "max_steps"}, owner_id=owner_identity)
         return {
             "conversation_id": conversation_id,
             "answer": answer,

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 """Round 2 P0-4 - deterministic failure -> recovery -> replan semantics.
 
 Exercises the real MissionRuntime with the real RecoveryPolicy. Invariants:
@@ -32,7 +32,7 @@ def _runtime(tmp_path):
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime):
+def _mission(runtime, tmp_path, monkeypatch):
     plan = Plan.initial("recover the mission").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
@@ -40,7 +40,8 @@ def _mission(runtime):
         "recover the mission",
         "recover the mission",
         plan,
-        completion_criteria=[{"criterion_id": "goal"}],
+        completion_criteria=[{"criterion_id": "goal", "check": "system_online"}],
+        **signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="failure-recovery-test"),
     )
 
 
@@ -93,7 +94,7 @@ def _ambiguous_execution_runtime(tmp_path, monkeypatch, exception):
 
     monkeypatch.setattr(tools.registry, "execute", boom)
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch)
 
     class OneShotModel:
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
@@ -125,9 +126,9 @@ def test_tool_timeout_is_ambiguous_and_requires_recovery(tmp_path, monkeypatch):
     assert result.is_terminal
 
 
-def test_reconcile_requires_an_in_flight_checkpoint(tmp_path):
+def test_reconcile_requires_an_in_flight_checkpoint(tmp_path, monkeypatch):
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch)
     with pytest.raises(ValueError):
         runtime.reconcile_in_flight(mission.mission_id, executed=False)
 
@@ -183,7 +184,8 @@ def test_reconcile_executed_records_evidence_without_replay(tmp_path, monkeypatc
     )
     assert reconciled.checkpoint.get("status") == "completed"
     assert reconciled.checkpoint.get("reconciled") is True
-    assert any(item.get("source") == "external_receipt_confirmed" and item.get("passed") for item in reconciled.evidence)
+    assert any(item.get("source") == "external_receipt_confirmed" for item in reconciled.observations)
+    assert not any(item.get("system_evidence") for item in reconciled.evidence)
 
     execute_calls = []
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: execute_calls.append(a) or {"ok": True})
@@ -194,7 +196,8 @@ def test_reconcile_executed_records_evidence_without_replay(tmp_path, monkeypatc
 
     finished = runtime.run_model_loop(mission.mission_id, FinalModel(), tools=[{"name": "status"}], max_turns=3)
     assert execute_calls == [], "a reconciled side effect is never replayed"
-    assert finished.status is MissionStatus.GOAL_COMPLETED
+    assert finished.status is MissionStatus.READY
+    assert not finished.completion_proof
 
 
 def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_path, monkeypatch):
@@ -206,7 +209,7 @@ def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_pat
         lambda *a, **k: {"ok": False, "error": "deterministic failure", "error_type": "provider_unavailable"},
     )
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch)
 
     class FailingThenFinalModel:
         def __init__(self):
@@ -234,7 +237,7 @@ def test_unavailable_tool_is_rejected_at_authorization(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: calls.append(a) or {"ok": True})
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime)
+    mission = _mission(runtime, tmp_path, monkeypatch)
 
     class UnknownToolModel:
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
@@ -255,5 +258,5 @@ def test_unavailable_tool_is_rejected_at_authorization(tmp_path, monkeypatch):
 
     result = runtime.run_model_loop(mission.mission_id, UnknownToolModel(), tools=[], max_turns=1)
     assert calls == [], "an unknown tool must never reach execution"
-    assert result.progress["model_loop"]["tool_results"][0]["error"] == "unknown tool"
+    assert result.progress["model_loop"]["tool_results"][0]["error"].startswith("TOOL_NOT_ALLOWED:")
     assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED

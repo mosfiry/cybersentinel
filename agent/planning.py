@@ -174,6 +174,42 @@ class Plan:
     def fingerprint(self) -> str:
         return hashlib.sha256(json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
+    def validate_dependency_graph(self) -> None:
+        """Reject ambiguous or unschedulable step prerequisites before execution."""
+        ids = [str(step.step_id) for step in self.steps]
+        if any(not step_id.strip() or step_id != step_id.strip() for step_id in ids):
+            raise ValueError("plan step IDs must be non-empty and have no surrounding whitespace")
+        if len(ids) != len(set(ids)):
+            raise ValueError("plan step IDs must be unique")
+        known = set(ids)
+        for step in self.steps:
+            prerequisites = tuple(str(item) for item in step.prerequisites)
+            if len(prerequisites) != len(set(prerequisites)):
+                raise ValueError(f"duplicate prerequisite in plan step {step.step_id}")
+            missing = [item for item in prerequisites if item not in known]
+            if missing:
+                raise ValueError(f"unknown prerequisite in plan step {step.step_id}")
+            if step.step_id in prerequisites:
+                raise ValueError(f"plan step cannot depend on itself: {step.step_id}")
+
+        by_id = {step.step_id: step for step in self.steps}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(step_id: str) -> None:
+            if step_id in visiting:
+                raise ValueError("plan step dependencies must be acyclic")
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            for prerequisite in by_id[step_id].prerequisites:
+                visit(str(prerequisite))
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in ids:
+            visit(step_id)
+
 
 @dataclass(frozen=True)
 class PlanRevision:
@@ -210,9 +246,19 @@ class GoalVerification:
     @classmethod
     def evaluate(cls, goal: str, criteria: Iterable[VerificationCriterion], evidence: Iterable[VerificationEvidence]) -> "GoalVerification":
         criteria_tuple = tuple(criteria)
-        evidence_by_id = {item.criterion_id: item for item in evidence}
-        missing = tuple(item.criterion_id for item in criteria_tuple if item.required and (item.criterion_id not in evidence_by_id or not evidence_by_id[item.criterion_id].passed))
-        return cls(str(goal), criteria_tuple, tuple(evidence_by_id.values()), not missing, missing)
+        if len({item.criterion_id for item in criteria_tuple}) != len(criteria_tuple):
+            raise ValueError("completion criterion IDs must be unique")
+        evidence_tuple = tuple(evidence)
+        required = tuple(item for item in criteria_tuple if item.required)
+        missing = tuple(
+            criterion.criterion_id
+            for criterion in required
+            if not any(item.criterion_id == criterion.criterion_id for item in evidence_tuple)
+            or any(item.criterion_id == criterion.criterion_id and not item.passed for item in evidence_tuple)
+        )
+        if not required:
+            missing = ("no_required_criteria",)
+        return cls(str(goal), criteria_tuple, evidence_tuple, bool(required) and not missing, missing)
 
     def require_verified(self) -> None:
         if not self.verified:

@@ -83,6 +83,19 @@ class AuthorizationContext:
             "scope_fingerprint": self.scope_fingerprint,
         }
 
+    def to_public_dict(self) -> dict[str, Any]:
+        """Return a browser-safe summary without bearer session references."""
+        value = self.to_dict()
+
+        def redact(item: Any) -> Any:
+            if isinstance(item, dict):
+                return {key: redact(child) for key, child in item.items() if key not in {"session_id", "owner_session_id"}}
+            if isinstance(item, list):
+                return [redact(child) for child in item]
+            return item
+
+        return redact(value)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AuthorizationContext":
         evidence = owner_policy.OwnerAuthenticationEvidence(**dict(data["owner_evidence"]))

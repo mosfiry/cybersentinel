@@ -955,6 +955,8 @@ class TestPhase5_Regression:
         
         from core import db
         monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
+        from owner_session_testutils import allow_owner_sessions
+        allow_owner_sessions(monkeypatch, "test-token")
         
         from agent.loop import AgentLoop
         

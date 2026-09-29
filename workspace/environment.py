@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterable, Sequence
 import hashlib
 import os
 import shlex
+import stat
 import subprocess
 import time
 
@@ -29,6 +30,7 @@ class WorkspacePolicy:
     max_processes: int = 4
     max_output_bytes: int = 64_000
     default_timeout: float = 30.0
+    max_file_bytes: int = 1_000_000
 
     def authorize(self, operation: str, *, command: Sequence[str] = (), network: bool = False, credentials: bool = False) -> None:
         if network and not self.allow_network:
@@ -58,6 +60,7 @@ class WorkspaceAuditEvent:
     exit_code: int | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
+    action_id: str = ""
 
 
 def _hash(value: Any) -> str:
@@ -67,7 +70,7 @@ def _hash(value: Any) -> str:
 class Workspace:
     """A root-confined, auditable operating environment for AgentCore tools."""
 
-    def __init__(self, root: str | Path, *, policy: WorkspacePolicy | None = None, mission_id: str = "", request_id: str = "", tool_id: str = "", authorization_snapshot: Any = None, evidence_store: Any = None):
+    def __init__(self, root: str | Path, *, policy: WorkspacePolicy | None = None, mission_id: str = "", request_id: str = "", tool_id: str = "", action_id: str = "", authorization_snapshot: Any = None, evidence_store: Any = None):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.policy = policy or WorkspacePolicy()
@@ -76,27 +79,33 @@ class Workspace:
         self.mission_id = mission_id
         self.request_id = request_id
         self.tool_id = tool_id
+        self.action_id = action_id
         self.authorization_snapshot = authorization_snapshot
         self.evidence_store = evidence_store
 
     def resolve(self, relative: str | Path = ".") -> Path:
         candidate = Path(relative)
         if candidate.is_absolute():
-            resolved = candidate.resolve()
-        else:
-            resolved = (self.root / candidate).resolve()
+            raise WorkspaceBoundaryError("absolute workspace paths are not allowed")
+        resolved = (self.root / candidate).resolve()
         if resolved != self.root and self.root not in resolved.parents:
             raise WorkspaceBoundaryError("path escapes workspace root")
         return resolved
 
-    def bind(self, *, mission_id: str, request_id: str, tool_id: str, authorization_snapshot: Any, evidence_store: Any = None) -> "Workspace":
-        self.mission_id, self.request_id, self.tool_id = mission_id, request_id, tool_id
+    def bind(self, *, mission_id: str, request_id: str, tool_id: str, action_id: str = "", authorization_snapshot: Any, evidence_store: Any = None) -> "Workspace":
+        self.mission_id, self.request_id, self.tool_id, self.action_id = mission_id, request_id, tool_id, action_id
         self.authorization_snapshot, self.evidence_store = authorization_snapshot, evidence_store
         return self
 
     def _authorize(self, operation: str, *, path: str = ".", command: Sequence[str] = (), network: str | None = None, credential: str | None = None) -> None:
         if self.authorization_snapshot is None:
             raise WorkspacePolicyError("mission authorization snapshot required")
+        snapshot_mission = str(getattr(self.authorization_snapshot, "mission_id", ""))
+        if self.mission_id and snapshot_mission and snapshot_mission != self.mission_id:
+            raise WorkspacePolicyError("workspace mission does not match its authorization snapshot")
+        snapshot_root = str(getattr(self.authorization_snapshot, "workspace_boundary", {}).get("root", "") or "")
+        if snapshot_root and Path(snapshot_root).expanduser().resolve() != self.root:
+            raise WorkspacePolicyError("workspace root does not match its authorization snapshot")
         forbidden = set(self.authorization_snapshot.forbidden_actions)
         if operation in forbidden:
             raise WorkspacePolicyError("operation forbidden by mission authorization")
@@ -109,7 +118,7 @@ class Workspace:
     def _record(self, operation: str, *, path: Path | None = None, command: Sequence[str] = (), input_value: Any = None, output_value: Any = None, result: str = "success", exit_code: int | None = None) -> None:
         relative = str(path.relative_to(self.root)) if path and path != self.root else "." if path else ""
         auth_hash = str(getattr(self.authorization_snapshot, "authorization_hash", ""))
-        event = WorkspaceAuditEvent(operation, relative, tuple(command), "allowed", _hash(input_value) if input_value is not None else "", _hash(output_value) if output_value is not None else "", self.mission_id, self.request_id, self.tool_id, auth_hash, result, exit_code, {"mission_id": self.mission_id, "request_id": self.request_id, "tool_id": self.tool_id, "authorization_snapshot_hash": auth_hash, "workspace": str(self.root), "operation": operation})
+        event = WorkspaceAuditEvent(operation, relative, tuple(command), "allowed", _hash(input_value) if input_value is not None else "", _hash(output_value) if output_value is not None else "", self.mission_id, self.request_id, self.tool_id, auth_hash, result, exit_code, {"mission_id": self.mission_id, "request_id": self.request_id, "tool_id": self.tool_id, "action_id": self.action_id, "authorization_snapshot_hash": auth_hash, "workspace": str(self.root), "operation": operation}, action_id=self.action_id)
         self.audit.append(event)
         if self.evidence_store is not None:
             self.evidence_store.append_workspace_event(event)
@@ -120,15 +129,37 @@ class Workspace:
         if not path.is_dir():
             raise NotADirectoryError(str(relative))
         result = sorted(item.name for item in path.iterdir())
+        if len(result) > 1000:
+            raise WorkspacePolicyError("workspace directory has too many entries")
         self._record("list", path=path, output_value=result)
         return result
 
     def read(self, relative: str | Path, *, encoding: str = "utf-8") -> str:
         self._authorize("read", path=str(relative))
         path = self.resolve(relative)
-        if not path.is_file():
-            raise FileNotFoundError(str(relative))
-        value = path.read_text(encoding=encoding)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                raise FileNotFoundError(str(relative)) from exc
+            raise
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise IsADirectoryError(str(relative))
+            if info.st_size > self.policy.max_file_bytes:
+                raise WorkspacePolicyError("workspace file exceeds the read size limit")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                raw = stream.read(self.policy.max_file_bytes + 1)
+            if len(raw) > self.policy.max_file_bytes:
+                raise WorkspacePolicyError("workspace file exceeds the read size limit")
+        finally:
+            os.close(fd)
+        try:
+            value = raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError) as exc:
+            raise ValueError("workspace file encoding is unsupported or invalid") from exc
         self._record("read", path=path, output_value=value)
         return value
 
@@ -209,9 +240,16 @@ class Workspace:
         return result
 
     def git(self, operation: str, *arguments: str, timeout: float | None = None) -> "ProcessResult":
-        allowed = {"status", "diff", "log", "branch", "checkout", "commit", "apply", "revert"}
+        allowed = {"status", "diff", "log", "branch", "rev-parse", "remote", "checkout", "commit", "apply", "revert"}
         if operation not in allowed:
             raise WorkspacePolicyError("unsupported git operation")
+        if self.tool_id == "git_read":
+            if operation not in {"status", "diff", "log", "branch", "rev-parse", "remote"}:
+                raise WorkspacePolicyError("browser Git access is read-only")
+            if operation == "rev-parse" and tuple(arguments) not in {("HEAD",), ("--show-toplevel",)}:
+                raise WorkspacePolicyError("unsupported browser Git identity query")
+            if operation == "remote" and tuple(arguments) != ("get-url", "origin"):
+                raise WorkspacePolicyError("unsupported browser Git remote query")
         self._authorize("git", command=("git", operation, *arguments))
         return self.run_process(("git", operation, *arguments), timeout=timeout, cwd=".")
 

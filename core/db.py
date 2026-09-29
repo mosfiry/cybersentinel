@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     conversation_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    owner_session_id TEXT NOT NULL DEFAULT ''
+    owner_session_id TEXT NOT NULL DEFAULT '',
+    owner_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -105,10 +106,30 @@ CREATE INDEX IF NOT EXISTS idx_owner_sessions_status ON owner_sessions(status);
 """
 
 def connect():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    import os
+    import stat
+    path = DB_PATH.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError("application database must be a regular file owned by the application user")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    columns = {row[1] for row in con.execute("PRAGMA table_info(conversations)")}
+    if "owner_id" not in columns:
+        con.execute("ALTER TABLE conversations ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+    # Convert legacy session-scoped rows to their stable account identity, then
+    # remove persisted bearer session IDs. Unresolvable rows remain unowned and
+    # inaccessible to authenticated browser requests.
+    con.execute("UPDATE conversations SET owner_id=CAST((SELECT owner_id FROM owner_sessions WHERE owner_sessions.session_id=conversations.owner_session_id) AS TEXT) WHERE owner_id='' AND owner_session_id!='' AND EXISTS (SELECT 1 FROM owner_sessions WHERE owner_sessions.session_id=conversations.owner_session_id)")
+    con.execute("UPDATE conversations SET owner_session_id='' WHERE owner_session_id!=''")
     try:
         con.execute("ALTER TABLE executions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
@@ -215,17 +236,22 @@ def clear_database():
         con.execute("DELETE FROM intel")
         con.execute("DELETE FROM watches")
 
-def ensure_conversation(conversation_id, owner_session_id=""):
+def ensure_conversation(conversation_id, owner_id=""):
+    conversation_id = str(conversation_id)
+    owner_id = str(owner_id or "")
     with connect() as con:
         con.execute(
-            "INSERT OR IGNORE INTO conversations(conversation_id,owner_session_id) VALUES(?,?)",
-            (str(conversation_id), str(owner_session_id or "")),
+            "INSERT OR IGNORE INTO conversations(conversation_id,owner_id) VALUES(?,?)",
+            (conversation_id, owner_id),
         )
-        con.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?", (str(conversation_id),))
+        row = con.execute("SELECT owner_id FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+        if row is None or str(row["owner_id"] or "") != owner_id:
+            raise PermissionError("conversation access denied")
+        con.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?", (conversation_id,))
 
-def add_conversation_message(conversation_id, role, content, metadata=None):
+def add_conversation_message(conversation_id, role, content, metadata=None, *, owner_id=""):
     import json
-    ensure_conversation(conversation_id)
+    ensure_conversation(conversation_id, owner_id)
     with connect() as con:
         cur = con.execute(
             "INSERT INTO conversation_messages(conversation_id,role,content,metadata_json) VALUES(?,?,?,?)",
@@ -248,7 +274,12 @@ def conversation_messages(conversation_id, limit=40):
         result.append(item)
     return result
 
-def conversation_info(conversation_id):
+def conversation_info(conversation_id, *, owner_id=None):
     with connect() as con:
         row = con.execute("SELECT * FROM conversations WHERE conversation_id=?", (str(conversation_id),)).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    value = dict(row)
+    if owner_id is not None and str(value.get("owner_id") or "") != str(owner_id):
+        raise PermissionError("conversation access denied")
+    return value

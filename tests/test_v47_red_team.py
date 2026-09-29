@@ -4,6 +4,7 @@ from agent.runtime import AgentRuntime
 from cyber_knowledge.models import normalize
 from reasoning.red_team import assess
 from retrieval.local import LocalRetriever
+from security.execution_boundary import OwnerDirectBoundary
 from tools.registry import execute
 from security.owner_policy import authority_snapshot, _issue_evidence, capture_policy_snapshot
 from security.authorization import authorize_tool
@@ -19,7 +20,7 @@ def test_red_team_assessment_is_defensive_only():
     evidence = _issue_evidence("username_password", "red-team-test", "test")
     context = AuthorizationContext("red-team-test", evidence, capture_policy_snapshot("red-team-test", evidence))
     decision = authorize_tool(["red_team_assess", "php-fpm -> sh -> curl"], context=context).decision
-    result = execute("red_team_assess", "php-fpm -> sh -> curl", authorization_decision=decision, request_id="red-team-test")
+    result = OwnerDirectBoundary.execute(tool="red_team_assess", argument="php-fpm -> sh -> curl", decision=decision, request_id="red-team-test", tool_call_id="red-team-call-1")
     assert result["mode"] == "owner_defensive_red_team"
     assert result["required_evidence"]
     assert result["contradicting_evidence"] == []

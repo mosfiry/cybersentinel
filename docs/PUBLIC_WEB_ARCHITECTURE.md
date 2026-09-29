@@ -1,8 +1,8 @@
 # CyberSentinel X — Secure Public Web Architecture
 
-**Status:** Design baseline for `feature/public-web-secure-boundary`
-**Baseline commit:** `f1ed9ae21fe5ff9e806daebc76db8be549ccbe74`
-**Scope:** Secure browser boundary and reviewable deployment artifacts only. No Firebase project creation, Firebase login, Cloud Run deployment, billing change, production secret, or provider credential is included.
+**Status:** Local browser boundary implemented; production deployment remains unconfigured.
+**Implementation baseline:** `main` at `8a3fd10`; see [`CURRENT_RUNTIME_TRUTH.md`](CURRENT_RUNTIME_TRUTH.md) for the current code path.
+**Scope:** Same-process, loopback browser access with Owner password authentication. No Firebase project creation, Cloud Run deployment, billing change, production secret, or provider credential is included.
 
 ## 1. Request flow
 
@@ -29,17 +29,15 @@ Until a production deployment target and origin are supplied, the gateway's publ
 
 ## 2. Authentication flow
 
-A browser visit creates no Owner authority. A public session, if enabled, identifies a browser/client session only; it is not an Owner credential.
+A browser visit creates no Owner authority. `POST /api/public/session` issues an in-memory, short-lived public session and a CSRF token; that session is not an Owner credential.
 
-The gateway must reject protected operations unless the request carries a valid gateway session and the operation's required CyberSentinel authorization has independently succeeded. The gateway must not accept the words “Owner” or any frontend state as proof of Owner authority.
+`POST /api/public/auth/login` checks the Owner username/password with the existing `security/owner_password.py` verifier and creates the canonical server-side Owner session. Successful login sets the opaque session ID only in a separate `HttpOnly; Secure; SameSite=Lax` cookie. The response returns the username and expiry but not the session ID. Browser chat requires both the public CSRF proof and a valid Owner cookie, then calls the existing `api.chat.chat` path. Logout requires CSRF validation and revokes the Owner session. The gateway does not accept the word “Owner” or frontend state as proof of identity.
 
-The current internal `BRIDGE_TOKEN` and `OWNER_TOKEN` remain server-side configuration. They must never be returned to the browser, rendered into public assets, stored in browser storage, or written to logs.
-
-For the current Owner-only chat semantics, an unresolved decision remains: a production-facing Owner login mechanism must be selected before browser users can invoke Owner-authorized chat. Possible choices include an approved identity provider mapped to a CyberSentinel Owner policy, or a private operator-only gateway. The gateway must not silently turn an anonymous public session into an Owner session.
+`BRIDGE_TOKEN` remains a server-side internal transport credential and is never returned to the browser, rendered into assets, stored in browser storage, or written to logs. There is no live `OWNER_TOKEN` environment credential; Owner authentication is account-backed and session-based.
 
 ## 3. Session flow
 
-The browser-facing session is an opaque server-managed session represented by a cookie with the following intended attributes:
+The browser uses two separate server-managed sessions: a public CSRF session and a canonical Owner authentication session. The Owner session is represented by a cookie with these attributes:
 
 - `Secure`
 - `HttpOnly`
@@ -49,15 +47,15 @@ The browser-facing session is an opaque server-managed session represented by a 
 
 The cookie contains only an opaque session identifier or an equally non-sensitive signed reference. Session state is server-side and must not contain raw Owner or provider credentials in client-visible form. Session rotation is required after authentication-state changes. Logout invalidates the server-side session.
 
-The existing `OwnerSession` remains separate. Its challenge, expiry, HMAC proof, single-use behavior, and authorization scope are not replaced by the browser session.
+The public session cookie contains no authority. Owner session expiry and revocation are enforced by `security/owner_password.py` and its SQLite tables; the public web layer does not replace or bypass that authentication module.
 
 ## 4. Owner authorization flow
 
-1. The gateway authenticates the browser session.
-2. The gateway determines whether the requested operation is public, authenticated-user, or Owner-only.
-3. For Owner-only operations, the gateway invokes the existing Owner authorization path using server-side material or a future approved identity-to-Owner mapping.
-4. `OwnerSession`, challenge validation, HMAC proof, expiry, single-use challenge consumption, and scope checks remain enforced by CyberSentinel.
-5. Authorization failures remain failures and retain their HTTP error semantics.
+1. The gateway validates the public session and CSRF token for state-changing browser requests.
+2. Owner login verifies the username/password through `security.owner_password.login` and issues a server-side session.
+3. Owner-only chat resolves the cookie to that existing Owner session and passes its session ID to `api.chat.chat`.
+4. The chat path retains its MissionRuntime authorization, scope, evidence, and verification checks.
+5. Anonymous or expired sessions remain denied; logout revokes the session and expires the cookie.
 
 No public website visit, Firebase Authentication state, browser cookie by itself, or user-entered phrase grants Owner authority.
 
@@ -69,24 +67,24 @@ The browser is not trusted to choose authorization scope, Owner status, provider
 
 ## 6. Secret boundary
 
-Secrets remain exclusively in server-side runtime configuration or a managed secret-injection mechanism. This includes `BRIDGE_TOKEN`, `OWNER_TOKEN`, API keys, LLM credentials, provider credentials, session-signing secrets, HMAC secrets, and deployment credentials.
+Secrets remain exclusively in server-side runtime configuration or a managed secret-injection mechanism. This includes `BRIDGE_TOKEN`, API keys, LLM credentials, provider credentials, Owner session identifiers, HMAC secrets, and deployment credentials.
 
 The frontend must contain none of these names as operational values and must not prompt for them. Public responses and logs must use redacted error categories and correlation identifiers only.
 
 ## 7. CORS model
 
-The preferred topology is same-site browser-to-gateway traffic, which minimizes CORS. If Firebase Hosting and the gateway have different origins, the gateway will use an explicit allowlist configured with the exact Firebase production origin.
+The implemented UI and gateway use the same origin. `PUBLIC_WEB_ORIGIN` can restrict the accepted `Origin` header, but the current service does not emit CORS headers or handle preflight; setting that value alone does not make a separate static host usable.
 
 Rules:
 
 - no wildcard origin for credentialed requests;
-- unknown `Origin` is rejected for browser API requests;
-- the configured production origin is allowed only after Owner supplies/approves it;
+- unknown or foreign `Origin` is rejected for browser API requests;
+- a configured `PUBLIC_WEB_ORIGIN` is an exact origin check, not a CORS policy;
 - localhost development origins, if enabled, are development-only configuration and cannot be included in production defaults;
 - allowed methods and headers are narrow and explicit;
 - preflight does not disclose secrets or internal routes.
 
-Production CORS is not considered configured until the actual Firebase origin is known.
+Cross-origin browser access is not implemented. A future deployment with separate static and API origins needs reviewed CORS/preflight behavior and tests in addition to this origin check.
 
 ## 8. CSRF model
 
@@ -101,9 +99,12 @@ If the browser uses an HttpOnly cookie, state-changing requests require CSRF pro
 
 The browser-facing boundary should use the smallest stable set of routes:
 
-- `POST /api/public/session` — establish or rotate a browser session; no Owner authority;
+- `POST /api/public/session` — establish a browser CSRF session; no Owner authority;
+- `POST /api/public/auth/login` — validate Owner username/password and set the HttpOnly Owner-session cookie;
+- `GET /api/public/auth/session` — return only authenticated state, username, and expiry;
+- `POST /api/public/auth/logout` — revoke the Owner session and clear its cookie;
 - `GET /api/public/health` — non-sensitive health response;
-- `POST /api/public/chat` — validated chat entry, subject to session and Owner policy;
+- `POST /api/public/chat` — validated chat entry, subject to CSRF and existing Owner authorization;
 - `GET /api/public/chat/stream` or a POST-compatible streaming route — only if the final gateway supports safe streaming;
 - `POST /api/public/logout` — invalidate the browser session.
 
@@ -180,28 +181,29 @@ Controls are server-side secret storage, HttpOnly/Secure cookies, CSRF checks, e
 - `AgentCore`, `MissionRuntime`, and `ModelRouter` remain the system of record.
 - A Firebase project and production origin are not yet known.
 - No production provider credentials are available for this phase.
-- Existing local `BRIDGE_TOKEN` and `OWNER_TOKEN` semantics must remain valid internally.
-- The public browser should not be able to perform Owner-only operations until an approved Owner identity flow exists.
+- `BRIDGE_TOKEN` remains an internal transport credential; Owner identity is established by the existing username/password account and session flow.
+- The local browser Owner login is not a production identity provider, and the bridge remains bound to loopback.
 - Long-session/1000-message continuity is out of scope and will not be claimed.
 - Current local tests require installation of project/test dependencies before execution.
 
-## 17. Unresolved Owner decisions
+## 17. Production decisions still open
 
 The following decisions require Owner input before deployment or before enabling public Owner-authorized chat:
 
 1. Firebase project ID and authorized Firebase account/project access.
 2. Production Firebase Hosting origin/domain.
 3. Backend hosting target and acceptance of any billing requirement.
-4. Public user identity model and whether public chat is allowed without Owner authority.
-5. Approved mapping, if any, from an external identity to CyberSentinel Owner authority.
-6. Production session store and retention/expiry policy.
-7. Production provider/model and secret-injection source.
-8. Whether SSE is required for the first release.
-9. Production rate limits and resource limits.
-10. Domain ownership and TLS/DNS changes, if a custom domain is desired.
+4. Whether an external identity provider is needed for any future multi-user production deployment; the local browser uses the canonical Owner password flow.
+5. Production session store and retention/expiry policy.
+6. Production provider/model and secret-injection source.
+7. Whether SSE is required for any deployed browser boundary.
+8. Production rate limits and resource limits.
+9. Domain ownership and TLS/DNS changes, if a custom domain is desired.
 
-Until these choices are resolved, this design supports reviewable implementation work but does not assert production readiness, security certification, or real end-to-end operation.
+Until these choices are resolved, the local implementation must not be described as production-ready, security-certified, or deployed to Firebase/Cloud Run.
 
 ## Implementation boundary for this phase
 
-The next safe implementation steps are limited to local, reviewable changes: remove browser token prompts/storage, add a server-side public-boundary skeleton that fails closed when no approved Owner mapping exists, add security tests and documentation, and prepare deployment artifacts without deployment. Any step requiring Firebase login/project ID, production secret, Cloud Run creation, billing, domain ownership, or changed Owner semantics must stop for Owner decision.
+The local implementation now includes password login, cookie-backed Owner sessions, CSRF/origin checks, authenticated chat, logout, and HTTP regression tests. Any step requiring Firebase login/project ID, production secrets, Cloud Run creation, billing, domain ownership, or new identity semantics remains outside this implementation and requires separate authorization.
+
+The current local bridge serves both the static UI and its API from the same loopback origin. The Firebase/static-hosting diagram below remains a future deployment target, not the present runtime.

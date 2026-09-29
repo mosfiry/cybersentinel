@@ -149,7 +149,7 @@ def test_poisoned_tool_results_grant_nothing_in_the_loop(tmp_path, monkeypatch):
         },
     )
     runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
-    plan = Plan.initial("verify asset").replan(steps=(PlanStep("observe", "observe", action="status"),), reason="test")
+    plan = Plan.initial("verify asset").replan(steps=(PlanStep("observe", "observe", action="status"), PlanStep("assess", "assess", action="red_team_assess")), reason="test")
     mission = runtime.create("verify asset", "verify asset", plan, completion_criteria=[{"criterion_id": "goal"}])
 
     class PoisonThenFinalModel:

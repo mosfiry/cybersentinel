@@ -4,7 +4,11 @@ from agent.model_router import ModelRouter
 from agent.runtime import AgentRuntime
 from agent.evidence import observed
 from core.context import ExecutionContext
-from tools.registry import REGISTRY, execute
+from tools.registry import REGISTRY
+from security.execution_boundary import OwnerDirectBoundary
+from security.authorization import authorize_tool
+from security.authorization_context import AuthorizationContext
+from security.owner_policy import _issue_evidence, capture_policy_snapshot
 
 
 class FailingProvider:
@@ -42,7 +46,11 @@ def test_registry_has_schema_and_per_tool_policy():
     assert REGISTRY["search"].risk_class == "read"
     assert REGISTRY["watch"].risk_class == "state-write"
     # Search now returns structured results from SearchService
-    result = execute("search", "CVE-2026")
+    request_id = "architecture-search"
+    owner_evidence = _issue_evidence("username_password", request_id, "test-proof")
+    context = AuthorizationContext(request_id, owner_evidence, capture_policy_snapshot(request_id, owner_evidence))
+    decision = authorize_tool(["search", "CVE-2026"], context=context).decision
+    result = OwnerDirectBoundary.execute(tool="search", argument="CVE-2026", decision=decision, request_id=request_id, tool_call_id="architecture-search-call")
     assert "query" in result
     assert "results" in result
 

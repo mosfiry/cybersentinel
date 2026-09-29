@@ -67,6 +67,12 @@ def authorize_tool(item: Any, *, context: AuthorizationContext | None = None, ow
     spec = get_tool(name)
     if spec is None:
         return _result(context, allowed=False, reason="unknown tool", name=name)
+    if context is not None:
+        budget = getattr(context.policy_snapshot, "authority_snapshot", {}).get("owner_tool_budget")
+        if not isinstance(budget, (list, tuple, set, frozenset)):
+            return _result(context, allowed=False, reason="Owner tool budget is missing from the captured policy snapshot", name=name, risk_class=spec.risk_class)
+        if name not in budget:
+            return _result(context, allowed=False, reason="tool is outside the captured Owner tool budget", name=name, risk_class=spec.risk_class)
     if spec.owner_only and not effective_authenticated:
         return _result(context, allowed=False, reason="tool requires authenticated Owner", name=name, risk_class=spec.risk_class)
     if spec.owner_only and structural_only:
