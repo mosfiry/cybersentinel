@@ -74,9 +74,10 @@ class HypothesisEngine:
     def snapshot(self) -> list[dict[str, Any]]:
         return [self.hypotheses[key].to_dict() for key in sorted(self.hypotheses)]
 
-    def apply(self, proposal: ObservationInterpretationProposal, *, goal_verified: bool = False, deterministic_validation: bool = False) -> list[dict[str, Any]]:
+    def apply(self, proposal: ObservationInterpretationProposal, *, goal_verified: bool = False, deterministic_validation: bool = False, eligible_evidence_ids: Iterable[str] | None = None) -> list[dict[str, Any]]:
         updates: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc).isoformat()
+        eligible = None if eligible_evidence_ids is None else {str(item) for item in eligible_evidence_ids}
         for item in proposal.hypothesis_updates:
             hid = str(item.get("hypothesis_id", "")).strip()
             statement = str(item.get("statement", "")).strip()
@@ -96,6 +97,9 @@ class HypothesisEngine:
                 continue
             if not change.reason or (not change.supporting_evidence_ids and not change.counter_evidence_ids):
                 raise ValueError("confidence changes require reason and evidence provenance")
+            evidence_ids = (*change.supporting_evidence_ids, *change.counter_evidence_ids)
+            if eligible is not None and not set(evidence_ids).issubset(eligible):
+                continue
             current.confidence = max(0.0, min(1.0, current.confidence + float(change.delta)))
             current.supporting_evidence_ids.extend(change.supporting_evidence_ids)
             current.counter_evidence_ids.extend(change.counter_evidence_ids)

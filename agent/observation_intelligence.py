@@ -178,9 +178,10 @@ class ObservationInterpreter:
         proposal.pop("scope", None)
         proposal.pop("identity", None)
         proposal.pop("objective", None)
+        proposal.pop("provenance", None)
         proposal.setdefault("observation_id", base.observation_id)
         proposal.setdefault("summary", base.summary)
-        proposal.setdefault("provenance", {"source": "model_proposal", "base": base.provenance})
+        proposal["provenance"] = {"source": "model_proposal", "trust": "untrusted_claim", "base": base.provenance}
         try:
             return self._validate_model_proposal(proposal, base)
         except (TypeError, ValueError, KeyError) as exc:

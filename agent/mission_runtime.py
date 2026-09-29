@@ -261,8 +261,25 @@ class MissionRuntime:
             record = self.store.issue_criterion_evidence(mission, criterion_id, action_id)
             if record is None:
                 continue
+            system_evidence = record.get("system_evidence")
+            evidence_id = str(system_evidence.get("provenance_token", "")) if isinstance(system_evidence, dict) else ""
+            if evidence_id:
+                record["evidence_id"] = evidence_id
             mission.evidence.append(record)
             mission.emit(EventType.EVIDENCE_ADDED, data={"criterion_id": criterion_id, "provenance": "system-signed"})
+
+    @staticmethod
+    def _persisted_verified_evidence_ids(mission: Mission) -> set[str]:
+        """Resolve references only to persisted evidence with verified system provenance."""
+        if not mission.evidence:
+            return set()
+        eligible: set[str] = set()
+        for item in mission._verified_system_evidence():
+            verified = item.get("verified_provenance", {})
+            evidence_id = str(verified.get("provenance_token", "")) if isinstance(verified, dict) else ""
+            if evidence_id and str(item.get("evidence_id", evidence_id)) == evidence_id:
+                eligible.add(evidence_id)
+        return eligible
 
     def _interpret_observation(self, mission: Mission, step: PlanStep, observation: dict[str, Any], *, success: bool):
         previous = mission.observations[-2] if len(mission.observations) > 1 else None
@@ -280,7 +297,12 @@ class MissionRuntime:
             conversation_context=(),
         )
         engine = HypothesisEngine(HypothesisState.from_dict(item) for item in mission.hypotheses)
-        hypothesis_updates = engine.apply(proposal, goal_verified=False, deterministic_validation=False)
+        hypothesis_updates = engine.apply(
+            proposal,
+            goal_verified=False,
+            deterministic_validation=False,
+            eligible_evidence_ids=self._persisted_verified_evidence_ids(mission),
+        )
         mission.hypotheses = engine.snapshot()
         mission.knowledge_context = list(mission.knowledge_context)
         mission.interpretations.append(proposal.to_dict())
@@ -298,7 +320,8 @@ class MissionRuntime:
         if decision.next_strategy:
             strategy.current_strategy = decision.next_strategy
             strategy.version += 1
-        strategy.known_facts.extend(proposal.facts)
+        if proposal.provenance.get("source") != "model_proposal":
+            strategy.known_facts.extend(proposal.facts)
         strategy.unknowns.extend(proposal.unknowns)
         strategy.required_evidence.extend(proposal.required_next_evidence)
         mission.strategy_state = strategy.to_dict()
