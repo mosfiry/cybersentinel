@@ -13,7 +13,7 @@ from owner_session_testutils import allow_owner_sessions
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.execution_boundary import OwnerDirectBoundary
-from security.owner_policy import _issue_evidence, capture_policy_snapshot
+from security.owner_policy import authenticate_owner, capture_policy_snapshot
 from security.scope import ProgramAuthorization, TargetIdentity, make_snapshot
 import security.scope_store as scope_store
 from security.scope_store import init_scope_store, save_snapshot
@@ -104,12 +104,13 @@ def scope_context(url: str = "https://target.example.com/api/v1") -> dict[str, s
 
 
 def owner_context(snapshot, request_id: str = "probe-request") -> AuthorizationContext:
-    evidence = _issue_evidence("username_password", request_id, "probe-owner")
+    evidence = authenticate_owner("probe-owner", request_id)
     return AuthorizationContext(
         request_id,
         evidence,
         capture_policy_snapshot(request_id, evidence),
         scope_snapshot=snapshot,
+        session_id=evidence.session_id,
     )
 
 

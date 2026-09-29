@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import sqlite3
 import threading
@@ -44,7 +45,14 @@ init_scope_store()
 
 def save_snapshot(snapshot: ScopeSnapshot, *, owner_session_token: str | None = None) -> ScopeSnapshot:
     from .owner_policy import authenticate_owner
-    authenticate_owner(owner_session_token)
+    authentication = authenticate_owner(owner_session_token)
+    owner_session_id = str(authentication.session_id or "")
+    if not owner_session_id.strip():
+        raise PermissionError("owner session id required for persisted scope snapshots")
+    if snapshot.authorization.owner_session_id and snapshot.authorization.owner_session_id != owner_session_id:
+        raise PermissionError("scope snapshot session binding mismatch")
+    authorization = replace(snapshot.authorization, owner_session_id=owner_session_id, evidence_hash="")
+    snapshot = replace(snapshot, authorization=authorization)
     payload = json.dumps(snapshot.to_dict(), ensure_ascii=False, sort_keys=True)
     with _LOCK, _connect() as conn:
         try:

@@ -149,6 +149,41 @@ def test_save_snapshot_requires_owner_authentication(tmp_path, monkeypatch):
         save_snapshot(make_snapshot("snapshot-noauth", _authorization(), [_target()]), owner_session_token=None)
 
 
+def test_save_snapshot_binds_authenticated_owner_session_on_roundtrip(battery_snapshot):
+    loaded = scope_store.get_snapshot(battery_snapshot.snapshot_id)
+
+    assert battery_snapshot.authorization.owner_session_id == "battery-owner"
+    assert loaded is not None
+    assert loaded.authorization.owner_session_id == "battery-owner"
+    assert loaded.authorization.evidence_hash == battery_snapshot.authorization.evidence_hash
+
+
+def test_save_snapshot_rejects_caller_supplied_session_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
+    allow_owner_sessions(monkeypatch, "battery-owner")
+    init_scope_store()
+    snapshot = make_snapshot("snapshot-mismatched-session", _authorization(owner_session_id="other-owner"), [_target()])
+
+    with pytest.raises(PermissionError, match="scope snapshot session binding mismatch"):
+        save_snapshot(snapshot, owner_session_token="battery-owner")
+    assert scope_store.get_snapshot(snapshot.snapshot_id) is None
+
+
+def test_save_snapshot_rejects_authenticated_owner_without_session_id(tmp_path, monkeypatch):
+    import security.owner_password as owner_password
+
+    monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", Path(tmp_path) / "scope.sqlite3")
+    monkeypatch.setattr(owner_password, "resolve_session", lambda _token: {
+        "session_id": "",
+        "owner_id": 1,
+        "auth_method": "username_password",
+    })
+    init_scope_store()
+
+    with pytest.raises(PermissionError, match="owner session id required"):
+        save_snapshot(make_snapshot("snapshot-missing-session", _authorization(), [_target()]), owner_session_token="missing-id")
+
+
 def test_snapshot_evidence_hash_is_tamper_evident(battery_snapshot, tmp_path, monkeypatch):
     import json
     import sqlite3
@@ -161,6 +196,41 @@ def test_snapshot_evidence_hash_is_tamper_evident(battery_snapshot, tmp_path, mo
     conn.close()
     with pytest.raises(ValueError):
         scope_store.get_snapshot("snapshot-battery")
+
+
+def test_snapshot_owner_session_id_is_evidence_hashed(battery_snapshot):
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(scope_store.SCOPE_DB_PATH))
+    row = conn.execute("SELECT snapshot_json FROM scope_snapshots WHERE snapshot_id = 'snapshot-battery'").fetchone()
+    payload = json.loads(row[0])
+    payload["authorization"]["owner_session_id"] = "other-owner"
+    conn.execute("UPDATE scope_snapshots SET snapshot_json = ? WHERE snapshot_id = 'snapshot-battery'", (json.dumps(payload),))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ValueError, match="scope_evidence_hash_mismatch"):
+        scope_store.get_snapshot("snapshot-battery")
+
+
+def test_persisted_snapshot_cannot_be_reused_under_another_owner_session(battery_snapshot, monkeypatch):
+    from security.authorization_context import AuthorizationContext
+
+    allow_owner_sessions(monkeypatch, "battery-owner", "other-owner")
+    request_id = "cross-session-scope-reuse"
+    evidence = owner_policy.authenticate_owner("other-owner", request_id)
+    policy = owner_policy.capture_policy_snapshot(request_id, evidence)
+    persisted = scope_store.get_snapshot(battery_snapshot.snapshot_id)
+
+    with pytest.raises(ValueError, match="authorization context scope/session binding mismatch"):
+        AuthorizationContext(
+            request_id=request_id,
+            owner_evidence=evidence,
+            policy_snapshot=policy,
+            scope_snapshot=persisted,
+            session_id=evidence.session_id,
+        )
 
 
 # ---------------------------------------------------------------------------

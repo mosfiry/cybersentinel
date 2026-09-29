@@ -121,7 +121,7 @@ class ProgramAuthorization:
             raise ScopeError("scope_evidence_hash_mismatch")
 
     def computed_evidence_hash(self) -> str:
-        payload = {"program_id": self.program_id, "platform": self.platform, "scope_version": self.scope_version, "in_scope_assets": self.in_scope_assets, "out_of_scope_assets": self.out_of_scope_assets, "allowed_methods": self.allowed_methods, "prohibited_methods": self.prohibited_methods, "rate_limits": self.rate_limits, "testing_window": self.testing_window, "disclosure_policy": self.disclosure_policy}
+        payload = {"program_id": self.program_id, "platform": self.platform, "scope_version": self.scope_version, "in_scope_assets": self.in_scope_assets, "out_of_scope_assets": self.out_of_scope_assets, "allowed_methods": self.allowed_methods, "prohibited_methods": self.prohibited_methods, "rate_limits": self.rate_limits, "testing_window": self.testing_window, "disclosure_policy": self.disclosure_policy, "owner_session_id": self.owner_session_id}
         return sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:

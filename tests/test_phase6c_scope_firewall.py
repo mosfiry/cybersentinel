@@ -17,7 +17,7 @@ from security.execution_boundary import OwnerDirectBoundary
 import security.scope_store as scope_store
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
-from security.owner_policy import _issue_evidence, capture_policy_snapshot
+from security.owner_policy import authenticate_owner, capture_policy_snapshot
 
 
 @pytest.fixture
@@ -67,8 +67,8 @@ def test_scoped_probe_is_available_but_requires_the_bound_owner_scope_proof(snap
     assert "scoped_http_probe" in {item["name"] for item in tool_definitions()}
     catalog_entry = next(item for item in tool_definitions(include_unavailable=True) if item["name"] == "scoped_http_probe")
     assert catalog_entry["available"] is True
-    evidence = _issue_evidence("username_password", "scope-direct", "scope-direct")
-    auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
+    evidence = authenticate_owner("scope-owner", "scope-direct")
+    auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot, session_id=evidence.session_id)
     assert authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context).allowed
     with pytest.raises(PermissionError, match="PROOF_REQUIRED"):
         execute("scoped_http_probe", "https://target.example.com/api", request_id="scope-direct", tool_call_id="missing-proof")
