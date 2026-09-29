@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -12,7 +13,7 @@ from .state import TaskState
 from .task import TERMINAL_STATUSES, Task, TaskStatus
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "tasks.sqlite3"
+DB_PATH = Path(os.environ.get("CYBERSENTINEL_TASKS_DB_PATH", str(ROOT / "tasks.sqlite3")))
 _db_lock = threading.RLock()
 
 

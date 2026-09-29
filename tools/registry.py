@@ -200,7 +200,7 @@ def _unwatch(argument):
 
 def _sandbox_python_environment_args(prefix: Path, *, disable_bytecode: bool = False) -> list[str]:
     """Build a cleared environment, allowing only the bound interpreter library path."""
-    args = ["--clearenv", "--setenv", "PATH", f"{prefix / 'bin'}:/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp"]
+    args = ["--clearenv", "--setenv", "PATH", f"{prefix / 'bin'}:/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--setenv", "CYBERSENTINEL_MEMORY_DB_PATH", "/tmp/cybersentinel-pytest-memory.sqlite3", "--setenv", "CYBERSENTINEL_TASKS_DB_PATH", "/tmp/cybersentinel-pytest-tasks.sqlite3"]
     runtime_library_dir = prefix / "lib"
     if runtime_library_dir.is_dir():
         args.extend(("--setenv", "LD_LIBRARY_PATH", str(runtime_library_dir)))

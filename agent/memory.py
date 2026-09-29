@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -20,7 +21,7 @@ from typing import Any
 
 # Database setup
 ROOT = Path(__file__).resolve().parents[1]
-MEMORY_DB_PATH = ROOT / "memory.sqlite3"
+MEMORY_DB_PATH = Path(os.environ.get("CYBERSENTINEL_MEMORY_DB_PATH", str(ROOT / "memory.sqlite3")))
 
 # Ensure database directory exists
 MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)

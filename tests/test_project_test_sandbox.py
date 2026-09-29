@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
+import sys
+import textwrap
 import time
 
 import pytest
@@ -43,6 +46,64 @@ class _SubprocessWorkspace:
             False,
             time.monotonic() - started,
         )
+
+
+def test_database_paths_default_to_repository_files_without_overrides():
+    repository = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment.pop("CYBERSENTINEL_MEMORY_DB_PATH", None)
+    environment.pop("CYBERSENTINEL_TASKS_DB_PATH", None)
+    script = textwrap.dedent(
+        """
+        import sqlite3
+        from pathlib import Path
+
+        class _Result:
+            def fetchall(self):
+                return []
+
+        class _Connection:
+            def execute(self, *_args, **_kwargs):
+                return _Result()
+            def commit(self):
+                pass
+            def rollback(self):
+                pass
+            def close(self):
+                pass
+
+        sqlite3.connect = lambda *_args, **_kwargs: _Connection()
+        from agent import memory, task_manager
+
+        root = Path(memory.__file__).resolve().parents[1]
+        assert memory.MEMORY_DB_PATH == root / "memory.sqlite3"
+        assert task_manager.DB_PATH == root / "tasks.sqlite3"
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_sandbox_environment_uses_fixed_tmpfs_database_paths(monkeypatch):
+    monkeypatch.setenv("CYBERSENTINEL_MEMORY_DB_PATH", "/workspace/host-memory.sqlite3")
+    monkeypatch.setenv("CYBERSENTINEL_TASKS_DB_PATH", "/workspace/host-tasks.sqlite3")
+
+    args = registry._sandbox_python_environment_args(Path("/usr"))
+
+    assert args[args.index("CYBERSENTINEL_MEMORY_DB_PATH") + 1] == "/tmp/cybersentinel-pytest-memory.sqlite3"
+    assert args[args.index("CYBERSENTINEL_TASKS_DB_PATH") + 1] == "/tmp/cybersentinel-pytest-tasks.sqlite3"
+    assert "/workspace/host-memory.sqlite3" not in args
+    assert "/workspace/host-tasks.sqlite3" not in args
 
 
 def test_sandbox_environment_allows_only_prefix_library_path(tmp_path, monkeypatch):
@@ -91,6 +152,11 @@ def test_project_tests_run_in_secret_filtered_readonly_networkless_sandbox(tmp_p
 
     root = tmp_path / "project"
     root.mkdir()
+    shutil.copytree(
+        Path(__file__).resolve().parents[1] / "agent",
+        root / "agent",
+        ignore=registry._project_snapshot_ignore,
+    )
     (root / "config").mkdir()
     (root / ".aws").mkdir()
     (root / ".ssh").mkdir()
@@ -110,6 +176,13 @@ def test_project_tests_run_in_secret_filtered_readonly_networkless_sandbox(tmp_p
     (root / "conftest.py").write_text(
         "from pathlib import Path\n"
         "import os, socket\n"
+        "from agent import memory, task_manager\n"
+        "assert memory.MEMORY_DB_PATH == Path('/tmp/cybersentinel-pytest-memory.sqlite3')\n"
+        "assert task_manager.DB_PATH == Path('/tmp/cybersentinel-pytest-tasks.sqlite3')\n"
+        "assert Path('/tmp/cybersentinel-pytest-memory.sqlite3').is_file()\n"
+        "assert Path('/tmp/cybersentinel-pytest-tasks.sqlite3').is_file()\n"
+        "assert os.environ.get('CYBERSENTINEL_MEMORY_DB_PATH') == str(memory.MEMORY_DB_PATH)\n"
+        "assert os.environ.get('CYBERSENTINEL_TASKS_DB_PATH') == str(task_manager.DB_PATH)\n"
         "assert not Path('/tmp/cybersentinel-project-test-host-canary').exists()\n"
         "assert not Path('/workspace/.env').exists()\n"
         "assert Path('/workspace/.env.example').exists()\n"
@@ -136,6 +209,8 @@ def test_project_tests_run_in_secret_filtered_readonly_networkless_sandbox(tmp_p
     )
     (root / "test_sample.py").write_text("def test_sandbox_temp_write(tmp_path):\n    marker = tmp_path / 'ok.txt'\n    marker.write_text('isolated')\n    assert marker.read_text() == 'isolated'\n", encoding="utf-8")
     monkeypatch.setenv("CYBERSENTINEL_HOST_SECRET", "host-env-canary")
+    monkeypatch.setenv("CYBERSENTINEL_MEMORY_DB_PATH", "/workspace/host-memory.sqlite3")
+    monkeypatch.setenv("CYBERSENTINEL_TASKS_DB_PATH", "/workspace/host-tasks.sqlite3")
 
     workspace = _SubprocessWorkspace(root)
     try:
@@ -151,4 +226,8 @@ def test_project_tests_run_in_secret_filtered_readonly_networkless_sandbox(tmp_p
     assert registry._BWRAP in workspace.command
     assert "/workspace" in workspace.command
     assert workspace.command[workspace.command.index("LD_LIBRARY_PATH") + 1] == str(Path(registry.sys.prefix).resolve() / "lib")
+    workspace_mount = workspace.command.index("/workspace")
+    assert workspace.command[workspace_mount - 2] == "--ro-bind"
+    tmpfs = workspace.command.index("--tmpfs")
+    assert workspace.command[tmpfs + 1] == "/tmp"
     assert not (root / "should-not-write").exists()
