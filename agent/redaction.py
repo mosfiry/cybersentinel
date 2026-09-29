@@ -32,6 +32,13 @@ _SENSITIVE_KEY_MARKERS = (
     "apikey", "password", "secret", "credential", "sessionid", "ownersession",
     "accesstoken", "refreshtoken", "privatekey",
 )
+_SAFE_TOKEN_COUNT_KEYS = frozenset(
+    {
+        "inputtokensestimated", "inputtokens", "inputtokensreported",
+        "outputtokens", "outputtokensreported", "prompttokens", "completiontokens",
+        "maxtotaltokens",
+    }
+)
 _SENSITIVE_EXACT_KEYS = frozenset(
     {
         "auth", "authcontext", "ownerauth", "ownerauthorization", "authorization",
@@ -73,7 +80,11 @@ def sanitize_sensitive_data(value: Any) -> Any:
         for key, item in value.items():
             compact = re.sub(r"[^a-z0-9]", "", str(key).casefold())
             safe_derivative = compact.endswith(_SAFE_DERIVATIVE_SUFFIXES)
-            if compact in _OPAQUE_REFERENCE_KEYS or compact in _SAFE_STRUCTURAL_KEYS:
+            if compact in _SAFE_TOKEN_COUNT_KEYS and (
+                item is None or (type(item) is int and item >= 0)
+            ):
+                result[str(key)] = item
+            elif compact in _OPAQUE_REFERENCE_KEYS or compact in _SAFE_STRUCTURAL_KEYS:
                 result[str(key)] = sanitize_sensitive_data(item)
             elif compact in _SENSITIVE_EXACT_KEYS or (
                 not safe_derivative and any(marker in compact for marker in _SENSITIVE_KEY_MARKERS)

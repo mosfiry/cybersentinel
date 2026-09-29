@@ -283,3 +283,55 @@ def test_lifecycle_execution_result_and_errors_are_sanitized_before_storage(tmp_
     assert result.final_result["status"] == 200
     assert result.final_result["password"] == "[REDACTED]"
     assert result.error == "Cookie: [REDACTED]"
+
+
+def test_mission_serialization_preserves_token_count_telemetry_and_redacts_credentials(tmp_path, monkeypatch):
+    from agent import redaction
+
+    marker = _marker()
+    monkeypatch.setattr(
+        redaction,
+        "_SENSITIVE_KEY_MARKERS",
+        (*redaction._SENSITIVE_KEY_MARKERS, "token"),
+    )
+    mission = Mission.create(
+        "Record model invocation telemetry",
+        "Preserve token usage metrics without credential material",
+        Plan.initial("Preserve token usage metrics without credential material"),
+        mission_id="mission-token-telemetry-canary",
+    )
+    mission.provenance["model_invocation"] = {
+        "input_tokens_estimated": 128,
+        "input_tokens": 128,
+        "input_tokens_reported": 120,
+        "output_tokens": 32,
+        "output_tokens_reported": 32,
+        "prompt_tokens": 128,
+        "completion_tokens": 32,
+        "max_total_tokens": 1024,
+        "token": marker,
+        "access_token": marker,
+        "api_key": marker,
+    }
+    store = MissionStore(tmp_path / "mission-token-telemetry.sqlite3")
+    store.save(mission)
+
+    with sqlite3.connect(store.db_path) as db:
+        serialized = db.execute(
+            "SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)
+        ).fetchone()[0]
+    payload = json.loads(serialized)
+    invocation = payload["provenance"]["model_invocation"]
+
+    assert invocation["input_tokens_estimated"] == 128
+    assert invocation["input_tokens"] == 128
+    assert invocation["input_tokens_reported"] == 120
+    assert invocation["output_tokens"] == 32
+    assert invocation["output_tokens_reported"] == 32
+    assert invocation["prompt_tokens"] == 128
+    assert invocation["completion_tokens"] == 32
+    assert invocation["max_total_tokens"] == 1024
+    assert invocation["token"] == "[REDACTED]"
+    assert invocation["access_token"] == "[REDACTED]"
+    assert invocation["api_key"] == "[REDACTED]"
+    assert marker not in serialized
