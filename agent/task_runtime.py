@@ -52,6 +52,8 @@ class AgentTaskRuntime:
     def _schemas() -> list[dict[str, Any]]:
         schemas = []
         for spec in REGISTRY.values():
+            if not spec.available:
+                continue
             parameters = {"type": "object", "properties": {}, "additionalProperties": False}
             if spec.argument_type is str:
                 parameters["properties"]["query"] = {"type": "string", "maxLength": 256}

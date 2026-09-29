@@ -403,8 +403,9 @@ class ContextBuilder:
     
     def add_tool_definitions(self) -> ContextBuilder:
         """Add tool definitions from registry."""
-        from tools.registry import tool_definitions
-        self.tool_definitions = tool_definitions()
+        from tools.registry import REGISTRY, tool_definitions
+        available_names = {spec.name for spec in REGISTRY.values() if spec.available}
+        self.tool_definitions = [item for item in tool_definitions() if item.get("name") in available_names]
         
         # Create a compact tool summary
         tool_list = []
@@ -883,7 +884,7 @@ class ContextEngine:
 # =============================================================================
 
 class ProviderAdapter:
-    """Adapter for provider-specific context formatting.
+    """Legacy generic prompt-formatting helper, not a model transport.
     
     Each provider (OpenAI, HF, Local) may need different formatting.
     This keeps ContextEngine provider-agnostic.
@@ -899,10 +900,13 @@ class ProviderAdapter:
 
 
 class OpenAIProviderAdapter(ProviderAdapter):
-    """Adapter for OpenAI-compatible providers."""
+    """Compatibility name using generic formatting; it does not call a provider.
+
+    The live OpenAI-compatible HTTP adapter is ``agent.provider_api.OpenAICompatibleProvider``.
+    """
     pass
 
 
 class LocalProviderAdapter(ProviderAdapter):
-    """Adapter for local providers."""
+    """Compatibility name using generic formatting; no local transport is implemented here."""
     pass

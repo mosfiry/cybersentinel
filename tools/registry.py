@@ -4,8 +4,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import fnmatch
 import os
+import shutil
 import sys
+import tempfile
+import subprocess
 
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
@@ -14,6 +18,10 @@ TOOL_TIMEOUTS = {"run_project_tests": 65, "refresh_intel": 30}
 
 
 class ToolTimeout(TimeoutError):
+    pass
+
+
+class ToolUnavailableError(RuntimeError):
     pass
 
 
@@ -38,6 +46,8 @@ class ToolSpec:
     timeout: int = DEFAULT_TOOL_TIMEOUT
     rate_limit: str = "bounded"
     evidence_requirements: tuple[str, ...] = ("authorization_decision", "observation")
+    available: bool = True
+    availability_reason: str = ""
 
     @property
     def tool_id(self) -> str:
@@ -66,6 +76,8 @@ class ToolSpec:
             "timeout": self.timeout,
             "rate_limit": self.rate_limit,
             "evidence_requirements": list(self.evidence_requirements),
+            "available": self.available,
+            "availability_reason": self.availability_reason,
         }
 
     def validate(self, argument: Any) -> tuple[bool, str]:
@@ -186,9 +198,85 @@ def _unwatch(argument):
     return {"keyword": argument, "watches": watches()}
 
 
+def _probe_project_test_sandbox() -> tuple[bool, str, str, str]:
+    """Verify the OS sandbox and isolated interpreter are available at startup."""
+    bwrap = shutil.which("bwrap") or ""
+    prlimit = shutil.which("prlimit") or ""
+    if not bwrap or not prlimit:
+        return False, "Unavailable: bubblewrap/prlimit OS sandbox is not installed", bwrap, prlimit
+    prefix = Path(sys.prefix).resolve()
+    try:
+        prefix.relative_to(Path.home().resolve())
+    except ValueError:
+        pass
+    else:
+        return False, "Unavailable: the test interpreter is inside the user home and cannot be exposed to project tests", bwrap, prlimit
+    command = [prlimit, "--cpu=5", "--as=2147483648", "--fsize=67108864", "--nofile=256", "--nproc=1024", "--", bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/usr", "/usr"]
+    for system_path in ("/bin", "/lib", "/lib64", "/etc"):
+        if Path(system_path).exists():
+            command.extend(("--ro-bind", system_path, system_path))
+    if not prefix.is_relative_to(Path("/usr")):
+        command.extend(("--ro-bind", str(prefix), str(prefix)))
+    command.extend(("--size", "268435456", "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--clearenv", "--setenv", "PATH", f"{prefix / 'bin'}:/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--setenv", "PYTHONNOUSERSITE", "1", "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1", "--", sys.executable, "-c", "import pytest"))
+    try:
+        probe = subprocess.run(command, capture_output=True, timeout=4, check=False, env={"PATH": os.environ.get("PATH", "")})
+    except Exception as exc:
+        return False, f"Unavailable: OS test sandbox preflight failed ({type(exc).__name__})", bwrap, prlimit
+    if probe.returncode != 0:
+        return False, "Unavailable: OS test sandbox or isolated pytest interpreter failed preflight", bwrap, prlimit
+    return True, "", bwrap, prlimit
+
+
+_PROJECT_TEST_SANDBOX_AVAILABLE, _PROJECT_TEST_SANDBOX_REASON, _BWRAP, _PRLIMIT = _probe_project_test_sandbox()
+
+
+def _project_snapshot_ignore(_directory: str, names: list[str]) -> set[str]:
+    blocked_exact = {".git", ".pytest_cache", "__pycache__", ".env", ".envrc", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".vault-token", ".terraformrc", "terraform.rc", "credentials.json", "token.json", "client_secret.json", ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker", ".config", ".terraform", ".pulumi", ".vercel", "secrets", "credentials", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "id_xmss", "identity", "authorized_keys", "known_hosts"}
+    safe_templates = {".env.example", ".env.sample", ".env.template"}
+    blocked_globs = ("*.key", "*.pem", "*.p12", "*.pfx", "*.crt", "*.cer", "*.der", "*.ovpn", "*.tfstate", "*.tfstate.*", "*.sqlite", "*.sqlite3", "*.db", "*.db-wal", "*.db-shm", "*service-account*.json")
+    ignored = set()
+    for name in names:
+        folded = name.casefold()
+        if folded in blocked_exact or (folded.startswith(".env.") and folded not in safe_templates) or any(fnmatch.fnmatch(folded, pattern) for pattern in blocked_globs):
+            ignored.add(name)
+    return ignored
+
+
+def _project_snapshot_size(source: Path, *, max_entries: int = 20_000, max_bytes: int = 256 * 1024 * 1024, max_depth: int = 128) -> None:
+    count = 0
+    total = 0
+    for directory, child_dirs, files in os.walk(source, topdown=True, followlinks=False):
+        ignored_dirs = _project_snapshot_ignore(directory, child_dirs)
+        child_dirs[:] = [name for name in child_dirs if name not in ignored_dirs]
+        ignored_files = _project_snapshot_ignore(directory, files)
+        relative_directory = Path(directory).relative_to(source)
+        if len(relative_directory.parts) > max_depth:
+            raise ValueError("project test input exceeds the 128-level directory depth limit")
+        for name in (*child_dirs, *(item for item in files if item not in ignored_files)):
+            path = Path(directory) / name
+            if path.is_symlink():
+                total += len(os.readlink(path).encode("utf-8", errors="replace"))
+                count += 1
+            elif path.is_dir():
+                count += 1
+                continue
+            else:
+                try:
+                    info = path.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise ValueError("project snapshot contains an unreadable entry") from exc
+                if path.is_file():
+                    total += info.st_size
+                count += 1
+            if count > max_entries or total > max_bytes:
+                raise ValueError("project test input exceeds the 20,000-entry / 256 MiB snapshot limit")
+
+
 def _run_project_tests(argument, *, workspace=None):
     if workspace is None:
         raise PermissionError("run_project_tests requires governed Workspace")
+    if not _PROJECT_TEST_SANDBOX_AVAILABLE:
+        raise ToolUnavailableError(_PROJECT_TEST_SANDBOX_REASON)
     target = argument or "."
     try:
         if not workspace.resolve(target).is_dir():
@@ -197,7 +285,22 @@ def _run_project_tests(argument, *, workspace=None):
         if isinstance(exc, ValueError):
             raise
         raise ValueError("project directory is outside the configured test root") from exc
-    result = workspace.develop((sys.executable, "-m", "pytest", "-q"), cwd=target, timeout=60)
+    _project_snapshot_size(workspace.resolve(target))
+    try:
+        with tempfile.TemporaryDirectory(prefix="cybersentinel-pytest-snapshot-") as temporary:
+            snapshot = Path(temporary) / "project"
+            shutil.copytree(workspace.resolve(target), snapshot, symlinks=True, ignore=_project_snapshot_ignore)
+            prefix = Path(sys.prefix).resolve()
+            command = [_PRLIMIT, "--cpu=60", "--as=2147483648", "--fsize=67108864", "--nofile=256", "--nproc=1024", "--", _BWRAP, "--unshare-all", "--die-with-parent", "--new-session", "--ro-bind", "/usr", "/usr"]
+            for system_path in ("/bin", "/lib", "/lib64", "/etc"):
+                if Path(system_path).exists():
+                    command.extend(("--ro-bind", system_path, system_path))
+            if not prefix.is_relative_to(Path("/usr")):
+                command.extend(("--ro-bind", str(prefix), str(prefix)))
+            command.extend(("--ro-bind", str(snapshot), "/workspace", "--size", "268435456", "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--chdir", "/workspace", "--clearenv", "--setenv", "PATH", f"{prefix / 'bin'}:/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTHONNOUSERSITE", "1", "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1", "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--basetemp=/tmp/pytest-run", "-q"))
+            result = workspace.develop(tuple(command), cwd=".", timeout=60)
+    except (OSError, shutil.Error) as exc:
+        raise ToolUnavailableError("isolated project test setup failed closed") from exc
     return {"ok": result.ok, "timed_out": result.timed_out, "returncode": result.exit_code, "output": (result.stdout + result.stderr)[-4000:]}
 
 
@@ -207,8 +310,7 @@ def _red_team_assess(argument):
 
 
 def _scoped_http_probe(argument):
-    """Metadata-only bounded probe placeholder; network execution comes after Scope Firewall."""
-    return {"ok": True, "operation": "scoped_http_probe", "url": argument, "note": "scope-authorized observation placeholder"}
+    raise ToolUnavailableError("Unavailable / Not supported by current backend contract: scoped HTTP transport is not implemented")
 
 
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
@@ -218,7 +320,7 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             raise ValueError("duplicate or invalid tool specification")
         scope_namespace = spec.name.split(".", 1)[0]
         scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "report"}
-        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner) or (scope_namespace in scope_namespaces and not spec.scope_required):
+        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner) or (scope_namespace in scope_namespaces and not spec.scope_required) or type(spec.available) is not bool or (not spec.available and not spec.availability_reason):
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
@@ -235,18 +337,20 @@ REGISTRY = build_registry([
     ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search),
     ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch),
     ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch),
-    ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests),
+    ToolSpec("run_project_tests", "تشغيل pytest داخل نسخة قراءة فقط معزولة بنظام التشغيل", "bounded-exec", True, str, _run_project_tests, timeout=65, network_access="none", filesystem_access="secret_filtered_read_only_snapshot", process_access="bubblewrap+prlimit", credential_access="none", available=_PROJECT_TEST_SANDBOX_AVAILABLE, availability_reason=_PROJECT_TEST_SANDBOX_REASON),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
-    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True),
+    ToolSpec("scoped_http_probe", "Unavailable / Not supported by current backend contract: لا يوجد نقل HTTP محدود النطاق منفذ حاليًا", "network-read", True, str, _scoped_http_probe, False, True, available=False, availability_reason="Unavailable / Not supported by current backend contract: scoped HTTP transport is not implemented"),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
 
 
-def tool_definitions() -> list[dict[str, Any]]:
+def tool_definitions(*, include_unavailable: bool = False) -> list[dict[str, Any]]:
     """Build provider-neutral tool metadata from the canonical registry."""
     definitions: list[dict[str, Any]] = []
     for spec in REGISTRY.values():
+        if not spec.available and not include_unavailable:
+            continue
         parameters: dict[str, Any] = {
             "type": "object",
             "properties": {},
@@ -277,6 +381,8 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+    if not spec.available:
+        raise ToolUnavailableError(spec.availability_reason or "tool is unavailable")
     from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, RejectionCode
     mission_bound = mission_authorization is not None or workspace is not None or evidence_store is not None or bool(mission_id)
     resolved_class = str(execution_class or (ExecutionClass.MISSION_BOUND.value if mission_bound else ExecutionClass.OWNER_DIRECT.value))

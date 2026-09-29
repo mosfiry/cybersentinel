@@ -23,8 +23,7 @@
     "watch",
     "unwatch",
     "run_project_tests",
-    "red_team_assess",
-    "scoped_http_probe"
+    "red_team_assess"
   ],
   "runtime_limits": {
     "max_context_messages": 50,

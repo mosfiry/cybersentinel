@@ -12,7 +12,7 @@ from agent.task_runtime import AgentTaskRuntime
 from security.scope import ProgramAuthorization, TargetIdentity, make_snapshot
 from security.scope_resolver import resolve
 from security.scope_store import init_scope_store, save_snapshot
-from tools.registry import execute
+from tools.registry import ToolUnavailableError, execute, get_tool, tool_definitions
 from security.execution_boundary import OwnerDirectBoundary
 import security.scope_store as scope_store
 from security.authorization import authorize_tool
@@ -59,17 +59,20 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
     assert not resolve("snapshot-1", "target-1", "https://target.example.com/api/private").allowed
 
 
-def test_direct_registry_execution_cannot_bypass_scope(snapshot):
-    with pytest.raises(PermissionError, match="unique tool-call identity"):
+def test_scoped_probe_is_unavailable_and_never_reports_placeholder_success(snapshot):
+    spec = get_tool("scoped_http_probe")
+    assert spec is not None and spec.available is False
+    assert "Unavailable / Not supported by current backend contract" in spec.availability_reason
+    assert "scoped_http_probe" not in {item["name"] for item in tool_definitions()}
+    catalog_entry = next(item for item in tool_definitions(include_unavailable=True) if item["name"] == "scoped_http_probe")
+    assert catalog_entry["available"] is False
+    assert catalog_entry["availability_reason"] == spec.availability_reason
+    with pytest.raises(ToolUnavailableError, match="Unavailable / Not supported by current backend contract"):
         execute("scoped_http_probe", "https://target.example.com/api")
     evidence = _issue_evidence("username_password", "scope-direct", "scope-direct")
     auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
-    denied = authorize_tool(["scoped_http_probe", "https://other.example.com/api"], context=auth_context)
-    with pytest.raises(PermissionError, match="scope denied"):
-        OwnerDirectBoundary.execute(tool="scoped_http_probe", argument="https://other.example.com/api", decision=denied.decision, request_id="scope-direct", tool_call_id="scope-call-denied", scope_context=context("https://other.example.com/api"))
-    allowed = authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context)
-    result = OwnerDirectBoundary.execute(tool="scoped_http_probe", argument="https://target.example.com/api", decision=allowed.decision, request_id="scope-direct", tool_call_id="scope-call-allowed", scope_context=context())
-    assert result["ok"] is True
+    assert not authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context).allowed
+    assert not resolve("snapshot-1", "target-1", "https://other.example.com/api", consume_rate=False).allowed
 
 
 def test_rate_limit_is_persistent_and_enforced(snapshot):

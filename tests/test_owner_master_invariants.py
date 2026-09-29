@@ -62,10 +62,10 @@ def test_i15_sensitive_tool_requires_typed_context():
     assert result.reason == "sensitive tool requires AuthorizationContext"
 
 
-def test_i8_scope_bound_tool_requires_scope_snapshot_context():
+def test_unavailable_scoped_probe_is_rejected_before_scope_authorization():
     result = authorize_tool(_item("scoped_http_probe"))
     assert result.allowed is False
-    assert result.reason == "scope-bound tool requires AuthorizationContext with ScopeSnapshot"
+    assert result.reason == "Unavailable / Not supported by current backend contract: scoped HTTP transport is not implemented"
 
 
 def test_argument_length_limit_is_enforced():

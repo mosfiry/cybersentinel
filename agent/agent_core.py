@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,8 @@ from .knowledge_context import TypedKnowledgeRetriever
 from .hypotheses import HypothesisState, HypothesisStatus
 from .strategy import StrategyState
 from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnderstanding
+
+logger = logging.getLogger(__name__)
 
 
 class AgentCore:
@@ -73,6 +76,8 @@ class AgentCore:
     def _schemas() -> list[dict[str, Any]]:
         result = []
         for spec in REGISTRY.values():
+            if not spec.available:
+                continue
             parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
             if spec.argument_type is str:
                 parameters["properties"]["query"] = {"type": "string", "maxLength": 256}
@@ -130,7 +135,7 @@ class AgentCore:
         steps: list[PlanStep] = []
         for index, call in enumerate(calls, start=1):
             spec = get_tool(call.name)
-            if spec is None:
+            if spec is None or not spec.available:
                 continue
             steps.append(PlanStep(
                 step_id=f"step-{index}-{call.name}",
@@ -289,7 +294,7 @@ class AgentCore:
                     "required": True,
                 }]
             else:
-                effective_criteria = [{"criterion_id": "mission-goal", "description": "The Owner objective has a supported, independently verified result.", "check": "tool observation", "required": True}]
+                effective_criteria = [{"criterion_id": "mission-goal", "description": "A supported independent deterministic verifier must establish the Owner objective; generic tool success or captured output is not sufficient.", "check": "owner_defined_verifier", "required": True}]
         else:
             effective_criteria = list(completion_criteria)
 
@@ -364,8 +369,8 @@ class AgentCore:
                     result.progress["last_model_content"] = str(final_response["content"])
                     result.progress["last_model_response"] = dict(final_response)
                     self.store.save(result)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("presentation-only final response failed (%s)", type(exc).__name__)
         return result
 
     def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None, run: bool = True) -> Mission:

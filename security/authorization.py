@@ -67,6 +67,8 @@ def authorize_tool(item: Any, *, context: AuthorizationContext | None = None, ow
     spec = get_tool(name)
     if spec is None:
         return _result(context, allowed=False, reason="unknown tool", name=name)
+    if not spec.available:
+        return _result(context, allowed=False, reason=spec.availability_reason or "tool is unavailable", name=name, risk_class=spec.risk_class)
     if context is not None:
         budget = getattr(context.policy_snapshot, "authority_snapshot", {}).get("owner_tool_budget")
         if not isinstance(budget, (list, tuple, set, frozenset)):

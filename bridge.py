@@ -44,6 +44,16 @@ from workspace import Workspace, WorkspaceBoundaryError, WorkspacePolicy, Worksp
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
+WORKSPACE_GIT_DIFF_EXCLUSIONS = tuple(
+    f":(exclude,icase,glob){pattern}"
+    for pattern in (
+        ".env*", "**/.env*", ".netrc", "**/.netrc", ".npmrc", "**/.npmrc", ".pypirc", "**/.pypirc", ".git-credentials", "**/.git-credentials",
+        ".aws/**", "**/.aws/**", ".azure/**", "**/.azure/**", ".gcloud/**", "**/.gcloud/**", ".kube/**", "**/.kube/**", ".docker/**", "**/.docker/**", ".config/**", "**/.config/**", ".ssh/**", "**/.ssh/**", ".gnupg/**", "**/.gnupg/**", ".terraform/**", "**/.terraform/**", ".pulumi/**", "**/.pulumi/**", ".vercel/**", "**/.vercel/**",
+        "id_rsa", "**/id_rsa", "id_dsa", "**/id_dsa", "id_ecdsa", "**/id_ecdsa", "id_ed25519", "**/id_ed25519", "id_ed25519_sk", "**/id_ed25519_sk", "id_xmss", "**/id_xmss", "identity", "**/identity", "authorized_keys", "**/authorized_keys", "known_hosts", "**/known_hosts",
+        ".vault-token", "**/.vault-token", ".terraformrc", "**/.terraformrc", "terraform.rc", "**/terraform.rc", "terraform.tfstate*", "**/terraform.tfstate*", "credentials.json", "**/credentials.json", "token.json", "**/token.json", "client_secret.json", "**/client_secret.json",
+        "*.key", "**/*.key", "*.pem", "**/*.pem", "*.p12", "**/*.p12", "*.pfx", "**/*.pfx", "*.crt", "**/*.crt", "*.cer", "**/*.cer", "*.der", "**/*.der", "*.ovpn", "**/*.ovpn", "*.sqlite*", "**/*.sqlite*", "*.db*", "**/*.db*", "secrets/**", "**/secrets/**", "credentials/**", "**/credentials/**",
+    )
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -174,8 +184,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = tuple(part.casefold() for part in path.relative_to(root).parts)
         except ValueError:
             return True
-        blocked_dirs = {".git", ".ssh", ".gnupg", "secrets", "credentials"}
-        blocked_names = {".env", "id_rsa", "id_ed25519", "authorized_keys", "known_hosts"}
+        blocked_dirs = {".git", ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker", ".config", ".terraform", ".pulumi", ".vercel", "secrets", "credentials"}
+        blocked_names = {".env", ".envrc", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".vault-token", ".terraformrc", "terraform.rc", "terraform.tfstate", "terraform.tfstate.backup", "credentials.json", "token.json", "client_secret.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ed25519_sk", "id_xmss", "identity", "authorized_keys", "known_hosts"}
         safe_env_templates = {".env.example", ".env.sample", ".env.template"}
         if any(part in blocked_dirs or part in blocked_names or (part.startswith(".env.") and part not in safe_env_templates) for part in parts):
             return True
@@ -369,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
                         "status": ("status", "--short", "--branch"),
                         "branch": ("branch", "--show-current"),
                         "log": ("log", "-8", "--oneline", "--decorate"),
-                        "diff": ("diff", "--no-ext-diff", "--no-color", "--", ".", ":(exclude).env", ":(exclude).env.*", ":(exclude)**/*.key", ":(exclude)**/*.pem", ":(exclude)**/*.p12", ":(exclude)**/*.pfx", ":(exclude)**/*.sqlite*", ":(exclude)**/*.db*", ":(exclude)**/secrets/**", ":(exclude)**/credentials/**"),
+                        "diff": ("diff", "--no-ext-diff", "--no-color", "--", ".", *WORKSPACE_GIT_DIFF_EXCLUSIONS),
                         "head": ("rev-parse", "HEAD"),
                         "repository": ("rev-parse", "--show-toplevel"),
                         "remote": ("remote", "get-url", "origin"),
@@ -405,7 +415,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tools":
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
-            return self._send(200, {"ok": True, "tools": tool_definitions()})
+            return self._send(200, {"ok": True, "tools": tool_definitions(include_unavailable=True)})
         if parsed.path.startswith("/api/session/"):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})

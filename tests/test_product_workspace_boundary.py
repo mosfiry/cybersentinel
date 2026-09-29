@@ -273,6 +273,59 @@ def test_workspace_git_ui_is_real_read_only_and_redacts_remote_credentials(web_s
     assert "لا تنفّذ commit أو push" in Path("web/app.js").read_text(encoding="utf-8")
 
 
+def test_workspace_blocks_environment_and_credential_paths_from_file_listing_and_git_diff(web_server, tmp_path, monkeypatch):
+    server = web_server
+    public_cookies, csrf = login(server)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "config").mkdir()
+    secret_files = {
+        ".envrc": "fixture-secret-envrc",
+        ".ENV": "fixture-secret-uppercase-env",
+        "config/.env": "fixture-secret-nested-env",
+        "config/.env.local": "fixture-secret-nested-env-local",
+        ".aws/credentials": "fixture-secret-aws",
+        ".AWS/Credentials": "fixture-secret-uppercase-aws",
+        ".ssh/id_ed25519": "fixture-secret-ssh",
+        ".docker/config.json": "fixture-secret-docker",
+        ".config/gcloud": "fixture-secret-config",
+        "id_rsa": "fixture-secret-root-key",
+    }
+    for secret_path, marker in secret_files.items():
+        destination = root / secret_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(f"{marker}\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "workspace-test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Workspace Test"], check=True)
+    (root / "README.md").write_text("baseline", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", *secret_files, "README.md"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "workspace baseline"], check=True)
+    for secret_path, marker in secret_files.items():
+        (root / secret_path).write_text(f"{marker}-modified\n", encoding="utf-8")
+    service, mission = make_service(tmp_path, root)
+    monkeypatch.setattr(bridge.Handler, "_mission_service", lambda self: service)
+
+    for secret_path, marker in secret_files.items():
+        status, _, file_response = request(server, "GET", f"/api/public/workspace/{mission.mission_id}/file?path={secret_path}", cookies=public_cookies, csrf=csrf)
+        assert status == 404
+        assert marker not in json.dumps(file_response)
+
+    status, _, listing = request(server, "GET", f"/api/public/workspace/{mission.mission_id}/files?path=.", cookies=public_cookies, csrf=csrf)
+    assert status == 200
+    assert {".envrc", ".ENV", ".aws", ".AWS", ".ssh", ".docker", ".config", "id_rsa"}.isdisjoint({item["name"] for item in listing["files"]})
+    status, _, nested_listing = request(server, "GET", f"/api/public/workspace/{mission.mission_id}/files?path=config", cookies=public_cookies, csrf=csrf)
+    assert status == 200
+    assert {item["name"] for item in nested_listing["files"]}.isdisjoint({".env", ".env.local"})
+
+    status, _, diff = request(server, "GET", f"/api/public/workspace/{mission.mission_id}/git?operation=diff", cookies=public_cookies, csrf=csrf)
+    assert status == 200
+    for marker in secret_files.values():
+        assert marker not in json.dumps(diff)
+    for secret_path in secret_files:
+        assert secret_path not in diff["output"]
+
+
 def test_conversation_ids_are_permanent_owner_scoped_and_private_db_is_restricted(tmp_path, monkeypatch):
     monkeypatch.setattr(core_db, "DB_PATH", tmp_path / "private" / "app.sqlite3")
     core_db.connect().close()

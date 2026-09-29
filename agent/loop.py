@@ -33,6 +33,8 @@ SYSTEM_PROMPT = (
 def tool_definitions() -> list[dict[str, Any]]:
     definitions = []
     for spec in REGISTRY.values():
+        if not spec.available:
+            continue
         parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
         if spec.argument_type is str:
             parameters["properties"]["query"] = {"type": "string", "maxLength": 256}

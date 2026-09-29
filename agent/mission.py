@@ -335,7 +335,30 @@ class MissionStore:
             for item in chain.list(request_id=mission.request_id):
                 event = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
                 command = tuple(str(part) for part in event.get("command", ()))
-                pytest_command = "-m" in command and command[command.index("-m") + 1:command.index("-m") + 3] == ("pytest", "-q")
+                import sys
+                from tools.registry import _BWRAP, _PRLIMIT
+                pytest_tail = (sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--basetemp=/tmp/pytest-run", "-q")
+                pytest_command = (
+                    bool(_BWRAP and _PRLIMIT)
+                    and command[0] == _PRLIMIT
+                    and _BWRAP in command
+                    and "--unshare-all" in command
+                    and "--ro-bind" in command
+                    and "--tmpfs" in command
+                    and "--size" in command
+                    and "--clearenv" in command
+                    and "PYTHONNOUSERSITE" in command
+                    and "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in command
+                    and {"--cpu=60", "--as=2147483648", "--fsize=67108864", "--nofile=256", "--nproc=1024"}.issubset(command)
+                    and "/workspace" in command
+                    and command[command.index("/workspace") - 2:command.index("/workspace")] == ("--ro-bind", command[command.index("/workspace") - 1])
+                    and "--chdir" in command
+                    and command.index("--chdir") + 1 < len(command)
+                    and command.index("--size") + 1 < len(command)
+                    and command[command.index("--size") + 1] == "268435456"
+                    and command[command.index("--chdir") + 1] == "/workspace"
+                    and command[-len(pytest_tail):] == pytest_tail
+                )
                 if (
                     event.get("mission_id") == mission.mission_id
                     and event.get("request_id") == mission.request_id
