@@ -76,3 +76,7 @@
 - احتفظ worktree المصدر بفرع `feat/cybersentinel-mind-orchestration` وcommit المصدر `4d4251504ecdcc1afe8aa249b5458277505bec97`؛ حمل فرع الدمج المطلوب الشيفرة نفسها عبر cherry-pick محلي `b5259b850b5b1cc2bb5c1a6f728358c795b9e610`.
 - كان `/workspace/cybersentinel` نظيفًا على `integration/cybersentinel-final-completion` عند نقطة البداية `d7b5827a1a0a23a7656d442449d1e988211c3d59`؛ أُضيف فقط إيداع الشيفرة وإيداع التوثيق المحددان ثم سجل تصحيح توثيق محلي منفصل. لم يُعدّل `main` أو PR #17 أو remotes أو Cloudflare أو worktrees أخرى.
 - لم يُدفع أي تغيير إلى remote، ولم يحدث نشر أو تغيير Cloudflare.
+
+## آخر تحقق بعد تقوية الجلسة وتنقيح التخزين — 2026-09-30
+
+على `integration/cybersentinel-final-completion` عند SHA `233bb323a8876035f87638e2e97bc3bacff3cdf0`، اجتازت المجموعة الكاملة المحصورة **930 passed, 1 skipped, 0 failed**، ونجحت `compileall` و`node --check web/app.js` و`git diff --check`. التخطي هو قبول المزوّد الحي؛ لم تُهيّأ ملفات مزوّد. أضيف فحص جلسة Owner قبل استدعاء الأدوات، وسجل provenance لكل استدعاء نموذج، وتنقيح best-effort للبيانات المعروفة الحساسية قبل التخزين. تبقى الخطة `PARTIAL`: لا Vault أو مزامنة P2P أو إثبات IDOR/BOLA مستقل أو سلسلة HTTP كاملة أو CI على SHA الحالي أو نشر موثق. قيم الأسرار غير المعروفة قد تفلت من التنقيح، والصفوف القديمة لا تُنقّح تلقائيًا؛ سياق Owner المحفوظ يُطلب تجديد مصادقته بعد إعادة تشغيل باردة.

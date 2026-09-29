@@ -1,11 +1,11 @@
 # قائمة مهام إكمال CyberSentinel X
 
-> **الحالة: PARTIAL — لم تكتمل المهمة.** الترتيب تابع للاعتماديات في [الخطة](plan.md). تحقق بدءًا أن `/workspace/cybersentinel` نظيف على `integration/cybersentinel-final-completion` عند `d7b5827a1a0a23a7656d442449d1e988211c3d59`، ثم أُنشئ فرع التنفيذ المعزول منه. baseline الشيفرة على هذا الـHEAD: **887 ناجحًا، 1 متخطّى، 0 إخفاقات خلال 24.97 ثانية** عبر `_run_project_tests` و`_SubprocessWorkspace` و`bubblewrap`/`prlimit`. هذه نتيجة قبل التغييرات؛ حالة المزوّد الحي غير متحققة.
+> **الحالة: PARTIAL — لم تكتمل المهمة.** أحدث حالة محلية موثقة للفرع `/workspace/cybersentinel` هي `integration/cybersentinel-final-completion` عند `233bb323a8876035f87638e2e97bc3bacff3cdf0`، مع شجرة نظيفة و**930 اختبارًا ناجحًا، 1 متخطّى، 0 إخفاقات** عبر `_run_project_tests` و`_SubprocessWorkspace` و`bubblewrap`/`prlimit`. الاختبار المتخطّى هو قبول المزوّد الحي؛ ولا تثبت هذه النتيجة CI أو مزوّدًا حيًا أو نشرًا. انظر سجل التحقق الأخير أدناه.
 
 ## 1. تدقيق المتطلبات ومصفوفة الفجوات — PARTIAL
 - [x] سجّل الميزات المتكاملة وحدودها والموانع الحرجة في وثيقة الحقيقة الحالية.
 - [ ] أكمل مصفوفة ربط كل مطلب في المهمة الرئيسية بالشيفرة والاختبار ودليل التشغيل والحالة والمانع، قبل إغلاق المهمة.
-- [x] صنّف CI والمزوّد الحي والنشر وCloudflare على أنها `NOT VERIFIED`؛ فشل namespaces التاريخي في CI كان على SHA أقدم وليس نتيجة لهذا الـSHA.
+- [x] صنّف CI والمزوّد الحي والنشر وCloudflare على أنها `NOT VERIFIED`؛ لا توجد نتيجة CI على SHA الحالي، وفشلت آخر محاولتي Actions المشاهدتين على SHA أقدم عند فحص عزل namespaces قبل pytest.
 - **الاعتماد:** لا شيء.
 
 ## 2. تثبيت سلطة Owner وحدود الأمان ومسار التنفيذ — PARTIAL
@@ -102,3 +102,10 @@
 - أُعيدت الاختبارات الكاملة على SHA الشيفرة المدمجة: **915 passed, 1 skipped, 0 failed** خلال 26.08 ثانية؛ عبر `tools.registry._run_project_tests` و`_SubprocessWorkspace` مع لقطة read-only و`bubblewrap`/`prlimit` ومن دون شبكة أو اعتمادات موروثة.
 - يثبت `tests/test_cybersentinel_mind.py::test_native_mission_model_shares_durable_reasoning_scope_and_knowledge_across_roles` أن محللي/ناقدي الاختبار الاصطناعيين المختلفين كليهما سُجّلت لهما استدعاءات ضمن دورة `MissionRuntime` واحدة وسياق Mission مشترك؛ هذا اختبار adapter حتمي وليس قبول مزوّد حي.
 - تخطّى `tests/test_real_provider_long_horizon.py::test_real_provider_long_horizon` لغياب إعداد المزوّد الحي؛ `ModelRouter.from_env()` يعيد **0 ملفات مزوّد**، لذلك لا توجد استدعاءات حية أو قبول حي. نجحت فحوص `compileall` و`node --check` و`git diff --check` وفحص الأنماط الشبيهة بالأسرار في إضافات Python الإنتاجية. لا نشر/Cloudflare أو CI مؤكد؛ يظل إكمال المنتج العام `PARTIAL`.
+
+## سجل تحقق تقوية الجلسة والتخزين — 2026-09-30
+
+- الحالة المحلية الحالية على `integration/cybersentinel-final-completion` هي SHA `233bb323a8876035f87638e2e97bc3bacff3cdf0` وشجرة نظيفة. اجتازت المجموعة الكاملة **930 passed, 1 skipped, 0 failed** عبر runner المشروع المعزول ذي اللقطة read-only والشبكة المعزولة؛ كما اجتازت فحوص `compileall` و`node --check web/app.js` و`git diff --check`. تخطّى الاختبار الحي لعدم وجود أي ملفات مزود مهيأة.
+- يعيد runtime الآن فحص جلسة Owner مباشرة قبل dispatch التسلسلي والمتوازي، مع اختبارات إلغاء الجلسة أثناء استدلال النموذج. سُجّل لكل استدعاء نموذج provenance آمن، ووقت/كمون ومصدر واضح لعدد الرموز، وتكلفة تقديرية فقط عند توافر السعر والاستخدام.
+- تُنقّح الكتابات الجديدة في Mission وEvidence Chain والذاكرة والسجلات ونتائج دورة التنفيذ بأنماط credential معروفة؛ حُفظت مراجع `secret_ref` والحقول التقنية الآمنة، وأعيد حساب بصمات المحتوى المتأثر. التنقيح best-effort ولا يكتشف الأسرار المعتمة، ولا يمسح الصفوف التاريخية، وليس Vault. سياق Owner الموقّع يُحفظ منقّحًا فقط في قاعدة البيانات؛ الاستئناف البارد يحتاج مصادقة Owner جديدة.
+- لا تزال المهمة الأم `PARTIAL`: لا تحقق حي لمزود، ولا نتيجة CI على SHA الحالي، ولا Worker مصدره هذا الفرع؛ كما لا توجد Vault مشفّرة أو مزامنة P2P أو مسار IDOR/BOLA بحسابين اصطناعيين أو متحقق مستقل حتمي للثغرات أو Evidence HTTP كامل قابل للإعادة أو مسار موافقة Owner قبل الإفصاح. Cloudflare لم يُغيّر.
