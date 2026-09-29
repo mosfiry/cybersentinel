@@ -78,16 +78,19 @@ class HypothesisEngine:
         updates: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc).isoformat()
         eligible = None if eligible_evidence_ids is None else {str(item) for item in eligible_evidence_ids}
+        reject_model_updates = eligible is not None and proposal.provenance.get("source") == "model_proposal"
         for item in proposal.hypothesis_updates:
             hid = str(item.get("hypothesis_id", "")).strip()
             statement = str(item.get("statement", "")).strip()
             if not hid:
                 continue
+            if item.get("status") == HypothesisStatus.CONFIRMED.value and not (goal_verified and deterministic_validation):
+                raise ValueError("model cannot confirm a hypothesis without GoalVerification and deterministic validation")
+            if reject_model_updates:
+                continue
             current = self.hypotheses.get(hid) or HypothesisState(hid, statement or hid, provenance={"source": "proposal"})
             if statement:
                 current.statement = statement
-            if item.get("status") == HypothesisStatus.CONFIRMED.value and not (goal_verified and deterministic_validation):
-                raise ValueError("model cannot confirm a hypothesis without GoalVerification and deterministic validation")
             if item.get("status"):
                 current.status = HypothesisStatus(item["status"])
             self.hypotheses[hid] = current

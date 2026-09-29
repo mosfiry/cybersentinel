@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from runtime_authorization import make_test_snapshot
 
 from agent.hypotheses import HypothesisState, HypothesisStatus
@@ -149,3 +151,46 @@ def test_persisted_system_verified_evidence_can_update_confidence(tmp_path, monk
     assert evidence_id["value"] == first.evidence[0]["system_evidence"]["provenance_token"]
     assert second.hypotheses[0]["confidence"] == 0.6
     assert evidence_id["value"] in second.hypotheses[0]["supporting_evidence_ids"]
+
+
+@pytest.mark.parametrize("status", ["WEAKENED", "DISPROVEN", "STRENGTHENED", "ABANDONED"])
+def test_model_ghost_evidence_cannot_change_hypothesis_status_or_statement(tmp_path, status):
+    ghost_id = "ghost-evidence-id"
+    proposed_update = {
+        "hypothesis_id": "h1",
+        "status": status,
+        "statement": "model-authored replacement statement",
+        "supporting_evidence_ids": [ghost_id],
+    }
+    interpreter = ObservationInterpreter(
+        proposer=lambda _context: {
+            "summary": "model analysis",
+            "confidence_changes": [{
+                "hypothesis_id": "h1",
+                "delta": -0.9,
+                "reason": "model claims ghost evidence disproves the hypothesis",
+                "supporting_evidence_ids": [ghost_id],
+            }],
+            "hypothesis_updates": [proposed_update],
+        }
+    )
+    runtime = _runtime(
+        tmp_path,
+        executor=lambda *_: {"success": True, "source": "status"},
+        interpreter=interpreter,
+    )
+    mission = runtime.create("inspect", "inspect", _plan("status"), request_id=f"ghost-status-{status}")
+    mission.hypotheses = [HypothesisState("h1", "host is compromised", HypothesisStatus.ACTIVE, 0.4).to_dict()]
+    runtime.store.save(mission)
+
+    result = runtime.run_slice(mission.mission_id)
+
+    hypothesis = result.hypotheses[0]
+    assert hypothesis["status"] == HypothesisStatus.ACTIVE.value
+    assert hypothesis["statement"] == "host is compromised"
+    assert hypothesis["confidence"] == 0.4
+    proposal = result.interpretations[-1]
+    assert proposal["provenance"]["source"] == "model_proposal"
+    assert proposal["provenance"]["trust"] == "untrusted_claim"
+    assert proposal["hypothesis_updates"] == [proposed_update]
+    assert proposal["confidence_changes"][0]["supporting_evidence_ids"] == [ghost_id]
