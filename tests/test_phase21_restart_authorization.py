@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 
 from pathlib import Path
 
@@ -14,28 +14,28 @@ from agent.planning import Plan, PlanStep
 from agent.model_router import ModelRouter
 
 
-def _mission(db: Path):
+def _mission(db: Path, tmp_path, monkeypatch):
     store = MissionStore(db)
     runtime = MissionRuntime(store, executor=lambda *args, **kwargs: {"success": True, "criterion_id": "goal", "source": "fixture"}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("resume objective").replan(steps=(PlanStep("status", "status", action="status", authorization_requirement="owner"),), reason="test")
-    mission = runtime.create("resume objective", "resume objective", plan, completion_criteria=[{"criterion_id": "goal"}], request_id="resume-request")
+    mission = runtime.create("resume objective", "resume objective", plan, completion_criteria=[{"criterion_id": "goal", "check": "system_online"}], **signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="resume-request"))
     return store, mission
 
 
 def test_missing_owner_authentication_moves_restored_mission_to_owner_input(tmp_path, monkeypatch):
     allow_owner_sessions(monkeypatch, "valid-owner")
-    store, mission = _mission(Path(tmp_path) / "missions.sqlite3")
+    store, mission = _mission(Path(tmp_path) / "missions.sqlite3", tmp_path, monkeypatch)
     core = AgentCore(ModelRouter([]), store=store)
     with pytest.raises(PermissionError):
         core.resume_mission(mission.mission_id, owner_session_token="wrong-owner", max_slices=1)
     restored = store.load(mission.mission_id)
     assert restored.status is MissionStatus.OWNER_INPUT_REQUIRED
-    assert any(item.get("event") == "owner_revalidation_failed" for item in restored.recovery_events)
+    assert any(item.get("event") == "owner_session_unavailable" for item in restored.recovery_events)
 
 
 def test_valid_resume_replaces_stale_or_forged_authority(tmp_path, monkeypatch):
     allow_owner_sessions(monkeypatch, "valid-owner")
-    store, mission = _mission(Path(tmp_path) / "missions.sqlite3")
+    store, mission = _mission(Path(tmp_path) / "missions.sqlite3", tmp_path, monkeypatch)
     forged = store.load(mission.mission_id)
     forged.authorization_context = {"owner_evidence": {"forged": True}, "scope_snapshot_id": None}
     forged.policy_snapshot = {"forged": True}

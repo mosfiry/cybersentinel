@@ -26,15 +26,27 @@ class AgentTaskRuntime:
 
     def __init__(self, router: Any, executor: Callable[..., dict[str, Any]] | None = None, runtime_limits: RuntimeLimits | None = None):
         self.router = router
+        self._uses_default_executor = executor is None
         self.executor = executor or self._default_executor
         self.limits = runtime_limits or RuntimeLimits.from_owner_policy()
 
     @staticmethod
-    def _default_executor(command: str, *, owner_session_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None, authorization_decision: Any = None) -> dict[str, Any]:
+    def _default_executor(command: str, *, owner_session_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None, authorization_decision: Any = None, tool_call_id: str = "") -> dict[str, Any]:
         parts = command.split(" ", 2)
         name = parts[1] if len(parts) > 1 else ""
         argument = parts[2] if len(parts) > 2 else None
-        return {"ok": True, "result": execute_tool(name, argument, authorization_decision=authorization_decision, scope_context=scope_context)}
+        from security.execution_boundary import OwnerDirectBoundary
+        request_id = authorization_context.request_id if authorization_context is not None else ""
+        result = OwnerDirectBoundary.execute(
+            tool=name,
+            argument=argument,
+            decision=authorization_decision,
+            request_id=request_id,
+            tool_call_id=tool_call_id,
+            scope_context=scope_context,
+            execute=execute_tool,
+        )
+        return {"ok": True, "result": result}
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
@@ -96,11 +108,18 @@ class AgentTaskRuntime:
             snapshot = get_snapshot(scope_context["scope_snapshot_id"])
             if snapshot is None or snapshot.authorization.program_id != scope_context["program_id"] or snapshot.target(scope_context["target_id"]) is None:
                 raise ValueError("invalid_scope_context")
-        ensure_conversation(conversation_id, owner_session_id)
+        owner_identity = str(authorization_context.owner_evidence.owner_id) if authorization_context is not None else ""
+        if not owner_identity and owner_session_id:
+            from security.owner_password import resolve_session
+            owner_session = resolve_session(owner_session_id)
+            if owner_session is None:
+                raise PermissionError("owner authentication required")
+            owner_identity = str(owner_session["owner_id"])
+        ensure_conversation(conversation_id, owner_identity)
         request_id = authorization_context.request_id if authorization_context is not None else uuid.uuid4().hex
         task = TaskManager.create_task(conversation_id, request_id, owner_session_id, objective, authentication_method=authentication_method)
         bound_context = replace(authorization_context, task_id=task.task_id) if authorization_context is not None else None
-        task.execution_state = {"tool_results": [], "evidence_refs": [], "memory_refs": [], "objective": objective, "events": [], "scope_context": scope_context, "authorization_context": bound_context.to_dict() if bound_context is not None else None}
+        task.execution_state = {"tool_results": [], "evidence_refs": [], "memory_refs": [], "objective": objective, "events": [], "scope_context": scope_context, "authorization_context": bound_context.to_dict() if bound_context is not None else None, "owner_identity": owner_identity}
         self._event(task, "task.created", {"objective": objective, "authentication_method": authentication_method})
         objective_item = ConversationMemory.store_conversation_memory(conversation_id, objective, MemoryType.ACTIVE_OBJECTIVE, source="task", provenance=f"task:{task.task_id}")
         recent_item = ConversationMemory.store_conversation_memory(conversation_id, objective, MemoryType.RECENT, source="conversation", provenance="user_message")
@@ -210,9 +229,13 @@ class AgentTaskRuntime:
         try:
             scope_context = task.execution_state.get("scope_context")
             if spec is not None and spec.scope_required:
-                result = {"ok": True, "result": execute_tool(call.name, argument, authorization_decision=decision.decision, scope_context=scope_context, request_id=task.request_id)}
+                from security.execution_boundary import OwnerDirectBoundary
+                result = {"ok": True, "result": OwnerDirectBoundary.execute(tool=call.name, argument=argument, decision=decision.decision, request_id=task.request_id, tool_call_id=call.call_id, scope_context=scope_context, execute=execute_tool)}
             else:
-                result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_session_token=owner_session_token, owner_session_id=owner_session_id, scope_context=scope_context, authorization_context=authorization_context, authorization_decision=decision.decision)
+                executor_kwargs = {"owner_session_token": owner_session_token, "owner_session_id": owner_session_id, "scope_context": scope_context, "authorization_context": authorization_context, "authorization_decision": decision.decision}
+                if self._uses_default_executor:
+                    executor_kwargs["tool_call_id"] = call.call_id
+                result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), **executor_kwargs)
             result = result if isinstance(result, dict) else {"ok": True, "result": result}
             status = "completed" if result.get("ok", True) else "failed"
         except Exception as exc:
@@ -276,7 +299,7 @@ class AgentTaskRuntime:
             kind, value = self._parse(response)
             if kind == "final":
                 task.result = {"answer": value, "provenance": {"provider": task.provider, "model": task.model}, "context_hash": context.context_hash}
-                add_conversation_message(task.conversation_id, "assistant", value, {"task_id": task.task_id, "step": task.current_step})
+                add_conversation_message(task.conversation_id, "assistant", value, {"task_id": task.task_id, "step": task.current_step}, owner_id=str(task.execution_state.get("owner_identity", "")))
                 ConversationMemory.store_conversation_memory(task.conversation_id, value, MemoryType.RECENT, source="assistant", provenance=f"task:{task.task_id}")
                 task.update_status(TaskStatus.COMPLETED if not task.tool_calls or all(item.get("status") == "completed" for item in task.tool_calls) else TaskStatus.PARTIAL_SUCCESS)
                 self._event(task, "assistant.completed", {"chars": len(value)})

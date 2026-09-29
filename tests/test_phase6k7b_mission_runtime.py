@@ -31,10 +31,11 @@ def test_end_to_end_observation_failure_replan_verify_and_persistence(tmp_path):
     assert after_failure.failures[0]["class"] == FailureClass.COMPILATION.value
 
     completed = rt.run_to_completion(mission.mission_id)
-    assert completed.status is MissionStatus.GOAL_COMPLETED
-    assert completed.verification_state["verified"] is True
+    assert completed.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert completed.verification_state["verified"] is False
+    assert completed.verification_state["missing_criteria"] == ["tests"]
     assert len(completed.plan_history) == 2
-    assert MissionStore(Path(tmp_path) / "missions.sqlite3").load(mission.mission_id).status is MissionStatus.GOAL_COMPLETED
+    assert MissionStore(Path(tmp_path) / "missions.sqlite3").load(mission.mission_id).status is MissionStatus.FAILED_RETRY_EXHAUSTED
     assert calls == [(2, "build"), (3, "repair-2-1")]
 
 
@@ -63,7 +64,8 @@ def test_new_runtime_instance_resumes_after_simulated_process_crash(tmp_path):
     reconciled = second.reconcile_in_flight(mission.mission_id, executed=False)
     assert reconciled.status is MissionStatus.READY
     resumed = second.run_to_completion(mission.mission_id)
-    assert resumed.status is MissionStatus.GOAL_COMPLETED
+    assert resumed.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert resumed.verification_state["verified"] is False
     assert len(resumed.action_history) == 1
     assert attempts["count"] == 2
 
@@ -83,7 +85,8 @@ def test_in_flight_receipt_reconciliation_prevents_duplicate_side_effect(tmp_pat
     reconciled = rt.reconcile_in_flight(mission.mission_id, executed=True, observation={"success": True, "criterion_id": "step", "source": "receipt"})
     assert reconciled.status is MissionStatus.READY
     completed = rt.run_to_completion(mission.mission_id)
-    assert completed.status is MissionStatus.GOAL_COMPLETED
+    assert completed.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert completed.verification_state["verified"] is False
     assert calls == ["%s:2:step:0" % mission.mission_id]
 
 
@@ -101,7 +104,7 @@ def test_goal_verification_blocks_completion_until_required_evidence(tmp_path):
     assert after_step.status is MissionStatus.READY
     checked = rt.run_slice(mission.mission_id)
     assert checked.status is MissionStatus.RUNNING
-    assert checked.verification_state["missing_criteria"] == ["tests"]
+    assert checked.verification_state["missing_criteria"] == ["implementation", "tests"]
     assert checked.status is not MissionStatus.GOAL_COMPLETED
 
 
@@ -133,7 +136,8 @@ def test_authorization_intervention_persists_and_allow_resumes(tmp_path, monkeyp
     auth = AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=policy.capture_policy_snapshot(request_id, evidence))
     rt.provide_owner_decision(mission2.mission_id, allow=True, authorization_context=auth.to_dict())
     completed = rt.run_to_completion(mission2.mission_id)
-    assert completed.status is MissionStatus.GOAL_COMPLETED
+    assert completed.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert completed.verification_state["verified"] is False
     assert len(executed) == 1
 
 

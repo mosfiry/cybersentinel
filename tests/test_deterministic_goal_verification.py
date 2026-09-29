@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 """Round 2 P1 - deterministic goal verification.
 
 A MODEL CLAIM alone can never complete a mission. Completion requires
@@ -28,11 +28,11 @@ def _runtime(tmp_path):
     return MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
 
 
-def _mission(runtime, criteria):
+def _mission(runtime, criteria, **kwargs):
     plan = Plan.initial("prove the goal").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
-    return runtime.create("prove the goal", "prove the goal", plan, completion_criteria=criteria)
+    return runtime.create("prove the goal", "prove the goal", plan, completion_criteria=criteria, **kwargs)
 
 
 def test_goal_verification_requires_all_required_criteria():
@@ -63,6 +63,15 @@ def test_failed_evidence_does_not_verify():
     assert result.missing_criteria == ("c1",)
 
 
+def test_empty_required_criteria_and_conflicting_evidence_never_verify():
+    assert GoalVerification.evaluate("goal", (), ()).verified is False
+    criteria = (VerificationCriterion("c1", "first", "check"),)
+    contradictory = (evidence_for("c1", True, "system", {}), evidence_for("c1", False, "system", {}))
+    result = GoalVerification.evaluate("goal", criteria, contradictory)
+    assert result.verified is False
+    assert result.missing_criteria == ("c1",)
+
+
 def test_model_final_claim_without_evidence_does_not_complete(tmp_path):
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, [{"criterion_id": "goal"}])
@@ -79,12 +88,13 @@ def test_model_final_claim_without_evidence_does_not_complete(tmp_path):
     assert "goal" in result.verification_state.get("missing_criteria", [])
 
 
-def test_completion_requires_passed_evidence_not_a_claim(tmp_path, monkeypatch):
+def test_tool_success_flag_and_model_claim_do_not_complete(tmp_path, monkeypatch):
     import tools.registry
 
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal", "source": "fixture"})
     runtime = _runtime(tmp_path)
-    mission = _mission(runtime, [{"criterion_id": "goal"}])
+    owner_kwargs = signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="request-fake-tool")
+    mission = _mission(runtime, [{"criterion_id": "goal"}], **owner_kwargs)
 
     class EvidenceThenFinalModel:
         def __init__(self):
@@ -110,11 +120,37 @@ def test_completion_requires_passed_evidence_not_a_claim(tmp_path, monkeypatch):
             return ModelTurn(turn_id, content="goal achieved", finish_reason="stop")
 
     result = runtime.run_model_loop(mission.mission_id, EvidenceThenFinalModel(), tools=[{"name": "status"}], max_turns=4)
-    assert result.status is MissionStatus.GOAL_COMPLETED
-    assert result.verification_state.get("verified") is True
-    events = [event["event"] for event in result.trajectory]
-    assert "GoalVerified" in events
-    assert "MissionCompleted" in events
+    assert result.status is MissionStatus.READY
+    assert result.verification_state.get("verified") is False
+    assert not result.completion_proof
+    assert not any(item.get("system_evidence") for item in result.evidence)
+
+
+def test_signed_completion_requires_independent_status_check_and_survives_restart(tmp_path, monkeypatch):
+    import core.engine
+    import security.truthfulness as truthfulness
+
+    monkeypatch.setattr(truthfulness, "PROVENANCE_KEY_PATH", Path(tmp_path) / "completion.key")
+    monkeypatch.setattr(truthfulness, "_ISSUER", None)
+    monkeypatch.setattr(core.engine, "status", lambda: {"service": "CyberSentinel X", "version": "test", "online": True})
+    store = MissionStore(Path(tmp_path) / "missions.sqlite3")
+    runtime = MissionRuntime(
+        store,
+        executor=lambda *_: {"success": True, "source": "status", "result": {"online": False}},
+        authorizer=lambda *_: (True, "test owner authorization"),
+        authorization_snapshot_factory=make_test_snapshot,
+    )
+    mission = _mission(runtime, [{"criterion_id": "service-online", "check": "system_online"}])
+    completed = runtime.run_to_completion(mission.mission_id, max_slices=4)
+
+    assert completed.status is MissionStatus.GOAL_COMPLETED
+    assert completed.completion_proof and completed.completion_proof["provenance_token"]
+    assert completed.verification_state == {"verified": True, "missing_criteria": [], "evidence_count": 1}
+    assert completed.evidence[0]["result"]["online"] is True
+    assert completed.evidence[0]["system_evidence"]["payload"]["action_id"] == completed.action_history[0]["action_id"]
+    reloaded = MissionStore(Path(tmp_path) / "missions.sqlite3").load(completed.mission_id)
+    assert reloaded is not None and reloaded.status is MissionStatus.GOAL_COMPLETED
+    assert reloaded.completion_proof_is_valid()
 
 
 def test_turn_budget_exhaustion_is_an_honest_failure(tmp_path, monkeypatch):

@@ -28,10 +28,15 @@ class MissionTaskAdapter:
         return TaskStatus.FAILED
 
     def create_task(self, conversation_id: str, objective: str, *, owner_session_token: str, owner_session_id: str = "", authentication_method: str = "username_password", scope_context: dict[str, Any] | None = None, run: bool = True) -> Task:
-        ensure_conversation(conversation_id, owner_session_id or "")
+        from security.owner_password import resolve_session
+        owner = resolve_session(owner_session_token)
+        if owner is None:
+            raise PermissionError("owner authentication required")
+        owner_identity = str(owner["owner_id"])
+        ensure_conversation(conversation_id, owner_identity)
         mission = self.core.run_owner_mission(objective, owner_session_token=owner_session_token, scope_context=scope_context, run=run)
         task = TaskManager.create_task(conversation_id, mission.request_id, owner_session_id or "", objective, authentication_method=authentication_method)
-        task.execution_state = {"canonical_runtime": "MissionRuntime", "mission_id": mission.mission_id, "mission": mission.to_dict()}
+        task.execution_state = {"canonical_runtime": "MissionRuntime", "mission_id": mission.mission_id, "mission": mission.to_public_dict(), "owner_identity": owner_identity}
         task.result = {"mission_id": mission.mission_id, "mission_status": mission.status.value}
         task.update_status(self._status(mission.status))
         TaskManager.update_task(task)

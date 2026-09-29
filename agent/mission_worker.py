@@ -6,7 +6,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 import json
+import os
 import sqlite3
+import stat
 import uuid
 
 from .mission import MissionStatus
@@ -36,6 +38,21 @@ class LeaseLostError(PermissionError):
 DEFAULT_WORKER_LEASE_SECONDS = 120
 
 
+def _secure_database_file(path: str | Path) -> str:
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(target, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError("mission queue database must be a regular file owned by the application user")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return str(target)
+
+
 @dataclass(frozen=True)
 class QueueItem:
     mission_id: str
@@ -52,7 +69,7 @@ class MissionQueue:
     """Durable queue metadata; mission truth remains in MissionStore."""
 
     def __init__(self, db_path: str | Path):
-        self.db_path = str(db_path)
+        self.db_path = _secure_database_file(db_path)
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS mission_queue (mission_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, claimed_at TEXT, last_error TEXT NOT NULL DEFAULT '')")
             for column, definition in (("lease_owner", "TEXT"), ("lease_expires_at", "TEXT")):
@@ -66,6 +83,10 @@ class MissionQueue:
             raise ValueError("mission_id required")
         available = available_at or datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT state FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
+            if current and current[0] == WorkerMissionState.EXECUTING.value:
+                return self.get(mission_id)
             db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL", (mission_id, state.value, 0, available))
         return self.get(mission_id)
 
@@ -100,6 +121,16 @@ class MissionQueue:
                     raise LeaseLostError("worker lease is not owned")
             else:
                 db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, state.value, state.value, state.value, mission_id))
+        return self.get(mission_id)
+
+    def release(self, mission_id: str, state: WorkerMissionState, *, worker_id: str, available_at: str | None = None, error: str = "") -> QueueItem:
+        """Atomically relinquish an owned lease for resumable/nonterminal work."""
+        if state in {WorkerMissionState.COMPLETED, WorkerMissionState.FAILED, WorkerMissionState.CANCELLED, WorkerMissionState.NEEDS_INPUT, WorkerMissionState.PARTIAL_SUCCESS}:
+            raise ValueError("terminal queue states must use update")
+        with sqlite3.connect(self.db_path) as db:
+            updated = db.execute("UPDATE mission_queue SET state=?,available_at=COALESCE(?,available_at),last_error=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE mission_id=? AND lease_owner=? AND state=?", (state.value, available_at, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value))
+            if updated.rowcount != 1:
+                raise LeaseLostError("worker lease is not owned")
         return self.get(mission_id)
 
     def heartbeat(self, mission_id: str, *, worker_id: str, now: str | None = None, lease_seconds: int = 60) -> QueueItem:
@@ -139,13 +170,14 @@ class MissionQueue:
 class MissionWorker:
     """Single-step worker adapter; a supervisor may call run_once repeatedly."""
 
-    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker", lease_seconds: int = DEFAULT_WORKER_LEASE_SECONDS):
+    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker", lease_seconds: int = DEFAULT_WORKER_LEASE_SECONDS, resume_callback: Callable[[str, int | None, Callable[[], None]], Any] | None = None):
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.queue = queue
         self.runtime_factory = runtime_factory
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        self.resume_callback = resume_callback
 
     def enqueue(self, mission_id: str) -> QueueItem:
         return self.queue.enqueue(mission_id)
@@ -160,7 +192,11 @@ class MissionWorker:
         runtime = self.runtime_factory()
         try:
             try:
-                mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds))
+                heartbeat = lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                if self.resume_callback is not None:
+                    mission = self.resume_callback(item.mission_id, max_slices, heartbeat)
+                else:
+                    mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=heartbeat)
             except TypeError as exc:
                 if "heartbeat" not in str(exc):
                     raise
@@ -170,9 +206,35 @@ class MissionWorker:
             # stale worker must not overwrite the queue outcome or report FAILED.
             return self.queue.get(item.mission_id)
         except Exception as exc:
-            return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}", worker_id=self.worker_id)
+            store = getattr(runtime, "store", None)
+            mission = store.load(item.mission_id) if store is not None else None
+            if mission is not None and (
+                mission.status is MissionStatus.RECOVERY_REQUIRED
+                or (mission.checkpoint or {}).get("status") in {"in_flight", "in_flight_parallel"}
+            ):
+                if mission.status is not MissionStatus.RECOVERY_REQUIRED and not mission.is_terminal:
+                    try:
+                        mission.transition(MissionStatus.RECOVERY_REQUIRED, "worker exception left an ambiguous in-flight execution")
+                        store.save(mission)
+                    except Exception:
+                        # A concurrent checkpoint update is safer than a stale
+                        # worker overwriting the authoritative persisted mission.
+                        pass
+                try:
+                    return self.queue.release(item.mission_id, WorkerMissionState.WAITING_FOR_TOOL, worker_id=self.worker_id, error="ambiguous in-flight execution requires reconciliation")
+                except LeaseLostError:
+                    return self.queue.get(item.mission_id)
+            if mission is not None and mission.status is MissionStatus.PAUSED:
+                try:
+                    return self.queue.release(item.mission_id, WorkerMissionState.PAUSED, worker_id=self.worker_id, error="mission paused")
+                except LeaseLostError:
+                    return self.queue.get(item.mission_id)
+            if mission is not None and mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
+                return self.queue.update(item.mission_id, WorkerMissionState.NEEDS_INPUT, error="Owner authorization requires renewal", worker_id=self.worker_id)
+            return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=type(exc).__name__, worker_id=self.worker_id)
         state = {
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
+            MissionStatus.PAUSED: WorkerMissionState.PAUSED,
             MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
             MissionStatus.AUTHORIZATION_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.RECOVERY_REQUIRED: WorkerMissionState.WAITING_FOR_TOOL,
@@ -180,7 +242,19 @@ class MissionWorker:
             MissionStatus.FAILED_RETRY_EXHAUSTED: WorkerMissionState.FAILED,
             MissionStatus.SCOPE_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
-        }.get(mission.status, WorkerMissionState.PARTIAL_SUCCESS if mission.evidence else WorkerMissionState.FAILED)
+        }.get(mission.status)
+        if state is None:
+            moment = now or datetime.now(timezone.utc).isoformat()
+            available = (datetime.fromisoformat(moment.replace("Z", "+00:00")) + timedelta(seconds=1)).isoformat()
+            try:
+                return self.queue.release(item.mission_id, WorkerMissionState.QUEUED, worker_id=self.worker_id, available_at=available, error="mission remains active; continuing from persisted checkpoint")
+            except LeaseLostError:
+                return self.queue.get(item.mission_id)
+        if state is WorkerMissionState.PAUSED:
+            try:
+                return self.queue.release(item.mission_id, WorkerMissionState.PAUSED, worker_id=self.worker_id, error="mission paused by Owner")
+            except LeaseLostError:
+                return self.queue.get(item.mission_id)
         try:
             return self.queue.update(item.mission_id, state, error=mission.error, worker_id=self.worker_id)
         except LeaseLostError:
@@ -204,7 +278,7 @@ class MissionScheduler:
     """Persistent schedule records that enqueue missions; no hidden execution thread."""
 
     def __init__(self, db_path: str | Path, queue: MissionQueue):
-        self.db_path = str(db_path)
+        self.db_path = _secure_database_file(db_path)
         self.queue = queue
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS mission_schedules (schedule_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, next_run_at TEXT NOT NULL, interval_seconds INTEGER, retry_limit INTEGER NOT NULL, retries INTEGER NOT NULL, state TEXT NOT NULL)")

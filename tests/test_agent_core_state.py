@@ -28,7 +28,7 @@ def test_agent_state_projection_contains_auditable_fields(tmp_path):
 def test_trajectory_is_typed_and_persisted(tmp_path):
     rt = _runtime(tmp_path, lambda m, s, a: {"success": True, "criterion_id": "goal"})
     plan = Plan.initial("goal").replan(steps=(PlanStep("s", "observe", action="status"),), reason="initial")
-    mission = rt.create("Owner goal", "goal", plan, request_id="r")
+    mission = rt.create("Owner goal", "goal", plan, request_id="r", completion_criteria=[{"criterion_id": "service-online", "check": "system_online"}])
     done = rt.run_to_completion(mission.mission_id)
     events = [item["event"] for item in done.trajectory]
     assert "MissionStarted" in events
@@ -50,7 +50,7 @@ def test_malformed_or_unknown_action_replans_instead_of_silent_success(tmp_path)
         return mission.plan.replan(steps=(PlanStep("recovered", "recover", action="status"),), reason="malformed proposal")
     rt = _runtime(tmp_path, execute, replan)
     plan = Plan.initial("goal").replan(steps=(PlanStep("bad", "bad", action="__planning_failure__"),), reason="initial")
-    mission = rt.create("Owner goal", "goal", plan)
+    mission = rt.create("Owner goal", "goal", plan, completion_criteria=[{"criterion_id": "service-online", "check": "system_online"}])
     result = rt.run_to_completion(mission.mission_id)
     assert result.plan.version >= 2
     assert result.status is MissionStatus.GOAL_COMPLETED

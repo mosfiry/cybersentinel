@@ -30,7 +30,14 @@ def _agent_core() -> AgentCore:
 
 
 def _task_public(task) -> dict[str, Any]:
-    value = task.to_dict()
+    def redact(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {key: redact(child) for key, child in item.items() if key not in {"session_id", "owner_session_id"}}
+        if isinstance(item, list):
+            return [redact(child) for child in item]
+        return item
+
+    value = redact(task.to_dict())
     value["events"] = task.execution_state.get("events", [])
     return value
 
@@ -97,8 +104,9 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
     # compatibility endpoints below; it is not a chat execution path.
     owner = _owner_session(owner_session_token)
     core = _agent_core()
-    ensure_conversation(conversation_id, owner["session_id"])
-    add_conversation_message(conversation_id, "user", text)
+    owner_id = str(owner["owner_id"])
+    ensure_conversation(conversation_id, owner_id)
+    add_conversation_message(conversation_id, "user", text, owner_id=owner_id)
     mission = core.resume_mission(str(payload["mission_id"]), owner_session_token=owner_session_token) if payload.get("mission_id") else core.run_owner_mission(
         text,
         owner_session_token=owner_session_token,
@@ -124,7 +132,7 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
         except json.JSONDecodeError:
             pass
     answer = answer or "Mission " + mission.status.value
-    add_conversation_message(conversation_id, "assistant", answer, {"mission_id": mission.mission_id, "status": mission.status.value, "request_id": mission.request_id})
+    add_conversation_message(conversation_id, "assistant", answer, {"mission_id": mission.mission_id, "status": mission.status.value, "request_id": mission.request_id}, owner_id=owner_id)
     activity = list(mission.trajectory)
     for action in mission.action_history:
         if action.get("status") == "completed":
@@ -135,14 +143,16 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
         "mission_id": mission.mission_id,
         "status": mission.status.value,
         "activity": activity,
-        "mission": mission.to_dict(),
+        "mission": mission.to_public_dict(),
     }
 
 
-def get_session(conversation_id: str) -> dict[str, Any] | None:
-    info = conversation_info(conversation_id)
+def get_session(conversation_id: str, *, owner_id: str) -> dict[str, Any] | None:
+    info = conversation_info(conversation_id, owner_id=owner_id)
     if info is None:
         return None
+    info.pop("owner_id", None)
+    info.pop("owner_session_id", None)
     info["messages"] = conversation_messages(conversation_id)
     info["tasks"] = [_task_public(task) for task in TaskManager.get_tasks_by_conversation(conversation_id)]
     return info

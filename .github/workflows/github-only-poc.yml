@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       max_iterations:
-        description: "Maximum bounded MissionRuntime iterations"
+        description: "Maximum bounded MissionRuntime iterations (1–16)"
         required: false
         default: "4"
         type: string
@@ -18,83 +18,127 @@ concurrency:
 
 jobs:
   bounded-poc:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       POC_OUTPUT: poc-output
       PYTHONUNBUFFERED: "1"
+      MAX_ITERATIONS: ${{ inputs.max_iterations }}
+      DB_PATH: ${{ github.workspace }}/.github-owner-db.sqlite3
+    permissions:
+      contents: read
     steps:
-      - name: Checkout audited commit
+      - name: Checkout protected default branch
         uses: actions/checkout@v4
-
+        with:
+          ref: main
+          persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
+          python-version: "3.13"
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt pytest
-
+      - name: Validate bounded run input
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${MAX_ITERATIONS}" =~ ^[1-9][0-9]?$ ]] || (( MAX_ITERATIONS > 16 )); then
+            echo "max_iterations must be an integer from 1 to 16."
+            exit 2
+          fi
       - name: Compile Python sources
         run: python -m compileall -q .
-
       - name: Run existing tests
         run: python -m pytest -q
-
       - name: Initialize bounded proof workspace
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$POC_OUTPUT"
-          cat > "$POC_OUTPUT/run-context.json" <<EOF
-          {
-            "status": "WORKFLOW_STARTED",
-            "commit_sha": "${GITHUB_SHA}",
-            "workflow_run_id": "${GITHUB_RUN_ID}",
-            "repository": "${GITHUB_REPOSITORY}",
-            "ref": "${GITHUB_REF}",
-            "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          payload = {
+              "status": "WORKFLOW_STARTED",
+              "commit_sha": os.environ["GITHUB_SHA"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "ref": os.environ["GITHUB_REF"],
+              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
           }
-          EOF
-
+          with open(os.path.join(os.environ["POC_OUTPUT"], "run-context.json"), "w", encoding="utf-8") as stream:
+              json.dump(payload, stream, ensure_ascii=False, indent=2)
+              stream.write("\n")
+          PY
+      - name: Create disposable Owner account/session
+        env:
+          CYBERSENTINEL_OWNER_PASSWORD: ${{ secrets.CYBERSENTINEL_OWNER_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CYBERSENTINEL_OWNER_PASSWORD:-}" ]]; then
+            echo "Owner bootstrap secret unavailable; no live mission was started."
+            exit 0
+          fi
+          python - <<'PY'
+          import os
+          from security.owner_password import OWNER_USERNAME, create_owner_account, login
+          password = os.environ["CYBERSENTINEL_OWNER_PASSWORD"]
+          create_owner_account(OWNER_USERNAME, password)
+          session = login(OWNER_USERNAME, password)
+          session_token = str(session.get("session_id", ""))
+          if not session_token:
+              raise SystemExit("Owner session creation failed")
+          print("::add-mask::" + session_token)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write("OWNER_SESSION_TOKEN=" + session_token + "\n")
+          print("Created a disposable Owner session for this isolated runner.")
+          PY
       - name: Execute bounded REAL provider mission when credentials are available
         env:
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OWNER_TOKEN: ${{ secrets.OWNER_TOKEN }}
           REAL_PROVIDER_MODEL: ${{ secrets.REAL_PROVIDER_MODEL }}
+          CYBERSENTINEL_OWNER_PASSWORD: ${{ secrets.CYBERSENTINEL_OWNER_PASSWORD }}
+        shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_API_KEY:-}" || -z "${OWNER_TOKEN:-}" ]]; then
-            cat > "$POC_OUTPUT/real-mission.json" <<'EOF'
-          {
-            "status": "NOT EXECUTED — credentials unavailable",
-            "request_id": null,
-            "mission_id": null,
-            "provider": null,
-            "model": null,
-            "evidence_count": 0,
-            "verification": null,
-            "reason": "Required provider and Owner credentials were not supplied to this workflow. No mission was started."
+          if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_API_KEY:-}" || -z "${CYBERSENTINEL_OWNER_PASSWORD:-}" ]]; then
+            python - <<'PY'
+          import json, os
+          payload = {
+              "status": "BLOCKED",
+              "request_id": None,
+              "mission_id": None,
+              "provider": None,
+              "model": None,
+              "evidence_count": 0,
+              "verification": None,
+              "reason": "Required provider and disposable Owner bootstrap secrets were unavailable. No mission was started.",
           }
-          EOF
+          with open(os.path.join(os.environ["POC_OUTPUT"], "real-mission.json"), "w", encoding="utf-8") as stream:
+              json.dump(payload, stream, ensure_ascii=False, indent=2)
+              stream.write("\n")
+          PY
             exit 0
           fi
           python scripts/run_real_provider_mission.py \
-            --max-iterations "${{ inputs.max_iterations }}" \
+            --max-iterations "${MAX_ITERATIONS}" \
             --artifact "$POC_OUTPUT/real-mission.json"
-
       - name: Add artifact hash and validate non-secret proof
         if: always()
+        shell: bash
         run: |
           set -euo pipefail
           if [[ -f "$POC_OUTPUT/real-mission.json" ]]; then
             sha256sum "$POC_OUTPUT/real-mission.json" > "$POC_OUTPUT/real-mission.sha256"
           fi
-          if grep -RInE 'gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|OWNER_TOKEN|BRIDGE_TOKEN|OPENAI_API_KEY' "$POC_OUTPUT"; then
+          if grep -RInE 'gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|OWNER_SESSION_TOKEN|OPENAI_API_KEY' "$POC_OUTPUT"; then
             echo "Potential secret material found in proof output; refusing artifact publication."
             exit 1
           fi
-
       - name: Upload non-secret proof artifact
         if: always()
         uses: actions/upload-artifact@v4

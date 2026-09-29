@@ -112,9 +112,11 @@ def test_queue_worker_and_restart_recovery(tmp_path):
 def test_reenqueue_clears_stale_lease_and_error(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-requeued", available_at="2026-01-01T00:00:00+00:00")
-    queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=3600)
+    queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=30)
     queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker")
 
+    expired = queue.recover_expired(now="2026-01-01T00:01:00+00:00")
+    assert len(expired) == 1
     requeued = queue.enqueue("mission-requeued", available_at="2026-01-01T00:01:00+00:00")
     assert requeued.state is WorkerMissionState.QUEUED
     assert requeued.last_error == ""
@@ -190,7 +192,7 @@ def test_worker_records_runtime_permission_error_as_failure(tmp_path):
 
     result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once(now="2026-01-01T00:00:00+00:00")
     assert result.state is WorkerMissionState.FAILED
-    assert result.last_error == "PermissionError: authorization denied"
+    assert result.last_error == "PermissionError"
 
 
 def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
@@ -287,6 +289,6 @@ def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path):
     started = service.start_mission(mission["mission_id"])
     assert started["state"] == WorkerMissionState.QUEUED
     service.pause_mission(mission["mission_id"])
-    assert service.status(mission["mission_id"])["checkpoint"]["status"] == "paused"
+    assert service.status(mission["mission_id"])["progress"]["pause_requested"] is True
     scheduled = service.schedule_mission(mission["mission_id"], run_at="2026-01-01T00:00:00+00:00", schedule_id="svc")
     assert scheduled["schedule_id"] == "svc"

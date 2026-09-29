@@ -142,8 +142,12 @@ def test_frontend_exposes_login_but_never_bridge_secrets_or_owner_session_storag
     assert "/api/public/auth/logout" in script
     assert "credentials: \"include\"" in script
     assert "X-CSRF-Token" in script
-    assert 'localStorage.setItem("cs_conversation_id"' in script
-    assert "localStorage.setItem(\"cs_owner_session\"" not in script
+    assert "localStorage" not in script
+    assert 'item.status || "completed"' not in script
+    assert 'data.answer || "اكتمل التحليل."' not in script
+    assert '"ONLINE"' not in script
+    assert 'data-view="findings"' in page
+    assert "system_evidence" in script
 
 
 def test_http_anonymous_public_boundary_remains_fail_closed(web_server):

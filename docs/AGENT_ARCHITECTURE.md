@@ -184,3 +184,37 @@ and a private IP at connection. Full mitigation requires **IP pinning**
 this is not implemented. Until then, treat the SSRF check as a strong filter
 with a known rebinding residual risk, and constrain network egress at the
 platform layer.
+
+
+## Product Workspace, authorization proofs, and durable recovery (2026-09-29)
+
+The public browser workspace is a view/controller over server-owned mission state; browser state is not mission truth. Its flow is:
+
+```text
+Public CSRF session + authenticated Owner cookie
+  -> owner-scoped mission list/status/timeline/evidence/artifact/log APIs
+  -> exact mission-bound workspace snapshot
+  -> Owner-authorized mission start/pause/resume/cancel
+  -> durable queue lease + one bounded runtime slice
+  -> signed action/criterion evidence
+  -> deterministic goal verification + signed completion proof
+  -> persisted result displayed after reload
+```
+
+Mutating public calls remain same-origin, Owner-session authenticated, and CSRF checked. New browser missions bind to the server's fixed repository workspace; the request cannot select an arbitrary file root. Mission ownership is the stable authenticated account identity rather than a bearer session ID. Conversations are account-scoped; a different account cannot adopt an existing conversation by guessing its ID. Raw Owner-session identifiers are excluded from the public serializers.
+
+The workspace presents backend mission status, current action/checkpoint, queue state, timeline, evidence, artifacts, logs, file contents, repository identity, and read-only Git status/log/diff. Mission state and evidence are reloaded from the service rather than inferred from JavaScript defaults. The Findings tab is deliberately derived only from existing signed system criterion-evidence records, with criterion/action/verification links; there is no separate persisted finding object, and the UI says so explicitly. Empty evidence is displayed as no signed evidence—not as a passing finding. Conversation IDs exist only in page memory; the page does not persist session/mission authority in browser storage.
+
+File reads are mission-root-relative, bounded, UTF-8 checked, and reject absolute paths, traversal, symlink escapes, secret/database patterns, and missing/out-of-scope missions. Git access is read-only; credential-bearing remote userinfo and sensitive diff paths are omitted. Neither browser workspace nor Git view offers a write or deploy control.
+
+### Owner authority and one-use execution proofs
+
+The current registered tool surface is intersected with the explicit captured Owner tool budget. Model proposals cannot widen that budget. Production tool execution is routed through an Owner-direct or mission execution boundary carrying a typed Owner authorization decision, canonical request/mission/tool/argument/action binding, and a one-use signed proof. The final registry validates and consumes that proof before invoking a handler; missing, forged, modified, replayed, wrong-call, wrong-mission, and out-of-budget requests fail closed. The legacy command/task paths remain compatibility paths but still go through the same final governed registry boundary.
+
+System completion requires nonempty required criteria, unambiguous verification, independently checked criterion evidence, and a system-signed completion proof bound to the mission state. A model statement, tool-returned `success`, Owner-supplied recovery narrative, boolean `verified`, or frontend fallback is not sufficient. The supported automatic checks are intentionally narrow (such as an independent current core-status read and an exact successful locally recorded project-test event); other criteria remain unverified until an independent verifier exists.
+
+### Queue and restart behavior
+
+The bridge starts one worker and the persistent scheduler from `bridge.main`. A queue lease is not the mission result: the worker executes bounded slices, releases nonterminal work, recovers expired leases while the process is running, and requeues interrupted leases after restart. A stale worker cannot overwrite a lease it no longer owns. An ambiguous `in_flight` checkpoint is never retried silently; it is shown for explicit Owner reconciliation, with the retry consequence disclosed. Owner reauthentication renews the existing account-bound snapshot and does not bypass mission scope or proof verification. Pause, cancellation, authorization failure, and queue status remain distinct from goal completion.
+
+Owner, mission, queue/scheduler, and evidence data use private local storage files; Owner and system-evidence keys are persistent, local, and separate from model credentials. Back up the matching databases and signing keys together. The bridge binds to loopback only; no production reverse proxy or external hosting target is configured by this repository.

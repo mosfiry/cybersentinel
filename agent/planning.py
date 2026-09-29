@@ -210,9 +210,19 @@ class GoalVerification:
     @classmethod
     def evaluate(cls, goal: str, criteria: Iterable[VerificationCriterion], evidence: Iterable[VerificationEvidence]) -> "GoalVerification":
         criteria_tuple = tuple(criteria)
-        evidence_by_id = {item.criterion_id: item for item in evidence}
-        missing = tuple(item.criterion_id for item in criteria_tuple if item.required and (item.criterion_id not in evidence_by_id or not evidence_by_id[item.criterion_id].passed))
-        return cls(str(goal), criteria_tuple, tuple(evidence_by_id.values()), not missing, missing)
+        if len({item.criterion_id for item in criteria_tuple}) != len(criteria_tuple):
+            raise ValueError("completion criterion IDs must be unique")
+        evidence_tuple = tuple(evidence)
+        required = tuple(item for item in criteria_tuple if item.required)
+        missing = tuple(
+            criterion.criterion_id
+            for criterion in required
+            if not any(item.criterion_id == criterion.criterion_id for item in evidence_tuple)
+            or any(item.criterion_id == criterion.criterion_id and not item.passed for item in evidence_tuple)
+        )
+        if not required:
+            missing = ("no_required_criteria",)
+        return cls(str(goal), criteria_tuple, evidence_tuple, bool(required) and not missing, missing)
 
     def require_verified(self) -> None:
         if not self.verified:

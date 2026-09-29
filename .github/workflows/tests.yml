@@ -1,15 +1,20 @@
 name: tests
+
 on:
   push:
   pull_request:
+
 permissions:
   contents: read
+
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
     strategy:
@@ -17,6 +22,8 @@ jobs:
         python-version: ["3.13"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -26,23 +33,35 @@ jobs:
       - name: Compile Python sources
         id: compile
         run: python -m compileall -q .
+      - name: Check frontend JavaScript syntax
+        id: frontend
+        run: node --check web/app.js
       - name: Run tests
         id: tests
         run: python -m pytest -q
       - name: Check patch whitespace
         id: diff
-        run: git diff --check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            git diff --check "${BASE_SHA}...${GITHUB_SHA}"
+          else
+            git show --check --format= "${GITHUB_SHA}"
+          fi
       - name: Scan for secrets and sensitive files
         id: secrets
         shell: bash
         run: |
           set -euo pipefail
-          if git ls-files | grep -E '(^|/)(\.env$|.*\.pem$|.*\.key$|.*_state\.json$|.*\.db$|.*\.sqlite(3)?)$'; then
-            echo "A sensitive file is tracked; inspect the workflow log and remove the file from the proposed change."
+          if git ls-files | grep -E '(^|/)(\.env$|[^/]*\.(pem|key|p12|pfx)$|[^/]*_state\.json$|[^/]*\.(db|sqlite|sqlite3)$)'; then
+            echo "A sensitive file is tracked; inspect the workflow log and remove it from the proposed change."
             exit 1
           fi
           if git grep -q -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example' ':!diagnostics'; then
-            echo "A secret-like pattern was found; details are intentionally not copied into diagnostics artifacts."
+            echo "A secret-like pattern was found; details are intentionally not copied into CI diagnostics."
             exit 1
           fi
       - name: Write status report
@@ -50,25 +69,28 @@ jobs:
         env:
           DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
           COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          FRONTEND_OUTCOME: ${{ steps.frontend.outcome }}
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           DIFF_OUTCOME: ${{ steps.diff.outcome }}
           SECRETS_OUTCOME: ${{ steps.secrets.outcome }}
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p ci-output
-          cat > ci-output/status.md <<EOF
-          # CyberSentinel CI status
-
-          - Commit: ${GITHUB_SHA}
-          - Ref: ${GITHUB_REF}
-          - Dependencies: ${DEPENDENCIES_OUTCOME}
-          - Compile: ${COMPILE_OUTCOME}
-          - Tests: ${TESTS_OUTCOME}
-          - Whitespace: ${DIFF_OUTCOME}
-          - Secret scan: ${SECRETS_OUTCOME}
-
-          Full step output remains available in this Actions run. Diagnostics are uploaded as an artifact and are never committed back to a branch.
-          EOF
+          {
+            echo "# CyberSentinel CI status"
+            echo
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Ref: ${GITHUB_REF}"
+            echo "- Dependencies: ${DEPENDENCIES_OUTCOME:-not run}"
+            echo "- Compile: ${COMPILE_OUTCOME:-not run}"
+            echo "- Frontend syntax: ${FRONTEND_OUTCOME:-not run}"
+            echo "- Tests: ${TESTS_OUTCOME:-not run}"
+            echo "- Whitespace: ${DIFF_OUTCOME:-not run}"
+            echo "- Secret scan: ${SECRETS_OUTCOME:-not run}"
+            echo
+            echo "Status is an artifact only; the workflow does not commit back to a branch."
+          } > ci-output/status.md
       - name: Upload status artifact
         if: always()
         uses: actions/upload-artifact@v4

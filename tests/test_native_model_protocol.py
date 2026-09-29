@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 
 from pathlib import Path
 
@@ -21,7 +21,7 @@ class ScriptedModel:
                 turn_id,
                 tool_calls=(ToolCallProposal.create("status", {}, mission_id=mission_id, run_id=run_id, turn_id=turn_id, request_id="r1", plan_version=plan_version, step_id="observe", action_id="a1", tool_call_id="call_001"),),
             )
-        assert any(message.role == "tool" and "fixture-result" in message.content for message in self.turns[-1])
+        assert any(message.role == "tool" and "tool_observation" in message.content for message in self.turns[-1])
         return ModelTurn(turn_id, content="goal verified", finish_reason="stop")
 
 
@@ -31,7 +31,7 @@ def test_native_loop_executes_tool_then_models_again(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.registry, "execute", lambda *args, **kwargs: {"ok": True, "criterion_id": "goal", "source": "fixture-result"})
     runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("investigate").replan(steps=(PlanStep("observe", "observe", action="status"),), reason="test")
-    mission = runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}])
+    mission = runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal", "check": "system_online"}], **signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="native-protocol-test"))
     model = ScriptedModel(mission.mission_id)
 
     result = runtime.run_model_loop(mission.mission_id, model, tools=[{"name": "status"}], max_turns=3)

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 import threading
 from typing import Any
 
@@ -17,7 +18,39 @@ POLICY_PATH = ROOT / "security" / "owner_policy.json"
 STATE_PATH = ROOT / "security" / "owner_policy_state.json"
 OWNER_PHRASE = os.getenv("CYBERSENTINEL_OWNER_PHRASE", "Owner").strip()
 _STATE_LOCK = threading.RLock()
-_EVIDENCE_SECRET = secrets.token_bytes(32)
+
+
+def _load_evidence_secret() -> bytes:
+    path = Path(os.environ.get("CYBERSENTINEL_OWNER_EVIDENCE_KEY") or (Path.home() / ".cybersentinel-x" / "owner_evidence.key")).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        secret = secrets.token_bytes(32)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(secret)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            pass
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError("Owner evidence key must be a regular file owned by the application user")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+        key = os.read(fd, 4096)
+    finally:
+        os.close(fd)
+    if len(key) < 32:
+        raise PermissionError("Owner evidence key is invalid")
+    return key
+
+
+_EVIDENCE_SECRET = _load_evidence_secret()
 _EVIDENCE_TTL_SECONDS = 300
 _CONSUMED_EVIDENCE: set[str] = set()
 
@@ -53,6 +86,7 @@ class OwnerPolicy:
     external_content_authority: str = "none"
     model_authority: str = "none"
     system_safety_boundary: str = "immutable"
+    owner_tool_budget: tuple[str, ...] = ()
 
 
 class OwnerInstructionSource(str, Enum):
@@ -74,6 +108,7 @@ class OwnerAuthenticationEvidence:
     session_id: str | None
     nonce: str
     signature: str
+    owner_id: str = ""
 
     def __post_init__(self) -> None:
         if self.method not in {item.value for item in OwnerInstructionSource}:
@@ -82,7 +117,7 @@ class OwnerAuthenticationEvidence:
             raise ValueError("complete authentication evidence is required")
 
     def _signed_payload(self) -> str:
-        return "|".join((self.method, self.authenticated_at, self.expires_at, self.proof_fingerprint, self.request_id, self.session_id or "", self.nonce))
+        return "|".join((self.method, self.authenticated_at, self.expires_at, self.proof_fingerprint, self.request_id, self.session_id or "", self.nonce, self.owner_id))
 
     def is_valid(self, request_id: str, session_id: str | None = None, now: datetime | None = None) -> bool:
         now = now or datetime.now(timezone.utc)
@@ -108,6 +143,7 @@ class OwnerAuthenticationEvidence:
             "session_id": self.session_id,
             "nonce": self.nonce,
             "signature": self.signature,
+            "owner_id": self.owner_id,
         }
 
 
@@ -196,7 +232,11 @@ OwnerInstructionHistory = tuple[OwnerInstruction, ...]
 
 
 def load_policy() -> OwnerPolicy:
-    return OwnerPolicy(**json.loads(POLICY_PATH.read_text(encoding="utf-8")))
+    data = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+    budget = data.get("owner_tool_budget", ())
+    if not isinstance(budget, (list, tuple)) or any(not isinstance(item, str) or not item.strip() for item in budget):
+        raise ValueError("Owner Policy owner_tool_budget must be an explicit list of tool names")
+    return OwnerPolicy(**{**data, "owner_tool_budget": tuple(budget)})
 
 
 def get_runtime_limits() -> RuntimeLimitsConfig:
@@ -242,15 +282,15 @@ def _save_state(state: dict[str, Any]) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def _issue_evidence(method: str, request_id: str, proof_material: str, session_id: str | None = None) -> OwnerAuthenticationEvidence:
+def _issue_evidence(method: str, request_id: str, proof_material: str, session_id: str | None = None, *, owner_id: str = "") -> OwnerAuthenticationEvidence:
     now = datetime.now(timezone.utc)
     authenticated_at = now.isoformat()
     expires_at = (now + timedelta(seconds=_EVIDENCE_TTL_SECONDS)).isoformat()
     nonce = secrets.token_urlsafe(24)
     proof_fingerprint = hashlib.sha256(proof_material.encode("utf-8")).hexdigest()
-    provisional = OwnerAuthenticationEvidence(method, authenticated_at, expires_at, proof_fingerprint, str(request_id), session_id, nonce, "pending")
+    provisional = OwnerAuthenticationEvidence(method, authenticated_at, expires_at, proof_fingerprint, str(request_id), session_id, nonce, "pending", str(owner_id or ""))
     signature = hmac.new(_EVIDENCE_SECRET, provisional._signed_payload().encode("utf-8"), hashlib.sha256).hexdigest()
-    return OwnerAuthenticationEvidence(method, authenticated_at, expires_at, proof_fingerprint, str(request_id), session_id, nonce, signature)
+    return OwnerAuthenticationEvidence(method, authenticated_at, expires_at, proof_fingerprint, str(request_id), session_id, nonce, signature, str(owner_id or ""))
 
 
 def set_current_owner_instruction(text: str, source: str = "web", *, auth_evidence: OwnerAuthenticationEvidence | None = None, owner_authenticated: bool | None = None, request_id: str | None = None) -> dict[str, Any]:
@@ -335,6 +375,7 @@ def authority_snapshot() -> dict[str, Any]:
         "policy_fingerprint": policy_fingerprint(),
         "owner_instruction_fingerprint": owner_instruction_fingerprint(current),
         "invariant": invariant_snapshot(),
+        "owner_tool_budget": list(policy.owner_tool_budget),
     }
 
 
@@ -355,7 +396,7 @@ def authenticate_owner(session_token: str | None, request_id: str = "") -> Owner
     if session is None or session.get("auth_method") != OwnerInstructionSource.USERNAME_PASSWORD.value:
         raise PermissionError("owner authentication required")
     session_id = str(session.get("session_id") or "")
-    return _issue_evidence(OwnerInstructionSource.USERNAME_PASSWORD.value, request_id, session_id, session_id)
+    return _issue_evidence(OwnerInstructionSource.USERNAME_PASSWORD.value, request_id, session_id, session_id, owner_id=str(session.get("owner_id") or ""))
 
 
 def capture_policy_snapshot(request_id: str, authentication: OwnerAuthenticationEvidence) -> OwnerPolicySnapshot:
@@ -371,7 +412,7 @@ def capture_policy_snapshot(request_id: str, authentication: OwnerAuthentication
         owner_instruction=instruction,
         owner_instruction_fingerprint=owner_instruction_fingerprint(instruction),
         owner_policy_fingerprint=policy_fingerprint(),
-        authority_snapshot=invariant_snapshot(),
+        authority_snapshot={**invariant_snapshot(), "owner_tool_budget": list(load_policy().owner_tool_budget)},
         authentication=authentication.to_dict(),
         captured_at=captured_at,
         instruction_record=record,

@@ -18,59 +18,79 @@ class MissionService:
 
     def create_mission(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> dict[str, Any]:
         mission = self.runtime.create(owner_request, objective, plan, **kwargs)
-        return mission.to_dict()
+        return mission.to_public_dict()
 
-    def start_mission(self, mission_id: str) -> dict[str, Any]:
+    def start_mission(self, mission_id: str, *, owner_identity: str | None = None) -> dict[str, Any]:
+        self._load(mission_id, owner_identity=owner_identity)
         return self.queue.enqueue(mission_id).__dict__.copy()
 
-    def pause_mission(self, mission_id: str) -> dict[str, Any]:
-        mission = self._load(mission_id)
+    def pause_mission(self, mission_id: str, *, owner_identity: str | None = None) -> dict[str, Any]:
+        mission = self._load(mission_id, owner_identity=owner_identity)
         if mission.is_terminal:
-            return mission.to_dict()
+            return mission.to_public_dict()
         mission.progress["pause_requested"] = True
-        mission.checkpoint = {**mission.checkpoint, "status": "paused"}
-        return self.runtime.store.save(mission).to_dict()
+        return self.runtime.store.save(mission).to_public_dict()
 
-    def resume_mission(self, mission_id: str) -> dict[str, Any]:
-        mission = self._load(mission_id)
+    def resume_mission(self, mission_id: str, *, owner_identity: str | None = None) -> dict[str, Any]:
+        mission = self._load(mission_id, owner_identity=owner_identity)
         if mission.status is MissionStatus.RECOVERY_REQUIRED:
             raise ValueError("in-flight mission requires reconciliation before resume")
         mission.progress.pop("pause_requested", None)
+        if mission.status is MissionStatus.PAUSED:
+            mission.transition(MissionStatus.READY, "Owner resumed mission")
+            mission.checkpoint = {**mission.checkpoint, "status": "resumed"}
         self.runtime.store.save(mission)
         self.queue.enqueue(mission_id)
-        return mission.to_dict()
+        return mission.to_public_dict()
 
-    def cancel_mission(self, mission_id: str) -> dict[str, Any]:
-        mission = self._load(mission_id)
+    def cancel_mission(self, mission_id: str, *, owner_identity: str | None = None) -> dict[str, Any]:
+        mission = self._load(mission_id, owner_identity=owner_identity)
         if not mission.is_terminal:
-            mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
-            mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+            checkpoint_status = str((mission.checkpoint or {}).get("status", ""))
+            if checkpoint_status in {"in_flight", "in_flight_parallel"}:
+                mission.progress["cancel_requested"] = True
+            else:
+                mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
+                mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
             self.runtime.store.save(mission)
-        return mission.to_dict()
+        return mission.to_public_dict()
 
-    def status(self, mission_id: str) -> dict[str, Any]:
-        return self._load(mission_id).to_dict()
+    def status(self, mission_id: str, *, owner_identity: str | None = None) -> dict[str, Any]:
+        mission = self._load(mission_id, owner_identity=owner_identity)
+        value = mission.to_public_dict()
+        try:
+            item = self.queue.get(mission_id)
+            value["queue"] = {"state": item.state.value, "attempts": item.attempts, "available_at": item.available_at}
+        except KeyError:
+            value["queue"] = {"state": "not_queued"}
+        return value
 
-    def timeline(self, mission_id: str) -> list[dict[str, Any]]:
-        return list(self._load(mission_id).trajectory)
+    def timeline(self, mission_id: str, *, owner_identity: str | None = None) -> list[dict[str, Any]]:
+        return list(self._load(mission_id, owner_identity=owner_identity).trajectory)
 
-    def evidence(self, mission_id: str) -> list[dict[str, Any]]:
-        return list(self._load(mission_id).evidence)
+    def evidence(self, mission_id: str, *, owner_identity: str | None = None) -> list[dict[str, Any]]:
+        return list(self._load(mission_id, owner_identity=owner_identity).evidence)
 
-    def artifacts(self, mission_id: str) -> list[dict[str, Any]]:
-        return list(self._load(mission_id).artifacts)
+    def artifacts(self, mission_id: str, *, owner_identity: str | None = None) -> list[dict[str, Any]]:
+        return list(self._load(mission_id, owner_identity=owner_identity).artifacts)
 
-    def logs(self, mission_id: str) -> list[dict[str, Any]]:
-        mission = self._load(mission_id)
+    def logs(self, mission_id: str, *, owner_identity: str | None = None) -> list[dict[str, Any]]:
+        mission = self._load(mission_id, owner_identity=owner_identity)
         return list(mission.progress.get("logs", ()))
+
+    def list_missions(self, owner_identity: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        return self.runtime.store.list_for_owner(owner_identity, limit=limit)
+
+    def mission(self, mission_id: str, *, owner_identity: str) -> Mission:
+        return self._load(mission_id, owner_identity=owner_identity)
 
     def schedule_mission(self, mission_id: str, *, run_at: str, interval_seconds: int | None = None, retry_limit: int = 0, schedule_id: str | None = None) -> dict[str, Any]:
         if self.scheduler is None:
             raise RuntimeError("scheduler is not configured")
         return self.scheduler.schedule(mission_id, run_at=run_at, interval_seconds=interval_seconds, retry_limit=retry_limit, schedule_id=schedule_id).__dict__.copy()
 
-    def _load(self, mission_id: str) -> Mission:
-        mission = self.runtime.store.load(mission_id)
+    def _load(self, mission_id: str, *, owner_identity: str | None = None) -> Mission:
+        mission = self.runtime.store.load_for_owner(mission_id, owner_identity) if owner_identity is not None else self.runtime.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
         return mission
