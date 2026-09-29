@@ -130,10 +130,9 @@ def connect():
     # inaccessible to authenticated browser requests.
     con.execute("UPDATE conversations SET owner_id=CAST((SELECT owner_id FROM owner_sessions WHERE owner_sessions.session_id=conversations.owner_session_id) AS TEXT) WHERE owner_id='' AND owner_session_id!='' AND EXISTS (SELECT 1 FROM owner_sessions WHERE owner_sessions.session_id=conversations.owner_session_id)")
     con.execute("UPDATE conversations SET owner_session_id='' WHERE owner_session_id!=''")
-    try:
+    execution_columns = {row[1] for row in con.execute("PRAGMA table_info(executions)")}
+    if "cancel_requested" not in execution_columns:
         con.execute("ALTER TABLE executions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
     return con
 
 def add_event(kind, title, body, source, severity="info", trusted=False, metadata=None):

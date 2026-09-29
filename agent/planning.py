@@ -176,6 +176,8 @@ class Plan:
 
     def validate_dependency_graph(self) -> None:
         """Reject ambiguous or unschedulable step prerequisites before execution."""
+        if self.dependencies:
+            raise ValueError("top-level Plan.dependencies is unsupported; express ordering with PlanStep.prerequisites")
         ids = [str(step.step_id) for step in self.steps]
         if any(not step_id.strip() or step_id != step_id.strip() for step_id in ids):
             raise ValueError("plan step IDs must be non-empty and have no surrounding whitespace")

@@ -32,7 +32,7 @@ from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 from security.public_session import DEFAULT_PUBLIC_SESSIONS
 from api.missions import MissionService
-from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, WorkerMissionState
+from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, QueueCapacityError, WorkerMissionState
 from agent.mission_runtime import MissionRuntime
 from agent.mission import MissionStore, MissionStatus
 from agent.agent_core import AgentCore
@@ -549,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
                     payload = self._read_json()
                     return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
                 return self._send(404, {"ok": False, "error": "unknown_mission_action"})
+            except QueueCapacityError:
+                return self._send(429, {"ok": False, "error": "mission_queue_full"})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
             except (ValueError, KeyError) as exc:
@@ -571,6 +573,8 @@ class Handler(BaseHTTPRequestHandler):
                 mission = core.run_owner_mission(objective, owner_session_token=owner["session_id"], request_id=uuid.uuid4().hex, scope_context={"workspace_root": str(ROOT), "target_id": "cybersentinel-repository"}, completion_criteria=criteria, run=False)
                 queued = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3")).enqueue(mission.mission_id)
                 return self._send(201, {"ok": True, "mission": mission.to_public_dict(), "mission_id": mission.mission_id, "queue": queued.__dict__})
+            except QueueCapacityError:
+                return self._send(429, {"ok": False, "error": "mission_queue_full"})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
             except (ValueError, KeyError, TypeError) as exc:
@@ -608,6 +612,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "result": result})
             except KeyError:
                 return self._send(404, {"ok": False, "error": "unknown_mission"})
+            except QueueCapacityError:
+                return self._send(429, {"ok": False, "error": "mission_queue_full"})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
             except (ValueError, TypeError) as exc:

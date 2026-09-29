@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
+from threading import Thread
+from time import sleep
 from types import SimpleNamespace
 
 import pytest
 
 from agent.mission import Mission, MissionStatus
 from agent.planning import Plan
-from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, WorkerMissionState
+from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, QueueCapacityError, WorkerMissionState
 
 NOW = "2026-09-29T00:00:00+00:00"
 
@@ -51,6 +55,133 @@ def test_enqueue_is_idempotent_while_execution_lease_is_owned(tmp_path):
     assert recovered[0].state is WorkerMissionState.QUEUED
     assert recovered[0].lease_owner is None
     assert queue.claim_next(now="2026-09-29T00:02:02+00:00", worker_id="worker-b") is not None
+
+
+def test_legacy_queue_schema_migrates_lease_columns_idempotently(tmp_path):
+    database = tmp_path / "legacy-queue.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE mission_queue (mission_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, claimed_at TEXT, last_error TEXT NOT NULL DEFAULT '')")
+
+    MissionQueue(database)
+    MissionQueue(database)
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(mission_queue)")}
+    assert {"lease_owner", "lease_expires_at"}.issubset(columns)
+
+
+def test_queue_capacity_is_atomic_and_pending_reenqueue_does_not_consume_another_slot(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    queue = MissionQueue(tmp_path / "bounded-queue.sqlite3", max_pending=1)
+    queue.enqueue("mission-existing", available_at=NOW)
+
+    with pytest.raises(QueueCapacityError, match="mission_queue_capacity_exceeded"):
+        queue.enqueue("mission-new", available_at=NOW)
+    assert queue.enqueue("mission-existing", available_at=NOW).state is WorkerMissionState.QUEUED
+
+    queue.update("mission-existing", WorkerMissionState.COMPLETED)
+    barrier = __import__("threading").Barrier(2)
+
+    def enqueue(mission_id):
+        barrier.wait()
+        try:
+            queue.enqueue(mission_id, available_at=NOW)
+            return "accepted"
+        except QueueCapacityError:
+            return "full"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(enqueue, ("mission-a", "mission-b")))
+    assert sorted(outcomes) == ["accepted", "full"]
+    active = [item for item in queue.list() if item.state not in {WorkerMissionState.COMPLETED, WorkerMissionState.FAILED, WorkerMissionState.CANCELLED, WorkerMissionState.NEEDS_INPUT, WorkerMissionState.PARTIAL_SUCCESS}]
+    assert len(active) == 1
+
+
+def test_scheduler_rejects_unimplemented_nonzero_retry_limit(tmp_path):
+    queue = MissionQueue(tmp_path / "queue.sqlite3")
+    scheduler = MissionScheduler(tmp_path / "scheduler.sqlite3", queue)
+    with pytest.raises(ValueError, match="scheduled retries are unavailable"):
+        scheduler.schedule("mission-1", run_at=NOW, retry_limit=2)
+    with pytest.raises(ValueError, match="recurring schedules are unavailable"):
+        scheduler.schedule("mission-1", run_at=NOW, interval_seconds=60)
+
+
+def test_worker_renews_lease_while_executor_is_blocked(tmp_path):
+    queue = MissionQueue(tmp_path / "queue.sqlite3")
+    started_at = datetime.now(timezone.utc)
+    queue.enqueue("mission-long-action", available_at=started_at.isoformat())
+    outcomes = []
+
+    def slow_resume(*_args):
+        sleep(1.2)
+        return StubMission(MissionStatus.GOAL_COMPLETED)
+
+    worker = MissionWorker(queue, runtime_factory=lambda: None, worker_id="worker-a", lease_seconds=0.6, resume_callback=slow_resume)
+    thread = Thread(target=lambda: outcomes.append(worker.run_once(now=started_at.isoformat(), max_slices=1)))
+    thread.start()
+    sleep(0.75)
+    reclaimed = queue.claim_next(
+        now=(started_at + timedelta(seconds=0.75)).isoformat(),
+        worker_id="worker-b",
+        lease_seconds=0.6,
+    )
+    assert reclaimed is None
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert outcomes[0].state is WorkerMissionState.COMPLETED
+
+
+def test_worker_renews_lease_while_runtime_factory_is_blocked(tmp_path):
+    queue = MissionQueue(tmp_path / "runtime-factory-lease.sqlite3")
+    started_at = datetime.now(timezone.utc)
+    queue.enqueue("mission-slow-runtime-factory", available_at=started_at.isoformat())
+    outcomes = []
+
+    def slow_factory():
+        sleep(1.2)
+        return None
+
+    worker = MissionWorker(
+        queue,
+        runtime_factory=slow_factory,
+        worker_id="worker-a",
+        lease_seconds=0.6,
+        resume_callback=lambda *_args: StubMission(MissionStatus.GOAL_COMPLETED),
+    )
+    thread = Thread(target=lambda: outcomes.append(worker.run_once(now=started_at.isoformat(), max_slices=1)))
+    thread.start()
+    sleep(0.75)
+    reclaimed = queue.claim_next(
+        now=(started_at + timedelta(seconds=0.75)).isoformat(),
+        worker_id="worker-b",
+        lease_seconds=0.6,
+    )
+    assert reclaimed is None
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert outcomes[0].state is WorkerMissionState.COMPLETED
+
+
+def test_worker_does_not_publish_result_after_heartbeat_store_failure(tmp_path):
+    queue = MissionQueue(tmp_path / "heartbeat-failure.sqlite3")
+    queue.enqueue("mission-heartbeat-failure", available_at=NOW)
+
+    def broken_heartbeat(*_args, **_kwargs):
+        raise OSError("queue store unavailable")
+
+    queue.heartbeat = broken_heartbeat
+    worker = MissionWorker(
+        queue,
+        runtime_factory=lambda: None,
+        worker_id="worker-a",
+        lease_seconds=0.03,
+        resume_callback=lambda *_args: (sleep(0.08) or StubMission(MissionStatus.GOAL_COMPLETED)),
+    )
+
+    result = worker.run_once(now=NOW, max_slices=1)
+    assert result is not None
+    assert result.state is WorkerMissionState.EXECUTING
+    assert result.lease_owner == "worker-a"
 
 
 def test_bridge_resume_does_not_reauthorize_mission_owned_by_worker(monkeypatch):
@@ -176,4 +307,5 @@ def test_frontend_does_not_turn_worker_or_mission_unknown_into_success():
     assert 'mission?.status || "unknown"' in source
     assert 'item.status || "completed"' not in source
     assert 'verification?.verified ?? true' not in source
-    assert "localStorage" not in source
+    assert "localStorage.setItem(CONVERSATION_STORAGE_KEY" in source
+    assert "localStorage.getItem(CONVERSATION_STORAGE_KEY" in source

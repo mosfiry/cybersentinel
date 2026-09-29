@@ -2,9 +2,9 @@ from __future__ import annotations
 from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 """Round 2 P1 - deterministic goal verification.
 
-A MODEL CLAIM alone can never complete a mission. Completion requires
-observable evidence for every required criterion evaluated by the deterministic
-GoalVerification, or the mission returns to READY instead of completing.
+A MODEL CLAIM or generic tool observation alone can never complete a mission.
+Completion requires supported system-issued evidence for every required
+criterion; otherwise the mission stops for Owner input instead of looping.
 """
 
 
@@ -188,3 +188,54 @@ def test_turn_budget_exhaustion_is_an_honest_failure(tmp_path, monkeypatch):
     assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED
     assert "budget exhausted" in result.error
     assert result.is_terminal
+
+
+def test_generic_tool_observation_does_not_mint_completion_evidence(tmp_path):
+    store = MissionStore(Path(tmp_path) / "missions.sqlite3")
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, [{"criterion_id": "mission-goal", "check": "tool observation"}])
+    mission.record_action("action-observation", "observe", "completed", {"source": "status", "success": True, "result": {"online": True}}, plan_fingerprint=mission.plan.fingerprint)
+
+    assert store.issue_criterion_evidence(mission, "mission-goal", "action-observation") is None
+
+
+@pytest.mark.parametrize(
+    "tool,result",
+    [
+        ("status", {"error": "provider unavailable", "error_type": "provider_unavailable"}),
+        ("run_project_tests", {"ok": False, "returncode": 1, "output": "failed"}),
+        ("scoped_http_probe", {"ok": True, "note": "legacy placeholder"}),
+        ("status", {}),
+        ("status", []),
+    ],
+)
+def test_tool_observation_evidence_rejects_errors_empty_and_unavailable_tools(tmp_path, tool, result):
+    store = MissionStore(Path(tmp_path) / f"missions-{tool}-{len(str(result))}.sqlite3")
+    runtime = MissionRuntime(store, executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    plan = Plan.initial("prove the goal").replan(steps=(PlanStep("observe", "observe", action=tool),), reason="test")
+    mission = runtime.create(
+        "prove the goal",
+        "prove the goal",
+        plan,
+        completion_criteria=[{"criterion_id": "mission-goal", "check": "tool observation"}],
+    )
+    action_id = "action-observation"
+    mission.record_action(action_id, "observe", "completed", {"source": tool, "success": True, "result": result}, plan_fingerprint=plan.fingerprint)
+
+    assert store.issue_criterion_evidence(mission, "mission-goal", action_id) is None
+
+
+def test_unverifiable_criterion_stops_for_owner_without_repeating_verification(tmp_path):
+    store = MissionStore(Path(tmp_path) / "missions.sqlite3")
+    runtime = MissionRuntime(
+        store,
+        executor=lambda *_: {"success": True, "source": "status", "result": {"service": "CyberSentinel X", "version": "test", "online": True}},
+        authorizer=lambda *_: (True, "test owner authorization"),
+        authorization_snapshot_factory=make_test_snapshot,
+    )
+    mission = _mission(runtime, [{"criterion_id": "unknown", "check": "no deterministic validator"}])
+    result = runtime.run_to_completion(mission.mission_id, max_slices=60)
+
+    assert result.status is MissionStatus.OWNER_INPUT_REQUIRED
+    assert result.iteration_count == 2
+    assert "unknown" in result.error

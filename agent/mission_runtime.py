@@ -665,11 +665,13 @@ class MissionRuntime:
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
             mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
             return self.store.save(mission)
-        if (mission.checkpoint or {}).get("status") == "in_flight":
+        checkpoint_status = str((mission.checkpoint or {}).get("status", ""))
+        if checkpoint_status in {"in_flight", "in_flight_parallel"}:
             action_id = str(mission.checkpoint.get("action_id", ""))
-            mission.error = "in-flight action outcome is unknown; reconciliation required"
-            mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id})
-            mission.emit(EventType.FAILURE_DIAGNOSED, step_id=str(mission.checkpoint.get("step_id", "")), data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "action_id": action_id})
+            tool_call_ids = list(mission.checkpoint.get("ambiguous_tool_call_ids", ())) if checkpoint_status == "in_flight_parallel" else []
+            mission.error = "in-flight parallel tool outcomes are unknown; reconciliation required" if checkpoint_status == "in_flight_parallel" else "in-flight action outcome is unknown; reconciliation required"
+            mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id, "tool_call_ids": tool_call_ids})
+            mission.emit(EventType.FAILURE_DIAGNOSED, step_id=str(mission.checkpoint.get("step_id", "")), data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "action_id": action_id, "tool_call_ids": tool_call_ids})
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
             return self.store.save(mission)
         if mission.progress.get("cancel_requested"):
@@ -701,7 +703,10 @@ class MissionRuntime:
                 mission.transition(MissionStatus.GOAL_COMPLETED, "required verification evidence present", verification=mission.verification_state)
                 mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state})
             else:
-                mission.transition(MissionStatus.RUNNING, "required verification evidence missing")
+                missing = list(verification.missing_criteria)
+                mission.error = "required verification evidence missing: " + ", ".join(missing)
+                mission.emit(EventType.OWNER_INPUT_REQUIRED, data={"reason": mission.error, "missing_criteria": missing})
+                mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, mission.error)
             return self.store.save(mission)
 
         if not ready_steps:

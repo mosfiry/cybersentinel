@@ -235,16 +235,17 @@ def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
     assert result.last_error == "in-flight tool outcome is unknown"
 
 
-def test_scheduler_supports_one_time_and_recurring_dispatch(tmp_path):
+def test_scheduler_supports_one_time_dispatch_and_rejects_unimplemented_recurrence(tmp_path):
+    import pytest
+
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     scheduler = MissionScheduler(Path(tmp_path) / "scheduler.sqlite3", queue)
     one = scheduler.schedule("mission-one", run_at="2026-01-01T00:00:00+00:00", schedule_id="one")
-    recurring = scheduler.schedule("mission-recurring", run_at="2026-01-01T00:00:00+00:00", interval_seconds=60, schedule_id="recurring")
+    with pytest.raises(ValueError, match="recurring schedules are unavailable"):
+        scheduler.schedule("mission-recurring", run_at="2026-01-01T00:00:00+00:00", interval_seconds=60, schedule_id="recurring")
     dispatched = scheduler.dispatch_due(now="2026-01-01T00:01:00+00:00")
-    assert {item.schedule_id for item in dispatched} == {"one", "recurring"}
+    assert {item.schedule_id for item in dispatched} == {"one"}
     assert scheduler.get("one").state is WorkerMissionState.COMPLETED
-    assert scheduler.get("recurring").state is WorkerMissionState.SCHEDULED
-    assert scheduler.get("recurring").next_run_at == "2026-01-01T00:02:00+00:00"
 
 
 def test_context_separation_and_independent_verification():

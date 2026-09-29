@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import stat
+from threading import Event, Thread
 import uuid
 
 from .mission import MissionStatus
@@ -36,6 +37,11 @@ class LeaseLostError(PermissionError):
 
 
 DEFAULT_WORKER_LEASE_SECONDS = 120
+DEFAULT_MAX_PENDING_MISSIONS = 10
+
+
+class QueueCapacityError(RuntimeError):
+    """Raised when accepting another mission would exceed the durable queue bound."""
 
 
 def _secure_database_file(path: str | Path) -> str:
@@ -68,15 +74,18 @@ class QueueItem:
 class MissionQueue:
     """Durable queue metadata; mission truth remains in MissionStore."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, max_pending: int = DEFAULT_MAX_PENDING_MISSIONS):
+        if type(max_pending) is not int or max_pending < 1:
+            raise ValueError("max_pending must be a positive integer")
+        self.max_pending = max_pending
         self.db_path = _secure_database_file(db_path)
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS mission_queue (mission_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, claimed_at TEXT, last_error TEXT NOT NULL DEFAULT '')")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(mission_queue)")}
             for column, definition in (("lease_owner", "TEXT"), ("lease_expires_at", "TEXT")):
-                try:
+                if column not in columns:
                     db.execute(f"ALTER TABLE mission_queue ADD COLUMN {column} {definition}")
-                except sqlite3.OperationalError:
-                    pass
+                    columns.add(column)
 
     def enqueue(self, mission_id: str, *, available_at: str | None = None, state: WorkerMissionState = WorkerMissionState.QUEUED) -> QueueItem:
         if not mission_id.strip():
@@ -87,6 +96,11 @@ class MissionQueue:
             current = db.execute("SELECT state FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
             if current and current[0] == WorkerMissionState.EXECUTING.value:
                 return self.get(mission_id)
+            terminal_states = (WorkerMissionState.COMPLETED.value, WorkerMissionState.PARTIAL_SUCCESS.value, WorkerMissionState.NEEDS_INPUT.value, WorkerMissionState.FAILED.value, WorkerMissionState.CANCELLED.value)
+            if current is None or current[0] in terminal_states:
+                active_count = int(db.execute("SELECT COUNT(*) FROM mission_queue WHERE state NOT IN (?,?,?,?,?)", terminal_states).fetchone()[0])
+                if active_count >= self.max_pending:
+                    raise QueueCapacityError("mission_queue_capacity_exceeded")
             db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL", (mission_id, state.value, 0, available))
         return self.get(mission_id)
 
@@ -189,10 +203,32 @@ class MissionWorker:
         item = self.queue.claim_next(now=now, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
         if item is None:
             return None
-        runtime = self.runtime_factory()
+        runtime = None
+        heartbeat_stop = Event()
+        lease_lost = Event()
+        heartbeat_interval = max(0.01, min(self.lease_seconds / 3, 30.0))
+
+        def keep_lease_alive() -> None:
+            while not heartbeat_stop.wait(heartbeat_interval):
+                try:
+                    self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                except LeaseLostError:
+                    lease_lost.set()
+                    return
+                except Exception:
+                    # A transient queue-store failure makes lease ownership
+                    # uncertain too. Do not let this worker publish a result.
+                    lease_lost.set()
+                    return
+
+        heartbeat_thread = Thread(target=keep_lease_alive, name=f"mission-lease-{item.mission_id[:12]}", daemon=True)
+        heartbeat_thread.start()
         try:
+            runtime = self.runtime_factory()
+            if lease_lost.is_set():
+                return self.queue.get(item.mission_id)
+            heartbeat = lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
             try:
-                heartbeat = lambda: self.queue.heartbeat(item.mission_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
                 if self.resume_callback is not None:
                     mission = self.resume_callback(item.mission_id, max_slices, heartbeat)
                 else:
@@ -232,6 +268,11 @@ class MissionWorker:
             if mission is not None and mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
                 return self.queue.update(item.mission_id, WorkerMissionState.NEEDS_INPUT, error="Owner authorization requires renewal", worker_id=self.worker_id)
             return self.queue.update(item.mission_id, WorkerMissionState.FAILED, error=type(exc).__name__, worker_id=self.worker_id)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=max(0.2, heartbeat_interval + 0.2))
+        if lease_lost.is_set():
+            return self.queue.get(item.mission_id)
         state = {
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
             MissionStatus.PAUSED: WorkerMissionState.PAUSED,
@@ -284,8 +325,10 @@ class MissionScheduler:
             db.execute("CREATE TABLE IF NOT EXISTS mission_schedules (schedule_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, next_run_at TEXT NOT NULL, interval_seconds INTEGER, retry_limit INTEGER NOT NULL, retries INTEGER NOT NULL, state TEXT NOT NULL)")
 
     def schedule(self, mission_id: str, *, run_at: str, interval_seconds: int | None = None, retry_limit: int = 0, schedule_id: str | None = None) -> MissionSchedule:
-        if interval_seconds is not None and interval_seconds <= 0:
-            raise ValueError("interval_seconds must be positive")
+        if interval_seconds is not None:
+            raise ValueError("recurring schedules are unavailable; interval_seconds must be omitted")
+        if type(retry_limit) is not int or retry_limit != 0:
+            raise ValueError("scheduled retries are unavailable; retry_limit must be 0")
         item = MissionSchedule(schedule_id or uuid.uuid4().hex, mission_id, run_at, interval_seconds, retry_limit)
         with sqlite3.connect(self.db_path) as db:
             db.execute("INSERT INTO mission_schedules VALUES(?,?,?,?,?,?,?)", (item.schedule_id, item.mission_id, item.next_run_at, item.interval_seconds, item.retry_limit, item.retries, item.state.value))
@@ -325,4 +368,4 @@ class MissionScheduler:
         return self.get(schedule_id)
 
 
-__all__ = ["MissionQueue", "MissionQueue", "MissionSchedule", "MissionScheduler", "MissionWorker", "QueueItem", "WorkerMissionState"]
+__all__ = ["MissionQueue", "MissionSchedule", "MissionScheduler", "MissionWorker", "QueueCapacityError", "QueueItem", "WorkerMissionState"]

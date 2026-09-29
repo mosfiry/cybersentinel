@@ -23,7 +23,7 @@ from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.mission_authorization import MissionAuthorizationSnapshot
 from security.execution_boundary import MissionExecutionBoundary
-from tools.registry import execute
+from tools.registry import ToolUnavailableError, _PROJECT_TEST_SANDBOX_AVAILABLE, execute, get_tool
 from workspace import Workspace, WorkspaceBoundaryError, WorkspacePolicyError
 
 
@@ -52,6 +52,12 @@ def auth(root: str, *, mission_id: str = "m1", owner: str = "owner-proof", actio
 
 
 def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkeypatch):
+    if not _PROJECT_TEST_SANDBOX_AVAILABLE:
+        spec = get_tool("run_project_tests")
+        assert spec is not None and not spec.available and spec.availability_reason
+        with pytest.raises(ToolUnavailableError, match="Unavailable"):
+            execute("run_project_tests", ".", tool_call_id="sandbox-unavailable")
+        return
     (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert 2 + 2 == 4\n")
     store = EvidenceChainStore(tmp_path / "evidence.sqlite3")
     snapshot = auth(str(tmp_path))
@@ -294,7 +300,7 @@ def test_restart_e2e_does_not_promote_generic_tool_success_to_goal_completion(tm
     worker_item = queue.claim_next(worker_id="worker-a", lease_seconds=60)
     assert worker_item is not None
     result = first.run_to_completion(mission.mission_id, max_slices=3, heartbeat=lambda: queue.heartbeat(mission.mission_id, worker_id="worker-a"))
-    assert result.status is MissionStatus.RUNNING
+    assert result.status is MissionStatus.OWNER_INPUT_REQUIRED
     assert result.completion_proof is None
     assert (tmp_path / "artifact.txt").read_text() == "persisted"
     assert evidence_store.verify() and evidence_store.list(request_id="restart-request")
@@ -302,7 +308,7 @@ def test_restart_e2e_does_not_promote_generic_tool_success_to_goal_completion(tm
     restarted_store = MissionStore(mission_db)
     restarted_queue = MissionQueue(queue_db)
     restarted_evidence = EvidenceChainStore(evidence_db)
-    assert restarted_store.load(mission.mission_id).status is MissionStatus.RUNNING
+    assert restarted_store.load(mission.mission_id).status is MissionStatus.OWNER_INPUT_REQUIRED
     assert restarted_evidence.verify()
     assert restarted_queue.get(mission.mission_id).state is not WorkerMissionState.COMPLETED
 

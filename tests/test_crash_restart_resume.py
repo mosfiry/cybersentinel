@@ -178,6 +178,31 @@ def test_restart_never_continues_in_flight_without_reconciliation(tmp_path, monk
     assert execute_calls == [], "an unknown in-flight outcome must never be re-executed blindly"
 
 
+def test_resumed_parallel_in_flight_checkpoint_requires_reconciliation(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    runtime = _runtime(db)
+    mission = _mission(runtime, tmp_path, monkeypatch)
+    mission.status = MissionStatus.READY
+    mission.checkpoint = {
+        "status": "in_flight_parallel",
+        "tool_call_ids": ["call_001", "call_002"],
+        "ambiguous_tool_call_ids": ["call_002"],
+        "plan_fingerprint": mission.plan.fingerprint,
+    }
+    runtime.store.save(mission)
+
+    restarted = _runtime(db)
+    executed = []
+    restarted.executor = lambda *args, **kwargs: executed.append((args, kwargs)) or {"ok": True}
+    resumed = restarted.run_slice(mission.mission_id)
+
+    assert resumed.status is MissionStatus.RECOVERY_REQUIRED
+    assert resumed.checkpoint["status"] == "in_flight_parallel"
+    assert "reconciliation required" in resumed.error
+    assert resumed.failures[-1]["tool_call_ids"] == ["call_002"]
+    assert executed == [], "an ambiguous parallel result must not be replayed after restart"
+
+
 def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkeypatch):
     import tools.registry
 
@@ -229,7 +254,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
     result = runtime.run_model_loop(mission.mission_id, PrivilegeEscalationModel(), tools=[], max_turns=5)
     tool_results = result.progress["model_loop"]["tool_results"]
     assert tool_results[0]["error"] == "sensitive tool requires AuthorizationContext"
-    assert tool_results[1]["error"] == "scope-bound tool requires AuthorizationContext with ScopeSnapshot"
+    assert "not implemented" in tool_results[1]["error"].lower()
     assert result.status is not MissionStatus.GOAL_COMPLETED
     assert result.status is MissionStatus.READY
     assert "lacked deterministic goal evidence" in result.error
