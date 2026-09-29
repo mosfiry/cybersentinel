@@ -124,7 +124,7 @@ def test_canonicalization_and_snapshot_integrity(snapshot):
 def test_registry_rejects_scoped_namespace_without_firewall_metadata():
     from tools.registry import ToolSpec, build_registry
     with pytest.raises(ValueError, match="invalid registry metadata"):
-        build_registry([ToolSpec("recon.http_probe", "probe", "network-read", True, str, lambda value: value)])
+        build_registry([ToolSpec("recon.http_probe", "probe", "network-read", True, str, lambda value: value, network_access="none", filesystem_access="none", process_access="none", credential_access="none")])
 
 
 def test_scope_snapshot_write_requires_owner_token(tmp_path, monkeypatch):

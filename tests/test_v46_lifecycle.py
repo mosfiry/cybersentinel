@@ -63,7 +63,7 @@ def test_tool_timeout_is_explicit(monkeypatch, tmp_path):
         time.sleep(0.05)
         return {"ok": True}
     # Reuse an Owner-budgeted registry name while substituting only its local handler.
-    monkeypatch.setitem(registry.REGISTRY, "status", ToolSpec("status", "test", "read", True, None, slow))
+    monkeypatch.setitem(registry.REGISTRY, "status", ToolSpec("status", "test", "read", True, None, slow, network_access="none", filesystem_access="none", process_access="none", credential_access="none"))
     kwargs = signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="timeout-proof-test")
     context = AuthorizationContext.from_dict(kwargs["authorization_context"])
     decision = authorize_tool(["status", None], context=context)

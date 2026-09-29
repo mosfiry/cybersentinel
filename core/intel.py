@@ -1,16 +1,63 @@
 from __future__ import annotations
 import json
+import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from .config import CISA_KEV_URL, RSS_FEEDS
 from .db import add_intel, add_event, intel_recent
 
 UA = "CyberSentinel-X/FINAL defensive-intelligence"
+MAX_CISA_RESPONSE_BYTES = 16 * 1024 * 1024
+CISA_FEED_URLS = frozenset((CISA_KEV_URL, RSS_FEEDS["CISA Advisories"]))
+
+
+def _is_safe_cisa_redirect(url):
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() == "www.cisa.gov"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+    )
+
+
+class _CISASafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if req.get_method() != "GET" or not _is_safe_cisa_redirect(target):
+            raise urllib.error.HTTPError(
+                req.full_url, code, "CISA redirect rejected by policy", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, target)
 
 def _get(url, timeout=25):
+    if url not in CISA_FEED_URLS:
+        raise ValueError("unsupported CISA feed URL")
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    opener = urllib.request.build_opener(_CISASafeRedirectHandler())
+    with opener.open(req, timeout=timeout) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid CISA Content-Length") from exc
+            if declared_size < 0:
+                raise ValueError("invalid CISA Content-Length")
+            if declared_size > MAX_CISA_RESPONSE_BYTES:
+                raise ValueError("CISA response exceeds byte limit")
+        body = response.read(MAX_CISA_RESPONSE_BYTES + 1)
+        if len(body) > MAX_CISA_RESPONSE_BYTES:
+            raise ValueError("CISA response exceeds byte limit")
+        return body
 
 def severity_for_kev(v):
     if v.get("knownRansomwareUse") == "Known":

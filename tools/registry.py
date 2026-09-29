@@ -13,6 +13,18 @@ import subprocess
 
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
+VALID_NETWORK_ACCESS = frozenset({"none", "fixed_cisa_https_get", "fixed_public_search_apis"})
+VALID_FILESYSTEM_ACCESS = frozenset({
+    "none",
+    "application_db_read",
+    "application_db_read_write",
+    "application_db_read_and_policy_file_read",
+    "procfs_read_and_application_db_write",
+    "runtime_metadata_and_application_db_write",
+    "secret_filtered_read_only_snapshot",
+})
+VALID_PROCESS_ACCESS = frozenset({"none", "bubblewrap+prlimit"})
+VALID_CREDENTIAL_ACCESS = frozenset({"none", "optional_github_token"})
 DEFAULT_TOOL_TIMEOUT = 30
 TOOL_TIMEOUTS = {"run_project_tests": 65, "refresh_intel": 30}
 
@@ -38,10 +50,10 @@ class ToolSpec:
     version: str = "1.0.0"
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
-    network_access: str = "none"
-    filesystem_access: str = "none"
-    process_access: str = "none"
-    credential_access: str = "none"
+    network_access: str = "unspecified"
+    filesystem_access: str = "unspecified"
+    process_access: str = "unspecified"
+    credential_access: str = "unspecified"
     scope_requirements: tuple[str, ...] = ()
     timeout: int = DEFAULT_TOOL_TIMEOUT
     rate_limit: str = "bounded"
@@ -352,6 +364,14 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
         scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "report"}
         if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner) or (scope_namespace in scope_namespaces and not spec.scope_required) or type(spec.available) is not bool or (not spec.available and not spec.availability_reason):
             raise ValueError(f"invalid registry metadata for {spec.name}")
+        access_metadata = (
+            (spec.network_access, VALID_NETWORK_ACCESS),
+            (spec.filesystem_access, VALID_FILESYSTEM_ACCESS),
+            (spec.process_access, VALID_PROCESS_ACCESS),
+            (spec.credential_access, VALID_CREDENTIAL_ACCESS),
+        )
+        if any(not isinstance(value, str) or value not in vocabulary for value, vocabulary in access_metadata):
+            raise ValueError(f"invalid or unspecified access metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
         registry[spec.name] = spec
@@ -359,17 +379,17 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
 
 
 REGISTRY = build_registry([
-    ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status),
-    ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel),
-    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel),
-    ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security),
-    ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info),
-    ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search),
-    ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch),
-    ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch),
+    ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status, network_access="none", filesystem_access="application_db_read_and_policy_file_read", process_access="none", credential_access="none"),
+    ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel, network_access="none", filesystem_access="application_db_read", process_access="none", credential_access="none"),
+    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel, network_access="fixed_cisa_https_get", filesystem_access="application_db_read_write", process_access="none", credential_access="none"),
+    ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security, network_access="none", filesystem_access="procfs_read_and_application_db_write", process_access="none", credential_access="none"),
+    ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info, network_access="none", filesystem_access="runtime_metadata_and_application_db_write", process_access="none", credential_access="none"),
+    ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search, network_access="fixed_public_search_apis", filesystem_access="application_db_read", process_access="none", credential_access="optional_github_token"),
+    ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch, network_access="none", filesystem_access="application_db_read_write", process_access="none", credential_access="none"),
+    ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch, network_access="none", filesystem_access="application_db_read_write", process_access="none", credential_access="none"),
     ToolSpec("run_project_tests", "تشغيل pytest داخل نسخة قراءة فقط معزولة بنظام التشغيل", "bounded-exec", True, str, _run_project_tests, timeout=65, network_access="none", filesystem_access="secret_filtered_read_only_snapshot", process_access="bubblewrap+prlimit", credential_access="none", available=_PROJECT_TEST_SANDBOX_AVAILABLE, availability_reason=_PROJECT_TEST_SANDBOX_REASON),
-    ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
-    ToolSpec("scoped_http_probe", "Unavailable / Not supported by current backend contract: لا يوجد نقل HTTP محدود النطاق منفذ حاليًا", "network-read", True, str, _scoped_http_probe, False, True, available=False, availability_reason="Unavailable / Not supported by current backend contract: scoped HTTP transport is not implemented"),
+    ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True, network_access="none", filesystem_access="none", process_access="none", credential_access="none"),
+    ToolSpec("scoped_http_probe", "Unavailable / Not supported by current backend contract: لا يوجد نقل HTTP محدود النطاق منفذ حاليًا", "network-read", True, str, _scoped_http_probe, False, True, network_access="none", filesystem_access="none", process_access="none", credential_access="none", available=False, availability_reason="Unavailable / Not supported by current backend contract: scoped HTTP transport is not implemented"),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)

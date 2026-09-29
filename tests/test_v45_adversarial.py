@@ -21,13 +21,14 @@ class ForgedProvider:
 
 
 def test_registry_rejects_duplicates_and_invalid_handlers():
-    spec = ToolSpec("x", "read", "read", True, None, lambda _: None)
+    access = {"network_access": "none", "filesystem_access": "none", "process_access": "none", "credential_access": "none"}
+    spec = ToolSpec("x", "read", "read", True, None, lambda _: None, **access)
     with pytest.raises(ValueError):
         build_registry([spec, spec])
     with pytest.raises(ValueError):
-        build_registry([ToolSpec("bad", "bad", "read", True, None, None)])
+        build_registry([ToolSpec("bad", "bad", "read", True, None, None, **access)])
     with pytest.raises(ValueError):
-        build_registry([ToolSpec("bad-risk", "bad", "dangerous", True, None, lambda _: None)])
+        build_registry([ToolSpec("bad-risk", "bad", "dangerous", True, None, lambda _: None, **access)])
 
 
 def test_plan_schema_rejects_unknown_fields_and_hash_is_canonical():
