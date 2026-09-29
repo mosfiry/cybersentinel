@@ -45,6 +45,43 @@ class _SubprocessWorkspace:
         )
 
 
+def test_sandbox_environment_allows_only_prefix_library_path(tmp_path, monkeypatch):
+    prefix = tmp_path / "python"
+    library_dir = prefix / "lib"
+    library_dir.mkdir(parents=True)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/host-only/untrusted-libraries")
+
+    args = registry._sandbox_python_environment_args(prefix)
+
+    assert "--clearenv" in args
+    assert args[args.index("LD_LIBRARY_PATH") + 1] == str(library_dir)
+    assert "/host-only/untrusted-libraries" not in args
+
+
+def test_sandbox_environment_does_not_inherit_library_path_without_prefix_lib(tmp_path, monkeypatch):
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/host-only/untrusted-libraries")
+
+    args = registry._sandbox_python_environment_args(tmp_path)
+
+    assert "LD_LIBRARY_PATH" not in args
+    assert "/host-only/untrusted-libraries" not in args
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (b"bwrap: unshare failed: Operation not permitted", "Unavailable: host denied required OS namespace isolation"),
+        (b"python: error while loading shared libraries: libpython.so", "Unavailable: isolated Python runtime library path is unavailable"),
+        (b"execvp python: No such file or directory", "Unavailable: isolated Python executable or dependency path is inaccessible"),
+    ],
+)
+def test_sandbox_preflight_failure_reason_is_normalized(output, expected):
+    reason = registry._sandbox_preflight_failure_reason(output)
+
+    assert reason == expected
+    assert output.decode("utf-8") not in reason
+
+
 def test_project_tests_run_in_secret_filtered_readonly_networkless_sandbox(tmp_path, monkeypatch):
     if not registry._PROJECT_TEST_SANDBOX_AVAILABLE:
         assert not registry.get_tool("run_project_tests").available
@@ -113,4 +150,5 @@ def test_project_tests_run_in_secret_filtered_readonly_networkless_sandbox(tmp_p
     assert "--cpu=60" in workspace.command
     assert registry._BWRAP in workspace.command
     assert "/workspace" in workspace.command
+    assert workspace.command[workspace.command.index("LD_LIBRARY_PATH") + 1] == str(Path(registry.sys.prefix).resolve() / "lib")
     assert not (root / "should-not-write").exists()

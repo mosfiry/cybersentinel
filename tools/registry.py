@@ -198,6 +198,31 @@ def _unwatch(argument):
     return {"keyword": argument, "watches": watches()}
 
 
+def _sandbox_python_environment_args(prefix: Path, *, disable_bytecode: bool = False) -> list[str]:
+    """Build a cleared environment, allowing only the bound interpreter library path."""
+    args = ["--clearenv", "--setenv", "PATH", f"{prefix / 'bin'}:/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp"]
+    runtime_library_dir = prefix / "lib"
+    if runtime_library_dir.is_dir():
+        args.extend(("--setenv", "LD_LIBRARY_PATH", str(runtime_library_dir)))
+    if disable_bytecode:
+        args.extend(("--setenv", "PYTHONDONTWRITEBYTECODE", "1"))
+    args.extend(("--setenv", "PYTHONNOUSERSITE", "1", "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1"))
+    return args
+
+
+def _sandbox_preflight_failure_reason(output: bytes | str) -> str:
+    """Map sandbox diagnostics to fixed safe categories; never expose raw output."""
+    text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+    normalized = text.casefold()
+    if any(marker in normalized for marker in ("operation not permitted", "permission denied", "no permissions to create", "failed to create new namespace")):
+        return "Unavailable: host denied required OS namespace isolation"
+    if "error while loading shared libraries" in normalized or "cannot open shared object file" in normalized:
+        return "Unavailable: isolated Python runtime library path is unavailable"
+    if "no such file or directory" in normalized or "execvp" in normalized:
+        return "Unavailable: isolated Python executable or dependency path is inaccessible"
+    return "Unavailable: OS test sandbox or isolated pytest interpreter failed preflight"
+
+
 def _probe_project_test_sandbox() -> tuple[bool, str, str, str]:
     """Verify the OS sandbox and isolated interpreter are available at startup."""
     bwrap = shutil.which("bwrap") or ""
@@ -217,13 +242,16 @@ def _probe_project_test_sandbox() -> tuple[bool, str, str, str]:
             command.extend(("--ro-bind", system_path, system_path))
     if not prefix.is_relative_to(Path("/usr")):
         command.extend(("--ro-bind", str(prefix), str(prefix)))
-    command.extend(("--size", "268435456", "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--clearenv", "--setenv", "PATH", f"{prefix / 'bin'}:/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--setenv", "PYTHONNOUSERSITE", "1", "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1", "--", sys.executable, "-c", "import pytest"))
+    command.extend(("--size", "268435456", "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev"))
+    command.extend(_sandbox_python_environment_args(prefix))
+    command.extend(("--", sys.executable, "-c", "import pytest"))
     try:
         probe = subprocess.run(command, capture_output=True, timeout=4, check=False, env={"PATH": os.environ.get("PATH", "")})
     except Exception as exc:
         return False, f"Unavailable: OS test sandbox preflight failed ({type(exc).__name__})", bwrap, prlimit
     if probe.returncode != 0:
-        return False, "Unavailable: OS test sandbox or isolated pytest interpreter failed preflight", bwrap, prlimit
+        output = (probe.stderr or b"") + b"\n" + (probe.stdout or b"")
+        return False, _sandbox_preflight_failure_reason(output), bwrap, prlimit
     return True, "", bwrap, prlimit
 
 
@@ -297,7 +325,9 @@ def _run_project_tests(argument, *, workspace=None):
                     command.extend(("--ro-bind", system_path, system_path))
             if not prefix.is_relative_to(Path("/usr")):
                 command.extend(("--ro-bind", str(prefix), str(prefix)))
-            command.extend(("--ro-bind", str(snapshot), "/workspace", "--size", "268435456", "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--chdir", "/workspace", "--clearenv", "--setenv", "PATH", f"{prefix / 'bin'}:/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTHONNOUSERSITE", "1", "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1", "--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--basetemp=/tmp/pytest-run", "-q"))
+            command.extend(("--ro-bind", str(snapshot), "/workspace", "--size", "268435456", "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--chdir", "/workspace"))
+            command.extend(_sandbox_python_environment_args(prefix, disable_bytecode=True))
+            command.extend(("--", sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--basetemp=/tmp/pytest-run", "-q"))
             result = workspace.develop(tuple(command), cwd=".", timeout=60)
     except (OSError, shutil.Error) as exc:
         raise ToolUnavailableError("isolated project test setup failed closed") from exc
