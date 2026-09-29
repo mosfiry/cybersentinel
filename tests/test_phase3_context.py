@@ -463,9 +463,19 @@ class TestToolDefinitions:
         # Check that tools from REGISTRY are present
         defined_names = {t["name"] for t in builder.tool_definitions}
         
-        # Every executable tool is included; unavailable placeholders are not advertised.
-        assert registry_names == defined_names
+        scope_gated_names = {spec.name for spec in REGISTRY.values() if spec.available and spec.scope_required}
+        assert defined_names == registry_names - scope_gated_names
         assert "scoped_http_probe" not in defined_names
+
+        scoped_builder = ContextBuilder(
+            owner_policy_context="test",
+            execution_state=execution_state,
+            runtime_limits=runtime_limits,
+        )
+        scoped_builder.add_tool_definitions(registry_names, scope_available=True)
+        scoped_names = {item["name"] for item in scoped_builder.tool_definitions}
+        assert scoped_names == registry_names
+        assert "scoped_http_probe" in scoped_names
     
     def test_tool_definitions_include_metadata(self, runtime_limits, execution_state):
         """Test that tool definitions include required metadata."""

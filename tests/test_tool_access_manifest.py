@@ -25,7 +25,7 @@ EXPECTED_TOOL_ACCESS = {
     "unwatch": ("_unwatch", "none", "application_db_read_write", "none", "none"),
     "run_project_tests": ("_run_project_tests", "none", "secret_filtered_read_only_snapshot", "bubblewrap+prlimit", "none"),
     "red_team_assess": ("_red_team_assess", "none", "none", "none", "none"),
-    "scoped_http_probe": ("_scoped_http_probe", "none", "none", "none", "none"),
+    "scoped_http_probe": ("_scoped_http_probe", "scope_authorized_http_get", "none", "none", "none"),
 }
 
 
@@ -62,7 +62,7 @@ def test_builtin_access_declarations_are_explicit_and_match_handlers():
         assert actual == expected
         assert all(isinstance(value, str) and value != "unspecified" for value in actual[1:])
 
-    assert registry.REGISTRY["scoped_http_probe"].available is False
+    assert registry.REGISTRY["scoped_http_probe"].available is True
 
 
 def test_search_metadata_matches_fixed_public_provider_endpoints_and_optional_token():

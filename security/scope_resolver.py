@@ -70,7 +70,7 @@ def resolve(snapshot_id: str, target_id: str, url: str, *, method: str = "GET", 
     except ScopeError as exc:
         return ScopeDecision(False, str(exc), snapshot.authorization.program_id, target_id, snapshot_id)
     parts = urlsplit(normalized)
-    port = parts.port or (443 if parts.scheme == "https" else 80)
+    port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
     if not any(_asset_matches(asset, parts.hostname, parts.scheme, port, parts.path) for asset in snapshot.authorization.in_scope_assets):
         return ScopeDecision(False, "asset_not_in_scope", snapshot.authorization.program_id, target_id, snapshot_id, normalized)
     if parts.hostname != target.host:

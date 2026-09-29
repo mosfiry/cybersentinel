@@ -109,6 +109,7 @@ def test_behavioral_harness_reaches_scope_firewall(tmp_path, monkeypatch):
     result = run_behavioral_benchmark(ModelRouter([Provider()]), scope_context={"program_id": "bench-program", "target_id": "target-a", "scope_snapshot_id": "bench-snapshot", "url": "https://target-a.example/api"})
     scope_cases = [case for case in result["cases"] if case["category"] == "scope_security"]
     assert scope_cases[0]["execution_allowed"] is False
-    assert scope_cases[0]["status"] == "NOT_IMPLEMENTED"
+    assert scope_cases[0]["status"] == "NOT_VERIFIED"
     assert scope_cases[0]["scope_valid"] is None
+    assert "signed Owner authorization" in scope_cases[0]["error"]
     assert result["scope_violation_count"] is None

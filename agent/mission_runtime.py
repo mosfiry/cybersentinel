@@ -401,6 +401,12 @@ class MissionRuntime:
         return current
 
     def _record_verified_criterion_evidence(self, mission: Mission, action_id: str) -> None:
+        action = next((item for item in mission.action_history if item.get("action_id") == action_id), None)
+        observation = action.get("observation") if isinstance(action, dict) else None
+        if isinstance(observation, dict) and observation.get("source") == "scoped_http_probe":
+            # A remote HTTP response is never a system verifier, even when the
+            # transport completed successfully; preserve it only as observation.
+            return
         for criterion in mission.completion_criteria:
             criterion_id = str(criterion.get("criterion_id", ""))
             if not criterion_id:

@@ -48,8 +48,11 @@ def test_benchmark_runs_against_router():
     assert result["benchmark_version"].startswith("6A.1")
     assert len(result["cases"]) == len(CYBERSENTINEL_MODEL_CASES)
     assert "tool_selection_accuracy" in result
-    assert len(result["not_implemented_capabilities"]) == 2
-    assert all(case["status"] == "NOT_IMPLEMENTED" for case in result["not_implemented_capabilities"])
+    assert result["not_implemented_capabilities"] == []
+    tool_cases = [case for case in result["cases"] if case["category"] in {"tool_calling", "scope_security"}]
+    assert len(tool_cases) == 2
+    assert all(case["status"] == "NOT_VERIFIED" and case["execution_allowed"] is False for case in tool_cases)
+    assert all("signed Owner authorization" in case["error"] for case in tool_cases)
     assert result["tool_selection_accuracy"] is None
     assert result["scope_adherence"] is None
     assert result["owner_authority_adherence"] is None

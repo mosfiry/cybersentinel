@@ -12,7 +12,7 @@ from agent.task_runtime import AgentTaskRuntime
 from security.scope import ProgramAuthorization, TargetIdentity, make_snapshot
 from security.scope_resolver import resolve
 from security.scope_store import init_scope_store, save_snapshot
-from tools.registry import ToolUnavailableError, execute, get_tool, tool_definitions
+from tools.registry import execute, get_tool, tool_definitions
 from security.execution_boundary import OwnerDirectBoundary
 import security.scope_store as scope_store
 from security.authorization import authorize_tool
@@ -42,7 +42,7 @@ def snapshot(tmp_path, monkeypatch):
 
 
 def context(url="https://target.example.com/api/v1"):
-    return {"program_id": "program-1", "target_id": "target-1", "scope_snapshot_id": "snapshot-1", "url": url, "method": "GET"}
+    return {"program_id": "program-1", "target_id": "target-1", "scope_snapshot_id": "snapshot-1", "url": url}
 
 
 def test_scope_requires_snapshot_and_target(snapshot):
@@ -59,19 +59,19 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
     assert not resolve("snapshot-1", "target-1", "https://target.example.com/api/private").allowed
 
 
-def test_scoped_probe_is_unavailable_and_never_reports_placeholder_success(snapshot):
+def test_scoped_probe_is_available_but_requires_the_bound_owner_scope_proof(snapshot):
     spec = get_tool("scoped_http_probe")
-    assert spec is not None and spec.available is False
-    assert "Unavailable / Not supported by current backend contract" in spec.availability_reason
-    assert "scoped_http_probe" not in {item["name"] for item in tool_definitions()}
+    assert spec is not None and spec.available is True
+    assert spec.scope_required is True
+    assert spec.network_access == "scope_authorized_http_get"
+    assert "scoped_http_probe" in {item["name"] for item in tool_definitions()}
     catalog_entry = next(item for item in tool_definitions(include_unavailable=True) if item["name"] == "scoped_http_probe")
-    assert catalog_entry["available"] is False
-    assert catalog_entry["availability_reason"] == spec.availability_reason
-    with pytest.raises(ToolUnavailableError, match="Unavailable / Not supported by current backend contract"):
-        execute("scoped_http_probe", "https://target.example.com/api")
+    assert catalog_entry["available"] is True
     evidence = _issue_evidence("username_password", "scope-direct", "scope-direct")
     auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
-    assert not authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context).allowed
+    assert authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context).allowed
+    with pytest.raises(PermissionError, match="PROOF_REQUIRED"):
+        execute("scoped_http_probe", "https://target.example.com/api", request_id="scope-direct", tool_call_id="missing-proof")
     assert not resolve("snapshot-1", "target-1", "https://other.example.com/api", consume_rate=False).allowed
 
 

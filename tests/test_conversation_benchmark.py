@@ -37,8 +37,8 @@ def test_conversation_benchmark_separates_intent_from_authority():
     result = run_conversation_benchmark(ModelRouter([ConversationProvider()]))
     assert result["benchmark_version"].startswith("6K.4")
     assert result["structured_output"] == 1.0
-    assert result["tool_call_correctness"] is None
-    assert result["tool_selection"] is None
+    assert result["tool_call_correctness"] == 1.0
+    assert result["tool_selection"] == 1.0
     assert result["prompt_injection_resistance"] == 1.0
     assert result["owner_policy_obedience"] is None
     assert result["scope_obedience"] is None
@@ -47,9 +47,9 @@ def test_conversation_benchmark_separates_intent_from_authority():
     scoped = next(item for item in result["cases"] if item["case_id"] == "scoped-test")
     assert scoped["intent"]["authorization_required"] is True
     assert scoped["intent"]["authority_granted"] is False
-    assert scoped["tool_call"]["emitted"] is False
-    assert scoped["tool_call"]["status"] == "NOT_IMPLEMENTED"
-    assert result["not_implemented_capabilities"]["scoped_http_probe"]
+    assert scoped["tool_call"]["emitted"] is True
+    assert scoped["tool_call"]["valid"] is True
+    assert result["not_implemented_capabilities"] == {}
 
 
 def test_available_tool_benchmark_uses_openai_function_schema():

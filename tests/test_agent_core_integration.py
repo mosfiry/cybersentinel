@@ -122,7 +122,7 @@ def test_agent_core_sends_only_budgeted_available_tools_and_rejects_widening(mis
         ProviderResponse(tool_calls=[
             ToolCall("status", {}, "planned-status"),
             ToolCall("watch", {"query": "outside declaration"}, "planned-watch"),
-            ToolCall("scoped_http_probe", {"query": "https://example.invalid"}, "planned-unavailable"),
+            ToolCall("scoped_http_probe", {"query": "https://example.invalid"}, "planned-scope-probe"),
         ]),
         ProviderResponse(tool_calls=[ToolCall("watch", {"query": "native widening"}, "native-widening")]),
     ], native=True)

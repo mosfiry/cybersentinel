@@ -767,7 +767,7 @@ function toolsPanel() {
   box.textContent = "لا تعرض واجهة المالك العامة قائمة أدوات. تُقيد الأدوات الفعلية بميزانية المالك المصرّح بها على الخادم عند إنشاء المهمة، ولا يمكن للواجهة أن تضيف أداة أو تفويضًا.";
   const note = document.createElement("p");
   note.className = "muted";
-  note.textContent = "scoped_http_probe: Unavailable / Not supported by current backend contract. لا ينفذ الخادم طلبات HTTP عبر هذه القدرة، ولا يظهر زر تنفيذ لها.";
+  note.textContent = "scoped_http_probe: أداة GET واحدة محدودة النطاق، لا تتبع التحويلات، ولا ترسل بيانات اعتماد أو تعرض نص الاستجابة. لا يظهر زر تنفيذ عام؛ لا تُتاح إلا لمهمة يصرح بها المالك ضمن نطاق محفوظ.";
   const contract = document.createElement("p");
   contract.className = "muted";
   contract.textContent = "عقد مفقود: لا يوجد مسار عام لعرض قائمة الأدوات المتاحة لحساب المالك.";

@@ -254,7 +254,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
     result = runtime.run_model_loop(mission.mission_id, PrivilegeEscalationModel(), tools=[], max_turns=5)
     tool_results = result.progress["model_loop"]["tool_results"]
     assert tool_results[0]["error"] == "sensitive tool requires AuthorizationContext"
-    assert "not implemented" in tool_results[1]["error"].lower()
+    assert tool_results[1]["error"] == "scope-bound tool requires AuthorizationContext with ScopeSnapshot"
     assert result.status is not MissionStatus.GOAL_COMPLETED
     assert result.status is MissionStatus.READY
     assert "lacked deterministic goal evidence" in result.error

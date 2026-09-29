@@ -10,10 +10,11 @@ import shutil
 import sys
 import tempfile
 import subprocess
+import hmac
 
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
-VALID_NETWORK_ACCESS = frozenset({"none", "fixed_cisa_https_get", "fixed_public_search_apis"})
+VALID_NETWORK_ACCESS = frozenset({"none", "fixed_cisa_https_get", "fixed_public_search_apis", "scope_authorized_http_get"})
 VALID_FILESYSTEM_ACCESS = frozenset({
     "none",
     "application_db_read",
@@ -44,7 +45,7 @@ class ToolSpec:
     risk_class: str
     requires_owner: bool
     argument_type: type | None
-    handler: Callable[[str | None], Any]
+    handler: Callable[..., Any]
     owner_only: bool = False
     scope_required: bool = False
     version: str = "1.0.0"
@@ -351,8 +352,9 @@ def _red_team_assess(argument):
     return assess(argument).to_dict()
 
 
-def _scoped_http_probe(argument):
-    raise ToolUnavailableError("Unavailable / Not supported by current backend contract: scoped HTTP transport is not implemented")
+def _scoped_http_probe(argument, *, scope_context):
+    from tools.scoped_http_probe import scoped_http_probe
+    return scoped_http_probe(argument, scope_context=scope_context)
 
 
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
@@ -389,7 +391,7 @@ REGISTRY = build_registry([
     ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch, network_access="none", filesystem_access="application_db_read_write", process_access="none", credential_access="none"),
     ToolSpec("run_project_tests", "تشغيل pytest داخل نسخة قراءة فقط معزولة بنظام التشغيل", "bounded-exec", True, str, _run_project_tests, timeout=65, network_access="none", filesystem_access="secret_filtered_read_only_snapshot", process_access="bubblewrap+prlimit", credential_access="none", available=_PROJECT_TEST_SANDBOX_AVAILABLE, availability_reason=_PROJECT_TEST_SANDBOX_REASON),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True, network_access="none", filesystem_access="none", process_access="none", credential_access="none"),
-    ToolSpec("scoped_http_probe", "Unavailable / Not supported by current backend contract: لا يوجد نقل HTTP محدود النطاق منفذ حاليًا", "network-read", True, str, _scoped_http_probe, False, True, network_access="none", filesystem_access="none", process_access="none", credential_access="none", available=False, availability_reason="Unavailable / Not supported by current backend contract: scoped HTTP transport is not implemented"),
+    ToolSpec("scoped_http_probe", "One bounded, scope-authorized HTTP GET. GET only; redirects are blocked; no credentials or response body are returned.", "network-read", True, str, _scoped_http_probe, False, True, timeout=10, network_access="scope_authorized_http_get", filesystem_access="none", process_access="none", credential_access="none", scope_requirements=("persisted_scope_snapshot", "program_id", "target_id", "GET"), output_schema={"type": "object", "additionalProperties": False, "properties": {"success": {"type": "boolean"}, "outcome": {"type": "string"}, "observation_only": {"type": "boolean"}, "status": {"type": ["integer", "null"]}, "content_type": {"type": "string", "maxLength": 128}, "byte_count": {"type": "integer", "maximum": 65536}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "truncated": {"type": "boolean"}, "error_code": {"type": "string"}}}),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -461,26 +463,22 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
         raise PermissionError("Owner AuthorizationDecision required for this tool")
     if spec.scope_required and not decision_valid:
         raise PermissionError("scope-bound AuthorizationDecision required")
+    valid, reason = spec.validate(argument)
+    if not valid:
+        raise ValueError(reason)
+    strict_scope_context = None
     if spec.scope_required:
-        if not isinstance(scope_context, dict):
-            raise PermissionError("scope context required")
-        required = {"program_id", "target_id", "scope_snapshot_id", "url"}
-        if not required.issubset(scope_context):
-            raise PermissionError("incomplete scope context")
-        from security.scope_resolver import resolve
-        requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
-        urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
-        for checked_url in urls:
-            decision = resolve(
-                scope_context["scope_snapshot_id"],
-                scope_context["target_id"],
-                checked_url,
-                method=scope_context.get("method", "GET"),
-                expected_program_id=scope_context["program_id"],
-                redirect_chain=scope_context.get("redirect_chain", []),
-            )
-            if not decision.allowed:
-                raise PermissionError("scope denied: " + decision.reason)
+        from security.authorization_context import _fingerprint
+        from security.scope_store import get_snapshot
+        from tools.scoped_http_probe import _scope_authorized_url, validate_scope_context_fields
+        strict_scope_context = validate_scope_context_fields(scope_context)
+        live_scope = get_snapshot(strict_scope_context["scope_snapshot_id"])
+        if live_scope is None:
+            raise PermissionError("scope snapshot is not persisted")
+        if not hmac.compare_digest(_fingerprint(live_scope.to_dict()), str(authorization_decision.scope_fingerprint)):
+            raise PermissionError("scope snapshot differs from the Owner AuthorizationDecision")
+        if not hmac.compare_digest(_fingerprint(strict_scope_context), str(execution_proof.scope_hash)):
+            raise PermissionError("scope context differs from the execution proof")
     if mission_authorization is not None:
         from security.mission_authorization import MissionAuthorizationSnapshot
         snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
@@ -491,18 +489,21 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             raise PermissionError("mission authorization blocked: " + reason)
     elif mission_bound:
         raise PermissionError(f"{RejectionCode.SNAPSHOT_MISSING.value}: mission-bound execution requires the Owner authorization snapshot")
-    valid, reason = spec.validate(argument)
-    if not valid:
-        raise ValueError(reason)
+    if spec.scope_required:
+        _scope_authorized_url(argument, strict_scope_context, consume_rate=True)
     from security.execution_proof import consume_execution_proof_once
     consume_execution_proof_once(execution_proof)
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
+    if spec.scope_required:
+        limit = min(limit, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
         if workspace is None or mission_authorization is None or not mission_id:
             raise PermissionError("run_project_tests requires a mission-bound Workspace and Owner authorization snapshot")
         workspace.bind(mission_id=str(mission_id), request_id=str(request_id or ""), tool_id=name, action_id=str(tool_call_id or ""), authorization_snapshot=mission_authorization, evidence_store=evidence_store)
         future = executor.submit(spec.handler, argument, workspace=workspace)
+    elif spec.scope_required:
+        future = executor.submit(spec.handler, argument, scope_context=strict_scope_context)
     else:
         future = executor.submit(spec.handler, argument)
     try:

@@ -204,7 +204,7 @@ def test_generic_tool_observation_does_not_mint_completion_evidence(tmp_path):
     [
         ("status", {"error": "provider unavailable", "error_type": "provider_unavailable"}),
         ("run_project_tests", {"ok": False, "returncode": 1, "output": "failed"}),
-        ("scoped_http_probe", {"ok": True, "note": "legacy placeholder"}),
+        ("scoped_http_probe", {"success": True, "outcome": "response_received", "observation_only": True, "status": 200, "content_type": "text/plain", "byte_count": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "truncated": False}),
         ("status", {}),
         ("status", []),
     ],
