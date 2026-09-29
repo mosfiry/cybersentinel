@@ -67,10 +67,30 @@ def test_benchmark_runs_against_router():
     assert planning["passed"] is None
 
 
-def test_tool_calling_does_not_imply_structured_output(monkeypatch):
-    provider = OpenAICompatibleProvider("x", "http://localhost/v1", "model", tool_calling=True, structured_output=False)
+def test_builtin_adapter_fails_closed_for_unimplemented_capabilities():
+    provider = OpenAICompatibleProvider("x", "http://localhost/v1", "model", tool_calling=True, streaming=True, structured_output=True)
     assert provider.capabilities.tool_calling is True
+    assert provider.capabilities.stream is False
     assert provider.capabilities.structured_output is False
+    assert provider.status()["unsupported_capabilities"] == ["stream", "structured_output"]
+
+
+@pytest.mark.parametrize("prefix", ["LLM", "LOCAL_LLM"])
+def test_legacy_environment_flags_do_not_advertise_unimplemented_capabilities(monkeypatch, prefix):
+    for group in ("LOCAL_LLM", "COLAB_LLM", "HF_LLM", "LLM"):
+        for field in ("BASE_URL", "MODEL", "API_KEY", "TOOL_CALLING", "STREAMING", "STRUCTURED_OUTPUT", "PRIORITY"):
+            monkeypatch.delenv(f"{group}_{field}", raising=False)
+
+    monkeypatch.setenv(f"{prefix}_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv(f"{prefix}_MODEL", "mock-model")
+    monkeypatch.setenv(f"{prefix}_STREAMING", "true")
+    monkeypatch.setenv(f"{prefix}_STRUCTURED_OUTPUT", "true")
+
+    provider_status = ModelRouter.from_env().status()[0]
+
+    assert provider_status["capabilities"]["stream"] is False
+    assert provider_status["capabilities"]["structured_output"] is False
+    assert provider_status["unsupported_capabilities"] == ["stream", "structured_output"]
 
 
 def test_benchmark_honors_custom_cases_without_treating_scope_or_boolean_as_authority():

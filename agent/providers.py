@@ -17,7 +17,9 @@ class OpenAICompatibleProvider:
         self.failure_count = 0
         self.last_error = ""
         self.priority = priority
-        self.capabilities = ProviderCapabilities(generate=True, stream=streaming, tool_calling=tool_calling, structured_output=structured_output, chat=True, native_chat=True, parallel_tool_calls=parallel_tool_calls, reasoning=reasoning, reasoning_budget=reasoning_budget, long_context=long_context, vision=vision)
+        # Keep legacy constructor options source-compatible, but never advertise
+        # behaviors this synchronous adapter does not implement and enforce.
+        self.capabilities = ProviderCapabilities(generate=True, stream=False, tool_calling=tool_calling, structured_output=False, chat=True, native_chat=True, parallel_tool_calls=parallel_tool_calls, reasoning=reasoning, reasoning_budget=reasoning_budget, long_context=long_context, vision=vision)
 
     def status(self) -> dict:
         return {
@@ -28,6 +30,7 @@ class OpenAICompatibleProvider:
             "failure_count": self.failure_count,
             "last_error": self.last_error,
             "priority": self.priority,
+            "unsupported_capabilities": ["stream", "structured_output"],
             "capabilities": self.capabilities.__dict__.copy(),
         }
 

@@ -181,3 +181,114 @@ def test_false_native_tool_result_is_not_recorded_as_completed(tmp_path, monkeyp
     assert result.action_history[0]["status"] == "failed"
     assert result.progress["model_loop"]["tool_results"][0]["ok"] is False
     assert result.status.name != "GOAL_COMPLETED"
+
+
+def test_provider_switch_preserves_durable_mission_security_and_context(tmp_path, monkeypatch):
+    import copy
+    import json
+
+    from agent.model_protocol import RouterNativeModel
+    from agent.model_router import ModelRouter
+    from agent.provider_api import ProviderCapabilities
+    from runtime_authorization import signed_test_owner_kwargs
+
+    class FakeProvider:
+        def __init__(self, name, response):
+            self.name = name
+            self.model = f"{name}-model"
+            self.response = response
+            self.capabilities = ProviderCapabilities(generate=True, tool_calling=False)
+            self.requests = []
+
+        def generate(self, messages, temperature=0, **kwargs):
+            self.requests.append(messages)
+            return {"content": self.response}
+
+    database = Path(tmp_path) / "provider-switch.sqlite3"
+    store_a = MissionStore(database)
+    runtime_a = MissionRuntime(store_a, executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    scope_snapshot = {
+        "target_id": "test-target",
+        "allowed_targets": ["https://scope.example"],
+        "allowed_networks": [],
+        "allowed_credentials": [],
+        "workspace_root": "/workspace/test",
+    }
+    mission = runtime_a.create(
+        "continue the same mission",
+        "continue the same mission",
+        Plan.initial("continue the same mission").replan(
+            steps=(PlanStep("observe", "observe", action="status"),), reason="provider-switch fixture"
+        ),
+        scope_snapshot=scope_snapshot,
+        provenance={"source": "provider-switch-test", "verification": "NOT_VERIFIED"},
+        **signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="provider-switch-test"),
+    )
+    mission.evidence = [{
+        "criterion_id": "fixture-evidence",
+        "passed": False,
+        "source": "mock-provider-test",
+        "result": {"observation": "unverified fixture"},
+        "provenance": {"source_id": "fixture-source", "verification": "NOT_VERIFIED"},
+    }]
+    mission.knowledge_context = [{
+        "knowledge_id": "fixture-context",
+        "source": "mock-provider-test",
+        "text": "durable context marker",
+        "provenance": {"source_id": "context-source", "verification": "NOT_VERIFIED"},
+    }]
+    store_a.save(mission)
+    durable_before_switch = MissionStore(database).load(mission.mission_id)
+    expected = {
+        "mission_id": durable_before_switch.mission_id,
+        "authorization_context": copy.deepcopy(durable_before_switch.authorization_context),
+        "scope_snapshot": copy.deepcopy(durable_before_switch.scope_snapshot),
+        "policy_snapshot": copy.deepcopy(durable_before_switch.policy_snapshot),
+        "authorization_snapshot": copy.deepcopy(durable_before_switch.authorization_snapshot),
+        "evidence": copy.deepcopy(durable_before_switch.evidence),
+        "provenance": copy.deepcopy(durable_before_switch.provenance),
+        "knowledge_context": copy.deepcopy(durable_before_switch.knowledge_context),
+    }
+
+    provider_a = FakeProvider("provider-a", "first provider checkpoint")
+    first = runtime_a.run_model_loop(
+        mission.mission_id,
+        RouterNativeModel(ModelRouter([provider_a])),
+        tools=[],
+        max_turns=1,
+    )
+    assert first.status is MissionStatus.READY
+    saved_after_a = MissionStore(database).load(mission.mission_id)
+    for field, value in expected.items():
+        assert getattr(saved_after_a, field) == value
+
+    provider_b = FakeProvider("provider-b", "continued with replacement provider")
+    runtime_b = MissionRuntime(
+        MissionStore(database), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot
+    )
+    continued = runtime_b.run_model_loop(
+        mission.mission_id,
+        RouterNativeModel(ModelRouter([provider_b])),
+        tools=[],
+        max_turns=1,
+    )
+
+    assert continued.status is MissionStatus.READY
+    saved_after_b = MissionStore(database).load(mission.mission_id)
+    for field, value in expected.items():
+        assert getattr(saved_after_b, field) == value
+    turns = saved_after_b.progress["model_loop"]["turns"]
+    assert [turn["provider"] for turn in turns] == ["provider-a", "provider-b"]
+
+    def durable_state(provider):
+        content = next(message["content"] for message in provider.requests[0] if message["content"].startswith("DURABLE_STATE\n"))
+        return json.loads(content.removeprefix("DURABLE_STATE\n"))
+
+    state_a = durable_state(provider_a)
+    state_b = durable_state(provider_b)
+    for section in ("owner", "mission", "plan", "observation", "evidence", "knowledge", "tool", "tool_definitions"):
+        assert state_b[section] == state_a[section]
+    assert state_b["mission"]["mission_id"] == expected["mission_id"]
+    assert state_b["evidence"] == expected["evidence"]
+    assert state_b["knowledge"] == expected["knowledge_context"]
+    assert saved_after_b.verification_state["verified"] is False
