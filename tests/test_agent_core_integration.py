@@ -91,3 +91,76 @@ def test_agent_028_model_tool_proposal_cannot_authorize(mission_env):
     mission = core.run_owner_mission("Check status", owner_session_token="valid-owner")
     assert mission.status in {MissionStatus.GOAL_COMPLETED, MissionStatus.FAILED_RETRY_EXHAUSTED}
     assert mission.authorization_context is not None
+
+
+class SchemaCapturingProvider(MissionProvider):
+    def __init__(self, responses, *, native=False):
+        from agent.provider_api import ProviderCapabilities
+
+        super().__init__(responses)
+        self.capabilities = ProviderCapabilities(generate=True, tool_calling=True, native_chat=native)
+        self.schema_names = []
+
+    def tool_calling(self, messages, tools, **kwargs):
+        self.calls += 1
+        self.schema_names.append([item["function"]["name"] for item in tools])
+        return self.responses.pop(0)
+
+
+def test_agent_core_sends_only_budgeted_available_tools_and_rejects_widening(mission_env, monkeypatch):
+    from dataclasses import replace
+
+    import tools.registry
+
+    policy = owner_policy.load_policy()
+    monkeypatch.setattr(owner_policy, "load_policy", lambda: replace(policy, owner_tool_budget=(*policy.owner_tool_budget, "scoped_http_probe")))
+    executed = []
+    monkeypatch.setattr(tools.registry, "execute", lambda name, *args, **kwargs: executed.append(name) or {"success": True})
+    provider = SchemaCapturingProvider([
+        ProviderResponse(tool_calls=[
+            ToolCall("status", {}, "planned-status"),
+            ToolCall("watch", {"query": "outside declaration"}, "planned-watch"),
+            ToolCall("scoped_http_probe", {"query": "https://example.invalid"}, "planned-unavailable"),
+        ]),
+        ProviderResponse(tool_calls=[ToolCall("watch", {"query": "native widening"}, "native-widening")]),
+    ], native=True)
+    core = AgentCore(ModelRouter([provider]), store=MissionStore(Path(mission_env) / "missions.sqlite3"), max_iterations=1)
+
+    mission = core.run_owner_mission(
+        "Check service status",
+        owner_session_token="valid-owner",
+        scope_context={"owner_allowed_tools": ["status", "search", "scoped_http_probe"]},
+    )
+
+    assert set(provider.schema_names[0]) == {"status", "search"}
+    assert provider.schema_names[1] == ["status"]
+    assert [step.action for step in mission.plan.steps] == ["status"]
+    assert mission.provenance["model_requested_tools"] == ["status"]
+    assert "watch" not in provider.schema_names[0]
+    assert "scoped_http_probe" not in provider.schema_names[0]
+    assert executed == []
+    assert any(event["event"] == "ExecutionRejected" for event in mission.trajectory)
+    assert "outside mission authorization snapshot allowlist" in mission.progress["model_loop"]["tool_results"][-1]["error"]
+
+
+def test_restart_replanning_keeps_the_mission_bound_tool_set(mission_env):
+    provider = SchemaCapturingProvider([
+        ProviderResponse(tool_calls=[ToolCall("status", {}, "initial-status")]),
+        ProviderResponse(tool_calls=[ToolCall("search", {"query": "widen during replan"}, "replanned-search")]),
+    ])
+    database = Path(mission_env) / "missions.sqlite3"
+    initial_core = AgentCore(ModelRouter([provider]), store=MissionStore(database), max_iterations=1)
+    mission = initial_core.run_owner_mission(
+        "Check status and search only if needed",
+        owner_session_token="valid-owner",
+        scope_context={"owner_allowed_tools": ["status", "search"]},
+        run=False,
+    )
+    restarted_core = AgentCore(ModelRouter([provider]), store=MissionStore(database), max_iterations=1)
+    restarted_core._executor = lambda *_: {"success": False, "failure_class": "COMPILATION", "error": "test-triggered replan"}
+
+    resumed = restarted_core.resume_mission(mission.mission_id, owner_session_token="valid-owner", max_slices=1)
+
+    assert set(provider.schema_names[0]) == {"status", "search"}
+    assert provider.schema_names[1] == ["status"]
+    assert [step.action for step in resumed.plan.steps] == ["__planning_failure__"]

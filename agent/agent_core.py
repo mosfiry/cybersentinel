@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from core.config import DB_PATH
 from security.authorization import authorize_tool
@@ -73,10 +73,11 @@ class AgentCore:
         return self.store.save(mission)
 
     @staticmethod
-    def _schemas() -> list[dict[str, Any]]:
+    def _schemas(allowed_tools: Iterable[str] | None = None, *, scope_available: bool = True) -> list[dict[str, Any]]:
+        allowlist = None if allowed_tools is None else frozenset(str(name) for name in allowed_tools)
         result = []
         for spec in REGISTRY.values():
-            if not spec.available:
+            if not spec.available or (allowlist is not None and spec.name not in allowlist) or (spec.scope_required and not scope_available):
                 continue
             parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
             if spec.argument_type is str:
@@ -84,6 +85,21 @@ class AgentCore:
                 parameters["required"] = ["query"]
             result.append({"type": "function", "function": {"name": spec.name, "description": spec.description[:512], "parameters": parameters}})
         return result
+
+    @staticmethod
+    def _mission_model_tools(mission: Mission) -> tuple[str, ...]:
+        """Return only currently available registry tools in this mission's authorization snapshot."""
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        except (KeyError, TypeError, ValueError, PermissionError):
+            return ()
+        authorized = set(snapshot.allowed_tools).intersection(snapshot.allowed_actions)
+        authorization = mission.authorization_context if isinstance(mission.authorization_context, dict) else {}
+        scope_available = bool(authorization.get("scope_snapshot_id"))
+        return tuple(
+            spec.name for spec in REGISTRY.values()
+            if spec.available and spec.name in authorized and (not spec.scope_required or scope_available)
+        )
 
     @staticmethod
     def _calls(response: dict[str, Any]) -> list[ToolCall]:
@@ -107,7 +123,7 @@ class AgentCore:
             return [ToolCall(payload["name"], payload.get("arguments") or {}, str(payload.get("id") or uuid.uuid4().hex))]
         return []
 
-    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "") -> dict[str, Any]:
+    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", allowed_tools: Iterable[str] | None = None, scope_available: bool = True) -> dict[str, Any]:
         profile = select_reasoning_profile(objective)
         context = ContextEngine.build(
             user_text=objective,
@@ -119,7 +135,7 @@ class AgentCore:
         )
         messages = context.provider_messages()
         try:
-            return self.router.tool_calling(messages, self._schemas(), reasoning_profile=profile)
+            return self.router.tool_calling(messages, self._schemas(allowed_tools, scope_available=scope_available), reasoning_profile=profile)
         except CapabilityUnsupported:
             try:
                 return self.router.generate(messages, reasoning_profile=profile)
@@ -128,14 +144,15 @@ class AgentCore:
         except Exception as exc:
             return {"content": "", "provider": "failed", "model": "failed", "error": type(exc).__name__}
 
-    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "") -> Plan:
-        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id)
+    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", allowed_tools: Iterable[str] | None = None, scope_available: bool = True) -> Plan:
+        allowlist = None if allowed_tools is None else frozenset(str(name) for name in allowed_tools)
+        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, allowed_tools=allowlist, scope_available=scope_available)
         self._last_model_response = dict(response)
         calls = self._calls(response)
         steps: list[PlanStep] = []
         for index, call in enumerate(calls, start=1):
             spec = get_tool(call.name)
-            if spec is None or not spec.available:
+            if spec is None or not spec.available or (allowlist is not None and call.name not in allowlist) or (spec.scope_required and not scope_available):
                 continue
             steps.append(PlanStep(
                 step_id=f"step-{index}-{call.name}",
@@ -148,7 +165,7 @@ class AgentCore:
                 verification=(f"step-{index}-{call.name}",),
             ))
         if not steps:
-            if observation is not None:
+            if observation is not None and not calls:
                 # A textual continuation after an observed action means that
                 # the durable evidence should be verified now; it is not a
                 # new executable step.
@@ -260,23 +277,24 @@ class AgentCore:
                 scope_snapshot=snapshot,
                 session_id=authorization_context.session_id,
             )
-        plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id)
+        owner_budget = OwnerAuthorizedToolBudget.from_owner_declaration(
+            scope_context,
+            policy_version=str(getattr(authorization_context.policy_snapshot, "policy_version", "owner-policy")),
+            owner_approval=authorization_context.owner_evidence.proof_fingerprint,
+        )
+        scope_available = authorization_context.scope_snapshot is not None
+        plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id, allowed_tools=owner_budget.tools, scope_available=scope_available)
         task_profile = TaskProfile.from_proposal(instruction, {"task_type": "owner_mission", "horizon": "long_horizon", "complexity": "multi_step", "likely_tools": [step.action for step in plan.steps if step.action != "__planning_failure__"]})
         runtime = MissionRuntime(
             self.store,
             executor=self._executor,
-            replanner=lambda mission, observation: self._plan(mission.objective, observation, policy_context=policy_context, request_id=mission.request_id, conversation_id=mission.mission_id),
+            replanner=lambda mission, observation: self._plan(mission.objective, observation, policy_context=policy_context, request_id=mission.request_id, conversation_id=mission.mission_id, allowed_tools=self._mission_model_tools(mission)),
             recovery_policy=RecoveryPolicy(),
             interpreter=ObservationInterpreter(proposer=self._observation_proposal),
             require_authorization_snapshot=True,
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
-        owner_budget = OwnerAuthorizedToolBudget.from_owner_declaration(
-            scope_context,
-            policy_version=str(getattr(authorization_context.policy_snapshot, "policy_version", "owner-policy")),
-            owner_approval=authorization_context.owner_evidence.proof_fingerprint,
-        )
         model_requested_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
         allowed_tools = owner_budget.intersect(model_requested_tools)
         workspace_capabilities = ("workspace_read", "git_read")
@@ -351,7 +369,7 @@ class AgentCore:
         capabilities = [getattr(provider, "capabilities", None) for provider in getattr(self.router, "providers", ())]
         if any(getattr(item, "native_chat", False) and getattr(item, "tool_calling", False) for item in capabilities):
             from .model_protocol import RouterNativeModel
-            return runtime.run_model_loop(mission.mission_id, RouterNativeModel(self.router), tools=self._schemas(), max_turns=self.max_iterations)
+            return runtime.run_model_loop(mission.mission_id, RouterNativeModel(self.router), tools=self._schemas(self._mission_model_tools(mission)), max_turns=self.max_iterations)
         result = runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
         last_response = getattr(self, "_last_model_response", None)
         if isinstance(last_response, dict) and last_response.get("content"):
@@ -434,7 +452,7 @@ class AgentCore:
         if not run:
             return mission
         policy_context = policy_context_from_snapshot(fresh_snapshot)
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True)
+        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id, allowed_tools=self._mission_model_tools(current)), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True)
         return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations, heartbeat=heartbeat)
 
 
