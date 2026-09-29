@@ -15,6 +15,14 @@
 
 const API_BASE = String(window.CYBERSENTINEL_API_BASE || "").replace(/\/+$/, "");
 const CONVERSATION_STORAGE_KEY = "cybersentinel.lastConversation";
+const MAX_SCOPE_ASSETS = 32;
+const MAX_SCOPE_TARGETS = 32;
+const MAX_SCOPE_PORTS = 20;
+const MAX_SCOPE_PATHS = 32;
+const MAX_SCOPE_METHODS = 9;
+const MAX_SCOPE_EXPIRATION_DAYS = 365;
+const SCOPE_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SCOPE_HTTP_METHODS = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "TRACE", "CONNECT"];
 
 const state = {
   csrfToken: "",
@@ -28,6 +36,7 @@ const state = {
   selectedModelPreference: "balanced",
   continueSelectedMission: false,
   missions: [],
+  scopeSnapshotSubmitting: false,
   selectedMissionId: "",
   selectedMission: null,
   missionViews: { timeline: [], evidence: [], artifacts: [], logs: [] },
@@ -171,6 +180,7 @@ function updateAuthUI(data) {
   $("#loginForm").classList.toggle("hidden", state.ownerAuthenticated);
   $("#logoutButton").classList.toggle("hidden", !state.ownerAuthenticated);
   $("#authMessage").textContent = "";
+  updateScopeSnapshotAuthUI();
 }
 
 const MODEL_PREFERENCES = [
@@ -229,14 +239,13 @@ function resetWorkspaceState() {
   state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [] };
   state.missions = [];
   state.continueSelectedMission = false;
+  resetManualScopeForm();
   resetModelPreferences();
   $("#messages").replaceChildren();
   $("#missionHeader").classList.add("hidden");
   $("#missionTools").classList.add("hidden");
   $("#missionList").innerHTML = '<p class="muted">سجّل الدخول لعرض المهام.</p>';
-  renderMissionView("overview");
-  $$("#missionTabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === "overview"));
-  state.activeView = "overview";
+  showView("overview");
   updateSideLinks();
 }
 
@@ -789,11 +798,13 @@ function showView(view) {
   $$("#missionTabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === view));
   const isConversation = view === "conversation";
   const isInfo = view === "info";
-  $("#missionView").classList.toggle("hidden", isConversation || isInfo);
+  const isScopeSnapshot = view === "scope-snapshot";
+  $("#missionView").classList.toggle("hidden", isConversation || isInfo || isScopeSnapshot);
+  $("#scopeSnapshotView").classList.toggle("hidden", !isScopeSnapshot);
   $("#transcript").classList.toggle("hidden", !isConversation);
   $("#infoPanel").classList.toggle("hidden", !isInfo);
   $("#missionTabs").classList.toggle("hidden", isInfo);
-  if (!isConversation && !isInfo) renderMissionView(view);
+  if (!isConversation && !isInfo && !isScopeSnapshot) renderMissionView(view);
 }
 
 async function refreshAfterInteraction() {
@@ -808,6 +819,316 @@ async function refreshConnection() {
     if (connection?.reconnected) await restoreConversation();
   }
 }
+
+/* ── Owner manual Scope Snapshot ──────────────────────────── */
+
+const SCOPE_ROW_CONFIG = {
+  "in-scope": { template: "#inScopeAssetTemplate", container: "#inScopeAssetRows", add: "#addInScopeAsset", max: MAX_SCOPE_ASSETS, minimum: 1 },
+  "out-of-scope": { template: "#outOfScopeAssetTemplate", container: "#outOfScopeAssetRows", add: "#addOutOfScopeAsset", max: MAX_SCOPE_ASSETS, minimum: 0 },
+  target: { template: "#scopeTargetTemplate", container: "#scopeTargetRows", add: "#addScopeTarget", max: MAX_SCOPE_TARGETS, minimum: 1 },
+};
+
+function scopeRows(kind) {
+  const config = SCOPE_ROW_CONFIG[kind];
+  return config ? Array.from($(config.container).querySelectorAll(".scope-row")) : [];
+}
+
+function updateScopeRowControls(kind) {
+  const config = SCOPE_ROW_CONFIG[kind];
+  if (!config) return;
+  const rows = scopeRows(kind);
+  const canEdit = state.ownerAuthenticated && !state.scopeSnapshotSubmitting;
+  const addButton = $(config.add);
+  addButton.disabled = !canEdit || rows.length >= config.max;
+  rows.forEach((row) => {
+    const removeButton = row.querySelector(".remove-scope-row");
+    removeButton.disabled = !canEdit || rows.length <= config.minimum;
+  });
+}
+
+function addScopeRow(kind) {
+  const config = SCOPE_ROW_CONFIG[kind];
+  if (!config) return;
+  const container = $(config.container);
+  if (container.querySelectorAll(".scope-row").length >= config.max) return;
+  container.appendChild($(config.template).content.cloneNode(true));
+  const row = container.lastElementChild;
+  row.dataset.scopeKind = kind;
+  row.querySelector(".remove-scope-row").addEventListener("click", () => {
+    if (scopeRows(kind).length <= config.minimum) return;
+    row.remove();
+    updateScopeRowControls(kind);
+  });
+  updateScopeRowControls(kind);
+}
+
+function updateScopeSnapshotAuthUI() {
+  const authenticated = state.ownerAuthenticated;
+  const canEdit = authenticated && !state.scopeSnapshotSubmitting;
+  const fields = $("#scopeSnapshotFields");
+  if (fields) fields.disabled = !canEdit;
+  const submitButton = $("#createScopeSnapshot");
+  if (submitButton) submitButton.disabled = !canEdit;
+  const authNotice = $("#scopeSnapshotAuthNotice");
+  if (authNotice) {
+    authNotice.textContent = authenticated
+      ? "أنت مسجل الدخول بحساب المالك؛ الإرسال لا يحدث إلا عند اختيار حفظ تصريح النطاق."
+      : "سجّل الدخول بحساب المالك لتعبئة النموذج وحفظ التصريح.";
+    authNotice.className = `notice ${authenticated ? "ok" : "warn"}`;
+  }
+  Object.keys(SCOPE_ROW_CONFIG).forEach(updateScopeRowControls);
+}
+
+function resetManualScopeForm() {
+  state.scopeSnapshotSubmitting = false;
+  const form = $("#scopeSnapshotForm");
+  if (!form) return;
+  form.reset();
+  const defaultExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  defaultExpiry.setSeconds(0, 0);
+  const localExpiry = new Date(defaultExpiry.getTime() - defaultExpiry.getTimezoneOffset() * 60 * 1000);
+  $("#scopeExpiresAt").value = localExpiry.toISOString().slice(0, 16);
+  Object.values(SCOPE_ROW_CONFIG).forEach(({ container }) => $(container).replaceChildren());
+  addScopeRow("in-scope");
+  addScopeRow("target");
+  $("#scopeSnapshotMessage").textContent = "";
+  $("#scopeSnapshotMessage").className = "notice";
+  $("#scopeSnapshotResult").replaceChildren();
+  updateScopeSnapshotAuthUI();
+}
+
+function scopeIdentifier(value, field) {
+  const text = String(value ?? "").trim();
+  if (!SCOPE_IDENTIFIER_RE.test(text)) throw new Error(`invalid_${field}`);
+  return text;
+}
+
+function scopeHost(value, field, allowWildcard = false) {
+  const host = String(value ?? "");
+  const wildcard = host.startsWith("*.");
+  if (!host || host !== host.trim() || host.length > 253 || host.includes("://") || /[\/@]/.test(host)) {
+    throw new Error(`invalid_${field}`);
+  }
+  if (host.includes("*") && (!allowWildcard || !wildcard || (host.match(/\*/g) || []).length !== 1)) {
+    throw new Error(`invalid_${field}`);
+  }
+  return host;
+}
+
+function scopePaths(value, field, minimum, maximum) {
+  const paths = String(value ?? "").split(/\r?\n/).map((path) => path.trim()).filter(Boolean);
+  if (paths.length < minimum || paths.length > maximum || new Set(paths).size !== paths.length) {
+    throw new Error(`invalid_${field}`);
+  }
+  if (paths.some((path) => path.length > 256 || !path.startsWith("/") || path.startsWith("//")
+    || /[?#\\\x00-\x1f\x7f]/.test(path) || path.split("/").some((part) => part === "." || part === "..")
+    || /%(?:2e|2f|5c)/i.test(path))) {
+    throw new Error(`invalid_${field}`);
+  }
+  return paths;
+}
+
+function scopePorts(value, field) {
+  const text = String(value ?? "").trim();
+  const values = text ? text.split(",").map((part) => part.trim()) : [];
+  if (!values.length || values.length > MAX_SCOPE_PORTS || values.some((part) => !/^\d+$/.test(part))) {
+    throw new Error(`invalid_${field}`);
+  }
+  const ports = values.map(Number);
+  if (ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535) || new Set(ports).size !== ports.length) {
+    throw new Error(`invalid_${field}`);
+  }
+  return ports;
+}
+
+function scopeRowValue(row, field) {
+  return row.querySelector(`[data-field="${field}"]`)?.value ?? "";
+}
+
+function scopeRowsCounted(kind, minimum, maximum) {
+  const rows = scopeRows(kind);
+  if (rows.length < minimum || rows.length > maximum) throw new Error(`invalid_${kind.replaceAll("-", "_")}`);
+  return rows;
+}
+
+function buildManualScopePayload() {
+  const programId = scopeIdentifier($("#scopeProgramId").value, "program_id");
+  const platform = scopeIdentifier($("#scopePlatform").value, "platform");
+  const scopeVersion = scopeIdentifier($("#scopeVersion").value, "scope_version");
+
+  const inScopeAssets = scopeRowsCounted("in-scope", 1, MAX_SCOPE_ASSETS).map((row) => {
+    const schemes = Array.from(row.querySelectorAll('[data-field="scheme"]:checked')).map((item) => item.value);
+    if (!schemes.length || schemes.length > 2 || schemes.some((scheme) => !["http", "https"].includes(scheme))) {
+      throw new Error("invalid_asset_schemes");
+    }
+    return {
+      host: scopeHost(scopeRowValue(row, "host"), "in_scope_host", true),
+      schemes,
+      ports: scopePorts(scopeRowValue(row, "ports"), "asset_ports"),
+      paths: scopePaths(scopeRowValue(row, "paths"), "asset_paths", 1, MAX_SCOPE_PATHS),
+    };
+  });
+
+  const outOfScopeAssets = scopeRowsCounted("out-of-scope", 0, MAX_SCOPE_ASSETS).map((row) => {
+    const asset = { host: scopeHost(scopeRowValue(row, "host"), "out_of_scope_host", true) };
+    const paths = scopePaths(scopeRowValue(row, "paths"), "out_of_scope_paths", 0, MAX_SCOPE_PATHS);
+    if (paths.length) asset.paths = paths;
+    return asset;
+  });
+
+  const targets = scopeRowsCounted("target", 1, MAX_SCOPE_TARGETS).map((row) => {
+    const target = {
+      target_id: scopeIdentifier(scopeRowValue(row, "target_id"), "target_id"),
+      host: scopeHost(scopeRowValue(row, "host"), "target_host"),
+      allowed_ports: scopePorts(scopeRowValue(row, "allowed_ports"), "target_ports"),
+      allowed_paths: scopePaths(scopeRowValue(row, "allowed_paths"), "target_paths", 1, MAX_SCOPE_PATHS),
+    };
+    for (const field of ["asset_type", "environment"]) {
+      const value = String(scopeRowValue(row, field)).trim();
+      if (value) target[field] = scopeIdentifier(value, field);
+    }
+    const excludedPaths = scopePaths(scopeRowValue(row, "excluded_paths"), "target_excluded_paths", 0, MAX_SCOPE_PATHS);
+    if (excludedPaths.length) target.excluded_paths = excludedPaths;
+    return target;
+  });
+
+  const allowedMethods = Array.from(document.querySelectorAll('input[name="scopeAllowedMethods"]:checked')).map((item) => item.value);
+  const prohibitedMethods = Array.from(document.querySelectorAll('input[name="scopeProhibitedMethods"]:checked')).map((item) => item.value);
+  if (!allowedMethods.length || allowedMethods.length > MAX_SCOPE_METHODS || prohibitedMethods.length > MAX_SCOPE_METHODS
+    || [...allowedMethods, ...prohibitedMethods].some((method) => !SCOPE_HTTP_METHODS.includes(method))
+    || new Set(allowedMethods).size !== allowedMethods.length || new Set(prohibitedMethods).size !== prohibitedMethods.length
+    || allowedMethods.some((method) => prohibitedMethods.includes(method))) {
+    throw new Error("invalid_methods");
+  }
+
+  const expirationInput = $("#scopeExpiresAt").value;
+  const expiration = new Date(expirationInput);
+  const now = Date.now();
+  if (!expirationInput || !Number.isFinite(expiration.getTime()) || expiration.getTime() <= now
+    || expiration.getTime() > now + MAX_SCOPE_EXPIRATION_DAYS * 24 * 60 * 60 * 1000) {
+    throw new Error("invalid_expires_at");
+  }
+  const rateValue = $("#scopeRateLimit").value.trim();
+  let rateLimits = {};
+  if (rateValue) {
+    const requestsPerMinute = Number(rateValue);
+    if (!/^\d+$/.test(rateValue) || !Number.isInteger(requestsPerMinute) || requestsPerMinute < 1 || requestsPerMinute > 1000) {
+      throw new Error("invalid_requests_per_minute");
+    }
+    rateLimits = { requests_per_minute: requestsPerMinute };
+  }
+
+  return {
+    program_id: programId,
+    platform,
+    scope_version: scopeVersion,
+    in_scope_assets: inScopeAssets,
+    out_of_scope_assets: outOfScopeAssets,
+    targets,
+    allowed_methods: allowedMethods,
+    prohibited_methods: prohibitedMethods,
+    rate_limits: rateLimits,
+    expires_at: expiration.toISOString(),
+  };
+}
+
+function renderScopeSnapshotSummary(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") throw new Error("invalid_snapshot_summary");
+  const result = $("#scopeSnapshotResult");
+  result.replaceChildren();
+  const heading = document.createElement("h2");
+  heading.textContent = "ملخص اللقطة المحفوظة من الخادم";
+  const grid = document.createElement("dl");
+  grid.className = "scope-summary-grid";
+  const methodText = (value) => Array.isArray(value) && value.every((method) => SCOPE_HTTP_METHODS.includes(method))
+    ? (value.join("، ") || "لا يوجد") : "غير متاح";
+  const countText = (value) => Number.isInteger(value) && value >= 0 ? String(value) : "غير متاح";
+  const rateText = Number.isInteger(snapshot.rate_limits?.requests_per_minute)
+    ? `${snapshot.rate_limits.requests_per_minute} طلب/دقيقة` : "غير محدد";
+  const entries = [
+    ["معرّف اللقطة", snapshot.snapshot_id, true],
+    ["البرنامج", snapshot.program_id, true],
+    ["المنصة", snapshot.platform, true],
+    ["إصدار النطاق", snapshot.scope_version, true],
+    ["عدد الموارد داخل النطاق", countText(snapshot.in_scope_asset_count), false],
+    ["عدد الموارد خارج النطاق", countText(snapshot.out_of_scope_asset_count), false],
+    ["عدد الأهداف", countText(snapshot.target_count), false],
+    ["الطرق المسموح بها", methodText(snapshot.allowed_methods), true],
+    ["الطرق المحظورة", methodText(snapshot.prohibited_methods), true],
+    ["حد الطلبات", rateText, false],
+    ["وقت الإنشاء", snapshot.created_at, true],
+    ["انتهاء الصلاحية", snapshot.expires_at, true],
+  ];
+  entries.forEach(([label, value, leftToRight]) => {
+    const item = document.createElement("div");
+    item.className = "scope-summary-item";
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = typeof value === "string" && value ? value : "غير متاح";
+    if (leftToRight) description.dir = "ltr";
+    item.append(term, description);
+    grid.appendChild(item);
+  });
+  result.append(heading, grid);
+}
+
+function scopeAuthorizationErrorText(error) {
+  const messages = {
+    owner_authorization_required: "يلزم تسجيل الدخول بحساب المالك لحفظ تصريح النطاق.",
+    "invalid csrf token": "انتهت جلسة الحماية؛ أعد تحميل الصفحة وسجّل الدخول مجددًا.",
+    invalid_methods: "اختر طريقة مسموحًا بها واحدة على الأقل، ولا تكرر الطريقة نفسها ضمن المحظورات.",
+    invalid_expires_at: "اختر وقت انتهاء في المستقبل وبمدة لا تتجاوز 365 يومًا.",
+    target_outside_in_scope_assets: "يجب أن تقع أهدافك ضمن المضيفين والمنافذ والمسارات المعلنة داخل النطاق.",
+    allowed_and_prohibited_methods_overlap: "لا يمكن إدراج الطريقة نفسها في المسموح والمحظور.",
+  };
+  return messages[error?.message] || "تعذر حفظ تصريح النطاق؛ راجع الحقول وحدود النطاق ثم حاول مرة أخرى.";
+}
+
+function setScopeSnapshotMessage(message, kind = "") {
+  const notice = $("#scopeSnapshotMessage");
+  notice.textContent = message;
+  notice.className = `notice${kind ? ` ${kind}` : ""}`;
+}
+
+function initializeScopeSnapshotForm() {
+  $("#addInScopeAsset").addEventListener("click", () => addScopeRow("in-scope"));
+  $("#addOutOfScopeAsset").addEventListener("click", () => addScopeRow("out-of-scope"));
+  $("#addScopeTarget").addEventListener("click", () => addScopeRow("target"));
+  resetManualScopeForm();
+
+  $("#scopeSnapshotForm").onsubmit = async (event) => {
+    event.preventDefault();
+    if (!state.ownerAuthenticated) {
+      setScopeSnapshotMessage("سجّل الدخول بحساب المالك أولاً.", "warn");
+      return;
+    }
+    const form = $("#scopeSnapshotForm");
+    if (!form.reportValidity()) return;
+    state.scopeSnapshotSubmitting = true;
+    updateScopeSnapshotAuthUI();
+    $("#scopeSnapshotResult").replaceChildren();
+    setScopeSnapshotMessage("جارٍ حفظ تصريح النطاق يدويًا؛ لن يبدأ هذا الإجراء اختبارات.", "warn");
+    try {
+      const payload = buildManualScopePayload();
+      const data = await api("/api/public/program-authorizations", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (data.ok !== true) throw new Error("invalid_snapshot_summary");
+      renderScopeSnapshotSummary(data.snapshot);
+      setScopeSnapshotMessage("حُفظ التصريح. لم تُشغّل اختبارات ولم تتغير صلاحيات الأدوات.", "ok");
+    } catch (error) {
+      if (error.message === "owner_authorization_required") updateAuthUI({ authenticated: false });
+      setScopeSnapshotMessage(scopeAuthorizationErrorText(error), "error");
+    } finally {
+      state.scopeSnapshotSubmitting = false;
+      updateScopeSnapshotAuthUI();
+    }
+  };
+}
+
+initializeScopeSnapshotForm();
 
 /* ── Wiring ──────────────────────────────────────────────── */
 

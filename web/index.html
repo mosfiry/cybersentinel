@@ -98,6 +98,7 @@
       </section>
       <div class="tabs" role="tablist" id="missionTabs">
         <button class="tab active" data-view="overview" type="button">المهمة</button>
+        <button class="tab" data-view="scope-snapshot" type="button">تصريح النطاق</button>
         <button class="tab" data-view="conversation" type="button">المحادثة</button>
         <button class="tab" data-view="evidence" type="button">الأدلة</button>
         <button class="tab" data-view="findings" type="button">النتائج المرتبطة بالأدلة</button>
@@ -113,6 +114,159 @@
           <h1>CyberSentinel X</h1>
           <p>ماذا تعمل عليه؟ صف هدفك أو سؤالك أو خطوتك التالية في الحقل أسفل الشاشة. تنشئ CyberSentinel مهمة أو تستأنفها وفق تفويض المالك، وتعرض الحالة والأدلة من الخادم فقط.</p>
         </div>
+      </section>
+      <section id="scopeSnapshotView" class="scope-snapshot-view hidden" aria-labelledby="scopeSnapshotTitle">
+        <header class="scope-heading">
+          <h1 id="scopeSnapshotTitle">إنشاء تصريح نطاق يدوي</h1>
+          <p>أدخل بيان النطاق المراد حفظه. يتحقق الخادم من الصلاحية والحدود، ويعرض بعد الحفظ ملخص اللقطة الآمن فقط.</p>
+          <p class="scope-caution">حفظ التصريح لا يشغّل اختبارات ولا يغيّر صلاحيات الأدوات. لا تُدخل بيانات اعتماد أو أسرار للهدف.</p>
+          <p id="scopeSnapshotAuthNotice" class="notice warn" role="status" aria-live="polite">سجّل الدخول بحساب المالك لتعبئة النموذج وحفظ التصريح.</p>
+        </header>
+        <form id="scopeSnapshotForm">
+          <fieldset id="scopeSnapshotFields" disabled>
+            <div class="scope-meta-grid">
+              <label>معرّف البرنامج
+                <input id="scopeProgramId" type="text" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" required autocomplete="off" dir="ltr">
+              </label>
+              <label>المنصة
+                <input id="scopePlatform" type="text" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" required autocomplete="off" dir="ltr">
+              </label>
+              <label>إصدار النطاق
+                <input id="scopeVersion" type="text" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" required autocomplete="off" dir="ltr">
+              </label>
+            </div>
+
+            <fieldset class="scope-group">
+              <legend>الموارد داخل النطاق</legend>
+              <p class="muted">أضف من 1 إلى 32 موردًا. لكل مورد مخططات ومنافذ ومسارات محددة.</p>
+              <div id="inScopeAssetRows" class="scope-row-list"></div>
+              <button id="addInScopeAsset" class="scope-add-button" type="button">إضافة مورد داخل النطاق</button>
+            </fieldset>
+
+            <fieldset class="scope-group">
+              <legend>الموارد خارج النطاق (اختياري)</legend>
+              <p class="muted">حتى 32 موردًا؛ ترك المسارات فارغة يستثني المضيف بالكامل.</p>
+              <div id="outOfScopeAssetRows" class="scope-row-list"></div>
+              <button id="addOutOfScopeAsset" class="scope-add-button" type="button">إضافة مورد خارج النطاق</button>
+            </fieldset>
+
+            <fieldset class="scope-group">
+              <legend>الأهداف</legend>
+              <p class="muted">أضف من 1 إلى 32 هدفًا. يجب أن تبقى تراكيب المضيف والمنفذ والمسار ضمن مورد داخل النطاق.</p>
+              <div id="scopeTargetRows" class="scope-row-list"></div>
+              <button id="addScopeTarget" class="scope-add-button" type="button">إضافة هدف</button>
+            </fieldset>
+
+            <div class="scope-method-groups">
+              <fieldset class="scope-group">
+                <legend>الطرق المسموح بها (طريقة واحدة على الأقل)</legend>
+                <div class="scope-check-grid">
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="GET" checked> GET</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="HEAD"> HEAD</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="OPTIONS"> OPTIONS</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="POST"> POST</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="PUT"> PUT</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="PATCH"> PATCH</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="DELETE"> DELETE</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="TRACE"> TRACE</label>
+                  <label><input type="checkbox" name="scopeAllowedMethods" value="CONNECT"> CONNECT</label>
+                </div>
+              </fieldset>
+              <fieldset class="scope-group">
+                <legend>الطرق المحظورة (يمكن تركها فارغة)</legend>
+                <div class="scope-check-grid">
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="GET"> GET</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="HEAD"> HEAD</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="OPTIONS"> OPTIONS</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="POST"> POST</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="PUT"> PUT</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="PATCH"> PATCH</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="DELETE"> DELETE</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="TRACE"> TRACE</label>
+                  <label><input type="checkbox" name="scopeProhibitedMethods" value="CONNECT"> CONNECT</label>
+                </div>
+              </fieldset>
+            </div>
+
+            <div class="scope-meta-grid">
+              <label>الحد الاختياري للطلبات في الدقيقة (1–1000)
+                <input id="scopeRateLimit" type="number" min="1" max="1000" step="1" inputmode="numeric">
+              </label>
+              <label>انتهاء الصلاحية
+                <input id="scopeExpiresAt" type="datetime-local" step="60" required>
+              </label>
+            </div>
+            <p class="muted">يُحوّل وقت الانتهاء المحلي إلى توقيت UTC عند الإرسال. المدة لا تتجاوز 365 يومًا.</p>
+          </fieldset>
+          <div class="scope-actions">
+            <button id="createScopeSnapshot" type="submit" disabled>حفظ تصريح النطاق</button>
+          </div>
+        </form>
+        <p id="scopeSnapshotMessage" class="notice" role="status" aria-live="polite"></p>
+        <div id="scopeSnapshotResult" class="scope-snapshot-result" aria-live="polite"></div>
+
+        <template id="inScopeAssetTemplate">
+          <article class="scope-row">
+            <div class="scope-row-heading"><h3>مورد داخل النطاق</h3><button class="remove-scope-row" type="button">حذف</button></div>
+            <label>المضيف دون مخطط أو مسار
+              <input data-field="host" type="text" maxlength="253" required autocomplete="off" placeholder="api.example.com" dir="ltr">
+            </label>
+            <fieldset class="scope-inline-group">
+              <legend>المخططات (http و/أو https)</legend>
+              <div class="scope-check-grid">
+                <label><input data-field="scheme" type="checkbox" value="http"> http</label>
+                <label><input data-field="scheme" type="checkbox" value="https" checked> https</label>
+              </div>
+            </fieldset>
+            <label>المنافذ مفصولة بفواصل (1–20، من 1 إلى 65535)
+              <input data-field="ports" type="text" maxlength="119" required placeholder="443" dir="ltr">
+            </label>
+            <label>بادئات المسارات، سطر لكل مسار (1–32، حتى 256 حرفًا لكل مسار)
+              <textarea data-field="paths" rows="2" maxlength="8192" required placeholder="/api" dir="ltr"></textarea>
+            </label>
+          </article>
+        </template>
+
+        <template id="outOfScopeAssetTemplate">
+          <article class="scope-row">
+            <div class="scope-row-heading"><h3>مورد خارج النطاق</h3><button class="remove-scope-row" type="button">حذف</button></div>
+            <label>المضيف دون مخطط أو مسار
+              <input data-field="host" type="text" maxlength="253" required autocomplete="off" placeholder="admin.example.com" dir="ltr">
+            </label>
+            <label>المسارات المستثناة (اختياري؛ سطر لكل مسار، حتى 32)
+              <textarea data-field="paths" rows="2" maxlength="8192" placeholder="/private" dir="ltr"></textarea>
+            </label>
+          </article>
+        </template>
+
+        <template id="scopeTargetTemplate">
+          <article class="scope-row">
+            <div class="scope-row-heading"><h3>هدف</h3><button class="remove-scope-row" type="button">حذف</button></div>
+            <div class="scope-meta-grid">
+              <label>معرّف الهدف
+                <input data-field="target_id" type="text" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" required autocomplete="off" dir="ltr">
+              </label>
+              <label>المضيف
+                <input data-field="host" type="text" maxlength="253" required autocomplete="off" placeholder="api.example.com" dir="ltr">
+              </label>
+              <label>نوع المورد (اختياري)
+                <input data-field="asset_type" type="text" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" value="web" autocomplete="off" dir="ltr">
+              </label>
+              <label>البيئة (اختياري)
+                <input data-field="environment" type="text" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" value="production" autocomplete="off" dir="ltr">
+              </label>
+            </div>
+            <label>المنافذ المسموح بها (1–20)
+              <input data-field="allowed_ports" type="text" maxlength="119" required placeholder="443" dir="ltr">
+            </label>
+            <label>المسارات المسموح بها (1–32، حتى 256 حرفًا لكل مسار)
+              <textarea data-field="allowed_paths" rows="2" maxlength="8192" required placeholder="/api" dir="ltr"></textarea>
+            </label>
+            <label>المسارات المستثناة (اختياري؛ حتى 32)
+              <textarea data-field="excluded_paths" rows="2" maxlength="8192" placeholder="/api/private" dir="ltr"></textarea>
+            </label>
+          </article>
+        </template>
       </section>
       <section id="transcript" class="transcript hidden">
         <div id="messages"></div>

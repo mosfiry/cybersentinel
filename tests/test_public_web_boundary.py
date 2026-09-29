@@ -570,6 +570,8 @@ def test_manual_program_authorization_round_trips_exact_scope_with_cookie_sessio
     assert persisted.targets[0].to_dict() == expected_target
     assert persisted.expires_at == payload["expires_at"]
     serialized = json.dumps(response)
+    for submitted_scope_detail in ("api.example.test", "admin.example.test", "api-prod", "/api/private"):
+        assert submitted_scope_detail not in serialized
     for private_value in ("session_id", "owner_session_id", "csrf_token", owner_cookie, csrf, owner_session["session_id"]):
         assert private_value not in serialized
 
