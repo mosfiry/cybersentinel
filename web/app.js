@@ -380,15 +380,15 @@ async function loadMission(missionId = state.selectedMissionId) {
 }
 
 function renderMissionHeader() {
-  const mission = state.selectedMission;
-  if (!mission) return;
+  const selectedMission = state.selectedMission;
+  if (!selectedMission) return;
   $("#missionHeader").classList.remove("hidden");
   $("#missionTools").classList.remove("hidden");
-  const verification = mission.verification_state || {};
-  const complete = mission.status === "GOAL_COMPLETED" && verification.verified === true && !!mission.completion_proof;
-  const phase = mission.status === "PAUSED" ? "متوقفة مؤقتًا" : (mission.status || "غير متاح");
-  $("#missionDetail").innerHTML = `<div class="detail-title"><div><h1>${esc(mission.objective || mission.owner_request || "مهمة")}</h1><small>Mission ID: ${esc(mission.mission_id || state.selectedMissionId)} · Request ID: ${esc(mission.request_id || "غير متاح")}</small></div><span class="status-chip">${esc(phase)}</span></div>
-    <div class="kv"><div class="card">حالة التنفيذ<b class="small-value">${esc(mission.queue?.state || "لا توجد حالة طابور")}</b></div><div class="card">التحقق<b class="small-value">${verification.verified === true ? "متحقق حسب الخادم" : "غير متحقق"}</b></div><div class="card">الاكتمال<b class="small-value">${complete ? "مكتمل بدليل موقّع" : "غير مثبت"}</b></div><div class="card">إعادة المحاولة<b class="small-value">${esc(mission.retry_count ?? "غير متاح")}</b></div></div>`;
+  const verification = selectedMission.verification_state || {};
+  const complete = selectedMission.status === "GOAL_COMPLETED" && verification.verified === true && !!selectedMission.completion_proof;
+  const phase = selectedMission.status === "PAUSED" ? "متوقفة مؤقتًا" : (selectedMission.status || "غير متاح");
+  $("#missionDetail").innerHTML = `<div class="detail-title"><div><h1>${esc(selectedMission.objective || selectedMission.owner_request || "مهمة")}</h1><small>Mission ID: ${esc(selectedMission.mission_id || state.selectedMissionId)} · Request ID: ${esc(selectedMission.request_id || "غير متاح")}</small></div><span class="status-chip">${esc(phase)}</span></div>
+    <div class="kv"><div class="card">حالة التنفيذ<b class="small-value">${esc(selectedMission.queue?.state || "لا توجد حالة طابور")}</b></div><div class="card">التحقق<b class="small-value">${verification.verified === true ? "متحقق حسب الخادم" : "غير متحقق"}</b></div><div class="card">الاكتمال<b class="small-value">${complete ? "مكتمل بدليل موقّع" : "غير مثبت"}</b></div><div class="card">إعادة المحاولة<b class="small-value">${esc(selectedMission.retry_count ?? "غير متاح")}</b></div></div>`;
   updateSideLinks();
 }
 

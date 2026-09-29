@@ -115,6 +115,6 @@ def test_transport_boundary_is_desktop_ready():
 
 
 def test_completion_and_verification_states_come_from_the_server():
-    assert 'mission.status === "GOAL_COMPLETED"' in SCRIPT
+    assert 'selectedMission.status === "GOAL_COMPLETED"' in SCRIPT
     assert "verification.verified === true" in SCRIPT
     assert "completion_proof" in SCRIPT
