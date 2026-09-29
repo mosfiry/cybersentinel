@@ -28,6 +28,7 @@ import security.owner_password as owner_password
 from security.owner_password import login as owner_password_login, logout as owner_password_logout
 from api.chat import MissionBusyError, chat, get_session, sse, stream, task_stream, create_task, get_task, resume_task, pause_task, cancel_task, _task_public
 from api.models import model_catalog, requested_model_id, requested_model_preference
+from api.program_authorizations import build_manual_scope_snapshot, public_snapshot_summary
 from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
@@ -40,6 +41,7 @@ from agent.agent_core import AgentCore
 from agent.mission_task_adapter import task_owner_matches
 from agent.planning import Plan, PlanStep
 from security.mission_authorization import MissionAuthorizationSnapshot
+from security.scope_store import save_snapshot
 from workspace import Workspace, WorkspaceBoundaryError, WorkspacePolicy, WorkspacePolicyError
 
 ROOT = Path(__file__).resolve().parent
@@ -83,11 +85,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"ok": False, "error": "not_found"})
         return self._send(200, p.read_bytes(), MIME[p.suffix])
 
-    def _read_json(self):
-        n = int(self.headers.get("Content-Length", "0"))
+    def _read_json(self, *, strict=False):
+        if strict:
+            content_length = self.headers.get("Content-Length", "0")
+            if not re.fullmatch(r"[0-9]{1,8}", content_length):
+                raise ValueError("invalid_content_length")
+            n = int(content_length)
+        else:
+            n = int(self.headers.get("Content-Length", "0"))
         if n > 32768:
             raise ValueError("request_too_large")
-        return json.loads(self.rfile.read(n) or b"{}")
+        body = self.rfile.read(n)
+        if strict and len(body) != n:
+            raise ValueError("malformed_request_body")
+        pairs_hook = None
+        if strict:
+            def reject_duplicate_keys(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate_json_field")
+                    result[key] = value
+                return result
+
+            pairs_hook = reject_duplicate_keys
+        return json.loads(body or b"{}", object_pairs_hook=pairs_hook)
 
     def _chat_auth(self):
         return self.headers.get("X-CyberSentinel-Owner-Session", "")
@@ -660,6 +682,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, {"ok": False, "error": str(exc)})
             except (ValueError, TypeError) as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
+        if self.path == "/api/public/program-authorizations":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                payload = self._read_json(strict=True)
+                snapshot = build_manual_scope_snapshot(payload)
+                saved_snapshot = save_snapshot(snapshot, owner_session_token=str(owner["session_id"]))
+                return self._send(201, {"ok": True, "snapshot": public_snapshot_summary(saved_snapshot)})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, TypeError) as exc:
+                status = 413 if str(exc) == "request_too_large" else 400
+                return self._send(status, {"ok": False, "error": str(exc)})
+            except Exception:
+                return self._send(500, {"ok": False, "error": "program_authorization_creation_failed"})
         if self.path == "/api/public/session":
             if not self._public_enabled() or not self._public_origin_allowed():
                 return self._send(404, {"ok": False, "error": "public_boundary_disabled"})

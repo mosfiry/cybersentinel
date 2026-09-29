@@ -3,7 +3,9 @@ from __future__ import annotations
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from http.cookies import SimpleCookie
+from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from pathlib import Path
 import threading
 
@@ -13,6 +15,7 @@ import bridge
 import core.db as core_db
 from security import owner_password
 from security.public_session import PublicSessionManager
+import security.scope_store as scope_store
 
 TEST_PASSWORD = "browser-owner-test-password-2026"
 
@@ -29,6 +32,8 @@ def web_server(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "DEFAULT_PUBLIC_SESSIONS", PublicSessionManager(ttl_seconds=60))
     monkeypatch.setattr(core_db, "DB_PATH", tmp_path / "browser-owner-auth.db")
     core_db.connect().close()
+    monkeypatch.setattr(scope_store, "SCOPE_DB_PATH", tmp_path / "scope-snapshots.sqlite3")
+    scope_store.init_scope_store()
     owner_password.create_owner_account(owner_password.OWNER_USERNAME, TEST_PASSWORD)
 
     calls = []
@@ -53,16 +58,18 @@ def web_server(tmp_path, monkeypatch):
         thread.join(timeout=5)
 
 
-def request(server, method, path, payload=None, *, cookies="", csrf="", origin=None):
+def request(server, method, path, payload=None, *, cookies="", csrf="", origin=None, owner_session_header="", raw_body=None):
     connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
-    headers = {"Content-Type": "application/json"} if payload is not None else {}
+    headers = {"Content-Type": "application/json"} if payload is not None or raw_body is not None else {}
     if cookies:
         headers["Cookie"] = cookies
     if csrf:
         headers["X-CSRF-Token"] = csrf
     if origin is not None:
         headers["Origin"] = origin
-    body = json.dumps(payload) if payload is not None else None
+    if owner_session_header:
+        headers["X-CyberSentinel-Owner-Session"] = owner_session_header
+    body = raw_body if raw_body is not None else json.dumps(payload) if payload is not None else None
     connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     result = response.read()
@@ -96,6 +103,40 @@ def login(server, public_cookie, csrf, *, password=TEST_PASSWORD, owner_cookie="
         cookies=cookies,
         csrf=csrf,
     )
+
+
+def manual_scope_payload(*, expires_at=None):
+    return {
+        "program_id": "manual-program-1",
+        "platform": "owner-submitted",
+        "scope_version": "2026-09-30-v1",
+        "in_scope_assets": [
+            {"host": "api.example.test", "schemes": ["https"], "ports": [443], "paths": ["/api"]},
+        ],
+        "out_of_scope_assets": [
+            {"host": "admin.example.test", "paths": ["/private"]},
+        ],
+        "targets": [
+            {
+                "target_id": "api-prod",
+                "host": "api.example.test",
+                "asset_type": "web",
+                "environment": "production",
+                "allowed_ports": [443],
+                "allowed_paths": ["/api"],
+                "excluded_paths": ["/api/private"],
+            },
+        ],
+        "allowed_methods": ["GET", "HEAD"],
+        "prohibited_methods": ["POST", "PUT", "PATCH", "DELETE"],
+        "rate_limits": {"requests_per_minute": 50},
+        "expires_at": expires_at or (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+    }
+
+
+def persisted_scope_count():
+    with sqlite3.connect(str(scope_store.SCOPE_DB_PATH)) as connection:
+        return int(connection.execute("SELECT COUNT(*) FROM scope_snapshots").fetchone()[0])
 
 
 def test_public_session_does_not_grant_owner_authority(manager):
@@ -422,3 +463,192 @@ def test_public_model_catalog_requires_owner_and_returns_only_catalog_payload(we
     assert payload == {"ok": True, "models": [{"id": "auto", "mode": "auto"}]}
     assert called_with == [owner_session["session_id"]]
     assert chat_calls == []
+
+
+def test_manual_program_authorization_requires_owner_cookie_and_csrf_before_persistence(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    payload = manual_scope_payload()
+
+    status, _, denied = request(
+        server,
+        "POST",
+        "/api/public/program-authorizations",
+        payload,
+        owner_session_header="forged-owner-session",
+    )
+    assert status == 401
+    assert denied["ok"] is False
+    assert persisted_scope_count() == 0
+
+    status, _, denied = request(
+        server,
+        "POST",
+        "/api/public/program-authorizations",
+        payload,
+        cookies=public_cookie,
+        csrf=csrf,
+    )
+    assert status == 403
+    assert denied["error"] == "owner_authorization_required"
+    assert persisted_scope_count() == 0
+
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    cookies = f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}"
+    status, _, denied = request(
+        server,
+        "POST",
+        "/api/public/program-authorizations",
+        payload,
+        cookies=cookies,
+        owner_session_header="forged-owner-session",
+    )
+    assert status == 401
+    assert denied["error"] == "invalid csrf token"
+    assert persisted_scope_count() == 0
+
+
+def test_manual_program_authorization_round_trips_exact_scope_with_cookie_session_binding(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    owner_session = owner_password.resolve_session(owner_cookie)
+    assert owner_session is not None
+    payload = manual_scope_payload()
+
+    status, _, response = request(
+        server,
+        "POST",
+        "/api/public/program-authorizations",
+        payload,
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 201
+    assert response["ok"] is True
+    summary = response["snapshot"]
+    assert set(summary) == {
+        "snapshot_id",
+        "program_id",
+        "platform",
+        "scope_version",
+        "in_scope_asset_count",
+        "out_of_scope_asset_count",
+        "target_count",
+        "allowed_methods",
+        "prohibited_methods",
+        "rate_limits",
+        "created_at",
+        "expires_at",
+    }
+    assert summary["program_id"] == payload["program_id"]
+    assert summary["allowed_methods"] == payload["allowed_methods"]
+    assert summary["prohibited_methods"] == payload["prohibited_methods"]
+    assert summary["rate_limits"] == payload["rate_limits"]
+    assert summary["expires_at"] == payload["expires_at"]
+    assert summary["target_count"] == 1
+    assert persisted_scope_count() == 1
+
+    persisted = scope_store.get_snapshot(summary["snapshot_id"])
+    assert persisted is not None
+    authorization = persisted.authorization
+    assert authorization.program_id == payload["program_id"]
+    assert authorization.platform == payload["platform"]
+    assert authorization.scope_version == payload["scope_version"]
+    assert authorization.in_scope_assets == tuple(payload["in_scope_assets"])
+    assert authorization.out_of_scope_assets == tuple(payload["out_of_scope_assets"])
+    assert authorization.allowed_methods == tuple(payload["allowed_methods"])
+    assert authorization.prohibited_methods == tuple(payload["prohibited_methods"])
+    assert authorization.rate_limits == payload["rate_limits"]
+    assert authorization.owner_session_id == owner_session["session_id"]
+    expected_target = {**payload["targets"][0], "program_id": payload["program_id"]}
+    assert persisted.targets[0].to_dict() == expected_target
+    assert persisted.expires_at == payload["expires_at"]
+    serialized = json.dumps(response)
+    for private_value in ("session_id", "owner_session_id", "csrf_token", owner_cookie, csrf, owner_session["session_id"]):
+        assert private_value not in serialized
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "unknown_top_level_field",
+        "missing_required_methods",
+        "unknown_asset_field",
+        "invalid_port",
+        "target_outside_allowlist",
+        "method_overlap",
+        "rate_limit_out_of_bounds",
+        "boolean_rate_limit",
+        "expired_snapshot",
+        "expiration_too_far",
+    ],
+)
+def test_manual_program_authorization_rejects_malformed_and_out_of_bounds_payloads(web_server, invalid_case):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    payload = manual_scope_payload()
+    if invalid_case == "unknown_top_level_field":
+        payload["owner_session_id"] = "caller-controlled"
+    elif invalid_case == "missing_required_methods":
+        payload.pop("allowed_methods")
+    elif invalid_case == "unknown_asset_field":
+        payload["in_scope_assets"][0]["workspace_root"] = "/tmp"
+    elif invalid_case == "invalid_port":
+        payload["in_scope_assets"][0]["ports"] = [65536]
+    elif invalid_case == "target_outside_allowlist":
+        payload["targets"][0]["host"] = "other.example.test"
+    elif invalid_case == "method_overlap":
+        payload["prohibited_methods"].append("GET")
+    elif invalid_case == "rate_limit_out_of_bounds":
+        payload["rate_limits"]["requests_per_minute"] = 1001
+    elif invalid_case == "boolean_rate_limit":
+        payload["rate_limits"]["requests_per_minute"] = True
+    elif invalid_case == "expired_snapshot":
+        payload["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    elif invalid_case == "expiration_too_far":
+        payload["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=366)).isoformat()
+
+    status, _, response = request(
+        server,
+        "POST",
+        "/api/public/program-authorizations",
+        payload,
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 400
+    assert response["ok"] is False
+    assert persisted_scope_count() == 0
+
+
+def test_manual_program_authorization_rejects_duplicate_json_fields(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    payload = manual_scope_payload()
+    raw_body = json.dumps(payload).encode("utf-8")[:-1] + b',"allowed_methods":["TRACE"]}'
+
+    status, _, response = request(
+        server,
+        "POST",
+        "/api/public/program-authorizations",
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+        raw_body=raw_body,
+    )
+
+    assert status == 400
+    assert response["error"] == "duplicate_json_field"
+    assert persisted_scope_count() == 0

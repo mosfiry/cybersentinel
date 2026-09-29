@@ -20,9 +20,20 @@ Public cookies are `HttpOnly`, `Secure`, `SameSite=Lax`, and scoped to `/api/pub
 | `GET /api/public/conversations/{id}` | Restore messages/tasks after reload or reconnect, filtered by the stable authenticated Owner identity; unknown and foreign conversations both return `404 unknown_conversation` | `200 {ok:true, conversation:{...,messages:[...],tasks:[...]}}` |
 | `POST /api/public/auth/login` | Authenticate the Owner; requires public cookie and CSRF token | `200 {ok, authenticated:true, username, expires_at}` and Owner cookie |
 | `POST /api/public/auth/logout` | Revoke the Owner session; requires public cookie and CSRF token | `200 {ok, authenticated:false}` and expired Owner cookie |
+| `POST /api/public/program-authorizations` | Persist an explicit manual scope authorization; requires public cookie, CSRF token, and Owner cookie | `201 {ok:true, snapshot:{snapshot_id, program_id, platform, scope_version, asset counts, target_count, methods, rate_limits, created_at, expires_at}}` |
 | `POST /api/public/logout` | Revoke the public anti-CSRF session | `200 {ok:true}` and expired public cookie |
 
 Login failure is deliberately generic (`403 invalid_credentials`) so it does not reveal whether a username exists. Owner cookies are resolved server-side; neither username text nor browser UI state is accepted as identity evidence.
+
+## Manual program authorization API
+
+`POST /api/public/program-authorizations` accepts only Owner-submitted scope data. It derives the Owner session from the existing server-resolved Owner cookie, also requires the public anti-CSRF cookie and `X-CSRF-Token`, and binds persistence with that Owner session token. Owner IDs, session IDs, evidence hashes, source markers, and other unknown request fields are rejected; Owner session evidence is never included in the browser-safe response summary. This API has no UI client and does not add or change any tool permissions.
+
+The JSON object requires `program_id`, `platform`, `scope_version`, `in_scope_assets`, `out_of_scope_assets`, `targets`, `allowed_methods`, `prohibited_methods`, and timezone-qualified `expires_at`. Each in-scope asset must explicitly provide `host`, `schemes` (`http` and/or `https`), `ports`, and path prefixes. Each out-of-scope asset contains `host` and may contain `paths` (omitting or supplying an empty path list excludes the whole host). Each target must provide `target_id`, `host`, `allowed_ports`, and `allowed_paths`; `asset_type`, `environment`, and `excluded_paths` are optional. Target host/port/path combinations must remain within the declared in-scope assets.
+
+Allowed and prohibited methods must be explicit, use uppercase standard HTTP methods, and cannot overlap. `prohibited_methods` may be an empty array. `rate_limits` is optional and, when present, accepts only `{"requests_per_minute": N}` with an integer from 1 through 1,000. Limits are 32 in-scope assets, 32 out-of-scope assets, 32 targets, 20 ports per asset/target, 32 paths per list, and an expiration strictly in the future but no more than 365 days ahead. `expires_at` must include a timezone and is persisted in UTC. Unknown fields, duplicate JSON keys, malformed lists, invalid ports/paths, and out-of-bounds values fail with `400` before persistence.
+
+Each successful POST creates a new persisted snapshot; it is not idempotent and clients should not blindly retry an uncertain request. The response summary includes the generated `snapshot_id`, program/version labels, counts, method lists, rate limits, and creation/expiration times, but not the submitted asset contents, Owner identity/session identifiers, or secrets.
 
 ## Mission client endpoints
 
