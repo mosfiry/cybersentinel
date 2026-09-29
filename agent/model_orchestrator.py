@@ -9,6 +9,7 @@ import math
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -259,6 +260,22 @@ class ModelInvocation:
     elapsed_ms: int = 0
     input_tokens_estimated: int = 0
     output_tokens: int = 0
+    invocation_id: str = ""
+    request_id: str = ""
+    mission_id: str = ""
+    task_id: str = ""
+    parent_task_id: str = ""
+    timestamp: str = ""
+    provenance: tuple[dict[str, Any], ...] = ()
+    reasoning_case_ids: tuple[str, ...] = ()
+    input_tokens: int = 0
+    input_tokens_source: str = "estimated"
+    input_tokens_reported: int | None = None
+    output_tokens_source: str = "unavailable"
+    output_tokens_reported: int | None = None
+    token_usage_source: str = "partial"
+    estimated_cost_usd: float | None = None
+    estimated_cost_source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -275,6 +292,22 @@ class ModelInvocation:
             "input_tokens_estimated": self.input_tokens_estimated,
             "output_tokens": self.output_tokens,
             "output_trust": "untrusted_model_output",
+            "invocation_id": self.invocation_id,
+            "request_id": self.request_id,
+            "mission_id": self.mission_id,
+            "task_id": self.task_id,
+            "parent_task_id": self.parent_task_id,
+            "timestamp": self.timestamp,
+            "provenance": [dict(item) for item in self.provenance],
+            "reasoning_case_ids": list(self.reasoning_case_ids),
+            "input_tokens": self.input_tokens,
+            "input_tokens_source": self.input_tokens_source,
+            "input_tokens_reported": self.input_tokens_reported,
+            "output_tokens_source": self.output_tokens_source,
+            "output_tokens_reported": self.output_tokens_reported,
+            "token_usage_source": self.token_usage_source,
+            "estimated_cost_usd": self.estimated_cost_usd,
+            "estimated_cost_source": self.estimated_cost_source,
         }
 
 
@@ -462,11 +495,14 @@ class ModelOrchestrator:
         cost_reserved: float,
     ) -> tuple[dict[str, Any] | None, ModelInvocation, int, float]:
         started = time.monotonic()
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         input_tokens = _token_estimate(messages)
         remaining = deadline - started
         failure_kind = ""
         response: dict[str, Any] | None = None
         output_tokens = 0
+        reported_input_tokens: int | None = None
+        reported_output_tokens: int | None = None
         status = "failed"
         request_hash = _hash({"messages": messages, "tools": tools})
         response_hash = ""
@@ -502,7 +538,11 @@ class ModelOrchestrator:
             status = "success"
             response_hash = _hash({"content": response.get("content", ""), "tool_calls": response.get("tool_calls", ())})
             usage = response.get("usage", {}) if isinstance(response.get("usage"), dict) else {}
-            output_tokens = int(usage.get("completion_tokens", 0) or 0)
+            reported_input = int(usage.get("prompt_tokens", 0) or 0)
+            reported_input_tokens = reported_input if reported_input > 0 else None
+            reported_output = int(usage.get("completion_tokens", 0) or 0)
+            reported_output_tokens = reported_output if reported_output > 0 else None
+            output_tokens = reported_output_tokens or 0
             if output_tokens <= 0:
                 output_tokens = max(1, math.ceil(len(str(response.get("content", "")).encode("utf-8")) / 2))
             if tokens_used + input_tokens + output_tokens > request.budget.max_total_tokens:
@@ -522,14 +562,46 @@ class ModelOrchestrator:
                 failure_kind = type(exc).__name__[:80]
             response = None
         elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
-        if response is not None:
-            usage = response.get("usage", {}) if isinstance(response.get("usage"), dict) else {}
-            reported_input = int(usage.get("prompt_tokens", 0) or 0)
-            if reported_input > 0:
-                input_tokens = reported_input
-            reported_output = int(usage.get("completion_tokens", 0) or 0)
-            if reported_output > 0:
-                output_tokens = reported_output
+        if response is None:
+            reported_input_tokens = None
+            reported_output_tokens = None
+            recorded_input_tokens = input_tokens
+            input_tokens_source = "estimated"
+            recorded_output_tokens = 0
+            output_tokens_source = "unavailable"
+            token_usage_source = "partial"
+        else:
+            recorded_input_tokens = reported_input_tokens or input_tokens
+            input_tokens_source = "provider_reported" if reported_input_tokens is not None else "estimated"
+            recorded_output_tokens = output_tokens
+            output_tokens_source = "provider_reported" if reported_output_tokens is not None else "estimated"
+            token_usage_source = (
+                input_tokens_source if input_tokens_source == output_tokens_source else "mixed"
+            )
+        estimated_cost_usd = None
+        estimated_cost_source = None
+        if response is not None and profile.cost_per_1k_tokens_usd is not None:
+            estimated_cost_usd = (
+                (recorded_input_tokens + recorded_output_tokens) * profile.cost_per_1k_tokens_usd / 1000
+            )
+            estimated_cost_source = "declared_profile_rate_and_known_token_usage"
+        provenance = tuple(dict(item) for item in request.context_provenance)
+        reasoning_case_ids: list[str] = []
+        for item in provenance:
+            candidates = item.get("reasoning_case_ids", ())
+            if isinstance(candidates, str):
+                candidates = (candidates,)
+            elif not isinstance(candidates, (tuple, list)):
+                candidates = ()
+            case_id = item.get("reasoning_case_id")
+            if case_id is None and item.get("source") == "reasoning_case":
+                case_id = item.get("case_id")
+            if case_id:
+                candidates = (*candidates, case_id)
+            for candidate in candidates:
+                safe_case_id = _safe_label(candidate)
+                if safe_case_id != "unknown" and safe_case_id not in reasoning_case_ids:
+                    reasoning_case_ids.append(safe_case_id)
         invocation = ModelInvocation(
             role=role,
             profile_id=profile.profile_id,
@@ -542,7 +614,23 @@ class ModelOrchestrator:
             failure_kind=failure_kind,
             elapsed_ms=elapsed_ms,
             input_tokens_estimated=input_tokens,
-            output_tokens=output_tokens if response is not None else 0,
+            output_tokens=recorded_output_tokens,
+            invocation_id=uuid.uuid4().hex,
+            request_id=_safe_label(request.request_id),
+            mission_id=_safe_label(request.mission_id),
+            task_id=_safe_label(request.task_id),
+            parent_task_id=_safe_label(request.task_id),
+            timestamp=timestamp,
+            provenance=provenance,
+            reasoning_case_ids=tuple(reasoning_case_ids),
+            input_tokens=recorded_input_tokens,
+            input_tokens_source=input_tokens_source,
+            input_tokens_reported=reported_input_tokens,
+            output_tokens_source=output_tokens_source,
+            output_tokens_reported=reported_output_tokens,
+            token_usage_source=token_usage_source,
+            estimated_cost_usd=estimated_cost_usd,
+            estimated_cost_source=estimated_cost_source,
         )
         return response, invocation, tokens_used, cost_reserved
 
