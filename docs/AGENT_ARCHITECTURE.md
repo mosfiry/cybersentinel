@@ -16,9 +16,9 @@ Both paths
 
 `BRIDGE_TOKEN` authenticates only the internal/local HTTP transport. Owner authority comes from a valid server-side session issued by `security/owner_password.py`; internal clients pass its ID using `X-CyberSentinel-Owner-Session`, while the browser receives that ID only inside an HttpOnly cookie. A public CSRF session is not Owner authority, and browser access remains disabled unless `PUBLIC_WEB_ENABLED=true`.
 
-Owner chat is planned through `MissionRuntime` and `ModelRouter`; the separate `/api/command` compatibility route uses `AgentRuntime`. Both paths supply authenticated Owner context to an optional OpenAI-compatible model. A model can propose a plan, but it cannot execute tools or authorize itself. `tools/registry.py` is the single source of tool metadata, handlers, risk classes, and argument schemas; `security/authorization.py` applies the registry policy, maximum argument length, and maximum plan size before execution.
+Browser `/api/public/chat`, internal `/api/chat`, the legacy-named `/api/command` handler, and mission-backed `/api/tasks` all reach the same `api.chat.chat -> AgentCore -> MissionRuntime` execution path. `/api/tasks` keeps a compatibility `Task` envelope but stores and controls the canonical mission; it is not a second execution runtime. `core.engine.handle()` and `agent/runtime.py` remain historical/direct compatibility APIs with no current bridge route caller. A model can propose a plan, but it cannot execute tools or authorize itself. `tools/registry.py` is the single source of tool metadata, handlers, risk classes, and argument schemas; `security/authorization.py` applies the registry policy, maximum argument length, and maximum plan size before execution.
 
-The `/api/command` lifecycle path receives an `ExecutionContext` containing the request ID, authenticated Owner identity, policy fingerprint, and provider/model provenance. Mission chat instead uses the typed authorization and mission/run/turn context described below. In both paths, planner responses are validated before execution and a model cannot authorize itself.
+All bridge chat paths pass the authenticated Owner session into the canonical mission facade, where typed authorization snapshots, mission/run/tool-call identity, and one-use execution proofs are validated before dispatch. Planner responses remain untrusted proposals; the model cannot authorize itself or create Owner identity.
 
 Audit event IDs link authentication, policy, plan, authorization, execution, and response. Evidence objects carry the same request ID and a tamper-evident chain of `sequence`, `previous_hash`, and `current_hash`; `verify_chain()` detects later modification.
 
@@ -113,21 +113,26 @@ reading every entrypoint. Status:
 | --- | --- | --- |
 | `agent/mission_runtime.py` (`MissionRuntime`) | Canonical persistent mission engine | Owner chat through `api.chat.chat` and `AgentCore.run_owner_mission` / `resume_mission` |
 | `agent/agent_core.py` (`AgentCore`) | Facade/orchestration boundary over `MissionRuntime` | Every `/api/chat` request, including browser `/api/public/chat` |
-| `agent/task_runtime.py` (`AgentTaskRuntime`) | Live compatibility task engine | `/api/tasks` create/resume routes; not the chat execution path |
-| `agent/runtime.py` (`AgentRuntime`) | Planner for the command engine | `core.engine.handle()` through the separate `/api/command` route |
+| `agent/mission_task_adapter.py` (`MissionTaskAdapter`) | Compatibility Task envelope over canonical missions | `/api/tasks`; creation persists via AgentCore before supervised queueing, reads hydrate from MissionStore, and resume/pause/cancel/ownership delegate to AgentCore/MissionService |
+| `agent/task_runtime.py` (`AgentTaskRuntime`) | Legacy task runtime retained for compatibility/tests | No current bridge/API production caller |
+| `agent/runtime.py` (`AgentRuntime`) | Legacy planner for direct command-engine callers | No current bridge `/api/command` caller |
 | `agent/loop.py` (`AgentLoop`) | Legacy conversational loop | Not reachable from bridge/api except `tool_definitions()` imported by `bridge.py` for `/api/tools`; still imported by legacy tests |
-| `agent/conversation.py` (`ConversationParser`) | Deterministic intent baseline (not dead) | `core/engine.py` `_handle_once()` |
+| `agent/conversation.py` (`ConversationParser`) | Deterministic intent baseline for legacy direct callers | `core/engine.py` `_handle_once()` |
 | `agent/conversation_provider.py` | Model adapter for the conversation schema | Tests only (not imported by bridge/api/engine) |
 | `agent/model_intelligence/conversation.py` | Live NLU (`NaturalLanguageUnderstanding` → `MissionIntent`) | `AgentCore.understand_mission_intent` / `run_owner_mission` |
 
-Honest gaps against the "one canonical runtime" goal:
+Honest remaining gaps against the full workspace architecture goal:
 
-1. `/api/tasks` and `/api/command` remain live compatibility routes beside the
-   canonical MissionRuntime chat path. They retain their existing authorization
-   checks and are not used as an authentication fallback for browser chat.
-2. `agent/loop.py` still contains a legacy conversational loop and exports tool
+1. `/api/tasks` remains a compatibility API envelope, though its mission-backed
+   execution and lifecycle now use the canonical MissionRuntime. `agent/loop.py`
+   still contains a legacy conversational loop and exports tool
    metadata used by `/api/tools`; removing it requires a separate compatibility
    migration.
+2. The generic mission plan now validates DAG dependencies and blocks native or
+   deterministic execution of a step until its prerequisites are complete. It
+   does not yet spawn independent specialist agents; the existing
+   `core.expert_modes` functions are deterministic analysis templates, not
+   independent provider-backed experts.
 3. No `owner_authenticated=True` trust path exists anymore:
    `security/authorization.py` explicitly rejects a bare boolean
    ("typed Owner authentication evidence required") and forbids mixing legacy

@@ -19,15 +19,13 @@
     </section>
     <button class="nav active" data-action="chat" type="button">◉ المحادثة</button>
     <button class="nav" data-action="workspace" type="button">▦ مساحة العمل والمهام</button>
-    <button class="nav" data-action="intel" type="button">◈ استخبارات التهديد</button>
-    <button class="nav" data-action="local" type="button">⌁ فحص محلي</button>
     <button class="nav" data-action="status" type="button">◌ حالة النظام</button>
     <div class="security"><b>حدود الثقة</b><small>الادعاءات النصية لا تثبت الاكتمال. الحالة والأدلة المعروضة تأتي من الخادم، وتبقى غير مؤكدة عند غياب التحقق المستقل.</small></div>
   </aside>
   <main>
     <header><button id="menu" type="button" aria-label="القائمة">☰</button><div><b>CyberSentinel X Agent</b><small id="conn">اتصال...</small></div><button id="reload" type="button" aria-label="تحديث">↻</button></header>
     <section id="chat" class="page">
-      <div id="messages"><div class="welcome"><div class="hero">CS</div><h1>CyberSentinel X</h1><p>محادثة أمنية طبيعية: أفهم السؤال، أطلب الأدلة، أستدعي الأدوات المصرح بها، ثم أوضح الفرضيات والثقة.</p><div class="cards"><button data-p="افحص آخر الأحداث وابحث عن نشاط مشبوه" type="button">تحليل الأحداث</button><button data-p="حدّث استخبارات التهديدات ثم اعرض الملخص" type="button">تحديث الاستخبارات</button><button data-p="افحص الجهاز محليًا" type="button">فحص محلي</button><button data-p="ما حالة النظام؟" type="button">حالة النظام</button></div></div></div>
+      <div id="messages"><div class="welcome"><div class="hero">CS</div><h1>CyberSentinel X</h1><p>اكتب هدفك الأمني أو سؤالك بحرية باللغة الطبيعية. سيطلب النظام الأدلة اللازمة، ويتحقق من التفويض والنطاق، ثم يوضح ما نُفّذ وما بقي غير مؤكد.</p></div></div>
       <form id="form"><textarea id="input" rows="1" placeholder="اكتب سؤالك الأمني بلغة طبيعية..."></textarea><button type="submit" aria-label="إرسال">➤</button></form><div class="hint">طلب ← تفويض ← تنفيذ ← رصد ← دليل موثّق ← رد صريح</div>
     </section>
     <section id="workspace" class="page hidden">
@@ -46,8 +44,6 @@
         </div>
       </div>
     </section>
-    <section id="intel" class="page hidden"><div class="panel"><h2>استخبارات التهديد</h2><button id="intelBtn" type="button">تحديث المصادر الآن</button><div id="intelOut"></div></div></section>
-    <section id="local" class="page hidden"><div class="panel"><h2>الفحص المحلي</h2><button id="localBtn" type="button">فحص TCP على هذا الجهاز</button><div id="localOut"></div></div></section>
     <section id="status" class="page hidden"><div class="panel"><h2>حالة النظام</h2><div id="statusOut"></div></div></section>
   </main>
 </div>

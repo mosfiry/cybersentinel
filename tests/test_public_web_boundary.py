@@ -148,6 +148,10 @@ def test_frontend_exposes_login_but_never_bridge_secrets_or_owner_session_storag
     assert '"ONLINE"' not in script
     assert 'data-view="findings"' in page
     assert "system_evidence" in script
+    assert 'placeholder="اكتب سؤالك الأمني بلغة طبيعية...' in page
+    for fixed_action in ('data-p=', 'data-action="intel"', 'data-action="local"', 'id="intelBtn"', 'id="localBtn"'):
+        assert fixed_action not in page
+    assert "function direct(command, output)" not in script
 
 
 def test_http_anonymous_public_boundary_remains_fail_closed(web_server):

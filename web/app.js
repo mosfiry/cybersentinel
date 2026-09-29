@@ -171,31 +171,6 @@ function showJson(value) {
   return pre;
 }
 
-async function direct(command, output) {
-  if (!ownerAuthenticated) {
-    $(output).textContent = "سجّل الدخول بحساب المالك أولاً.";
-    return;
-  }
-  $(output).textContent = "جارٍ انتظار استجابة الخادم...";
-  try {
-    const data = await api("/api/public/chat", {
-      method: "POST",
-      body: JSON.stringify({ text: command, conversation_id: conversationId || undefined }),
-    });
-    conversationId = String(data.conversation_id || "");
-    $(output).replaceChildren();
-    const answer = document.createElement("div");
-    answer.className = "result";
-    answer.textContent = data.answer || `لا توجد إجابة نصية. حالة المهمة: ${data.mission?.status || "غير متاحة"}.`;
-    $(output).appendChild(answer);
-    $(output).appendChild(showJson(data.activity || []));
-    status();
-  } catch (error) {
-    $(output).textContent = errorText(error);
-    if (error.message === "owner_authorization_required") updateAuthUI({ authenticated: false });
-  }
-}
-
 function setNotice(message, kind = "") {
   const notice = $("#workspaceNotice");
   notice.textContent = message;
@@ -487,9 +462,6 @@ $("#form").onsubmit = (event) => { event.preventDefault(); send($("#input").valu
 $("#input").onkeydown = (event) => {
   if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(event.target.value); }
 };
-$$('[data-p]').forEach((button) => button.addEventListener("click", () => send(button.dataset.p)));
-$("#intelBtn").onclick = () => direct("حدّث استخبارات التهديدات ثم اعرض الملخص", "#intelOut");
-$("#localBtn").onclick = () => direct("افحص الجهاز محليًا", "#localOut");
 $("#reload").onclick = status;
 $("#menu").onclick = () => $("#side").classList.toggle("open");
 $("#refreshMissions").onclick = loadWorkspace;
