@@ -90,6 +90,34 @@ class MissionRuntime:
             tool_call_id=proposal.tool_call_id,
         )
 
+    @staticmethod
+    def _live_owner_session_failure(mission: Mission, auth_context: Any) -> str | None:
+        """Revalidate the session-bound Owner identity at the dispatch boundary."""
+        owner_evidence = getattr(auth_context, "owner_evidence", None)
+        context_session_id = getattr(auth_context, "session_id", None)
+        evidence_session_id = getattr(owner_evidence, "session_id", None)
+        if context_session_id and evidence_session_id and context_session_id != evidence_session_id:
+            return "Owner session binding mismatch"
+        session_id = context_session_id or evidence_session_id
+        if not session_id:
+            return None
+        if not isinstance(session_id, str):
+            return "live Owner session could not be verified"
+        try:
+            from security.owner_password import resolve_session
+
+            live_owner = resolve_session(session_id)
+        except Exception:
+            return "live Owner session could not be verified"
+        if not isinstance(live_owner, dict) or live_owner.get("session_id") != session_id:
+            return "live Owner session expired or was revoked"
+        evidence_owner_id = str(getattr(owner_evidence, "owner_id", "") or "")
+        live_owner_id = str(live_owner.get("owner_id", "") or "")
+        mission_owner_id = str(getattr(mission, "owner_identity_ref", "") or "")
+        if evidence_owner_id and (live_owner_id != evidence_owner_id or (mission_owner_id and mission_owner_id != evidence_owner_id)):
+            return "live Owner session identity mismatch"
+        return None
+
     def _registry_context(self, mission: Mission, tool_name: str) -> dict[str, Any]:
         from security.mission_authorization import MissionAuthorizationSnapshot
         snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
@@ -1309,6 +1337,14 @@ class MissionRuntime:
                         except MissionWriteConflictError:
                             latest = self._load(mission_id)
                             return self._accept_pending_control(latest) or latest
+                        session_failure = self._live_owner_session_failure(mission, auth_context)
+                        if session_failure:
+                            mission.checkpoint = previous_checkpoint
+                            mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": session_failure})
+                            mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "OWNER_SESSION_INVALID", "reason": session_failure})
+                            result = ToolCallResult(proposal, False, error=session_failure)
+                            progress["tool_results"].append(result.to_dict())
+                            continue
                         try:
                             raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, tool_call_id=proposal.tool_call_id, execution_proof=proof, execution_class="MISSION_BOUND", **registry_context)
                             action_id = proposal.action_id or proposal.tool_call_id
@@ -1445,6 +1481,9 @@ class MissionRuntime:
             proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
             if not proof_ok:
                 return {"_proof_rejected": True, "proof_code": proof_code, "proof_reason": proof_reason}
+            session_failure = self._live_owner_session_failure(mission, auth_context)
+            if session_failure:
+                return {"_owner_session_rejected": True, "reason": session_failure}
             try:
                 raw = execute_tool(
                     proposal.name, argument,
@@ -1464,6 +1503,12 @@ class MissionRuntime:
         ambiguous: list[tuple[Any, dict[str, Any]]] = []
         for item, wrapped in zip(authorized, raw_results):
             proposal = item[0]
+            if wrapped.get("_owner_session_rejected"):
+                reason = str(wrapped.get("reason") or "live Owner session could not be verified")
+                mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": False, "reason": reason})
+                mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "OWNER_SESSION_INVALID", "reason": reason})
+                results.append(ToolCallResult(proposal, False, error=reason))
+                continue
             if wrapped.get("_proof_rejected"):
                 mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": wrapped.get("proof_code"), "reason": wrapped.get("proof_reason")})
                 results.append(ToolCallResult(proposal, False, error=f"{wrapped.get('proof_code')}: {wrapped.get('proof_reason')}"))

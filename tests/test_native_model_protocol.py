@@ -3,6 +3,8 @@ from runtime_authorization import make_test_snapshot, signed_test_owner_kwargs
 
 from pathlib import Path
 
+import pytest
+
 from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
@@ -292,3 +294,167 @@ def test_provider_switch_preserves_durable_mission_security_and_context(tmp_path
     assert state_b["evidence"] == expected["evidence"]
     assert state_b["knowledge"] == expected["knowledge_context"]
     assert saved_after_b.verification_state["verified"] is False
+
+
+def _live_owner_session_mission(tmp_path, monkeypatch, *, request_id, steps):
+    import core.db as core_db
+    from security import owner_password, owner_policy
+    from security.authorization_context import AuthorizationContext
+
+    monkeypatch.setattr(core_db, "DB_PATH", Path(tmp_path) / "owner-sessions.sqlite3")
+    monkeypatch.setattr(owner_policy, "STATE_PATH", Path(tmp_path) / "owner-policy-state.json")
+    owner_password.create_owner_account(owner_password.OWNER_USERNAME, "integration-test-password")
+    session = owner_password.login(owner_password.OWNER_USERNAME, "integration-test-password")
+    evidence = owner_policy.authenticate_owner(session["session_id"], request_id)
+    policy = owner_policy.capture_policy_snapshot(request_id, evidence)
+    context = AuthorizationContext(request_id, evidence, policy, session_id=session["session_id"])
+    runtime = MissionRuntime(
+        MissionStore(Path(tmp_path) / "missions.sqlite3"),
+        executor=lambda *_: {},
+        authorization_snapshot_factory=make_test_snapshot,
+    )
+    plan = Plan.initial("perform authorized tool actions").replan(steps=steps, reason="live-session-test")
+    mission = runtime.create(
+        "perform authorized tool actions",
+        "perform authorized tool actions",
+        plan,
+        request_id=request_id,
+        owner_identity_ref=str(evidence.owner_id),
+        authorization_context=context.to_dict(),
+        policy_snapshot=policy.to_dict(),
+    )
+    return runtime, mission, session["session_id"]
+
+
+@pytest.mark.parametrize(
+    ("actions", "omit_context_session"),
+    [
+        (("watch",), False),
+        (("watch", "unwatch"), False),
+        (("watch",), True),
+    ],
+)
+def test_revoked_owner_session_during_inference_blocks_tool_dispatch(tmp_path, monkeypatch, actions, omit_context_session):
+    import threading
+
+    import security.owner_password as owner_password
+    import tools.registry
+
+    steps = tuple(PlanStep(f"{name}-step", f"{name} tool", action=name) for name in actions)
+    runtime, mission, session_id = _live_owner_session_mission(
+        tmp_path,
+        monkeypatch,
+        request_id=f"dispatch-race-{len(actions)}-{int(omit_context_session)}",
+        steps=steps,
+    )
+    if omit_context_session:
+        mission.authorization_context = dict(mission.authorization_context)
+        mission.authorization_context["session_id"] = None
+        runtime.store.save(mission)
+    inference_started = threading.Event()
+    release_inference = threading.Event()
+    executions = []
+    monkeypatch.setattr(tools.registry, "execute", lambda *args, **kwargs: executions.append(args[0]) or {"ok": True})
+
+    class InferenceBarrierModel:
+        def complete(self, _messages, _tools, *, mission_id, run_id, turn_id, plan_version):
+            inference_started.set()
+            assert release_inference.wait(5), "test did not release model inference"
+            proposals = tuple(
+                ToolCallProposal.create(
+                    name,
+                    {"query": "revocation-race"},
+                    mission_id=mission_id,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    plan_version=plan_version,
+                    step_id=f"{name}-step",
+                    tool_call_id=f"{turn_id}-{name}",
+                )
+                for name in actions
+            )
+            return ModelTurn(turn_id, tool_calls=proposals)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            runtime.run_model_loop,
+            mission.mission_id,
+            InferenceBarrierModel(),
+            tools=[{"name": name} for name in actions],
+            max_turns=1,
+        )
+        assert inference_started.wait(5), "model inference did not reach the barrier"
+        assert owner_password.revoke_session(session_id)
+        release_inference.set()
+        result = future.result(timeout=10)
+
+    assert executions == []
+    tool_results = result.progress["model_loop"]["tool_results"]
+    assert len(tool_results) == len(actions)
+    assert all(not item["ok"] and "session" in item["error"].casefold() for item in tool_results)
+
+
+def test_parallel_dispatch_rechecks_owner_session_after_each_external_tool_call(tmp_path, monkeypatch):
+    import threading
+
+    import security.owner_password as owner_password
+    import tools.registry
+
+    runtime, mission, session_id = _live_owner_session_mission(
+        tmp_path,
+        monkeypatch,
+        request_id="parallel-dispatch-revocation-race",
+        steps=(
+            PlanStep("watch-step", "add watch", action="watch"),
+            PlanStep("unwatch-step", "remove watch", action="unwatch"),
+        ),
+    )
+    first_dispatch_finished = threading.Event()
+    resolve_lock = threading.Lock()
+    resolve_count = 0
+    resolve_session = owner_password.resolve_session
+
+    def ordered_resolve(session_token):
+        nonlocal resolve_count
+        with resolve_lock:
+            resolve_count += 1
+            ordinal = resolve_count
+        if ordinal > 1:
+            assert first_dispatch_finished.wait(5), "second dispatch did not wait for first dispatch revocation"
+        return resolve_session(session_token)
+
+    monkeypatch.setattr(owner_password, "resolve_session", ordered_resolve)
+    executions = []
+
+    def execute(name, *_args, **_kwargs):
+        executions.append(name)
+        if len(executions) == 1:
+            assert owner_password.revoke_session(session_id)
+            first_dispatch_finished.set()
+        return {"ok": True}
+
+    monkeypatch.setattr(tools.registry, "execute", execute)
+
+    class ParallelModel:
+        def complete(self, _messages, _tools, *, mission_id, run_id, turn_id, plan_version):
+            proposals = (
+                ToolCallProposal.create("watch", {"query": "race"}, mission_id=mission_id, run_id=run_id, turn_id=turn_id, plan_version=plan_version, step_id="watch-step", tool_call_id="parallel-watch-call"),
+                ToolCallProposal.create("unwatch", {"query": "race"}, mission_id=mission_id, run_id=run_id, turn_id=turn_id, plan_version=plan_version, step_id="unwatch-step", tool_call_id="parallel-unwatch-call"),
+            )
+            return ModelTurn(turn_id, tool_calls=proposals)
+
+    result = runtime.run_model_loop(
+        mission.mission_id,
+        ParallelModel(),
+        tools=[{"name": "watch"}, {"name": "unwatch"}],
+        max_turns=1,
+    )
+
+    assert len(executions) == 1
+    tool_results = result.progress["model_loop"]["tool_results"]
+    assert len(tool_results) == 2
+    assert sum(bool(item["ok"]) for item in tool_results) == 1
+    denied = next(item for item in tool_results if not item["ok"])
+    assert "session" in denied["error"].casefold()
