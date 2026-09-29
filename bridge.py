@@ -306,6 +306,21 @@ class Handler(BaseHTTPRequestHandler):
             if self._public_owner_cookie() and owner_session is None:
                 headers = {"Set-Cookie": self._public_owner_cookie_header("", 0)}
             return self._send(200, response, headers=headers)
+        if parsed.path.startswith("/api/public/conversations/"):
+            owner = self._public_mission_owner()
+            if owner is None:
+                return
+            conversation_id = parsed.path[len("/api/public/conversations/"):]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation_id):
+                return self._send(400, {"ok": False, "error": "invalid_conversation_id"})
+            try:
+                from api.chat import get_session
+                conversation = get_session(conversation_id, owner_id=str(owner["owner_id"]))
+                if conversation is None:
+                    return self._send(404, {"ok": False, "error": "unknown_conversation"})
+                return self._send(200, {"ok": True, "conversation": conversation})
+            except PermissionError:
+                return self._send(404, {"ok": False, "error": "unknown_conversation"})
         if parsed.path == "/api/public/missions":
             owner = self._public_mission_owner()
             if owner is None:

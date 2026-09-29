@@ -4,8 +4,9 @@
  * Architecture notes:
  *  - The frontend is an untrusted client. Every mission state, evidence record,
  *    finding, and activity item rendered here originates from server responses.
- *  - No session or token material is stored in the browser: owner sessions live
- *    in HttpOnly cookies scoped to /api/public.
+ *  - No credential or session-token material is stored in the browser: owner
+ *    sessions live in HttpOnly cookies and only a non-secret conversation pointer
+ *    is retained for server-authorized transcript restoration.
  *  - All transport goes through api() so a future desktop shell can supply a
  *    different transport origin via window.CYBERSENTINEL_API_BASE.
  *  - The composer input is natural language only. There are no predefined
@@ -13,6 +14,7 @@
  */
 
 const API_BASE = String(window.CYBERSENTINEL_API_BASE || "").replace(/\/+$/, "");
+const CONVERSATION_STORAGE_KEY = "cybersentinel.lastConversation";
 
 const state = {
   csrfToken: "",
@@ -20,6 +22,8 @@ const state = {
   ownerAuthenticated: false,
   ownerUsername: "",
   conversationId: "",
+  conversationTasks: [],
+  connectionAvailable: false,
   missions: [],
   selectedMissionId: "",
   selectedMission: null,
@@ -116,21 +120,26 @@ function setNotice(message, kind = "") {
 
 async function status() {
   try {
+    const wasAvailable = state.connectionAvailable;
     const [health, auth] = await Promise.all([
       api("/api/public/health"),
       api("/api/public/auth/session"),
     ]);
     updateAuthUI(auth);
+    state.connectionAvailable = health.ok === true;
     const runtime = $("#runtimeState");
     runtime.classList.remove("offline");
     runtime.textContent = health.ok === true
       ? `● ${health.service || "الخدمة"} · ${health.version || "الإصدار غير متاح"}`
       : "? حالة الخدمة غير مؤكدة";
+    return { connected: state.connectionAvailable, reconnected: state.connectionAvailable && !wasAvailable };
   } catch (error) {
+    state.connectionAvailable = false;
     const runtime = $("#runtimeState");
     runtime.classList.add("offline");
     runtime.textContent = "○ تعذر الوصول إلى الخدمة";
     $("#authState").textContent = "تعذر التحقق من الجلسة";
+    return { connected: false, reconnected: false };
   }
 }
 
@@ -154,6 +163,7 @@ function updateAuthUI(data) {
 
 function resetWorkspaceState() {
   state.conversationId = "";
+  state.conversationTasks = [];
   state.selectedMissionId = "";
   state.selectedMission = null;
   state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [] };
@@ -166,6 +176,57 @@ function resetWorkspaceState() {
   $$("#missionTabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === "overview"));
   state.activeView = "overview";
   updateSideLinks();
+}
+
+function rememberConversation(conversationId) {
+  if (!state.ownerAuthenticated || !state.ownerUsername || !conversationId) return;
+  try {
+    localStorage.setItem(CONVERSATION_STORAGE_KEY, JSON.stringify({ owner: state.ownerUsername, conversation_id: String(conversationId) }));
+  } catch (_) { /* The server remains authoritative if browser storage is unavailable. */ }
+}
+
+function forgetConversation() {
+  try { localStorage.removeItem(CONVERSATION_STORAGE_KEY); } catch (_) { /* Storage can be disabled by browser policy. */ }
+}
+
+async function restoreConversation() {
+  if (!state.ownerAuthenticated || !state.ownerUsername) return;
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(CONVERSATION_STORAGE_KEY) || "null"); } catch (_) { saved = null; }
+  if (!saved || typeof saved.conversation_id !== "string") {
+    state.conversationTasks = [];
+    renderMissions();
+    return;
+  }
+  if (saved.owner !== state.ownerUsername || !/^[A-Za-z0-9_-]{1,128}$/.test(saved.conversation_id)) {
+    forgetConversation();
+    state.conversationTasks = [];
+    renderMissions();
+    return;
+  }
+  try {
+    const response = await api(`/api/public/conversations/${encodeURIComponent(saved.conversation_id)}`);
+    const conversation = response.conversation;
+    if (!conversation || conversation.conversation_id !== saved.conversation_id || !Array.isArray(conversation.messages)) throw new Error("unknown_conversation");
+    state.conversationId = conversation.conversation_id;
+    state.conversationTasks = Array.isArray(conversation.tasks)
+      ? conversation.tasks.filter((task) => task && typeof task === "object" && task.conversation_id === conversation.conversation_id && typeof task.task_id === "string")
+      : [];
+    renderMissions();
+    const messages = $("#messages");
+    messages.replaceChildren();
+    conversation.messages.forEach((message) => {
+      if (message?.role === "user") bubble("user", String(message.content || ""));
+      else if (message?.role === "assistant") bubble("bot", String(message.content || ""));
+    });
+    if (conversation.messages.length || state.conversationTasks.length) showView("conversation");
+  } catch (error) {
+    if (error.message === "unknown_conversation") {
+      forgetConversation();
+      state.conversationTasks = [];
+      renderMissions();
+    }
+  }
 }
 
 /* ── Activity panel (real server events only) ───────────── */
@@ -255,6 +316,7 @@ async function send(text) {
     });
     loading.remove();
     state.conversationId = String(data.conversation_id || "");
+    rememberConversation(state.conversationId);
     (Array.isArray(data.activity) ? data.activity : []).forEach((item) => {
       const label = item.event || item.type || item.tool || item.name || "حدث من الخادم";
       const statusText = item.status ? ` · الحالة: ${item.status}` : "";
@@ -289,12 +351,13 @@ function renderMissions() {
     target.innerHTML = '<p class="muted">سجّل الدخول لعرض المهام.</p>';
     return;
   }
-  if (!state.missions.length) {
+  if (!state.missions.length && !state.conversationTasks.length) {
     target.innerHTML = '<p class="muted">لا توجد مهام محفوظة لهذا الحساب.</p>';
     return;
   }
+  const activeStatuses = new Set(["CREATED", "PLANNING", "READY", "RUNNING", "OBSERVING", "VERIFYING", "REPLANNING", "PAUSED"]);
   const groups = [
-    { title: "نشطة", match: (m) => !["GOAL_COMPLETED", "CANCELLED", "FAILED_RETRY_EXHAUSTED", "SCOPE_BLOCKED", "SAFETY_BLOCKED"].includes(m.status) },
+    { title: "نشطة", match: (m) => activeStatuses.has(m.status) },
     { title: "مكتملة (بتحقق الخادم)", match: (m) => m.status === "GOAL_COMPLETED" },
     { title: "منتهية لأسباب أخرى", match: () => true },
   ];
@@ -316,6 +379,24 @@ function renderMissions() {
       target.appendChild(button);
     });
   });
+  if (state.conversationTasks.length) {
+    const heading = document.createElement("div");
+    heading.className = "mission-group";
+    heading.textContent = "مهام محفوظة في المحادثة";
+    target.appendChild(heading);
+    state.conversationTasks.forEach((task) => {
+      const card = document.createElement("div");
+      card.className = "mission-item conversation-task";
+      const title = document.createElement("strong");
+      title.textContent = String(task.objective || task.task_id || "مهمة محفوظة");
+      const status = document.createElement("span");
+      status.textContent = String(task.status || "حالة غير متاحة");
+      const id = document.createElement("small");
+      id.textContent = String(task.task_id || "");
+      card.append(title, status, id);
+      target.appendChild(card);
+    });
+  }
 }
 
 async function loadMissions() {
@@ -605,8 +686,11 @@ function toolsPanel() {
   box.textContent = "لا تعرض واجهة المالك العامة قائمة أدوات. تُقيد الأدوات الفعلية بميزانية المالك المصرّح بها على الخادم عند إنشاء المهمة، ولا يمكن للواجهة أن تضيف أداة أو تفويضًا.";
   const note = document.createElement("p");
   note.className = "muted";
-  note.textContent = "عقد مفقود: لا يوجد مسار عام لعرض الأدوات المتاحة لحساب المالك. عُرضت حالة عدم توفر صادقة بدل بيانات ملفقة.";
-  showInfoPanel([box, note]);
+  note.textContent = "scoped_http_probe: Unavailable / Not supported by current backend contract. لا ينفذ الخادم طلبات HTTP عبر هذه القدرة، ولا يظهر زر تنفيذ لها.";
+  const contract = document.createElement("p");
+  contract.className = "muted";
+  contract.textContent = "عقد مفقود: لا يوجد مسار عام لعرض قائمة الأدوات المتاحة لحساب المالك.";
+  showInfoPanel([box, note, contract]);
 }
 
 async function settingsPanel() {
@@ -643,8 +727,11 @@ async function refreshAfterInteraction() {
 }
 
 async function refreshConnection() {
-  await status();
-  if (state.ownerAuthenticated && !document.hidden) await loadMissions();
+  const connection = await status();
+  if (state.ownerAuthenticated && !document.hidden) {
+    await loadMissions();
+    if (connection?.reconnected) await restoreConversation();
+  }
 }
 
 /* ── Wiring ──────────────────────────────────────────────── */
@@ -709,7 +796,7 @@ $("#loginForm").onsubmit = async (event) => {
     $("#loginPassword").value = "";
     updateAuthUI(data);
     await status();
-    if (state.ownerAuthenticated) await loadMissions();
+    if (state.ownerAuthenticated) await Promise.all([loadMissions(), restoreConversation()]);
   } catch (error) {
     $("#authMessage").textContent = errorText(error);
   } finally {
@@ -741,4 +828,4 @@ function updateSideLinks() {
   $$("[data-side-view]").forEach((button) => { button.disabled = !state.selectedMissionId; });
 }
 
-status().then(() => { if (state.ownerAuthenticated) loadMissions(); });
+status().then(() => { if (state.ownerAuthenticated) return Promise.all([loadMissions(), restoreConversation()]); });

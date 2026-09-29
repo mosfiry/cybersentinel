@@ -84,9 +84,8 @@ def test_lifecycle_controls_call_real_server_actions():
     assert "reconcile" in SCRIPT
 
 
-def test_client_stores_no_tokens_or_sessions_in_the_browser():
+def test_client_stores_no_tokens_or_sessions_and_only_a_nonsecret_conversation_pointer():
     for forbidden in (
-        "localStorage",
         "sessionStorage",
         "BRIDGE_TOKEN",
         "OWNER_TOKEN",
@@ -95,6 +94,9 @@ def test_client_stores_no_tokens_or_sessions_in_the_browser():
         "prompt(",
     ):
         assert forbidden not in SCRIPT
+    assert 'const CONVERSATION_STORAGE_KEY = "cybersentinel.lastConversation"' in SCRIPT
+    assert "localStorage.setItem(CONVERSATION_STORAGE_KEY" in SCRIPT
+    assert 'owner: state.ownerUsername, conversation_id: String(conversationId)' in SCRIPT
 
 
 def test_reconnect_refetches_server_state():
@@ -105,6 +107,26 @@ def test_reconnect_refetches_server_state():
     assert "loadMission" in SCRIPT
     refresh_function = SCRIPT.split("async function refreshConnection() {", 1)[1].split("\n}", 1)[0]
     assert "await loadMissions()" in refresh_function
+    assert "await restoreConversation()" in refresh_function
+    assert "connection?.reconnected" in refresh_function
+    assert "conversation.tasks" in SCRIPT
+    assert "state.conversationTasks.forEach" in SCRIPT
+
+
+def test_terminal_missions_are_not_misclassified_as_active():
+    active_statuses = SCRIPT.split("const activeStatuses = new Set([", 1)[1].split("]);", 1)[0]
+    for terminal in (
+        "GOAL_COMPLETED",
+        "OWNER_INPUT_REQUIRED",
+        "AUTHORIZATION_BLOCKED",
+        "SCOPE_BLOCKED",
+        "RESOURCE_BLOCKED",
+        "RECOVERY_REQUIRED",
+        "SAFETY_BLOCKED",
+        "FAILED_RETRY_EXHAUSTED",
+        "CANCELLED",
+    ):
+        assert terminal not in active_statuses
 
 
 def test_unavailable_contracts_render_truthful_states():

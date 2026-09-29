@@ -128,7 +128,6 @@ def test_frontend_exposes_login_but_never_bridge_secrets_or_owner_session_storag
         "OWNER_TOKEN",
         "cs_bridge_token",
         "cs_owner_token",
-        "sessionStorage",
         "prompt(",
         "X-CyberSentinel-Token",
         "X-CyberSentinel-Owner-Token",
@@ -142,7 +141,10 @@ def test_frontend_exposes_login_but_never_bridge_secrets_or_owner_session_storag
     assert "/api/public/auth/logout" in script
     assert "credentials: \"include\"" in script
     assert "X-CSRF-Token" in script
-    assert "localStorage" not in script
+    assert "localStorage.setItem(CONVERSATION_STORAGE_KEY" in script
+    assert "localStorage.getItem(CONVERSATION_STORAGE_KEY" in script
+    assert "restoreConversation" in script
+    assert "sessionStorage" not in script
     assert 'item.status || "completed"' not in script
     assert 'data.answer || "اكتمل التحليل."' not in script
     assert '"ONLINE"' not in script
@@ -225,6 +227,45 @@ def test_http_owner_login_session_and_chat_use_canonical_auth(web_server):
     assert len(calls) == 1
     assert calls[0][0]["text"] == "Check the system"
     assert calls[0][1] == owner_session["session_id"]
+
+
+def test_public_transcript_restore_is_durable_and_owner_scoped(web_server, monkeypatch):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    owner_session = owner_password.resolve_session(owner_cookie)
+    assert owner_session is not None
+    cookies = f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}"
+
+    core_db.ensure_conversation("restore-conversation", str(owner_session["owner_id"]))
+    core_db.add_conversation_message("restore-conversation", "user", "saved question", {"mission_id": "mission-1"}, owner_id=str(owner_session["owner_id"]))
+    core_db.add_conversation_message("restore-conversation", "assistant", "saved answer", {"mission_id": "mission-1"}, owner_id=str(owner_session["owner_id"]))
+    import api.chat as chat_api
+    from types import SimpleNamespace
+
+    foreign_task = SimpleNamespace(execution_state={"owner_identity": "different-owner", "events": []}, to_dict=lambda: {"task_id": "foreign-task"})
+    owned_task = SimpleNamespace(execution_state={"owner_identity": str(owner_session["owner_id"]), "events": []}, to_dict=lambda: {"task_id": "owned-task"})
+    monkeypatch.setattr(chat_api.TaskManager, "get_tasks_by_conversation", staticmethod(lambda _conversation_id: [foreign_task, owned_task]))
+    status, _, payload = request(server, "GET", "/api/public/conversations/restore-conversation", cookies=cookies)
+    assert status == 200
+    conversation = payload["conversation"]
+    assert conversation["conversation_id"] == "restore-conversation"
+    assert [message["content"] for message in conversation["messages"]] == ["saved question", "saved answer"]
+    assert [task["task_id"] for task in conversation["tasks"]] == ["owned-task"]
+    assert "owner_id" not in conversation
+    assert "owner_session_id" not in json.dumps(conversation)
+
+    core_db.ensure_conversation("foreign-conversation", "different-owner")
+    core_db.add_conversation_message("foreign-conversation", "assistant", "private", owner_id="different-owner")
+    status, _, payload = request(server, "GET", "/api/public/conversations/foreign-conversation", cookies=cookies)
+    assert status == 404
+    assert payload["error"] == "unknown_conversation"
+
+    status, _, payload = request(server, "GET", "/api/public/conversations/restore-conversation", cookies=public_cookie)
+    assert status == 403
+    assert payload["error"] == "owner_authorization_required"
 
 
 def test_browser_login_returns_generic_failure_for_wrong_password(web_server):

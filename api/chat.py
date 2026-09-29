@@ -109,6 +109,9 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
         scope_context=payload.get("scope_context"),
         completion_criteria=payload.get("completion_criteria"),
     )
+    if mission.provenance.get("conversation_id") != conversation_id:
+        mission.provenance["conversation_id"] = conversation_id
+        mission = core.store.save(mission)
     answer = str(mission.progress.get("last_model_content") or "")
     if answer:
         try:
@@ -127,7 +130,7 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
         except json.JSONDecodeError:
             pass
     answer = answer or "Mission " + mission.status.value
-    add_conversation_message(conversation_id, "assistant", answer, {"mission_id": mission.mission_id, "status": mission.status.value, "request_id": mission.request_id}, owner_id=owner_id)
+    add_conversation_message(conversation_id, "assistant", answer, {"mission_id": mission.mission_id, "status": mission.status.value, "request_id": mission.request_id, "conversation_id": conversation_id}, owner_id=owner_id)
     activity = list(mission.trajectory)
     for action in mission.action_history:
         if action.get("status") == "completed":
@@ -149,7 +152,12 @@ def get_session(conversation_id: str, *, owner_id: str) -> dict[str, Any] | None
     info.pop("owner_id", None)
     info.pop("owner_session_id", None)
     info["messages"] = conversation_messages(conversation_id)
-    info["tasks"] = [_task_public(task) for task in TaskManager.get_tasks_by_conversation(conversation_id)]
+    owned_tasks = []
+    for task in TaskManager.get_tasks_by_conversation(conversation_id):
+        state = task.execution_state if isinstance(task.execution_state, dict) else {}
+        if str(state.get("owner_identity", "")) == str(owner_id):
+            owned_tasks.append(_task_public(task))
+    info["tasks"] = owned_tasks
     return info
 
 
