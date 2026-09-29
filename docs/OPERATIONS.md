@@ -55,6 +55,8 @@ With no model provider, deterministic local behavior is used; that is not a live
 
 The Owner-only `run_project_tests` tool is enabled only when startup verifies `bubblewrap` and `prlimit` can establish an isolated user/PID/network namespace. It runs pytest from a filtered, read-only project snapshot with no inherited credentials, no network, disabled third-party pytest plugin autoload, and explicit CPU, memory, process, file, tmpfs, entry-count, and depth limits. Hosts that cannot satisfy the OS sandbox preflight expose the capability as unavailable; tests are never silently run as an ordinary application-user subprocess. See [Tool Execution](TOOL_EXECUTION.md) for the exact limits and evidence contract.
 
+The GitHub `tests` and `pytest-diagnostics` workflows install `bubblewrap` and `util-linux` (which provides `prlimit`) and require the same startup namespace preflight to pass before pytest runs. If the hosted runner cannot create the required user/PID/network isolation, the job fails closed; sandbox tests are not skipped and no unisolated fallback is used.
+
 The optional manually dispatched live-provider workflow is limited to `main`, validates its `max_iterations` input (1–16), and uses repository Actions secrets named `OPENAI_API_BASE`, `OPENAI_API_KEY`, and `CYBERSENTINEL_OWNER_PASSWORD`; `REAL_PROVIDER_MODEL` is optional. It creates a disposable Owner account/session in the workflow runner's temporary database. Do not put any of these values in source or workflow inputs. When a required secret is absent, the workflow records a `BLOCKED` artifact without starting a mission; this is not a passing live-provider test.
 
 ## Persistent state, permissions, and backup

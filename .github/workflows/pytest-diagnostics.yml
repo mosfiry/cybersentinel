@@ -28,9 +28,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install OS sandbox dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends bubblewrap util-linux
+          command -v bwrap
+          command -v prlimit
       - name: Install dependencies
         id: dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Verify OS sandbox namespace preflight
+        id: sandbox
+        run: |
+          python - <<'PY'
+          import sys
+          from tools.registry import _PROJECT_TEST_SANDBOX_AVAILABLE, _PROJECT_TEST_SANDBOX_REASON
+          if not _PROJECT_TEST_SANDBOX_AVAILABLE:
+              print(_PROJECT_TEST_SANDBOX_REASON or "OS sandbox preflight failed", file=sys.stderr)
+              raise SystemExit(1)
+          print("bubblewrap user/PID/network sandbox preflight passed")
+          PY
       - name: Compile Python sources
         id: compile
         run: python -m compileall -q .
@@ -69,6 +86,7 @@ jobs:
         if: always()
         env:
           DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          SANDBOX_OUTCOME: ${{ steps.sandbox.outcome }}
           COMPILE_OUTCOME: ${{ steps.compile.outcome }}
           FRONTEND_OUTCOME: ${{ steps.frontend.outcome }}
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
@@ -84,6 +102,7 @@ jobs:
             echo "- Commit: ${GITHUB_SHA}"
             echo "- Ref: ${GITHUB_REF}"
             echo "- Dependencies: ${DEPENDENCIES_OUTCOME:-not run}"
+            echo "- OS sandbox preflight: ${SANDBOX_OUTCOME:-not run}"
             echo "- Compile: ${COMPILE_OUTCOME:-not run}"
             echo "- Frontend syntax: ${FRONTEND_OUTCOME:-not run}"
             echo "- Tests: ${TESTS_OUTCOME:-not run}"
