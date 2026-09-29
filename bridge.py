@@ -26,7 +26,7 @@ from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
 import security.owner_password as owner_password
 from security.owner_password import login as owner_password_login, logout as owner_password_logout
-from api.chat import chat, get_session, sse, stream, task_stream, create_task, resume_task, pause_task, cancel_task, _task_public
+from api.chat import chat, get_session, sse, stream, task_stream, create_task, get_task, resume_task, pause_task, cancel_task, _task_public
 from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
@@ -36,6 +36,7 @@ from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, 
 from agent.mission_runtime import MissionRuntime
 from agent.mission import MissionStore, MissionStatus
 from agent.agent_core import AgentCore
+from agent.mission_task_adapter import task_owner_matches
 from agent.planning import Plan, PlanStep
 from security.mission_authorization import MissionAuthorizationSnapshot
 from workspace import Workspace, WorkspaceBoundaryError, WorkspacePolicy, WorkspacePolicyError
@@ -438,13 +439,15 @@ class Handler(BaseHTTPRequestHandler):
                 task = TaskManager.get_task(task_id)
                 if task is None:
                     return self._send(404, {"ok": False, "error": "unknown_task"})
+                if not task_owner_matches(task, owner_session):
+                    return self._send(403, {"ok": False, "error": "task access denied"})
                 return self._send_sse(task_stream(task_id, owner_session_token=self._chat_auth()))
             task = TaskManager.get_task(task_id)
             if task is None:
                 return self._send(404, {"ok": False, "error": "unknown_task"})
-            if task.owner_session_id and task.owner_session_id != owner_session["session_id"]:
+            if not task_owner_matches(task, owner_session):
                 return self._send(403, {"ok": False, "error": "task access denied"})
-            return self._send(200, {"ok": True, "task": _task_public(task)})
+            return self._send(200, {"ok": True, **get_task(task_id, owner_session_token=self._chat_auth())})
         if self.path in {"/app.js", "/style.css"}:
             return self._static(self.path[1:])
         if self.path.startswith("/static/"):

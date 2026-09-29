@@ -289,6 +289,10 @@ def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path):
     started = service.start_mission(mission["mission_id"])
     assert started["state"] == WorkerMissionState.QUEUED
     service.pause_mission(mission["mission_id"])
-    assert service.status(mission["mission_id"])["progress"]["pause_requested"] is True
+    paused = service.status(mission["mission_id"])
+    assert paused["status"] == "PAUSED"
+    assert paused["checkpoint"]["status"] == "paused"
+    assert paused["queue"]["state"] == WorkerMissionState.PAUSED.value
+    assert "pause_requested" not in paused["progress"]
     scheduled = service.schedule_mission(mission["mission_id"], run_at="2026-01-01T00:00:00+00:00", schedule_id="svc")
     assert scheduled["schedule_id"] == "svc"

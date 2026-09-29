@@ -4,7 +4,7 @@ from typing import Any
 
 from agent.mission import Mission, MissionStatus
 from agent.mission_runtime import MissionRuntime
-from agent.mission_worker import MissionQueue, MissionScheduler
+from agent.mission_worker import MissionQueue, MissionScheduler, WorkerMissionState
 from agent.planning import Plan
 
 
@@ -28,7 +28,19 @@ class MissionService:
         mission = self._load(mission_id, owner_identity=owner_identity)
         if mission.is_terminal:
             return mission.to_public_dict()
-        mission.progress["pause_requested"] = True
+        try:
+            queue_item = self.queue.get(mission_id)
+        except KeyError:
+            queue_item = None
+        checkpoint_status = str((mission.checkpoint or {}).get("status", ""))
+        if (queue_item is not None and queue_item.state is WorkerMissionState.EXECUTING) or checkpoint_status in {"in_flight", "in_flight_parallel"}:
+            mission.progress["pause_requested"] = True
+        else:
+            mission.progress.pop("pause_requested", None)
+            mission.transition(MissionStatus.PAUSED, "Owner requested mission pause")
+            mission.checkpoint = {**mission.checkpoint, "status": "paused"}
+            if queue_item is not None:
+                self.queue.update(mission_id, WorkerMissionState.PAUSED)
         return self.runtime.store.save(mission).to_public_dict()
 
     def resume_mission(self, mission_id: str, *, owner_identity: str | None = None) -> dict[str, Any]:
@@ -52,6 +64,12 @@ class MissionService:
             else:
                 mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
                 mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+                try:
+                    queue_item = self.queue.get(mission_id)
+                except KeyError:
+                    queue_item = None
+                if queue_item is not None and queue_item.state is not WorkerMissionState.EXECUTING:
+                    self.queue.update(mission_id, WorkerMissionState.CANCELLED)
             self.runtime.store.save(mission)
         return mission.to_public_dict()
 

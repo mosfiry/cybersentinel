@@ -6,7 +6,7 @@ from typing import Any, Iterator
 
 from agent.task import TaskStatus
 from agent.task_manager import TaskManager
-from agent.mission_task_adapter import MissionTaskAdapter
+from agent.mission_task_adapter import MissionTaskAdapter, task_owner_matches
 from agent.agent_core import AgentCore
 from agent.mission import MissionStatus
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
@@ -60,37 +60,32 @@ def create_task(payload: dict[str, Any], *, owner_session_token: str, run: bool 
     return {"task": _task_public(task)}
 
 
+def get_task(task_id: str, *, owner_session_token: str) -> dict[str, Any]:
+    task = _runtime().get_task(task_id, owner_session_token=owner_session_token)
+    return {"task": _task_public(task)}
+
+
 def resume_task(task_id: str, *, owner_session_token: str, run: bool = True) -> dict[str, Any]:
+    owner = _owner_session(owner_session_token)
     task = TaskManager.get_task(task_id)
     if task is None:
         raise KeyError("unknown_task")
+    if not task_owner_matches(task, owner):
+        raise PermissionError("task access denied")
     if run:
-        task = _runtime().resume_task(task_id, owner_session_token=owner_session_token)
+        task = _runtime().resume_task(task_id, owner_session_token=owner_session_token, run=True)
+    else:
+        task = _runtime().get_task(task_id, owner_session_token=owner_session_token)
     return {"task": _task_public(task)}
 
 
 def pause_task(task_id: str, *, owner_session_token: str) -> dict[str, Any]:
-    owner = _owner_session(owner_session_token)
-    task = TaskManager.get_task(task_id)
-    if task is None:
-        raise KeyError("unknown_task")
-    if task.owner_session_id and task.owner_session_id != owner["session_id"]:
-        raise PermissionError("task access denied")
-    task.request_pause()
-    task.update_status(TaskStatus.PAUSED)
-    TaskManager.update_task(task)
+    task = _runtime().pause_task(task_id, owner_session_token=owner_session_token)
     return {"task": _task_public(task)}
 
 
 def cancel_task(task_id: str, *, owner_session_token: str) -> dict[str, Any]:
-    owner = _owner_session(owner_session_token)
-    task = TaskManager.get_task(task_id)
-    if task is None:
-        raise KeyError("unknown_task")
-    if task.owner_session_id and task.owner_session_id != owner["session_id"]:
-        raise PermissionError("task access denied")
-    task.request_cancel()
-    TaskManager.update_task(task)
+    task = _runtime().cancel_task(task_id, owner_session_token=owner_session_token)
     return {"task": _task_public(task)}
 
 
@@ -168,10 +163,13 @@ def stream(payload: dict[str, Any], *, owner_session_token: str) -> Iterator[dic
 
 
 def task_stream(task_id: str, *, owner_session_token: str) -> Iterator[dict[str, Any]]:
-    result = resume_task(task_id, owner_session_token=owner_session_token, run=True)
+    result = get_task(task_id, owner_session_token=owner_session_token)
+    task = TaskManager.get_task(task_id)
     for event in result["task"].get("events", []):
         yield {"event": event["event"], "data": event}
-    yield {"event": "task.completed", "data": result}
+    status = result["task"].get("status")
+    final_event = "task.completed" if status == TaskStatus.COMPLETED.value else ("task.terminal" if task.is_terminal else "task.status")
+    yield {"event": final_event, "data": result}
 
 
 def sse(event: dict[str, Any]) -> bytes:
