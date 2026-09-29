@@ -96,6 +96,8 @@ class MissionQueue:
             current = db.execute("SELECT state FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
             if current and current[0] == WorkerMissionState.EXECUTING.value:
                 return self.get(mission_id)
+            if current and current[0] == WorkerMissionState.CANCELLED.value:
+                return self.get(mission_id)
             terminal_states = (WorkerMissionState.COMPLETED.value, WorkerMissionState.PARTIAL_SUCCESS.value, WorkerMissionState.NEEDS_INPUT.value, WorkerMissionState.FAILED.value, WorkerMissionState.CANCELLED.value)
             if current is None or current[0] in terminal_states:
                 active_count = int(db.execute("SELECT COUNT(*) FROM mission_queue WHERE state NOT IN (?,?,?,?,?)", terminal_states).fetchone()[0])
@@ -135,6 +137,22 @@ class MissionQueue:
                     raise LeaseLostError("worker lease is not owned")
             else:
                 db.execute("UPDATE mission_queue SET state=?, available_at=COALESCE(?,available_at), last_error=?, claimed_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE claimed_at END, lease_owner=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN ? IN ('completed','failed','cancelled','needs_input','partial_success') THEN NULL ELSE lease_expires_at END WHERE mission_id=?", (state.value, available_at, error, state.value, state.value, state.value, mission_id))
+        return self.get(mission_id)
+
+    def sync_control_state(self, mission_id: str, state: WorkerMissionState) -> QueueItem:
+        """Reconcile an idle queue item without stealing an executing worker lease."""
+        if state not in {WorkerMissionState.PAUSED, WorkerMissionState.CANCELLED}:
+            raise ValueError("control sync only accepts paused or cancelled states")
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT state FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
+            if row is None:
+                raise KeyError("unknown queued mission")
+            if row[0] != WorkerMissionState.EXECUTING.value:
+                db.execute(
+                    "UPDATE mission_queue SET state=?,last_error=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE mission_id=?",
+                    (state.value, "mission paused" if state is WorkerMissionState.PAUSED else "mission cancelled", mission_id),
+                )
         return self.get(mission_id)
 
     def release(self, mission_id: str, state: WorkerMissionState, *, worker_id: str, available_at: str | None = None, error: str = "") -> QueueItem:

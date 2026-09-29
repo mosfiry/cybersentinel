@@ -6,7 +6,7 @@ from typing import Any, Callable
 import hashlib
 import json
 
-from .mission import Mission, MissionStatus, MissionStore
+from .mission import Mission, MissionStatus, MissionStore, MissionWriteConflictError
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
 from .trajectory import EventType
 from .observation import Observation
@@ -306,6 +306,100 @@ class MissionRuntime:
             raise KeyError("unknown_mission")
         return mission
 
+    def _accept_pending_control(self, mission: Mission) -> Mission | None:
+        """Commit pause/cancel only at a boundary with no claimed tool effect."""
+        current = mission
+        for _ in range(8):
+            if current.is_terminal:
+                return current
+            cancel = bool(current.progress.get("cancel_requested"))
+            pause = bool(current.progress.get("pause_requested"))
+            if not cancel and not pause:
+                return None
+            if str((current.checkpoint or {}).get("status", "")) in {"in_flight", "in_flight_parallel"}:
+                return None
+            if cancel:
+                current.progress.pop("cancel_requested", None)
+                current.progress.pop("pause_requested", None)
+                current.transition(MissionStatus.CANCELLED, "Owner cancellation request accepted at a safe execution boundary")
+                current.checkpoint = {**current.checkpoint, "status": "cancelled"}
+            else:
+                current.progress.pop("pause_requested", None)
+                current.transition(MissionStatus.PAUSED, "Owner pause request accepted at a safe execution boundary")
+                current.checkpoint = {**current.checkpoint, "status": "paused"}
+            try:
+                return self.store.save(current)
+            except MissionWriteConflictError:
+                current = self._load(current.mission_id)
+        return current
+
+    def _claim_callback(self, mission: Mission, checkpoint: dict[str, Any]) -> tuple[Mission, bool]:
+        """Use MissionStore's optimistic write as the callback/control linearization point."""
+        if mission.is_terminal:
+            return mission, False
+        if mission.progress.get("cancel_requested") or mission.progress.get("pause_requested"):
+            return self._accept_pending_control(mission) or mission, False
+        mission.checkpoint = checkpoint
+        try:
+            return self.store.save(mission), True
+        except MissionWriteConflictError:
+            latest = self._load(mission.mission_id)
+            controlled = self._accept_pending_control(latest)
+            return controlled or latest, False
+
+    def _claim_followup_callback(self, mission: Mission, stage: str) -> tuple[Mission, bool]:
+        """Claim model-backed postprocessing without dropping the tool-effect checkpoint."""
+        expected = dict(mission.checkpoint or {})
+        expected_status = str(expected.get("status", ""))
+        expected_call_id = str(expected.get("tool_call_id", ""))
+        expected_parallel_ids = tuple(str(item) for item in expected.get("tool_call_ids", ()))
+        for _ in range(8):
+            current = self._load(mission.mission_id)
+            checkpoint = dict(current.checkpoint or {})
+            if current.is_terminal:
+                return current, False
+            if (
+                str(checkpoint.get("status", "")) != expected_status
+                or expected_status not in {"in_flight", "in_flight_parallel"}
+                or str(checkpoint.get("tool_call_id", "")) != expected_call_id
+                or tuple(str(item) for item in checkpoint.get("tool_call_ids", ())) != expected_parallel_ids
+            ):
+                return current, False
+            if current.progress.get("cancel_requested") or current.progress.get("pause_requested"):
+                return self._require_reconciliation(
+                    current.mission_id,
+                    expected_status,
+                    f"control arrived before claimed {stage} callback; tool outcome requires reconciliation",
+                ), False
+            current.checkpoint = {**checkpoint, "followup_claim": stage}
+            try:
+                saved = self.store.save(current)
+            except MissionWriteConflictError:
+                continue
+            # The caller holds the tool result in memory; advance only its CAS
+            # token/checkpoint so the eventual durable result write is based on
+            # this exact follow-up claim.
+            mission.integrity_hash = saved.integrity_hash
+            mission.checkpoint = dict(saved.checkpoint)
+            return mission, True
+        return self._load(mission.mission_id), False
+
+    def _require_reconciliation(self, mission_id: str, checkpoint_status: str, reason: str) -> Mission:
+        """Retain an in-flight claim when a callback result could not be committed."""
+        current = self._load(mission_id)
+        for _ in range(8):
+            if str((current.checkpoint or {}).get("status", "")) != checkpoint_status:
+                return current
+            if current.status is MissionStatus.RECOVERY_REQUIRED or current.is_terminal:
+                return current
+            current.error = reason
+            current.transition(MissionStatus.RECOVERY_REQUIRED, reason)
+            try:
+                return self.store.save(current)
+            except MissionWriteConflictError:
+                current = self._load(mission_id)
+        return current
+
     def _record_verified_criterion_evidence(self, mission: Mission, action_id: str) -> None:
         for criterion in mission.completion_criteria:
             criterion_id = str(criterion.get("criterion_id", ""))
@@ -458,6 +552,26 @@ class MissionRuntime:
                 auth_context = None
 
         for _ in range(max_turns):
+            mission = self._load(mission_id)
+            if mission.is_terminal:
+                return mission
+            checkpoint_status = str((mission.checkpoint or {}).get("status", ""))
+            if checkpoint_status in {"model_in_flight", "verification_in_flight"}:
+                return self._require_reconciliation(
+                    mission_id,
+                    checkpoint_status,
+                    "in-flight model/verifier callback outcome is unknown; reconciliation required",
+                )
+            if str((mission.checkpoint or {}).get("status", "")) in {"in_flight", "in_flight_parallel"}:
+                mission.error = "in-flight native tool outcome is unknown; reconciliation required"
+                mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+                return self.store.save(mission)
+            controlled = self._accept_pending_control(mission)
+            if controlled is not None:
+                return controlled
+            mission.progress["model_run_id"] = run_id
+            progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
+            seen = set(str(item) for item in progress.setdefault("seen_call_ids", []))
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
             assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools)
             progress["last_context_hash"] = assembled.context_hash
@@ -472,9 +586,25 @@ class MissionRuntime:
                 "tool_call_ids": [item.get("tool_call_id", "") for item in progress.get("tool_results", ())],
             }
             messages = assembled.messages
+            previous_checkpoint = dict(mission.checkpoint or {})
+            mission, claimed = self._claim_callback(
+                mission,
+                {"status": "model_in_flight", "kind": "native_model", "run_id": run_id, "turn_id": turn_id, "plan_version": mission.plan.version},
+            )
+            if not claimed:
+                return mission
+            progress = mission.progress["model_loop"]
             try:
                 turn = model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version)
             except ProviderError as exc:
+                latest = self._load(mission_id)
+                controlled = self._accept_pending_control(latest)
+                if controlled is not None:
+                    return controlled
+                if latest.is_terminal:
+                    return latest
+                mission = latest
+                progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")
                 failure = {"class": FailureClass.PROVIDER.value, "kind": str(kind), "reason": str(exc), "turn_id": turn_id, "run_id": run_id}
                 mission.failures.append(failure)
@@ -490,10 +620,50 @@ class MissionRuntime:
                     mission.transition(MissionStatus.REPLANNING, "provider failure; replan selected")
                 else:
                     mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
-                self.store.save(mission)
+                mission.checkpoint = {"status": "model_call_failed", "run_id": run_id, "turn_id": turn_id}
+                try:
+                    self.store.save(mission)
+                except MissionWriteConflictError:
+                    latest = self._load(mission_id)
+                    return self._accept_pending_control(latest) or latest
                 if mission.is_terminal:
                     return mission
                 continue
+            except Exception:
+                latest = self._load(mission_id)
+                controlled = self._accept_pending_control(latest)
+                if controlled is not None:
+                    return controlled
+                if (
+                    (latest.checkpoint or {}).get("status") == "model_in_flight"
+                    and (latest.checkpoint or {}).get("turn_id") == turn_id
+                ):
+                    latest.checkpoint = previous_checkpoint
+                    try:
+                        self.store.save(latest)
+                    except MissionWriteConflictError:
+                        latest = self._load(mission_id)
+                        controlled = self._accept_pending_control(latest)
+                        if controlled is not None:
+                            return controlled
+                raise
+            latest = self._load(mission_id)
+            controlled = self._accept_pending_control(latest)
+            if controlled is not None:
+                return controlled
+            if latest.is_terminal:
+                return latest
+            if (
+                (latest.checkpoint or {}).get("status") != "model_in_flight"
+                or (latest.checkpoint or {}).get("turn_id") != turn_id
+            ):
+                return latest
+            mission = latest
+            progress = mission.progress["model_loop"]
+            seen = set(str(item) for item in progress.setdefault("seen_call_ids", []))
+            if previous_checkpoint.get("status") == "model_in_flight":
+                previous_checkpoint = {"status": "model_turn_completed", "run_id": run_id, "turn_id": turn_id}
+            mission.checkpoint = previous_checkpoint
             if auth_context is not None and turn.tool_calls:
                 from dataclasses import replace as replace_dataclass
                 turn = replace_dataclass(turn, tool_calls=tuple(
@@ -507,10 +677,48 @@ class MissionRuntime:
                 ))
             progress["turns"].append(turn.to_dict())
             mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
+            mission.checkpoint = previous_checkpoint
+            try:
+                mission = self.store.save(mission)
+            except MissionWriteConflictError:
+                latest = self._load(mission_id)
+                return self._accept_pending_control(latest) or latest
+            latest = self._load(mission_id)
+            controlled = self._accept_pending_control(latest)
+            if controlled is not None:
+                return controlled
+            if latest.is_terminal:
+                return latest
+            mission = latest
+            progress = mission.progress["model_loop"]
+            seen = set(str(item) for item in progress.setdefault("seen_call_ids", []))
             if not turn.tool_calls:
                 progress["last_model_content"] = turn.content
                 progress["last_model_finish_reason"] = turn.finish_reason
+                latest = self._load(mission_id)
+                controlled = self._accept_pending_control(latest)
+                if controlled is not None:
+                    return controlled
+                if latest.is_terminal:
+                    return latest
+                mission = latest
+                progress = mission.progress["model_loop"]
+                mission, claimed = self._claim_callback(
+                    mission,
+                    {"status": "verification_in_flight", "kind": "mission_verifier", "run_id": run_id, "turn_id": turn_id},
+                )
+                if not claimed:
+                    return mission
                 verification = self.verifier(mission)
+                latest = self._load(mission_id)
+                controlled = self._accept_pending_control(latest)
+                if controlled is not None:
+                    return controlled
+                if latest.is_terminal:
+                    return latest
+                mission = latest
+                progress = mission.progress["model_loop"]
+                mission.checkpoint = previous_checkpoint
                 mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
                 if verification.verified:
                     mission.verification_state = self.store.issue_completion_proof(mission)
@@ -520,14 +728,31 @@ class MissionRuntime:
                 else:
                     mission.error = "model final lacked deterministic goal evidence"
                     mission.transition(MissionStatus.READY, mission.error)
-                return self.store.save(mission)
+                try:
+                    return self.store.save(mission)
+                except MissionWriteConflictError:
+                    latest = self._load(mission_id)
+                    return self._accept_pending_control(latest) or latest
             if len(turn.tool_calls) > 1:
-                self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, progress=progress, seen=seen)
-                self.store.save(mission)
+                if not self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, progress=progress, seen=seen):
+                    return self._load(mission_id)
+                try:
+                    self.store.save(mission)
+                except MissionWriteConflictError:
+                    return self._require_reconciliation(mission_id, "in_flight_parallel", "parallel native tool results were not durably committed")
                 if mission.is_terminal:
                     return mission
                 continue
             for proposal in turn.tool_calls:
+                latest = self._load(mission_id)
+                controlled = self._accept_pending_control(latest)
+                if controlled is not None:
+                    return controlled
+                if latest.is_terminal:
+                    return latest
+                mission = latest
+                progress = mission.progress["model_loop"]
+                seen = set(str(item) for item in progress.setdefault("seen_call_ids", []))
                 if proposal.mission_id and proposal.mission_id != mission.mission_id:
                     result = ToolCallResult(proposal, False, error="tool call belongs to another mission")
                 elif proposal.run_id and proposal.run_id != run_id:
@@ -574,9 +799,13 @@ class MissionRuntime:
                             result = ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution authorization rejected: {type(exc).__name__}")
                             progress["tool_results"].append(result.to_dict())
                             continue
+                        mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
                         try:
-                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id or proposal.tool_call_id, "step_id": proposal.step_id, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
-                            self.store.save(mission)
+                            mission = self.store.save(mission)
+                        except MissionWriteConflictError:
+                            latest = self._load(mission_id)
+                            return self._accept_pending_control(latest) or latest
+                        try:
                             raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, tool_call_id=proposal.tool_call_id, execution_proof=proof, execution_class="MISSION_BOUND", **registry_context)
                             action_id = proposal.action_id or proposal.tool_call_id
                             observation, success = self._normalize_native_tool_result(
@@ -589,6 +818,9 @@ class MissionRuntime:
                             )
                             mission.record_observation(observation)
                             if planned_step is not None:
+                                mission, followup_claimed = self._claim_followup_callback(mission, f"observation_interpretation:{proposal.tool_call_id}")
+                                if not followup_claimed:
+                                    return mission
                                 self._interpret_observation(mission, planned_step, observation, success=success)
                             mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
                             if success:
@@ -600,14 +832,23 @@ class MissionRuntime:
                         except Exception as exc:
                             mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
                             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
-                            return self.store.save(mission)
+                            try:
+                                return self.store.save(mission)
+                            except MissionWriteConflictError:
+                                return self._require_reconciliation(mission_id, "in_flight", "native tool result was not durably committed")
                 progress["tool_results"].append(result.to_dict())
-            self.store.save(mission)
+            try:
+                self.store.save(mission)
+            except MissionWriteConflictError:
+                latest = self._load(mission_id)
+                if str((latest.checkpoint or {}).get("status", "")) == "in_flight":
+                    return self._require_reconciliation(mission_id, "in_flight", "native tool result was not durably committed")
+                return self._accept_pending_control(latest) or latest
         mission.error = "model turn budget exhausted"
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self.store.save(mission)
 
-    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, progress: dict[str, Any], seen: set[str]) -> None:
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, progress: dict[str, Any], seen: set[str]) -> bool:
         """Authorize, proof-bind, and execute independent proposals in parallel."""
         from security.authorization import authorize_tool
         from security.execution_boundary import MissionExecutionBoundary
@@ -669,7 +910,12 @@ class MissionRuntime:
         all_ids = [item[0].tool_call_id for item in authorized]
         call_bindings = {item[0].tool_call_id: {"action_id": item[0].action_id or item[0].tool_call_id, "step_id": item[0].step_id} for item in authorized}
         mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": all_ids, "call_bindings": call_bindings, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
-        self.store.save(mission)
+        try:
+            self.store.save(mission)
+        except MissionWriteConflictError:
+            latest = self._load(mission.mission_id)
+            self._accept_pending_control(latest)
+            return False
 
         def execute_one(item: tuple[Any, Any, Any, Any, dict[str, Any]]) -> dict[str, Any]:
             proposal, argument, decision, proof, registry_context = item
@@ -714,6 +960,9 @@ class MissionRuntime:
             mission.record_observation(observation)
             planned_step = next((step for step in mission.plan.steps if step.step_id == proposal.step_id), None)
             if planned_step is not None:
+                mission, followup_claimed = self._claim_followup_callback(mission, f"parallel_observation_interpretation:{proposal.tool_call_id}")
+                if not followup_claimed:
+                    return True
                 self._interpret_observation(mission, planned_step, observation, success=success)
             mission.record_action(action_id, proposal.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
             if success:
@@ -732,8 +981,9 @@ class MissionRuntime:
             mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "tool_call_ids": ambiguous_ids})
             mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": all_ids, "ambiguous_tool_call_ids": ambiguous_ids, "call_bindings": call_bindings, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
-            return
+            return True
         mission.checkpoint = {"status": "completed", "tool_call_ids": all_ids, "call_bindings": call_bindings, "run_id": run_id, "plan_fingerprint": mission.plan.fingerprint}
+        return True
 
     def run_slice(self, mission_id: str) -> Mission:
         mission = self._load(mission_id)
@@ -746,6 +996,12 @@ class MissionRuntime:
             mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
             return self.store.save(mission)
         checkpoint_status = str((mission.checkpoint or {}).get("status", ""))
+        if checkpoint_status in {"model_in_flight", "verification_in_flight"}:
+            return self._require_reconciliation(
+                mission_id,
+                checkpoint_status,
+                "in-flight model/verifier callback outcome is unknown; reconciliation required",
+            )
         if checkpoint_status in {"in_flight", "in_flight_parallel"}:
             action_id = str(mission.checkpoint.get("action_id", ""))
             tool_call_ids = list(mission.checkpoint.get("ambiguous_tool_call_ids", ())) if checkpoint_status == "in_flight_parallel" else []
@@ -775,7 +1031,22 @@ class MissionRuntime:
         if not pending_steps:
             mission.transition(MissionStatus.VERIFYING, "all plan steps observed")
             mission.emit(EventType.GOAL_VERIFICATION_STARTED)
+            previous_checkpoint = dict(mission.checkpoint or {})
+            mission, claimed = self._claim_callback(
+                mission,
+                {"status": "verification_in_flight", "kind": "mission_verifier", "plan_version": mission.plan.version},
+            )
+            if not claimed:
+                return mission
             verification = self.verifier(mission)
+            latest = self._load(mission_id)
+            controlled = self._accept_pending_control(latest)
+            if controlled is not None:
+                return controlled
+            if latest.is_terminal:
+                return latest
+            mission = latest
+            mission.checkpoint = previous_checkpoint
             mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
             if verification.verified:
                 mission.emit(EventType.GOAL_VERIFIED, data={"evidence_count": len(verification.evidence)})
@@ -800,6 +1071,7 @@ class MissionRuntime:
         prior_action = next((item for item in mission.action_history if item.get("action_id") == action_id and item.get("status") == "completed"), None)
         if prior_action and prior_action.get("plan_fingerprint") not in {None, "", mission.plan.fingerprint}:
             action_id = f"{action_id}:plan:{mission.plan.fingerprint[:12]}"
+        completed_checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version, "plan_fingerprint": mission.plan.fingerprint}
         mission.emit(EventType.STEP_SELECTED, step_id=step.step_id, data={"action_id": action_id, "plan_version": mission.plan.version})
         signatures = mission.progress.setdefault("loop_signatures", {})
         signature = hashlib.sha256(json.dumps({"plan": mission.plan.fingerprint, "step": step.step_id, "action": step.action}, sort_keys=True).encode()).hexdigest()
@@ -827,7 +1099,11 @@ class MissionRuntime:
 
         mission.transition(MissionStatus.RUNNING, "step started", step_id=step.step_id)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "in_flight", "plan_version": mission.plan.version, "plan_fingerprint": mission.plan.fingerprint}
-        self.store.save(mission)
+        try:
+            mission = self.store.save(mission)
+        except MissionWriteConflictError:
+            latest = self._load(mission_id)
+            return self._accept_pending_control(latest) or latest
         try:
             result = self.executor(mission, step, action_id)
         except Exception as exc:
@@ -848,13 +1124,16 @@ class MissionRuntime:
         mission.record_observation(observation)
         success = bool(observation.get("success", observation.get("ok", False)))
         mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation, plan_fingerprint=mission.plan.fingerprint)
-        mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version, "plan_fingerprint": mission.plan.fingerprint}
+        mission, followup_claimed = self._claim_followup_callback(mission, f"observation_interpretation:{action_id}")
+        if not followup_claimed:
+            return mission
         try:
             strategy_decision = self._interpret_observation(mission, step, observation, success=success)
         except (TypeError, ValueError, KeyError) as exc:
             mission.error = f"observation interpretation rejected: {type(exc).__name__}"
             mission.recovery_events.append({"event": "interpretation_rejected", "reason": str(exc), "action_id": action_id})
             mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+            mission.checkpoint = completed_checkpoint
             return self.store.save(mission)
         allowed_targets = (mission.scope_snapshot or {}).get("allowed_targets") if isinstance(mission.scope_snapshot, dict) else None
         scope_blocked = bool(observation.get("target") and isinstance(allowed_targets, (list, tuple, set)) and str(observation.get("target")) not in {str(item) for item in allowed_targets})
@@ -862,22 +1141,28 @@ class MissionRuntime:
             mission.error = "observation proposed a target outside deterministic scope"
             mission.failures.append({"class": FailureClass.SCOPE.value, "reason": mission.error, "target": observation.get("target")})
             mission.transition(MissionStatus.SCOPE_BLOCKED, mission.error)
+            mission.checkpoint = completed_checkpoint
             return self.store.save(mission)
         if success:
             self._record_verified_criterion_evidence(mission, action_id)
             if strategy_decision is not None and strategy_decision.decision.value in {"REPLAN", "CHANGE_HYPOTHESIS", "ADD_EVIDENCE"}:
                 mission.transition(MissionStatus.REPLANNING, strategy_decision.reason)
                 mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data=strategy_decision.to_dict())
+                mission, followup_claimed = self._claim_followup_callback(mission, f"replanner:{action_id}")
+                if not followup_claimed:
+                    return mission
                 new_plan = self.replanner(mission, {**observation, "interpretation": mission.interpretations[-1], "strategy_decision": strategy_decision.to_dict()})
                 if new_plan.objective != mission.objective:
                     mission.error = "replanner attempted to change Owner objective"
                     mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                    mission.checkpoint = completed_checkpoint
                     return self.store.save(mission)
                 try:
                     new_plan.validate_dependency_graph()
                 except ValueError:
                     mission.error = "replanner returned an invalid dependency graph"
                     mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                    mission.checkpoint = completed_checkpoint
                     return self.store.save(mission)
                 mission.replan_history.append({"from_version": mission.plan.version, "to_version": new_plan.version, "reason": strategy_decision.reason, "trigger": strategy_decision.to_dict()})
                 mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": strategy_decision.reason})
@@ -886,11 +1171,13 @@ class MissionRuntime:
                 mission.current_step = 0
                 mission.retry_count = 0
                 mission.transition(MissionStatus.READY, "informative observation caused replan", plan_version=new_plan.version)
+                mission.checkpoint = completed_checkpoint
                 return self.store.save(mission)
             next_steps = self._ready_plan_steps(mission)
             mission.current_step = next_steps[0][0] if next_steps else len(mission.plan.steps)
             mission.retry_count = 0
             mission.transition(MissionStatus.READY, "observation accepted")
+            mission.checkpoint = completed_checkpoint
             return self.store.save(mission)
 
         failure = FailureClass(str(observation.get("failure_class", FailureClass.UNKNOWN.value))) if str(observation.get("failure_class", FailureClass.UNKNOWN.value)) in {item.value for item in FailureClass} else FailureClass.UNKNOWN
@@ -908,16 +1195,21 @@ class MissionRuntime:
         elif action is RecoveryAction.REPLAN:
             mission.transition(MissionStatus.REPLANNING, "observation invalidated current plan")
             mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data={"reason": "failure observation"})
+            mission, followup_claimed = self._claim_followup_callback(mission, f"replanner:{action_id}")
+            if not followup_claimed:
+                return mission
             new_plan = self.replanner(mission, observation)
             if new_plan.objective != mission.objective:
                 mission.error = "replanner attempted to change Owner objective"
                 mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                mission.checkpoint = completed_checkpoint
                 return self.store.save(mission)
             try:
                 new_plan.validate_dependency_graph()
             except ValueError:
                 mission.error = "replanner returned an invalid dependency graph"
                 mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                mission.checkpoint = completed_checkpoint
                 return self.store.save(mission)
             mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": "failure observation"})
             mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint})
@@ -929,6 +1221,7 @@ class MissionRuntime:
             mission.transition(MissionStatus.READY, "bounded retry selected")
         else:
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, "recovery budget exhausted")
+        mission.checkpoint = completed_checkpoint
         return self.store.save(mission)
 
     def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:

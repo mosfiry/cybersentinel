@@ -45,6 +45,10 @@ TERMINAL_MISSION_STATUSES = frozenset({
 })
 
 
+class MissionWriteConflictError(ValueError):
+    """Raised when an optimistic MissionStore write loses a concurrent race."""
+
+
 @dataclass
 class Mission:
     mission_id: str
@@ -437,10 +441,10 @@ class MissionStore:
             else:
                 current_hash = str(json.loads(existing[0]).get("integrity_hash", ""))
                 if not mission.integrity_hash or current_hash != mission.integrity_hash:
-                    raise ValueError("stale mission write rejected")
+                    raise MissionWriteConflictError("stale mission write rejected")
                 updated = db.execute("UPDATE missions SET payload=? WHERE mission_id=? AND payload=?", (encoded, mission.mission_id, existing[0]))
                 if updated.rowcount != 1:
-                    raise ValueError("concurrent mission write rejected")
+                    raise MissionWriteConflictError("concurrent mission write rejected")
             mission.integrity_hash = str(payload["integrity_hash"])
         return mission
 
@@ -472,4 +476,4 @@ class MissionStore:
         return result
 
 
-__all__ = ["Mission", "MissionStatus", "MissionStore", "TERMINAL_MISSION_STATUSES"]
+__all__ = ["Mission", "MissionStatus", "MissionStore", "MissionWriteConflictError", "TERMINAL_MISSION_STATUSES"]
