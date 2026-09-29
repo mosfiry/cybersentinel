@@ -11,7 +11,6 @@ from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAc
 from .trajectory import EventType
 from .observation import Observation
 from .observation_intelligence import ObservationInterpreter, should_interpret_observation
-from .hypotheses import HypothesisEngine, HypothesisState
 from .strategy import StrategyState, decide as decide_strategy
 from .model_protocol import ConversationTurn, NativeModel, ToolCallResult
 from .provider_api import ProviderError
@@ -322,19 +321,6 @@ class MissionRuntime:
             mission.evidence.append(record)
             mission.emit(EventType.EVIDENCE_ADDED, data={"criterion_id": criterion_id, "provenance": "system-signed"})
 
-    @staticmethod
-    def _persisted_verified_evidence_ids(mission: Mission) -> set[str]:
-        """Resolve references only to persisted evidence with verified system provenance."""
-        if not mission.evidence:
-            return set()
-        eligible: set[str] = set()
-        for item in mission._verified_system_evidence():
-            verified = item.get("verified_provenance", {})
-            evidence_id = str(verified.get("provenance_token", "")) if isinstance(verified, dict) else ""
-            if evidence_id and str(item.get("evidence_id", evidence_id)) == evidence_id:
-                eligible.add(evidence_id)
-        return eligible
-
     def _interpret_observation(self, mission: Mission, step: PlanStep, observation: dict[str, Any], *, success: bool):
         previous = mission.observations[-2] if len(mission.observations) > 1 else None
         if not should_interpret_observation(observation, previous=previous):
@@ -350,32 +336,39 @@ class MissionRuntime:
             knowledge_context=mission.knowledge_context,
             conversation_context=(),
         )
-        engine = HypothesisEngine(HypothesisState.from_dict(item) for item in mission.hypotheses)
-        hypothesis_updates = engine.apply(
-            proposal,
-            goal_verified=False,
-            deterministic_validation=False,
-            eligible_evidence_ids=self._persisted_verified_evidence_ids(mission),
-        )
-        mission.hypotheses = engine.snapshot()
         mission.knowledge_context = list(mission.knowledge_context)
         mission.interpretations.append(proposal.to_dict())
         mission.emit(EventType.OBSERVATION_INTERPRETED, step_id=step.step_id, data=proposal.to_dict())
-        if hypothesis_updates:
-            mission.emit(EventType.HYPOTHESIS_UPDATED, step_id=step.step_id, data={"updates": hypothesis_updates})
         scope_blocked = False
         target = observation.get("target")
         allowed_targets = (mission.scope_snapshot or {}).get("allowed_targets") if isinstance(mission.scope_snapshot, dict) else None
         if target and isinstance(allowed_targets, (list, tuple, set)) and str(target) not in {str(item) for item in allowed_targets}:
             scope_blocked = True
-        decision = decide_strategy(proposal, action_success=success, scope_blocked=scope_blocked)
+        decision_proposal = replace(
+            proposal,
+            facts=(),
+            hypothesis_updates=(),
+            confidence_changes=(),
+            recommended_strategy_change="",
+        )
+        decision = decide_strategy(decision_proposal, action_success=success, scope_blocked=scope_blocked)
+        if decision.decision.value in {"REPLAN", "ADD_EVIDENCE"}:
+            decision = replace(
+                decision,
+                reason="untrusted observation claims require independent evidence",
+                required_evidence=decision.required_evidence or ("independent corroboration of the observation claims",),
+                next_strategy="",
+                provenance={
+                    **decision.provenance,
+                    "input_trust": proposal.provenance.get("trust", "untrusted_observation_data"),
+                    "purpose": "evidence_seeking",
+                },
+            )
         mission.strategy_decisions.append(decision.to_dict())
         strategy = StrategyState.from_dict(mission.strategy_state, objective=mission.objective)
         if decision.next_strategy:
             strategy.current_strategy = decision.next_strategy
             strategy.version += 1
-        if proposal.provenance.get("source") != "model_proposal":
-            strategy.known_facts.extend(proposal.facts)
         strategy.unknowns.extend(proposal.unknowns)
         strategy.required_evidence.extend(proposal.required_next_evidence)
         mission.strategy_state = strategy.to_dict()

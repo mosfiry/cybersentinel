@@ -33,7 +33,7 @@ def initial_plan(objective="investigate"):
     )
 
 
-def test_successful_observation_that_changes_hypothesis_replans(tmp_path):
+def test_untrusted_counter_evidence_replans_without_changing_hypothesis(tmp_path):
     calls = []
 
     def execute(mission, step, action_id):
@@ -53,10 +53,12 @@ def test_successful_observation_that_changes_hypothesis_replans(tmp_path):
     assert result.status is not MissionStatus.GOAL_COMPLETED
     assert not result.completion_proof
     assert "goal" in result.verification_state.get("missing_criteria", [])
-    assert result.hypotheses[0]["status"] == "WEAKENED"
+    assert result.hypotheses[0]["status"] == "ACTIVE"
+    assert result.hypotheses[0]["confidence"] == 0.8
     assert result.plan.version == 3
     assert len(result.replan_history) == 1
     assert result.strategy_decisions[0]["decision"] == StrategyDecisionType.REPLAN.value
+    assert result.strategy_decisions[0]["provenance"]["purpose"] == "evidence_seeking"
 
 
 def test_observation_without_change_continues_plan(tmp_path):
@@ -70,7 +72,7 @@ def test_observation_without_change_continues_plan(tmp_path):
     assert result.strategy_decisions[-1]["decision"] == StrategyDecisionType.CONTINUE_PLAN.value
 
 
-def test_contradiction_weakens_h1_and_activates_h2(tmp_path):
+def test_untrusted_contradiction_does_not_change_h1_or_create_h2(tmp_path):
     def execute(mission, step, action_id):
         return {"success": True, "criterion_id": "observe", "counter_evidence": [{"evidence_id": "E1"}], "confidence_changes": [{"hypothesis_id": "H1", "delta": -0.5, "reason": "version mismatch", "counter_evidence_ids": ["E1"]}], "hypothesis_updates": [{"hypothesis_id": "H1", "status": "WEAKENED"}, {"hypothesis_id": "H2", "statement": "alternate access path", "status": "ACTIVE"}]}
 
@@ -80,9 +82,12 @@ def test_contradiction_weakens_h1_and_activates_h2(tmp_path):
     rt.store.save(mission)
     result = rt.run_slice(mission.mission_id)
     states = {item["hypothesis_id"]: item for item in result.hypotheses}
-    assert states["H1"]["status"] == "WEAKENED"
-    assert states["H2"]["status"] == "ACTIVE"
+    assert states["H1"]["status"] == "ACTIVE"
+    assert states["H1"]["confidence"] == 0.7
+    assert "H2" not in states
     assert result.plan.version == 3
+    assert result.strategy_decisions[-1]["decision"] == StrategyDecisionType.REPLAN.value
+    assert result.interpretations[-1]["hypothesis_updates"][1]["hypothesis_id"] == "H2"
 
 
 def test_information_gain_levels_are_deterministic():

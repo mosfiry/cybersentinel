@@ -11,8 +11,8 @@ credentials are provided.
 
 The trajectory must show, in order: model turns, tool proposals, authorization
 checks, tool executions, observations (including one real deterministic tool
-failure), interpretation, hypothesis updates, replan decisions, evidence, and
-final deterministic goal verification.
+failure), interpretation with untrusted hypothesis proposals, evidence-seeking
+replan decisions, signed evidence, and final deterministic goal verification.
 """
 
 
@@ -21,6 +21,7 @@ from pathlib import Path
 from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
+from agent.hypotheses import HypothesisState, HypothesisStatus
 from agent.planning import Plan, PlanStep
 
 TOOL_TURNS = 22
@@ -96,6 +97,8 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
         completion_criteria=[{"criterion_id": "goal", "check": "system_online"}],
         **signed_test_owner_kwargs(monkeypatch, tmp_path, request_id="long-horizon-test"),
     )
+    mission.hypotheses = [HypothesisState("h1", "asset A may be compromised", HypothesisStatus.ACTIVE, 0.8).to_dict()]
+    runtime.store.save(mission)
     model = LongHorizonModel()
 
     result = runtime.run_model_loop(mission.mission_id, model, tools=[{"name": "status"}], max_turns=TOOL_TURNS + 5)
@@ -111,7 +114,7 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
     assert events.count("ObservationReceived") == TOOL_TURNS
     assert events.count("ObservationInterpreted") == TOOL_TURNS
     assert events.count("StrategyDecided") == TOOL_TURNS
-    assert "HypothesisUpdated" in events
+    assert "HypothesisUpdated" not in events
     assert "GoalVerified" in events
     assert "MissionCompleted" in events
 
@@ -119,9 +122,16 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
     assert any(observation.get("ok") is False for observation in result.observations)
     assert any(decision["decision"] == "REPLAN" for decision in result.strategy_decisions)
 
-    # the contradicted hypothesis was rejected by the deterministic engine
-    disproven = [item for item in result.hypotheses if item["hypothesis_id"] == "h1"]
-    assert disproven and disproven[0]["status"] == "DISPROVEN"
+    # tool-supplied hypothesis proposals remain visible but are not validated or persisted as state
+    hypothesis = next(item for item in result.hypotheses if item["hypothesis_id"] == "h1")
+    assert hypothesis["statement"] == "asset A may be compromised"
+    assert hypothesis["status"] == HypothesisStatus.ACTIVE.value
+    assert hypothesis["confidence"] == 0.8
+    proposed_update = next(item for item in result.interpretations if item["hypothesis_updates"])
+    proposed_change = next(item for item in result.interpretations if item["confidence_changes"])
+    assert proposed_update["hypothesis_updates"][0]["statement"] == "asset A is compromised by the reported CVE"
+    assert proposed_change["confidence_changes"][0]["delta"] == -0.9
+    assert proposed_change["provenance"]["trust"] == "untrusted_observation_data"
 
     # every tool call executed exactly once - no infinite retry, no replay
     assert len(executions) == TOOL_TURNS

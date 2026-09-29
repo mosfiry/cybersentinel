@@ -1,8 +1,10 @@
-"""Round 2 P1 - contradiction evidence drives hypothesis and strategy updates.
+"""Direct HypothesisEngine mechanics and proposal-level strategy behavior.
 
-Evidence A strengthens a hypothesis; contradicting evidence B weakens or
-disproves it, and the deterministic strategy engine orders a replan. The model
-alone can never mark a hypothesis CONFIRMED.
+These unit tests intentionally exercise the low-level engine with already
+accepted proposals. They do not validate observation claims or establish that
+MissionRuntime may persist untrusted model/tool interpretations. Evidence A
+strengthens a hypothesis; contradicting evidence B weakens or disproves it, and
+the strategy engine orders a replan. The model alone can never confirm one.
 """
 
 from __future__ import annotations

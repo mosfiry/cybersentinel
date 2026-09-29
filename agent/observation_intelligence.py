@@ -231,7 +231,30 @@ class ObservationInterpreter:
         if evidence and any(float(item.get("information_gain", 0.0)) >= 0.8 for item in evidence):
             triggers.append(ReplanTrigger.NEW_HIGH_VALUE_EVIDENCE)
         replan_reason = "observation changed mission understanding" if gain in {InformationGain.HIGH, InformationGain.CRITICAL} else ("action failed" if not success else "")
-        return ObservationInterpretationProposal(obs_id, summary, facts, evidence, contradictions, tuple(item.get("evidence_id", "") for item in evidence if item.get("evidence_id")), tuple(item.get("evidence_id", "") for item in contradictions if item.get("evidence_id")), tuple(dict(item) for item in observation.get("hypothesis_updates", ())), unknowns, tuple(str(item) for item in observation.get("new_dependencies", ())), str(observation.get("recommended_strategy_change", "")), replan_reason, confidence_changes, required, gain, tuple(dict.fromkeys(triggers)), {"source": "deterministic_observation_interpreter", "action": action, "mission_id": mission.get("mission_id", "")})
+        return ObservationInterpretationProposal(
+            obs_id,
+            summary,
+            facts,
+            evidence,
+            contradictions,
+            tuple(item.get("evidence_id", "") for item in evidence if item.get("evidence_id")),
+            tuple(item.get("evidence_id", "") for item in contradictions if item.get("evidence_id")),
+            tuple(dict(item) for item in observation.get("hypothesis_updates", ())),
+            unknowns,
+            tuple(str(item) for item in observation.get("new_dependencies", ())),
+            str(observation.get("recommended_strategy_change", "")),
+            replan_reason,
+            confidence_changes,
+            required,
+            gain,
+            tuple(dict.fromkeys(triggers)),
+            {
+                "source": "deterministic_observation_interpreter",
+                "trust": "untrusted_observation_data",
+                "action": action,
+                "mission_id": mission.get("mission_id", ""),
+            },
+        )
 
     @staticmethod
     def _validate_model_proposal(data: dict[str, Any], base: ObservationInterpretationProposal) -> ObservationInterpretationProposal:
