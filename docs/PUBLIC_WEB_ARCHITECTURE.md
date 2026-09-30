@@ -172,7 +172,7 @@ Primary threats are:
 - session fixation, replay, or excessive lifetime;
 - deployment drift from the reviewed commit.
 
-Controls are server-side secret storage, HttpOnly/Secure cookies, CSRF checks, explicit CORS, session rotation/expiry, existing OwnerSession and authorization checks, request limits, safe logging, failure-preserving response handling, immutable deployment revisions, and tests for each boundary.
+Controls are server-side secret storage, HttpOnly/Secure cookies, CSRF checks, explicit CORS, session rotation/expiry, existing Owner password-session and authorization checks, request limits, safe logging, failure-preserving response handling, immutable deployment revisions, and tests for each boundary.
 
 ## 16. Explicit assumptions
 
