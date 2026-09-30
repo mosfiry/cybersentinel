@@ -165,6 +165,49 @@ def test_cancel_requested_before_parallel_dispatch_skips_all_tools(isolated_dbs,
     assert cancelled.tool_calls == []
 
 
+def test_cancel_during_long_tool_finishes_boundary_without_resume_replay(isolated_dbs, monkeypatch):
+    import threading
+
+    provider = ScriptedProvider([
+        ProviderResponse(tool_calls=[ToolCall("search", {"query": "long"}, "long-call")], finish_reason="tool_calls"),
+        ProviderResponse(text="must not be requested after cancellation"),
+    ])
+    started = threading.Event()
+    release = threading.Event()
+    executions = []
+
+    def executor(command, **kwargs):
+        started.set()
+        release.wait(5)
+        executions.append(command)
+        return {"ok": True, "request_id": "long-tool-receipt"}
+
+    allow_owner_sessions(monkeypatch, "owner")
+    runtime = AgentTaskRuntime(ModelRouter([provider]), executor=executor)
+    task = runtime.create_task("conv-cancel-long-tool", "cancel long tool")
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault("task", runtime.run_slice(task.task_id, owner_session_token="owner")))
+    worker.start()
+    assert started.wait(2)
+
+    persisted = TaskManager.get_task(task.task_id)
+    persisted.request_cancel()
+    TaskManager.update_task(persisted)
+    assert TaskManager.get_task(task.task_id).cancel_requested is True
+    release.set()
+    worker.join(3)
+
+    cancelled = outcome["task"]
+    assert cancelled.status == TaskStatus.CANCELLED
+    assert len(cancelled.tool_calls) == 1
+    assert cancelled.tool_calls[0]["status"] == "completed"
+    assert executions == ["Owner search long"]
+    resumed = runtime.run_slice(task.task_id, owner_session_token="owner")
+    assert resumed.status == TaskStatus.CANCELLED
+    assert len(executions) == 1
+    assert provider.calls == 1
+
+
 def test_native_and_json_fallback_share_task_runtime(isolated_dbs, monkeypatch):
     class Legacy:
         name = "legacy"

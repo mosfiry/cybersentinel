@@ -75,6 +75,9 @@ class TaskManager:
     @staticmethod
     def _save_task(task: Task) -> None:
         with _db_lock, _get_db() as conn:
+            existing = conn.execute("SELECT cancel_requested FROM tasks WHERE task_id = ?", (task.task_id,)).fetchone()
+            if existing is not None and existing["cancel_requested"]:
+                task.cancel_requested = True
             conn.execute("""INSERT OR REPLACE INTO tasks (
                 task_id, conversation_id, request_id, owner_session_id, authentication_method, status,
                 created_at, updated_at, started_at, finished_at, current_step, tool_calls, retry_count,
