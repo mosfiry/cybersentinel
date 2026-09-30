@@ -21,6 +21,7 @@ const MAX_SCOPE_PORTS = 20;
 const MAX_SCOPE_PATHS = 32;
 const MAX_SCOPE_METHODS = 9;
 const MAX_SCOPE_EXPIRATION_DAYS = 365;
+const MAX_SCOPE_SNAPSHOT_HISTORY = 20;
 const SCOPE_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SCOPE_HTTP_METHODS = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "TRACE", "CONNECT"];
 
@@ -37,6 +38,7 @@ const state = {
   continueSelectedMission: false,
   missions: [],
   scopeSnapshotSubmitting: false,
+  scopeSnapshotListRequestId: 0,
   selectedMissionId: "",
   selectedMission: null,
   missionViews: { timeline: [], evidence: [], artifacts: [], logs: [] },
@@ -165,6 +167,7 @@ async function status() {
 }
 
 function updateAuthUI(data) {
+  const wasAuthenticated = state.ownerAuthenticated;
   const nextAuthenticated = data.authenticated === true;
   const nextUsername = nextAuthenticated ? String(data.username || "") : "";
   if (state.ownerAuthenticated && (!nextAuthenticated || (state.ownerUsername && nextUsername && state.ownerUsername !== nextUsername))) {
@@ -181,6 +184,8 @@ function updateAuthUI(data) {
   $("#logoutButton").classList.toggle("hidden", !state.ownerAuthenticated);
   $("#authMessage").textContent = "";
   updateScopeSnapshotAuthUI();
+  if (!nextAuthenticated) clearScopeSnapshotHistory();
+  else if (!wasAuthenticated && state.activeView === "scope-snapshot") void loadScopeSnapshotHistory();
 }
 
 const MODEL_PREFERENCES = [
@@ -240,6 +245,7 @@ function resetWorkspaceState() {
   state.missions = [];
   state.continueSelectedMission = false;
   resetManualScopeForm();
+  clearScopeSnapshotHistory();
   resetModelPreferences();
   $("#messages").replaceChildren();
   $("#missionHeader").classList.add("hidden");
@@ -805,6 +811,98 @@ function showView(view) {
   $("#infoPanel").classList.toggle("hidden", !isInfo);
   $("#missionTabs").classList.toggle("hidden", isInfo);
   if (!isConversation && !isInfo && !isScopeSnapshot) renderMissionView(view);
+  if (isScopeSnapshot) {
+    if (state.ownerAuthenticated) void loadScopeSnapshotHistory();
+    else clearScopeSnapshotHistory();
+  }
+}
+
+function clearScopeSnapshotHistory() {
+  state.scopeSnapshotListRequestId += 1;
+  const list = $("#scopeSnapshotHistoryList");
+  if (list) list.replaceChildren();
+  const message = $("#scopeSnapshotHistoryMessage");
+  if (message) message.textContent = "سجّل الدخول بحساب المالك لعرض الملخصات المحفوظة لجلسة المالك الحالية.";
+}
+
+function renderScopeSnapshotHistory(snapshots) {
+  const list = $("#scopeSnapshotHistoryList");
+  const fragment = document.createDocumentFragment();
+  const textValue = (value) => typeof value === "string" && value ? value.slice(0, 256) : "غير متاح";
+  const countText = (value) => Number.isInteger(value) && value >= 0 ? String(value) : "غير متاح";
+  const methodText = (value) => Array.isArray(value) && value.every((method) => SCOPE_HTTP_METHODS.includes(method))
+    ? (value.join("، ") || "لا يوجد") : "غير متاح";
+
+  snapshots.slice(0, MAX_SCOPE_SNAPSHOT_HISTORY).forEach((summary, index) => {
+    if (!summary || typeof summary !== "object" || Array.isArray(summary)) return;
+    const card = document.createElement("article");
+    card.className = "scope-snapshot-history-item";
+    const title = document.createElement("h3");
+    title.textContent = `ملخص تصريح محفوظ ${index + 1}`;
+    const grid = document.createElement("dl");
+    grid.className = "scope-summary-grid";
+    const rate = summary.rate_limits?.requests_per_minute;
+    const rateText = Number.isInteger(rate) && rate >= 1 && rate <= 1000 ? `${rate} طلب/دقيقة` : "غير محدد";
+    const entries = [
+      ["معرّف اللقطة", textValue(summary.snapshot_id), true],
+      ["البرنامج", textValue(summary.program_id), true],
+      ["المنصة", textValue(summary.platform), true],
+      ["إصدار النطاق", textValue(summary.scope_version), true],
+      ["عدد الموارد داخل النطاق", countText(summary.in_scope_asset_count), false],
+      ["عدد الموارد خارج النطاق", countText(summary.out_of_scope_asset_count), false],
+      ["عدد الأهداف", countText(summary.target_count), false],
+      ["الطرق المسموح بها", methodText(summary.allowed_methods), true],
+      ["الطرق المحظورة", methodText(summary.prohibited_methods), true],
+      ["حد الطلبات", rateText, false],
+      ["وقت الإنشاء", textValue(summary.created_at), true],
+      ["انتهاء الصلاحية", textValue(summary.expires_at), true],
+    ];
+    entries.forEach(([label, value, leftToRight]) => {
+      const item = document.createElement("div");
+      item.className = "scope-summary-item";
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const description = document.createElement("dd");
+      description.textContent = value;
+      if (leftToRight) description.dir = "ltr";
+      item.append(term, description);
+      grid.appendChild(item);
+    });
+    card.append(title, grid);
+    fragment.appendChild(card);
+  });
+  list.replaceChildren(fragment);
+  return list.childElementCount;
+}
+
+async function loadScopeSnapshotHistory() {
+  const list = $("#scopeSnapshotHistoryList");
+  const message = $("#scopeSnapshotHistoryMessage");
+  if (!list || !message) return;
+  if (!state.ownerAuthenticated) {
+    clearScopeSnapshotHistory();
+    return;
+  }
+  const requestId = ++state.scopeSnapshotListRequestId;
+  list.replaceChildren();
+  message.textContent = "جارٍ تحميل الملخصات الآمنة من الخادم...";
+  try {
+    const data = await api(`/api/public/program-authorizations?limit=${MAX_SCOPE_SNAPSHOT_HISTORY}`);
+    if (requestId !== state.scopeSnapshotListRequestId || !state.ownerAuthenticated) return;
+    if (data.ok !== true || !Array.isArray(data.snapshots)) throw new Error("invalid_snapshot_list");
+    const count = renderScopeSnapshotHistory(data.snapshots);
+    message.textContent = count
+      ? `عُرض ${count} من أحدث الملخصات الآمنة لجلسة المالك الحالية.`
+      : "لا توجد ملخصات محفوظة لجلسة المالك الحالية.";
+  } catch (error) {
+    if (requestId !== state.scopeSnapshotListRequestId) return;
+    if (error.message === "owner_authorization_required") {
+      updateAuthUI({ authenticated: false });
+      return;
+    }
+    list.replaceChildren();
+    message.textContent = "تعذر تحميل الملخصات المحفوظة. أعد فتح عرض تصريح النطاق للمحاولة مجددًا.";
+  }
 }
 
 async function refreshAfterInteraction() {

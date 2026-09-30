@@ -147,6 +147,11 @@ button{font:inherit;cursor:pointer}
 .scope-heading h1{margin:0 0 8px;font-size:18px}
 .scope-heading p{margin:6px 0;color:#9aa7bb;line-height:1.7}
 .scope-heading .scope-caution{border-right:3px solid #d28a37;padding:7px 10px;background:#1c1710;color:#ffcf92}
+.scope-snapshot-history{max-width:1100px;display:grid;gap:8px}
+.scope-snapshot-history h2{margin:0;color:#d3dced;font-size:15px}
+.scope-snapshot-history-list{display:grid;gap:10px}
+.scope-snapshot-history-item{border:1px solid #29364b;background:#0c131e;border-radius:8px;padding:10px;display:grid;gap:8px}
+.scope-snapshot-history-item h3{margin:0;color:#bac5d6;font-size:12px}
 .scope-snapshot-view form{display:grid;gap:10px;max-width:1100px}
 #scopeSnapshotFields{border:0;margin:0;padding:0;min-width:0;display:grid;gap:12px}
 .scope-meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
