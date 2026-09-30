@@ -545,6 +545,7 @@ def test_manual_program_authorization_round_trips_exact_scope_with_cookie_sessio
         "in_scope_asset_count",
         "out_of_scope_asset_count",
         "target_count",
+        "target_ids",
         "allowed_methods",
         "prohibited_methods",
         "rate_limits",
@@ -557,6 +558,7 @@ def test_manual_program_authorization_round_trips_exact_scope_with_cookie_sessio
     assert summary["rate_limits"] == payload["rate_limits"]
     assert summary["expires_at"] == payload["expires_at"]
     assert summary["target_count"] == 1
+    assert summary["target_ids"] == ["api-prod"]
     assert persisted_scope_count() == 1
 
     persisted = scope_store.get_snapshot(summary["snapshot_id"])
@@ -575,7 +577,7 @@ def test_manual_program_authorization_round_trips_exact_scope_with_cookie_sessio
     assert persisted.targets[0].to_dict() == expected_target
     assert persisted.expires_at == payload["expires_at"]
     serialized = json.dumps(response)
-    for submitted_scope_detail in ("api.example.test", "admin.example.test", "api-prod", "/api/private"):
+    for submitted_scope_detail in ("api.example.test", "admin.example.test", "/api/private"):
         assert submitted_scope_detail not in serialized
     for private_value in ("session_id", "owner_session_id", "csrf_token", owner_cookie, csrf, owner_session["session_id"]):
         assert private_value not in serialized
@@ -694,12 +696,12 @@ def test_public_scope_snapshot_list_returns_only_safe_current_session_summaries(
     assert status == 200
     assert response == {"ok": True, "snapshots": [created_summary]}
     assert set(response["snapshots"][0]) == set(created_summary)
+    assert response["snapshots"][0]["target_ids"] == ["api-prod"]
     serialized = json.dumps(response)
     for private_value in (
         "targets",
         "api.example.test",
         "admin.example.test",
-        "api-prod",
         "evidence_hash",
         "session_id",
         "owner_session_id",
@@ -954,3 +956,125 @@ def test_public_scope_snapshot_list_clamps_count_and_rejects_nonpositive_limit(w
     )
     assert status == 400
     assert response["error"] == "invalid_limit"
+
+
+
+def _install_fake_public_mission_creator(monkeypatch, captured):
+    from types import SimpleNamespace
+
+    class FakeMission:
+        mission_id = "mission-scope-reference-test"
+
+        def to_public_dict(self):
+            return {"mission_id": self.mission_id, "status": "READY"}
+
+    class FakeCore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run_owner_mission(self, instruction, **kwargs):
+            captured.append((instruction, kwargs))
+            return FakeMission()
+
+    class FakeQueue:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def enqueue(self, mission_id):
+            assert mission_id == FakeMission.mission_id
+            return SimpleNamespace(state="QUEUED", attempts=1, available_at="2026-09-30T00:00:00+00:00")
+
+    monkeypatch.setattr(bridge, "AgentCore", FakeCore)
+    monkeypatch.setattr(bridge, "MissionQueue", FakeQueue)
+
+
+def _authenticated_public_owner_cookies(server):
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    assert owner_cookie
+    return public_cookie, csrf, owner_cookie
+
+
+def test_public_mission_scope_binding_forwards_only_persisted_references(web_server, monkeypatch):
+    server, _ = web_server
+    captured = []
+    _install_fake_public_mission_creator(monkeypatch, captured)
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+
+    status, _, response = request(
+        server,
+        "POST",
+        "/api/public/missions",
+        {
+            "objective": "Inspect the saved target safely",
+            "scope_snapshot_id": "snapshot-selected",
+            "target_id": "api-prod",
+            "scope_context": {"program_id": "forged-program", "host": "attacker.example", "allowed_networks": ["0.0.0.0/0"]},
+            "program_id": "forged-program",
+            "host": "attacker.example",
+        },
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 201
+    assert response["ok"] is True
+    assert len(captured) == 1
+    instruction, kwargs = captured[0]
+    assert instruction == "Inspect the saved target safely"
+    assert kwargs["owner_session_token"] == owner_password.resolve_session(owner_cookie)["session_id"]
+    assert kwargs["scope_context"] == {
+        "workspace_root": str(bridge.ROOT),
+        "scope_snapshot_id": "snapshot-selected",
+        "target_id": "api-prod",
+    }
+    assert "host" not in kwargs["scope_context"]
+    assert "program_id" not in kwargs["scope_context"]
+    assert "allowed_networks" not in kwargs["scope_context"]
+
+
+def test_public_mission_without_scope_preserves_repository_workspace_path(web_server, monkeypatch):
+    server, _ = web_server
+    captured = []
+    _install_fake_public_mission_creator(monkeypatch, captured)
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+
+    status, _, response = request(
+        server,
+        "POST",
+        "/api/public/missions",
+        {"objective": "Review the current repository"},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 201
+    assert response["ok"] is True
+    assert len(captured) == 1
+    assert captured[0][1]["scope_context"] == {
+        "workspace_root": str(bridge.ROOT),
+        "target_id": "cybersentinel-repository",
+    }
+    assert "scope_snapshot_id" not in captured[0][1]["scope_context"]
+
+
+def test_public_mission_rejects_incomplete_scope_reference_before_creation(web_server, monkeypatch):
+    server, _ = web_server
+    captured = []
+    _install_fake_public_mission_creator(monkeypatch, captured)
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+
+    status, _, response = request(
+        server,
+        "POST",
+        "/api/public/missions",
+        {"objective": "Do not start without a complete binding", "scope_snapshot_id": "snapshot-selected"},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 400
+    assert response == {"ok": False, "error": "invalid_scope_binding"}
+    assert captured == []

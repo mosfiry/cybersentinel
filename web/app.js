@@ -37,6 +37,8 @@ const state = {
   selectedModelPreference: "balanced",
   continueSelectedMission: false,
   missions: [],
+  missionScopeSnapshots: [],
+  missionScopeRequestId: 0,
   scopeSnapshotSubmitting: false,
   scopeSnapshotListRequestId: 0,
   selectedMissionId: "",
@@ -184,8 +186,13 @@ function updateAuthUI(data) {
   $("#logoutButton").classList.toggle("hidden", !state.ownerAuthenticated);
   $("#authMessage").textContent = "";
   updateScopeSnapshotAuthUI();
-  if (!nextAuthenticated) clearScopeSnapshotHistory();
-  else if (!wasAuthenticated && state.activeView === "scope-snapshot") void loadScopeSnapshotHistory();
+  if (!nextAuthenticated) {
+    clearScopeSnapshotHistory();
+    clearMissionScopeOptions();
+  } else if (!wasAuthenticated) {
+    void loadMissionScopeOptions();
+    if (state.activeView === "scope-snapshot") void loadScopeSnapshotHistory();
+  }
 }
 
 const MODEL_PREFERENCES = [
@@ -825,6 +832,77 @@ function clearScopeSnapshotHistory() {
   if (message) message.textContent = "سجّل الدخول بحساب المالك لعرض الملخصات المحفوظة لجلسة المالك الحالية.";
 }
 
+function clearMissionScopeOptions() {
+  state.missionScopeRequestId += 1;
+  state.missionScopeSnapshots = [];
+  const snapshots = $("#missionScopeSnapshotId");
+  const targets = $("#missionScopeTargetId");
+  if (snapshots) {
+    snapshots.replaceChildren(new Option("مساحة المستودع الحالية", ""));
+    snapshots.disabled = !state.ownerAuthenticated;
+  }
+  if (targets) {
+    targets.replaceChildren(new Option("اختر لقطة أولاً", ""));
+    targets.disabled = true;
+  }
+}
+
+function updateMissionScopeTargets() {
+  const snapshotId = $("#missionScopeSnapshotId")?.value || "";
+  const targets = $("#missionScopeTargetId");
+  if (!targets) return;
+  const selected = state.missionScopeSnapshots.find((item) => item.snapshot_id === snapshotId);
+  const targetIds = Array.isArray(selected?.target_ids)
+    ? [...new Set(selected.target_ids.filter((id) => typeof id === "string" && SCOPE_IDENTIFIER_RE.test(id)))].slice(0, MAX_SCOPE_TARGETS)
+    : [];
+  targets.replaceChildren(new Option("اختر هدفًا واحدًا", ""));
+  targetIds.forEach((targetId) => targets.add(new Option(targetId, targetId)));
+  targets.disabled = !state.ownerAuthenticated || !snapshotId || targetIds.length === 0;
+}
+
+async function loadMissionScopeOptions() {
+  const snapshots = $("#missionScopeSnapshotId");
+  const note = $("#missionScopeNote");
+  if (!snapshots || !note) return;
+  if (!state.ownerAuthenticated) {
+    clearMissionScopeOptions();
+    note.textContent = "سجّل الدخول بحساب المالك لاختيار لقطة نطاق محفوظة.";
+    return;
+  }
+  const requestId = ++state.missionScopeRequestId;
+  note.textContent = "جارٍ تحميل لقطات النطاق المحفوظة لجلسة المالك الحالية...";
+  try {
+    const data = await api(`/api/public/program-authorizations?limit=${MAX_SCOPE_SNAPSHOT_HISTORY}`);
+    if (requestId !== state.missionScopeRequestId || !state.ownerAuthenticated) return;
+    if (data.ok !== true || !Array.isArray(data.snapshots)) throw new Error("invalid_snapshot_list");
+    const previousId = snapshots.value;
+    state.missionScopeSnapshots = data.snapshots.slice(0, MAX_SCOPE_SNAPSHOT_HISTORY).filter((item) =>
+      item && typeof item === "object" && !Array.isArray(item)
+      && typeof item.snapshot_id === "string" && SCOPE_IDENTIFIER_RE.test(item.snapshot_id)
+      && Array.isArray(item.target_ids),
+    );
+    snapshots.replaceChildren(new Option("مساحة المستودع الحالية", ""));
+    state.missionScopeSnapshots.forEach((item, index) => {
+      const option = new Option(`لقطة ${index + 1} · ${item.snapshot_id}`, item.snapshot_id);
+      snapshots.add(option);
+    });
+    snapshots.disabled = false;
+    if (state.missionScopeSnapshots.some((item) => item.snapshot_id === previousId)) snapshots.value = previousId;
+    updateMissionScopeTargets();
+    note.textContent = state.missionScopeSnapshots.length
+      ? "اختر لقطة محفوظة ثم هدفًا واحدًا؛ يتحقق الخادم من الجلسة والعضوية والصلاحية."
+      : "لا توجد لقطات صالحة معروضة؛ بدون اختيار تبقى المهمة ضمن مساحة المستودع الحالية.";
+  } catch (error) {
+    if (requestId !== state.missionScopeRequestId) return;
+    clearMissionScopeOptions();
+    if (error.message === "owner_authorization_required") {
+      updateAuthUI({ authenticated: false });
+      return;
+    }
+    note.textContent = "تعذر تحميل لقطات النطاق؛ يمكنك متابعة مهمة مساحة المستودع الحالية.";
+  }
+}
+
 function renderScopeSnapshotHistory(snapshots) {
   const list = $("#scopeSnapshotHistoryList");
   const fragment = document.createDocumentFragment();
@@ -948,14 +1026,14 @@ async function deleteScopeSnapshot(snapshotId, button) {
       method: "DELETE",
     });
     if (data.ok !== true) throw new Error("invalid_snapshot_deletion");
-    await loadScopeSnapshotHistory();
+    await Promise.all([loadScopeSnapshotHistory(), loadMissionScopeOptions()]);
   } catch (error) {
     if (error.message === "owner_authorization_required") {
       updateAuthUI({ authenticated: false });
       return;
     }
     if (error.message === "snapshot_not_found" && state.ownerAuthenticated) {
-      await loadScopeSnapshotHistory();
+      await Promise.all([loadScopeSnapshotHistory(), loadMissionScopeOptions()]);
       const currentMessage = $("#scopeSnapshotHistoryMessage");
       if (currentMessage && state.ownerAuthenticated) {
         currentMessage.textContent = "لم تعد اللقطة متاحة لهذه الجلسة؛ حُدّثت القائمة الآمنة.";
@@ -1274,6 +1352,7 @@ function initializeScopeSnapshotForm() {
       if (data.ok !== true) throw new Error("invalid_snapshot_summary");
       renderScopeSnapshotSummary(data.snapshot);
       setScopeSnapshotMessage("حُفظ التصريح. لم تُشغّل اختبارات ولم تتغير صلاحيات الأدوات.", "ok");
+      await Promise.all([loadScopeSnapshotHistory(), loadMissionScopeOptions()]);
     } catch (error) {
       if (error.message === "owner_authorization_required") updateAuthUI({ authenticated: false });
       setScopeSnapshotMessage(scopeAuthorizationErrorText(error), "error");
@@ -1303,17 +1382,29 @@ $("#toolsLink").onclick = toolsPanel;
 $("#settingsLink").onclick = settingsPanel;
   $("#refreshMissions")?.addEventListener("click", loadMissions);
   $("#modelPreference")?.addEventListener("change", updateModelPreferenceNote);
+  $("#missionScopeSnapshotId")?.addEventListener("change", updateMissionScopeTargets);
 
 $("#missionForm").onsubmit = async (event) => {
   event.preventDefault();
   if (!state.ownerAuthenticated) { setNotice("سجّل الدخول بحساب المالك أولاً.", "warn"); return; }
+  const scopeSnapshotId = $("#missionScopeSnapshotId")?.value || "";
+  const targetId = $("#missionScopeTargetId")?.value || "";
+  if ((scopeSnapshotId && !targetId) || (!scopeSnapshotId && targetId)) {
+    setNotice("اختر لقطة محفوظة وهدفًا واحدًا معًا، أو اترك النطاق فارغًا.", "warn");
+    return;
+  }
   const button = $("#createMission");
   button.disabled = true;
   setNotice("جارٍ إنشاء المهمة وتسجيلها في طابور التنفيذ...", "warn");
   try {
+    const missionPayload = { objective: $("#missionObjective").value.trim(), model_preference: $("#modelPreference")?.value || "balanced" };
+    if (scopeSnapshotId) {
+      missionPayload.scope_snapshot_id = scopeSnapshotId;
+      missionPayload.target_id = targetId;
+    }
     const data = await api("/api/public/missions", {
       method: "POST",
-      body: JSON.stringify({ objective: $("#missionObjective").value.trim(), model_preference: $("#modelPreference")?.value || "balanced" }),
+      body: JSON.stringify(missionPayload),
     });
     $("#missionObjective").value = "";
     state.selectedMissionId = data.mission_id || data.mission?.mission_id || "";

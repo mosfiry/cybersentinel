@@ -80,3 +80,20 @@
 ## آخر تحقق بعد تقوية الجلسة وتنقيح التخزين — 2026-09-30
 
 على كود الفرع `integration/cybersentinel-final-completion` عند SHA `233bb323a8876035f87638e2e97bc3bacff3cdf0`، اجتازت المجموعة الكاملة المحصورة **930 passed, 1 skipped, 0 failed**، ونجحت `compileall` و`node --check web/app.js` و`git diff --check`. التخطي هو قبول المزوّد الحي؛ لم تُهيّأ ملفات مزوّد. أضيف فحص جلسة Owner قبل استدعاء الأدوات، وسجل provenance لكل استدعاء نموذج، وتنقيح best-effort للبيانات المعروفة الحساسية قبل التخزين. دُفع توثيق المتابعة إلى SHA `593811e46a4d9679a1b57a4c400f4bf5e9e97e2d`؛ فشلت Actions عليه عند namespace preflight قبل compile/pytest لأن المضيف رفض العزل. كما فشل Cloudflare build من نفس SHA عند `npx wrangler preview` لغياب كتلة `previews`، بلا preview URL أو نشر موثق؛ trigger list أظهر `main` فقط رغم أن build record يثبت بناء فرع التكامل، وسبب التعارض غير محسوم. تبقى الخطة `PARTIAL`: لا Vault أو مزامنة P2P أو إثبات IDOR/BOLA مستقل أو سلسلة HTTP كاملة أو قبول حي للمزوّد. قيم الأسرار غير المعروفة قد تفلت من التنقيح، والصفوف القديمة لا تُنقّح تلقائيًا؛ سياق Owner المحفوظ يُطلب تجديد مصادقته بعد إعادة تشغيل باردة.
+
+
+## Vertical slice extension — Owner-bound scope snapshot mission
+
+**Starting point:** Clean worktree `/workspace/cyber-owner-mission-snapshot-binding`, branch `feat/owner-mission-snapshot-binding`, based exactly on `689b2aef5926eb651fd4e693c6418161cb80202d`.
+
+**Goal:** Let an authenticated Owner optionally bind one public mission to one target in an already-persisted Scope Snapshot. The API accepts only the snapshot and target identifiers as references; the server resolves the exact stored record against the live Owner session, expiry, and target membership. The validated typed scope remains bound through MissionRuntime and the existing scoped HTTP tool. Without a selection, the current repository/workspace mission path remains unchanged.
+
+**Architecture decisions:**
+- Derive ownership from the validated Owner cookie/session; do not use browser scope content, entered hosts/program metadata, or model text as authority.
+- Fail closed for missing/unknown, expired, foreign-session, or non-member bindings both when creating/re-authorizing and at runtime authorization.
+- Reuse the existing `AuthorizationContext`, persisted snapshot fingerprint check, and scoped HTTP resolver; do not add registry tools, HTTP methods, credentials, arbitrary HTTP, or new allowed actions.
+- Keep the browser change to an optional snapshot/target selector populated from the existing Owner-only snapshot list.
+
+**Verification:** Add focused store/API/UI/runtime regression tests, then run only `tools.registry._run_project_tests` through its read-only `bubblewrap`/`prlimit` runner plus `compileall`, `node --check`, `git diff --check`, and secret-pattern scanning. Do not use live targets or network access.
+
+**Result:** The confined project runner passed **972 tests** with **1 skipped**; Python/JavaScript syntax, whitespace, and secret-pattern checks were clean. No live target or network access was used.

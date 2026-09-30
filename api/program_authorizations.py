@@ -274,6 +274,7 @@ def public_snapshot_summary(snapshot: ScopeSnapshot) -> dict[str, Any]:
         "in_scope_asset_count": len(authorization.in_scope_assets),
         "out_of_scope_asset_count": len(authorization.out_of_scope_assets),
         "target_count": len(snapshot.targets),
+        "target_ids": [target.target_id for target in snapshot.targets],
         "allowed_methods": list(authorization.allowed_methods),
         "prohibited_methods": list(authorization.prohibited_methods),
         "rate_limits": dict(authorization.rate_limits),

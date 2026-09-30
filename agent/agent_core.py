@@ -17,7 +17,7 @@ from security.owner_policy import (
     policy_context_from_snapshot,
     OwnerPolicySnapshot,
 )
-from security.scope_store import get_snapshot
+from security.scope_store import get_snapshot_for_owner_session
 from tools.registry import REGISTRY, execute as execute_tool, get_tool
 from agent.evidence import EvidenceChainStore
 from workspace import Workspace
@@ -488,7 +488,26 @@ class AgentCore:
             if not proof_ok:
                 mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": action_id, "code": proof_code, "reason": proof_reason})
                 return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{proof_code}: {proof_reason}", "execution_id": action_id}
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, tool_call_id=action_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_proof=proof, execution_class="MISSION_BOUND")
+            tool_scope_context = mission.scope_snapshot
+            if spec.scope_required:
+                binding = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+                persisted_scope = context.scope_snapshot
+                selected_target = persisted_scope.target(str(binding.get("target_id") or "")) if persisted_scope else None
+                if (
+                    persisted_scope is None
+                    or selected_target is None
+                    or persisted_scope.snapshot_id != str(binding.get("scope_snapshot_id") or "")
+                    or persisted_scope.authorization.program_id != str(binding.get("program_id") or "")
+                    or str(binding.get("scope_snapshot_fingerprint") or "") != context.scope_fingerprint
+                ):
+                    raise PermissionError("mission scope binding differs from the persisted Owner snapshot")
+                tool_scope_context = {
+                    "program_id": persisted_scope.authorization.program_id,
+                    "target_id": selected_target.target_id,
+                    "scope_snapshot_id": persisted_scope.snapshot_id,
+                    "url": str(argument),
+                }
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=tool_scope_context, request_id=mission.request_id, tool_call_id=action_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_proof=proof, execution_class="MISSION_BOUND")
             return {"success": True, "source": step.action, "result": value, "execution_id": action_id}
         except PermissionError as exc:
             return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
@@ -499,10 +518,24 @@ class AgentCore:
         request_id = request_id or uuid.uuid4().hex
         mission_id = uuid.uuid4().hex
         authorization_context, policy_context = self._auth(instruction, owner_session_token, request_id)
-        if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
-            snapshot = get_snapshot(scope_context["scope_snapshot_id"])
-            if snapshot is None:
-                raise PermissionError("invalid_scope_context")
+        if isinstance(scope_context, dict) and "scope_snapshot_id" in scope_context:
+            snapshot_id = scope_context.get("scope_snapshot_id")
+            target_id = scope_context.get("target_id")
+            snapshot = get_snapshot_for_owner_session(
+                snapshot_id,
+                target_id,
+                owner_session_token=owner_session_token,
+            )
+            target = snapshot.target(target_id)
+            safe_scope = {
+                "workspace_root": str(scope_context.get("workspace_root") or Path.cwd().resolve()),
+                "scope_snapshot_id": snapshot.snapshot_id,
+                "program_id": snapshot.authorization.program_id,
+                "target_id": target.target_id,
+            }
+            if "owner_allowed_tools" in scope_context:
+                safe_scope["owner_allowed_tools"] = scope_context["owner_allowed_tools"]
+            scope_context = safe_scope
             authorization_context = AuthorizationContext(
                 request_id=authorization_context.request_id,
                 owner_evidence=authorization_context.owner_evidence,
@@ -510,6 +543,8 @@ class AgentCore:
                 scope_snapshot=snapshot,
                 session_id=authorization_context.session_id,
             )
+            safe_scope["scope_snapshot_fingerprint"] = authorization_context.scope_fingerprint
+            scope_context = safe_scope
         selected_router, model_selection = self.router.with_model_selection(model_id)
         model_selection["preference"] = model_preference
         execution_core = copy.copy(self)
@@ -857,8 +892,32 @@ class AgentCore:
             mission.authorization_snapshot = renewed.to_dict()
             mission.provenance["authorization_snapshot_version"] = int(renewed.version)
         old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
-        fresh_scope = get_snapshot(str(old_scope_id)) if old_scope_id else None
-        fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope)
+        scope_binding = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+        fresh_scope = None
+        if old_scope_id:
+            try:
+                if str(scope_binding.get("scope_snapshot_id") or "") != str(old_scope_id):
+                    raise PermissionError("mission scope binding identifier mismatch")
+                fresh_scope = get_snapshot_for_owner_session(
+                    str(old_scope_id),
+                    scope_binding.get("target_id"),
+                    owner_session_token=str(evidence.session_id or ""),
+                )
+                if str(scope_binding.get("program_id") or "") != fresh_scope.authorization.program_id:
+                    raise PermissionError("mission scope binding no longer matches the persisted snapshot")
+                fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope, session_id=evidence.session_id)
+                if str(scope_binding.get("scope_snapshot_fingerprint") or "") != fresh_context.scope_fingerprint:
+                    raise PermissionError("persisted mission scope snapshot changed")
+            except (PermissionError, ValueError) as exc:
+                if mission.status is MissionStatus.PAUSED:
+                    mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "persisted scope binding requires Owner review")
+                if mission.status is not MissionStatus.AUTHORIZATION_BLOCKED and mission.status is not MissionStatus.RECOVERY_REQUIRED:
+                    mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "persisted mission scope binding is unavailable or changed")
+                mission.error = "persisted mission scope binding is unavailable or changed"
+                self.store.save(mission)
+                raise PermissionError("persisted mission scope binding is unavailable or changed") from exc
+        else:
+            fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=None, session_id=evidence.session_id)
         mission.authorization_context = fresh_context.to_dict()
         mission.policy_snapshot = fresh_snapshot.to_dict()
         mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "username_password", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})

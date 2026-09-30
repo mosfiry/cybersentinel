@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hmac
 import json
 import sqlite3
 import threading
@@ -80,6 +81,47 @@ def get_snapshot(snapshot_id: str) -> ScopeSnapshot | None:
     if row is None:
         return None
     return _snapshot_from_data(json.loads(row["snapshot_json"]))
+
+
+def get_snapshot_for_owner_session(
+    snapshot_id: str,
+    target_id: str,
+    *,
+    owner_session_token: str | None,
+) -> ScopeSnapshot:
+    """Resolve a persisted scope reference only for its live Owner session and member target."""
+    if (
+        not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or snapshot_id != snapshot_id.strip()
+        or len(snapshot_id) > 128
+        or not isinstance(target_id, str)
+        or not target_id
+        or target_id != target_id.strip()
+        or len(target_id) > 128
+    ):
+        raise ValueError("invalid_scope_binding")
+
+    from .owner_policy import authenticate_owner
+
+    authentication = authenticate_owner(owner_session_token)
+    session_id = str(authentication.session_id or "")
+    if not session_id:
+        raise PermissionError("owner session required for scope binding")
+    snapshot = get_snapshot(snapshot_id)
+    if snapshot is None or snapshot.snapshot_id != snapshot_id:
+        raise PermissionError("scope_snapshot_unavailable")
+    bound_session_id = str(snapshot.authorization.owner_session_id or "")
+    if not bound_session_id or not hmac.compare_digest(bound_session_id, session_id):
+        raise PermissionError("scope_snapshot_unavailable")
+    from .scope_resolver import _expired
+
+    if _expired(snapshot.expires_at):
+        raise PermissionError("scope_snapshot_expired")
+    target = snapshot.target(target_id)
+    if target is None or target.program_id != snapshot.authorization.program_id:
+        raise PermissionError("scope_target_unavailable")
+    return snapshot
 
 
 def list_snapshots_for_owner_session(

@@ -20,8 +20,8 @@ Public cookies are `HttpOnly`, `Secure`, `SameSite=Lax`, and scoped to `/api/pub
 | `GET /api/public/conversations/{id}` | Restore messages/tasks after reload or reconnect, filtered by the stable authenticated Owner identity; unknown and foreign conversations both return `404 unknown_conversation` | `200 {ok:true, conversation:{...,messages:[...],tasks:[...]}}` |
 | `POST /api/public/auth/login` | Authenticate the Owner; requires public cookie and CSRF token | `200 {ok, authenticated:true, username, expires_at}` and Owner cookie |
 | `POST /api/public/auth/logout` | Revoke the Owner session; requires public cookie and CSRF token | `200 {ok, authenticated:false}` and expired Owner cookie |
-| `GET /api/public/program-authorizations?limit=20` | List safe scope summaries bound to the currently authenticated Owner session; requires public and Owner cookies, uses the public Origin guard, and is read-only (no CSRF token required); default 20, maximum 50 | `200 {ok:true,snapshots:[{...public summary fields...}]}`; a requested limit above 50 is capped |
-| `POST /api/public/program-authorizations` | Persist an explicit manual scope authorization; requires public cookie, CSRF token, and Owner cookie | `201 {ok:true, snapshot:{snapshot_id, program_id, platform, scope_version, asset counts, target_count, methods, rate_limits, created_at, expires_at}}` |
+| `GET /api/public/program-authorizations?limit=20` | List safe scope summaries bound to the currently authenticated Owner session; includes target identifiers only (never target hosts); requires public and Owner cookies, uses the public Origin guard, and is read-only (no CSRF token required); default 20, maximum 50 | `200 {ok:true,snapshots:[{...public summary fields...,target_ids:[...]}]}`; a requested limit above 50 is capped |
+| `POST /api/public/program-authorizations` | Persist an explicit manual scope authorization; requires public cookie, CSRF token, and Owner cookie | `201 {ok:true, snapshot:{snapshot_id, program_id, platform, scope_version, asset counts, target_count, target_ids, methods, rate_limits, created_at, expires_at}}` |
 | `DELETE /api/public/program-authorizations/{snapshot_id}` | Manually delete one saved snapshot; requires public cookie, CSRF token, and Owner cookie; the ID selects a row but is not authority | `200 {ok:true}`; missing and other-session snapshots both return `404 snapshot_not_found` |
 | `POST /api/public/logout` | Revoke the public anti-CSRF session | `200 {ok:true}` and expired public cookie |
 
@@ -39,7 +39,7 @@ The JSON object requires `program_id`, `platform`, `scope_version`, `in_scope_as
 
 Allowed and prohibited methods must be explicit, use uppercase standard HTTP methods, and cannot overlap. `prohibited_methods` may be an empty array. `rate_limits` is optional and, when present, accepts only `{"requests_per_minute": N}` with an integer from 1 through 1,000. Limits are 32 in-scope assets, 32 out-of-scope assets, 32 targets, 20 ports per asset/target, 32 paths per list, and an expiration strictly in the future but no more than 365 days ahead. `expires_at` must include a timezone and is persisted in UTC. Unknown fields, duplicate JSON keys, malformed lists, invalid ports/paths, and out-of-bounds values fail with `400` before persistence.
 
-Each successful POST creates a new persisted snapshot; it is not idempotent and clients should not blindly retry an uncertain request. The response summary includes the generated `snapshot_id`, program/version labels, counts, method lists, rate limits, and creation/expiration times, but not the submitted asset contents, Owner identity/session identifiers, or secrets.
+Each successful POST creates a new persisted snapshot; it is not idempotent and clients should not blindly retry an uncertain request. The response summary includes the generated `snapshot_id`, program/version labels, target IDs, counts, method lists, rate limits, and creation/expiration times, but not target hosts, submitted asset contents, Owner identity/session identifiers, or secrets.
 
 ## Mission client endpoints
 
@@ -48,7 +48,7 @@ All public mission endpoints require both a valid public session and an authenti
 | Method and path | Purpose and response |
 |---|---|
 | `GET /api/public/missions?limit=100` | List missions filtered by stable Owner account; `{ok:true, missions:[...]}`. Default `limit` is 100. |
-| `POST /api/public/missions` | Create a natural-language mission objective and enqueue it; response includes `mission`, `mission_id`, and `queue`. The server fixes the browser scope to the configured CyberSentinel repository root. |
+| `POST /api/public/missions` | Create a natural-language mission objective and enqueue it; optionally accept the paired `scope_snapshot_id` and `target_id` references. Both IDs are resolved against the currently authenticated Owner session and the exact persisted, unexpired snapshot; the target must be a member. The server derives program/target authority and fixes the repository root. Omitting both IDs preserves the existing repository-only mission path. |
 | `GET /api/public/missions/{id}/status` | Persisted mission state and queue state; `{ok:true, mission_id, status:...}`. |
 | `GET /api/public/missions/{id}/timeline` | Saved trajectory events. |
 | `GET /api/public/missions/{id}/evidence` | Saved evidence records. |
@@ -62,6 +62,8 @@ All public mission endpoints require both a valid public session and an authenti
 | `POST /api/public/missions/{id}/schedule` | Persist a one-time scheduled dispatch; requires `run_at`, rejects recurring `interval_seconds` and requires `retry_limit: 0`. The scheduler is not a general recurring automation system or a hidden execution thread. |
 
 Mission status and completion fields are backend truth. The UI only renders `GOAL_COMPLETED` as complete when the server also returns verified completion state and a signed completion proof. The Findings tab is explicitly a view over system-signed criterion evidence; the application does not currently persist an independent `Finding` entity.
+
+For a snapshot-bound mission, the browser submits only the selected snapshot and member-target IDs; browser scope content, host strings, and model-proposed URLs are not authority. The server stores a non-secret fingerprint of the exact persisted snapshot binding, checks it again during Owner reauthorization/runtime authorization, and fails closed for unknown, expired, changed, foreign-session, or non-member targets. The scoped HTTP tool still receives only its existing strict context and is governed by the existing read-only method and URL resolver policy; no tool or HTTP-method permissions are added.
 
 ## Mission-bound read-only Workspace endpoints
 

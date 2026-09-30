@@ -646,6 +646,17 @@ class Handler(BaseHTTPRequestHandler):
                 criteria = payload.get("completion_criteria")
                 if criteria is not None and (not isinstance(criteria, list) or len(criteria) > 100):
                     raise ValueError("invalid_completion_criteria")
+                has_snapshot_id = "scope_snapshot_id" in payload
+                has_target_id = "target_id" in payload
+                if has_snapshot_id != has_target_id:
+                    raise ValueError("invalid_scope_binding")
+                scope_context = {"workspace_root": str(ROOT), "target_id": "cybersentinel-repository"}
+                if has_snapshot_id:
+                    scope_context = {
+                        "workspace_root": str(ROOT),
+                        "scope_snapshot_id": payload.get("scope_snapshot_id"),
+                        "target_id": payload.get("target_id"),
+                    }
                 core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
                 model_id = requested_model_id(payload, default=None)
                 if model_id is not None and "model_preference" in payload:
@@ -654,7 +665,7 @@ class Handler(BaseHTTPRequestHandler):
                     objective,
                     owner_session_token=owner["session_id"],
                     request_id=uuid.uuid4().hex,
-                    scope_context={"workspace_root": str(ROOT), "target_id": "cybersentinel-repository"},
+                    scope_context=scope_context,
                     completion_criteria=criteria,
                     run=False,
                     model_id=model_id or "auto",

@@ -110,3 +110,11 @@
 - تُنقّح الكتابات الجديدة في Mission وEvidence Chain والذاكرة والسجلات ونتائج دورة التنفيذ بأنماط credential معروفة؛ حُفظت مراجع `secret_ref` والحقول التقنية الآمنة، وأعيد حساب بصمات المحتوى المتأثر. التنقيح best-effort ولا يكتشف الأسرار المعتمة، ولا يمسح الصفوف التاريخية، وليس Vault. سياق Owner الموقّع يُحفظ منقّحًا فقط في قاعدة البيانات؛ الاستئناف البارد يحتاج مصادقة Owner جديدة.
 - لا تزال المهمة الأم `PARTIAL`: لا تحقق حي لمزود، ولا CI ناجح على SHA الدافع، ولا Worker مثبت المصدر من هذا الفرع؛ كما لا توجد Vault مشفّرة أو مزامنة P2P أو مسار IDOR/BOLA بحسابين اصطناعيين أو متحقق مستقل حتمي للثغرات أو Evidence HTTP كامل قابل للإعادة أو مسار موافقة Owner قبل الإفصاح. لم تُغيّر إعدادات أو نشر Cloudflare.
 - بعد دفع commit التوثيق `593811e46a4d9679a1b57a4c400f4bf5e9e97e2d`، فشل GitHub Actions workflow `tests` (run `36641927114`) و`pytest-diagnostics` (run `36641926965`) في preflight بعلة `Unavailable: host denied required OS namespace isolation`؛ compile وpytest تخطّيا. شغّل الدفع Cloudflare build `74056e55-a25f-438a-a94f-3b2cd7815a15` من نفس SHA، لكنه فشل عند `npx wrangler preview` لأن الإعداد يفتقر كتلة `previews`؛ لا preview URL ولا نشر مثبت. أظهر استعلام قائمة trigger فرع `main` فقط، بينما سجل هذا البناء يثبت تنفيذه على فرع التكامل؛ سبب التعارض غير محسوم. لا يرتبط آخر Worker deployment (`5fa5ade4-c86d-41f9-9cec-1ea1c05335af`) بهذا SHA، ومسارات chat/models المنشورة ترجع `404`.
+
+
+## 11. Owner-bound scope snapshot mission slice — COMPLETE
+- [x] Resolve optional snapshot/target references only from the current authenticated Owner session and exact persisted snapshot; reject unknown, expired, foreign-session, or non-member references.
+- [x] Carry the validated persisted binding through mission create, reauthorization, and runtime authorization; preserve the repository/workspace flow when no binding is supplied.
+- [x] Add the smallest ID-only optional UI selector and regression coverage for the new and legacy mission flows; keep the existing scoped HTTP tool, GET-only method, and policy allowlist unchanged.
+- [x] Run only the confined project runner and allowed static/whitespace/secret checks: 972 passed, 1 skipped; syntax, whitespace, and secret-pattern checks clean.
+- [x] Commit locally without pushing.

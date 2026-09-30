@@ -148,7 +148,7 @@ def test_saved_scope_snapshot_delete_is_confirmed_owner_csrf_bound_and_refreshes
     assert "window.confirm(" in handler
     assert handler.index("window.confirm(") < handler.index('method: "DELETE"')
     assert 'api(`/api/public/program-authorizations/${encodeURIComponent(snapshotId)}`' in handler
-    assert "await loadScopeSnapshotHistory()" in handler
+    assert "await Promise.all([loadScopeSnapshotHistory(), loadMissionScopeOptions()])" in handler
     assert "owner_session_id" not in handler
     assert "session_id" not in handler
 
@@ -160,7 +160,9 @@ def test_saved_scope_snapshot_history_refreshes_after_owner_login_and_clears_on_
     auth_end = script.index("\nconst MODEL_PREFERENCES", auth_start)
     auth_update = script[auth_start:auth_end]
     assert "const wasAuthenticated = state.ownerAuthenticated" in auth_update
-    assert "if (!nextAuthenticated) clearScopeSnapshotHistory()" in auth_update
+    assert "if (!nextAuthenticated)" in auth_update
+    assert "clearScopeSnapshotHistory();" in auth_update
+    assert "clearMissionScopeOptions();" in auth_update
     assert 'state.activeView === "scope-snapshot"' in auth_update
     assert "void loadScopeSnapshotHistory()" in auth_update
 
@@ -186,3 +188,30 @@ def test_saved_scope_snapshot_history_refreshes_after_owner_login_and_clears_on_
     assert 'api("/api/public/auth/logout"' in logout_handler
     assert "updateAuthUI({ authenticated: false })" in logout_handler
     assert "resetWorkspaceState()" in logout_handler
+
+
+def test_optional_mission_scope_selector_uses_current_owner_snapshot_ids_only():
+    page = (ROOT / "web/index.html").read_text(encoding="utf-8")
+    script = (ROOT / "web/app.js").read_text(encoding="utf-8")
+
+    assert 'id="missionScopeSnapshotId"' in page
+    assert 'id="missionScopeTargetId"' in page
+    assert "بدون اختيار، تحتفظ المهمة بنطاق مساحة المستودع الحالي" in page
+
+    loader_start = script.index("async function loadMissionScopeOptions()")
+    loader_end = script.index("\nfunction renderScopeSnapshotHistory", loader_start)
+    loader = script[loader_start:loader_end]
+    assert 'api(`/api/public/program-authorizations?limit=${MAX_SCOPE_SNAPSHOT_HISTORY}`)' in loader
+    assert "item.target_ids" in loader
+    assert "state.ownerAuthenticated" in loader
+    assert "summary.host" not in loader
+    assert "program_id" not in loader
+
+    submit_start = script.index('$("#missionForm").onsubmit')
+    submit_end = script.index("\n};", submit_start)
+    submit = script[submit_start:submit_end]
+    assert "missionPayload.scope_snapshot_id = scopeSnapshotId" in submit
+    assert "missionPayload.target_id = targetId" in submit
+    assert "scope_context" not in submit
+    assert "host" not in submit
+    assert "program_id" not in submit

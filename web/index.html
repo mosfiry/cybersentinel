@@ -42,6 +42,17 @@
           <label for="missionObjective">ماذا تريد أن تنجز؟</label>
           <textarea id="missionObjective" rows="3" maxlength="12000" required placeholder="صف هدف المهمة بلغة طبيعية…"></textarea>
           <div class="model-choice">
+            <label for="missionScopeSnapshotId">لقطة نطاق محفوظة (اختياري)</label>
+            <select id="missionScopeSnapshotId" aria-describedby="missionScopeNote" disabled>
+              <option value="">مساحة المستودع الحالية</option>
+            </select>
+            <label for="missionScopeTargetId">هدف واحد من اللقطة</label>
+            <select id="missionScopeTargetId" disabled>
+              <option value="">اختر لقطة أولاً</option>
+            </select>
+            <small id="missionScopeNote" role="status">بدون اختيار، تحتفظ المهمة بنطاق مساحة المستودع الحالي.</small>
+          </div>
+          <div class="model-choice">
             <label for="modelPreference">تفضيل التنسيق</label>
             <select id="modelPreference" aria-describedby="modelPreferenceNote" disabled>
               <option value="fast">سريع · ملف واحد وأقل كمون</option>

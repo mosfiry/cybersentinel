@@ -56,6 +56,39 @@ class MissionRuntime:
             valid, reason = snapshot.validate_for_mission(mission_id=mission.mission_id, owner_identity=mission.owner_identity_ref, target_identity=target, version=expected_version)
             if not valid:
                 return False, reason
+            scope_snapshot_id = scope.get("scope_snapshot_id")
+            authorization_scope_id = (
+                (mission.authorization_context or {}).get("scope_snapshot_id")
+                if isinstance(mission.authorization_context, dict)
+                else None
+            )
+            if scope_snapshot_id or authorization_scope_id:
+                from security.authorization_context import AuthorizationContext
+                from security.scope_store import get_snapshot_for_owner_session
+
+                context = AuthorizationContext.from_dict(dict(mission.authorization_context or {}))
+                if (
+                    not scope_snapshot_id
+                    or not authorization_scope_id
+                    or str(scope_snapshot_id) != str(authorization_scope_id)
+                ):
+                    return False, "mission scope binding identifier is missing or mismatched"
+                persisted_scope = get_snapshot_for_owner_session(
+                    str(scope_snapshot_id),
+                    scope.get("target_id"),
+                    owner_session_token=context.session_id,
+                )
+                bound_fingerprint = str(scope.get("scope_snapshot_fingerprint") or "")
+                if (
+                    context.scope_snapshot is None
+                    or context.session_id != persisted_scope.authorization.owner_session_id
+                    or context.scope_snapshot.snapshot_id != str(scope_snapshot_id)
+                    or context.scope_snapshot.to_dict() != persisted_scope.to_dict()
+                    or str(scope.get("program_id") or "") != persisted_scope.authorization.program_id
+                    or not bound_fingerprint
+                    or context.scope_fingerprint != bound_fingerprint
+                ):
+                    return False, "mission scope binding differs from the persisted Owner snapshot"
             actions = {step.action for step in mission.plan.steps if step.action != "__planning_failure__"}
             if actions - set(snapshot.allowed_actions) or actions - set(snapshot.allowed_tools) or actions.intersection(snapshot.forbidden_actions):
                 return False, "mission actions or tools outside authorization snapshot"
