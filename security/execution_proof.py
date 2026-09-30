@@ -147,6 +147,7 @@ class ExecutionAuthorizationProof:
     tool_call_id: str = ""
     plan_hash: str = ""
     scope_hash: str = ""
+    scope_context_hash: str = ""
     policy_fingerprint: str = ""
     decision_fingerprint: str = ""
     proof_signature: str = ""
@@ -154,7 +155,7 @@ class ExecutionAuthorizationProof:
     execution_class: str = "MISSION_BOUND"
 
     def _binding_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "execution_class": self.execution_class,
             "mission_id": self.mission_id,
             "request_id": self.request_id,
@@ -172,6 +173,9 @@ class ExecutionAuthorizationProof:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
         }
+        if self.scope_context_hash:
+            payload["scope_context_hash"] = self.scope_context_hash
+        return payload
 
     def _computed_binding_hash(self) -> str:
         return hashlib.sha256(_canonical(self._binding_payload()).encode("utf-8")).hexdigest()
@@ -196,6 +200,7 @@ class ExecutionAuthorizationProof:
             "snapshot_hash": self.snapshot_hash,
             "snapshot_version": self.snapshot_version,
             "scope_hash": self.scope_hash,
+            "scope_context_hash": self.scope_context_hash,
             "policy_fingerprint": self.policy_fingerprint,
             "decision_fingerprint": self.decision_fingerprint,
             "mission_status": self.mission_status,
@@ -208,7 +213,7 @@ class ExecutionAuthorizationProof:
         }
 
     @classmethod
-    def derive(cls, *, mission_id: str, request_id: str, tool: str, argument: Any, snapshot: MissionAuthorizationSnapshot | None = None, decision: Any = None, tool_call_id: str = "", plan_hash: str = "", scope: Any = None, mission_status: str = "", lifecycle_revision: int = 0, policy_fingerprint: str = "", ttl_seconds: int = PROOF_TTL_SECONDS, at: str | None = None, execution_class: str = "MISSION_BOUND") -> "ExecutionAuthorizationProof":
+    def derive(cls, *, mission_id: str, request_id: str, tool: str, argument: Any, snapshot: MissionAuthorizationSnapshot | None = None, decision: Any = None, tool_call_id: str = "", plan_hash: str = "", scope: Any = None, scope_context: Any = None, mission_status: str = "", lifecycle_revision: int = 0, policy_fingerprint: str = "", ttl_seconds: int = PROOF_TTL_SECONDS, at: str | None = None, execution_class: str = "MISSION_BOUND") -> "ExecutionAuthorizationProof":
         """Derive a proof for exactly one execution. Never creates authority.
 
         The execution class is explicit and determines the required bindings:
@@ -289,6 +294,7 @@ class ExecutionAuthorizationProof:
             tool_call_id=str(tool_call_id or ""),
             plan_hash=str(plan_hash or ""),
             scope_hash=_fingerprint(scope or {}),
+            scope_context_hash=_fingerprint(scope_context) if scope_context is not None else "",
             policy_fingerprint=effective_policy_fingerprint,
             decision_fingerprint=decision_fingerprint,
             execution_class=klass,

@@ -124,7 +124,7 @@ class MissionRuntime:
         return True, "", "authorized"
 
     @staticmethod
-    def _derive_execution_proof(mission: Mission, proposal: Any, argument: Any, decision: Any) -> Any:
+    def _derive_execution_proof(mission: Mission, proposal: Any, argument: Any, decision: Any, *, scope_context: Any = None) -> Any:
         from security.execution_boundary import MissionExecutionBoundary
         return MissionExecutionBoundary.derive(
             mission,
@@ -132,6 +132,7 @@ class MissionRuntime:
             argument=argument,
             decision=decision.decision if decision is not None and decision.allowed else None,
             tool_call_id=proposal.tool_call_id,
+            scope_context=scope_context,
         )
 
     @staticmethod
@@ -1041,7 +1042,7 @@ class MissionRuntime:
         """Run a real model/tool/observation loop for a durable mission."""
         from security.authorization import authorize_tool
         from security.authorization_context import AuthorizationContext
-        from tools.registry import execute as execute_tool
+        from tools.registry import execute as execute_tool, get_tool
 
         allowed_tool_names = self._tool_definition_names(tools)
         if specialist is not None and (specialist_context is None or allowed_tool_names != frozenset(specialist.allowed_tools)):
@@ -1381,9 +1382,23 @@ class MissionRuntime:
                             continue
                         proof = None
                         try:
-                            proof = self._derive_execution_proof(mission, proposal, argument, decision)
-                            mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
                             from security.execution_boundary import MissionExecutionBoundary
+                            tool_scope_context = MissionExecutionBoundary.scope_context_for_call(
+                                mission,
+                                tool=proposal.name,
+                                argument=argument,
+                                authorization_context=auth_context,
+                            )
+                            tool_spec = get_tool(proposal.name)
+                            proof_scope_context = tool_scope_context if tool_spec is not None and tool_spec.scope_required else None
+                            proof = self._derive_execution_proof(
+                                mission,
+                                proposal,
+                                argument,
+                                decision,
+                                scope_context=proof_scope_context,
+                            )
+                            mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
                             proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
                             mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": proof_reason})
                             if not proof_ok:
@@ -1412,7 +1427,7 @@ class MissionRuntime:
                             progress["tool_results"].append(result.to_dict())
                             continue
                         try:
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, tool_call_id=proposal.tool_call_id, execution_proof=proof, execution_class="MISSION_BOUND", **registry_context)
+                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=tool_scope_context, request_id=mission.request_id, tool_call_id=proposal.tool_call_id, execution_proof=proof, execution_class="MISSION_BOUND", **registry_context)
                             action_id = proposal.action_id or proposal.tool_call_id
                             observation, success = self._normalize_native_tool_result(
                                 raw,
@@ -1474,10 +1489,10 @@ class MissionRuntime:
         """Authorize, proof-bind, and execute independent proposals in parallel."""
         from security.authorization import authorize_tool
         from security.execution_boundary import MissionExecutionBoundary
-        from tools.registry import execute as execute_tool
+        from tools.registry import execute as execute_tool, get_tool
 
         identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
-        authorized: list[tuple[Any, Any, Any, Any, dict[str, Any]]] = []
+        authorized: list[tuple[Any, Any, Any, Any, dict[str, Any], Any]] = []
         results: list[ToolCallResult] = []
         claimed_step_ids: set[str] = set()
         for proposal in proposals:
@@ -1518,7 +1533,21 @@ class MissionRuntime:
                 results.append(ToolCallResult(proposal, False, error="tool is outside the supplied model tool schema allowlist"))
                 continue
             try:
-                proof = self._derive_execution_proof(mission, proposal, argument, decision)
+                tool_scope_context = MissionExecutionBoundary.scope_context_for_call(
+                    mission,
+                    tool=proposal.name,
+                    argument=argument,
+                    authorization_context=auth_context,
+                )
+                tool_spec = get_tool(proposal.name)
+                proof_scope_context = tool_scope_context if tool_spec is not None and tool_spec.scope_required else None
+                proof = self._derive_execution_proof(
+                    mission,
+                    proposal,
+                    argument,
+                    decision,
+                    scope_context=proof_scope_context,
+                )
                 mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": proposal.tool_call_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
                 proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
                 mission.emit(EventType.PROOF_VERIFIED, data={"tool_call_id": proposal.tool_call_id, "allowed": proof_ok, "reason": proof_reason})
@@ -1527,7 +1556,7 @@ class MissionRuntime:
                     results.append(ToolCallResult(proposal, False, error=f"{proof_code}: {proof_reason}"))
                     continue
                 registry_context = self._registry_context(mission, proposal.name)
-                authorized.append((proposal, argument, decision, proof, registry_context))
+                authorized.append((proposal, argument, decision, proof, registry_context, tool_scope_context))
             except Exception as exc:
                 mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": proposal.tool_call_id, "code": "PROOF_INVALID", "reason": f"execution authorization rejected: {type(exc).__name__}"})
                 results.append(ToolCallResult(proposal, False, error=f"PROOF_INVALID: execution authorization rejected: {type(exc).__name__}"))
@@ -1542,8 +1571,8 @@ class MissionRuntime:
             self._accept_pending_control(latest)
             return False
 
-        def execute_one(item: tuple[Any, Any, Any, Any, dict[str, Any]]) -> dict[str, Any]:
-            proposal, argument, decision, proof, registry_context = item
+        def execute_one(item: tuple[Any, Any, Any, Any, dict[str, Any], Any]) -> dict[str, Any]:
+            proposal, argument, decision, proof, registry_context, tool_scope_context = item
             proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
             if not proof_ok:
                 return {"_proof_rejected": True, "proof_code": proof_code, "proof_reason": proof_reason}
@@ -1554,7 +1583,7 @@ class MissionRuntime:
                 raw = execute_tool(
                     proposal.name, argument,
                     authorization_decision=decision.decision,
-                    scope_context=mission.scope_snapshot,
+                    scope_context=tool_scope_context,
                     request_id=mission.request_id,
                     tool_call_id=proposal.tool_call_id,
                     execution_proof=proof,

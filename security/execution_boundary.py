@@ -33,7 +33,7 @@ class MissionExecutionBoundary:
     """Canonical boundary for mission-bound tool execution."""
 
     @staticmethod
-    def derive(mission: Any, *, tool: str, argument: Any, decision: Any = None, tool_call_id: str = "", plan_hash: str | None = None, scope: Any = None) -> ExecutionAuthorizationProof:
+    def derive(mission: Any, *, tool: str, argument: Any, decision: Any = None, tool_call_id: str = "", plan_hash: str | None = None, scope: Any = None, scope_context: Any = None) -> ExecutionAuthorizationProof:
         """Derive the MISSION_BOUND proof for exactly one execution.
 
         All bindings come from the live Mission object and the Owner-minted
@@ -51,9 +51,53 @@ class MissionExecutionBoundary:
             tool_call_id=tool_call_id,
             plan_hash=plan_hash if plan_hash is not None else mission.plan.fingerprint,
             scope=scope if scope is not None else mission.scope_snapshot,
+            scope_context=scope_context,
             mission_status=mission.status.value,
             lifecycle_revision=len(mission.transitions),
         )
+
+    @staticmethod
+    def scope_context_for_call(mission: Any, *, tool: str, argument: Any, authorization_context: Any) -> Any:
+        """Project validated mission authority into a tool's per-call context.
+
+        This projection is passed to the registry separately from the execution
+        proof. The proof remains bound to the durable mission scope snapshot.
+        """
+        from tools.registry import get_tool
+
+        spec = get_tool(tool)
+        if spec is None or not spec.scope_required:
+            return mission.scope_snapshot
+        if tool != "scoped_http_probe":
+            raise PermissionError("scope context derivation is unavailable for this tool")
+
+        from security.authorization_context import AuthorizationContext
+        from tools.scoped_http_probe import validate_scope_context_fields
+
+        if not isinstance(authorization_context, AuthorizationContext):
+            raise PermissionError("scope-required tool needs a typed Owner AuthorizationContext")
+        binding = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+        persisted_scope = authorization_context.scope_snapshot
+        target_id = str(binding.get("target_id") or "")
+        selected_target = persisted_scope.target(target_id) if persisted_scope is not None and target_id else None
+        bound_fingerprint = str(binding.get("scope_snapshot_fingerprint") or "")
+        if (
+            persisted_scope is None
+            or selected_target is None
+            or authorization_context.session_id != persisted_scope.authorization.owner_session_id
+            or persisted_scope.snapshot_id != str(binding.get("scope_snapshot_id") or "")
+            or persisted_scope.authorization.program_id != str(binding.get("program_id") or "")
+            or not bound_fingerprint
+            or authorization_context.scope_fingerprint != bound_fingerprint
+        ):
+            raise PermissionError("mission scope binding differs from the persisted Owner snapshot")
+
+        return validate_scope_context_fields({
+            "program_id": persisted_scope.authorization.program_id,
+            "target_id": selected_target.target_id,
+            "scope_snapshot_id": persisted_scope.snapshot_id,
+            "url": argument,
+        })
 
     @staticmethod
     def validate(proof: Any, mission: Any) -> tuple[bool, str, str]:
@@ -61,14 +105,14 @@ class MissionExecutionBoundary:
         return ExecutionAuthorizationProof.validate_against_mission(proof, mission)
 
     @staticmethod
-    def execute(mission: Any, *, tool: str, argument: Any, decision: Any = None, tool_call_id: str = "", execute: Any = None, **governed: Any) -> Any:
+    def execute(mission: Any, *, tool: str, argument: Any, decision: Any = None, tool_call_id: str = "", scope_context: Any = None, execute: Any = None, **governed: Any) -> Any:
         """derive -> validate against live mission -> registry execution."""
         from tools.registry import execute as registry_execute
-        proof = MissionExecutionBoundary.derive(mission, tool=tool, argument=argument, decision=decision, tool_call_id=tool_call_id)
+        proof = MissionExecutionBoundary.derive(mission, tool=tool, argument=argument, decision=decision, tool_call_id=tool_call_id, scope_context=scope_context)
         ok, reason, code = MissionExecutionBoundary.validate(proof, mission)
         if not ok:
             raise PermissionError(f"{code}: {reason}")
-        return (execute or registry_execute)(tool, argument, authorization_decision=decision, execution_proof=proof, execution_class=ExecutionClass.MISSION_BOUND.value, tool_call_id=tool_call_id, mission_id=mission.mission_id, request_id=mission.request_id, **governed)
+        return (execute or registry_execute)(tool, argument, authorization_decision=decision, scope_context=scope_context, execution_proof=proof, execution_class=ExecutionClass.MISSION_BOUND.value, tool_call_id=tool_call_id, mission_id=mission.mission_id, request_id=mission.request_id, **governed)
 
 
 class OwnerDirectBoundary:
@@ -92,6 +136,7 @@ class OwnerDirectBoundary:
             decision=decision,
             tool_call_id=tool_call_id,
             scope=scope_context,
+            scope_context=scope_context,
         )
 
     @staticmethod

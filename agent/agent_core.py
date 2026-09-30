@@ -480,7 +480,21 @@ class AgentCore:
             workspace = Workspace(workspace_root)
             evidence_store = EvidenceChainStore(Path(self.store.db_path).with_name("evidence_chain.db"))
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
-            proof = MissionExecutionBoundary.derive(mission, tool=step.action, argument=argument, decision=decision.decision, tool_call_id=action_id)
+            tool_scope_context = MissionExecutionBoundary.scope_context_for_call(
+                mission,
+                tool=step.action,
+                argument=argument,
+                authorization_context=context,
+            )
+            proof_scope_context = tool_scope_context if spec.scope_required else None
+            proof = MissionExecutionBoundary.derive(
+                mission,
+                tool=step.action,
+                argument=argument,
+                decision=decision.decision,
+                tool_call_id=action_id,
+                scope_context=proof_scope_context,
+            )
             from .trajectory import EventType
             mission.emit(EventType.PROOF_CREATED, data={"tool_call_id": action_id, "proof_fingerprint": proof.proof_fingerprint, "snapshot_hash": proof.snapshot_hash, "plan_hash": proof.plan_hash})
             proof_ok, proof_reason, proof_code = MissionExecutionBoundary.validate(proof, mission)
@@ -488,25 +502,6 @@ class AgentCore:
             if not proof_ok:
                 mission.emit(EventType.EXECUTION_REJECTED, data={"tool_call_id": action_id, "code": proof_code, "reason": proof_reason})
                 return {"success": False, "failure_class": "AUTHORIZATION", "error": f"{proof_code}: {proof_reason}", "execution_id": action_id}
-            tool_scope_context = mission.scope_snapshot
-            if spec.scope_required:
-                binding = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
-                persisted_scope = context.scope_snapshot
-                selected_target = persisted_scope.target(str(binding.get("target_id") or "")) if persisted_scope else None
-                if (
-                    persisted_scope is None
-                    or selected_target is None
-                    or persisted_scope.snapshot_id != str(binding.get("scope_snapshot_id") or "")
-                    or persisted_scope.authorization.program_id != str(binding.get("program_id") or "")
-                    or str(binding.get("scope_snapshot_fingerprint") or "") != context.scope_fingerprint
-                ):
-                    raise PermissionError("mission scope binding differs from the persisted Owner snapshot")
-                tool_scope_context = {
-                    "program_id": persisted_scope.authorization.program_id,
-                    "target_id": selected_target.target_id,
-                    "scope_snapshot_id": persisted_scope.snapshot_id,
-                    "url": str(argument),
-                }
             value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=tool_scope_context, request_id=mission.request_id, tool_call_id=action_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_proof=proof, execution_class="MISSION_BOUND")
             return {"success": True, "source": step.action, "result": value, "execution_id": action_id}
         except PermissionError as exc:

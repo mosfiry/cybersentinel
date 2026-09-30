@@ -492,7 +492,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             raise PermissionError("scope snapshot is not persisted")
         if not hmac.compare_digest(_fingerprint(live_scope.to_dict()), str(authorization_decision.scope_fingerprint)):
             raise PermissionError("scope snapshot differs from the Owner AuthorizationDecision")
-        if not hmac.compare_digest(_fingerprint(strict_scope_context), str(execution_proof.scope_hash)):
+        if not hmac.compare_digest(_fingerprint(strict_scope_context), str(execution_proof.scope_context_hash)):
             raise PermissionError("scope context differs from the execution proof")
     if mission_authorization is not None:
         from security.mission_authorization import MissionAuthorizationSnapshot
