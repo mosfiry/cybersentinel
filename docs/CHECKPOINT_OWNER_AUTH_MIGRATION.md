@@ -1,7 +1,7 @@
 # CYBERSENTINEL X — Owner Authentication Migration Checkpoint
 
 Branch: security/owner-password-auth-migration
-Updated: 2026-09-27 (session 2 end — repository repair COMPLETE, CI GREEN, X-E design finalized)
+Updated: 2026-09-30 (session 7 — X-G active-docs reconciliation complete)
 Base: main @ 5ed08d9
 
 ## CURRENT_PHASE
@@ -305,3 +305,58 @@ NEXT (resume X-E live-path integration per session 2 design):
   rewrite their Owner-auth sections to the username/password + session model,
   push as one commit, then verify CI (tests.yml + diagnostics marker). Keep
   historical/dated docs untouched.
+
+---
+
+## SESSION 7 (2026-09-30) — X-G ACTIVE-DOCS RECONCILIATION — COMPLETE
+
+- Commit 80807c024832 (docs): README.md, docs/OPERATIONS.md,
+  docs/SECURITY_MODEL.md, docs/TESTING.md, docs/OWNER_POLICY.md,
+  docs/AGENT_ARCHITECTURE.md, docs/PUBLIC_WEB_ARCHITECTURE.md,
+  docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md — every OWNER_TOKEN-era
+  instruction/description replaced with the canonical username+password +
+  server-side session model (POST /api/auth/login;
+  X-CyberSentinel-Owner-Session; BRIDGE_TOKEN transport-only; scrypt
+  verifier-only). Diff verified commit-wide via the authenticated connector.
+- Commit (this commit): tests/test_active_docs_terminology.py — active-docs
+  terminology guard (forbidden legacy terms + required canonical markers);
+  docs/OWNER_AUTH_AUDIT_2026-09-28.md Section 5 flipped to RECONCILED;
+  this checkpoint updated.
+- Channel lesson (session 7): fetched text is NEVER a push base without
+  verifying a locally computed gitBlobSha == reported blob SHA. Verified
+  channels this session: contents API base64 (7 of 8 docs), git blob endpoint
+  (AGENT_ARCHITECTURE.md), raw channel + wrap-repair (open_url inserts a
+  newline every 2000 chars; removing the wrap newlines at raw positions
+  2000/4001 recovered OWNER_AUTH_AUDIT byte-exactly). The contents API base64
+  was corrupted (lone surrogates) for AGENT_ARCHITECTURE.md and the audit doc
+  — always SHA-verify before pushing.
+
+### SESSION 7 CHECKPOINT FIELDS
+
+- CURRENT_PHASE: Mission 1 (owner auth migration) — code complete; docs reconciled
+- CURRENT_UNIT: X-G closure (guard test + audit/checkpoint update)
+- CURRENT_STEP: CI verification of commits 80807c024832 and this commit
+- LAST_COMPLETED_STEP: X-G.1 eight-doc reconciliation (80807c024832)
+- NEXT_STEP: verify CI green on this commit; Mission-1 remaining items are
+  Owner-local (bootstrap command) + Owner merge decision
+- LAST_VERIFIED_COMMIT: 73da174603d9 (both checks success); 80807c024832 and
+  this commit verification pending
+- TEST_STATUS: full suite green at 73da174603d9; this commit adds
+  tests/test_active_docs_terminology.py (docs-only guard, no runtime effect)
+- CI_STATUS: pending for 80807c024832 and this commit
+- OPEN_ISSUES: (1) inert require_owner_token config key (zero consumers,
+  session-2 decision); (2) Owner-local bootstrap not yet run
+  (python -m security.owner_password_bootstrap); (3) merge into main = Owner
+  decision (note: PR #16 already merged the branch through cb2b262e into main
+  on 2026-09-27; session-6/7 commits remain unmerged)
+- INVARIANTS_PROVEN: username+password-only auth on ALL live paths (unchanged);
+  active docs now match the live authentication model; docs guard test pins it
+- INVARIANTS_NOT_PROVEN: none new
+- FILES_CHANGED (session 7): the eight active docs (80807c024832);
+  tests/test_active_docs_terminology.py,
+  docs/OWNER_AUTH_AUDIT_2026-09-28.md,
+  docs/CHECKPOINT_OWNER_AUTH_MIGRATION.md (this commit)
+- NEXT_SESSION_FIRST_ACTION: Verify CI (tests.yml + pytest-diagnostics
+  marker) on this commit; if green, Mission 1 code/docs work is complete —
+  remaining items are the Owner-local bootstrap command and the Owner merge
+  decision.

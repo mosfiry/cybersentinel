@@ -68,20 +68,28 @@ rejected as an Owner session value (covered by tests).
   positive controls per route; real password-DB lifecycle (wrong password,
   revocation, server-side expiry).
 
-## 5. DOCS — DRIFT (no runtime effect; open unit X-G)
+## 5. DOCS — RECONCILED (X-G complete, 2026-09-30)
 
-Active docs still describing the OWNER_TOKEN era (operator-facing): README.md,
-docs/OPERATIONS.md, docs/SECURITY_MODEL.md, docs/TESTING.md, docs/OWNER_POLICY.md,
-docs/AGENT_ARCHITECTURE.md, docs/PUBLIC_WEB_ARCHITECTURE.md,
-docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md.
-Historical records intentionally retained (dated audits, GITHUB_ONLY_POC_RESULTS
-POC record, checkpoint history, diagnostics/legacy-auth-inventory-*.md).
+All eight active docs (README.md, docs/OPERATIONS.md, docs/SECURITY_MODEL.md,
+docs/TESTING.md, docs/OWNER_POLICY.md, docs/AGENT_ARCHITECTURE.md,
+docs/PUBLIC_WEB_ARCHITECTURE.md, docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md) now
+describe the username+password + server-side session model only
+(POST /api/auth/login; X-CyberSentinel-Owner-Session; BRIDGE_TOKEN
+transport-only; scrypt verifier-only storage). The stale OwnerSession /
+challenge / HMAC wording in PUBLIC_WEB_ARCHITECTURE.md was corrected to the
+password-session model, and the run_agent_intelligence_audit example now uses
+OWNER_SESSION_TOKEN (matching the live script contract).
+Historical records intentionally retained (dated audits,
+GITHUB_ONLY_POC_RESULTS POC record, checkpoint history,
+diagnostics/legacy-auth-inventory-*.md).
+Guard: tests/test_active_docs_terminology.py fails if any active doc regresses
+to legacy Owner credential terms or drops the canonical markers.
 
 ## 6. Verdict
 
 - Owner authentication: username+password ONLY; scrypt verifier-only storage;
   server-side sessions; BRIDGE_TOKEN transport-only. NO legacy credential
   authenticates anywhere in live code.
-- Remaining for full Mission-1 closure: (a) active-docs reconciliation
-  (Section 5), (b) Owner-local python -m security.owner_password_bootstrap,
-  (c) merge into main (Owner decision).
+- Remaining for full Mission-1 closure: (a) DONE — active-docs reconciliation (Section 5, X-G, 2026-09-30),
+  (b) Owner-local python -m security.owner_password_bootstrap,
+  (c) merge of the remaining branch commits into main (Owner decision).
