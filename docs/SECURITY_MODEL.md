@@ -1,7 +1,7 @@
 # CyberSentinel X 5.0.0 — Security Model
 
 ## Trust
-The local bridge authenticates the channel with `BRIDGE_TOKEN`; only requests that also carry the separate `OWNER_TOKEN` are instruction authority.
+The local bridge authenticates the channel with `BRIDGE_TOKEN`; instruction authority is carried only by a server-side Owner session created through username+password login (`POST /api/auth/login`, sent as `X-CyberSentinel-Owner-Session`).
 CISA, RSS, CVE records, and any other external content are evidence only.
 
 ## Network

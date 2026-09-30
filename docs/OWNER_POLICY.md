@@ -29,7 +29,7 @@ MODEL / TOOLS
 
 ## Authentication
 
-`Owner` is a human-readable marker, not authentication. `OWNER_TOKEN` authenticates the Owner at the policy layer, while `BRIDGE_TOKEN` authenticates the local bridge channel.
+`Owner` is a human-readable marker, not authentication. The Owner authenticates with username and password only (`POST /api/auth/login` creates a server-side session; the password is stored only as a scrypt verifier), while `BRIDGE_TOKEN` authenticates the local bridge channel and never establishes Owner identity.
 
 Never commit tokens to source control or send them to the model.
 

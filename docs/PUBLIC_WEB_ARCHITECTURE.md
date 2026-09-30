@@ -33,7 +33,7 @@ A browser visit creates no Owner authority. A public session, if enabled, identi
 
 The gateway must reject protected operations unless the request carries a valid gateway session and the operation's required CyberSentinel authorization has independently succeeded. The gateway must not accept the words “Owner” or any frontend state as proof of Owner authority.
 
-The current internal `BRIDGE_TOKEN` and `OWNER_TOKEN` remain server-side configuration. They must never be returned to the browser, rendered into public assets, stored in browser storage, or written to logs.
+The current internal `BRIDGE_TOKEN` remains server-side configuration, and Owner authentication is username+password with server-side sessions. They must never be returned to the browser, rendered into public assets, stored in browser storage, or written to logs.
 
 For the current Owner-only chat semantics, an unresolved decision remains: a production-facing Owner login mechanism must be selected before browser users can invoke Owner-authorized chat. Possible choices include an approved identity provider mapped to a CyberSentinel Owner policy, or a private operator-only gateway. The gateway must not silently turn an anonymous public session into an Owner session.
 
@@ -49,14 +49,14 @@ The browser-facing session is an opaque server-managed session represented by a 
 
 The cookie contains only an opaque session identifier or an equally non-sensitive signed reference. Session state is server-side and must not contain raw Owner or provider credentials in client-visible form. Session rotation is required after authentication-state changes. Logout invalidates the server-side session.
 
-The existing `OwnerSession` remains separate. Its challenge, expiry, HMAC proof, single-use behavior, and authorization scope are not replaced by the browser session.
+The existing server-side Owner password session remains separate. Its expiry, revocation, and authorization scope are not replaced by the browser session.
 
 ## 4. Owner authorization flow
 
 1. The gateway authenticates the browser session.
 2. The gateway determines whether the requested operation is public, authenticated-user, or Owner-only.
 3. For Owner-only operations, the gateway invokes the existing Owner authorization path using server-side material or a future approved identity-to-Owner mapping.
-4. `OwnerSession`, challenge validation, HMAC proof, expiry, single-use challenge consumption, and scope checks remain enforced by CyberSentinel.
+4. Owner password-session validation, expiry, revocation, and scope checks remain enforced by CyberSentinel.
 5. Authorization failures remain failures and retain their HTTP error semantics.
 
 No public website visit, Firebase Authentication state, browser cookie by itself, or user-entered phrase grants Owner authority.
@@ -69,7 +69,7 @@ The browser is not trusted to choose authorization scope, Owner status, provider
 
 ## 6. Secret boundary
 
-Secrets remain exclusively in server-side runtime configuration or a managed secret-injection mechanism. This includes `BRIDGE_TOKEN`, `OWNER_TOKEN`, API keys, LLM credentials, provider credentials, session-signing secrets, HMAC secrets, and deployment credentials.
+Secrets remain exclusively in server-side runtime configuration or a managed secret-injection mechanism. This includes `BRIDGE_TOKEN`, the Owner password and its session material, API keys, LLM credentials, provider credentials, session-signing secrets, HMAC secrets, and deployment credentials.
 
 The frontend must contain none of these names as operational values and must not prompt for them. Public responses and logs must use redacted error categories and correlation identifiers only.
 
@@ -125,7 +125,7 @@ If cross-origin cookie/SSE behavior is not reliably supported by the final topol
 
 ## 12. Logging and redaction
 
-Structured logs contain timestamp, route category, status, latency, `request_id`, optional `mission_id`, safe failure category, and deployment version. Logs must not contain raw request authorization headers, cookies, Owner tokens, bridge tokens, provider keys, session secrets, HMAC material, or full sensitive prompts.
+Structured logs contain timestamp, route category, status, latency, `request_id`, optional `mission_id`, safe failure category, and deployment version. Logs must not contain raw request authorization headers, cookies, Owner passwords or session IDs, bridge tokens, provider keys, session secrets, HMAC material, or full sensitive prompts.
 
 Correlation identifiers are safe to return only when they do not expose secret material. Error bodies are bounded and sanitized.
 
@@ -162,7 +162,7 @@ Primary threats are:
 - public asset inspection revealing a secret;
 - XSS stealing a browser-readable credential;
 - CSRF using an ambient cookie to trigger state changes;
-- forged or replayed Owner challenges;
+- forged or replayed Owner sessions;
 - unauthorized access to internal bridge routes;
 - origin spoofing or permissive CORS;
 - request flooding and oversized payloads;
@@ -180,7 +180,7 @@ Controls are server-side secret storage, HttpOnly/Secure cookies, CSRF checks, e
 - `AgentCore`, `MissionRuntime`, and `ModelRouter` remain the system of record.
 - A Firebase project and production origin are not yet known.
 - No production provider credentials are available for this phase.
-- Existing local `BRIDGE_TOKEN` and `OWNER_TOKEN` semantics must remain valid internally.
+- Existing local `BRIDGE_TOKEN` and username+password Owner session semantics must remain valid internally.
 - The public browser should not be able to perform Owner-only operations until an approved Owner identity flow exists.
 - Long-session/1000-message continuity is out of scope and will not be claimed.
 - Current local tests require installation of project/test dependencies before execution.
