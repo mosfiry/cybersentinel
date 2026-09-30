@@ -360,3 +360,64 @@ NEXT (resume X-E live-path integration per session 2 design):
   marker) on this commit; if green, Mission 1 code/docs work is complete —
   remaining items are the Owner-local bootstrap command and the Owner merge
   decision.
+
+### SESSION 7 FINAL STATUS (CI verified 2026-09-30)
+
+- tests.yml: SUCCESS on 80807c024832 (docs commit; run 36791235462's
+  predecessor verified success earlier via the Actions API).
+- pytest-diagnostics.yml had been failing at STARTUP (zero jobs) on every push
+  since its mojibake line landed — including the session-6 commits 73da174603d9
+  and 2aa1e1a5162d. CORRECTION OF THE SESSION-6 RECORD: the session-6 claim
+  "pytest-diagnostics pytest green" was wrong — the workflow never started a
+  job on those commits, so no pytest step ran there. Root cause: double-encoded
+  em-dash (mojibake) in the charter-audit echo line of
+  .github/workflows/pytest-diagnostics.yml. Fixed in c7d7397c90c6 (ASCII
+  replacement; same fix as d6339c3a on security/core-authority-hardening).
+  After the fix the workflow runs jobs again and publishes markers.
+- Adversarial outcome (working as designed): the new guard test
+  tests/test_active_docs_terminology.py FAILED on its first run and caught a
+  genuine residue missed by the X-G.1 edit pass — a third "OwnerSession"
+  occurrence in PUBLIC_WEB_ARCHITECTURE.md ("Controls" list). Fix-forward:
+  3d088680b95e ("Owner password-session"). This is the guard proving its value
+  on its very first execution; the failure was never hidden.
+- FINAL VERIFICATION (authoritative per the session-4 CI rule):
+  diagnostics/ci-3d088680b95e.md (published at marker commit d7bd01e0c301) =
+  "result: SUCCESS" — full pytest suite, compileall, secret-scan, and
+  git diff --check all green on 3d088680b95e.
+- tests.yml run 36791354338 on 3d088680b95e was still in_progress when this
+  checkpoint was written; the diagnostics marker carries the same pytest
+  suite and is the binding verdict. Confirm the checks page shows
+  "test (3.13)" success for 3d088680b95e at next-session start.
+
+### SESSION 7 CHECKPOINT FIELDS (FINAL)
+
+- CURRENT_PHASE: Mission 1 (owner auth migration) — CODE AND DOCS COMPLETE
+- CURRENT_UNIT: X-G closed (reconciliation + guard + CI repair)
+- CURRENT_STEP: session closed
+- LAST_COMPLETED_STEP: X-G.2 fix-forward 3d088680b95e (guard residue fix)
+- NEXT_STEP: confirm tests.yml check on 3d088680b95e; then Owner-local steps
+- LAST_VERIFIED_COMMIT: 3d088680b95e (diagnostics/ci-3d088680b95e.md = SUCCESS)
+- TEST_STATUS: full suite GREEN on 3d088680b95e (diagnostics marker);
+  known failures on intermediate commits 0ad773a4/c7d7397 documented above
+- CI_STATUS: tests.yml SUCCESS on 80807c024832; pytest-diagnostics startup
+  failure repaired at c7d7397c90c6; marker SUCCESS on 3d088680b95e
+- OPEN_ISSUES: (1) inert require_owner_token config key (zero consumers,
+  session-2 decision); (2) Owner-local bootstrap not yet run
+  (python -m security.owner_password_bootstrap — username mosfiry, prompt
+  only in the Owner's local environment); (3) merge of session-6/7 commits
+  into main = Owner decision (PR #16 already merged through cb2b262e);
+  (4) pytest-diagnostics markers for 80807c0/0ad773a4/c7d7397 are absent
+  (startup failure) — ci-c7d7397c90c6.md = FAILURE is the honest record of
+  the guard-test catch, superseded by ci-3d088680b95e.md = SUCCESS
+- INVARIANTS_PROVEN: username+password-only auth on ALL live paths
+  (unchanged by docs work); active docs now match the live authentication
+  model; guard test pins the docs terminology; diagnostics channel restored
+- INVARIANTS_NOT_PROVEN: none new
+- FILES_CHANGED (session 7, final): 80807c024832 (8 docs), 0ad773a4ee65
+  (guard test + audit doc + checkpoint), c7d7397c90c6 (pytest-diagnostics.yml
+  mojibake fix), 3d088680b95e (PUBLIC_WEB residue fix), this checkpoint update
+- NEXT_SESSION_FIRST_ACTION: Confirm tests.yml "test (3.13)" success on
+  3d088680b95e (run 36791354338) and the marker d7bd01e0c301. If green,
+  Mission 1 engineering is COMPLETE: instruct the Owner to run
+  python -m security.owner_password_bootstrap locally, then the only
+  remaining item is the Owner merge decision. Do NOT start B3-C6/Phase A/R2.
