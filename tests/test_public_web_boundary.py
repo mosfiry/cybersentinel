@@ -139,6 +139,11 @@ def persisted_scope_count():
         return int(connection.execute("SELECT COUNT(*) FROM scope_snapshots").fetchone()[0])
 
 
+def persisted_scope_snapshot_ids():
+    with sqlite3.connect(str(scope_store.SCOPE_DB_PATH)) as connection:
+        return {row[0] for row in connection.execute("SELECT snapshot_id FROM scope_snapshots")}
+
+
 def test_public_session_does_not_grant_owner_authority(manager):
     session = manager.create()
     assert session.public().keys() == {"csrf_token", "created_at", "expires_at"}
@@ -788,6 +793,129 @@ def test_public_scope_snapshot_list_preserves_public_owner_origin_and_safe_get_c
     )
     assert status == 404
     assert response["error"] == "public_boundary_disabled"
+
+
+def test_public_scope_snapshot_delete_requires_owner_session_and_csrf(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    summary = save_manual_scope_snapshot(server, public_cookie, owner_cookie, csrf)
+    path = f"/api/public/program-authorizations/{summary['snapshot_id']}"
+    cookies = f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}"
+
+    status, _, response = request(server, "DELETE", path, cookies=cookies)
+    assert status == 401
+    assert response["error"] == "invalid csrf token"
+    assert persisted_scope_snapshot_ids() == {summary["snapshot_id"]}
+
+    status, _, response = request(server, "DELETE", path, cookies=public_cookie, csrf=csrf)
+    assert status == 403
+    assert response["error"] == "owner_authorization_required"
+    assert persisted_scope_snapshot_ids() == {summary["snapshot_id"]}
+
+    status, _, response = request(
+        server,
+        "DELETE",
+        path,
+        cookies=f"{bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+    assert status == 401
+    assert response["error"] == "public session required"
+    assert persisted_scope_snapshot_ids() == {summary["snapshot_id"]}
+
+
+def test_public_scope_snapshot_delete_removes_only_the_selected_current_session_row(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    cookies = f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}"
+    target = save_manual_scope_snapshot(server, public_cookie, owner_cookie, csrf)
+    sibling_payload = manual_scope_payload()
+    sibling_payload["program_id"] = "keep-this-snapshot"
+    sibling = save_manual_scope_snapshot(server, public_cookie, owner_cookie, csrf, payload=sibling_payload)
+
+    status, _, response = request(
+        server,
+        "DELETE",
+        f"/api/public/program-authorizations/{target['snapshot_id']}",
+        cookies=cookies,
+        csrf=csrf,
+    )
+    assert status == 200
+    assert response == {"ok": True}
+    assert persisted_scope_snapshot_ids() == {sibling["snapshot_id"]}
+
+    status, _, response = request(server, "GET", "/api/public/program-authorizations", cookies=cookies)
+    assert status == 200
+    assert [item["snapshot_id"] for item in response["snapshots"]] == [sibling["snapshot_id"]]
+
+    status, _, response = request(
+        server,
+        "DELETE",
+        f"/api/public/program-authorizations/{target['snapshot_id']}",
+        cookies=cookies,
+        csrf=csrf,
+    )
+    assert status == 404
+    assert response["error"] == "snapshot_not_found"
+    assert persisted_scope_snapshot_ids() == {sibling["snapshot_id"]}
+
+
+def test_public_scope_snapshot_delete_hides_other_sessions_and_ignores_caller_session_ids(web_server):
+    server, _ = web_server
+    first_public_cookie, first_csrf = create_public_session(server)
+    status, first_headers, _ = login(server, first_public_cookie, first_csrf)
+    assert status == 200
+    first_owner_cookie = cookie_value(first_headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    first_session = owner_password.resolve_session(first_owner_cookie)
+    assert first_session is not None
+    first_cookies = f"{first_public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={first_owner_cookie}"
+    first_snapshot = save_manual_scope_snapshot(server, first_public_cookie, first_owner_cookie, first_csrf)
+    first_sibling_payload = manual_scope_payload()
+    first_sibling_payload["program_id"] = "first-session-sibling"
+    first_sibling = save_manual_scope_snapshot(server, first_public_cookie, first_owner_cookie, first_csrf, payload=first_sibling_payload)
+
+    second_public_cookie, second_csrf = create_public_session(server)
+    status, second_headers, _ = login(server, second_public_cookie, second_csrf)
+    assert status == 200
+    second_owner_cookie = cookie_value(second_headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    second_session = owner_password.resolve_session(second_owner_cookie)
+    assert second_session is not None
+    assert second_session["session_id"] != first_session["session_id"]
+    second_cookies = f"{second_public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={second_owner_cookie}"
+    second_snapshot = save_manual_scope_snapshot(server, second_public_cookie, second_owner_cookie, second_csrf)
+
+    status, _, response = request(
+        server,
+        "DELETE",
+        f"/api/public/program-authorizations/{first_snapshot['snapshot_id']}?owner_session_id={first_session['session_id']}",
+        {"owner_session_id": first_session["session_id"]},
+        cookies=second_cookies,
+        csrf=second_csrf,
+        owner_session_header=first_session["session_id"],
+    )
+    assert status == 404
+    assert response["error"] == "snapshot_not_found"
+    assert persisted_scope_snapshot_ids() == {
+        first_snapshot["snapshot_id"],
+        first_sibling["snapshot_id"],
+        second_snapshot["snapshot_id"],
+    }
+
+    status, _, response = request(server, "GET", "/api/public/program-authorizations", cookies=first_cookies)
+    assert status == 200
+    assert {item["snapshot_id"] for item in response["snapshots"]} == {
+        first_snapshot["snapshot_id"],
+        first_sibling["snapshot_id"],
+    }
+    status, _, response = request(server, "GET", "/api/public/program-authorizations", cookies=second_cookies)
+    assert status == 200
+    assert [item["snapshot_id"] for item in response["snapshots"]] == [second_snapshot["snapshot_id"]]
 
 
 def test_public_scope_snapshot_list_clamps_count_and_rejects_nonpositive_limit(web_server):

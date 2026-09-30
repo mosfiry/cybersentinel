@@ -869,6 +869,16 @@ function renderScopeSnapshotHistory(snapshots) {
       grid.appendChild(item);
     });
     card.append(title, grid);
+    const snapshotId = summary.snapshot_id;
+    if (typeof snapshotId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(snapshotId)) {
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "scope-snapshot-delete";
+      deleteButton.textContent = "حذف اللقطة";
+      deleteButton.setAttribute("aria-label", `حذف اللقطة ${snapshotId}`);
+      deleteButton.addEventListener("click", () => { void deleteScopeSnapshot(snapshotId, deleteButton); });
+      card.appendChild(deleteButton);
+    }
     fragment.appendChild(card);
   });
   list.replaceChildren(fragment);
@@ -915,6 +925,54 @@ async function refreshConnection() {
   if (state.ownerAuthenticated && !document.hidden) {
     await loadMissions();
     if (connection?.reconnected) await restoreConversation();
+  }
+}
+
+async function deleteScopeSnapshot(snapshotId, button) {
+  const message = $("#scopeSnapshotHistoryMessage");
+  if (!state.ownerAuthenticated) {
+    if (message) message.textContent = "سجّل الدخول بحساب المالك لحذف لقطة محفوظة.";
+    return;
+  }
+  if (typeof snapshotId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(snapshotId)) {
+    if (message) message.textContent = "تعذر تحديد اللقطة المطلوبة للحذف.";
+    return;
+  }
+  if (!window.confirm("هل تريد حذف هذه اللقطة المحفوظة نهائيًا؟ لا يمكن التراجع عن هذا الإجراء.")) return;
+
+  const previousLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "جارٍ الحذف...";
+  try {
+    const data = await api(`/api/public/program-authorizations/${encodeURIComponent(snapshotId)}`, {
+      method: "DELETE",
+    });
+    if (data.ok !== true) throw new Error("invalid_snapshot_deletion");
+    await loadScopeSnapshotHistory();
+  } catch (error) {
+    if (error.message === "owner_authorization_required") {
+      updateAuthUI({ authenticated: false });
+      return;
+    }
+    if (error.message === "snapshot_not_found" && state.ownerAuthenticated) {
+      await loadScopeSnapshotHistory();
+      const currentMessage = $("#scopeSnapshotHistoryMessage");
+      if (currentMessage && state.ownerAuthenticated) {
+        currentMessage.textContent = "لم تعد اللقطة متاحة لهذه الجلسة؛ حُدّثت القائمة الآمنة.";
+      }
+      return;
+    }
+    const currentMessage = $("#scopeSnapshotHistoryMessage");
+    if (currentMessage) {
+      currentMessage.textContent = error.message === "invalid csrf token"
+        ? "انتهت جلسة الحماية؛ أعد تحميل الصفحة وسجّل الدخول مجددًا."
+        : "تعذر حذف اللقطة المحفوظة؛ لم تُعرض تفاصيل داخلية.";
+    }
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = previousLabel;
+    }
   }
 }
 

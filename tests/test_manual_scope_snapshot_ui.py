@@ -134,6 +134,25 @@ def test_saved_scope_snapshot_history_uses_bounded_cookie_aware_get_and_safe_sum
     assert ".innerHTML" not in renderer
 
 
+def test_saved_scope_snapshot_delete_is_confirmed_owner_csrf_bound_and_refreshes_the_safe_list():
+    script = (ROOT / "web/app.js").read_text(encoding="utf-8")
+    renderer_start = script.index("function renderScopeSnapshotHistory(snapshots)")
+    renderer_end = script.index("\nasync function loadScopeSnapshotHistory", renderer_start)
+    renderer = script[renderer_start:renderer_end]
+    assert 'className = "scope-snapshot-delete"' in renderer
+    assert 'deleteScopeSnapshot(snapshotId, deleteButton)' in renderer
+
+    handler_start = script.index("async function deleteScopeSnapshot(snapshotId, button)")
+    handler_end = script.index("\n/* ── Owner manual Scope Snapshot", handler_start)
+    handler = script[handler_start:handler_end]
+    assert "window.confirm(" in handler
+    assert handler.index("window.confirm(") < handler.index('method: "DELETE"')
+    assert 'api(`/api/public/program-authorizations/${encodeURIComponent(snapshotId)}`' in handler
+    assert "await loadScopeSnapshotHistory()" in handler
+    assert "owner_session_id" not in handler
+    assert "session_id" not in handler
+
+
 def test_saved_scope_snapshot_history_refreshes_after_owner_login_and_clears_on_logout():
     script = (ROOT / "web/app.js").read_text(encoding="utf-8")
 

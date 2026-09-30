@@ -44,6 +44,7 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 from security.scope_store import (
     DEFAULT_SCOPE_SNAPSHOT_LIST_LIMIT,
     MAX_SCOPE_SNAPSHOT_LIST_LIMIT,
+    delete_snapshot_for_owner_session,
     list_snapshots_for_owner_session,
     save_snapshot,
 )
@@ -902,6 +903,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, {"ok": False, "error": "mission_busy"})
         except Exception:
             return self._send(400, {"ok": False, "error": "invalid_request"})
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        match = re.fullmatch(r"/api/public/program-authorizations/([A-Za-z0-9_-]{1,128})", parsed.path)
+        if match is None:
+            return self._send(404, {"ok": False, "error": "not_found"})
+        owner = self._public_mission_owner(csrf=True)
+        if owner is None:
+            return
+        try:
+            deleted = delete_snapshot_for_owner_session(
+                match.group(1),
+                owner_session_token=str(owner["session_id"]),
+            )
+            if not deleted:
+                return self._send(404, {"ok": False, "error": "snapshot_not_found"})
+            return self._send(200, {"ok": True})
+        except PermissionError as exc:
+            return self._send(403, {"ok": False, "error": str(exc)})
+        except ValueError as exc:
+            return self._send(400, {"ok": False, "error": str(exc)})
+        except Exception:
+            return self._send(500, {"ok": False, "error": "program_authorization_deletion_failed"})
 
     def log_message(self, fmt, *args):
         print("[bridge]", fmt % args)

@@ -152,6 +152,9 @@ button{font:inherit;cursor:pointer}
 .scope-snapshot-history-list{display:grid;gap:10px}
 .scope-snapshot-history-item{border:1px solid #29364b;background:#0c131e;border-radius:8px;padding:10px;display:grid;gap:8px}
 .scope-snapshot-history-item h3{margin:0;color:#bac5d6;font-size:12px}
+.scope-snapshot-delete{justify-self:start;border:1px solid #6b3037;border-radius:6px;background:#281216;color:#ffc4ca;padding:6px 10px;font:inherit;cursor:pointer}
+.scope-snapshot-delete:hover{background:#3b171e;color:#fff}
+.scope-snapshot-delete:focus-visible{outline:2px solid #ffc4ca;outline-offset:2px}
 .scope-snapshot-view form{display:grid;gap:10px;max-width:1100px}
 #scopeSnapshotFields{border:0;margin:0;padding:0;min-width:0;display:grid;gap:12px}
 .scope-meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}

@@ -123,6 +123,33 @@ def delete_snapshot(snapshot_id: str) -> bool:
         return conn.execute("DELETE FROM scope_snapshots WHERE snapshot_id = ?", (snapshot_id,)).rowcount > 0
 
 
+def delete_snapshot_for_owner_session(
+    snapshot_id: str,
+    *,
+    owner_session_token: str | None,
+) -> bool:
+    """Delete one snapshot only when it is bound to the authenticated Owner session."""
+    from .owner_policy import authenticate_owner
+
+    authentication = authenticate_owner(owner_session_token)
+    owner_session_id = str(authentication.session_id or "")
+    if not owner_session_id.strip():
+        raise PermissionError("owner session id required for persisted scope snapshots")
+    if not isinstance(snapshot_id, str) or not snapshot_id.strip() or len(snapshot_id) > 128:
+        raise ValueError("invalid_snapshot_id")
+
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """DELETE FROM scope_snapshots
+               WHERE snapshot_id = ?
+                 AND CASE WHEN json_valid(snapshot_json)
+                          THEN json_extract(snapshot_json, '$.authorization.owner_session_id')
+                          ELSE NULL END = ?""",
+            (snapshot_id, owner_session_id),
+        )
+        return cursor.rowcount > 0
+
+
 def record_rate_event(rate_key: str, occurred_at: float) -> None:
     with _LOCK, _connect() as conn:
         conn.execute("INSERT INTO scope_rate_events(rate_key, occurred_at) VALUES(?, ?)", (rate_key, occurred_at))
