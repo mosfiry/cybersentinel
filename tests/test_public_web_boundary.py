@@ -654,3 +654,175 @@ def test_manual_program_authorization_rejects_duplicate_json_fields(web_server):
     assert status == 400
     assert response["error"] == "duplicate_json_field"
     assert persisted_scope_count() == 0
+
+
+def save_manual_scope_snapshot(server, public_cookie, owner_cookie, csrf, *, payload=None):
+    status, _, response = request(
+        server,
+        "POST",
+        "/api/public/program-authorizations",
+        payload or manual_scope_payload(),
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+    assert status == 201
+    return response["snapshot"]
+
+
+def test_public_scope_snapshot_list_returns_only_safe_current_session_summaries(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    owner_session = owner_password.resolve_session(owner_cookie)
+    assert owner_session is not None
+    created_summary = save_manual_scope_snapshot(server, public_cookie, owner_cookie, csrf)
+
+    status, _, response = request(
+        server,
+        "GET",
+        "/api/public/program-authorizations",
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+    )
+
+    assert status == 200
+    assert response == {"ok": True, "snapshots": [created_summary]}
+    assert set(response["snapshots"][0]) == set(created_summary)
+    serialized = json.dumps(response)
+    for private_value in (
+        "targets",
+        "api.example.test",
+        "admin.example.test",
+        "api-prod",
+        "evidence_hash",
+        "session_id",
+        "owner_session_id",
+        owner_cookie,
+        csrf,
+        owner_session["session_id"],
+    ):
+        assert private_value not in serialized
+
+
+def test_public_scope_snapshot_list_hides_prior_rotated_owner_session_records(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, first_headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    first_owner_cookie = cookie_value(first_headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    first_session = owner_password.resolve_session(first_owner_cookie)
+    assert first_session is not None
+    created_summary = save_manual_scope_snapshot(server, public_cookie, first_owner_cookie, csrf)
+
+    status, rotated_headers, _ = login(
+        server,
+        public_cookie,
+        csrf,
+        owner_cookie=first_owner_cookie,
+    )
+    assert status == 200
+    rotated_owner_cookie = cookie_value(rotated_headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    assert rotated_owner_cookie != first_owner_cookie
+    assert owner_password.resolve_session(first_owner_cookie) is None
+
+    status, _, response = request(
+        server,
+        "GET",
+        f"/api/public/program-authorizations?owner_session_id={first_session['session_id']}&snapshot_id={created_summary['snapshot_id']}",
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={rotated_owner_cookie}",
+    )
+
+    assert status == 200
+    assert response == {"ok": True, "snapshots": []}
+    assert first_session["session_id"] not in json.dumps(response)
+    assert created_summary["snapshot_id"] not in json.dumps(response)
+
+
+def test_public_scope_snapshot_list_preserves_public_owner_origin_and_safe_get_csrf_guards(web_server, monkeypatch):
+    server, _ = web_server
+    status, _, response = request(server, "GET", "/api/public/program-authorizations")
+    assert status == 401
+    assert response["error"] == "public session required"
+
+    public_cookie, csrf = create_public_session(server)
+    status, _, response = request(
+        server,
+        "GET",
+        "/api/public/program-authorizations",
+        cookies=public_cookie,
+    )
+    assert status == 403
+    assert response["error"] == "owner_authorization_required"
+
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    cookies = f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}"
+
+    status, _, response = request(
+        server,
+        "GET",
+        "/api/public/program-authorizations",
+        cookies=cookies,
+    )
+    assert status == 200
+    assert response == {"ok": True, "snapshots": []}
+
+    status, _, response = request(
+        server,
+        "GET",
+        "/api/public/program-authorizations",
+        cookies=cookies,
+        origin="https://attacker.example",
+    )
+    assert status == 403
+    assert response["error"] == "origin_not_allowed"
+
+    monkeypatch.setattr(bridge, "PUBLIC_WEB_ENABLED", False)
+    status, _, response = request(
+        server,
+        "GET",
+        "/api/public/program-authorizations",
+        cookies=cookies,
+    )
+    assert status == 404
+    assert response["error"] == "public_boundary_disabled"
+
+
+def test_public_scope_snapshot_list_clamps_count_and_rejects_nonpositive_limit(web_server):
+    server, _ = web_server
+    public_cookie, csrf = create_public_session(server)
+    status, headers, _ = login(server, public_cookie, csrf)
+    assert status == 200
+    owner_cookie = cookie_value(headers["Set-Cookie"], bridge.PUBLIC_OWNER_SESSION_COOKIE)
+    owner_session = owner_password.resolve_session(owner_cookie)
+    assert owner_session is not None
+
+    from api.program_authorizations import build_manual_scope_snapshot
+
+    for index in range(53):
+        payload = manual_scope_payload()
+        payload["program_id"] = f"bounded-program-{index}"
+        snapshot = build_manual_scope_snapshot(payload)
+        scope_store.save_snapshot(snapshot, owner_session_token=owner_session["session_id"])
+
+    cookies = f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}"
+    status, _, response = request(
+        server,
+        "GET",
+        "/api/public/program-authorizations?limit=999",
+        cookies=cookies,
+    )
+    assert status == 200
+    assert len(response["snapshots"]) == 50
+    assert all("owner_session_id" not in snapshot for snapshot in response["snapshots"])
+
+    status, _, response = request(
+        server,
+        "GET",
+        "/api/public/program-authorizations?limit=0",
+        cookies=cookies,
+    )
+    assert status == 400
+    assert response["error"] == "invalid_limit"

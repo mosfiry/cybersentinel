@@ -11,6 +11,8 @@ from .scope import ProgramAuthorization, ScopeSnapshot, TargetIdentity, make_sna
 
 SCOPE_DB_PATH = Path(__import__("os").environ.get("SCOPE_DB_PATH", "~/.cybersentinel-x/scope.sqlite3")).expanduser()
 _LOCK = threading.RLock()
+DEFAULT_SCOPE_SNAPSHOT_LIST_LIMIT = 20
+MAX_SCOPE_SNAPSHOT_LIST_LIMIT = 50
 
 
 def _connect() -> sqlite3.Connection:
@@ -62,12 +64,7 @@ def save_snapshot(snapshot: ScopeSnapshot, *, owner_session_token: str | None = 
     return snapshot
 
 
-def get_snapshot(snapshot_id: str) -> ScopeSnapshot | None:
-    with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT snapshot_json FROM scope_snapshots WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
-    if row is None:
-        return None
-    data = json.loads(row["snapshot_json"])
+def _snapshot_from_data(data: dict[str, Any]) -> ScopeSnapshot:
     auth_data = data["authorization"]
     stored_hash = auth_data.get("evidence_hash", "")
     auth = ProgramAuthorization(**{**auth_data, "evidence_hash": "", "in_scope_assets": tuple(auth_data["in_scope_assets"]), "out_of_scope_assets": tuple(auth_data.get("out_of_scope_assets", [])), "allowed_methods": tuple(auth_data.get("allowed_methods", [])), "prohibited_methods": tuple(auth_data.get("prohibited_methods", []))})
@@ -75,6 +72,50 @@ def get_snapshot(snapshot_id: str) -> ScopeSnapshot | None:
         raise ValueError("scope_evidence_hash_mismatch")
     targets = tuple(TargetIdentity(**{**item, "allowed_ports": tuple(item.get("allowed_ports", [])), "allowed_paths": tuple(item.get("allowed_paths", [])), "excluded_paths": tuple(item.get("excluded_paths", []))}) for item in data["targets"])
     return make_snapshot(data["snapshot_id"], auth, list(targets), expires_at=data.get("expires_at"), created_at=data.get("created_at"))
+
+
+def get_snapshot(snapshot_id: str) -> ScopeSnapshot | None:
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT snapshot_json FROM scope_snapshots WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+    if row is None:
+        return None
+    return _snapshot_from_data(json.loads(row["snapshot_json"]))
+
+
+def list_snapshots_for_owner_session(
+    owner_session_token: str | None,
+    *,
+    limit: int = DEFAULT_SCOPE_SNAPSHOT_LIST_LIMIT,
+) -> list[ScopeSnapshot]:
+    """List only snapshots bound to this currently authenticated Owner session."""
+    from .owner_policy import authenticate_owner
+
+    authentication = authenticate_owner(owner_session_token)
+    owner_session_id = str(authentication.session_id or "")
+    if not owner_session_id.strip():
+        raise PermissionError("owner session id required for persisted scope snapshots")
+    if type(limit) is not int or not 1 <= limit <= MAX_SCOPE_SNAPSHOT_LIST_LIMIT:
+        raise ValueError("invalid_limit")
+
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """SELECT snapshot_json FROM scope_snapshots
+               WHERE CASE WHEN json_valid(snapshot_json)
+                          THEN json_extract(snapshot_json, '$.authorization.owner_session_id')
+                          ELSE NULL END = ?
+               ORDER BY created_at DESC, snapshot_id ASC
+               LIMIT ?""",
+            (owner_session_id, limit),
+        ).fetchall()
+
+    snapshots = []
+    for row in rows:
+        data = json.loads(row["snapshot_json"])
+        authorization = data.get("authorization")
+        if not isinstance(authorization, dict) or authorization.get("owner_session_id") != owner_session_id:
+            continue
+        snapshots.append(_snapshot_from_data(data))
+    return snapshots
 
 
 def delete_snapshot(snapshot_id: str) -> bool:

@@ -41,7 +41,12 @@ from agent.agent_core import AgentCore
 from agent.mission_task_adapter import task_owner_matches
 from agent.planning import Plan, PlanStep
 from security.mission_authorization import MissionAuthorizationSnapshot
-from security.scope_store import save_snapshot
+from security.scope_store import (
+    DEFAULT_SCOPE_SNAPSHOT_LIST_LIMIT,
+    MAX_SCOPE_SNAPSHOT_LIST_LIMIT,
+    list_snapshots_for_owner_session,
+    save_snapshot,
+)
 from workspace import Workspace, WorkspaceBoundaryError, WorkspacePolicy, WorkspacePolicyError
 
 ROOT = Path(__file__).resolve().parent
@@ -339,6 +344,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, {"ok": False, "error": str(exc)})
             except Exception:
                 return self._send(503, {"ok": False, "error": "model_catalog_unavailable"})
+        if parsed.path == "/api/public/program-authorizations":
+            owner = self._public_mission_owner(csrf=False)
+            if owner is None:
+                return
+            requested_limits = parse_qs(parsed.query, keep_blank_values=True).get("limit", [])
+            raw_limit = requested_limits[0] if len(requested_limits) == 1 else str(DEFAULT_SCOPE_SNAPSHOT_LIST_LIMIT)
+            if len(requested_limits) > 1 or not re.fullmatch(r"[0-9]{1,9}", raw_limit):
+                return self._send(400, {"ok": False, "error": "invalid_limit"})
+            requested_limit = int(raw_limit)
+            if requested_limit < 1:
+                return self._send(400, {"ok": False, "error": "invalid_limit"})
+            limit = min(requested_limit, MAX_SCOPE_SNAPSHOT_LIST_LIMIT)
+            try:
+                snapshots = list_snapshots_for_owner_session(str(owner["session_id"]), limit=limit)
+                return self._send(200, {"ok": True, "snapshots": [public_snapshot_summary(item) for item in snapshots]})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except Exception:
+                return self._send(500, {"ok": False, "error": "program_authorization_list_failed"})
         if parsed.path.startswith("/api/public/conversations/"):
             owner = self._public_mission_owner()
             if owner is None:
