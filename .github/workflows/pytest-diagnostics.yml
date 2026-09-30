@@ -55,7 +55,7 @@ jobs:
         run: |
           S="${GITHUB_SHA:0:12}"
           {
-            echo "# OWNER charter audit â run $S"
+            echo "# OWNER charter audit - run $S"
             echo
             echo "## Files scanned:"
             git ls-files | wc -l
