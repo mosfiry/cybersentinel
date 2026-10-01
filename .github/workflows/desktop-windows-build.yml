@@ -1,0 +1,54 @@
+name: desktop-windows-build
+
+on:
+  push:
+    branches: ['desktop/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout desktop branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Generate application icon
+        run: python desktop/scripts/make_icon.py
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm install --no-fund --no-audit
+      - name: Build Windows executables
+        working-directory: desktop
+        run: npx electron-builder --win nsis portable --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Verify produced executables
+        shell: pwsh
+        run: |
+          $exes = Get-ChildItem desktop/dist -Filter *.exe -ErrorAction SilentlyContinue
+          if (-not $exes) { throw 'No Windows executable was produced' }
+          $exes | ForEach-Object { "{0} {1} bytes" -f $_.Name, $_.Length }
+      - name: Upload Windows build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CyberSentinel-Desktop-Windows
+          path: desktop/dist/*.exe
+          if-no-files-found: error
+          retention-days: 30

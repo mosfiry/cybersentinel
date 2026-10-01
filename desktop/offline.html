@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+  <title>CyberSentinel Desktop</title>
+</head>
+<body>
+<main id="offline">
+  <div class="badge">CS</div>
+  <h1>CyberSentinel Desktop</h1>
+  <p id="status">جارٍ الاتصال بالخادم المحلي...</p>
+  <p id="detail" class="detail"></p>
+  <p class="hint">هذا التطبيق عميل للخادم المحلي CyberSentinel (bridge) على <span id="bridgeUrl"></span>. لا يحتوي التطبيق على منطق خلفي خاص به، ولا يمنح أي صلاحية إضافية.</p>
+  <button id="retry" type="button">إعادة المحاولة</button>
+  <p class="help">لتشغيل الخادم: ثبّت المتطلبات، اضبط <code>.env</code> (BRIDGE_TOKEN و PUBLIC_WEB_ENABLED=true)، أنشئ حساب المالك عبر <code>python -m security.owner_password_bootstrap</code>، ثم شغّل <code>python bridge.py</code>.</p>
+</main>
+<script>
+  var status = document.getElementById('status');
+  var detail = document.getElementById('detail');
+  var retry = document.getElementById('retry');
+  var messages = {
+    starting: 'جارٍ بدء التطبيق...',
+    connecting: 'جارٍ الاتصال بالخادم المحلي...',
+    connected: 'تم الاتصال.',
+    unavailable: 'الخادم المحلي غير متاح حاليًا.',
+    'backend-disabled': 'الخادم يعمل لكن واجهة الويب معطلة (PUBLIC_WEB_ENABLED).',
+    'bridge-error': 'تعذّر تشغيل عملية الخادم.',
+    'bridge-exited': 'توقفت عملية الخادم.'
+  };
+  function render(state) {
+    status.textContent = messages[state.phase] || messages.connecting;
+    detail.textContent = state.detail || '';
+    if (state.bridgeUrl) {
+      document.getElementById('bridgeUrl').textContent = state.bridgeUrl.replace(/^https?:\/\//, '');
+    }
+  }
+  retry.addEventListener('click', function () {
+    status.textContent = 'جارٍ إعادة المحاولة...';
+    detail.textContent = '';
+    window.cybersentinelDesktop.retry().then(render);
+  });
+  window.cybersentinelDesktop.onState(render);
+  window.cybersentinelDesktop.getState().then(render);
+</script>
+<style>
+  body { margin: 0; background: #080c12; color: #dbe7f3; font-family: "Segoe UI", Tahoma, sans-serif; }
+  main { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 40px 24px; box-sizing: border-box; text-align: center; }
+  .badge { width: 64px; height: 64px; border: 2px solid #22d3ee; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 24px; color: #22d3ee; }
+  h1 { font-size: 22px; margin: 0; }
+  .detail { max-width: 640px; white-space: pre-wrap; color: #f8b4b4; }
+  .hint, .help { max-width: 640px; color: #8fa3b8; font-size: 13px; line-height: 1.8; }
+  code { color: #22d3ee; direction: ltr; display: inline-block; }
+  button { background: #12344a; color: #e6f6ff; border: 1px solid #22d3ee; border-radius: 8px; padding: 10px 26px; font-size: 15px; cursor: pointer; }
+  button:hover { background: #17405c; }
+</style>
+</body>
+</html>
