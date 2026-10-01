@@ -172,6 +172,44 @@ def test_restart_never_continues_in_flight_without_reconciliation(tmp_path, monk
     assert execute_calls == [], "an unknown in-flight outcome must never be re-executed blindly"
 
 
+def test_crash_after_successful_tool_before_final_save_requires_reconciliation(tmp_path, monkeypatch):
+    import tools.registry
+
+    db = _db(tmp_path)
+    executed = []
+    monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: executed.append(a) or {"ok": True, "criterion_id": "goal"})
+
+    class CrashAfterToolSave(MissionStore):
+        def __init__(self, db_path):
+            super().__init__(db_path)
+            self.crash_after_in_flight = False
+
+        def save(self, mission):
+            if self.crash_after_in_flight and (mission.checkpoint or {}).get("status") == "completed":
+                raise RuntimeError("simulated crash after tool receipt")
+            return super().save(mission)
+
+    store = CrashAfterToolSave(db)
+    runtime = MissionRuntime(store, executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    mission = _mission(runtime)
+    store.crash_after_in_flight = True
+
+    class OneShot:
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 1),))
+
+    with pytest.raises(RuntimeError, match="after tool receipt"):
+        runtime.run_model_loop(mission.mission_id, OneShot(), tools=[{"name": "status"}], max_turns=1)
+    assert executed == [("status", None)]
+
+    restarted = _runtime(db)
+    resumed_executions = []
+    monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: resumed_executions.append(a) or {"ok": True})
+    refused = restarted.run_model_loop(mission.mission_id, OneShot(), tools=[{"name": "status"}], max_turns=1)
+    assert refused.status is MissionStatus.RECOVERY_REQUIRED
+    assert resumed_executions == []
+
+
 def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkeypatch):
     import tools.registry
 
