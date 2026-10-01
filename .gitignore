@@ -25,6 +25,11 @@ credentials.json
 secrets/
 tokens/
 
+# Desktop client build outputs
+node_modules/
+desktop/dist/
+desktop/build/
+
 # OS/editor files
 .DS_Store
 .vscode/

@@ -1,0 +1,48 @@
+{
+  "name": "cybersentinel-desktop",
+  "productName": "CyberSentinel",
+  "version": "1.0.0",
+  "description": "CyberSentinel X desktop shell over the existing loopback bridge and web client",
+  "author": "Mohammed Sfiry",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "icon": "node tools/make-icon.js",
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "ly.cybersentinel.desktop",
+    "productName": "CyberSentinel",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "unavailable.html",
+      "build/icon.png"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "CyberSentinel-Setup-${version}.exe"
+    },
+    "portable": {
+      "artifactName": "CyberSentinel-Portable-${version}.exe"
+    }
+  }
+}
