@@ -1,0 +1,46 @@
+{
+  "name": "cybersentinel-desktop",
+  "productName": "CyberSentinel Desktop",
+  "version": "1.0.0",
+  "description": "CyberSentinel X desktop shell: existing web UI + existing local bridge backend",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable --publish never"
+  },
+  "devDependencies": {
+    "electron": "^31.7.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "app.cybersentinel.desktop",
+    "productName": "CyberSentinel Desktop",
+    "copyright": "Copyright (c) 2026 mosfiry",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "offline.html"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "artifactName": "CyberSentinel-Desktop-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "CyberSentinel-Desktop-Portable-${version}.${ext}"
+    }
+  }
+}
