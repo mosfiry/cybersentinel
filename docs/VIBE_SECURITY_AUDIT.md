@@ -147,3 +147,48 @@ test_phase6k7b_mission_runtime.py, test_task_mission_compatibility.py.
   remains a documented gap (V1/V0), nothing invented.
 
 ## Backend modifications by Vibe in V3: 0
+
+
+## V4 — LEASE / FENCING HARDENING — VERIFIED (implementation + CI)
+
+Source of truth: agent/mission_worker.py at 32e2677a24c7; tests/test_lease_fencing.py;
+docs/LEASE_FENCING_MODEL.md (gaps G1-G5, designs F1-F6).
+
+Implemented fencing model (all in MissionQueue SQL predicates, single-statement
+compare-and-set under SQLite transactions):
+
+- lease_epoch column: monotonic fencing token, advanced by claim_next, recover_expired,
+  and recover_after_restart. Every ownership transition strictly increases the epoch.
+- update()/release()/heartbeat() with worker_id now enforce owner match AND
+  lease_expires_at > now (AND lease_epoch = expected when supplied); rowcount != 1
+  raises LeaseLostError. Stale workers cannot write outcomes, release, or re-extend
+  leases after expiry or takeover.
+- run_once threads the claimed lease_epoch and the caller clock into every queue call;
+  a stale worker's final update/release is rejected and never overwrites the reclaiming
+  worker's state (LeaseLostError is caught and the queue truth is returned).
+- Ambiguous in-flight execution (worker exception with checkpoint status in_flight or
+  mission RECOVERY_REQUIRED) converges to RECOVERY_REQUIRED + queue WAITING_FOR_TOOL
+  with an explicit reconciliation error; it never becomes SUCCESS or FAILED.
+- Exactly-once is claimed ONLY for internal single-writer lease transitions
+  (claim is atomic via BEGIN IMMEDIATE); external side effects remain at-least-once
+  with a deterministic RECOVERY_REQUIRED path (no exactly-once external claim).
+
+Test battery (13 deterministic frozen-clock tests, tests/test_lease_fencing.py):
+epoch monotonicity; stale epoch rejection on update/release/heartbeat; expired-lease
+heartbeat and outcome rejection; legacy-caller expiry fencing; valid-path success;
+same-worker stale-epoch rejection; single concurrent claimant; restart recovery
+fencing; no duplicate completion after stale ack; crash-after-side-effect recovery;
+duplicate delivery convergence.
+
+CI (head 32e2677a24c7): test (3.13) SUCCESS (runs 37005576764, 37005583646);
+pytest-diagnostics SUCCESS (runs 37005576769, 37005583770); vibe-diagnostics SUCCESS
+(run 37005576781, zero FAILED lines); export SUCCESS; Workers Builds FAILURE is
+pre-existing on all branches.
+
+Compatibility notes: tests/test_autonomous_foundation.py gained one explicit now
+argument (V4.2.1) — intent preserved, fenced semantics unchanged; no production caller
+passes worker_id without now except run_once's heartbeat callback, which uses the real
+clock by design. api/missions.py and bridge.py call update()/enqueue() without
+worker_id and are unaffected (VERIFIED by caller inventory).
+
+## Backend modifications by Vibe in V4: agent/mission_worker.py, tests listed above.
