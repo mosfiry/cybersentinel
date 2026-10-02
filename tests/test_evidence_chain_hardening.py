@@ -63,6 +63,7 @@ def test_chain_rejects_reordering_and_replay(tmp_path):
     store = EvidenceChainStore(tmp_path / "evidence.sqlite3")
     store.append(observed("claim-1", "tool", {"k": 1}, request_id="req-1"))
     store.append(observed("claim-2", "tool", {"k": 2}, request_id="req-1"))
+    store.append(observed("claim-3", "tool", {"k": 3}, request_id="req-1"))
     records = store.list()
     assert verify_chain(records) is True
     # replaying a record as an extra slot breaks the expected sequence
