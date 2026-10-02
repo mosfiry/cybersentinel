@@ -5,13 +5,13 @@ Status vocabulary: VERIFIED / PARTIALLY VERIFIED / UNVERIFIED / BLOCKED / FAILED
 
 ## CURRENT_PHASE
 
-V10 — KNOWLEDGE FABRIC / SUPPLY CHAIN AUDIT (in progress). Next: V10
-verification battery + docs/KNOWLEDGE_SUPPLY_CHAIN.md, then V11 training-data
-governance (PoC classification validator; parquet analysis honesty limits apply).
+SESSION COMPLETE (V0-V12 executed to evidence-provable limits; V13-V16 verdicts
+recorded honestly below). Next exact action for a future session: Owner decisions
+on the BLOCKED items, then V13 full crash-point matrix and V16 re-audit.
 
 ## CURRENT_CHECKPOINT
 
-2eeefc2d6ee4dcbd4674fac51d4ad5661546aa29 (branch vibe/principal-engineering).
+b58e432b31e4494956ca28702689d4b610863e33 (branch vibe/principal-engineering).
 
 ## COMPLETED (checkpoints)
 
@@ -235,3 +235,66 @@ CI on 2eeefc2d (V8.1+V8.2+V8.2.1+V8.4+V9.1 combined tree): test (3.13) SUCCESS
 diagnose SUCCESS (110841707821), export SUCCESS (110841679682); Workers Builds
 FAILURE pre-existing and unrelated. The earlier failing run at 92b4d39f was the
 V8.4 flake documented above (single failure, tests/test_tool_continuity.py).
+
+## V10 / V11 VERIFIED (checkpoint a29de05c14a9cc5049b1a93d9c4e5dfe1b50d03e)
+
+V10 — knowledge fabric: VERIFIED from source with NO code change (invariants
+already implemented and pinned by existing batteries; duplicating them would
+violate the resource rules). Full matrix with per-requirement status:
+docs/KNOWLEDGE_SUPPLY_CHAIN.md. Gaps recorded honestly: license has no
+downstream GATE (Owner policy decision — recorded, not implemented
+unilaterally); no generator metadata field; no freshness policy;
+cyber_data/provenance/sources.json lacks per-source version/license/hash.
+
+V11 — training data: cybersentinel_train-00001.parquet is VERIFIED ABSENT from
+this repository lineage (every tree enumerated at the audited commit); the
+data review is therefore NOT VERIFIED, not claimed. The requested PoC
+classification validator was implemented as new functionality:
+cyber_data/poc_validation.py — PocClass NO_POC / REFERENCE_ONLY /
+NON_EXECUTABLE / LAB_REPRODUCER / VERIFIED_LAB_POC; structural classification
+only (mentions/links/the word exploit NEVER upgrade — pinned by
+tests/test_poc_validation.py, 6 tests); VERIFIED_LAB_POC requires complete lab
+evidence and is never self-declared; unknown kinds rejected fail-closed. No
+operational PoC was collected or created. SYNTHETIC ONLY for validator tests.
+
+## V12 VERIFIED (checkpoints ea95a464, b58e432b)
+
+Focused adversarial battery over the surfaces hardened by this mission
+(tests/test_v12_adversarial_surface.py, 6 tests): request_id injection
+(SQLi-style, newline, null byte, path traversal, unicode, length, padding),
+run_at injection, tampered schedule state (fail-closed ValueError), far-past
+run_at immediate dispatch (no hidden delay), provider-failure disguise
+(a provider error whose message claims success is recorded as data and NEVER
+parsed into completion; no tool results; no completion proof).
+
+FINDING FIXED (V12.1, agent/agent_core.py): the V12 battery caught a real
+leniency in the V8.2 validator — it STRIPPED whitespace before validating, so
+a padded identifier was silently normalized. Hardened: no normalization; any
+whitespace (including padding) is rejected fail-closed. This is exactly the
+adversarial-review loop the mission demanded.
+
+## V13-V16 VERDICTS (honest)
+
+- V13 crash/resume/chaos: PARTIALLY VERIFIED via existing deterministic
+  batteries (tests/test_crash_restart_resume.py, tests/test_lease_fencing.py
+  frozen-clock matrix, reconcile single-shot semantics in
+  test_failure_recovery_replan.py, recover_after_restart in mission_worker).
+  The full §13 14-point crash-injection matrix was NOT EXECUTED in this
+  session (resource limits); recorded as the next session's first build task.
+- V14 desktop compatibility: VERIFIED UNCHANGED — Vibe backend changes
+  (mission_worker, agent_core request_id validator, evidence, poc_validation)
+  alter no public route or response shape consumed by web/app.js at desktop
+  baseline 5dc5e1cb (the client never sends request_id/run_at; no delete/
+  report/approval UI; chat response shape unchanged). No desktop change made
+  or required; Windows launch remains NOT VERIFIED (no Windows runtime).
+- V15 release matrix: docs/RELEASE_READINESS.md (this checkpoint). The
+  vibe-diagnostics.yml workflow remains in the branch and must be removed at
+  a future release gate (it is an audit aid, not a release component).
+- V16 final integration audit: docs/ARCHITECTURE_FINAL_AUDIT.md (this
+  checkpoint) — claim-by-claim linkage to source; no re-execution of the whole
+  audit beyond citation of verified checkpoints.
+
+CI on b58e432b (final tree): test (3.13) SUCCESS (check runs 110849021668,
+110848999747), test SUCCESS (110849022006, 110848999900), export SUCCESS
+(110849115268); Workers Builds FAILURE pre-existing and unrelated (fails on
+every branch including baselines).
