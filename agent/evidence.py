@@ -74,6 +74,11 @@ class EvidenceChainStore:
             payload = dict(item)
             payload["sequence"] = sequence
             payload["previous_hash"] = previous
+            # A caller may supply a current_hash precomputed over sequence 0
+            # and an empty previous hash (the observed() factory does); the
+            # sequenced record must be hashed after its chain position is
+            # assigned, or the appended chain can never verify.
+            payload.pop("current_hash", None)
             record = Evidence(**payload)
             db.execute("INSERT INTO evidence_chain(sequence,current_hash,payload) VALUES(?,?,?)", (sequence, record.current_hash, json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)))
         return record.to_dict()
