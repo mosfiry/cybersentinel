@@ -9,6 +9,7 @@ import json
 import sqlite3
 import uuid
 
+from .effect_intent import ExternalEffectState
 from .mission import MissionStatus, MissionStore
 
 
@@ -416,6 +417,12 @@ class MissionWorker:
                 raise ValueError("fenced mission writes require mission and queue to share one SQLite authority file")
             fenced_store = runtime_store.with_claim(claim, now=now)
             runtime.store = fenced_store
+            from .mission_runtime import MissionRuntime
+            if isinstance(runtime, MissionRuntime):
+                runtime.bind_worker_dispatch(fenced_store)
+                current_mission = fenced_store.load(item.mission_id)
+                if current_mission is not None:
+                    fenced_store.effect_intents.recover_dispatching(current_mission)
 
         def heartbeat() -> None:
             nonlocal claim
@@ -438,6 +445,16 @@ class MissionWorker:
             # stale worker must not overwrite the queue outcome or report FAILED.
             return self.queue.get(item.mission_id)
         except Exception as exc:
+            if fenced_store is not None:
+                try:
+                    pending = fenced_store.effect_intents.list_for_mission(item.mission_id)
+                    if any(intent.state is ExternalEffectState.DISPATCHING for intent in pending):
+                        # A prior DISPATCHING commit means the side effect may have started.
+                        # Preserve the live claim for expiry/recovery; never ack it as FAILED.
+                        return self.queue.get(item.mission_id)
+                except Exception:
+                    # If intent state cannot be inspected, fail closed and avoid a terminal ack.
+                    return self.queue.get(item.mission_id)
             try:
                 return self.queue.update(
                     item.mission_id, WorkerMissionState.FAILED, error=f"{type(exc).__name__}: {exc}", claim=claim, now=now

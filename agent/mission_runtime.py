@@ -7,6 +7,7 @@ import hashlib
 import json
 
 from .mission import Mission, MissionStatus, MissionStore
+from .effect_dispatch import EffectDispatchReceipt, EffectOutcomeUnknownError, MissionEffectDispatcher
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
 from .trajectory import EventType
 from .observation import Observation
@@ -32,6 +33,59 @@ class MissionRuntime:
         self.interpreter = interpreter or ObservationInterpreter()
         self.require_authorization_snapshot = require_authorization_snapshot
         self.authorization_snapshot_factory = authorization_snapshot_factory
+        self.effect_dispatcher: MissionEffectDispatcher | None = None
+
+    def bind_worker_dispatch(self, claim_bound_store) -> None:
+        """Require effect-intent dispatch whenever this runtime is worker-bound."""
+        from .effect_intent import ClaimBoundEffectIntentRepository
+
+        if not isinstance(getattr(claim_bound_store, "effect_intents", None), ClaimBoundEffectIntentRepository):
+            raise ValueError("worker dispatch requires a claim-bound effect-intent repository")
+        self.store = claim_bound_store
+        self.effect_dispatcher = MissionEffectDispatcher(claim_bound_store)
+
+    def _dispatch_effect(self, mission, *, logical_action_id, tool_id, payload, handler, action_id=None, step_id=None, result_factory=None):
+        if self.effect_dispatcher is None:
+            return handler()
+        return self.effect_dispatcher.dispatch(
+            mission,
+            logical_action_id=logical_action_id,
+            tool_id=tool_id,
+            payload=payload,
+            handler=handler,
+            action_id=action_id,
+            step_id=step_id,
+            result_factory=result_factory,
+        )
+
+    @staticmethod
+    def _step_effect_payload(mission, step) -> dict[str, Any]:
+        return {"step": step.to_dict(), "plan_version": mission.plan.version}
+
+    def _can_resume_prepared_step(self, mission) -> bool:
+        if self.effect_dispatcher is None:
+            return False
+        checkpoint = dict(mission.checkpoint or {})
+        step = mission.current_plan_step
+        if checkpoint.get("status") != "in_flight" or step is None or not checkpoint.get("effect_id"):
+            return False
+        action_id = f"{mission.mission_id}:{mission.plan.version}:{step.step_id}:{mission.current_step}"
+        if (
+            checkpoint.get("action_id") != action_id
+            or checkpoint.get("step_id", step.step_id) != step.step_id
+            or checkpoint.get("tool_id") != step.action
+        ):
+            return False
+        try:
+            intent = self.store.effect_intents.get(str(checkpoint["effect_id"]))
+        except (KeyError, ValueError):
+            return False
+        from .effect_intent import ExternalEffectState
+        return (
+            intent.state is ExternalEffectState.PREPARED
+            and intent.logical_action_id == action_id
+            and intent.tool_id == step.action
+        )
 
     def _mission_authorization(self, mission: Mission) -> tuple[bool, str]:
         if not self.require_authorization_snapshot:
@@ -352,19 +406,40 @@ class MissionRuntime:
                         try:
                             mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                             self.store.save(mission)
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
-                            observation = dict(raw or {})
-                            observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
-                            mission.record_observation(observation)
+                            receipt = self._dispatch_effect(
+                                mission,
+                                logical_action_id=proposal.action_id or proposal.tool_call_id,
+                                tool_id=proposal.name,
+                                payload={"arguments": proposal.arguments, "plan_version": mission.plan.version},
+                                handler=lambda: execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id),
+                                action_id=proposal.action_id or proposal.tool_call_id,
+                                step_id=proposal.step_id or proposal.name,
+                                result_factory=lambda raw: {
+                                    **dict(raw or {}),
+                                    "type": "tool_observation",
+                                    "action_id": proposal.action_id or proposal.tool_call_id,
+                                    "step_id": proposal.step_id or proposal.name,
+                                    "mission_id": mission.mission_id,
+                                    "tool_call_id": proposal.tool_call_id,
+                                },
+                            )
+                            already_confirmed = isinstance(receipt, EffectDispatchReceipt)
+                            observation = dict(receipt.observation if already_confirmed else (receipt or {}))
+                            if not already_confirmed:
+                                observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+                                mission.record_observation(observation)
                             if current_step is not None:
                                 self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
-                            if bool(observation.get("success", observation.get("ok", True))):
+                            if bool(observation.get("success", observation.get("ok", True))) and not already_confirmed:
                                 criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
                                 mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
-                            mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
+                            if not already_confirmed:
+                                mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
                             mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                             result = ToolCallResult(proposal, True, result=observation)
                         except Exception as exc:
+                            if isinstance(exc, EffectOutcomeUnknownError):
+                                return mission
                             mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
                             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
                             return self.store.save(mission)
@@ -400,25 +475,49 @@ class MissionRuntime:
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
             proposal, argument, decision = item
             try:
-                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id) or {})
+                return self._dispatch_effect(
+                    mission,
+                    logical_action_id=proposal.action_id or proposal.tool_call_id,
+                    tool_id=proposal.name,
+                    payload={"arguments": proposal.arguments, "plan_version": mission.plan.version},
+                    handler=lambda: execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id),
+                    action_id=proposal.action_id or proposal.tool_call_id,
+                    step_id=proposal.step_id or proposal.name,
+                    result_factory=lambda raw: {
+                        **dict(raw or {}),
+                        "type": "tool_observation",
+                        "action_id": proposal.action_id or proposal.tool_call_id,
+                        "step_id": proposal.step_id or proposal.name,
+                        "mission_id": mission.mission_id,
+                        "tool_call_id": proposal.tool_call_id,
+                    },
+                )
             except Exception as exc:
                 # An exception after dispatch cannot prove that the external side effect did not happen.
                 # Preserve ambiguity so recovery cannot blindly replay this proposal.
                 return {"_ambiguous": True, "error": str(exc), "failure_class": FailureClass.UNKNOWN.value, "exception": type(exc).__name__}
-        raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
+        if self.effect_dispatcher is not None:
+            # SQLite mission revisions are shared by all intents; serialize gated calls
+            # so each confirmation advances one current mission snapshot at a time.
+            raw_results = [execute_one(item) for item in authorized]
+        else:
+            raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
         ambiguous: list[tuple[Any, dict[str, Any]]] = []
         for item, raw in zip(authorized, raw_results):
-            if raw.get("_ambiguous"):
+            if isinstance(raw, dict) and raw.get("_ambiguous"):
                 ambiguous.append((item[0], raw))
                 continue
             proposal = item[0]
-            observation = dict(raw)
-            observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
-            mission.record_observation(observation)
+            already_confirmed = isinstance(raw, EffectDispatchReceipt)
+            observation = dict(raw.observation if already_confirmed else raw)
+            if not already_confirmed:
+                observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+            if not already_confirmed:
+                mission.record_observation(observation)
             success = bool(observation.get("success", observation.get("ok", True)))
             if current_step is not None:
                 self._interpret_observation(mission, current_step, observation, success=success)
-            if success:
+            if success and not already_confirmed:
                 criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
                 mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
             mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
@@ -449,7 +548,8 @@ class MissionRuntime:
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
             mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
             return self.store.save(mission)
-        if (mission.checkpoint or {}).get("status") == "in_flight":
+        resuming_prepared_effect = self._can_resume_prepared_step(mission)
+        if (mission.checkpoint or {}).get("status") == "in_flight" and not resuming_prepared_effect:
             action_id = str(mission.checkpoint.get("action_id", ""))
             mission.error = "in-flight action outcome is unknown; reconciliation required"
             mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id})
@@ -501,10 +601,33 @@ class MissionRuntime:
             return self.store.save(mission)
 
         mission.transition(MissionStatus.RUNNING, "step started", step_id=step.step_id)
+        prepared_effect_id = str((mission.checkpoint or {}).get("effect_id", "")) if resuming_prepared_effect else ""
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "in_flight", "plan_version": mission.plan.version}
+        if resuming_prepared_effect:
+            mission.checkpoint.update({"effect_id": prepared_effect_id, "tool_id": step.action})
         self.store.save(mission)
         try:
-            result = self.executor(mission, step, action_id)
+            receipt = self._dispatch_effect(
+                mission,
+                logical_action_id=action_id,
+                tool_id=step.action,
+                payload=self._step_effect_payload(mission, step),
+                handler=lambda: self.executor(mission, step, action_id),
+                action_id=action_id,
+                step_id=step.step_id,
+                result_factory=lambda raw: {
+                    **dict(raw or {}),
+                    "type": "tool_observation",
+                    "action_id": action_id,
+                    "step_id": step.step_id,
+                    "mission_id": mission.mission_id,
+                },
+            )
+            already_confirmed = isinstance(receipt, EffectDispatchReceipt)
+            result = receipt.observation if already_confirmed else receipt
+        except EffectOutcomeUnknownError:
+            # UNKNOWN and RECOVERY_REQUIRED were already committed atomically.
+            return mission
         except Exception as exc:
             # Keep the in-flight checkpoint durable. A new runtime can safely resume it.
             mission.error = type(exc).__name__
@@ -519,9 +642,11 @@ class MissionRuntime:
         typed_observation = Observation.from_result(step.action, action_id, observation, request_id=mission.request_id, scope=mission.scope_snapshot)
         observation["observation"] = typed_observation.to_dict()
         mission.transition(MissionStatus.OBSERVING, "action returned observation", action_id=action_id)
-        mission.record_observation(observation)
+        if not already_confirmed:
+            mission.record_observation(observation)
         success = bool(observation.get("success", observation.get("ok", False)))
-        mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation)
+        if not already_confirmed:
+            mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version}
         try:
             strategy_decision = self._interpret_observation(mission, step, observation, success=success)
@@ -538,7 +663,8 @@ class MissionRuntime:
             mission.transition(MissionStatus.SCOPE_BLOCKED, mission.error)
             return self.store.save(mission)
         if success:
-            mission.evidence.append({"criterion_id": observation.get("criterion_id", step.step_id), "passed": True, "source": observation.get("source", step.action), "result": observation, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id}})
+            if not already_confirmed:
+                mission.evidence.append({"criterion_id": observation.get("criterion_id", step.step_id), "passed": True, "source": observation.get("source", step.action), "result": observation, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id}})
             mission.emit(EventType.EVIDENCE_ADDED, step_id=step.step_id, data={"criterion_id": observation.get("criterion_id", step.step_id)})
             if strategy_decision is not None and strategy_decision.decision.value in {"REPLAN", "CHANGE_HYPOTHESIS", "ADD_EVIDENCE"}:
                 mission.transition(MissionStatus.REPLANNING, strategy_decision.reason)
