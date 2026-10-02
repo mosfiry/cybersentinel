@@ -277,6 +277,24 @@ class MissionSchedule:
     state: WorkerMissionState = WorkerMissionState.SCHEDULED
 
 
+def _parse_instant(value: str) -> datetime:
+    """Parse one timezone-aware ISO-8601 instant; naive or malformed values are rejected."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("iso8601_instant_required")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("iso8601_instant_required") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timezone_aware_instant_required")
+    return parsed.astimezone(timezone.utc)
+
+
+def normalize_run_at(run_at: str) -> str:
+    """Canonical UTC ISO-8601 form of a schedule instant; dispatch never compares raw text."""
+    return _parse_instant(run_at).isoformat()
+
+
 class MissionScheduler:
     """Persistent schedule records that enqueue missions; no hidden execution thread."""
 
@@ -289,7 +307,7 @@ class MissionScheduler:
     def schedule(self, mission_id: str, *, run_at: str, interval_seconds: int | None = None, retry_limit: int = 0, schedule_id: str | None = None) -> MissionSchedule:
         if interval_seconds is not None and interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
-        item = MissionSchedule(schedule_id or uuid.uuid4().hex, mission_id, run_at, interval_seconds, retry_limit)
+        item = MissionSchedule(schedule_id or uuid.uuid4().hex, mission_id, normalize_run_at(run_at), interval_seconds, retry_limit)
         with sqlite3.connect(self.db_path) as db:
             db.execute("INSERT INTO mission_schedules VALUES(?,?,?,?,?,?,?)", (item.schedule_id, item.mission_id, item.next_run_at, item.interval_seconds, item.retry_limit, item.retries, item.state.value))
         return item
@@ -302,12 +320,17 @@ class MissionScheduler:
         return MissionSchedule(row[0], row[1], row[2], row[3], row[4], row[5], WorkerMissionState(row[6]))
 
     def dispatch_due(self, *, now: str) -> list[MissionSchedule]:
-        current = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        current = _parse_instant(now)
         with sqlite3.connect(self.db_path) as db:
-            rows = db.execute("SELECT schedule_id FROM mission_schedules WHERE state=? AND next_run_at<=? ORDER BY next_run_at,schedule_id", (WorkerMissionState.SCHEDULED.value, now)).fetchall()
+            rows = db.execute("SELECT schedule_id FROM mission_schedules WHERE state=? ORDER BY next_run_at,schedule_id", (WorkerMissionState.SCHEDULED.value,)).fetchall()
         dispatched = []
         for (schedule_id,) in rows:
             item = self.get(schedule_id)
+            try:
+                if _parse_instant(item.next_run_at) > current:
+                    continue
+            except ValueError:
+                continue
             self.queue.enqueue(item.mission_id, available_at=now, state=WorkerMissionState.QUEUED)
             if item.interval_seconds:
                 next_run = (current + timedelta(seconds=item.interval_seconds)).isoformat()
@@ -321,7 +344,10 @@ class MissionScheduler:
 
     def mark_missed(self, schedule_id: str, *, now: str) -> MissionSchedule:
         item = self.get(schedule_id)
-        if datetime.fromisoformat(now.replace("Z", "+00:00")) <= datetime.fromisoformat(item.next_run_at.replace("Z", "+00:00")):
+        try:
+            if _parse_instant(now) <= _parse_instant(item.next_run_at):
+                return item
+        except ValueError:
             return item
         with sqlite3.connect(self.db_path) as db:
             db.execute("UPDATE mission_schedules SET state=? WHERE schedule_id=?", (WorkerMissionState.SLEEPING.value, schedule_id))
