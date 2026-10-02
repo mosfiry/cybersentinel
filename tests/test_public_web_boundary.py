@@ -13,6 +13,10 @@ import pytest
 
 import bridge
 import core.db as core_db
+from agent.mission import MissionStatus, MissionStore
+from agent.mission_runtime import MissionRuntime
+from agent.mission_worker import MissionQueue, WorkerMissionState
+from agent.planning import Plan, PlanStep
 from security import owner_password
 from security.public_session import PublicSessionManager
 import security.scope_store as scope_store
@@ -1078,3 +1082,173 @@ def test_public_mission_rejects_incomplete_scope_reference_before_creation(web_s
     assert status == 400
     assert response == {"ok": False, "error": "invalid_scope_binding"}
     assert captured == []
+
+
+def _prepare_owner_reconciliation(tmp_path, monkeypatch, owner_id, *, incomplete=False):
+    import agent.memory as mission_memory
+
+    monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "bridge.sqlite3")
+    monkeypatch.setattr(mission_memory, "MEMORY_DB_PATH", tmp_path / "mission-memory.sqlite3")
+    missions_path = tmp_path / "missions.sqlite3"
+    store = MissionStore(missions_path)
+    runtime = MissionRuntime(store, executor=lambda *_: {"success": True})
+    plan = Plan.initial("synthetic bridge recovery").replan(
+        steps=(PlanStep("observe", "observe synthetic state", action="status"),),
+        reason="local bridge regression",
+    )
+    mission = runtime.create(
+        "synthetic bridge recovery",
+        "synthetic bridge recovery",
+        plan,
+        request_id="synthetic-bridge-reconciliation",
+        owner_identity_ref=str(owner_id),
+    )
+    if incomplete:
+        mission.checkpoint = {"status": "in_flight_parallel", "ambiguous_tool_call_ids": []}
+    else:
+        action_id = f"{mission.mission_id}:{mission.plan.version}:observe:0"
+        mission.checkpoint = {
+            "status": "in_flight",
+            "action_id": action_id,
+            "step_id": "observe",
+            "plan_fingerprint": mission.plan.fingerprint,
+        }
+    mission.transition(MissionStatus.RECOVERY_REQUIRED, "synthetic ambiguous action")
+    store.save(mission)
+
+    queue = MissionQueue(tmp_path / "mission_queue.sqlite3")
+    queue.enqueue(mission.mission_id)
+    claimed = queue.claim_next(worker_id="synthetic-before-reconcile")
+    assert claimed is not None
+    waiting = queue.release(
+        mission.mission_id,
+        WorkerMissionState.WAITING_FOR_TOOL,
+        worker_id="synthetic-before-reconcile",
+        error="ambiguous action requires reconciliation",
+    )
+    assert waiting.state is WorkerMissionState.WAITING_FOR_TOOL
+    return mission, missions_path, queue
+
+
+def test_public_owner_reconciliation_persists_receipt_before_queue_requeue(web_server, tmp_path, monkeypatch):
+    server, _ = web_server
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+    owner = owner_password.resolve_session(owner_cookie)
+    assert owner is not None
+    mission, missions_path, queue = _prepare_owner_reconciliation(
+        tmp_path, monkeypatch, owner["owner_id"]
+    )
+    assert queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+    assert queue.claim_next(worker_id="synthetic-before-owner-reconcile") is None
+
+    durable_store = MissionStore(missions_path)
+    enqueue_order = []
+    queue_claims = []
+    original_enqueue = MissionQueue.enqueue
+    original_claim_next = MissionQueue.claim_next
+
+    def verify_receipt_before_enqueue(self, mission_id, *args, **kwargs):
+        if mission_id == mission.mission_id:
+            persisted = durable_store.load(mission_id)
+            assert persisted.status is MissionStatus.READY
+            assert persisted.checkpoint["status"] == "completed"
+            assert persisted.checkpoint["reconciled"] is True
+            receipt = next(
+                item for item in persisted.observations
+                if item.get("action_id") == mission.checkpoint["action_id"]
+            )
+            assert receipt["source"] == "external_reconciliation"
+            action = next(
+                item for item in persisted.action_history
+                if item.get("action_id") == mission.checkpoint["action_id"]
+            )
+            assert action["status"] == "completed"
+            assert self.get(mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+            enqueue_order.append("durable-receipt-before-enqueue")
+        return original_enqueue(self, mission_id, *args, **kwargs)
+
+    def track_claim(self, *args, **kwargs):
+        queue_claims.append(args or kwargs)
+        return original_claim_next(self, *args, **kwargs)
+
+    monkeypatch.setattr(MissionQueue, "enqueue", verify_receipt_before_enqueue)
+    monkeypatch.setattr(MissionQueue, "claim_next", track_claim)
+    status, _, response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {"executed": True},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 200, response
+    assert response["ok"] is True
+    assert response["result"]["queue"]["state"] == WorkerMissionState.QUEUED.value
+    assert enqueue_order == ["durable-receipt-before-enqueue"]
+    assert queue_claims == []
+
+    replay_status, _, replay = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {"executed": True},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+    assert replay_status == 400
+    assert replay == {"ok": False, "error": "mission has no in-flight action requiring reconciliation"}
+    assert enqueue_order == ["durable-receipt-before-enqueue"]
+    assert queue.get(mission.mission_id).state is WorkerMissionState.QUEUED
+    replayed = durable_store.load(mission.mission_id)
+    assert len(replayed.observations) == 1
+    assert len(replayed.action_history) == 1
+    assert queue_claims == []
+
+
+def test_public_owner_reconciliation_rejects_incomplete_receipt_without_requeue(web_server, tmp_path, monkeypatch):
+    server, _ = web_server
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+    owner = owner_password.resolve_session(owner_cookie)
+    assert owner is not None
+    mission, missions_path, queue = _prepare_owner_reconciliation(
+        tmp_path, monkeypatch, owner["owner_id"], incomplete=True
+    )
+    assert queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+    assert queue.claim_next(worker_id="synthetic-before-owner-reconcile") is None
+    enqueue_calls = []
+    queue_claims = []
+    original_enqueue = MissionQueue.enqueue
+    original_claim_next = MissionQueue.claim_next
+
+    def track_enqueue(self, mission_id, *args, **kwargs):
+        if mission_id == mission.mission_id:
+            enqueue_calls.append(mission_id)
+        return original_enqueue(self, mission_id, *args, **kwargs)
+
+    def track_claim(self, *args, **kwargs):
+        queue_claims.append(args or kwargs)
+        return original_claim_next(self, *args, **kwargs)
+
+    monkeypatch.setattr(MissionQueue, "enqueue", track_enqueue)
+    monkeypatch.setattr(MissionQueue, "claim_next", track_claim)
+    status, _, response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {"executed": True},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 400
+    assert response == {"ok": False, "error": "parallel checkpoint has no ambiguous tool calls"}
+    assert enqueue_calls == []
+    assert queue_claims == []
+    persisted = MissionStore(missions_path).load(mission.mission_id)
+    assert persisted.status is MissionStatus.RECOVERY_REQUIRED
+    assert persisted.checkpoint["status"] == "in_flight_parallel"
+    assert persisted.observations == []
+    assert persisted.action_history == []
+    assert queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+    assert original_claim_next(queue, worker_id="synthetic-after-rejected-reconcile") is None
