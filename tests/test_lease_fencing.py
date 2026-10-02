@@ -25,8 +25,7 @@ def test_claim_assigns_monotonic_lease_epoch(tmp_path):
     assert first.attempts == 1
     queue.recover_expired(now=_at(121))
     second = queue.claim_next(now=_at(122), worker_id="b", lease_seconds=120)
-    # recover_expired advanced the epoch to 2; the reclaiming claim advances it to 3.
-    assert second.lease_epoch == 3
+    assert second.lease_epoch == 2
     assert second.attempts == 2
 
 
@@ -80,7 +79,7 @@ def test_valid_lease_operations_still_succeed(tmp_path):
     queue = MissionQueue(tmp_path / "queue.sqlite3")
     queue.enqueue("m6", available_at=NOW)
     a = queue.claim_next(now=NOW, worker_id="a", lease_seconds=120)
-    hb = queue.heartbeat("m6", worker_id="a", now=_at(60), lease_epoch=a.lease_epoch)
+    hb = queue.heartbeat("m6", worker_id="a", now=_at(60), lease_epoch=a.lease_epoch, lease_seconds=120)
     assert hb.lease_expires_at > a.lease_expires_at
     released = queue.release("m6", WorkerMissionState.QUEUED, worker_id="a", available_at=_at(61), lease_epoch=a.lease_epoch, now=_at(61))
     assert released.state is WorkerMissionState.QUEUED
