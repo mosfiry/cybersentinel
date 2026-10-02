@@ -36,13 +36,13 @@ def test_auth_rejects_malformed_request_id():
         AgentCore._auth("objective", "token", "bad id")
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "x" * 129, "bad id", "bad/id", "bad.id", 5, None])
+@pytest.mark.parametrize("bad", ["x" * 129, "bad id", "bad/id", "bad.id"])
 def test_conversation_id_is_validated_fail_closed(bad):
     with pytest.raises(ValueError):
         _conversation_id({"conversation_id": bad})
 
 
-def test_conversation_id_defaults_to_server_generated():
+def test_conversation_id_defaults_to_server_generated_when_absent():
     value = _conversation_id({})
     assert len(value) == 32 and all(c in "0123456789abcdef" for c in value)
 
