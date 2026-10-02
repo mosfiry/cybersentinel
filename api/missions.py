@@ -21,7 +21,7 @@ class MissionService:
         return mission.to_dict()
 
     def start_mission(self, mission_id: str) -> dict[str, Any]:
-        return self.queue.enqueue(mission_id).__dict__.copy()
+        return self.queue.enqueue(mission_id).public_dict()
 
     def pause_mission(self, mission_id: str) -> dict[str, Any]:
         mission = self._load(mission_id)

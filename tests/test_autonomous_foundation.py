@@ -112,8 +112,9 @@ def test_queue_worker_and_restart_recovery(tmp_path):
 def test_reenqueue_clears_stale_lease_and_error(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-requeued", available_at="2026-01-01T00:00:00+00:00")
-    queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=3600)
-    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker")
+    old_claim = queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=3600)
+    assert old_claim is not None and old_claim.lease_claim is not None
+    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", claim=old_claim.lease_claim, now="2026-01-01T00:00:00+00:00")
 
     requeued = queue.enqueue("mission-requeued", available_at="2026-01-01T00:01:00+00:00")
     assert requeued.state is WorkerMissionState.QUEUED
@@ -144,21 +145,19 @@ def test_concurrent_workers_claim_a_mission_once(tmp_path):
 
 
 def test_worker_does_not_mark_mission_failed_after_lease_takeover(tmp_path):
-    import sqlite3
-
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-taken-over", available_at="2026-01-01T00:00:00+00:00")
 
     class Runtime:
         def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
-            with sqlite3.connect(queue.db_path) as db:
-                db.execute("UPDATE mission_queue SET lease_owner=? WHERE mission_id=?", ("replacement-worker", mission_id))
+            queue.recover_expired(now="2026-01-01T00:01:01+00:00")
+            queue.claim_next(now="2026-01-01T00:01:01+00:00", worker_id="replacement-worker", lease_seconds=60)
             heartbeat()
 
-    result = MissionWorker(queue, lambda: Runtime(), worker_id="stale-worker").run_once(now="2026-01-01T00:00:00+00:00")
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="stale-worker", lease_seconds=60).run_once(now="2026-01-01T00:00:00+00:00")
     assert result.state is WorkerMissionState.EXECUTING
     assert result.lease_owner == "replacement-worker"
-    assert result.last_error == ""
+    assert result.last_error == "worker lease expired"
 
 
 def test_worker_does_not_overwrite_requeued_mission_after_handler_lease_expiry(tmp_path):
