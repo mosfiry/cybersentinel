@@ -5,12 +5,12 @@ Status vocabulary: VERIFIED / PARTIALLY VERIFIED / UNVERIFIED / BLOCKED / FAILED
 
 ## CURRENT_PHASE
 
-V6 — EVIDENCE CHAIN HARDENING — V6.1-V6.3 CI VERIFIED (492a7d1c324b).
-Next: V7 — security report / Owner approval gap.
+V7 — SECURITY REPORT / OWNER APPROVAL — VERDICT: VERIFIED GAP; approval route
+BLOCKED on Owner decision (see below). Next: V8 request/API contract hardening.
 
 ## CURRENT_CHECKPOINT
 
-492a7d1c324be83ff62a48a6db6465940bbf5a8a (branch vibe/principal-engineering).
+f48467b20caea8629f21c348d1deafabb3520692 (branch vibe/principal-engineering).
 
 ## COMPLETED (checkpoints)
 
@@ -139,3 +139,26 @@ mission/operation chain binding; record hash is content-bound.
 CI on 492a7d1c: test (3.13) SUCCESS (runs 37006527742 push, 37006534336 PR);
 pytest-diagnostics SUCCESS (runs 37006527678, 37006534270); vibe-diagnostics
 SUCCESS (run 37006527736); export SUCCESS; Workers Builds FAILURE pre-existing.
+
+## V7 VERDICT (at f48467b20caea8629f21c348d1deafabb3520692)
+
+- VERIFIED ABSENCE: the complete public route inventory (docs/DESKTOP_BACKEND_CONTRACT.md,
+  built from bridge.py at 71ce3c95 — the identical bridge.py carried unchanged into this
+  branch through V4-V6; Vibe commits touch only agent/mission_worker.py, agent/evidence.py,
+  tests, docs, workflows) contains NO route for security report retrieval and NO route for
+  Owner approval. The chain report -> retrieval -> approval -> completion proof does not
+  exist as an implemented surface in this lineage.
+- Manus uncommitted report/approval work remains UNVERIFIED (dirty worktree, no checkpoint,
+  never merged); it is not treated as contract.
+- Report RETRIEVAL route design (read-only, Owner-session + CSRF, mission-bound, evidence
+  completeness passthrough) is documented in docs/VIBE_SECURITY_AUDIT.md V7 section;
+  implementing it requires a report-generation backend that does not exist in this lineage
+  — building it would be feature invention, which earlier phases explicitly avoided.
+- Owner APPROVAL route: BLOCKED on Owner decision. An approval route binds Owner consent
+  to mission continuation/completion semantics; that is an authority-model change (mission
+  §26) and is not implemented without explicit Owner instruction.
+- No test can exercise a nonexistent route; CSRF/session/isolation/replay batteries for
+  these routes are deferred until the Owner decides the design.
+
+CI on f48467b2 (docs-only checkpoint): tests re-run on this tree in V6 record;
+V7 changed no code, no new CI run required.

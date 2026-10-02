@@ -212,3 +212,31 @@ request isolation; unsigned/substituted/transplanted evidence cannot support a
 completion proof; workspace event chain binding; content-bound record hashes.
 
 ## Backend modifications by Vibe in V6: agent/evidence.py (F-V6-1 fix), tests above.
+
+
+## V7 — SECURITY REPORT / OWNER APPROVAL — VERIFIED GAP (no code change)
+
+Verified absence at f48467b2: the public surface (bridge.py public routes,
+identical from 71ce3c95 through this checkpoint; contract map in
+docs/DESKTOP_BACKEND_CONTRACT.md) has no security-report retrieval route and no
+Owner approval route. The report -> approval -> completion chain is therefore
+NOT IMPLEMENTED in this lineage — it is a documented gap, not an assumed feature.
+Manus's uncommitted report/approval work is UNVERIFIED and is not contract.
+
+Design notes for the Owner's decision:
+- Retrieval: GET /api/public/security-reports/{mission_id} — Owner session +
+  CSRF-equivalent GET policy (cookie session, same-origin), report bound to
+  mission and owner via load_for_owner, evidence completeness passthrough with
+  deterministic verification summary; no report content is ever accepted from
+  the browser.
+- Approval: POST /api/public/security-reports/{mission_id}/approval — Owner
+  session + CSRF + idempotency (duplicate approval converges), replay-safe
+  (approval bound to a specific report hash), stale-report rejection (approval
+  for a superseded report hash is rejected), and approval recorded as Owner
+  provenance, never as completion proof (completion remains the deterministic
+  system proof of V5/V6).
+- BLOCKED: the approval route binds Owner consent to mission lifecycle
+  semantics — an authority-model change requiring an explicit Owner decision
+  (mission §26). Recorded as BLOCKED, not guessed.
+
+## Backend modifications by Vibe in V7: none.
