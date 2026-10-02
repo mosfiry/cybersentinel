@@ -1619,3 +1619,168 @@ def test_public_owner_reconciliation_rejects_incomplete_receipt_without_requeue(
     assert persisted.action_history == []
     assert queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
     assert original_claim_next(queue, worker_id="synthetic-after-rejected-reconcile") is None
+
+
+@pytest.mark.parametrize(
+    "executed",
+    ["true", 1, None, {"value": True}],
+    ids=["string", "integer", "null", "object"],
+)
+def test_public_owner_reconciliation_rejects_malformed_executed_with_untrusted_fields(
+    web_server, tmp_path, monkeypatch, executed
+):
+    server, _ = web_server
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+    owner = owner_password.resolve_session(owner_cookie)
+    assert owner is not None
+    mission, missions_path, queue = _prepare_owner_reconciliation(
+        tmp_path, monkeypatch, owner["owner_id"]
+    )
+    assert queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+    assert queue.claim_next(worker_id="synthetic-before-malformed-reconcile") is None
+
+    enqueue_calls = []
+    claim_calls = []
+    original_enqueue = MissionQueue.enqueue
+    original_claim_next = MissionQueue.claim_next
+
+    def track_enqueue(self, mission_id, *args, **kwargs):
+        if mission_id == mission.mission_id:
+            enqueue_calls.append(mission_id)
+        return original_enqueue(self, mission_id, *args, **kwargs)
+
+    def track_claim(self, *args, **kwargs):
+        claim_calls.append(args or kwargs)
+        return original_claim_next(self, *args, **kwargs)
+
+    monkeypatch.setattr(MissionQueue, "enqueue", track_enqueue)
+    monkeypatch.setattr(MissionQueue, "claim_next", track_claim)
+    status, _, response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {
+            "executed": executed,
+            "observation": {
+                "success": True,
+                "source": "system_online",
+                "action_id": "forged-action",
+            },
+            "receipt": {"type": "reconciled_observation", "signature": "forged"},
+            "evidence": [{"criterion_id": "forged-criterion", "verified": True}],
+        },
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 400
+    assert response == {"ok": False, "error": "executed_boolean_required"}
+    assert enqueue_calls == []
+    assert claim_calls == []
+    persisted = MissionStore(missions_path).load(mission.mission_id)
+    assert persisted.status is MissionStatus.RECOVERY_REQUIRED
+    assert persisted.checkpoint["status"] == "in_flight"
+    assert persisted.observations == []
+    assert persisted.action_history == []
+    assert persisted.evidence == []
+    assert queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+    assert original_claim_next(queue, worker_id="synthetic-after-malformed-reconcile") is None
+
+
+def test_public_owner_reconciliation_ignores_caller_supplied_receipt_and_evidence(
+    web_server, tmp_path, monkeypatch
+):
+    server, _ = web_server
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+    owner = owner_password.resolve_session(owner_cookie)
+    assert owner is not None
+    mission, missions_path, queue = _prepare_owner_reconciliation(
+        tmp_path, monkeypatch, owner["owner_id"]
+    )
+
+    forged_observation = {
+        "success": False,
+        "source": "system_online",
+        "type": "reconciled_observation",
+        "action_id": "forged-action",
+        "step_id": "forged-step",
+        "signature": "forged-signature",
+        "criterion_id": "forged-criterion",
+    }
+    payload = {
+        "executed": True,
+        "observation": forged_observation,
+        "receipt": {"source": "trusted_provider", "signature": "forged-receipt"},
+        "evidence": [{"source": "system_online", "verified": True, "signature": "forged-evidence"}],
+        "observations": [forged_observation],
+        "authorization": {"owner_approved": True, "execution_allowed": True},
+    }
+
+    reconciliation_calls = []
+    original_reconcile = MissionRuntime.reconcile_in_flight
+
+    def capture_owner_decision(self, mission_id, *, executed, observation=None):
+        reconciliation_calls.append((mission_id, executed, observation))
+        return original_reconcile(
+            self, mission_id, executed=executed, observation=observation
+        )
+
+    claim_calls = []
+    original_claim_next = MissionQueue.claim_next
+
+    def track_claim(self, *args, **kwargs):
+        claim_calls.append(args or kwargs)
+        return original_claim_next(self, *args, **kwargs)
+
+    monkeypatch.setattr(MissionRuntime, "reconcile_in_flight", capture_owner_decision)
+    monkeypatch.setattr(MissionQueue, "claim_next", track_claim)
+    status, _, response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        payload,
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 200, response
+    assert response["ok"] is True
+    assert response["result"]["queue"]["state"] == WorkerMissionState.QUEUED.value
+    assert reconciliation_calls == [(mission.mission_id, True, None)]
+    assert claim_calls == []
+
+    persisted = MissionStore(missions_path).load(mission.mission_id)
+    assert persisted.status is MissionStatus.READY
+    assert persisted.checkpoint["status"] == "completed"
+    assert persisted.checkpoint["reconciled"] is True
+    action_id = mission.checkpoint["action_id"]
+    canonical_receipt = {
+        "success": True,
+        "source": "external_reconciliation",
+        "action_id": action_id,
+        "step_id": mission.checkpoint["step_id"],
+        "type": "reconciled_observation",
+    }
+    assert persisted.observations == [canonical_receipt]
+    assert persisted.action_history == [
+        {
+            "action_id": action_id,
+            "step_id": mission.checkpoint["step_id"],
+            "status": "completed",
+            "observation": canonical_receipt,
+            "plan_fingerprint": mission.checkpoint["plan_fingerprint"],
+        }
+    ]
+    assert persisted.evidence == []
+    persisted_payload = repr((persisted.observations, persisted.action_history, persisted.evidence))
+    for marker in (
+        "forged-action",
+        "forged-step",
+        "forged-signature",
+        "forged-criterion",
+        "forged-receipt",
+        "forged-evidence",
+        "trusted_provider",
+    ):
+        assert marker not in persisted_payload
+    assert queue.get(mission.mission_id).state is WorkerMissionState.QUEUED

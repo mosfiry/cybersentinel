@@ -123,3 +123,28 @@ This manifest records small recovery checkpoints. A checkpoint is published only
 - **API impact:** None; no API implementation or contract changed.
 - **Desktop impact:** None; Desktop/Electron/Vibe untouched.
 - **Next task:** M1 — add a local public-route regression for malformed `executed` payloads and untrusted caller-supplied observation fields, confirming the existing boolean-only Owner decision contract and server-generated reconciliation receipt remain fail-closed without changing auth or scope.
+
+## 2026-10-02 — M1 public reconciliation input contract
+
+- **Epic:** A — Recovery + Engineering Baseline
+- **Story:** M1 — Durable Mission Runtime
+- **Task:** Add local authenticated public-route regressions for malformed `executed` values and caller-supplied observation, receipt, evidence, and authorization fields. Confirm only a boolean Owner decision is accepted, invalid decisions leave recovery state and the queue unchanged, and valid reconciliation persists only the server-generated canonical receipt.
+- **Branch:** `engineering/agile-runtime-reconcile-input-contract`.
+- **Commit:** One test/documentation checkpoint commit at `refs/heads/engineering/agile-runtime-reconcile-input-contract`; publish normally and require exact local `HEAD`/live remote SHA equality. Do not record this manifest commit's own SHA here. **Parent:** `dcc982c8c8bec0847249ebc1eb963db9691bd4bb`.
+- **Recovery source SHA:** `dcc982c8c8bec0847249ebc1eb963db9691bd4bb`, parent `34ee19c256205c33275ecdb2c144d12d0390be75`; verified equal to the live `origin/refs/heads/engineering/agile-runtime-crash-reconcile` tip before worktree creation. The suggested candidate local and remote refs were absent before branch creation.
+- **Files:** `tests/test_public_web_boundary.py`; `docs/AGILE_CHECKPOINTS.md` only. No production, authentication, scope, API, or Desktop source changed.
+- **Tests (in requested order; pytest-reported durations):**
+  - Unmodified-tip baseline: `python -m pytest -q tests/test_public_web_boundary.py::test_public_owner_reconciliation_persists_receipt_before_queue_requeue tests/test_public_web_boundary.py::test_public_owner_reconciliation_requeues_for_worker_execution_once tests/test_public_web_boundary.py::test_public_owner_reconciliation_rejects_incomplete_receipt_without_requeue tests/test_public_web_boundary.py::test_public_owner_reconciliation_recovers_crashed_worker_side_effect_once tests/test_phase6k7b_mission_runtime.py::test_in_flight_receipt_reconciliation_prevents_duplicate_side_effect tests/test_crash_restart_resume.py::test_queue_restart_does_not_run_recovery_required_mission_before_reconciliation_and_requeue` — 6 passed in 3.73s (shell wall 4.076s).
+  - Focused new regressions: `python -m pytest -q tests/test_public_web_boundary.py::test_public_owner_reconciliation_rejects_malformed_executed_with_untrusted_fields tests/test_public_web_boundary.py::test_public_owner_reconciliation_ignores_caller_supplied_receipt_and_evidence` — 5 passed in 3.97s (shell wall 4.369s); the malformed-value test covers string, integer, null, and object payloads.
+  - `python -m pytest -q tests/test_public_web_boundary.py` — 46 passed in 26.95s (shell wall 27.385s).
+  - `python -m pytest -q tests/test_mission_worker_lifecycle.py` — 15 passed in 3.08s (shell wall 3.468s).
+  - `python -m pytest -q tests/test_failure_recovery_replan.py tests/test_mission_control_races.py tests/test_phase6k7b_mission_runtime.py` — 27 passed in 1.46s (shell wall 1.816s).
+  - `python -m pytest -q tests/test_crash_restart_resume.py` — 6 passed in 0.93s (shell wall 1.293s).
+  - `python -m pytest -q` — 987 passed, 1 skipped in 76.02s (shell wall 76.537s). All suite runs had `CYBERSENTINEL_MEMORY_DB_PATH` set to a disposable `/tmp` database before Python imports. The project-root `memory.sqlite3`, WAL, and SHM files were absent before and after validation. Quiet output did not identify the skipped test or reason; neither is inferred.
+- **Status:** The tests use the authenticated public bridge reconciliation route with the existing Owner session and CSRF helpers, temporary SQLite stores, and synthetic local in-flight actions. String, integer, null, and object `executed` values return 400 without queue enqueue/claim, observations, action history, or evidence. With `executed=True`, arbitrary caller fields are not passed to `MissionRuntime.reconcile_in_flight`; the call receives only the boolean decision, records exactly the canonical `external_reconciliation` observation bound to the checkpoint action/step, creates no system evidence, and does not claim or execute queue work. Inspection confirmed the existing route/runtime implementation already satisfies the contract, so no source fix was warranted.
+- **Original checkout boundary:** `/workspace/cybersentinel-release-closure` was not opened, inspected, modified, or used as a source; no dirty content was imported.
+- **Known limitations:** No live provider, external target, or Desktop behavior was exercised. The full-suite skip's identity and reason remain unknown because the run used `-q`.
+- **Security impact:** Regression-only. Owner authentication, CSRF, policy, scope, evidence issuance/validation, and runtime behavior are unchanged.
+- **API impact:** None; no API implementation or contract changed.
+- **Desktop impact:** None; Desktop/Electron/Vibe untouched.
+- **Next task:** M1 — add a local authenticated public-route regression for `executed=False` with forged observation/receipt/evidence fields, proving the safe-retry decision persists no caller-supplied observation or evidence and that the route itself does not claim work.
