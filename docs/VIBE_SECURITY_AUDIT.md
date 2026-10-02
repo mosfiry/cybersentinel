@@ -77,59 +77,73 @@ tests/test_security_integrity_adversarial.py, tests/test_phase21_restart_authori
 ## Backend modifications by Vibe in this phase: 0
 
 
-## V2.2 — F-V2-1 RESOLVED (fail-closed chain verified from source) — VERIFIED
+## V3 — MISSION LIFECYCLE AUDIT (source-grounded) — VERIFIED (surface + invariants)
 
-The apparent authorization-weakening fallback in agent/task_runtime.py
-(authorize_tool without context when execution_state lacks authorization_context)
-was traced through the full execution chain. Result: no bypass exists; the chain
-is fail-closed at three independent layers.
+### Mission state machine (agent/mission.py, read 27,765 chars)
 
-1. security/authorization.py authorize_tool (read in full, 6,484 chars):
-   - structural_only mode (context=None, no evidence) DENIES owner_only tools
-     ("sensitive tool requires AuthorizationContext") and DENIES scope_required
-     tools ("scope-bound tool requires AuthorizationContext with ScopeSnapshot").
-   - when context is None the returned AuthorizationResult.decision is None
-     (AuthorizationDecision.issue is only invoked with a context).
-2. security/execution_proof.py ExecutionAuthorizationProof.derive (read in full,
-   23,159 chars): for the OWNER_DIRECT class, "if decision is None: raise
-   ExecutionProofError(PROOF_INCOMPLETE, 'owner-direct proof requires the typed
-   AuthorizationDecision that authorized the execution')"; decision binding is
-   verified via decision.is_valid_for(tool, argument, request_id).
-3. tools/registry.py execute (read in full, 16,486 chars): registry re-verifies
-   independently — ExecutionAuthorizationProof REQUIRED (PROOF_REQUIRED),
-   proof.verify(...) against name/argument/mission_id/request_id/tool_call_id,
-   execution-class match, decision signature + policy fingerprint binding,
-   spec.requires_owner / spec.scope_required demand a valid decision, and
-   scope_required tools re-resolve every URL through ScopeResolver (deny by
-   default).
+MissionStatus enum (lines 23-41): CREATED, PLANNING, READY, RUNNING, OBSERVING,
+VERIFYING, REPLANNING, PAUSED, GOAL_COMPLETED, OWNER_INPUT_REQUIRED,
+AUTHORIZATION_BLOCKED, SCOPE_BLOCKED, RESOURCE_BLOCKED, RECOVERY_REQUIRED,
+SAFETY_BLOCKED, FAILED_RETRY_EXHAUSTED, CANCELLED.
+TERMINAL_MISSION_STATUSES frozenset defined at line 41.
 
-Therefore a task created without a stored authorization_context can pass
-structural preflight for non-sensitive tools but CANNOT execute any tool: the
-OwnerDirectBoundary proof derivation raises before the registry is reached.
-Model output, external data, or a context-less task cannot mint an
-AuthorizationDecision or an ExecutionAuthorizationProof.
+Mission.transition() guards (read from source, lines 112-131):
+- TypeError on non-MissionStatus target.
+- "recovery requires reconciliation before continuation" gate.
+- PAUSED only from pre-completion states; paused missions must be resumed
+  (READY/CANCELLED/OWNER_INPUT_REQUIRED) before execution.
+- Terminal missions cannot transition to a different status (explicit
+  ValueError) except the narrow reconciled recovery / owner-intervention paths.
+- GOAL_COMPLETED is a system invariant: requires the runtime's exact verified
+  verification state (verified is True, no missing_criteria, matches
+  verification_state) AND a valid completion proof.
 
-### set_current_owner_instruction — repository-wide corroboration
+Persistence invariants (agent/mission.py store):
+- GOAL_COMPLETED cannot be persisted without a valid system-signed completion
+  proof (line ~422 raises "refusing to persist GOAL_COMPLETED without a valid
+  system-signed completion proof").
+- Optimistic concurrency: stale mission writes are rejected via integrity_hash
+  compare (line ~430 "stale mission write rejected") — concurrent worker
+  corruption is blocked.
+- Mission store issues criterion evidence (issue_criterion_evidence) and loads
+  are owner-bound (load_for_owner).
 
-GitHub code search across the repository returns exactly two non-test,
-non-doc, non-diagnostics callers: security/owner_policy.py (definition) and
-core/engine.py (the owner-authenticated path, with auth_evidence and
-request_id). No caller exists in bridge.py, agent/mission_runtime.py, or any
-other module. (Search index covers the default branch; the checkpoint lineage
-adds no new caller per the PR #17 77-file diff audited previously.)
-Verdict: model output and external data cannot legislate Owner Instruction —
-VERIFIED on the readable surface.
+### Request lifecycle (core/lifecycle.py, read in full, 125 lines)
 
-### Owner authentication notes (from source)
+- begin(): atomically creates a request; "an existing request is never executed
+  twice" (source docstring) — idempotency at request level.
+- transition(): validates against STATES and TRANSITIONS maps; invalid
+  transitions raise ValueError.
+- complete(): terminal succeeded/failed transition then durable final result.
+- recover_incomplete(): records left in active states by a crash are marked
+  failed and completed — crash-safe reconciliation.
+- request_cancel() / is_cancelled(): cooperative cancellation flags.
 
-- security/owner_password.py: scrypt-family hash_password, _dummy_verify
-  (timing-safe dummy comparison for unknown accounts), login / resolve_session /
-  authenticated_owner / revoke_session / revoke_owner_sessions.
-- Owner identity is server-side username+password sessions only; legacy
-  OWNER_TOKEN / owner_session.py were deleted on main (commits 3cf5bccba037,
-  bf388cad0e4f) with a CI regression test asserting module deletion.
-- No backend change was required in V2: the audited chain is fail-closed as
-  designed. F-V2-1 is closed as NOT A VULNERABILITY (fail-closed), with the
-  three-layer evidence above recorded for reproduction.
+### Worker queue (agent/mission_worker.py, read 20,356 chars)
 
-## Backend modifications by Vibe in V2: 0
+- MissionQueue with lease columns (lease_owner, lease_expires_at);
+  claim_next uses BEGIN IMMEDIATE (atomic claim) and only claims items whose
+  lease is absent or expired; attempts increment on claim.
+- LeaseLostError raised when a heartbeat no longer owns the lease
+  (DEFAULT_WORKER_LEASE_SECONDS = 120).
+- _secure_database_file hardens the SQLite file.
+- main commit 7b85a339 "fix(worker): protect completion after lease expiry"
+  covers the stale-worker completion race.
+
+### Existing test batteries (inventory, not modified)
+
+test_mission_worker_lifecycle.py, test_crash_restart_resume.py,
+test_v46_lifecycle.py, test_deterministic_goal_verification.py,
+test_failure_recovery_replan.py, test_long_horizon_deterministic.py,
+test_phase6k7b_mission_runtime.py, test_task_mission_compatibility.py.
+
+### Residual (carried to later phases)
+
+- mission_runtime.py (MissionRuntime) full transition-driver logic is beyond the
+  raw read channel — structure verified; deep resume/reconcile semantics to be
+  verified in V11 (CI/recovery) via existing tests and, if needed, an
+  alternate-channel read.
+- APPROVED state and security-report/approval flow: no public route verified —
+  remains a documented gap (V1/V0), nothing invented.
+
+## Backend modifications by Vibe in V3: 0
