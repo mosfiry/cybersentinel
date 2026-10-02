@@ -5,13 +5,12 @@ Status vocabulary: VERIFIED / PARTIALLY VERIFIED / UNVERIFIED / BLOCKED / FAILED
 
 ## CURRENT_PHASE
 
-V4 — LEASE / FENCING HARDENING — COMPLETE (CI VERIFIED at V4.3).
-Next: V5 — mission state machine hardening tests.
+V5 — MISSION STATE MACHINE HARDENING — V5.1 battery CI VERIFIED (bc76d2594875).
+Next: V6 — evidence chain hardening.
 
 ## CURRENT_CHECKPOINT
 
-32e2677a24c7560cb5f9483ebbfd301de5f006ce (branch vibe/principal-engineering).
-This checkpoint adds the V4 documentation record; code state is identical to 32e2677a.
+bc76d25948752d3720478fd97b958fe70a6400fd (branch vibe/principal-engineering).
 
 ## COMPLETED (checkpoints)
 
@@ -99,3 +98,20 @@ reconciliation; duplicate delivery convergence. Full suite regression: CI VERDIC
 ## ROLLBACK POINT
 
 - 32e2677a24c7; parent chain intact to 1f06ece28129 via e6bce919/e275316/5dc5e1cb.
+
+## V5.1 VERIFIED (bc76d25948752d3720478fd97b958fe70a6400fd)
+
+tests/test_mission_state_machine_hardening.py — 10 deterministic model-free tests:
+GOAL_COMPLETED requires the exact persisted verified state (missing/mismatched
+verification rejected; honest replay absorbed without state duplication); tampered
+completion proof never completes nor persists; proof transplant across missions
+rejected (binding payload mismatch); forged in-memory GOAL_COMPLETED rejected at
+persistence; integrity-hash tamper rejected on load; terminal states absorbing
+except RECOVERY_REQUIRED->READY reconciliation and AUTHORIZATION_BLOCKED/
+OWNER_INPUT_REQUIRED->READY owner intervention; PAUSED gate; stale/concurrent
+writes rejected via integrity_hash compare-and-set; owner isolation on
+load_for_owner; non-MissionStatus transition argument is a TypeError.
+
+CI on bc76d2594875: test (3.13) SUCCESS (runs 37005803521, 37005809177);
+pytest-diagnostics SUCCESS (runs 37005803634, 37005809073); vibe-diagnostics
+SUCCESS (run 37005803672); export SUCCESS; Workers Builds FAILURE pre-existing.
