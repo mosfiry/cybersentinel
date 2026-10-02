@@ -72,3 +72,28 @@ This manifest records small recovery checkpoints. A checkpoint is published only
 - **API impact:** None; no API implementation or contract changed.
 - **Desktop impact:** None; Desktop/Electron/Vibe and PR #18 untouched.
 - **Next task:** M1 — add a local-only bridge-to-worker regression proving an explicitly reconciled and requeued mission can be claimed and executed once, with durable completion state and no duplicate side effect.
+
+## 2026-10-02 — M1 Owner reconciliation-to-worker execution regression
+
+- **Epic:** A — Recovery + Engineering Baseline
+- **Story:** M1 — Durable Mission Runtime
+- **Task:** Complete the prior checkpoint’s next M1 task: add a local-only bridge-to-worker integration regression proving an authenticated Owner’s explicit reconciliation and requeue permits one queued mission to be claimed and executed, persists valid completion/evidence state, and prevents duplicate irreversible effects after repeated or replayed delivery. Keep Owner authentication, CSRF, authorization, scope, evidence validation, deterministic guards, API contracts, and Desktop unchanged.
+- **Branch:** `engineering/agile-runtime-reconcile-execution`
+- **Commit:** One test/documentation checkpoint commit at `refs/heads/engineering/agile-runtime-reconcile-execution`; publish with a normal push and require exact equality between local `HEAD` and the live remote branch SHA. Do not record this manifest commit’s own SHA here. **Parent:** `266e931364a2326d7a5fc5ffb2e96d50e5dfc480`.
+- **Recovery source SHA:** `266e931364a2326d7a5fc5ffb2e96d50e5dfc480`, parent `1e1ae3cdbb6c9a565163959363e60e8d4902a775`; verified clean locally and equal to the live `origin/refs/heads/engineering/agile-runtime-owner-reconcile` tip before branch/worktree creation.
+- **Files:** `tests/test_public_web_boundary.py`; `docs/AGILE_CHECKPOINTS.md` only. No production source changed.
+- **Tests (in requested order):**
+  - Unmodified-tip baseline: `python -m pytest -q tests/test_public_web_boundary.py tests/test_phase6k7b_mission_runtime.py::test_in_flight_receipt_reconciliation_prevents_duplicate_side_effect` — 40 passed in 23.20s (shell wall time 23.641s).
+  - Focused new regression: `python -m pytest -q tests/test_public_web_boundary.py::test_public_owner_reconciliation_requeues_for_worker_execution_once` — 1 passed in 1.45s (wall 1.820s).
+  - `python -m pytest -q tests/test_public_web_boundary.py` — 40 passed in 23.07s (wall 23.457s).
+  - `python -m pytest -q tests/test_mission_worker_lifecycle.py` — 15 passed in 3.01s (wall 3.414s).
+  - `python -m pytest -q tests/test_failure_recovery_replan.py tests/test_mission_control_races.py tests/test_phase6k7b_mission_runtime.py` — 27 passed in 1.54s (wall 1.943s).
+  - `python -m pytest -q tests/test_crash_restart_resume.py` — 6 passed in 0.96s (wall 1.325s).
+  - `python -m pytest -q` — 981 passed, 1 skipped in 64.69s (wall 65.273s). Quiet output did not identify the skipped test or its reason; neither is inferred. The first draft of the new regression exposed a missing schema initialization in its temporary memory-store fixture; the helper now sets the per-test temporary path before module import and initializes only that temporary database, and the focused test and all suites pass.
+- **Status:** The regression uses the real authenticated public bridge route, temporary SQLite stores, a synthetic in-flight action, and a deterministic local executor/interpreter. Before Owner reconciliation, the queue is `WAITING_FOR_TOOL` and unclaimable. The explicit `executed=False` reconciliation persists `reconciled_not_executed` and requeues without claiming; the worker then claims and executes with the deterministic mission action ID as its idempotency key. The test reopens `MissionStore` and verifies `GOAL_COMPLETED`, valid system-signed completion proof, and persisted system-verified `system_online` evidence. The fake status payload is not treated as proof: the existing validator independently reads local `core.engine.status`. A duplicate queue delivery after completion and a replayed Owner reconciliation do not invoke the fake side effect again; the replay is rejected by the existing route contract. The route itself does not claim or execute work.
+- **Original checkout boundary:** `/workspace/cybersentinel-release-closure` was not accessed or modified, and no content was imported. The prior manifest records 114 mixed-worktree status paths; current state was not inspected under the explicit no-touch boundary.
+- **Known limitations:** No live provider acceptance, external target, or Desktop behavior was exercised. The single full-suite skip’s identity and reason remain unknown because the run used `-q`.
+- **Security impact:** Regression-only. Owner authentication, CSRF, authorization, scope, evidence issuance/validation, deterministic execution guards, and runtime code are unchanged.
+- **API impact:** None; no API implementation or contract changed.
+- **Desktop impact:** None; Desktop/Electron/Vibe untouched.
+- **Next task:** M1 — add a local-only bridge/worker crash-recovery regression where a fake side effect occurs after claim but before durable completion, then prove explicit Owner `executed=True` reconciliation persists the receipt and prevents the action from being repeated after restart.

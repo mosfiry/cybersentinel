@@ -15,7 +15,8 @@ import bridge
 import core.db as core_db
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
-from agent.mission_worker import MissionQueue, WorkerMissionState
+from agent.observation_intelligence import ObservationInterpreter
+from agent.mission_worker import MissionQueue, MissionWorker, WorkerMissionState
 from agent.planning import Plan, PlanStep
 from security import owner_password
 from security.public_session import PublicSessionManager
@@ -1084,15 +1085,20 @@ def test_public_mission_rejects_incomplete_scope_reference_before_creation(web_s
     assert captured == []
 
 
-def _prepare_owner_reconciliation(tmp_path, monkeypatch, owner_id, *, incomplete=False):
+def _prepare_owner_reconciliation(
+    tmp_path, monkeypatch, owner_id, *, incomplete=False, plan=None, completion_criteria=None
+):
+    memory_path = tmp_path / "mission-memory.sqlite3"
+    monkeypatch.setenv("CYBERSENTINEL_MEMORY_DB_PATH", str(memory_path))
     import agent.memory as mission_memory
 
     monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "bridge.sqlite3")
-    monkeypatch.setattr(mission_memory, "MEMORY_DB_PATH", tmp_path / "mission-memory.sqlite3")
+    monkeypatch.setattr(mission_memory, "MEMORY_DB_PATH", memory_path)
+    mission_memory._init_memory_db()
     missions_path = tmp_path / "missions.sqlite3"
     store = MissionStore(missions_path)
     runtime = MissionRuntime(store, executor=lambda *_: {"success": True})
-    plan = Plan.initial("synthetic bridge recovery").replan(
+    plan = plan or Plan.initial("synthetic bridge recovery").replan(
         steps=(PlanStep("observe", "observe synthetic state", action="status"),),
         reason="local bridge regression",
     )
@@ -1100,17 +1106,19 @@ def _prepare_owner_reconciliation(tmp_path, monkeypatch, owner_id, *, incomplete
         "synthetic bridge recovery",
         "synthetic bridge recovery",
         plan,
+        completion_criteria=completion_criteria or [],
         request_id="synthetic-bridge-reconciliation",
         owner_identity_ref=str(owner_id),
     )
     if incomplete:
         mission.checkpoint = {"status": "in_flight_parallel", "ambiguous_tool_call_ids": []}
     else:
-        action_id = f"{mission.mission_id}:{mission.plan.version}:observe:0"
+        step = mission.plan.steps[0]
+        action_id = f"{mission.mission_id}:{mission.plan.version}:{step.step_id}:0"
         mission.checkpoint = {
             "status": "in_flight",
             "action_id": action_id,
-            "step_id": "observe",
+            "step_id": step.step_id,
             "plan_fingerprint": mission.plan.fingerprint,
         }
     mission.transition(MissionStatus.RECOVERY_REQUIRED, "synthetic ambiguous action")
@@ -1204,6 +1212,153 @@ def test_public_owner_reconciliation_persists_receipt_before_queue_requeue(web_s
     assert len(replayed.observations) == 1
     assert len(replayed.action_history) == 1
     assert queue_claims == []
+
+
+def test_public_owner_reconciliation_requeues_for_worker_execution_once(web_server, tmp_path, monkeypatch):
+    server, _ = web_server
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+    owner = owner_password.resolve_session(owner_cookie)
+    assert owner is not None
+    plan = Plan.initial("apply one local synthetic action and verify the local core").replan(
+        steps=(
+            PlanStep("apply", "apply one synthetic local action", action="local_fake_action"),
+            PlanStep("verify", "read local core status", action="status", prerequisites=("apply",)),
+        ),
+        reason="local bridge-to-worker regression",
+    )
+    mission, missions_path, queue = _prepare_owner_reconciliation(
+        tmp_path,
+        monkeypatch,
+        owner["owner_id"],
+        plan=plan,
+        completion_criteria=[
+            {"criterion_id": "local-core-online", "description": "local core is online", "check": "system_online"}
+        ],
+    )
+    assert queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+    assert queue.claim_next(worker_id="synthetic-before-owner-reconcile") is None
+
+    claim_events = []
+    original_claim_next = MissionQueue.claim_next
+
+    def track_claim(self, *args, **kwargs):
+        item = original_claim_next(self, *args, **kwargs)
+        if self.db_path == queue.db_path and item is not None:
+            claim_events.append((item.state, item.attempts, item.lease_owner))
+        return item
+
+    monkeypatch.setattr(MissionQueue, "claim_next", track_claim)
+    status, _, response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {"executed": False},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+
+    assert status == 200, response
+    assert response["result"]["queue"]["state"] == WorkerMissionState.QUEUED.value
+    assert claim_events == []
+    reconciled = MissionStore(missions_path).load(mission.mission_id)
+    assert reconciled.status is MissionStatus.READY
+    assert reconciled.checkpoint["status"] == "reconciled_not_executed"
+    assert reconciled.action_history == []
+    assert reconciled.evidence == []
+    assert queue.get(mission.mission_id).state is WorkerMissionState.QUEUED
+
+    side_effect_attempts = {}
+    applied_action_ids = set()
+    side_effect_ledger = []
+    executor_calls = []
+
+    def local_executor(_mission, step, action_id):
+        executor_calls.append((step.step_id, action_id))
+        if step.step_id == "apply":
+            side_effect_attempts[action_id] = side_effect_attempts.get(action_id, 0) + 1
+            if action_id not in applied_action_ids:
+                applied_action_ids.add(action_id)
+                side_effect_ledger.append(action_id)
+            return {"success": True, "source": "local_fake_executor", "idempotency_key": action_id}
+        assert step.step_id == "verify"
+        # The payload is only an observation trigger; the criterion validator independently
+        # reads core.engine.status and signs evidence rather than trusting this fake response.
+        return {"success": True, "source": "status", "summary": "synthetic local status observation"}
+
+    interpreter = ObservationInterpreter(
+        proposer=lambda _context: {"summary": "synthetic local interpretation", "facts": []}
+    )
+    runtime = MissionRuntime(
+        MissionStore(missions_path),
+        executor=local_executor,
+        interpreter=interpreter,
+    )
+    worker = MissionWorker(queue, runtime_factory=lambda: runtime, worker_id="local-reconcile-worker")
+    first_run = worker.run_once(now=(datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat())
+
+    assert first_run is not None
+    assert first_run.state is WorkerMissionState.COMPLETED
+    assert first_run.attempts == 2
+    assert claim_events == [(WorkerMissionState.EXECUTING, 2, "local-reconcile-worker")]
+    expected_action_id = f"{mission.mission_id}:{mission.plan.version}:apply:0"
+    assert side_effect_attempts == {expected_action_id: 1}
+    assert applied_action_ids == {expected_action_id}
+    assert side_effect_ledger == [expected_action_id]
+    assert executor_calls == [
+        ("apply", expected_action_id),
+        ("verify", f"{mission.mission_id}:{mission.plan.version}:verify:1"),
+    ]
+
+    persisted = MissionStore(missions_path).load(mission.mission_id)
+    assert persisted.status is MissionStatus.GOAL_COMPLETED
+    assert persisted.completion_proof_is_valid()
+    assert persisted.verification_state == {"verified": True, "missing_criteria": [], "evidence_count": 1}
+    assert len(persisted._verified_system_evidence()) == 1
+    assert len(persisted.evidence) == 1
+    assert persisted.evidence[0]["criterion_id"] == "local-core-online"
+    assert persisted.evidence[0]["source"] == "system_online"
+    effect_record = next(item for item in persisted.action_history if item["action_id"] == expected_action_id)
+    assert effect_record["observation"]["idempotency_key"] == expected_action_id
+    assert queue.get(mission.mission_id).state is WorkerMissionState.COMPLETED
+
+    # Simulate duplicate queue delivery after completion: terminal mission state is authoritative.
+    duplicate_delivery = queue.enqueue(
+        mission.mission_id,
+        available_at=(datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat(),
+    )
+    assert duplicate_delivery.state is WorkerMissionState.QUEUED
+    second_run = worker.run_once(now=(datetime.now(timezone.utc) + timedelta(seconds=3)).isoformat())
+    assert second_run is not None
+    assert second_run.state is WorkerMissionState.COMPLETED
+    assert second_run.attempts == 3
+    assert claim_events == [
+        (WorkerMissionState.EXECUTING, 2, "local-reconcile-worker"),
+        (WorkerMissionState.EXECUTING, 3, "local-reconcile-worker"),
+    ]
+    assert side_effect_attempts == {expected_action_id: 1}
+    assert side_effect_ledger == [expected_action_id]
+    assert len(executor_calls) == 2
+
+    replay_status, _, replay = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {"executed": False},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+    assert replay_status == 400
+    assert replay == {"ok": False, "error": "mission has no in-flight action requiring reconciliation"}
+    after_replay = MissionStore(missions_path).load(mission.mission_id)
+    assert after_replay.status is MissionStatus.GOAL_COMPLETED
+    assert after_replay.completion_proof_is_valid()
+    assert len(after_replay._verified_system_evidence()) == 1
+    assert len(after_replay.action_history) == 2
+    assert len(after_replay.evidence) == 1
+    assert queue.get(mission.mission_id).state is WorkerMissionState.COMPLETED
+    assert side_effect_attempts == {expected_action_id: 1}
+    assert side_effect_ledger == [expected_action_id]
+    assert len(executor_calls) == 2
 
 
 def test_public_owner_reconciliation_rejects_incomplete_receipt_without_requeue(web_server, tmp_path, monkeypatch):
