@@ -1,19 +1,25 @@
-# حالة المهمة — M2 Architecture Design
+# حالة المهمة — M2.a
 
 | الحقل | القيمة |
 |---|---|
-| `CURRENT_PHASE` | `M2` — تصميم اختيار سلطة التنفيذ وربط claim بكتابات mission/evidence/proof/intents. |
-| `CURRENT_CHECKPOINT` | `design` — وثيقة تصميم فقط؛ لا تنفيذ M2. commit هذا checkpoint أبوه `579387ff58910c14d8ca277cfdd68535220be846`؛ لا يُسجل SHA ذاتيًا هنا. |
-| `LAST_GOOD_SHA` | `579387ff58910c14d8ca277cfdd68535220be846` — HEAD المنشور الذي تحقق قبل التعديل؛ ليس commit هذا checkpoint. |
+| `CURRENT_PHASE` | `M2.a` — atomic fenced mission write + deterministic stale A/B regression؛ لا يعني cutover إنتاجيًا. |
+| `CURRENT_CHECKPOINT` | `M2.a` مقبول محليًا؛ parent المباشر `b81742b59afd612f627f82dc6db1beca1a7d2a3a`؛ لا يُسجل SHA ذاتيًا هنا. |
+| `LAST_GOOD_SHA` | `b81742b59afd612f627f82dc6db1beca1a7d2a3a` — base المنشور الذي تحقق قبل M2.a وparent المقصود للـcheckpoint. |
 | `BRANCH` | `manus/durable-runtime-fencing` |
-| `REMOTE_BASE_SHA` | `579387ff58910c14d8ca277cfdd68535220be846` — نتيجة `git ls-remote origin refs/heads/manus/durable-runtime-fencing` قبل العمل. |
-| `COMPLETED_PHASES` | `M0`, `M1` — M0 جرد توثيقي؛ M1 تنفيذ محلي لlease fencing في queue واختباراته وcheckpointه السابق. لا يعني ذلك اكتمال M2 أو deployment/قبول حي. |
-| `ACTIVE_WORK` | `implementation not started` |
+| `REMOTE_BASE_SHA` | `b81742b59afd612f627f82dc6db1beca1a7d2a3a` — SHA البعيد للفرع عند preflight وقبل checkpoint. |
+| `COMPLETED_PHASES` | `M0`, `M1`, `M2.a` — M2.a يثبت worker mission-write fencing فقط عند اشتراك queue/store في ملف واحد؛ لا يعني حماية `/api/chat` أو اكتمال M2 أو deployment. |
+| `ACTIVE_WORK` | `M2.a acceptance complete; production API/supervisor fencing remains out of scope` |
 | `WORKTREE` | `/workspace/cybersentinel-m0-20261002-1329` |
-| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md` — قرار queue+supervisor كسلطة إنتاجية وحيدة بعد cutover M2.d، مع إبقاء `/api/chat` متزامنًا حتى ذلك الحين. |
-| `NEXT_ACTION` | `M2.a` |
-| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_mission_store_fencing.py tests/test_mission_queue_fencing.py -q` (اختبار مستقبلي للخطوة M2.a؛ لم يُشغّل في checkpoint التصميم). |
-| `CHECKPOINT_VERIFICATION` | شُغّل `git diff --check` فقط، ورُوجعت مسارات diff و`git status`. لا اختبار وظيفي أو compile أو قبول/deployment في هذا checkpoint. |
+| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; أدلة التنفيذ والحدود في `docs/MANUS_M2A_EVIDENCE.md`. |
+| `NEXT_ACTION` | `M2.b` — evidence/proof atomicity، بعد checkpoint مستقل. |
+| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_mission_store_fencing.py tests/test_mission_queue_fencing.py -q` |
+| `CHECKPOINT_VERIFICATION` | targeted: 13 passed؛ compileall: pass؛ full suite: 717 passed, 1 skipped (live provider disabled)؛ adaptive: 24 passed؛ انظر `docs/MANUS_M2A_EVIDENCE.md`. |
+
+## وضع تنفيذ M2.a
+
+- أُثبت اختبار A/B أحمر على base قبل الإصلاح ثم أخضر بعده؛ revision CAS والتحقق من claim يقعان في transaction واحدة على authority file نفسه.
+- **write-fencing للمسار الإنتاجي الحالي غير متحقق:** `/api/chat` ما زال inline بلا claim، وتهيئة bridge تفصل mission وqueue. لا يُدّعى أن الكود يحمي هذا المسار أو أي عامل لا يستخدم binding. لم يحدث supervisor/API cutover.
+- المخاطر والحدود الدقيقة وجرد قواعد الاختبار ignored موثقة في `docs/MANUS_M2A_EVIDENCE.md`.
 
 ## الأساس التاريخي المحفوظ
 

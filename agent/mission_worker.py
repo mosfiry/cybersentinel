@@ -9,7 +9,7 @@ import json
 import sqlite3
 import uuid
 
-from .mission import MissionStatus
+from .mission import MissionStatus, MissionStore
 
 
 class WorkerMissionState(str, Enum):
@@ -407,6 +407,15 @@ class MissionWorker:
         if claim is None:
             raise LeaseLostError("claim returned without a lease snapshot", lease_status=LeaseStatus.LEASE_LOST)
         runtime = self.runtime_factory()
+        fenced_store = None
+        runtime_store = getattr(runtime, "store", None)
+        if runtime_store is not None:
+            if not isinstance(runtime_store, MissionStore):
+                raise ValueError("worker runtime must provide a fenced MissionStore")
+            if Path(runtime_store.db_path).resolve() != Path(self.queue.db_path).resolve():
+                raise ValueError("fenced mission writes require mission and queue to share one SQLite authority file")
+            fenced_store = runtime_store.with_claim(claim, now=now)
+            runtime.store = fenced_store
 
         def heartbeat() -> None:
             nonlocal claim
@@ -414,6 +423,8 @@ class MissionWorker:
             if renewed.lease_claim is None:
                 raise LeaseLostError("heartbeat returned without a lease snapshot", lease_status=LeaseStatus.LEASE_LOST)
             claim = renewed.lease_claim
+            if fenced_store is not None:
+                fenced_store.set_claim(claim)
 
         try:
             try:

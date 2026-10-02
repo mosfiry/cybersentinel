@@ -80,6 +80,7 @@ class Mission:
     recovery_events: list[dict[str, Any]] = field(default_factory=list)
     semantic_intent: dict[str, Any] = field(default_factory=dict)
     integrity_hash: str = ""
+    revision: int = field(default=0, repr=False, compare=False)
 
     @classmethod
     def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50, request_id: str = "", owner_identity_ref: str = "", owner_instruction: str = "", policy_snapshot: dict[str, Any] | None = None, authorization_snapshot: dict[str, Any] | None = None, provenance: dict[str, Any] | None = None) -> "Mission":
@@ -162,31 +163,91 @@ class MissionStore:
         import sqlite3
         self.db_path = str(db_path)
         with sqlite3.connect(self.db_path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS missions (mission_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS missions (mission_id TEXT PRIMARY KEY, payload TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(missions)")}
+            if "revision" not in columns:
+                db.execute("ALTER TABLE missions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
 
-    def save(self, mission: Mission) -> Mission:
+    def save(self, mission: Mission, *, claim=None, now: str | None = None) -> Mission:
         import json, sqlite3
+        payload = mission.to_dict()
+        encoded = json.dumps(payload, ensure_ascii=False)
+        next_revision = mission.revision + 1
         with sqlite3.connect(self.db_path) as db:
-            payload = mission.to_dict()
-            encoded = json.dumps(payload, ensure_ascii=False)
-            existing = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
+            db.execute("BEGIN IMMEDIATE")
+            if claim is not None:
+                from .mission_worker import (
+                    LeaseClaimSnapshot,
+                    LeaseLostError,
+                    LeaseStatus,
+                    MissionQueue,
+                    _current_timestamp,
+                )
+                if not isinstance(claim, LeaseClaimSnapshot):
+                    raise LeaseLostError("a lease claim snapshot is required", lease_status=LeaseStatus.LEASE_LOST)
+                if claim.mission_id != mission.mission_id:
+                    raise LeaseLostError("claim belongs to another mission", lease_status=LeaseStatus.LEASE_LOST)
+                MissionQueue._require_current_claim(db, claim, _current_timestamp(now))
+
+            existing = db.execute("SELECT payload, revision FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
             if existing is None:
-                db.execute("INSERT INTO missions(mission_id,payload) VALUES(?,?)", (mission.mission_id, encoded))
+                if mission.revision != 0:
+                    raise ValueError("stale mission write rejected")
+                db.execute(
+                    "INSERT INTO missions(mission_id,payload,revision) VALUES(?,?,?)",
+                    (mission.mission_id, encoded, next_revision),
+                )
             else:
                 current_hash = str(json.loads(existing[0]).get("integrity_hash", ""))
-                if not mission.integrity_hash or current_hash != mission.integrity_hash:
+                current_revision = int(existing[1])
+                if (
+                    not mission.integrity_hash
+                    or current_hash != mission.integrity_hash
+                    or current_revision != mission.revision
+                ):
                     raise ValueError("stale mission write rejected")
-                updated = db.execute("UPDATE missions SET payload=? WHERE mission_id=? AND payload=?", (encoded, mission.mission_id, existing[0]))
+                updated = db.execute(
+                    "UPDATE missions SET payload=?,revision=revision+1 "
+                    "WHERE mission_id=? AND payload=? AND revision=?",
+                    (encoded, mission.mission_id, existing[0], mission.revision),
+                )
                 if updated.rowcount != 1:
                     raise ValueError("concurrent mission write rejected")
-            mission.integrity_hash = str(payload["integrity_hash"])
+        mission.integrity_hash = str(payload["integrity_hash"])
+        mission.revision = next_revision
         return mission
 
     def load(self, mission_id: str) -> Mission | None:
         import json, sqlite3
         with sqlite3.connect(self.db_path) as db:
-            row = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
-        return Mission.from_dict(json.loads(row[0])) if row else None
+            row = db.execute("SELECT payload,revision FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
+        if row is None:
+            return None
+        mission = Mission.from_dict(json.loads(row[0]))
+        mission.revision = int(row[1])
+        return mission
+
+    def with_claim(self, claim, *, now: str | None = None):
+        """Bind worker runtime saves to a current queue claim in this database."""
+        return _ClaimBoundMissionStore(self, claim, now)
+
+
+class _ClaimBoundMissionStore:
+    """MissionStore view that attaches the latest worker claim to each save."""
+
+    def __init__(self, store: MissionStore, claim, now: str | None):
+        self._store = store
+        self._claim = claim
+        self._now = now
+
+    def set_claim(self, claim) -> None:
+        self._claim = claim
+
+    def save(self, mission: Mission) -> Mission:
+        return self._store.save(mission, claim=self._claim, now=self._now)
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
 
 
 __all__ = ["Mission", "MissionStatus", "MissionStore", "TERMINAL_MISSION_STATUSES"]
