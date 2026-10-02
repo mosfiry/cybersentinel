@@ -44,14 +44,13 @@ def validated_request_id(request_id: str) -> str:
     Server-generated ids are 32-character hex. Client-supplied ids are accepted
     only when they are strings of 1..128 characters from [A-Za-z0-9_-]; anything
     else is rejected before authorization so a malformed identifier can never
-    become a lifecycle, evidence, or provenance key.
+    become a lifecycle, evidence, or provenance key. There is NO whitespace
+    normalization: a padded identifier is rejected, never silently trimmed
+    (V12 adversarial finding — trimming masked injected whitespace).
     """
-    if not isinstance(request_id, str):
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128 or any(c not in _REQUEST_ID_ALLOWED for c in request_id):
         raise ValueError("invalid_request_id")
-    value = request_id.strip()
-    if not value or len(value) > 128 or any(c not in _REQUEST_ID_ALLOWED for c in value):
-        raise ValueError("invalid_request_id")
-    return value
+    return request_id
 
 
 class AgentCore:
