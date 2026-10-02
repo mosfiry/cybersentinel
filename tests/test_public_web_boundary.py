@@ -2027,6 +2027,205 @@ def test_public_owner_safe_retry_survives_store_and_queue_restart_once(
     assert MissionQueue(queue.db_path).get(mission.mission_id).state is WorkerMissionState.COMPLETED
 
 
+def test_public_owner_safe_retry_fences_stale_worker_after_lease_takeover(
+    web_server, tmp_path, monkeypatch
+):
+    from agent.mission_worker import LeaseLostError
+
+    server, _ = web_server
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+    owner = owner_password.resolve_session(owner_cookie)
+    assert owner is not None
+    criterion_id = "synthetic-worker-online"
+    plan = Plan.initial("fence a stale worker before one local retry").replan(
+        steps=(
+            PlanStep("apply", "apply one local synthetic action", action="local_fake_action"),
+            PlanStep("verify", "read local core status", action="status", prerequisites=("apply",)),
+        ),
+        reason="local stale-worker lease-fencing regression",
+    )
+    mission, missions_path, original_queue = _prepare_owner_reconciliation(
+        tmp_path,
+        monkeypatch,
+        owner["owner_id"],
+        plan=plan,
+        completion_criteria=[
+            {"criterion_id": criterion_id, "description": "Local system is online", "check": "system_online"}
+        ],
+    )
+    assert original_queue.get(mission.mission_id).state is WorkerMissionState.WAITING_FOR_TOOL
+
+    status, _, response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {"executed": False},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+    assert status == 200, response
+    assert response["result"]["queue"]["state"] == WorkerMissionState.QUEUED.value
+
+    # Fresh store/queue instances model restart after the explicit safe-retry
+    # decision. The retry carries no claimed observation or completed action.
+    restarted_store = MissionStore(missions_path)
+    queue = MissionQueue(original_queue.db_path)
+    assert queue.recover_after_restart() == []
+    safe_retry = restarted_store.load(mission.mission_id)
+    assert safe_retry.status is MissionStatus.READY
+    assert safe_retry.checkpoint["status"] == "reconciled_not_executed"
+    assert safe_retry.observations == []
+    assert safe_retry.action_history == []
+    assert safe_retry.evidence == []
+
+    expected_action_id = f"{mission.mission_id}:{mission.plan.version}:apply:0"
+    stale_executor_calls = []
+    current_executor_calls = []
+    current_side_effects = []
+
+    def stale_executor(_current, step, action_id):
+        stale_executor_calls.append((step.step_id, action_id))
+        return {"success": True, "source": "stale_local_fake_executor", "idempotency_key": action_id}
+
+    def current_executor(_current, step, action_id):
+        current_executor_calls.append((step.step_id, action_id))
+        if step.step_id == "apply":
+            current_side_effects.append(action_id)
+            return {"success": True, "source": "current_local_fake_executor", "idempotency_key": action_id}
+        assert step.step_id == "verify"
+        return {"success": True, "source": "status", "summary": "synthetic local status observation"}
+
+    stale_factory_entered = threading.Event()
+    release_stale_factory = threading.Event()
+    current_factory_entered = threading.Event()
+    release_current_factory = threading.Event()
+    stale_worker_id = "expired-worker"
+    current_worker_id = "replacement-worker"
+
+    def stale_runtime_factory():
+        stale_factory_entered.set()
+        assert release_stale_factory.wait(5), "test did not release stale runtime factory"
+        return MissionRuntime(MissionStore(missions_path), executor=stale_executor)
+
+    def current_runtime_factory():
+        item = queue.get(mission.mission_id)
+        assert item.state is WorkerMissionState.EXECUTING
+        assert item.lease_owner == current_worker_id
+        current_factory_entered.set()
+        assert release_current_factory.wait(5), "test did not release replacement runtime factory"
+        return MissionRuntime(
+            MissionStore(missions_path),
+            executor=current_executor,
+            interpreter=ObservationInterpreter(
+                proposer=lambda _context: {"summary": "synthetic local interpretation", "facts": []}
+            ),
+        )
+
+    stale_worker = MissionWorker(
+        queue, runtime_factory=stale_runtime_factory, worker_id=stale_worker_id, lease_seconds=60
+    )
+    current_worker = MissionWorker(
+        queue, runtime_factory=current_runtime_factory, worker_id=current_worker_id, lease_seconds=60
+    )
+    stale_results = []
+    current_results = []
+    stale_failures = []
+    current_failures = []
+
+    def run_worker(worker, now, results, failures):
+        try:
+            results.append(worker.run_once(now=now))
+        except BaseException as exc:
+            failures.append(exc)
+
+    first_claim_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+    stale_thread = threading.Thread(
+        target=run_worker,
+        args=(stale_worker, first_claim_at.isoformat(), stale_results, stale_failures),
+        daemon=True,
+    )
+    current_thread = None
+    stale_thread.start()
+    try:
+        assert stale_factory_entered.wait(5), "stale worker did not claim the retry"
+        stale_claim = queue.get(mission.mission_id)
+        assert stale_claim.state is WorkerMissionState.EXECUTING
+        assert stale_claim.lease_owner == stale_worker_id
+
+        # Advance the queue's deterministic clock beyond any initial or renewed
+        # lease, recover it, and let a distinct worker ID claim the safe retry.
+        takeover_at = (first_claim_at + timedelta(hours=1)).isoformat()
+        recovered = queue.recover_expired(now=takeover_at)
+        assert len(recovered) == 1
+        assert recovered[0].state is WorkerMissionState.QUEUED
+        assert recovered[0].lease_owner is None
+
+        current_thread = threading.Thread(
+            target=run_worker,
+            args=(current_worker, takeover_at, current_results, current_failures),
+            daemon=True,
+        )
+        current_thread.start()
+        assert current_factory_entered.wait(5), "replacement worker did not claim the retry"
+        replacement_lease = queue.get(mission.mission_id)
+        assert replacement_lease.state is WorkerMissionState.EXECUTING
+        assert replacement_lease.lease_owner == current_worker_id
+
+        with pytest.raises(LeaseLostError, match="worker lease is not owned"):
+            queue.heartbeat(mission.mission_id, worker_id=stale_worker_id)
+        with pytest.raises(LeaseLostError, match="worker lease is not owned"):
+            queue.update(
+                mission.mission_id,
+                WorkerMissionState.FAILED,
+                error="stale result must not publish",
+                worker_id=stale_worker_id,
+            )
+        assert queue.get(mission.mission_id).lease_owner == current_worker_id
+
+        # Resume the stale worker while the replacement still owns the lease.
+        # Its runtime's pre-slice heartbeat must fail before its executor runs.
+        release_stale_factory.set()
+        stale_thread.join(timeout=8)
+        assert not stale_thread.is_alive()
+        assert stale_failures == []
+        assert len(stale_results) == 1
+        assert stale_results[0].state is WorkerMissionState.EXECUTING
+        assert stale_results[0].lease_owner == current_worker_id
+        assert stale_executor_calls == []
+        assert current_executor_calls == []
+
+        release_current_factory.set()
+        current_thread.join(timeout=15)
+        assert not current_thread.is_alive()
+        assert current_failures == []
+    finally:
+        release_stale_factory.set()
+        release_current_factory.set()
+        stale_thread.join(timeout=8)
+        if current_thread is not None:
+            current_thread.join(timeout=15)
+
+    assert not stale_thread.is_alive()
+    assert current_thread is not None and not current_thread.is_alive()
+    assert len(current_results) == 1
+    assert current_results[0].state is WorkerMissionState.COMPLETED
+    assert current_results[0].lease_owner is None
+    assert stale_executor_calls == []
+    assert current_executor_calls == [
+        ("apply", expected_action_id),
+        ("verify", f"{mission.mission_id}:{mission.plan.version}:verify:1"),
+    ]
+    assert current_side_effects == [expected_action_id]
+
+    completed = MissionStore(missions_path).load(mission.mission_id)
+    assert completed.status is MissionStatus.GOAL_COMPLETED
+    assert completed.completion_proof_is_valid()
+    apply_record = next(item for item in completed.action_history if item["action_id"] == expected_action_id)
+    assert apply_record["status"] == "completed"
+    assert apply_record["observation"]["idempotency_key"] == expected_action_id
+    assert MissionQueue(queue.db_path).get(mission.mission_id).state is WorkerMissionState.COMPLETED
+
+
 def test_public_owner_reconciliation_ignores_caller_supplied_receipt_and_evidence(
     web_server, tmp_path, monkeypatch
 ):
