@@ -18,3 +18,21 @@ This manifest records small recovery checkpoints. A checkpoint is published only
 - **API impact:** None.
 - **Desktop impact:** None; Desktop/Electron/Vibe and PR #18 untouched.
 - **Next task:** M1 — Durable Mission Runtime, from the verified M0 remote branch tip.
+
+## 2026-10-02 — M1 Recovery-required worker lease release
+
+- **Epic:** A — Recovery + Engineering Baseline
+- **Story:** M1 — Durable Mission Runtime
+- **Task:** When a worker returns a mission in `RECOVERY_REQUIRED`, atomically transition its queue item to `WAITING_FOR_TOOL` and relinquish the worker lease. Preserve the mission's authoritative recovery status; do not make the queue item claimable until explicit reconciliation/requeue.
+- **Branch:** `engineering/agile-runtime`
+- **Commit:** One bug-fix commit at `refs/heads/engineering/agile-runtime`; after a normal push, resolve the exact SHA with `git ls-remote` and require equality with local `git rev-parse HEAD`. Do not write the commit's own SHA into this manifest. **Parent:** `cb1aca63682035f8555e7e0b752b1747f133b534` (verified M0 tip).
+- **Recovery source SHA:** `cb1aca63682035f8555e7e0b752b1747f133b534` at `origin/refs/heads/engineering/agile-foundation` before branch creation.
+- **Files:** `agent/mission_worker.py`; `tests/test_mission_worker_lifecycle.py`; `docs/AGILE_CHECKPOINTS.md` only.
+- **Tests:** The new regression first failed before the fix (`1 failed in 0.18s`, because `lease_owner` remained `worker-a`), then passed after the fix (`1 passed in 0.08s`). `python -m pytest -q tests/test_mission_worker_lifecycle.py` — 15 passed in 3.24s. `python -m pytest -q tests/test_failure_recovery_replan.py tests/test_mission_control_races.py tests/test_phase6k7b_mission_runtime.py` — 27 passed in 1.61s. `python -m pytest -q` — 977 passed, 1 skipped in 72.29s. The full run used `-q`, so the skipped test's reason was not printed; no live-provider acceptance or external-target tests were run.
+- **Status:** Worker return of `RECOVERY_REQUIRED` now uses the queue's lease-checked atomic `release` operation for `WAITING_FOR_TOOL`. The regression verifies both lease fields are cleared, mission status remains `RECOVERY_REQUIRED`, attempts remain unchanged, and the queue cannot be claimed or executed again through the worker until explicit requeue.
+- **Original checkout boundary:** `/workspace/cybersentinel-release-closure` remained untouched at `47683c22079eb17e79f43d21147a8fba98c4e127`; its preflight and post-review porcelain-status fingerprints were identical. The prior M0 checkpoint records 114 dirty status paths. No dirty-checkout content was imported.
+- **Known limitation:** The existing queue restart recovery path may promote `WAITING_FOR_TOOL` rows for processing. The persisted `RECOVERY_REQUIRED` mission remains terminal, and the runtime's terminal-state guard prevents model/tool execution until reconciliation; this slice does not change restart routing. An integrated queue-restart/runtime regression is recommended next.
+- **Security impact:** No authorization, scope, evidence, deterministic verification, or policy gates changed. Only the worker's lease relinquishment for the `WAITING_FOR_TOOL` result changed.
+- **API impact:** None.
+- **Desktop impact:** None.
+- **Next task:** Add a focused integration test covering `MissionQueue.recover_after_restart()` with a persisted `RECOVERY_REQUIRED` mission and prove the runtime does not execute a tool before explicit reconciliation/requeue; change restart routing only if that test exposes a missing guard.

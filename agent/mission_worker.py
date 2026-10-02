@@ -314,6 +314,11 @@ class MissionWorker:
                 return self.queue.release(item.mission_id, WorkerMissionState.PAUSED, worker_id=self.worker_id, error="mission paused by Owner")
             except LeaseLostError:
                 return self.queue.get(item.mission_id)
+        if state is WorkerMissionState.WAITING_FOR_TOOL:
+            try:
+                return self.queue.release(item.mission_id, state, worker_id=self.worker_id, error=mission.error)
+            except LeaseLostError:
+                return self.queue.get(item.mission_id)
         try:
             return self.queue.update(item.mission_id, state, error=mission.error, worker_id=self.worker_id)
         except LeaseLostError:

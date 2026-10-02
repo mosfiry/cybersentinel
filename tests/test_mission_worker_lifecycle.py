@@ -284,6 +284,30 @@ def test_worker_exception_with_inflight_checkpoint_waits_for_reconciliation(tmp_
     assert mission.status is MissionStatus.RECOVERY_REQUIRED
 
 
+def test_worker_returning_recovery_required_releases_lease_until_explicit_requeue(tmp_path):
+    queue = MissionQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue("mission-6", available_at=NOW)
+    mission = StubMission(MissionStatus.RECOVERY_REQUIRED, error="reconciliation required")
+    executions = []
+
+    def resume(mission_id, *_args):
+        executions.append(mission_id)
+        return mission
+
+    worker = MissionWorker(queue, runtime_factory=lambda: None, worker_id="worker-a", resume_callback=resume)
+    result = worker.run_once(now=NOW, max_slices=1)
+
+    assert result.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert result.lease_owner is None
+    assert result.lease_expires_at is None
+    assert mission.status is MissionStatus.RECOVERY_REQUIRED
+    assert result.attempts == 1
+    assert queue.claim_next(now="2026-09-29T00:02:01+00:00", worker_id="worker-b") is None
+    assert worker.run_once(now="2026-09-29T00:02:02+00:00", max_slices=1) is None
+    assert queue.get("mission-6").attempts == 1
+    assert executions == ["mission-6"]
+
+
 def test_queue_and_scheduler_databases_are_private_and_symlinks_rejected(tmp_path):
     queue_path = tmp_path / "queue.sqlite3"
     scheduler_path = tmp_path / "scheduler.sqlite3"
