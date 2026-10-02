@@ -10,6 +10,10 @@ import json
 from .planning import Plan, GoalVerification
 from .trajectory import EventType, TrajectoryEvent, verify_trajectory
 from .evidence import MissionEvidenceChain
+from .effect_intent import (
+    ExternalEffectIntentRepository,
+    initialize_effect_intent_schema,
+)
 
 
 class MissionStatus(str, Enum):
@@ -169,64 +173,71 @@ class MissionStore:
             if "revision" not in columns:
                 db.execute("ALTER TABLE missions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
             MissionEvidenceChain.initialize(db)
+            initialize_effect_intent_schema(db)
+        self.effect_intents = ExternalEffectIntentRepository(self)
 
-    def save(self, mission: Mission, *, claim=None, now: str | None = None) -> Mission:
-        import json, sqlite3
+    def _save_mission_in_transaction(self, db, mission: Mission, *, claim=None, now: str | None = None) -> tuple[str, int]:
+        import json
         payload = mission.to_dict()
         encoded = json.dumps(payload, ensure_ascii=False)
         next_revision = mission.revision + 1
+        if claim is not None:
+            from .mission_worker import (
+                LeaseClaimSnapshot,
+                LeaseLostError,
+                LeaseStatus,
+                MissionQueue,
+                _current_timestamp,
+            )
+            if not isinstance(claim, LeaseClaimSnapshot):
+                raise LeaseLostError("a lease claim snapshot is required", lease_status=LeaseStatus.LEASE_LOST)
+            if claim.mission_id != mission.mission_id:
+                raise LeaseLostError("claim belongs to another mission", lease_status=LeaseStatus.LEASE_LOST)
+            MissionQueue._require_current_claim(db, claim, _current_timestamp(now))
+
+        existing = db.execute("SELECT payload, revision FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
+        if existing is None:
+            if mission.revision != 0:
+                raise ValueError("stale mission write rejected")
+            if claim is not None:
+                MissionEvidenceChain.append_in_transaction(db, mission.mission_id, list(payload.get("evidence", [])), claim)
+            db.execute(
+                "INSERT INTO missions(mission_id,payload,revision) VALUES(?,?,?)",
+                (mission.mission_id, encoded, next_revision),
+            )
+        else:
+            current_payload = json.loads(existing[0])
+            current_hash = str(current_payload.get("integrity_hash", ""))
+            current_revision = int(existing[1])
+            if (
+                not mission.integrity_hash
+                or current_hash != mission.integrity_hash
+                or current_revision != mission.revision
+            ):
+                raise ValueError("stale mission write rejected")
+            if claim is not None:
+                previous_evidence = list(current_payload.get("evidence", []))
+                next_evidence = list(payload.get("evidence", []))
+                if len(next_evidence) < len(previous_evidence) or next_evidence[:len(previous_evidence)] != previous_evidence:
+                    raise ValueError("mission evidence history is append-only")
+                MissionEvidenceChain.append_in_transaction(
+                    db, mission.mission_id, next_evidence[len(previous_evidence):], claim
+                )
+            updated = db.execute(
+                "UPDATE missions SET payload=?,revision=revision+1 "
+                "WHERE mission_id=? AND payload=? AND revision=?",
+                (encoded, mission.mission_id, existing[0], mission.revision),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("concurrent mission write rejected")
+        return str(payload["integrity_hash"]), next_revision
+
+    def save(self, mission: Mission, *, claim=None, now: str | None = None) -> Mission:
+        import sqlite3
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
-            if claim is not None:
-                from .mission_worker import (
-                    LeaseClaimSnapshot,
-                    LeaseLostError,
-                    LeaseStatus,
-                    MissionQueue,
-                    _current_timestamp,
-                )
-                if not isinstance(claim, LeaseClaimSnapshot):
-                    raise LeaseLostError("a lease claim snapshot is required", lease_status=LeaseStatus.LEASE_LOST)
-                if claim.mission_id != mission.mission_id:
-                    raise LeaseLostError("claim belongs to another mission", lease_status=LeaseStatus.LEASE_LOST)
-                MissionQueue._require_current_claim(db, claim, _current_timestamp(now))
-
-            existing = db.execute("SELECT payload, revision FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
-            if existing is None:
-                if mission.revision != 0:
-                    raise ValueError("stale mission write rejected")
-                if claim is not None:
-                    MissionEvidenceChain.append_in_transaction(db, mission.mission_id, list(payload.get("evidence", [])), claim)
-                db.execute(
-                    "INSERT INTO missions(mission_id,payload,revision) VALUES(?,?,?)",
-                    (mission.mission_id, encoded, next_revision),
-                )
-            else:
-                current_payload = json.loads(existing[0])
-                current_hash = str(current_payload.get("integrity_hash", ""))
-                current_revision = int(existing[1])
-                if (
-                    not mission.integrity_hash
-                    or current_hash != mission.integrity_hash
-                    or current_revision != mission.revision
-                ):
-                    raise ValueError("stale mission write rejected")
-                if claim is not None:
-                    previous_evidence = list(current_payload.get("evidence", []))
-                    next_evidence = list(payload.get("evidence", []))
-                    if len(next_evidence) < len(previous_evidence) or next_evidence[:len(previous_evidence)] != previous_evidence:
-                        raise ValueError("mission evidence history is append-only")
-                    MissionEvidenceChain.append_in_transaction(
-                        db, mission.mission_id, next_evidence[len(previous_evidence):], claim
-                    )
-                updated = db.execute(
-                    "UPDATE missions SET payload=?,revision=revision+1 "
-                    "WHERE mission_id=? AND payload=? AND revision=?",
-                    (encoded, mission.mission_id, existing[0], mission.revision),
-                )
-                if updated.rowcount != 1:
-                    raise ValueError("concurrent mission write rejected")
-        mission.integrity_hash = str(payload["integrity_hash"])
+            integrity_hash, next_revision = self._save_mission_in_transaction(db, mission, claim=claim, now=now)
+        mission.integrity_hash = integrity_hash
         mission.revision = next_revision
         return mission
 
@@ -252,6 +263,7 @@ class _ClaimBoundMissionStore:
         self._store = store
         self._claim = claim
         self._now = now
+        self.effect_intents = store.effect_intents.with_claim(lambda: self._claim, lambda: self._now)
 
     def set_claim(self, claim) -> None:
         self._claim = claim
