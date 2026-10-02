@@ -1361,6 +1361,218 @@ def test_public_owner_reconciliation_requeues_for_worker_execution_once(web_serv
     assert len(executor_calls) == 2
 
 
+def test_public_owner_reconciliation_recovers_crashed_worker_side_effect_once(web_server, tmp_path, monkeypatch):
+    class SimulatedWorkerProcessCrash(BaseException):
+        pass
+
+    server, _ = web_server
+    public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
+    owner = owner_password.resolve_session(owner_cookie)
+    assert owner is not None
+
+    memory_path = tmp_path / "crash-mission-memory.sqlite3"
+    monkeypatch.setenv("CYBERSENTINEL_MEMORY_DB_PATH", str(memory_path))
+    import agent.memory as mission_memory
+
+    monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "bridge.sqlite3")
+    monkeypatch.setattr(mission_memory, "MEMORY_DB_PATH", memory_path)
+    mission_memory._init_memory_db()
+
+    missions_path = tmp_path / "missions.sqlite3"
+    queue_path = tmp_path / "mission_queue.sqlite3"
+    store = MissionStore(missions_path)
+    plan = Plan.initial("apply one local synthetic action and verify the local core").replan(
+        steps=(
+            PlanStep("apply", "apply one synthetic local action", action="unwatch"),
+            PlanStep("verify", "read local core status", action="status", prerequisites=("apply",)),
+        ),
+        reason="local crash-reconciliation regression",
+    )
+    runtime = MissionRuntime(store, executor=lambda *_args: {})
+    mission = runtime.create(
+        "apply one local synthetic action and verify the local core",
+        "apply one local synthetic action and verify the local core",
+        plan,
+        completion_criteria=[
+            {"criterion_id": "local-core-online", "description": "local core is online", "check": "system_online"}
+        ],
+        request_id="synthetic-bridge-worker-crash-reconciliation",
+        owner_identity_ref=str(owner["owner_id"]),
+    )
+    queue = MissionQueue(queue_path)
+    start_status, _, start_response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/start",
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+    assert start_status == 200, start_response
+    assert start_response["result"]["queue"]["state"] == WorkerMissionState.QUEUED.value
+    assert MissionStore(missions_path).load(mission.mission_id).authorization_snapshot
+
+    effect_attempts = {}
+    effect_ledger = []
+    expected_action_id = f"{mission.mission_id}:{mission.plan.version}:apply:0"
+
+    def apply_fake_effect(action_id):
+        effect_attempts[action_id] = effect_attempts.get(action_id, 0) + 1
+        effect_ledger.append(action_id)
+
+    def crash_after_fake_effect(current, step, action_id):
+        assert step.step_id == "apply"
+        assert queue.get(current.mission_id).state is WorkerMissionState.EXECUTING
+        assert queue.get(current.mission_id).lease_owner == "worker-before-crash"
+        persisted = MissionStore(missions_path).load(current.mission_id)
+        assert persisted.checkpoint["status"] == "in_flight"
+        assert not any(item.get("action_id") == action_id for item in persisted.action_history)
+        apply_fake_effect(action_id)
+        raise SimulatedWorkerProcessCrash("simulated process termination after side effect")
+
+    crashing_runtime = MissionRuntime(MissionStore(missions_path), executor=crash_after_fake_effect)
+    crashing_worker = MissionWorker(queue, runtime_factory=lambda: crashing_runtime, worker_id="worker-before-crash")
+    crash_time = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+    with pytest.raises(SimulatedWorkerProcessCrash):
+        crashing_worker.run_once(now=crash_time)
+
+    after_crash = MissionStore(missions_path).load(mission.mission_id)
+    assert effect_attempts == {expected_action_id: 1}
+    assert effect_ledger == [expected_action_id]
+    assert after_crash.checkpoint["status"] == "in_flight"
+    assert after_crash.action_history == []
+    assert after_crash.observations == []
+    claimed = queue.get(mission.mission_id)
+    assert claimed.state is WorkerMissionState.EXECUTING
+    assert claimed.lease_owner == "worker-before-crash"
+
+    # Reopen both durable stores as a fresh process would. Queue recovery makes
+    # the lease claimable, but the runtime must first quarantine the ambiguous action.
+    restarted_queue = MissionQueue(queue_path)
+    recovered = restarted_queue.recover_after_restart()
+    assert len(recovered) == 1
+    assert recovered[0].state is WorkerMissionState.QUEUED
+    assert recovered[0].lease_owner is None
+    restarted_executor_calls = []
+
+    def restarted_executor(_current, step, action_id):
+        restarted_executor_calls.append((step.step_id, action_id))
+        if step.step_id == "apply":
+            apply_fake_effect(action_id)
+        return {"success": True, "source": "local_fake_executor", "idempotency_key": action_id}
+
+    restarted_runtime = MissionRuntime(MissionStore(missions_path), executor=restarted_executor)
+    restarted_worker = MissionWorker(
+        restarted_queue,
+        runtime_factory=lambda: restarted_runtime,
+        worker_id="worker-after-restart-before-owner",
+    )
+    waiting = restarted_worker.run_once(now=crash_time)
+    assert waiting is not None
+    assert waiting.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert waiting.lease_owner is None
+    ambiguous = MissionStore(missions_path).load(mission.mission_id)
+    assert ambiguous.status is MissionStatus.RECOVERY_REQUIRED
+    assert ambiguous.checkpoint["status"] == "in_flight"
+    assert ambiguous.action_history == []
+    assert ambiguous.observations == []
+    assert restarted_executor_calls == []
+    assert effect_attempts == {expected_action_id: 1}
+    assert effect_ledger == [expected_action_id]
+
+    status, _, response = request(
+        server,
+        "POST",
+        f"/api/public/missions/{mission.mission_id}/reconcile",
+        {"executed": True},
+        cookies=f"{public_cookie}; {bridge.PUBLIC_OWNER_SESSION_COOKIE}={owner_cookie}",
+        csrf=csrf,
+    )
+    assert status == 200, response
+    assert response["ok"] is True
+    assert response["result"]["queue"]["state"] == WorkerMissionState.QUEUED.value
+
+    reconciled = MissionStore(missions_path).load(mission.mission_id)
+    assert reconciled.status is MissionStatus.READY
+    assert reconciled.checkpoint["status"] == "completed"
+    assert reconciled.checkpoint["reconciled"] is True
+    receipt = next(item for item in reconciled.observations if item.get("action_id") == expected_action_id)
+    assert receipt["type"] == "reconciled_observation"
+    assert receipt["source"] == "external_reconciliation"
+    assert receipt["success"] is True
+    action = next(item for item in reconciled.action_history if item.get("action_id") == expected_action_id)
+    assert action["status"] == "completed"
+    assert action["observation"] == receipt
+    assert reconciled.evidence == []
+
+    # Reopen the post-reconciliation queue/runtime and deliver work again.
+    post_reconcile_queue = MissionQueue(queue_path)
+    assert post_reconcile_queue.recover_after_restart() == []
+    post_reconcile_executor_calls = []
+
+    def post_reconcile_executor(_current, step, action_id):
+        post_reconcile_executor_calls.append((step.step_id, action_id))
+        if step.step_id == "apply":
+            apply_fake_effect(action_id)
+        if step.step_id == "verify":
+            return {"success": True, "source": "status", "summary": "synthetic local status observation"}
+        return {"success": True, "source": "local_fake_executor"}
+
+    post_reconcile_runtime = MissionRuntime(
+        MissionStore(missions_path),
+        executor=post_reconcile_executor,
+        interpreter=ObservationInterpreter(
+            proposer=lambda _context: {"summary": "synthetic local interpretation", "facts": []}
+        ),
+    )
+    post_reconcile_worker = MissionWorker(
+        post_reconcile_queue,
+        runtime_factory=lambda: post_reconcile_runtime,
+        worker_id="worker-after-owner-reconciliation",
+    )
+    completed = post_reconcile_worker.run_once(
+        now=(datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+    )
+    assert completed is not None
+    assert completed.state is WorkerMissionState.COMPLETED
+    assert post_reconcile_executor_calls == [
+        ("verify", f"{mission.mission_id}:{mission.plan.version}:verify:1")
+    ]
+
+    final = MissionStore(missions_path).load(mission.mission_id)
+    assert final.status is MissionStatus.GOAL_COMPLETED
+    assert final.completion_proof_is_valid()
+    assert final.verification_state == {"verified": True, "missing_criteria": [], "evidence_count": 1}
+    assert len(final._verified_system_evidence()) == 1
+    assert len(final.evidence) == 1
+    final_receipt = next(item for item in final.observations if item.get("action_id") == expected_action_id)
+    final_action = next(item for item in final.action_history if item.get("action_id") == expected_action_id)
+    assert final_receipt["source"] == "external_reconciliation"
+    assert final_action["status"] == "completed"
+    assert effect_attempts == {expected_action_id: 1}
+    assert effect_ledger == [expected_action_id]
+
+    # A duplicate delivery to another reopened queue/worker remains harmless.
+    duplicate_queue = MissionQueue(queue_path)
+    duplicate_queue.enqueue(
+        mission.mission_id,
+        available_at=(datetime.now(timezone.utc) + timedelta(seconds=3)).isoformat(),
+    )
+    duplicate_executor_calls = []
+    duplicate_runtime = MissionRuntime(
+        MissionStore(missions_path),
+        executor=lambda *_args: duplicate_executor_calls.append("unexpected execution") or {"success": True},
+    )
+    duplicate_worker = MissionWorker(duplicate_queue, runtime_factory=lambda: duplicate_runtime, worker_id="worker-redelivery")
+    duplicate_delivery = duplicate_worker.run_once(
+        now=(datetime.now(timezone.utc) + timedelta(seconds=4)).isoformat()
+    )
+    assert duplicate_delivery is not None
+    assert duplicate_delivery.state is WorkerMissionState.COMPLETED
+    assert duplicate_executor_calls == []
+    assert effect_attempts == {expected_action_id: 1}
+    assert effect_ledger == [expected_action_id]
+
+
 def test_public_owner_reconciliation_rejects_incomplete_receipt_without_requeue(web_server, tmp_path, monkeypatch):
     server, _ = web_server
     public_cookie, csrf, owner_cookie = _authenticated_public_owner_cookies(server)
