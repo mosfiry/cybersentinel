@@ -210,6 +210,54 @@ def test_crash_after_successful_tool_before_final_save_requires_reconciliation(t
     assert resumed_executions == []
 
 
+def test_parallel_crash_after_subset_fold_reconciles_only_unresolved_tools(tmp_path, monkeypatch):
+    import tools.registry
+
+    db = _db(tmp_path)
+    executed = []
+    monkeypatch.setattr(tools.registry, "execute", lambda name, argument, **kwargs: executed.append(name) or {"ok": True, "criterion_id": "goal", "source": name})
+
+    class CrashAfterFirstFold(MissionStore):
+        def __init__(self, db_path):
+            super().__init__(db_path)
+            self.crash_after_first_fold = False
+
+        def save(self, mission):
+            saved = super().save(mission)
+            if self.crash_after_first_fold and (mission.checkpoint or {}).get("completed_tool_call_ids") == ["call_001"]:
+                raise RuntimeError("simulated crash after first parallel fold")
+            return saved
+
+    store = CrashAfterFirstFold(db)
+    runtime = MissionRuntime(store, executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    mission = _mission(runtime)
+    store.crash_after_first_fold = True
+
+    class ParallelModel:
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            return ModelTurn(turn_id, tool_calls=(
+                _call(mission_id, run_id, turn_id, plan_version, 1),
+                _call(mission_id, run_id, turn_id, plan_version, 2),
+            ))
+
+    with pytest.raises(RuntimeError, match="first parallel fold"):
+        runtime.run_model_loop(mission.mission_id, ParallelModel(), tools=[{"name": "status"}], max_turns=1)
+    assert executed == ["status", "status"]
+
+    restarted = _runtime(db)
+    loaded = restarted.store.load(mission.mission_id)
+    assert loaded.checkpoint["completed_tool_call_ids"] == ["call_001"]
+    assert loaded.checkpoint["tool_call_ids"] == ["call_001", "call_002"]
+    assert [item["tool_call_id"] for item in loaded.progress["model_loop"]["tool_results"]] == ["call_001"]
+    reconciled = restarted.reconcile_in_flight(
+        mission.mission_id,
+        executed=True,
+        observation={"success": True, "criterion_id": "goal", "source": "parallel-receipt"},
+    )
+    assert [item["action_id"] for item in reconciled.action_history] == ["a1", "call_002"]
+    assert reconciled.checkpoint["status"] == "completed"
+
+
 def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkeypatch):
     import tools.registry
 

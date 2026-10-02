@@ -203,7 +203,11 @@ class MissionRuntime:
         if checkpoint_status not in {"in_flight", "in_flight_parallel"}:
             raise ValueError("mission has no in-flight action requiring reconciliation")
         if checkpoint_status == "in_flight_parallel":
-            ambiguous_ids = [str(item) for item in checkpoint.get("ambiguous_tool_call_ids", checkpoint.get("tool_call_ids", []))]
+            all_ids = [str(item) for item in checkpoint.get("tool_call_ids", [])]
+            completed_ids = {str(item) for item in checkpoint.get("completed_tool_call_ids", [])}
+            ambiguous_ids = [str(item) for item in checkpoint.get("ambiguous_tool_call_ids", [])]
+            if not ambiguous_ids:
+                ambiguous_ids = [tool_call_id for tool_call_id in all_ids if tool_call_id not in completed_ids]
             if not ambiguous_ids:
                 raise ValueError("parallel checkpoint has no ambiguous tool calls")
             if executed:
@@ -395,6 +399,8 @@ class MissionRuntime:
                 authorized.append((proposal, argument, decision))
             else:
                 results.append(ToolCallResult(proposal, False, error=decision.reason))
+        progress["tool_results"].extend(result.to_dict() for result in results)
+        results = []
         mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
         self.store.save(mission)
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
@@ -407,9 +413,18 @@ class MissionRuntime:
                 return {"_ambiguous": True, "error": str(exc), "failure_class": FailureClass.UNKNOWN.value, "exception": type(exc).__name__}
         raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
         ambiguous: list[tuple[Any, dict[str, Any]]] = []
+        completed_ids: list[str] = []
         for item, raw in zip(authorized, raw_results):
             if raw.get("_ambiguous"):
                 ambiguous.append((item[0], raw))
+                mission.checkpoint = {
+                    "status": "in_flight_parallel",
+                    "tool_call_ids": [entry[0].tool_call_id for entry in authorized],
+                    "completed_tool_call_ids": list(completed_ids),
+                    "ambiguous_tool_call_ids": [proposal.tool_call_id for proposal, _ in ambiguous],
+                    "run_id": run_id,
+                }
+                self.store.save(mission)
                 continue
             proposal = item[0]
             observation = dict(raw)
@@ -422,8 +437,18 @@ class MissionRuntime:
                 criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
                 mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
             mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
-            results.append(ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", ""))))
-        progress["tool_results"].extend(result.to_dict() for result in results)
+            result = ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", "")))
+            results.append(result)
+            progress["tool_results"].append(result.to_dict())
+            completed_ids.append(proposal.tool_call_id)
+            mission.checkpoint = {
+                "status": "in_flight_parallel",
+                "tool_call_ids": [entry[0].tool_call_id for entry in authorized],
+                "completed_tool_call_ids": list(completed_ids),
+                "ambiguous_tool_call_ids": [proposal.tool_call_id for proposal, _ in ambiguous],
+                "run_id": run_id,
+            }
+            self.store.save(mission)
         if ambiguous:
             ambiguous_ids = [proposal.tool_call_id for proposal, _ in ambiguous]
             mission.error = "parallel tool outcome is ambiguous; reconciliation required"
