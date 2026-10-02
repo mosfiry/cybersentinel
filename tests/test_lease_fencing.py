@@ -25,7 +25,8 @@ def test_claim_assigns_monotonic_lease_epoch(tmp_path):
     assert first.attempts == 1
     queue.recover_expired(now=_at(121))
     second = queue.claim_next(now=_at(122), worker_id="b", lease_seconds=120)
-    assert second.lease_epoch == 2
+    # recover_expired advanced the epoch to 2; the reclaiming claim advances it to 3.
+    assert second.lease_epoch == 3
     assert second.attempts == 2
 
 
