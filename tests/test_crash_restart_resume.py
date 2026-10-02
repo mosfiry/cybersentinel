@@ -16,6 +16,7 @@ import pytest
 from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
+from agent.mission_worker import MissionQueue, MissionWorker, WorkerMissionState
 from agent.planning import Plan, PlanStep
 
 
@@ -258,3 +259,65 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
     assert result.status is not MissionStatus.GOAL_COMPLETED
     assert result.status is MissionStatus.READY
     assert "lacked deterministic goal evidence" in result.error
+
+
+def test_queue_restart_does_not_run_recovery_required_mission_before_reconciliation_and_requeue(tmp_path, monkeypatch):
+    now = "2026-09-29T00:00:00+00:00"
+    missions_db = _db(tmp_path)
+    queue_db = Path(tmp_path) / "mission_queue.sqlite3"
+    runtime = _runtime(missions_db)
+    mission = _mission(runtime, tmp_path, monkeypatch)
+    action_id = f"{mission.mission_id}:{mission.plan.version}:observe:0"
+    mission.checkpoint = {
+        "status": "in_flight",
+        "action_id": action_id,
+        "step_id": "observe",
+        "plan_fingerprint": mission.plan.fingerprint,
+    }
+    mission.transition(MissionStatus.RECOVERY_REQUIRED, "simulated ambiguous in-flight action")
+    runtime.store.save(mission)
+
+    queue = MissionQueue(queue_db)
+    queue.enqueue(mission.mission_id, available_at=now)
+    claimed = queue.claim_next(now=now, worker_id="worker-before-restart")
+    assert claimed is not None
+    waiting = queue.release(
+        mission.mission_id,
+        WorkerMissionState.WAITING_FOR_TOOL,
+        worker_id="worker-before-restart",
+        error="ambiguous in-flight execution requires reconciliation",
+    )
+    assert waiting.state is WorkerMissionState.WAITING_FOR_TOOL
+
+    # Both durable stores are reopened to model application startup.
+    restarted_runtime = _runtime(missions_db)
+    executions = []
+    restarted_runtime.executor = lambda current, step, current_action: executions.append(
+        (current.mission_id, step.step_id, current_action)
+    ) or {"ok": True}
+    restarted_queue = MissionQueue(queue_db)
+    recovered = restarted_queue.recover_after_restart()
+
+    assert len(recovered) == 1
+    assert recovered[0].state is WorkerMissionState.QUEUED
+    assert recovered[0].lease_owner is None
+    assert restarted_runtime.store.load(mission.mission_id).status is MissionStatus.RECOVERY_REQUIRED
+
+    worker = MissionWorker(restarted_queue, lambda: restarted_runtime, worker_id="worker-after-restart")
+    promoted = worker.run_once(now=now, max_slices=1)
+    assert promoted is not None
+    assert promoted.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert promoted.lease_owner is None
+    assert restarted_runtime.store.load(mission.mission_id).status is MissionStatus.RECOVERY_REQUIRED
+    assert executions == [], "startup recovery must not execute an unreconciled tool"
+    assert restarted_queue.claim_next(now=now, worker_id="worker-without-reconciliation") is None
+
+    reconciled = restarted_runtime.reconcile_in_flight(mission.mission_id, executed=False)
+    assert reconciled.status is MissionStatus.READY
+    assert reconciled.checkpoint["status"] == "reconciled_not_executed"
+    assert restarted_queue.claim_next(now=now, worker_id="worker-without-requeue") is None
+
+    requeued = restarted_queue.enqueue(mission.mission_id, available_at=now)
+    assert requeued.state is WorkerMissionState.QUEUED
+    worker.run_once(now=now, max_slices=1)
+    assert executions == [(mission.mission_id, "observe", action_id)]

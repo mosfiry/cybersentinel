@@ -35,4 +35,22 @@ This manifest records small recovery checkpoints. A checkpoint is published only
 - **Security impact:** No authorization, scope, evidence, deterministic verification, or policy gates changed. Only the worker's lease relinquishment for the `WAITING_FOR_TOOL` result changed.
 - **API impact:** None.
 - **Desktop impact:** None.
-- **Next task:** Add a focused integration test covering `MissionQueue.recover_after_restart()` with a persisted `RECOVERY_REQUIRED` mission and prove the runtime does not execute a tool before explicit reconciliation/requeue; change restart routing only if that test exposes a missing guard.
+- **Next task:** Completed in the M1 restart/reconciliation regression checkpoint below.
+
+## 2026-10-02 — M1 Restart/reconciliation regression
+
+- **Epic:** A — Recovery + Engineering Baseline
+- **Story:** M1 — Durable Mission Runtime
+- **Task:** Add an integration-level regression for `MissionQueue.recover_after_restart()` with a persisted `RECOVERY_REQUIRED` mission. Prove queue startup recovery and worker promotion cannot execute a tool before explicit reconciliation and queue requeue.
+- **Branch:** `engineering/agile-runtime-restart-recovery`
+- **Commit:** One test-only commit at `refs/heads/engineering/agile-runtime-restart-recovery`; publish with a normal push and require exact local/remote SHA equality. Do not write this manifest commit's own SHA here. **Parent:** `71536e2175ed14def01aac48e909999bcf991fb1` (verified M1 tip).
+- **Recovery source SHA:** `71536e2175ed14def01aac48e909999bcf991fb1` at `origin/refs/heads/engineering/agile-runtime` before worktree creation.
+- **Files:** `tests/test_crash_restart_resume.py`; `docs/AGILE_CHECKPOINTS.md` only.
+- **Tests:** Focused restart/reconciliation regression — 1 passed in 0.61s. `python -m pytest -q tests/test_mission_worker_lifecycle.py` — 15 passed in 3.19s. `python -m pytest -q tests/test_failure_recovery_replan.py tests/test_mission_control_races.py tests/test_phase6k7b_mission_runtime.py` — 27 passed in 1.47s. `python -m pytest -q tests/test_crash_restart_resume.py` — 6 passed in 0.90s. `python -m pytest -q` — 978 passed, 1 skipped in 69.74s. Quiet output did not identify the skipped test's reason. No provider acceptance or external-target tests were run.
+- **Status:** The test reopens separate durable MissionStore and MissionQueue databases, runs `recover_after_restart()` against a persisted `RECOVERY_REQUIRED` mission, and verifies the worker returns it to `WAITING_FOR_TOOL` without executing the executor. The queue remains unclaimable after reconciliation until explicit enqueue; after both explicit actions the safe retry executes once. The existing `run_slice()` terminal-state guard suffices, so no production code changed.
+- **Original checkout boundary:** `/workspace/cybersentinel-release-closure` was not accessed; its prior checkpoint records 114 dirty status paths. No content from that checkout was imported.
+- **Known limitations:** The single skipped test's reason was not printed by `-q`; no reason is inferred. Live-provider behavior and external targets were not exercised.
+- **Security impact:** None; no authorization, scope, evidence, tool policy, or runtime guard changed.
+- **API impact:** None.
+- **Desktop impact:** None.
+- **Next task:** M1 — add a local-only bridge regression showing the explicit Owner reconciliation handler completes durable receipt reconciliation before queue requeue, without changing auth, scope, or evidence policy.
