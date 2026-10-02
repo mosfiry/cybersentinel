@@ -4,18 +4,18 @@
 
 - **Mission ID:** `H62oLpGmBPGpsZMdljp68U` (CyberSentinel M2E production-cutover / restart-authority / unified-fencing mission)
 - **Phase:** `M2E-V0 — INVENTORY / SAFE START`
-- **Phase status:** `BLOCKED` for remote checkpoint completion; local branch and this inventory are prepared. M2E-V1 has not started.
-- **Branch:** `task/m2e-cutover-20261002` (created locally; no upstream set and no push performed)
+- **Phase status:** `IN PROGRESS` — Owner-approved M2E branch push and non-production preview are authorized; exact-SHA CI/preview verification is pending. M2E-V1 has not started.
+- **Branch:** `task/m2e-cutover-20261002` (isolated M2E branch; remote was absent at pre-push verification)
 - **Base SHA:** `9bf91ea37748a239e6a6e3b6327706fa614232cd` (`task/m2d-cutover-20261002`, live-verified)
-- **Current source SHA at V0 verification:** `9bf91ea37748a239e6a6e3b6327706fa614232cd`
-- **V0 checkpoint SHA:** pending local commit; after the commit, record it in the next state update. The initial document records the exact source/base SHA from which V0 began.
+- **Current M2E HEAD before this approved state update:** `c1fcc4f2df0c7373dbfeb01f8ed7bcedffda1526`
+- **V0 base checkpoint SHA:** `c1fcc4f2df0c7373dbfeb01f8ed7bcedffda1526`; this approval/configuration update is the next documentation-only checkpoint.
 - **Code changes:** none. V0 is a source/Git/CI inventory and state-documentation change only.
 
 ## Live Git verification (2026-10-02)
 
 The repository is `mosfiry/cybersentinel`; GitHub reports `main` as its default branch. Before branch isolation, `git status --porcelain=v2 --branch` showed no modified, staged, or untracked paths. The active branch and `origin/task/m2d-cutover-20261002` both pointed to `9bf91ea37748a239e6a6e3b6327706fa614232cd`; live GitHub API branch lookup confirmed the same M2D tip. The local and live `main` SHA is `8a3fd109c0e586db13ed48a7371ac9ad06465b74`. The M2D final commit is `docs: record M2.d cutover audit and final state`, authored/committed by `Cue task runner` at `2026-10-02T19:33:15Z`; its first parent is `95a6675bfc6732d30dbd044572440c96e796ff57`, and the merge base with `main` is exactly `8a3fd109c0e586db13ed48a7371ac9ad06465b74`. M2D's final commit is documentation-only; the last M2D production-source checkpoint is its parent.
 
-The requested remote branch `task/m2e-cutover-20261002` was absent (GitHub branch API returned 404) before this local branch was created. The local branch now points at the exact verified M2D base. No commit has been pushed, no branch other than the new local M2E branch has been checked out, and neither `main` nor the M2D branch has been changed.
+The requested remote branch `task/m2e-cutover-20261002` was absent (GitHub branch API returned 404) before this local branch was created. At the 2026-10-02 22:25 UTC re-verification, GitHub still reported `main` at `8a3fd109c0e586db13ed48a7371ac9ad06465b74`, M2D at `9bf91ea37748a239e6a6e3b6327706fa614232cd`, and M2E absent. The local branch was at `c1fcc4f2df0c7373dbfeb01f8ed7bcedffda1526`; the sole worktree change was `docs/M2E_STATE.md`, with no staged changes. M2E has not yet been pushed. Neither `main` nor M2D has been changed, and no Vibe/Desktop branch was checked out or modified.
 
 ### Backend branch/provenance inventory
 
@@ -66,22 +66,25 @@ At the exact M2D SHA `9bf91ea37748a239e6a6e3b6327706fa614232cd`, GitHub Actions 
 - [`owner-charter-audit` run `37054871253`](https://github.com/mosfiry/cybersentinel/actions/runs/37054871253) — `completed / success`, exact head SHA and branch verified through the GitHub API.
 - Cloudflare check [`Workers Builds: cybersentinel` run `110997115927`](https://github.com/mosfiry/cybersentinel/runs/110997115927) — `completed / failure`, exact head SHA. Its details URL is under the Cloudflare `workers/services/view/cybersentinel/production/builds/…` path. This is an external Cloudflare check, not one of the repository's GitHub Actions workflows. GitHub's deployments API returned no deployment record for this SHA.
 
-Cloudflare's official [Workers Builds branch documentation](https://developers.cloudflare.com/workers/ci-cd/builds/build-branches/) says pushes to the configured production branch run the build command followed by the deploy command; non-production branch pushes can run preview builds when enabled. The official [Workers Builds overview](https://developers.cloudflare.com/workers/ci-cd/builds/) says a successful production build may promote a version to the active deployment when configured. The Cloudflare and Cloudflare API connectors are disabled for this session, so the current production branch, preview setting, and deploy command cannot be verified here. Because the M2D SHA received a Cloudflare check labeled `production`, pushing a new branch without determining the Cloudflare branch-control behavior could create an unapproved build/deployment/preview. **No push will be made until this risk is resolved.** No attempt has been made to enable a connector, access Cloudflare, or deploy.
+The Owner explicitly approved: “وافق، ادفع فرع M2E وشغّل معاينة غير إنتاجية.” (push the M2E branch and run a non-production preview). Read-only Cloudflare verification, relayed by the Owner/coordinator at 2026-10-02 22:24, reports that account owns Worker `cybersentinel`, connected to `mosfiry/cybersentinel`; production Git branch is `main`; the deploy command contains `wrangler deploy`; previews are enabled; and the build trigger `branch_includes` is `main`. No Cloudflare setting was changed. The M2E branch name is not `main`.
+
+Cloudflare's official [Workers Builds branch documentation](https://developers.cloudflare.com/workers/ci-cd/builds/build-branches/) says pushes to a configured production branch run build then deploy, while non-production branches use preview builds when enabled. Its [Workers Builds overview](https://developers.cloudflare.com/workers/ci-cd/builds/) distinguishes previews from production activation. Given the verified production branch `main`, the enabled previews, the `branch_includes: main` trigger, and the Owner's explicit approval, pushing M2E is authorized only within the non-production preview scope. The actual Cloudflare outcome for the M2E SHA is still pending. Do not modify Cloudflare settings or call any Cloudflare deployment/build API manually; a preview may occur naturally on push. No production deployment is approved or claimed.
 
 ## Known blockers
 
-1. **Remote checkpoint / deployment-trigger ambiguity — `BLOCKED`.** The exact remote M2E push may trigger Cloudflare Workers build/deploy behavior; current Cloudflare branch settings are not visible. No remote write is authorized until its impact is known and compatible with the explicit no-deploy boundary.
+1. **Exact-SHA remote verification — `PENDING`.** The Owner-approved branch push is authorized for a non-production preview only. GitHub Actions and any naturally triggered Cloudflare preview must be verified against the pushed SHA; absence of a preview must be recorded, not inferred as success.
 2. **Owner authority after restart — `BLOCKED / OWNER DECISION`.** No source-grounded authority model lets a persistent worker obtain fresh Owner authorization after restart. A serialized context, session, queue claim, or generation token will not be treated as current Owner authority.
 3. **Unified fencing / atomicity — `PARTIALLY VERIFIED`.** The queue fence exists, but MissionStore, evidence, and external effects are outside that queue epoch's atomic transaction.
 4. **External-effect reconciliation — `BLOCKED`.** A crash around an effect can leave an ambiguous result. No blind retry, success/failure inference, or exactly-once claim is permitted.
 5. **Operations proof — `NOT VERIFIED`.** No OS process-kill matrix, multi-process supervisor test, or production lifecycle evidence was verified in V0.
-6. **M2D Cloudflare check — `BLOCKED` for clean CI claims.** Its failure is recorded independently of successful GitHub Actions tests/audit; the reason was not exposed by the check-run response.
+6. **Historical M2D Cloudflare check — `FAILED` at the M2D SHA.** This baseline failure is distinct from M2E results; its cause was not exposed by the check-run response. Do not label M2E clean until exact-SHA outcomes are observed.
 
 ## Known assumptions / non-actions
 
-- M2E starts only from M2D final SHA `9bf91ea37748a239e6a6e3b6327706fa614232cd`; that remote branch remains unchanged.
+- M2E starts only from M2D final SHA `9bf91ea37748a239e6a6e3b6327706fa614232cd`; live re-verification shows that remote branch and `main` remain at their recorded SHAs.
 - V0 is documentation/source inventory only. No behavior, authorization contract, schema, CI workflow, Desktop code, Vibe-owned branch, production runtime, or external provider was changed or executed.
-- `main` and all sibling branches remain untouched. The new M2E branch is currently local-only.
+- `main`, M2D, and all sibling branches remain untouched. Only the isolated M2E branch may be pushed, with the approved natural non-production preview effect.
+- Owner approval covers the M2E branch push and non-production preview only. It does not authorize a production deployment, Cloudflare setting changes, or manual build/deploy API calls.
 - A failed Cloudflare check is not reclassified as successful merely because the GitHub Actions tests and audit passed.
 - External effects remain `UNKNOWN` / potentially ambiguous unless durable source-backed evidence proves otherwise; no exactly-once guarantee is asserted.
 
@@ -95,19 +98,20 @@ Cloudflare's official [Workers Builds branch documentation](https://developers.c
 | Full local tests | `718 passed, 1 skipped in 11.32s` in a disposable venv using `requirements.txt`; run was against the unchanged M2D code plus the V0 documentation work. |
 | Targeted adversarial tests | Not applicable to this documentation-only phase; no test or behavior was changed. Existing full-suite tests ran as stated above. |
 | Diagnostics/static checks | `python -m compileall -q .` and `git diff --check` passed locally. |
-| Commit | Pending; local branch only. |
-| Push | Blocked pending Cloudflare build/deploy impact clarification. |
-| Exact-SHA remote CI | Pending because no push was performed. The M2D base's last successful GitHub Actions runs are listed above; they are not evidence for an M2E commit. |
-| Phase checkpoint / resume point | V0 is not complete. Do not enter M2E-V1 until the local checkpoint is committed, remote push impact is resolved, the exact pushed SHA's CI is recorded, and state is updated. |
+| Commit | Initial V0 state commit `c1fcc4f2df0c7373dbfeb01f8ed7bcedffda1526`; approved configuration/decision update is being prepared as a task-owned documentation-only follow-up. |
+| Push | Owner-approved for `task/m2e-cutover-20261002` only; not yet performed. No force-push. |
+| Exact-SHA GitHub CI | Pending; the M2D base's successful runs above are not evidence for an M2E commit. |
+| Cloudflare preview | Pending natural outcome of the approved push; do not trigger manually and do not claim a production deployment. |
+| Phase checkpoint / resume point | V0 is not complete. Push the reviewed documentation-only M2E checkpoint, verify the exact pushed SHA's GitHub CI and Cloudflare preview outcome, record them in a follow-up state checkpoint, and do not enter M2E-V1 until those results are complete. |
 
 ## Exact next action
 
-**Resolve Cloudflare branch-control behavior without changing it**—either verify the configured production branch, preview-build setting, and deploy command through owner-provided Cloudflare access, or obtain the owner's explicit decision that a remote push is allowed despite the disclosed possibility of an automatic preview/build. Until then, do not push. Once safe and authorized, push the V0 checkpoint branch, run GitHub Actions on that exact SHA, record the run IDs/results here, and only then consider M2E-V1.
+**Run local tests and checks on the reviewed state-only change, commit only `docs/M2E_STATE.md` without rewriting history, then push only `task/m2e-cutover-20261002` without force.** Verify the live branch SHA, GitHub Actions conclusions on that exact SHA, and the naturally triggered Cloudflare preview (if any); make no Cloudflare API/build/deploy calls and do not claim production deployment. Record exact outcomes and run IDs in a follow-up state checkpoint, verify its exact-SHA CI, and only then consider M2E-V1.
 
 ## Resume instructions
 
 1. Read this file and `docs/M2D_CUTOVER_FINAL_AUDIT.md` / `docs/M2D_CUTOVER_STATE.md` before acting.
-2. In `/workspace/cybersentinel`, verify `git status --porcelain=v2 --branch`, `git branch --show-current`, and `git rev-parse HEAD`; expected branch is `task/m2e-cutover-20261002` based at `9bf91ea37748a239e6a6e3b6327706fa614232cd`.
+2. In `/workspace/cybersentinel`, verify `git status --porcelain=v2 --branch`, `git branch --show-current`, and `git rev-parse HEAD`; expected branch is `task/m2e-cutover-20261002`, currently at `c1fcc4f2df0c7373dbfeb01f8ed7bcedffda1526` before the approved state-only follow-up, based at `9bf91ea37748a239e6a6e3b6327706fa614232cd`.
 3. Verify M2D and `main` live SHAs through the GitHub connector again; verify no unexpected dirty state, no new remote M2E branch, and no changes to protected/excluded branches.
-4. Resolve the Cloudflare push/deploy ambiguity before any push. Do not enable Cloudflare connectors or change its settings without explicit user direction.
-5. After the V0 checkpoint is remotely pushed and its exact-SHA CI is successful, update this state with the run URLs/results and checkpoint SHA before starting M2E-V1. If any check fails, stop and record it; do not advance phases.
+4. Apply the Owner's approval only to the M2E branch push and a non-production preview. Do not change Cloudflare settings or call a Cloudflare build/deploy API.
+5. After push, verify GitHub Actions and any Cloudflare preview for the exact SHA. Record exact run IDs/outcomes in the follow-up state checkpoint; do not start M2E-V1 unless the exact-SHA CI and state update are complete. If any check fails, stop and record it.
