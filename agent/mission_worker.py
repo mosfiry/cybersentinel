@@ -226,33 +226,31 @@ class MissionWorker:
         item = self.queue.claim_next(now=now, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
         if item is None:
             return None
-        runtime = self.runtime_factory()
         try:
-            try:
-                mission = runtime.run_to_completion(
+            runtime = self.runtime_factory()
+            mission = runtime.run_to_completion(
+                item.mission_id,
+                max_slices=max_slices,
+                heartbeat=lambda: self.queue.heartbeat(
                     item.mission_id,
-                    max_slices=max_slices,
-                    heartbeat=lambda: self.queue.heartbeat(
-                        item.mission_id,
-                        worker_id=self.worker_id,
-                        lease_epoch=item.lease_epoch,
-                        lease_seconds=self.lease_seconds,
-                    ),
-                )
-            except TypeError as exc:
-                if "heartbeat" not in str(exc):
-                    raise
-                mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices)
+                    worker_id=self.worker_id,
+                    lease_epoch=item.lease_epoch,
+                    lease_seconds=self.lease_seconds,
+                ),
+            )
         except LeaseLostError:
             # A lease may be reclaimed while this worker is between slices. The
             # stale worker must not overwrite the queue outcome or report FAILED.
             return self.queue.get(item.mission_id)
-        except Exception as exc:
+        except Exception:
+            # An unexpected runtime exception may follow an external effect.
+            # Never convert that ambiguity into FAILED or retry it automatically,
+            # and do not persist exception text that could contain sensitive data.
             try:
-                return self.queue.update(
+                return self.queue.release(
                     item.mission_id,
-                    WorkerMissionState.FAILED,
-                    error=f"{type(exc).__name__}: {exc}",
+                    WorkerMissionState.WAITING_FOR_TOOL,
+                    error="worker runtime failed; execution outcome requires reconciliation",
                     worker_id=self.worker_id,
                     lease_epoch=item.lease_epoch,
                 )

@@ -100,7 +100,7 @@ def test_queue_worker_and_restart_recovery(tmp_path):
         error = ""
 
     class Runtime:
-        def run_to_completion(self, mission_id, max_slices=None):
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
             assert mission_id == "mission-1"
             return Mission()
 
@@ -196,7 +196,7 @@ def test_worker_does_not_overwrite_requeued_mission_after_handler_lease_expiry(t
     assert result.last_error == "worker lease expired"
 
 
-def test_worker_records_runtime_permission_error_as_failure(tmp_path):
+def test_worker_parks_unexpected_runtime_error_for_reconciliation(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-auth-error", available_at="2026-01-01T00:00:00+00:00")
 
@@ -205,8 +205,26 @@ def test_worker_records_runtime_permission_error_as_failure(tmp_path):
             raise PermissionError("authorization denied")
 
     result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once()
-    assert result.state is WorkerMissionState.FAILED
-    assert result.last_error == "PermissionError: authorization denied"
+    assert result.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert result.last_error == "worker runtime failed; execution outcome requires reconciliation"
+    assert result.lease_owner is None
+
+
+def test_worker_does_not_retry_typeerror_that_mentions_heartbeat(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("ambiguous-heartbeat", available_at="2026-01-01T00:00:00+00:00")
+    calls = []
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            calls.append(mission_id)
+            raise TypeError("heartbeat failed after dispatch")
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once()
+    assert calls == ["ambiguous-heartbeat"]
+    assert result.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert result.last_error == "worker runtime failed; execution outcome requires reconciliation"
+    assert result.lease_owner is None
 
 
 def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
@@ -241,7 +259,7 @@ def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
         error = "in-flight tool outcome is unknown"
 
     class Runtime:
-        def run_to_completion(self, mission_id, max_slices=None):
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
             assert mission_id == "mission-recovery"
             return Mission()
 
