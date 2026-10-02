@@ -1,46 +1,47 @@
-# حالة المهمة — M1 Lease Semantics
+# حالة المهمة — M2 Architecture Design
 
 | الحقل | القيمة |
 |---|---|
-| `CURRENT_PHASE` | `M1` — fencing محلي عند حد `MissionQueue` فقط. |
-| `CURRENT_CHECKPOINT` | commit M1 الذري `4df8958ef38f49254eb35108e24060a8000d7c29`، أبوه `49d4044ff7929455959f1ca22ccb6be52ac096c5`. يسجل هذا commit التوثيقي SHA السابق ولا يضع SHA ذاتيًا. |
-| `COMPLETED_PHASES` | `M0`, `M1` — تنفيذ M1 واختباراته وcheckpointه اكتملت. |
-| `ACTIVE_WORK` | لا يوجد عمل تنفيذي؛ اكتمل M1 ودُفع checkpoint والمتابعة التوثيقية على الفرع المحدد. لم يبدأ M2. |
-| `LAST_GOOD_SHA` | `4df8958ef38f49254eb35108e24060a8000d7c29` — checkpoint M1 الذري الذي يضم code/tests/semantics/state/inventory. |
+| `CURRENT_PHASE` | `M2` — تصميم اختيار سلطة التنفيذ وربط claim بكتابات mission/evidence/proof/intents. |
+| `CURRENT_CHECKPOINT` | `design` — وثيقة تصميم فقط؛ لا تنفيذ M2. commit هذا checkpoint أبوه `579387ff58910c14d8ca277cfdd68535220be846`؛ لا يُسجل SHA ذاتيًا هنا. |
+| `LAST_GOOD_SHA` | `579387ff58910c14d8ca277cfdd68535220be846` — HEAD المنشور الذي تحقق قبل التعديل؛ ليس commit هذا checkpoint. |
 | `BRANCH` | `manus/durable-runtime-fencing` |
-| `REMOTE` | `origin https://github.com/mosfiry/cybersentinel.git`; بعد الدفع العادي طابق `refs/heads/manus/durable-runtime-fencing` محليًا عند `4161575da579fe119f297a1ac8785c5e9e308e7a`؛ فُحص تطابق SHA ونظافة الشجرة نهائيًا. |
+| `REMOTE_BASE_SHA` | `579387ff58910c14d8ca277cfdd68535220be846` — نتيجة `git ls-remote origin refs/heads/manus/durable-runtime-fencing` قبل العمل. |
+| `COMPLETED_PHASES` | `M0`, `M1` — M0 جرد توثيقي؛ M1 تنفيذ محلي لlease fencing في queue واختباراته وcheckpointه السابق. لا يعني ذلك اكتمال M2 أو deployment/قبول حي. |
+| `ACTIVE_WORK` | `implementation not started` |
 | `WORKTREE` | `/workspace/cybersentinel-m0-20261002-1329` |
-| `BASE_SHA` | `49d4044ff7929455959f1ca22ccb6be52ac096c5`، الأب `b17a70ba44463e7a35d8b8e9d6b9ecc0c8773bd8`. |
+| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md` — قرار queue+supervisor كسلطة إنتاجية وحيدة بعد cutover M2.d، مع إبقاء `/api/chat` متزامنًا حتى ذلك الحين. |
+| `NEXT_ACTION` | `M2.a` |
+| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_mission_store_fencing.py tests/test_mission_queue_fencing.py -q` (اختبار مستقبلي للخطوة M2.a؛ لم يُشغّل في checkpoint التصميم). |
+| `CHECKPOINT_VERIFICATION` | شُغّل `git diff --check` فقط، ورُوجعت مسارات diff و`git status`. لا اختبار وظيفي أو compile أو قبول/deployment في هذا checkpoint. |
 
-## المنجز في M1
+## الأساس التاريخي المحفوظ
 
-- أضيفت هوية claim مستقلة (`lease_id`, `generation`, `acquired_at`) وحالة heartbeat، مع snapshot immutable تفصل claim عن `worker_id`.
-- heartbeat وqueue updates وrelease وterminal acknowledgement تتطلب snapshot الحالية وغير المنتهية. generation تزداد ذريًا ولا تُعاد عند release أو recovery أو requeue؛ انتهاء المهلة يرفض الكتابة فورًا قبل recovery.
-- أضيف ترحيل تراكمي لقاعدة lease القديمة مع إبقاء قيم `lease_owner` و`lease_expires_at` ورفض اعتبارها claim token. حافظ `MissionService.start_mission()` على شكل الاستجابة السابق دون إرسال token جديد.
-- لم يُضف `task_id` لأنه غير موجود في MissionQueue. لم تتغير Owner authentication أو authorization/scope/policy. لا تغييرات خارج الملفات المسموح بها.
-- تفاصيل العقد والحدود في `docs/MANUS_LEASE_SEMANTICS.md`؛ أضيفت حقائق M1 المتغيرة إلى `docs/MANUS_FENCING_INVENTORY.md` مع إبقاء نتائج M0 التاريخية.
+- كان HEAD المنشور عند بدء العمل `579387ff58910c14d8ca277cfdd68535220be846` على الفرع `manus/durable-runtime-fencing`، وطابق `git ls-remote` قبل التعديل. كانت الشجرة نظيفة، وparent M2 design المقصود هو SHA نفسه.
+- checkpoint تنفيذ M1 التاريخي هو `4df8958ef38f49254eb35108e24060a8000d7c29`؛ وسجل M1 السابق نتائج اختبارات queue/fencing. المرجع التفصيلي التاريخي باقٍ في هذا الملف قبل checkpoint وفي `docs/MANUS_LEASE_SEMANTICS.md` و`docs/MANUS_FENCING_INVENTORY.md`.
+- لا تعدّل جرد M0/M1 التاريخي لإظهار deployment أو قبول لم يحدث. لم تُجرَ migration لبيانات قديمة في M2 design.
 
-## التحقق والاختبارات
+## القرار والمخاطر المعروفة
 
-| الأمر | النتيجة | الزمن |
-|---|---|---:|
-| انحدار M0 الأولي: `python -m pytest tests/test_mission_queue_fencing.py -q` قبل الإصلاح | فشل متوقع واحد: قُبل heartbeat القديم بعد expiry/reclaim وإعادة استخدام `worker_id`. |
-| `python -m pytest tests/test_mission_queue_fencing.py -q` بعد الإصلاح | `7 passed` | `0.17s` |
-| `python -m pytest tests/test_mission_queue_fencing.py tests/test_autonomous_foundation.py tests/test_governed_execution.py -q` | `48 passed` | `1.62s` |
-| `python -m compileall -q .` | exit 0 | `0.426s` في التحقق المعزول النهائي |
-| `python -m pytest -q` | `711 passed, 1 skipped`؛ الاختبار المتجاوز `tests/test_real_provider_long_horizon.py:35` لأنه يتطلب بيانات اعتماد provider حي غير مضبوطة. | `14.94s` في clone المصدر (`15.79s` في التحقق المعزول مع `-rs`) |
-| تحقق معزول نهائي | نسخ محتوى clone الحالي إلى `/tmp/cybersentinel-m1-validation-20261002` دون `.git` وشغّل compileall وsuite؛ أنشأت قواعد الاختبار هناك فقط. |
+يعتمد التصميم على queue+supervisor كسلطة التنفيذ الإنتاجية الوحيدة بعد cutover صريح في M2.d. إلى أن تثبت M2.a–M2.c المخزن والكتابات fenced، يبقى `/api/chat` على تنفيذه المتزامن الحالي، ولا يعمل supervisor كسلطة ثانية. عند cutover يحافظ handler على عقد HTTP المتزامن لكنه ينتظر نتيجة supervisor، فلا ينفذ المهمة inline.
 
-قبل أول تشغيل اختبارات لم توجد ملفات قاعدة SQLite/DB محلية أو متعقبة في clone. أنشأت اختبارات المشروع لاحقًا ملفات ignored هي `knowledge.sqlite3`, `memory.sqlite3`, `tasks.sqlite3` في جذر clone؛ حُفظت كاملة دون تعديل في `/tmp/m1-test-databases-20261002` مع التحقق من SHA-256، ولم تُحذف. بعد نقلها لا توجد قاعدة SQLite/DB في جذر clone. كل اختبارات M1 نفسها استخدمت `tmp_path`، والتحقق الكامل الأخير أنشأ قواعده في نسخة `/tmp` المعزولة.
+مخاطر/مجهولات رئيسية:
 
-لم يُشغّل provider حي أو هدف خارجي. محاولة استخدام `/usr/bin/time` تعذرت لعدم وجوده؛ أُعيد القياس بمؤقت Python. فشلان وسيطان في اختبارات الوقت التاريخي صُحّحا بإضافة `now` ثابت إلى الاختبارين، ثم اجتازت المجموعة المركزة؛ لا إخفاق اختبار متبقٍ.
+- mission وqueue وscheduler وtask/evidence موزعة حاليًا بين قواعد SQLite؛ لا تُفترض ذرية كتابة عبر ملفات. إعداد `journal_mode` الحالي غير مثبت. التصميم يوصي بملف SQLite سلطوي واحد/repository transaction؛ وتوثيق SQLite الرسمي يذكر قيد ذرية `ATTACH` مع WAL: [ATTACH DATABASE](https://sqlite.org/lang_attach.html) و[WAL](https://www.sqlite.org/wal.html).
+- فحص lease ثم كتابة mission في مخزن آخر لا يوفّر fencing عابرًا للمخازن. يجب أن يصبح تحقق claim وكتابة mission/evidence/proof/intent ذرّيًا في repository واحد.
+- أثر خارجي قد يبدأ ثم تضيع نتيجته. تبقى المهمة `RECOVERY_REQUIRED` والـintent `OWNER_RECONCILIATION_REQUIRED` بلا retry آلي؛ لا exactly-once عام. توجد race/TOCTOU بين فحص DB ونداء الخدمة، وSQLite لا يستطيع إلغاء أثر بدأ بالفعل.
+- `/api/chat` قد يستمر متزامنًا أطول من مهلات العميل أو الوسيط بعد cutover، بينما supervisor يواصل العمل بعد انقطاع HTTP. واجهة async أو UI قرار phase منفصل إذا تقرر.
+- القدرات الخارجية (idempotency keys/receipts)، إعدادات تشغيل supervisor، وربط كل صفوف legacy لم تُثبت بعد؛ أي تعارض في migration يبقى محفوظًا ولا يحل باستبدال أو حذف.
+- `M3–M15` خارج M2؛ تبنى لاحقًا من checkpoint M2 المقبول وفق مراحل مستقلة، دون إعادة تعريفها أو الادعاء بإنجازها هنا.
 
-## الحدود والمخاطر المتبقية
+## الخطوة التالية
 
-M1 يثبت fencing عند حد صف queue فقط. لا يثبت fencing عابرًا لمخازن mission/evidence/proof ولا ذرية dispatch/الأثر الخارجي، ولا يحدد نتيجة عملية خارجية انقطعت بعد أن بدأت. لم يضف M1 supervisor؛ يذكر جرد M0 أنه لا يوجد مستهلك إنتاجي موثق لـMissionWorker/scheduler. يلزم M2 اختيار مسار التشغيل الإنتاجي وربط حالة `RECOVERY_REQUIRED` بمصالحة قبل retry، مع إبقاء حدود ربط المخازن والآثار الخارجية منفصلة. لا تدّعِ هذه المرحلة ضمان تنفيذ بعينه عبر الانهيار.
+`NEXT_ACTION=M2.a`
 
-## الخطوة التالية — M2 بعد checkpoint M1
+اختبار القبول المخطط (لا يُشغّل إلا ضمن تنفيذ M2.a):
 
-1. اختيار وتوثيق مسار التشغيل الإنتاجي بين queue مع supervisor حي والمسار المتزامن الحالي، وتحديد موضع عبور claim إلى التنفيذ.
-2. تصميم reconciliation قبل retry عند dispatch/timeout أو crash غير محسوم، وإضافة اختبارات لعامل قديم بعد reclaim ولنتيجة أثر خارجي غير معروفة.
-3. إبقاء cross-store fencing والذرية الخارجية خارج M1؛ الحفاظ على Owner authorization وscope/policy دون تغيير.
+```bash
+python -m pytest tests/test_mission_store_fencing.py tests/test_mission_queue_fencing.py -q
+```
+
+يجب أن يضيف M2.a انحدار stale A/B حتميًا: يطالب A، ثم يطالب B generation التالية، ويرفض أي كتابة mission من A بلا تغيير لصف B أو mission revision، ويقبل كتابة B. لا تبدأ M2.b قبل قبول ذلك وتسجيل checkpoint مستقل.
