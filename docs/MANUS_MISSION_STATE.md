@@ -1,25 +1,33 @@
-# حالة المهمة — M2.d.dispatch
+# حالة المهمة — M2.d.supervisor-module
 
 | الحقل | القيمة |
 |---|---|
-| `CURRENT_PHASE` | `M2.d.dispatch` — تكامل claim-bound `MissionWorker` مع `MissionRuntime` وeffect-intent gate مختبَر محليًا؛ supervisor/API production cutover **UNVERIFIED**. |
-| `CURRENT_CHECKPOINT` | dispatch integration فقط؛ parent المباشر `0799147d7dacdbf24487e10e2384d94e4c515d9a`؛ لا يُسجل SHA ذاتيًا هنا. |
-| `LAST_GOOD_SHA` | `0799147d7dacdbf24487e10e2384d94e4c515d9a` — base المطابق قبل هذا checkpoint، وليس SHA ذاتيًا. |
+| `CURRENT_PHASE` | `M2.d.supervisor-module` — وحدة lifecycle داخلية مختبرة؛ production supervisor/API cutover **NOT IMPLEMENTED**. |
+| `CURRENT_CHECKPOINT` | supervisor lifecycle module فقط؛ parent المباشر `4e3ef0116cca27be58fcb8287390da4fbab508ae`؛ لا يُسجل SHA ذاتيًا هنا. |
+| `LAST_GOOD_SHA` | `4e3ef0116cca27be58fcb8287390da4fbab508ae` — base المطابق قبل هذا checkpoint، وليس SHA ذاتيًا. |
 | `BRANCH` | `manus/durable-runtime-fencing` |
-| `REMOTE_BASE_SHA` | `0799147d7dacdbf24487e10e2384d94e4c515d9a` — SHA البعيد المطابق قبل التعديل في هذا checkpoint. |
-| `COMPLETED_PHASES` | `M0`, `M1`, `M2.a`, `M2.b`, `M2.c (repository/state-machine layer)`, `M2.d.dispatch`؛ supervisor cutover ما زال **UNVERIFIED**. |
-| `ACTIVE_WORK` | `M2.d.dispatch integration tested; no production supervisor/API cutover or full-suite claim.` |
+| `REMOTE_BASE_SHA` | `4e3ef0116cca27be58fcb8287390da4fbab508ae` — SHA البعيد المطابق قبل التنفيذ والتحقق منه مجددًا قبل هذا التوثيق. |
+| `COMPLETED_PHASES` | `M0`, `M1`, `M2.a`, `M2.b`, `M2.c (repository/state-machine layer)`, `M2.d.dispatch`, `M2.d.supervisor-module`; cutover منفصل وغير منفذ. |
+| `ACTIVE_WORK` | `M2.d.supervisor-module lifecycle tested; no production activation, API cutover, or full-suite claim.` |
 | `WORKTREE` | `/workspace/cybersentinel-m0-20261002-1329` |
-| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; الأدلة في `docs/MANUS_M2A_EVIDENCE.md`, `docs/MANUS_M2B_EVIDENCE.md`, `docs/MANUS_M2C_EVIDENCE.md`, `docs/MANUS_M2D_DISPATCH_EVIDENCE.md`. |
-| `NEXT_ACTION` | `M2.d.supervisor` — cutover خطوة مستقلة وغير منفذة هنا. |
-| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_m2d_dispatch_integration.py -q` |
-| `CHECKPOINT_VERIFICATION` | M2.d.dispatch: focused 7 passed؛ مجموعة M2.a–M2.c والمسارات المتأثرة 104 passed؛ adaptive 24 passed؛ compileall للملفات المتأثرة خارج `web/` و`git diff --check` ناجحان. لم تُشغل full suite أو live-provider/network tests. انظر `docs/MANUS_M2D_DISPATCH_EVIDENCE.md`. |
+| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; الأدلة في `docs/MANUS_M2A_EVIDENCE.md`, `docs/MANUS_M2B_EVIDENCE.md`, `docs/MANUS_M2C_EVIDENCE.md`, `docs/MANUS_M2D_DISPATCH_EVIDENCE.md`, `docs/MANUS_M2D_SUPERVISOR_EVIDENCE.md`. |
+| `NEXT_ACTION` | `M2.d.cutover` — خطوة مستقلة، غير منفذة في هذا checkpoint. |
+| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_mission_supervisor.py -q` |
+| `CHECKPOINT_VERIFICATION` | supervisor: focused 12 passed؛ targeted M2.a–M2.d regression 116 passed؛ adaptive 24 passed؛ compileall للملفات المتأثرة ناجح. لم تُشغل full suite أو live-provider/network tests. انظر `docs/MANUS_M2D_SUPERVISOR_EVIDENCE.md`. |
 
 ## وضع تنفيذ M2.d.dispatch
 
 - يربط `MissionWorker.run_once()` الـclaim snapshot ببوابة `MissionEffectDispatcher` قبل أي executor أو Registry handler في worker-bound `MissionRuntime`، ويحوّل `DISPATCHING` غير المكتمل عند reclaim إلى `UNKNOWN/RECOVERY_REQUIRED` قبل تشغيل أي slice.
 - الاختبارات المحلية تثبت commit الحالة قبل دخول handler، confirmation ذريًا مع mission/evidence، رفض نتيجة العامل القديم بعد reclaim، restart بلا إعادة إرسال، rollback عند فشل الحفظ، ومفتاحًا ثابتًا عبر retry بعد `PREPARED`. مسارا native الفردي والمتوازي يمران بالبوابة؛ المتوازي يُسلسل في worker mode.
 - هذا **dispatch integration tested but not production cutover**. لا يثبت حماية مسارات inline خارج Worker، ولا exactly-once أو منع خدمة خارجية من استقبال call عبر سباق TOCTOU. لا تغييرات في API أو supervisor.
+
+## وضع تنفيذ M2.d.supervisor-module
+
+- أضيفت `agent/mission_supervisor.py` كوحدة lifecycle داخلية؛ لا تبدأ عند import أو الإنشاء. `start()` و`stop()` صريحان، وإيقاف thread ينتظر انتهاء `MissionWorker.run_once()` الجاري، ولا ينفذ المشرف queue acknowledgement أو يكتب حالة نهائية بنفسه.
+- polling/backoff bounded، وتظل exceptions متاحة عبر `last_exception`/`last_error`. يسترد المشرف leases المنتهية فقط قبل claim؛ يتجنب إعادة تعيين جميع الصفوف النشطة حتى لا يسحب claim من مشرف منافس حي. بعد claim، تستخدم `MissionWorker` الحالية `recover_dispatching()` قبل تشغيل runtime، فتتحول النتيجة المبهمة إلى `UNKNOWN/RECOVERY_REQUIRED` بلا retry.
+- يمنع سجل العملية تشغيل مشرف آخر للـauthority و`worker_id` نفسيهما؛ هويات worker مختلفة تتنافس بأمان عبر claim ذرّي حقيقي. crash مع lease غير منتهية ينتظر انتهاءها بدل انتزاعها قسرًا.
+- اختبارات supervisor الاثنا عشر تستخدم SQLite محلية و`MissionQueue` و`MissionWorker` و`MissionRuntime` وdispatcher وregistry handler محلي. نتائج الانحدار المحددة 116 passed، adaptive 24 passed، وcompileall ناجح؛ full suite وlive provider/network لم يُشغّلا.
+- هذا لا يشغّل supervisor في production ولا يربطه بـ`bridge.py` أو routes/API؛ لا تتغير حالة `/api/chat` inline. تفاصيل nonclaims والبصمات في `docs/MANUS_M2D_SUPERVISOR_EVIDENCE.md`.
 
 ## وضع تنفيذ M2.c
 
@@ -55,8 +63,8 @@
 
 ## الخطوة التالية
 
-`NEXT_ACTION=M2.d.supervisor` (بعد قبول repository وdispatch integration؛ هذه الخطوة لم تبدأ)
+`NEXT_ACTION=M2.d.cutover` (بعد قبول supervisor lifecycle module؛ cutover لم يبدأ)
 
-طبقة M2.c وتكامل M2.d.dispatch مقبولان بالاختبارات المحددة. يبقى `UNKNOWN` ظاهرًا ويتطلب reconciliation صريحًا؛ لا يوجد Owner UI/API يغيره، ولا يُسمح بإعادة dispatch آلية. الخطوة التالية فقط هي تقييم/تنفيذ supervisor cutover ضمن نطاق مستقل.
+طبقة M2.c وتكامل M2.d.dispatch ووحدة supervisor lifecycle الداخلية مقبولة بالاختبارات المحددة. يبقى `UNKNOWN` ظاهرًا ويتطلب reconciliation صريحًا؛ لا يوجد Owner UI/API يغيره، ولا يُسمح بإعادة dispatch آلية. الخطوة التالية فقط هي cutover supervisor صريح ضمن نطاق مستقل.
 
-لم يحدث supervisor/API cutover في هذا checkpoint. يلزم قبل تشغيله مراجعة حدود authority والتكاملات المتبقية وخطة cutover، مع الحفاظ على سجلات M2.a–M2.d وأدلتها كما هي.
+لم يحدث supervisor/API cutover أو production activation في هذا checkpoint. لا يبدأ supervisor تلقائيًا؛ يلزم استدعاؤه يدويًا من lifecycle مُدار لاحقًا. تتطلب خطوة cutover المستقلة مراجعة حدود authority والتكاملات المتبقية وخطة التفعيل، مع الحفاظ على سجلات M2.a–M2.d وأدلتها كما هي.
