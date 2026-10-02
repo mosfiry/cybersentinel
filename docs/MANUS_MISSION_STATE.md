@@ -5,10 +5,10 @@
 | `CURRENT_PHASE` | `M1` — fencing محلي عند حد `MissionQueue` فقط. |
 | `CURRENT_CHECKPOINT` | commit M1 الذري `4df8958ef38f49254eb35108e24060a8000d7c29`، أبوه `49d4044ff7929455959f1ca22ccb6be52ac096c5`. يسجل هذا commit التوثيقي SHA السابق ولا يضع SHA ذاتيًا. |
 | `COMPLETED_PHASES` | `M0`, `M1` — تنفيذ M1 واختباراته وcheckpointه اكتملت. |
-| `ACTIVE_WORK` | لا يوجد عمل تنفيذي؛ بانتظار التحقق النهائي ثم push عادي للـcheckpoint والمتابعة التوثيقية. لا يبدأ M2. |
+| `ACTIVE_WORK` | لا يوجد عمل تنفيذي؛ اكتمل M1 ودُفع checkpoint والمتابعة التوثيقية على الفرع المحدد. لم يبدأ M2. |
 | `LAST_GOOD_SHA` | `4df8958ef38f49254eb35108e24060a8000d7c29` — checkpoint M1 الذري الذي يضم code/tests/semantics/state/inventory. |
 | `BRANCH` | `manus/durable-runtime-fencing` |
-| `REMOTE` | `origin https://github.com/mosfiry/cybersentinel.git`; كان `refs/heads/manus/durable-runtime-fencing` عند `49d4044ff7929455959f1ca22ccb6be52ac096c5` في تحقق ما قبل الالتزام؛ لا يُدفع إلا دفعًا عاديًا إذا ظل مطابقًا أو صار تابعًا واضحًا للالتزام. |
+| `REMOTE` | `origin https://github.com/mosfiry/cybersentinel.git`; بعد الدفع العادي طابق `refs/heads/manus/durable-runtime-fencing` محليًا عند `4161575da579fe119f297a1ac8785c5e9e308e7a`؛ فُحص تطابق SHA ونظافة الشجرة نهائيًا. |
 | `WORKTREE` | `/workspace/cybersentinel-m0-20261002-1329` |
 | `BASE_SHA` | `49d4044ff7929455959f1ca22ccb6be52ac096c5`، الأب `b17a70ba44463e7a35d8b8e9d6b9ecc0c8773bd8`. |
 
