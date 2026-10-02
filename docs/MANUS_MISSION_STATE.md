@@ -1,19 +1,26 @@
-# حالة المهمة — M2.b
+# حالة المهمة — M2.c
 
 | الحقل | القيمة |
 |---|---|
-| `CURRENT_PHASE` | `M2.b` — claim-fenced mission-owned evidence chain + حفظ verification state مع mission؛ لا يعني cutover إنتاجيًا. |
-| `CURRENT_CHECKPOINT` | `M2.b` مقبول بالاختبارات المركزة؛ parent المباشر `8724cd16b63f28f41260952e6119f18dcbbb072f`؛ لا يُسجل SHA ذاتيًا هنا. |
-| `LAST_GOOD_SHA` | `8724cd16b63f28f41260952e6119f18dcbbb072f` — checkpoint M2.a المنشور والمتحقق قبل M2.b وparent المقصود لهذا checkpoint. |
+| `CURRENT_PHASE` | `M2.c` — مستودع ExternalEffectIntent وحالاته على ملف authority؛ dispatch integration في runtime الإنتاجي **UNVERIFIED** ولا يعني cutover. |
+| `CURRENT_CHECKPOINT` | طبقة repository/state machine مقبولة بالاختبارات المركزة؛ parent المباشر `0ea1b8bd09a69e22a0e50dd1e6210ee0e7be0044`؛ لا يُسجل SHA ذاتيًا هنا. |
+| `LAST_GOOD_SHA` | `0ea1b8bd09a69e22a0e50dd1e6210ee0e7be0044` — base المطابق قبل هذا checkpoint، وليس SHA ذاتيًا. |
 | `BRANCH` | `manus/durable-runtime-fencing` |
-| `REMOTE_BASE_SHA` | `8724cd16b63f28f41260952e6119f18dcbbb072f` — SHA البعيد المطابق قبل التعديل في هذا checkpoint. |
-| `COMPLETED_PHASES` | `M0`, `M1`, `M2.a`, `M2.b` — M2.b يثبت worker mission-owned evidence append فقط تحت claim/revision في authority file نفسه؛ Workspace legacy chain وinline `/api/chat` بلا fencing. |
-| `ACTIVE_WORK` | `M2.b acceptance complete; no full-suite/cutover claim; next M2.c` |
+| `REMOTE_BASE_SHA` | `0ea1b8bd09a69e22a0e50dd1e6210ee0e7be0044` — SHA البعيد المطابق قبل التعديل في هذا checkpoint. |
+| `COMPLETED_PHASES` | `M0`, `M1`, `M2.a`, `M2.b`, `M2.c (repository/state-machine layer)`؛ dispatch الفعلي ما زال **UNVERIFIED**. |
+| `ACTIVE_WORK` | `M2.c repository acceptance complete; no worker/adapter integration, supervisor cutover, or full-suite claim.` |
 | `WORKTREE` | `/workspace/cybersentinel-m0-20261002-1329` |
-| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; أدلة M2.a في `docs/MANUS_M2A_EVIDENCE.md` وأدلة M2.b وحدوده في `docs/MANUS_M2B_EVIDENCE.md`. |
-| `NEXT_ACTION` | `M2.c` — ExternalEffectIntent PREPARED/DISPATCHING/outcome/UNKNOWN، crash recovery وreconciliation صريح؛ لا retry آلي ولا M2.d cutover. |
+| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; الأدلة في `docs/MANUS_M2A_EVIDENCE.md`, `docs/MANUS_M2B_EVIDENCE.md`, `docs/MANUS_M2C_EVIDENCE.md`. |
+| `NEXT_ACTION` | `M2.d` فقط بعد قبول طبقة M2.c: ربط adapter/worker والتحقق من dispatch fencing قبل أي supervisor cutover؛ لا يُنفذ هذا هنا. |
 | `NEXT_TEST_COMMAND` | `python -m pytest tests/test_effect_intent_recovery.py tests/test_external_effect_unknown.py -q` |
-| `CHECKPOINT_VERIFICATION` | M2.b+M2.a targeted: 64 passed؛ adaptive: 24 passed؛ compileall للملفات خارج `web/`: pass؛ `git diff --check`: pass؛ full suite لم تُشغّل حفاظًا على حدود `web/` وقواعد SQLite. انظر `docs/MANUS_M2B_EVIDENCE.md`. |
+| `CHECKPOINT_VERIFICATION` | M2.c + regressions: 76 passed؛ adaptive: 24 passed؛ compileall للملفات خارج `web/`: pass؛ focused M2.c: 12 passed؛ لا full-suite أو live-provider/network test. انظر `docs/MANUS_M2C_EVIDENCE.md`. |
+
+## وضع تنفيذ M2.c
+
+- أُضيف `PREPARED` و`DISPATCHING` و`CONFIRMED` و`DEFINITE_NOT_SENT` و`FAILED` و`UNKNOWN`، مع attempt history مربوطة بـclaim generation، ومفاتيح effect/idempotency ثابتة للعمل المنطقي نفسه.
+- prepare/checkpoint، confirmation/result/evidence، وcrash-to-UNKNOWN تُحفظ على ملف SQLite السلطوي ومعاملة واحدة؛ الكتابات تفحص claim الحالي وmission revision.
+- الاختبارات تثبت `UNKNOWN` بعد reopen/reclaim ورفض الإرسال التلقائي، وrollback الذري. لكنها تختبر واجهة المستودع الفعلية مع قواعد مؤقتة، لا adapter يستدعي أداة خارجية.
+- لم يوجد مسار إنتاجي يربط `MissionWorker` بمسارات `AgentCore`/`MissionRuntime` inline؛ لذلك **DISPATCH INTEGRATION=UNVERIFIED**، و`/api/chat`/supervisor لم يتغيرا. التفاصيل في `docs/MANUS_M2C_EVIDENCE.md`.
 
 ## وضع تنفيذ M2.a
 
@@ -42,12 +49,8 @@
 
 ## الخطوة التالية
 
-`NEXT_ACTION=M2.c`
+`NEXT_ACTION=M2.d` (بعد قبول طبقة repository في M2.c؛ dispatch integration ما زال UNVERIFIED)
 
-ابدأ M2.c من checkpoint M2.b المنشور: أضف حالات intent الدائمة `PREPARED` و`DISPATCHING` والنتيجة المعروفة/`UNKNOWN`، ثم crash recovery إلى `RECOVERY_REQUIRED` و`OWNER_RECONCILIATION_REQUIRED` بلا retry تلقائي. اختبرها فقط بأدوات fake محلية عبر:
+M2.c repository/state-machine layer مكتمل ومقبول. يبقى unknown ظاهرًا ويتطلب reconciliation صريحًا؛ لا يوجد Owner UI/API يغيره، ولا يُسمح بإعادة dispatch آلية. في M2.d يجب وصل عامل/adapter فعلي بعد إثبات مصدره وحدود authority، ثم فقط تقييم supervisor cutover.
 
-```bash
-python -m pytest tests/test_effect_intent_recovery.py tests/test_external_effect_unknown.py -q
-```
-
-لا تبدأ supervisor/API cutover؛ يظل M2.d منفصلًا بعد قبول M2.c.
+لا تبدأ supervisor/API cutover قبل إثبات أن كل dispatch يكتب `DISPATCHING` على authority قبل بدء الاتصال، وأن timeout/reclaim/crash ينتج `UNKNOWN` بلا retry. سجلات M2.a/M2.b التاريخية أعلاه وفي ملفات أدلتها محفوظة.
