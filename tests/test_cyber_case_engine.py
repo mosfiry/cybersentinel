@@ -74,6 +74,76 @@ class TestCyberCase:
         with pytest.raises(ValueError, match="objective"):
             CyberCase(objective="   ")
 
+    def test_empty_observation_and_evidence_are_refused(self):
+        case = CyberCase(objective="assess synth-commerce-1")
+
+        with pytest.raises(ValueError, match="observation text"):
+            case.add_observation("  ")
+        with pytest.raises(ValueError, match="evidence statement"):
+            case.add_evidence("")
+
+    def test_contradiction_requires_two_recorded_evidence_items(self):
+        case = CyberCase(objective="assess synth-commerce-1")
+        evidence_id = case.add_evidence("claim A")
+
+        with pytest.raises(ValueError, match="recorded evidence"):
+            case.register_contradiction(evidence_id, "ev-unknown")
+
+    def test_hypothesis_references_and_duplicate_ids_are_validated(self):
+        case = CyberCase(objective="assess synth-commerce-1")
+        evidence_id = case.add_evidence("observed indicator", status=EvidenceStatus.SUPPORTED)
+        case.add_hypothesis("h1", "indicator is malicious")
+
+        with pytest.raises(ValueError, match="duplicate hypothesis"):
+            case.add_hypothesis("h1", "duplicate")
+        with pytest.raises(ValueError, match="unknown hypothesis"):
+            case.apply_evidence("missing", evidence_id, supports=True)
+        with pytest.raises(ValueError, match="unknown evidence"):
+            case.apply_evidence("h1", "ev-unknown", supports=True)
+
+        case.apply_evidence("h1", evidence_id, supports=False)
+        assert case.hypotheses["h1"].status.value == "DISPROVEN"
+        assert case.hypotheses["h1"].opposing == [evidence_id]
+
+    def test_weak_opposition_weakens_hypothesis_without_disproving_it(self):
+        case = CyberCase(objective="assess synth-commerce-1")
+        evidence_id = case.add_evidence("unconfirmed indicator", status=EvidenceStatus.WEAK)
+        case.add_hypothesis("h1", "indicator is malicious")
+
+        case.apply_evidence("h1", evidence_id, supports=False)
+
+        assert case.hypotheses["h1"].status.value == "WEAKENED"
+
+    def test_close_without_conclusion_records_missing_unknown_when_empty(self):
+        case = CyberCase(objective="assess synth-commerce-1")
+
+        assert case.close() == CaseStatus.CLOSED_INSUFFICIENT_EVIDENCE
+        assert case.unknowns == ["case closed without conclusion and without recorded unknowns"]
+
+    def test_serialization_preserves_provenance_and_case_metadata(self):
+        case = CyberCase(objective="assess synth-commerce-1", scope="synth-commerce-1")
+        provenance = Provenance(source="fixture", classification="FIXTURE", timestamp="2026-09-30T00:00:00Z")
+        observation_id = case.add_observation("surface enumerated", provenance=provenance)
+        evidence_id = case.add_evidence("gateway exposed", provenance=provenance)
+        case.add_hypothesis("h1", "gateway is exposed")
+        case.apply_evidence("h1", evidence_id, supports=True)
+        case.entities.append("gateway")
+        case.add_next_action("collect server telemetry")
+
+        serialized = case.as_dict()
+
+        assert observation_id == "obs-1"
+        assert serialized["scope"] == "synth-commerce-1"
+        assert serialized["observations"][0]["source"] == "EXTERNAL_UNTRUSTED"
+        assert serialized["observations"][0]["authority"] == "NONE"
+        assert serialized["observations"][0]["provenance"] == provenance.as_dict()
+        assert serialized["evidence"][0]["evidence_id"] == evidence_id
+        assert serialized["evidence"][0]["provenance"] == provenance.as_dict()
+        assert serialized["hypotheses"][0]["status"] == "STRENGTHENED"
+        assert serialized["hypotheses"][0]["supporting"] == [evidence_id]
+        assert serialized["entities"] == ["gateway"]
+        assert serialized["next_actions"] == ["collect server telemetry"]
+
 
 class _FakeMission:
     mission_id = "m-1"
