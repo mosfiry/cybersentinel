@@ -109,20 +109,35 @@ def test_queue_worker_and_restart_recovery(tmp_path):
     assert result.state is WorkerMissionState.COMPLETED
 
 
-def test_reenqueue_clears_stale_lease_and_error(tmp_path):
+def test_reenqueue_does_not_steal_live_lease_and_clears_after_expiry_recovery(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
-    queue.enqueue("mission-requeued", available_at="2026-01-01T00:00:00+00:00")
-    claimed = queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=3600)
+    claimed_at = datetime.now(timezone.utc)
+    claimed_at_text = claimed_at.isoformat()
+    recovery_at = (claimed_at + timedelta(seconds=3601)).isoformat()
+    queue.enqueue("mission-requeued", available_at=claimed_at_text)
+    claimed = queue.claim_next(now=claimed_at_text, worker_id="old-worker", lease_seconds=3600)
     assert claimed is not None
-    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker", lease_epoch=claimed.lease_epoch, now="2026-01-01T00:00:00+00:00")
+    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker", lease_epoch=claimed.lease_epoch, now=claimed_at_text)
 
-    requeued = queue.enqueue("mission-requeued", available_at="2026-01-01T00:01:00+00:00")
+    live = queue.get("mission-requeued")
+    still_live = queue.enqueue("mission-requeued", available_at=recovery_at)
+    assert still_live.state is WorkerMissionState.EXECUTING
+    assert still_live.lease_owner == "old-worker"
+    assert still_live.lease_expires_at == live.lease_expires_at
+    assert still_live.lease_epoch == live.lease_epoch
+    assert still_live.last_error == "old failure"
+
+    recovered = queue.recover_after_restart(now=recovery_at)
+    assert len(recovered) == 1
+    assert recovered[0].state is WorkerMissionState.QUEUED
+    assert recovered[0].lease_epoch > claimed.lease_epoch
+    requeued = queue.enqueue("mission-requeued", available_at=recovery_at)
     assert requeued.state is WorkerMissionState.QUEUED
     assert requeued.last_error == ""
     assert requeued.lease_owner is None
     assert requeued.lease_expires_at is None
 
-    reclaimed = queue.claim_next(now="2026-01-01T00:01:00+00:00", worker_id="new-worker")
+    reclaimed = queue.claim_next(now=recovery_at, worker_id="new-worker")
     assert reclaimed is not None
     assert reclaimed.lease_owner == "new-worker"
 

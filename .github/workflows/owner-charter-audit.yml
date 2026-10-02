@@ -1,0 +1,68 @@
+name: owner-charter-audit
+
+on:
+  push:
+    branches-ignore: [main]
+    paths-ignore:
+      - 'diagnostics/**'
+
+concurrency:
+  group: owner-charter-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Write Owner Charter heuristic inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          file_count="$(git ls-files -- ':!diagnostics/**' | wc -l | tr -d ' ')"
+          {
+            echo "# Owner Charter heuristic inventory"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Tracked source/docs files scanned (archived diagnostics excluded): ${file_count}"
+            echo "- This is a location inventory for human review, not proof of compliance."
+            echo "- Only counts and file/line locations are reported; source text is not exported."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          scan_group() {
+            local label="$1"
+            local pattern="$2"
+            local limit="$3"
+            local matches
+            matches="$(git grep -n -I -E "$pattern" -- ':!diagnostics/**' || true)"
+            {
+              echo
+              echo "## ${label}"
+              if [[ -z "$matches" ]]; then
+                echo "- Candidate lines: 0"
+                echo "- No matching tracked lines."
+              else
+                local count
+                count="$(printf '%s\n' "$matches" | wc -l | tr -d ' ')"
+                echo "- Candidate lines: ${count}"
+                echo "- File/line locations (up to ${limit}; matched source text omitted):"
+                printf '%s\n' "$matches" \
+                  | sed -E 's/^([^:]+:[0-9]+):.*/- `\1`/' \
+                  | sort -u \
+                  | awk -v limit="$limit" 'NR <= limit'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          scan_group "Authority-ordering terminology" '(takes? (precedence|priority)|overrides?|supersedes?|precedes|more restrictive|higher.authority|authority order|authority hierarchy|precedence)' 60
+          scan_group "Owner Charter references" 'OWNER_INSTRUCTION|owner_instruction' 60
+          scan_group "Potential competing-authority labels" 'MODEL_POLICY|SAFETY_POLICY|ETHICS_POLICY|TOOL_POLICY|SYSTEM_PLATFORM' 60
+          scan_group "Ethics/safety/policy definition locations" '(ethics|ethical|safety|safety_policy)' 60
+          scan_group "Model-output authority references" 'MODEL_OUTPUT' 60
