@@ -5,12 +5,12 @@ Status vocabulary: VERIFIED / PARTIALLY VERIFIED / UNVERIFIED / BLOCKED / FAILED
 
 ## CURRENT_PHASE
 
-V5 — MISSION STATE MACHINE HARDENING — V5.1 battery CI VERIFIED (bc76d2594875).
-Next: V6 — evidence chain hardening.
+V6 — EVIDENCE CHAIN HARDENING — V6.1-V6.3 CI VERIFIED (492a7d1c324b).
+Next: V7 — security report / Owner approval gap.
 
 ## CURRENT_CHECKPOINT
 
-bc76d25948752d3720478fd97b958fe70a6400fd (branch vibe/principal-engineering).
+492a7d1c324be83ff62a48a6db6465940bbf5a8a (branch vibe/principal-engineering).
 
 ## COMPLETED (checkpoints)
 
@@ -115,3 +115,27 @@ load_for_owner; non-MissionStatus transition argument is a TypeError.
 CI on bc76d2594875: test (3.13) SUCCESS (runs 37005803521, 37005809177);
 pytest-diagnostics SUCCESS (runs 37005803634, 37005809073); vibe-diagnostics
 SUCCESS (run 37005803672); export SUCCESS; Workers Builds FAILURE pre-existing.
+
+## V6 VERIFIED (492a7d1c324be83ff62a48a6db6465940bbf5a8a)
+
+FINDING FIXED (V6.2, agent/evidence.py, second backend modification by Vibe):
+EvidenceChainStore.append accepted caller-supplied current_hash values that were
+precomputed over sequence 0 and an empty previous hash (the observed() factory
+produces exactly that); append then overwrote sequence and previous_hash without
+recomputing, so chains built through observed()+append could never verify — a
+silent integrity failure. Fix: append drops any caller-supplied current_hash and
+recomputes after the chain position is assigned. No baseline path depends on the
+broken semantics (workspace events append without a precomputed hash); behavior
+for consistent pre-hashed records is unchanged.
+
+tests/test_evidence_chain_hardening.py — 9 deterministic tests: chain rejects
+direct database payload tampering; rejects reordering, replay and middle-record
+removal; duplicate appends receive unique sequence slots with correct linkage;
+per-request isolation; unsigned evidence never supports a completion proof;
+substituted system evidence (action-binding forgery, signature forgery) rejected;
+evidence transplant across missions rejected; workspace event evidence carries
+mission/operation chain binding; record hash is content-bound.
+
+CI on 492a7d1c: test (3.13) SUCCESS (runs 37006527742 push, 37006534336 PR);
+pytest-diagnostics SUCCESS (runs 37006527678, 37006534270); vibe-diagnostics
+SUCCESS (run 37006527736); export SUCCESS; Workers Builds FAILURE pre-existing.

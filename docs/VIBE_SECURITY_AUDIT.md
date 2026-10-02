@@ -192,3 +192,23 @@ clock by design. api/missions.py and bridge.py call update()/enqueue() without
 worker_id and are unaffected (VERIFIED by caller inventory).
 
 ## Backend modifications by Vibe in V4: agent/mission_worker.py, tests listed above.
+
+
+## V6 — EVIDENCE CHAIN HARDENING — VERIFIED (finding fixed + battery)
+
+Finding F-V6-1 (FIXED in agent/evidence.py at 7bae7623e05): EvidenceChainStore.append
+accepted a caller-supplied current_hash precomputed over sequence 0 / empty
+previous_hash (the shape produced by observed()); after append assigned the real
+chain position, the stored hash no longer matched the record, so
+observed()+append chains returned verify() == False permanently. Severity
+rationale: integrity verification was silently unattainable on that path; no
+completion path used it (workspace events append un-hashed), so no authority
+bypass existed — a reliability/integrity defect, not an exploitable forgery.
+Fix: append recomputes the record hash after chain position assignment.
+
+tests/test_evidence_chain_hardening.py (9 tests, CI VERIFIED on 492a7d1c):
+tamper/reorder/replay/removal rejection; unique sequencing for duplicate appends;
+request isolation; unsigned/substituted/transplanted evidence cannot support a
+completion proof; workspace event chain binding; content-bound record hashes.
+
+## Backend modifications by Vibe in V6: agent/evidence.py (F-V6-1 fix), tests above.
