@@ -2,18 +2,18 @@
 
 | الحقل | القيمة |
 |---|---|
-| `CURRENT_PHASE` | `M2.d.supervisor-module` — وحدة lifecycle داخلية مختبرة؛ production supervisor/API cutover **NOT IMPLEMENTED**. |
-| `CURRENT_CHECKPOINT` | supervisor lifecycle module فقط؛ parent المباشر `4e3ef0116cca27be58fcb8287390da4fbab508ae`؛ لا يُسجل SHA ذاتيًا هنا. |
-| `LAST_GOOD_SHA` | `4e3ef0116cca27be58fcb8287390da4fbab508ae` — base المطابق قبل هذا checkpoint، وليس SHA ذاتيًا. |
+| `CURRENT_PHASE` | `M2.d.cutover` — **BLOCKED قبل تعديل الكود** بسبب handoff آمن لتفويض Owner؛ لم يحدث cutover أو activation. |
+| `CURRENT_CHECKPOINT` | توثيق blocker فقط؛ parent code baseline المطابق `3789aab54caa71fd77930126f8d45b73918a1ecc`؛ لا يُسجل SHA ذاتيًا هنا. |
+| `LAST_GOOD_SHA` | `3789aab54caa71fd77930126f8d45b73918a1ecc` — آخر checkpoint كود مختبر/موجود قبل cutover؛ لم يتغير الكود هنا. |
 | `BRANCH` | `manus/durable-runtime-fencing` |
-| `REMOTE_BASE_SHA` | `4e3ef0116cca27be58fcb8287390da4fbab508ae` — SHA البعيد المطابق قبل التنفيذ والتحقق منه مجددًا قبل هذا التوثيق. |
+| `REMOTE_BASE_SHA` | `3789aab54caa71fd77930126f8d45b73918a1ecc` — HEAD البعيد المطابق عند بدء M2.d.cutover. |
 | `COMPLETED_PHASES` | `M0`, `M1`, `M2.a`, `M2.b`, `M2.c (repository/state-machine layer)`, `M2.d.dispatch`, `M2.d.supervisor-module`; cutover منفصل وغير منفذ. |
-| `ACTIVE_WORK` | `M2.d.supervisor-module lifecycle tested; no production activation, API cutover, or full-suite claim.` |
+| `ACTIVE_WORK` | `M2.d.cutover source review complete; blocked before code; no supervisor/API activation or full-suite claim.` |
 | `WORKTREE` | `/workspace/cybersentinel-m0-20261002-1329` |
 | `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; الأدلة في `docs/MANUS_M2A_EVIDENCE.md`, `docs/MANUS_M2B_EVIDENCE.md`, `docs/MANUS_M2C_EVIDENCE.md`, `docs/MANUS_M2D_DISPATCH_EVIDENCE.md`, `docs/MANUS_M2D_SUPERVISOR_EVIDENCE.md`. |
-| `NEXT_ACTION` | `M2.d.cutover` — خطوة مستقلة، غير منفذة في هذا checkpoint. |
-| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_mission_supervisor.py -q` |
-| `CHECKPOINT_VERIFICATION` | supervisor: focused 12 passed؛ targeted M2.a–M2.d regression 116 passed؛ adaptive 24 passed؛ compileall للملفات المتأثرة ناجح. لم تُشغل full suite أو live-provider/network tests. انظر `docs/MANUS_M2D_SUPERVISOR_EVIDENCE.md`. |
+| `NEXT_ACTION` | حسم Owner لسياسة إعادة التفويض بعد restart قبل بدء أي تعديل تنفيذي؛ التفاصيل في `docs/MANUS_M2D_CUTOVER_EVIDENCE.md`. |
+| `NEXT_TEST_COMMAND` | لا يوجد قبل رفع blocker؛ لم تُشغل اختبارات في checkpoint التوثيق هذا. |
+| `CHECKPOINT_VERIFICATION` | code unchanged؛ لا tests/compileall أو supervisor runtime في هذا checkpoint؛ لا SQLite open/write/hash. baseline الاختبارات السابقة محفوظ في `docs/MANUS_M2D_SUPERVISOR_EVIDENCE.md`. |
 
 ## وضع تنفيذ M2.d.dispatch
 
@@ -68,3 +68,10 @@
 طبقة M2.c وتكامل M2.d.dispatch ووحدة supervisor lifecycle الداخلية مقبولة بالاختبارات المحددة. يبقى `UNKNOWN` ظاهرًا ويتطلب reconciliation صريحًا؛ لا يوجد Owner UI/API يغيره، ولا يُسمح بإعادة dispatch آلية. الخطوة التالية فقط هي cutover supervisor صريح ضمن نطاق مستقل.
 
 لم يحدث supervisor/API cutover أو production activation في هذا checkpoint. لا يبدأ supervisor تلقائيًا؛ يلزم استدعاؤه يدويًا من lifecycle مُدار لاحقًا. تتطلب خطوة cutover المستقلة مراجعة حدود authority والتكاملات المتبقية وخطة التفعيل، مع الحفاظ على سجلات M2.a–M2.d وأدلتها كما هي.
+
+## M2.d.cutover — blocker investigation
+
+- تحقّق أن local `HEAD`, remote-tracking `origin/manus/durable-runtime-fencing`، وremote baseline متطابقة عند `3789aab54caa71fd77930126f8d45b73918a1ecc` قبل التوثيق، وأن الشجرة كانت نظيفة. فُحص المصدر فقط داخل هذا المستودع؛ لم تُفتح أو تُعدل أو تُبصم أي قاعدة SQLite محمية أو بيانات مستخدم.
+- blocker: `OwnerAuthenticationEvidence`/`AuthorizationContext` يسلسلان `session_id` bearer الخام إلى mission/task storage، بينما مفتاح توقيعه عشوائي للعملية ويتغير بعد restart. حفظه كما هو يخالف منع raw token؛ حذفه دون handoff معتمد يفقد إثبات Owner. `AgentCore.resume_mission()` يطلب حاليًا إعادة مصادقة صريحة. لا supervisor جزئيًا.
+- راجع call graph، أسماء المسارات، ونقاط المصدر والمهام اللاحقة في `tasks/plan.md`, `tasks/todo.md`, و`docs/MANUS_M2D_CUTOVER_EVIDENCE.md`. إعادة التشغيل/التفويض، token-free serialization، same-file authority، وجعل API wait facade لم تُنفذ أو تُختبر.
+- request-id replay semantics غير مدعومة في المصدر ولا يُنشأ لها معنى جديد ضمن هذا checkpoint. لا PR/merge/deploy؛ الحالة الحالية **BLOCKED** وتنتظر قرار Owner حول إعادة المصادقة قبل re-enqueue مقابل تصميم capability آمن آخر.
