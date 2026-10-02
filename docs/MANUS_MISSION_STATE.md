@@ -1,19 +1,19 @@
-# حالة المهمة — M2.a
+# حالة المهمة — M2.b
 
 | الحقل | القيمة |
 |---|---|
-| `CURRENT_PHASE` | `M2.a` — atomic fenced mission write + deterministic stale A/B regression؛ لا يعني cutover إنتاجيًا. |
-| `CURRENT_CHECKPOINT` | `M2.a` مقبول محليًا؛ parent المباشر `b81742b59afd612f627f82dc6db1beca1a7d2a3a`؛ لا يُسجل SHA ذاتيًا هنا. |
-| `LAST_GOOD_SHA` | `b81742b59afd612f627f82dc6db1beca1a7d2a3a` — base المنشور الذي تحقق قبل M2.a وparent المقصود للـcheckpoint. |
+| `CURRENT_PHASE` | `M2.b` — claim-fenced mission-owned evidence chain + حفظ verification state مع mission؛ لا يعني cutover إنتاجيًا. |
+| `CURRENT_CHECKPOINT` | `M2.b` مقبول بالاختبارات المركزة؛ parent المباشر `8724cd16b63f28f41260952e6119f18dcbbb072f`؛ لا يُسجل SHA ذاتيًا هنا. |
+| `LAST_GOOD_SHA` | `8724cd16b63f28f41260952e6119f18dcbbb072f` — checkpoint M2.a المنشور والمتحقق قبل M2.b وparent المقصود لهذا checkpoint. |
 | `BRANCH` | `manus/durable-runtime-fencing` |
-| `REMOTE_BASE_SHA` | `b81742b59afd612f627f82dc6db1beca1a7d2a3a` — SHA البعيد للفرع عند preflight وقبل checkpoint. |
-| `COMPLETED_PHASES` | `M0`, `M1`, `M2.a` — M2.a يثبت worker mission-write fencing فقط عند اشتراك queue/store في ملف واحد؛ لا يعني حماية `/api/chat` أو اكتمال M2 أو deployment. |
-| `ACTIVE_WORK` | `M2.a acceptance complete; production API/supervisor fencing remains out of scope` |
+| `REMOTE_BASE_SHA` | `8724cd16b63f28f41260952e6119f18dcbbb072f` — SHA البعيد المطابق قبل التعديل في هذا checkpoint. |
+| `COMPLETED_PHASES` | `M0`, `M1`, `M2.a`, `M2.b` — M2.b يثبت worker mission-owned evidence append فقط تحت claim/revision في authority file نفسه؛ Workspace legacy chain وinline `/api/chat` بلا fencing. |
+| `ACTIVE_WORK` | `M2.b acceptance complete; no full-suite/cutover claim; next M2.c` |
 | `WORKTREE` | `/workspace/cybersentinel-m0-20261002-1329` |
-| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; أدلة التنفيذ والحدود في `docs/MANUS_M2A_EVIDENCE.md`. |
-| `NEXT_ACTION` | `M2.b` — evidence/proof atomicity، بعد checkpoint مستقل. |
-| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_mission_store_fencing.py tests/test_mission_queue_fencing.py -q` |
-| `CHECKPOINT_VERIFICATION` | targeted: 13 passed؛ compileall: pass؛ full suite: 717 passed, 1 skipped (live provider disabled)؛ adaptive: 24 passed؛ انظر `docs/MANUS_M2A_EVIDENCE.md`. |
+| `DESIGN` | `docs/MANUS_M2_ARCHITECTURE.md`; أدلة M2.a في `docs/MANUS_M2A_EVIDENCE.md` وأدلة M2.b وحدوده في `docs/MANUS_M2B_EVIDENCE.md`. |
+| `NEXT_ACTION` | `M2.c` — ExternalEffectIntent PREPARED/DISPATCHING/outcome/UNKNOWN، crash recovery وreconciliation صريح؛ لا retry آلي ولا M2.d cutover. |
+| `NEXT_TEST_COMMAND` | `python -m pytest tests/test_effect_intent_recovery.py tests/test_external_effect_unknown.py -q` |
+| `CHECKPOINT_VERIFICATION` | M2.b+M2.a targeted: 64 passed؛ adaptive: 24 passed؛ compileall للملفات خارج `web/`: pass؛ `git diff --check`: pass؛ full suite لم تُشغّل حفاظًا على حدود `web/` وقواعد SQLite. انظر `docs/MANUS_M2B_EVIDENCE.md`. |
 
 ## وضع تنفيذ M2.a
 
@@ -42,12 +42,12 @@
 
 ## الخطوة التالية
 
-`NEXT_ACTION=M2.a`
+`NEXT_ACTION=M2.c`
 
-اختبار القبول المخطط (لا يُشغّل إلا ضمن تنفيذ M2.a):
+ابدأ M2.c من checkpoint M2.b المنشور: أضف حالات intent الدائمة `PREPARED` و`DISPATCHING` والنتيجة المعروفة/`UNKNOWN`، ثم crash recovery إلى `RECOVERY_REQUIRED` و`OWNER_RECONCILIATION_REQUIRED` بلا retry تلقائي. اختبرها فقط بأدوات fake محلية عبر:
 
 ```bash
-python -m pytest tests/test_mission_store_fencing.py tests/test_mission_queue_fencing.py -q
+python -m pytest tests/test_effect_intent_recovery.py tests/test_external_effect_unknown.py -q
 ```
 
-يجب أن يضيف M2.a انحدار stale A/B حتميًا: يطالب A، ثم يطالب B generation التالية، ويرفض أي كتابة mission من A بلا تغيير لصف B أو mission revision، ويقبل كتابة B. لا تبدأ M2.b قبل قبول ذلك وتسجيل checkpoint مستقل.
+لا تبدأ supervisor/API cutover؛ يظل M2.d منفصلًا بعد قبول M2.c.

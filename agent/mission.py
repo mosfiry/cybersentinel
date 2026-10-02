@@ -9,6 +9,7 @@ import json
 
 from .planning import Plan, GoalVerification
 from .trajectory import EventType, TrajectoryEvent, verify_trajectory
+from .evidence import MissionEvidenceChain
 
 
 class MissionStatus(str, Enum):
@@ -167,6 +168,7 @@ class MissionStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(missions)")}
             if "revision" not in columns:
                 db.execute("ALTER TABLE missions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+            MissionEvidenceChain.initialize(db)
 
     def save(self, mission: Mission, *, claim=None, now: str | None = None) -> Mission:
         import json, sqlite3
@@ -193,12 +195,15 @@ class MissionStore:
             if existing is None:
                 if mission.revision != 0:
                     raise ValueError("stale mission write rejected")
+                if claim is not None:
+                    MissionEvidenceChain.append_in_transaction(db, mission.mission_id, list(payload.get("evidence", [])), claim)
                 db.execute(
                     "INSERT INTO missions(mission_id,payload,revision) VALUES(?,?,?)",
                     (mission.mission_id, encoded, next_revision),
                 )
             else:
-                current_hash = str(json.loads(existing[0]).get("integrity_hash", ""))
+                current_payload = json.loads(existing[0])
+                current_hash = str(current_payload.get("integrity_hash", ""))
                 current_revision = int(existing[1])
                 if (
                     not mission.integrity_hash
@@ -206,6 +211,14 @@ class MissionStore:
                     or current_revision != mission.revision
                 ):
                     raise ValueError("stale mission write rejected")
+                if claim is not None:
+                    previous_evidence = list(current_payload.get("evidence", []))
+                    next_evidence = list(payload.get("evidence", []))
+                    if len(next_evidence) < len(previous_evidence) or next_evidence[:len(previous_evidence)] != previous_evidence:
+                        raise ValueError("mission evidence history is append-only")
+                    MissionEvidenceChain.append_in_transaction(
+                        db, mission.mission_id, next_evidence[len(previous_evidence):], claim
+                    )
                 updated = db.execute(
                     "UPDATE missions SET payload=?,revision=revision+1 "
                     "WHERE mission_id=? AND payload=? AND revision=?",
