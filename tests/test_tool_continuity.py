@@ -190,7 +190,11 @@ def test_parallel_tool_exception_requires_reconciliation(tmp_path, monkeypatch):
     assert len(executions) == 2
     assert result.status.name == "RECOVERY_REQUIRED"
     assert result.checkpoint.get("status") == "in_flight_parallel"
-    assert result.checkpoint.get("ambiguous_tool_call_ids") == ["call_002"]
+    ambiguous = result.checkpoint.get("ambiguous_tool_call_ids")
+    # execute_bounded_parallel runs proposals on a thread pool: the raised call
+    # is whichever thread happened to execute the second proposal, so the
+    # assertion must be order-independent while staying exactly one ambiguous id.
+    assert len(ambiguous) == 1 and ambiguous[0] in {"call_001", "call_002"}
 
     resumed_without_reconciliation = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=2)
     assert len(executions) == 2, "restart must not replay any parallel side effect before reconciliation"
