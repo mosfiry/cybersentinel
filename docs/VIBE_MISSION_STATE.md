@@ -5,12 +5,13 @@ Status vocabulary: VERIFIED / PARTIALLY VERIFIED / UNVERIFIED / BLOCKED / FAILED
 
 ## CURRENT_PHASE
 
-V7 — SECURITY REPORT / OWNER APPROVAL — VERDICT: VERIFIED GAP; approval route
-BLOCKED on Owner decision (see below). Next: V8 request/API contract hardening.
+V10 — KNOWLEDGE FABRIC / SUPPLY CHAIN AUDIT (in progress). Next: V10
+verification battery + docs/KNOWLEDGE_SUPPLY_CHAIN.md, then V11 training-data
+governance (PoC classification validator; parquet analysis honesty limits apply).
 
 ## CURRENT_CHECKPOINT
 
-f48467b20caea8629f21c348d1deafabb3520692 (branch vibe/principal-engineering).
+2eeefc2d6ee4dcbd4674fac51d4ad5661546aa29 (branch vibe/principal-engineering).
 
 ## COMPLETED (checkpoints)
 
@@ -162,3 +163,75 @@ SUCCESS (run 37006527736); export SUCCESS; Workers Builds FAILURE pre-existing.
 
 CI on f48467b2 (docs-only checkpoint): tests re-run on this tree in V6 record;
 V7 changed no code, no new CI run required.
+
+## V8 VERIFIED (checkpoints 5e70f649, ef440d97, 92b4d39f, b571148f)
+
+FINDING FIXED (V8.1, agent/mission_worker.py, third backend file touched by Vibe —
+joining agent/evidence.py from V6.2): MissionScheduler.schedule stored run_at
+verbatim and MissionScheduler.dispatch_due selected due schedules with a SQL raw
+TEXT comparison (next_run_at<=?), so scheduling semantics depended on string
+formats: naive timestamps, offset-timezone instants, and legacy rows were compared
+lexicographically. Fixes: schedule() now requires a timezone-aware ISO-8601 run_at
+and normalizes it to canonical UTC (ValueError otherwise — fail-closed);
+dispatch_due parses and compares instants in Python (legacy/unparseable rows are
+skipped, never dispatched — fail-closed); mark_missed is fail-closed for legacy
+rows instead of raising TypeError. Full decision record: docs/API_CONTRACT_MATRIX.md.
+
+FINDING FIXED (V8.2, agent/agent_core.py, fourth backend file touched by Vibe):
+client-supplied request_id values were accepted verbatim with no format contract
+at AgentCore._auth and AgentCore.run_owner_mission. Policy decision (engineering,
+not authority-changing): client-generated ids REMAIN ALLOWED under a strict
+contract — str, 1..128 chars, charset [A-Za-z0-9_-] — anything else raises
+ValueError(invalid_request_id) BEFORE authorization (fail-closed; bridge maps
+ValueError to 400). Server-generated ids remain uuid4().hex. All baseline test
+request_id literals were surveyed first and conform. Known limitation recorded
+honestly: request_id uniqueness against prior requests is NOT enforced on the
+mission path (core.lifecycle.begin exists but is used only by the legacy engine);
+no collision-rejection claim is made.
+
+FINDING FIXED (V8.4, tests/test_tool_continuity.py): pre-existing flaky test
+test_parallel_tool_exception_requires_reconciliation assumed the second parallel
+tool call raises (call_002); execute_bounded_parallel uses ThreadPoolExecutor +
+as_completed, so WHICH call raises is scheduling-dependent. The flake fired on the
+first V8 CI run (ambiguous id call_001). Production semantics are correct (the
+raised call is recorded ambiguous); the test assertion is now order-independent.
+This was NOT a V8 regression.
+
+tests/test_run_at_contract.py (8 tests), tests/test_request_id_contract.py
+(6 tests incl. conversation_id + SSE wire-format characterization).
+
+## V9 VERIFIED (checkpoint 2eeefc2d)
+
+VERDICT: the provider failure model required by mission §14 is ALREADY
+implemented in this lineage and is now pinned by a dedicated battery
+tests/test_provider_failure_model.py (11 deterministic tests):
+- Typed taxonomy in agent/provider_api.py: CAPABILITY_UNSUPPORTED, PROVIDER_FAILURE,
+  INVALID_MODEL_RESPONSE, TIMEOUT, AUTHENTICATION_FAILURE (ProviderError carries
+  provider/model provenance).
+- agent/mission_runtime.py run_model_loop records every ProviderError as DATA on the
+  mission (class PROVIDER, kind, reason, turn_id, run_id) in mission.failures and
+  progress["model_failures"], sets mission.error, increments retry_count, and routes
+  through the bounded RecoveryPolicy (RETRY -> REPLANNING -> FAILED_RETRY_EXHAUSTED).
+  A provider failure NEVER becomes fake success or completion (pinned by test).
+- agent/model_router.py classifies transport exceptions deterministically
+  (TimeoutError->TIMEOUT, PermissionError->AUTHENTICATION_FAILURE, ValueError/
+  TypeError->INVALID_MODEL_RESPONSE, other->PROVIDER_FAILURE; typed errors pass
+  through), fails over across providers with a full failure trace in last_trace,
+  and raises when all providers fail.
+- RouterNativeModel falls back to generate() ONLY on CapabilityUnsupported; a real
+  provider failure propagates and is never disguised as a generate() response
+  (pinned by test).
+- response_from_legacy is deterministic for malformed tool-call payloads
+  (non-dict entries skipped; unparseable/non-dict arguments become {}).
+Mapping to the mission-required labels is recorded in docs/PROVIDER_FAILURE_MODEL.md
+(MODEL_TIMEOUT=TIMEOUT, MODEL_SCHEMA_FAILURE=INVALID_MODEL_RESPONSE,
+MODEL_REJECT=CAPABILITY_UNSUPPORTED, MODEL_PROVIDER_FAILURE=PROVIDER_FAILURE/
+AUTHENTICATION_FAILURE, MODEL_RUNTIME_FAILURE=unclassified runtime exceptions at
+the router boundary, DETERMINISTIC_VALIDATION_FAILURE=failed tool results that can
+never become verification evidence — pinned in test_failure_recovery_replan.py).
+
+CI on 2eeefc2d (V8.1+V8.2+V8.2.1+V8.4+V9.1 combined tree): test (3.13) SUCCESS
+(check runs 110841742566, 110841722996), test SUCCESS (110841757581, 110841719396),
+diagnose SUCCESS (110841707821), export SUCCESS (110841679682); Workers Builds
+FAILURE pre-existing and unrelated. The earlier failing run at 92b4d39f was the
+V8.4 flake documented above (single failure, tests/test_tool_continuity.py).
