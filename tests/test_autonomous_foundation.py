@@ -89,9 +89,9 @@ def test_authorization_snapshot_is_hashed_immutable_and_amendable():
 def test_queue_worker_and_restart_recovery(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-1", available_at="2026-01-01T00:00:00+00:00")
-    claimed = queue.claim_next(now="2026-01-01T00:00:00+00:00")
+    claimed = queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="worker-a", lease_seconds=60)
     assert claimed.state is WorkerMissionState.EXECUTING
-    recovered = queue.recover_after_restart()
+    recovered = queue.recover_after_restart(now="2026-01-01T00:01:01+00:00")
     assert recovered[0].state is WorkerMissionState.QUEUED
 
     class Mission:
@@ -105,15 +105,16 @@ def test_queue_worker_and_restart_recovery(tmp_path):
             return Mission()
 
     worker = MissionWorker(queue, lambda: Runtime())
-    result = worker.run_once(now="2026-01-01T00:00:00+00:00")
+    result = worker.run_once()
     assert result.state is WorkerMissionState.COMPLETED
 
 
 def test_reenqueue_clears_stale_lease_and_error(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-requeued", available_at="2026-01-01T00:00:00+00:00")
-    queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=3600)
-    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker")
+    claimed = queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=3600)
+    assert claimed is not None
+    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker", lease_epoch=claimed.lease_epoch, now="2026-01-01T00:00:00+00:00")
 
     requeued = queue.enqueue("mission-requeued", available_at="2026-01-01T00:01:00+00:00")
     assert requeued.state is WorkerMissionState.QUEUED
@@ -155,7 +156,7 @@ def test_worker_does_not_mark_mission_failed_after_lease_takeover(tmp_path):
                 db.execute("UPDATE mission_queue SET lease_owner=? WHERE mission_id=?", ("replacement-worker", mission_id))
             heartbeat()
 
-    result = MissionWorker(queue, lambda: Runtime(), worker_id="stale-worker").run_once(now="2026-01-01T00:00:00+00:00")
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="stale-worker").run_once(now=datetime.now(timezone.utc).isoformat())
     assert result.state is WorkerMissionState.EXECUTING
     assert result.lease_owner == "replacement-worker"
     assert result.last_error == ""
@@ -188,7 +189,7 @@ def test_worker_records_runtime_permission_error_as_failure(tmp_path):
         def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
             raise PermissionError("authorization denied")
 
-    result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once(now="2026-01-01T00:00:00+00:00")
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once()
     assert result.state is WorkerMissionState.FAILED
     assert result.last_error == "PermissionError: authorization denied"
 
@@ -196,6 +197,7 @@ def test_worker_records_runtime_permission_error_as_failure(tmp_path):
 def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-lease-config", available_at="2026-01-01T00:00:00+00:00")
+    run_started_at = datetime.now(timezone.utc)
 
     class Mission:
         status = MissionStatus.GOAL_COMPLETED
@@ -205,12 +207,12 @@ def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
     class Runtime:
         def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
             item = queue.get(mission_id)
-            assert item.lease_expires_at == "2026-01-01T00:00:17+00:00"
+            assert item.lease_expires_at == (run_started_at + timedelta(seconds=17)).isoformat()
             return Mission()
 
     with pytest.raises(ValueError, match="lease_seconds"):
         MissionWorker(queue, lambda: Runtime(), lease_seconds=0)
-    result = MissionWorker(queue, lambda: Runtime(), lease_seconds=17).run_once(now="2026-01-01T00:00:00+00:00")
+    result = MissionWorker(queue, lambda: Runtime(), lease_seconds=17).run_once(now=run_started_at.isoformat())
     assert result.state is WorkerMissionState.COMPLETED
 
 
@@ -228,7 +230,7 @@ def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
             assert mission_id == "mission-recovery"
             return Mission()
 
-    result = MissionWorker(queue, lambda: Runtime()).run_once(now="2026-01-01T00:00:00+00:00")
+    result = MissionWorker(queue, lambda: Runtime()).run_once()
     assert result.state is WorkerMissionState.WAITING_FOR_TOOL
     assert result.last_error == "in-flight tool outcome is unknown"
 

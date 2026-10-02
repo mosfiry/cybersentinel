@@ -113,7 +113,7 @@ def test_worker_lease_prevents_duplicate_and_recovers_expired(tmp_path):
     assert first and first.lease_owner == "a"
     assert queue.claim_next(now="2026-01-01T00:00:01+00:00", worker_id="b", lease_seconds=10) is None
     with pytest.raises(PermissionError):
-        queue.heartbeat("m1", worker_id="b", now="2026-01-01T00:00:01+00:00")
+        queue.heartbeat("m1", worker_id="b", lease_epoch=first.lease_epoch, now="2026-01-01T00:00:01+00:00")
     recovered = queue.recover_expired(now="2026-01-01T00:00:11+00:00")
     assert recovered[0].state is WorkerMissionState.QUEUED
     second = queue.claim_next(now="2026-01-01T00:00:11+00:00", worker_id="b", lease_seconds=10)
@@ -210,14 +210,15 @@ def test_worker_heartbeat_during_execution_and_stale_update_rejected(tmp_path):
     queue.enqueue("m1", available_at="2026-01-01T00:00:00+00:00")
     item = queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="a", lease_seconds=1)
     assert item is not None
-    renewed = queue.heartbeat("m1", worker_id="a", now="2026-01-01T00:00:00.500000+00:00", lease_seconds=10)
+    renewed = queue.heartbeat("m1", worker_id="a", lease_epoch=item.lease_epoch, now="2026-01-01T00:00:00.500000+00:00", lease_seconds=10)
     assert renewed.lease_owner == "a"
     with pytest.raises(PermissionError):
-        queue.update("m1", WorkerMissionState.COMPLETED, worker_id="stale")
+        queue.update("m1", WorkerMissionState.COMPLETED, worker_id="stale", lease_epoch=item.lease_epoch, now="2026-01-01T00:00:00.500000+00:00")
     queue.recover_expired(now="2026-01-01T00:00:11+00:00")
-    queue.claim_next(now="2026-01-01T00:00:11+00:00", worker_id="b", lease_seconds=10)
+    replacement = queue.claim_next(now="2026-01-01T00:00:11+00:00", worker_id="b", lease_seconds=10)
+    assert replacement is not None
     with pytest.raises(PermissionError):
-        queue.update("m1", WorkerMissionState.COMPLETED, worker_id="a")
+        queue.update("m1", WorkerMissionState.COMPLETED, worker_id="a", lease_epoch=item.lease_epoch, now="2026-01-01T00:00:11+00:00")
 
 
 def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, monkeypatch):
@@ -287,9 +288,9 @@ def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):
     queue.enqueue(mission.mission_id)
     worker_item = queue.claim_next(worker_id="worker-a", lease_seconds=60)
     assert worker_item is not None
-    result = first.run_to_completion(mission.mission_id, max_slices=3, heartbeat=lambda: queue.heartbeat(mission.mission_id, worker_id="worker-a"))
+    result = first.run_to_completion(mission.mission_id, max_slices=3, heartbeat=lambda: queue.heartbeat(mission.mission_id, worker_id="worker-a", lease_epoch=worker_item.lease_epoch))
     assert result.status is MissionStatus.GOAL_COMPLETED
-    queue.update(mission.mission_id, WorkerMissionState.COMPLETED, worker_id="worker-a")
+    queue.update(mission.mission_id, WorkerMissionState.COMPLETED, worker_id="worker-a", lease_epoch=worker_item.lease_epoch)
     assert (tmp_path / "artifact.txt").read_text() == "persisted"
     assert evidence_store.verify() and evidence_store.list(request_id="restart-request")
 
