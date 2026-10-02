@@ -113,7 +113,9 @@ def test_reenqueue_clears_stale_lease_and_error(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-requeued", available_at="2026-01-01T00:00:00+00:00")
     queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="old-worker", lease_seconds=30)
-    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker")
+    # The fenced update path requires a clock-consistent timestamp; the claim
+    # above used a frozen 2026-01-01 clock, so the update must pass now explicitly.
+    queue.update("mission-requeued", WorkerMissionState.EXECUTING, error="old failure", worker_id="old-worker", now="2026-01-01T00:00:05+00:00")
 
     expired = queue.recover_expired(now="2026-01-01T00:01:00+00:00")
     assert len(expired) == 1

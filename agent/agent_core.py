@@ -35,6 +35,24 @@ from .strategy import StrategyState
 from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnderstanding
 
 
+_REQUEST_ID_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+
+
+def validated_request_id(request_id: str) -> str:
+    """Fail-closed request identifier contract.
+
+    Server-generated ids are 32-character hex. Client-supplied ids are accepted
+    only when they are strings of 1..128 characters from [A-Za-z0-9_-]; anything
+    else is rejected before authorization so a malformed identifier can never
+    become a lifecycle, evidence, or provenance key. There is NO whitespace
+    normalization: a padded identifier is rejected, never silently trimmed
+    (V12 adversarial finding — trimming masked injected whitespace).
+    """
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128 or any(c not in _REQUEST_ID_ALLOWED for c in request_id):
+        raise ValueError("invalid_request_id")
+    return request_id
+
+
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
 
@@ -191,6 +209,7 @@ class AgentCore:
 
     @staticmethod
     def _auth(text: str, owner_session_token: str, request_id: str) -> tuple[AuthorizationContext, dict[str, Any]]:
+        request_id = validated_request_id(request_id)
         evidence = authenticate_owner(owner_session_token, request_id)
         snapshot = capture_policy_snapshot(request_id, evidence)
         return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=evidence.session_id), policy_context_from_snapshot(snapshot)
@@ -242,7 +261,7 @@ class AgentCore:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
 
     def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True) -> Mission:
-        request_id = request_id or uuid.uuid4().hex
+        request_id = validated_request_id(request_id or uuid.uuid4().hex)
         authorization_context, policy_context = self._auth(instruction, owner_session_token, request_id)
         if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
             snapshot = get_snapshot(scope_context["scope_snapshot_id"])

@@ -1,0 +1,39 @@
+name: vibe-diagnostics
+
+on:
+  push:
+    branches: [vibe/principal-engineering]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vibe-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Run tests and surface failures as annotations
+        run: |
+          set +e
+          python -m pytest -q --tb=short 2>&1 | tee /tmp/pytest.log
+          status=${PIPESTATUS[0]}
+          echo "::error::pytest exit ${status}"
+          grep -E "^(FAILED|ERROR)" /tmp/pytest.log | while IFS= read -r line; do
+            echo "::error::${line:0:250}"
+          done
+          tail -n 15 /tmp/pytest.log | while IFS= read -r line; do
+            echo "::error::summary: ${line:0:250}"
+          done
+          exit ${status}
