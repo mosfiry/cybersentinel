@@ -74,6 +74,9 @@ class EvidenceChainStore:
             payload = dict(item)
             payload["sequence"] = sequence
             payload["previous_hash"] = previous
+            # Evidence factories may precompute a hash before the chain position is known.
+            # Recompute it after assigning sequence and previous_hash.
+            payload.pop("current_hash", None)
             record = Evidence(**payload)
             db.execute("INSERT INTO evidence_chain(sequence,current_hash,payload) VALUES(?,?,?)", (sequence, record.current_hash, json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)))
         return record.to_dict()
