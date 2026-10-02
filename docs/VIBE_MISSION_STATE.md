@@ -3,76 +3,62 @@
 Durable, checkpointed record. Resume from the last checkpointed SHA after interruption.
 Status vocabulary: VERIFIED / PARTIALLY VERIFIED / UNVERIFIED / BLOCKED / FAILED.
 
-## Current phase
+## CURRENT_PHASE
 
-V3 — MISSION LIFECYCLE AUDIT (complete; this checkpoint). Next: V4 evidence/report/approval.
+V4.1 — LEASE FENCING DESIGN (complete; this checkpoint). Next: V4.2 implementation.
 
-## Completed phases
+## CURRENT_CHECKPOINT
 
-- V0 — Inventory + safe checkpoint: 1f06ece2812954dee2da28a05a071493a923eb9e
-- V1 — Architecture audit: 253270493691fda97d9e09918a0816a6b81cd953
-- V2 — Authority audit (V2.1 f011a48254bc, V2.2 46a1cc51a68447250a7bc8a2a8d8d8f11c76d727)
-- V3 — Mission lifecycle audit: this commit
+This commit on vibe/principal-engineering. Prior: 165706dba48 (V3).
 
-## Current objective
+## LAST_COMMIT
 
-V4 — EVIDENCE / REPORT / APPROVAL chain audit: verify evidence chain properties
-(agent/evidence.py EvidenceChainStore verify_chain; security/truthfulness.py
-SystemEvidenceIssuer keyed-HMAC provenance, EvidenceStatus claimed vs verified;
-security/execution_proof.py one-time consume_execution_proof_once); then determine
-the actual state of the report → Owner retrieval → approval → completion path in the
-verified checkpoint (public routes absent — documented, not invented), and audit the
-Manus-uncommitted report/approval work as UNVERIFIED until a checkpoint exists.
+165706dba48 (V3 mission lifecycle audit).
 
-## Last verified SHA (this checkpoint)
+## COMPLETED
 
-This commit on vibe/principal-engineering. Prior checkpoint: 46a1cc51a68.
+- V0 Inventory + safe checkpoint: 1f06ece28129 (re-verified this session: HEAD chain intact)
+- V1 Architecture audit: 253270493691
+- V2 Authority audit: f011a48254bc + 46a1cc51a68
+- V3 Mission lifecycle audit: 165706dba48
+- V4.1 Lease fencing design: this commit (docs/LEASE_FENCING_MODEL.md)
 
-## Last test result
+## IN_PROGRESS
 
-No code changed in V0–V3 (docs only); carried verified runs stand:
-Windows build run 36851558192 SUCCESS; test (3.13) run 36851558154 SUCCESS;
-diagnostics run 36851558190 SUCCESS. Windows launch test NOT EXECUTED.
+- V4.2 — implement F1–F5 in agent/mission_worker.py + tests/test_lease_fencing.py
+  (byte-exact base verified: blob 2b48dc75eb1c4ca9b98f28139c3a2ec944b4d57d, 20,346
+  bytes, dual-channel match raw-repair === contents-base64).
 
-## Key V3 verdicts
+## NEXT_PHASE
 
-- Mission state machine: transition guards + terminal-set enforcement VERIFIED
-  from source (agent/mission.py:112-131).
-- GOAL_COMPLETED is a system invariant: exact verified state + system-signed
-  completion proof required at transition AND persistence. VERIFIED.
-- Stale-write rejection via integrity_hash compare: VERIFIED (concurrent-worker
-  corruption blocked).
-- Request lifecycle: begin() atomic idempotency, validated transitions,
-  recover_incomplete crash reconciliation. VERIFIED.
-- Worker queue: BEGIN IMMEDIATE atomic claim, leases with expiry, LeaseLostError.
-  VERIFIED.
+V4.2 implementation → CI verification (Actions API, tests workflow on new SHA) →
+V4.3 checkpoint record → V5 mission state machine hardening (stale/replay/shortcut
+tests) → V6 evidence chain hardening.
 
-## Known blockers
+## BLOCKED
 
-- Manus backend UNCOMMITTED/DIRTY; its uncommitted changes remain UNVERIFIED.
-- work/desktop-client (08a87cf3) unknown-provenance parallel desktop client —
-  documented, untouched.
-- No public route for security report retrieval / Owner approval (documented).
-- mission_runtime.py / bridge.py full reads limited by raw channel (~32.7k).
+None new. Standing: no public route for security report / Owner approval (design
+gap documented in V1/V2); Manus uncommitted changes remain UNVERIFIED contract;
+work/desktop-client unknown provenance — untouched.
 
-## Next exact action
+## FILES_CHANGED (this checkpoint)
 
-V4.1 — Read agent/evidence.py (4,690 chars) and security/truthfulness.py
-(19,832 chars) in full; enumerate evidence provenance/trust labels and the
-issuer-minting flow; record the report/approval gap precisely (which backend
-functions exist, which public routes do not); update
-docs/VIBE_SECURITY_AUDIT.md (V4 section) + this file; commit
-"vibe: phase V4 evidence/report/approval audit".
-
-## Files changed (this checkpoint)
-
-- docs/VIBE_SECURITY_AUDIT.md (V3 section appended)
+- docs/LEASE_FENCING_MODEL.md (new)
 - docs/VIBE_MISSION_STATE.md (updated)
 
-## Migration notes
+## TESTS_RUN
 
-- Branch vibe/principal-engineering. Backend modifications by Vibe: 0.
+None yet in V4 (design only). Carried: test (3.13) run 36851558154 SUCCESS on
+5dc5e1cb lineage; full battery pending on V4.2 push.
+
+## KNOWN_RISKS
+
+- V4.2 expiry predicates must thread run_once clock (frozen-clock tests would
+  otherwise compare against real time) — handled by design F5.
+- Existing tests test_governed_execution.py / test_autonomous_foundation.py call
+  recover_expired; epoch bump is additive (state/owner assertions unaffected) —
+  to be confirmed by CI.
 
 ## Rollback point
 
-- This commit; parent 46a1cc51a68.
+This commit; parent 165706dba48.
