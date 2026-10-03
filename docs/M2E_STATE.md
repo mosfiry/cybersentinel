@@ -1038,3 +1038,73 @@ V5 final checkpoint SHA `9c60674c4a20687432e8f40d95e679f0c03830d3` is remote-con
 V5 implementation SHA `db9fbf08fe2326756b4d3c98f54d2e404e66f38e` plus final terminal-results SHA `9c60674c4a20687432e8f40d95e679f0c03830d3` are remote-confirmed; exact tests and audits passed. The natural Cloudflare build `503f73eb-e173-4369-b48c-419f7ba25acb` is directly confirmed stopped/fail due to missing top-level Wrangler `previews`, with no build `preview_url` or queried preview deployment. Workers check `111118553357` is completed failure; distinct earlier check `111118500144` was observed in progress/null for that same external ID. V4 remains blocked on its recorded owner decision. No V6 source has changed.
 
 **Next exact action:** validate and push this V5 result-record update as a separate docs-only non-force M2E checkpoint. Verify exact-SHA tests/audit and natural Workers/Cloudflare status for that checkpoint. Then proceed to V6 execution-proof review and implementation in order, leaving any authority/trust choice `BLOCKED` if unresolved; no manual Cloudflare calls.
+
+
+### V5 final status-log SHA exact-SHA check snapshot — 2026-10-03 05:33 +02:00
+
+| Time / phase | Exact observation and classification | Effect / identifiers | Verification and next action |
+|---|---|---|---|
+| 05:33:23 +02:00; V5 final state SHA `6fa32d155fcba8b7a168b6ea571bf9728334d591` | Remote branch GET confirmed exact SHA. Audit run `37093571784` / check `111118823895` completed `success`; test run `37093571759` / check `111118823677` was `in_progress`, conclusion null. Workers check `111118826694` was `in_progress`, conclusion null; details URL identifies build `584b9996-de1f-4e3c-8ac6-a707c23a90be`. | New natural preview build corresponds to the V5 final-result state commit; external preview effect `UNKNOWN / IN_PROGRESS` at this observation. | Read-only exact-SHA status query; no retry. Next permitted request is GET-only status/log/preview for this existing build. No V6 edits until these V5 results are recorded. |
+
+## Current checkpoint — final V5 status-log checkpoint pushed; exact test/build pending (2026-10-03 05:34 +02:00)
+
+V5 final status-log SHA `6fa32d155fcba8b7a168b6ea571bf9728334d591` is remote-confirmed. Its audit passed; test check `111118823677` and Workers check `111118826694` were `in_progress` / null at 05:33:23 +02:00. Cloudflare build `584b9996-de1f-4e3c-8ac6-a707c23a90be` has not yet been directly queried. Earlier V5 implementation and preview outcomes are documented above. No V6 code has changed.
+
+**Next exact action:** read only Cloudflare status/logs and matching preview/deployment data for existing build `584b9996-de1f-4e3c-8ac6-a707c23a90be`; after a quiet interval read exact-SHA GitHub test/Workers status once. Record both results before advancing to V6. No manual Cloudflare build/deploy or configuration changes.
+
+
+### V5 final state-result SHA Cloudflare direct-API follow-up — 2026-10-03 05:33 +02:00
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 05:33:46 +02:00; V5 final state SHA `6fa32d155fcba8b7a168b6ea571bf9728334d591` | Read-only Cloudflare GET for build `584b9996-de1f-4e3c-8ac6-a707c23a90be` returned HTTP 200, `status=stopped`, `build_outcome=fail`; logs returned HTTP 200 and show the missing top-level Wrangler `previews` block. Classification: `OPERATION_CONFIRMED_FAILURE` for this natural preview build. | Build commit/branch match `6fa32d1` / M2E; command `npx wrangler preview`, trigger `push_event`. Build response omitted `preview_url`; build-worker preview list and branch-preview deployments each returned `total_count=0`. Existing branch-preview resource retains a configured URL but `deployed_on=null` and predates this build. | GET-only status/log/preview/deployment; no manual build, deploy, retry, cancellation, or config change. No preview artifact/deployment was returned. GitHub Workers check `111118826694` was `in_progress` / null at 05:33:23 +02:00; preserve it separately. Do not infer production state. |
+
+## Current checkpoint — V5 final preview resolved; exact-SHA test pending (2026-10-03 05:34 +02:00)
+
+V5 final status-log SHA `6fa32d155fcba8b7a168b6ea571bf9728334d591` is remote-confirmed; audit passed and test check `111118823677` was `in_progress` / null at 05:33:23 +02:00. Cloudflare build `584b9996-de1f-4e3c-8ac6-a707c23a90be` is directly confirmed stopped/fail due to missing `previews`, with no `preview_url` or exact preview deployment. GitHub Workers check `111118826694` was in progress at that observation, separate from the Cloudflare result. No V6 code has changed.
+
+**Next exact action:** after a quiet interval, read exact-SHA GitHub test `37093571759` / check `111118823677` and Workers check `111118826694` once. Record the result locally and then proceed to V6 in order. The Cloudflare build gate is terminal. No manual Cloudflare build/deploy or config call.
+
+
+### V5 final status-log SHA exact-SHA terminal follow-up — 2026-10-03 05:34 +02:00
+
+| Time / phase | Exact observation and classification | External effect / identifiers | Verification and recovery |
+|---|---|---|---|
+| 05:34:17 +02:00; exact-SHA GitHub checks for `6fa32d155fcba8b7a168b6ea571bf9728334d591` | Remote branch GET confirmed exact SHA. Test run `37093571759` / check `111118823677` completed `success`; audit run `37093571784` / check `111118823895` completed `success`. Workers check `111118878270` completed `failure`, external ID `584b9996-de1f-4e3c-8ac6-a707c23a90be`. Earlier check `111118826694` was observed `in_progress` / null at 05:33:23 +02:00 for the same external build. | Direct Cloudflare GET above independently confirms build `584b9996-de1f-4e3c-8ac6-a707c23a90be` stopped/fail from missing `previews`, with no `preview_url` or matching preview deployment. Keep the GitHub check-run observations distinct; make no production-state claim. | Read-only exact-SHA GitHub metadata; no retry or mutation. Exact tests/audit passed and external preview failure is terminally verified. |
+
+## Current checkpoint — V5 complete; V6 source review next (2026-10-03 05:35 +02:00)
+
+V5 evidence-chain append serialization and regression tests are checkpointed on the M2E branch, including implementation SHA `db9fbf08fe2326756b4d3c98f54d2e404e66f38e`. Its final state-log checkpoint `6fa32d155fcba8b7a168b6ea571bf9728334d591` is remote-confirmed; exact-SHA test and audit passed. The naturally triggered Cloudflare build `584b9996-de1f-4e3c-8ac6-a707c23a90be` is directly confirmed terminal stopped/fail from the repository's absent Wrangler `previews` block, with no build preview URL or queried deployment. GitHub Workers check `111118878270` failed while distinct prior check `111118826694` was observed in progress/null for the same build. V4 remains explicitly `BLOCKED / OWNER DECISION REQUIRED`. V5 results are recorded locally here; no V6 source has changed yet.
+
+**Next exact action:** inspect the complete owner's V6 requirements and the current V6 source boundaries; maintain the V5 outcome log. Implement only independently safe execution-proof binding changes, with no invented authority or key trust. Any unresolved cryptographic authority/signer decision must be marked `BLOCKED` while continuing independent safe scope. Then tests, exact phase checkpoint and M2E-only push, following the Tool Failure Protocol. Do not modify excluded branches or Cloudflare configuration, and do not manually trigger previews.
+
+
+### V5 final state-log exact-SHA terminal follow-up — 2026-10-03 05:34 +02:00
+
+| Time / phase | Exact observation and classification | External effect / identifiers | Verification and recovery |
+|---|---|---|---|
+| 05:34:17 +02:00; final V5 state SHA `6fa32d155fcba8b7a168b6ea571bf9728334d591` | Remote M2E branch GET returned the exact SHA. Test run `37093571759` / check `111118823677` completed `success`; audit run `37093571784` / check `111118823895` completed `success`. Workers check `111118878270` completed `failure` with external build `584b9996-de1f-4e3c-8ac6-a707c23a90be`; separate prior check `111118826694` had been observed `in_progress` / null at 05:33:23 for this build. | Direct Cloudflare GET for the same build confirms `stopped`/`fail`, missing Wrangler `previews` block, absent `preview_url`, and zero exact build/branch preview deployments. Do not infer production state. | Read-only exact-SHA and Cloudflare checks; no retry/manual build or deploy. V5 test/audit succeeded; preview failure terminal. These final results are recorded locally pending this state update's commit/push. |
+
+### V6 execution-proof binding — BLOCKED / OWNER DECISION REQUIRED (2026-10-03)
+
+**Source review confirms the trust contract is unresolved; no V6 implementation or proof type was added.** `MissionQueue.claim_next()` returns `lease_owner` and `lease_epoch` (`agent/mission_worker.py:136-174`), but `MissionWorker.run_once()` passes only a heartbeat closure into `MissionRuntime.run_to_completion()` and retains the claim locally for finalization (`agent/mission_worker.py:345-404`). Native dispatch persists `in_flight`, checks limited mission/run/duplicate identity, and invokes the registry without queue claim identity (`agent/mission_runtime.py:335-375,377-440`); planned-step execution similarly writes an in-flight checkpoint and result/evidence without a proof object (`agent/mission_runtime.py:478-562`). `AuthorizationDecision` HMAC binds its authorization fields, tool, request/argument fingerprint and expiry (`security/authorization_context.py:122-180`), but not queue owner/epoch or the full execution invocation; its signing key falls back to process-local `os.urandom(32)` when `CYBERSENTINEL_DECISION_SECRET` is unset (`security/authorization_context.py:20`). Registry validates the authorization decision but accepts no queue-fence proof (`tools/registry.py:276-342`). V5 `EvidenceChainStore` is a separate SHA-256 chain, not a signed execution proof (`agent/evidence.py:61-99`).
+
+An acceptable V6 contract would need an Owner-established decision on required bound identities, proof purpose (authorization versus tamper evidence), verifier/signer trust root, durable key lifecycle, and queue-lease semantics. Adding a signature, schema, or “proof” with an unapproved/process-local key would invent security authority and overstate guarantees. Therefore V6 remains explicitly blocked, no source code changed, and the separately approved phase sequence proceeds to V7 external-effect-boundary review; V8 reconciliation and later work remain in order.
+
+### Tool Failures & Recovery — current mission-brief artifact lookup (2026-10-03 05:34 +02:00)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification and recovery |
+|---|---|---|---|
+| 05:34:44 +02:00; V6 requirements retrieval | Read-only search of `/home/ubuntu/upload/pasted_content_wS0ZFUCCqxfX7mbP3WOU98.txt` found zero lines and no searchable V6 terms in the active environment. Classification: `READ_ONLY_SOURCE_LOOKUP_MISS`; this is not evidence that the Owner's mission lacks V6 requirements. | No repository or external effect. The supplemental `/home/ubuntu/upload/pasted_content.txt` was present with 656 lines. | Recovered the V6 phase/block instruction from the saved session transcript and revalidated concrete source boundaries in the current checkout and architecture map. No retry or implementation based on guessed trust semantics. Earlier V6 lookup observations remain historical; this records the current environment's file state separately. |
+
+### Tool Failures & Recovery — V5/V6 checkpoint citation-range validation (2026-10-03 05:37 +02:00)
+
+| Time / operation | Failure and classification | External effect | Verification and recovery |
+|---|---|---|---|
+| 05:37:22 +02:00; pre-commit state validator | Local validation rejected the V6 blocker citation `tools/registry.py:276-343` because the current source file contains 342 lines. Classification: `VALIDATION_FAILURE / SOURCE_CITATION_RANGE_MISMATCH`. | The shell stopped before staging or commit; no push, CI, Cloudflare, or other external effect. | Re-read the current source and confirmed its relevant registry dispatch ends at line 342. Correct citation to `tools/registry.py:276-342`, then rerun local validation. No external mutation was retried. |
+
+## Current checkpoint — V5 exact outcomes documented locally; V6 blocked; V7 next (2026-10-03 05:37 +02:00)
+
+Remote M2E currently ends at `6fa32d155fcba8b7a168b6ea571bf9728334d591`; local `docs/M2E_STATE.md` has the terminal V5 exact-SHA results and V6 blocker appended but not yet committed. V5 code SHA `db9fbf08fe2326756b4d3c98f54d2e404e66f38e` and final state SHA `6fa32d1` passed exact-SHA tests/audit. The natural preview build for `6fa32d1` is terminal fail for the known missing `previews` block with no returned preview deployment. V6 is `BLOCKED / OWNER DECISION REQUIRED` as above; no V6 source was changed. The working tree is currently dirty only in this intended state file; preserve it.
+
+**Next exact action:** validate and non-force push this docs-only V5/V6 status checkpoint to the authorized M2E branch; verify exact-SHA CI and natural Workers/preview results separately. After that checkpoint's terminal preview result is observed, begin V7 source/design and implement only an independently safe effect-boundary subset; mark unresolved idempotency/provider/authority choices `BLOCKED` and proceed to V8 as directed. No manual Cloudflare build/deploy, config change, merge, or production action.
