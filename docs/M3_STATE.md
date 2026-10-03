@@ -219,3 +219,8 @@ A second read-only review accepted the mission/run/plan/turn echo checks, the on
 ### V11 clarification — input context versus returned response text (2026-10-03)
 
 A second instrumented long-horizon run stopped at turn 20 on `max_context_chars=32,000`. This showed the prior correction still applied `MAX_PROVIDER_TEXT_CHARS` (32K) to model input, although that ceiling is for provider-returned assistant text only. This pairing is incorrect. The model-input payload must obey the Owner's exact configured `max_context_chars`; `ContextAssembler.max_chars=24,000` remains a compaction target/default, and `RuntimeLimits(max_context_chars=64_000)` is already supported. The 23-turn test will use an explicit 64K Owner context budget. The V11 plan/checklist now separates input and output limits; no unbounded provider-response or tool-argument relaxation is made.
+
+
+### V11 context-input correction — verified (2026-10-03)
+
+The prior 32K model-input cap is superseded: `MAX_PROVIDER_TEXT_CHARS=32,000` limits assistant text returned by a provider, not the model request. `MissionRuntime._context_limits()` now returns the exact validated Owner `max_context_chars` value; `ContextAssembler` compacts toward that value, and the configured message-count limit is enforced against the actual assembled messages. The standard Owner default remains 32K; the existing long-horizon deterministic test explicitly uses the supported 64K Owner setting to exercise its documented 23-turn trajectory. Focused V11 context, preflight, fallback, and continuity regressions: **29 passed**. No production provider calls were made. This supersedes the earlier entries that paired model input with the 32K returned-text ceiling.

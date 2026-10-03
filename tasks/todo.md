@@ -58,7 +58,7 @@
 
 - [ ] Apply Owner-configured cumulative `max_tool_calls` and exact-repeat signature budgets without inventing a lifetime cap below supported Owner settings; keep the provider's 10-calls-per-response and 32,000-character returned-text ceilings separate from the exact Owner-configured model-input budget (24K remains only the assembler compaction default).
 - [ ] Require exact, nonempty `mission_id`, `run_id`, `turn_id`, and `plan_version` on native proposals; derive `action_id` from mission/turn/call identity, bind request/step/auth/scope from trusted state, and reject supplied mismatches.
-- [ ] Enforce the actual assembled message count against the exact Owner limit with no hardcoded two-message minimum; prove one message is accepted when one is configured and the assembled request fits.
+- [ ] Enforce the actual assembled message count against the exact Owner limit with no hardcoded two-message minimum; prove one message is accepted when one is configured and the assembled request fits, and preserve the long-horizon run under an explicit supported 64K Owner input-context budget.
 - [ ] Bind nonempty provider/model/capability provenance to the configured router adapter; reject arbitrary or mismatched labels before durable turn recording.
 - [ ] Require supplied provider-facing tool definitions to equal the canonical registry schemas exactly; reject altered, duplicate, unknown, or extra-metadata definitions before calling the model.
 - [ ] Disable silent `CapabilityUnsupported` → `generate` fallback by default; permit only an explicit opt-in and persist the actual capability used.
