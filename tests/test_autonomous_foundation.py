@@ -310,18 +310,29 @@ def test_self_repair_records_bounded_cycle():
     assert any(item.phase == "repair" for item in result.records)
 
 
-def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path):
+def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path, monkeypatch):
     from agent.mission import MissionStore
+    from agent.agent_core import AgentCore
+    from agent.model_router import ModelRouter
+    from owner_session_testutils import allow_owner_sessions
 
+    allow_owner_sessions(monkeypatch, "service-owner")
     store = MissionStore(Path(tmp_path) / "missions.sqlite3")
     runtime = MissionRuntime(store, executor=lambda _mission, _step, _action: {"success": True, "criterion_id": "done", "source": "test"}, authorization_snapshot_factory=make_test_snapshot)
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     scheduler = MissionScheduler(Path(tmp_path) / "scheduler.sqlite3", queue)
-    service = MissionService(runtime, queue, scheduler)
+    core = AgentCore(ModelRouter([]), store=store)
+    service = MissionService(runtime, queue, scheduler, owner_revalidator=core.prepare_mission_for_queue)
     mission = service.create_mission("build", "build", Plan.initial("build"))
-    started = service.start_mission(mission["mission_id"])
+    assert mission["request_id"]
+    initial_iterations = store.load(mission["mission_id"]).iteration_count
+    started = service.start_mission(mission["mission_id"], owner_session_token="service-owner")
     assert started["state"] == WorkerMissionState.QUEUED
     service.pause_mission(mission["mission_id"])
     assert service.status(mission["mission_id"])["checkpoint"]["status"] == "paused"
+    resumed = service.resume_mission(mission["mission_id"], owner_session_token="service-owner")
+    assert "pause_requested" not in resumed["progress"]
+    assert queue.get(mission["mission_id"]).state == WorkerMissionState.QUEUED
+    assert store.load(mission["mission_id"]).iteration_count == initial_iterations
     scheduled = service.schedule_mission(mission["mission_id"], run_at="2026-01-01T00:00:00+00:00", schedule_id="svc")
     assert scheduled["schedule_id"] == "svc"

@@ -2,15 +2,19 @@
 
 ## Identity and checkpoint
 
+> Entries below preserve their recorded timestamps; the latest dated checkpoint at the end is authoritative for the current head, worktree, blockers, and phase cursor.
+
 - **Mission ID:** `H62oLpGmBPGpsZMdljp68U` (CyberSentinel M2E production-cutover / restart-authority / unified-fencing mission)
-- **Phase:** `M2E-V1 — ARCHITECTURE MAP / CHECKPOINT`
-- **Phase status:** `CHECKPOINT READY` — V0 source-forensics are complete as an inventory; Cloudflare remains `BLOCKED` and non-blocking. The source-grounded V1 architecture map is drafted and validated; next is V2 Owner revalidation on queued mission start/resume, using the existing authentication policy.
+- **Phase:** `M2E-V2 — OWNER REVALIDATION BEFORE QUEUED START/RESUME`
+- **Phase status:** `LOCAL VERIFICATION PASS / CHECKPOINT PENDING` — V2 source/tests are locally verified; the V1 remote checkpoint at `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44` has successful GitHub Actions and a failed, non-blocking Workers Build check. Exact-SHA CI for V2 is pending its authorized M2E-branch push. Cloudflare remains `BLOCKED`; no Cloudflare API/build/deployment action is authorized here.
 - **Branch:** `task/m2e-cutover-20261002`
 - **Base SHA:** `9bf91ea37748a239e6a6e3b6327706fa614232cd` (`task/m2d-cutover-20261002`, live-verified)
-- **Start-of-resumption M2E HEAD:** `e3c75688584dece1cb71393a884a63dfbecb4613` (remote branch head and source-audit baseline; exact-SHA GitHub Actions complete)
+- **Start-of-resumption M2E HEAD:** `e3c75688584dece1cb71393a884a63dfbecb4613` (historical remote branch head and source-audit baseline)
+- **Current remote M2E HEAD before V2 commit:** `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44` (V1 docs checkpoint; exact-SHA results recorded below)
 - **V0 initial checkpoint SHA:** `c1fcc4f2df0c7373dbfeb01f8ed7bcedffda1526`
 - **Pushed V0 state checkpoint SHA:** `e3c75688584dece1cb71393a884a63dfbecb4613` (documentation-only; no force push)
-- **Application code changes:** none at this checkpoint. Local documentation includes the state log and `docs/M2E_ARCHITECTURE_MAP.md`; no Wrangler configuration or Worker entrypoint was invented. V0 forensic inventory is complete; the preview subcheck is still blocked.
+- **V1 docs checkpoint SHA:** `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44` (pushed only to the M2E task branch)
+- **Current V2 worktree:** code, tests, architecture-map update, and state update are locally verified but not yet committed/pushed. No Wrangler configuration, Worker entrypoint, Cloudflare setting, or production operation was added.
 
 ## Live Git verification (2026-10-02)
 
@@ -82,8 +86,8 @@ Cloudflare's official [Workers Builds branch documentation](https://developers.c
 
 ## Known blockers
 
-1. **Cloudflare source/preview — `BLOCKED`, non-blocking for independent phases.** Build `a4800e34-d7dd-45e6-94b2-1d73018617c2` for M2E SHA `e3c75688584dece1cb71393a884a63dfbecb4613` used `npx wrangler preview` and failed because a `previews` block is missing; `preview_url=null`. Do not invent a Worker configuration or call build/deployment APIs. Continue source discovery from repository/workflow metadata, record Cloudflare as blocked if no canonical source is found, and proceed with independent engineering phases.
-2. **Owner authority after restart — `BLOCKED / OWNER DECISION`.** No source-grounded authority model lets a persistent worker obtain fresh Owner authorization after restart. A serialized context, session, queue claim, or generation token will not be treated as current Owner authority.
+1. **Cloudflare source/preview — `BLOCKED`, non-blocking for independent phases.** The build `a4800e34-d7dd-45e6-94b2-1d73018617c2` for M2E SHA `e3c75688584dece1cb71393a884a63dfbecb4613` failed the Wrangler configuration check with `preview_url=null`. A push-triggered V1 check `111087253066` for SHA `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44` also completed as `failure`; its summary has no preview URL or failure cause. Do not invent a Worker configuration or call Cloudflare APIs. This remains blocked and does not gate independent phases.
+2. **Unattended worker/scheduler authority — `BLOCKED / OWNER DECISION`.** V2 adds fresh Owner revalidation for authenticated HTTP queue start/resume, but no source-grounded authority model lets an independently running worker or scheduled dispatch obtain live Owner authority after restart. A serialized context, queue claim, or generation token is not current Owner authority.
 3. **Unified fencing / atomicity — `PARTIALLY VERIFIED`.** The queue fence exists, but MissionStore, evidence, and external effects are outside that queue epoch's atomic transaction.
 4. **External-effect reconciliation — `BLOCKED`.** A crash around an effect can leave an ambiguous result. No blind retry, success/failure inference, or exactly-once claim is permitted.
 5. **Operations proof — `NOT VERIFIED`.** No OS process-kill matrix, multi-process supervisor test, or production lifecycle evidence was verified in V0.
@@ -93,13 +97,15 @@ Cloudflare's official [Workers Builds branch documentation](https://developers.c
 
 - M2E starts only from M2D final SHA `9bf91ea37748a239e6a6e3b6327706fa614232cd`; live re-verification shows that remote branch and `main` remain at their recorded SHAs.
 - V0 is documentation/source inventory only. No behavior, authorization contract, schema, CI workflow, Desktop code, Vibe-owned branch, production runtime, or external provider was changed or executed.
-- `main` at `8a3fd109c0e586db13ed48a7371ac9ad06465b74` and M2D at `9bf91ea37748a239e6a6e3b6327706fa614232cd` remain unchanged. The M2E branch is pushed at `e3c75688584dece1cb71393a884a63dfbecb4613`; no other branch was written.
+- `main` at `8a3fd109c0e586db13ed48a7371ac9ad06465b74` and M2D at `9bf91ea37748a239e6a6e3b6327706fa614232cd` remain unchanged. The M2E branch is remotely at `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44` before the V2 checkpoint; V2 changes are local at this precommit cursor. No other branch was written.
 - Owner approval covers the M2E branch push and non-production preview only. It does not authorize a production deployment, Cloudflare setting changes, or manual build/deploy API calls.
 - The actual Cloudflare preview build failed and returned no URL. No Wrangler config change, retry, commit, or push was made after that result; this local state update is uncommitted.
 - A failed Cloudflare check is not reclassified as successful merely because the GitHub Actions tests and audit passed.
 - External effects remain `UNKNOWN` / potentially ambiguous unless durable source-backed evidence proves otherwise; no exactly-once guarantee is asserted.
 
 ## V0 checkpoint protocol results
+
+> Historical V0 receipt. Its stop-at-V0 and expected-`e3c7568` cursor are superseded by the later dated checkpoints below.
 
 | Step | Result |
 |---|---|
@@ -117,9 +123,11 @@ Cloudflare's official [Workers Builds branch documentation](https://developers.c
 
 ## Exact next action
 
-V0 source inventory is complete and V1 architecture mapping is checkpoint-ready; see `docs/M2E_ARCHITECTURE_MAP.md`. Next: in V2, route queued mission start/resume through the existing `AgentCore` Owner authentication and authorization-snapshot renewal flow before enqueue, preserve `RECOVERY_REQUIRED`, and add focused tests. Do not change Owner policy or introduce new approval semantics. Cloudflare remains blocked/non-blocking; do not add guessed config or invoke build/deployment APIs.
+V2 implementation and local tests are complete. Validate the updated map citations, secret/diff hygiene, and state failure log; commit and non-force push only `task/m2e-cutover-20261002`; then verify exact-SHA GitHub Actions and the naturally emitted Workers Build check. Only after V2 exact-SHA GitHub Actions pass and its state is updated, proceed sequentially to V3 lease epoch/fencing hardening. Do not call Cloudflare APIs or change Owner policy.
 
 ## Resume instructions
+
+> Historical V0-era resume recipe, retained for chronology. Its expected remote SHA and stop-at-V0 instruction are obsolete; resume only from the latest dated checkpoint at the end of this file.
 
 1. Read this file and `docs/M2D_CUTOVER_FINAL_AUDIT.md` / `docs/M2D_CUTOVER_STATE.md` before acting.
 2. In `/workspace/cybersentinel`, verify `git status --porcelain=v2 --branch`, `git branch --show-current`, and `git rev-parse HEAD`; expected remote branch/head is `task/m2e-cutover-20261002` / `e3c75688584dece1cb71393a884a63dfbecb4613`, based at `9bf91ea37748a239e6a6e3b6327706fa614232cd`. The sole current local change is the uncommitted `docs/M2E_STATE.md` result update.
@@ -208,3 +216,26 @@ The full local suite on the unchanged source baseline passed again: `718 passed,
 
 
 | 2026-10-03 02:37:19 +02:00; V1 | `git push origin task/m2e-cutover-20261002` for local commit `b7d1a0d7da73dabc89f66013c74494d5e9c432ed` returned `fatal: could not read Username for 'https://github.com': terminal prompts disabled`. Initial classification: `TOOL_RESULT_UNKNOWN`; no retry was issued. | Repository ref mutation was possible until reconciled; no authenticated push success was reported. | Independent GitHub connector query at 02:37:42 confirmed remote task-branch SHA remained `e3c75688584dece1cb71393a884a63dfbecb4613`; Actions run-list query found no run for `b7d1a0d7da73dabc89f66013c74494d5e9c432ed`; local HEAD remained that SHA and clean apart from no pending changes. Final classification: `TOOL_FAILED_BEFORE_SUBMISSION` for the ref update; no repository write is evidenced. Safe recovery is to use the existing GitHub connector via a command-scoped askpass helper, without changing Git config, then independently verify the final pushed SHA and runs. No retry has yet occurred.
+
+
+## Current checkpoint — V2 queued-start/resume Owner revalidation (2026-10-03 02:51 +02:00)
+
+This is the operative cursor and supersedes the earlier V0/V1 “current” status and stop-at-V0 instructions. Historical evidence and failed attempts remain unchanged in the earlier sections.
+
+- **Branch / base:** `task/m2e-cutover-20261002`, based on M2D `9bf91ea37748a239e6a6e3b6327706fa614232cd`. The pre-V2 remote tip and local HEAD are `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44`; `main` remains `8a3fd109c0e586db13ed48a7371ac9ad06465b74`, and M2D remains at its base SHA. V2 changes below are local and not yet committed/pushed.
+- **V2 implementation:** `AgentCore` now exposes a prepare-only Owner revalidation method that reuses the existing authentication and policy-snapshot renewal logic. The bridge passes the live server-resolved Owner session ID to queued start/resume. `MissionService` requires the revalidator, validates the returned typed evidence against the request/session and persisted authorization/policy fingerprints, and fails closed before enqueue for missing/invalid proof, `RECOVERY_REQUIRED`, and terminal missions. Preparation persists refreshed proof/context without executing a mission slice; synchronous chat resume uses the same underlying revalidation path. Missions created through `MissionService` now receive a server-generated UUID request ID when none is supplied, matching the existing `api/chat.py` convention. No Owner policy, approval semantics, worker startup, scheduler authority, Cloudflare configuration, or deployment behavior was invented.
+- **Verification:** focused bridge/auth/recovery/service tests: `13 passed in 0.48s`. Final post-format full repository suite: `723 passed, 1 skipped in 10.14s`. Full-tree `compileall` and `git diff --check` passed. The V2 exact-SHA GitHub CI is pending the authorized branch push.
+- **V1 exact-SHA checks:** at `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44`, GitHub `tests` run [`37082930447`](https://github.com/mosfiry/cybersentinel/actions/runs/37082930447) completed `success` (check `111087173036`), and `owner-charter-audit` run [`37082930398`](https://github.com/mosfiry/cybersentinel/actions/runs/37082930398) completed `success` (check `111087172726`). The automatically triggered external Workers Build check [`111087253066`](https://github.com/mosfiry/cybersentinel/runs/111087253066) completed `failure` for the same SHA, external build ID `78383d09-1a63-4449-84c9-767dd22d7b50`. Its GitHub summary contains neither a preview URL nor a failure cause; it remains a failed attempt, not success. This second failed preview observation does not erase the earlier M2E build `a4800e34-d7dd-45e6-94b2-1d73018617c2` (`preview_url=null`, missing Wrangler `previews` block). No manual Cloudflare API/build/deployment call was made.
+- **Remaining blockers:** canonical Cloudflare source/config is still unproved and the preview checks remain failed/blocked; independent phases continue. V2 does not authorize a scheduled dispatch or an independently restarted worker to continue without a fresh live Owner session. Queue/mission/evidence/external-effect state is still not one atomic transaction; no exactly-once claim is made. External-effect reconciliation and operational multi-process/process-kill proof remain unresolved.
+- **Next exact action:** validate the updated architecture-map source citations and secret/diff hygiene; review and stage only the intended V2 source/tests/docs; commit and non-force push only the M2E task branch with command-scoped identity and connector-backed askpass. Independently verify the pushed SHA and its GitHub Actions; record the naturally triggered Workers Build result separately without calling Cloudflare APIs. Only after the V2 exact-SHA GitHub Actions pass, update the state and proceed to V3 lease epoch/fencing hardening.
+- **Owner-confirmed order after V2:** V3 lease epoch/fencing hardening; V4 Mission/Queue atomicity; V5 evidence fencing; V6 execution-proof binding; V7 external-effect boundary; V8 recovery/reconciliation; V9 crash-injection matrix; V10 multi-worker adversarial tests; V11 Owner cutover/recovery contract; V12 provider/model failure boundary; V13 Cloudflare/deployment forensics; V14 security/integration/regression battery; V15 final cutover audit; V16 repository hygiene. Work one phase at a time, updating evidence/state and verifying exact-SHA checks before advancing.
+
+### Tool Failures & Recovery
+
+| Time / phase | Failed operation and classification | External-effect possibility | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 2026-10-03 02:39–02:40 +02:00; V1 check monitor | `job.wait` reported no running job while the bounded read-only V1 check poll had reached its terminal state. Classification: `TOOL_FAILED_BUT_OPERATION_CONFIRMED` after the completion result arrived. The monitor job handle was not preserved in the compacted cursor. | The wait/monitor itself had no external mutation. The underlying GitHub queries were reads only. | The exact V1 branch/check results were independently re-queried through the GitHub connector at 02:49; run/check IDs and conclusions are recorded above. No duplicate poll or CI trigger was issued. |
+| 2026-10-03 02:43 +02:00; V2 focused tests | The first focused pytest run returned `5 passed, 1 failed`: service-created structured missions had an empty `request_id`, so existing request-bound Owner evidence could not be constructed during revalidation. Classification: `TEST_FAILURE`, not an external/tool operation failure. | None; local test execution only. | Added a server-generated UUID in `MissionService.create_mission()` using the repository’s existing `api/chat.py` convention, plus a regression assertion. Rerun passed `6/6`; after adding bridge route coverage the focused set passed `13/13`; full suite passed `723/1 skipped`. No blind retry of an external action occurred. |
+| 2026-10-03 02:46:38 +02:00; phase-history inspection | Reading `shell://recover-brief-phases` failed because that terminal was no longer open. Classification: `TOOL_FAILED_BEFORE_EXECUTION`. | None; read-only inspection. | The current state cursor was used temporarily; at 02:51:38 the Owner reconfirmed that the full ordered V3–V16 plan had already been supplied in this conversation. No repository/external state changed and no terminal command was reissued. |
+| 2026-10-03 02:46:57 +02:00; phase-history inspection | A local read-only helper attempted to parse the compacted history as one JSON value and exited with `JSONDecodeError: Extra data`; the file is JSONL. Classification: `TOOL_FAILED_DURING_EXECUTION`. | None; local read-only parsing only. | Recovered by parsing line-by-line as JSONL at 02:47:11. The later Owner correction at 02:51:38 supplied the exact V3–V16 order; the temporary provider/API cursor was withdrawn and V3 is lease epoch/fencing hardening. No repository operation was repeated. |
+| 2026-10-03 02:49 +02:00; V1 exact-SHA verification | Read-only GitHub API query confirmed `main=8a3fd109c0e586db13ed48a7371ac9ad06465b74`, M2D=`9bf91ea37748a239e6a6e3b6327706fa614232cd`, and M2E=`0aa4f5de6a40285d1ec9ce247dee4d535ea87c44`; V1 Actions passed and Workers Build failed as listed above. | No external mutation. | Results were independently read from the GitHub connector; no Cloudflare settings/build/deployment API was called. Preserve both the failed Cloudflare build and its missing preview URL/cause as failure/unknown, not success. |

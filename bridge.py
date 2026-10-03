@@ -84,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
         runtime = MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True)
         queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"))
         scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
-        return MissionService(runtime, queue, scheduler)
+        return MissionService(runtime, queue, scheduler, owner_revalidator=core.prepare_mission_for_queue)
 
     def _mission_owner(self):
         if not self._bridge_auth():
@@ -274,7 +274,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 service = self._mission_service()
                 if action == "start" or action == "resume":
-                    result = service.start_mission(mission_id) if action == "start" else service.resume_mission(mission_id)
+                    if action == "start":
+                        result = service.start_mission(
+                            mission_id, owner_session_token=auth["session_id"]
+                        )
+                    else:
+                        result = service.resume_mission(
+                            mission_id, owner_session_token=auth["session_id"]
+                        )
                     return self._send(200, {"ok": True, "mission": result})
                 if action == "pause":
                     return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id)})

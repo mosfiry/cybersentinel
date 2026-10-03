@@ -9,10 +9,11 @@ from core.config import DB_PATH
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.owner_policy import (
+    OwnerAuthenticationEvidence,
+    OwnerPolicySnapshot,
     authenticate_owner,
     capture_policy_snapshot,
     policy_context_from_snapshot,
-    OwnerPolicySnapshot,
 )
 from security.scope_store import get_snapshot
 from tools.registry import REGISTRY, execute as execute_tool, get_tool
@@ -329,18 +330,21 @@ class AgentCore:
                 pass
         return result
 
-    def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
+    def _reauthorize_mission(
+        self, mission_id: str, *, owner_session_token: str
+    ) -> tuple[Mission, OwnerAuthenticationEvidence, OwnerPolicySnapshot]:
         mission = self.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
+        if mission.status is MissionStatus.RECOVERY_REQUIRED:
+            raise ValueError("in-flight mission requires reconciliation before resume")
+        if mission.is_terminal and mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
+            raise ValueError("terminal mission cannot be resumed")
         try:
             evidence = authenticate_owner(owner_session_token, mission.request_id)
         except PermissionError as exc:
-            if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
-                if mission.status is MissionStatus.RECOVERY_REQUIRED:
-                    mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation required after restore")
-                else:
-                    mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation failed after restore")
+            if not mission.is_terminal:
+                mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "owner revalidation failed after restore")
                 mission.recovery_events.append({"event": "owner_revalidation_failed", "reason": str(exc)})
                 self.store.save(mission)
             raise
@@ -368,7 +372,20 @@ class AgentCore:
         mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "username_password", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})
         if mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
             mission.transition(MissionStatus.READY, "owner authorization revalidated")
-        self.store.save(mission)
+        mission = self.store.save(mission)
+        return mission, evidence, fresh_snapshot
+
+    def prepare_mission_for_queue(
+        self, mission_id: str, owner_session_token: str
+    ) -> OwnerAuthenticationEvidence:
+        """Revalidate Owner authority and persist the renewed snapshot without executing a runtime slice."""
+        _, evidence, _ = self._reauthorize_mission(
+            mission_id, owner_session_token=owner_session_token
+        )
+        return evidence
+
+    def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
+        mission, _, fresh_snapshot = self._reauthorize_mission(mission_id, owner_session_token=owner_session_token)
         policy_context = policy_context_from_snapshot(fresh_snapshot)
         runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True)
         return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations)

@@ -83,6 +83,32 @@ def test_bridge_owner_session_resolves_server_side_session(monkeypatch):
     assert bridge.Handler._owner_session(handler) is not None
 
 
+@pytest.mark.parametrize("action", ("start", "resume"))
+def test_bridge_queued_mission_route_passes_authenticated_session(action):
+    calls = []
+
+    class Service:
+        def start_mission(self, mission_id, *, owner_session_token=None):
+            calls.append(("start", mission_id, owner_session_token))
+            return {"state": "queued"}
+
+        def resume_mission(self, mission_id, *, owner_session_token=None):
+            calls.append(("resume", mission_id, owner_session_token))
+            return {"status": "READY"}
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.path = f"/api/missions/mission-1/{action}"
+    handler._mission_owner = lambda: {"session_id": "live-session"}
+    handler._mission_service = lambda: Service()
+    handler._send = lambda status, payload: (status, payload)
+
+    status, response = handler.do_POST()
+
+    assert status == 200
+    assert response["ok"] is True
+    assert calls == [(action, "mission-1", "live-session")]
+
+
 def test_bridge_transport_token_is_never_owner_identity():
     handler = bridge.Handler.__new__(bridge.Handler)
     handler.headers = {"X-CyberSentinel-Owner-Session": "transport-secret", "X-CyberSentinel-Token": "transport-secret"}

@@ -1,6 +1,6 @@
 # CyberSentinel M2E Architecture Map
 
-**Evidence baseline:** checkout `e3c75688584dece1cb71393a884a63dfbecb4613` on `task/m2e-cutover-20261002`. This describes the code present at that SHA; it does not claim a running production service or an out-of-band deployment.
+**Source-audit baseline:** checkout `e3c75688584dece1cb71393a884a63dfbecb4613` on `task/m2e-cutover-20261002`. This checkpoint also records the V2 queued-start/resume revalidation change on that branch; it does not claim a running production service or an out-of-band deployment.
 
 ## Runtime and request path
 
@@ -13,6 +13,7 @@ flowchart TD
     gates[Bridge token + live username/password Owner session\nfor mission HTTP routes]
     chat[api.chat.chat]
     core[AgentCore]
+    reauth[AgentCore.prepare_mission_for_queue]
     service[MissionService]
     runtime[MissionRuntime]
     queue[MissionQueue\nmission_queue.sqlite3]
@@ -27,7 +28,8 @@ flowchart TD
     gates -->|/api/chat create/resume| chat --> core --> runtime
     gates -->|/api/missions create/start/resume| service
     service -->|create| runtime
-    service -->|start/resume enqueue| queue
+    service -->|fresh Owner session| reauth -->|renewed proof and snapshot| service
+    service -->|revalidated start/resume| queue
     sched -->|dispatch_due enqueues| queue
     queue --> worker --> runtime
     runtime --> store
@@ -38,7 +40,7 @@ flowchart TD
 
 The diagram’s queued worker is an available code path, not an active service proven by this checkout. `bridge.py:82-87` constructs a `MissionRuntime`, `MissionQueue`, and `MissionScheduler`; it does not construct `MissionWorker`, call `run_once()`, or run `dispatch_due()`. The only server entrypoint calls `serve_forever()` (`bridge.py:416-426`).
 
-There are two materially different restart paths. The chat API’s `mission_id` path calls `AgentCore.resume_mission()` (`api/chat.py:90-108`); that authenticates the supplied Owner session against the mission request, renews the authorization snapshot and policy/context, persists revalidation, and then runs the runtime (`agent/agent_core.py:332-374`). By contrast, the HTTP `/api/missions/{id}/start` and `/resume` routes require the bridge token and a live Owner username/password session (`bridge.py:89-97,268-278`), but call `MissionService.start_mission()` / `resume_mission()`, which enqueue directly and do not pass that session through the AgentCore revalidation path (`api/missions.py:23-41`). No production worker is wired into bridge startup, so this is a concrete integration gap, not evidence that a background mission is currently executing. Whether background continuation may rely on a persisted authorization snapshot is not established by the source.
+The chat API’s `mission_id` path calls `AgentCore.resume_mission()` (`api/chat.py:90-108`), which authenticates the supplied Owner session against the mission request, renews the authorization snapshot and policy/context, persists revalidation, and then runs the runtime (`agent/agent_core.py:333-391`). V2 closes the corresponding request-time gap for HTTP queueing: `/api/missions/{id}/start` and `/resume` require the bridge token and a live username/password Owner session (`bridge.py:89-97,268-285`), pass its server-side session ID to `MissionService`, and invoke the same AgentCore authentication/snapshot-renewal path before enqueue (`api/missions.py:29-53,84-111`). The prepare-only method persists the renewed proof/context without running a mission slice (`agent/agent_core.py:378-385`). Missing, invalid, or unbound proof fails closed; `RECOVERY_REQUIRED` and other terminal missions are rejected before queueing. No production worker is wired into bridge startup, so this does not establish an active background service or resolve authority for unattended scheduler dispatch or worker restart.
 
 ## State, leases, effects, and recovery
 
@@ -56,18 +58,18 @@ The queue, mission, scheduler, and evidence stores are separate persistence boun
 
 ## Authorization and model/tool boundary
 
-Owner username/password sessions are server-side records with expiry and revocation (`security/owner_password.py:142-211`). Mission HTTP routes check both bridge authentication and a valid Owner session (`bridge.py:89-97,162-175,244-290`). The application has one canonical Owner account; the checked-in routes do not establish a multi-tenant mission-owner model. Structured-plan mission creation currently labels the owner as the literal `owner-password-session` and creates a snapshot through a route factory (`bridge.py:255-260,99-106`); this is not a proof that the individual current session was rebound to the queued execution.
+Owner username/password sessions are server-side records with expiry and revocation (`security/owner_password.py:142-211`). Mission HTTP routes check both bridge authentication and a valid Owner session (`bridge.py:89-97,162-175,244-290`). The application has one canonical Owner account; the checked-in routes do not establish a multi-tenant mission-owner model. Structured-plan mission creation still uses the literal `owner-password-session` identity reference and route snapshot factory (`bridge.py:259-260,99-106`), but V2 now rebinds queue start/resume to a fresh session proof and policy snapshot before enqueue. `MissionService.create_mission()` supplies a server-generated UUID request ID when one is absent, matching the existing chat path convention (`api/missions.py:29-32`; `api/chat.py:102-106`).
 
-`AuthorizationContext` requires typed, request-bound Owner evidence and a policy snapshot (`security/authorization_context.py:23-52`). `AuthorizationDecision` is HMAC-signed and binds tool, request ID, expiry, and argument fingerprint (`security/authorization_context.py:122-177`); `tools.registry.execute()` is the deterministic execution boundary. `MissionRuntime` checks authorization snapshots against mission/owner/target/version/action/tool and scope boundaries (`agent/mission_runtime.py:36-62`). These checks provide meaningful defense-in-depth, but are not a substitute for fresh Owner revalidation on every intended restart path.
+`AuthorizationContext` requires typed, request-bound Owner evidence and a policy snapshot (`security/authorization_context.py:23-52`). `AuthorizationDecision` is HMAC-signed and binds tool, request ID, expiry, and argument fingerprint (`security/authorization_context.py:122-177`); `tools.registry.execute()` is the deterministic execution boundary. `MissionRuntime` checks authorization snapshots against mission/owner/target/version/action/tool and scope boundaries (`agent/mission_runtime.py:36-62`). V2 uses fresh Owner revalidation for the synchronous chat resume and authenticated HTTP queue start/resume paths; scheduled dispatch and a worker process resuming independently still have no source-established live Owner authority model.
 
 The provider adapter currently normalizes malformed JSON tool arguments to `{}` and silently skips calls with non-string tool names (`agent/providers.py:62-86`). Native execution extracts only `arguments.query` and records success evidence without an execution-proof object or a durable link to the authorization decision and queue claim (`agent/mission_runtime.py:335-365`). Plan metadata is serialized, but the native model loop does not enforce proposal plan-version/step identity against the active step. There is no `ExecutionProof` type, verifier, or durable proof schema in this checkout; the trust model and required proof fields need an explicit design before adding one.
 
 ## CI and deployment boundary
 
-`.github/workflows/tests.yml:1-60` is Python test/compile/secret-scan CI. At the baseline HEAD, the isolated local run completed **718 passed, 1 skipped**, then `compileall` and `git diff --check` passed. `.github/workflows/github-only-poc.yml:1-105` is a manually dispatched, bounded Python job with an optional real-provider run and non-secret artifact; `docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md:69-92` explicitly describes it as a batch/POC, not a public backend.
+`.github/workflows/tests.yml:1-60` is Python test/compile/secret-scan CI. At the initial source baseline, the isolated local run completed **718 passed, 1 skipped**. The V2 working-tree run completed **723 passed, 1 skipped**, followed by `compileall` and `git diff --check`; exact-SHA CI for the V2 checkpoint is pending. `.github/workflows/github-only-poc.yml:1-105` is a manually dispatched, bounded Python job with an optional real-provider run and non-secret artifact; `docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md:69-92` explicitly describes it as a batch/POC, not a public backend.
 
-The repository inventory and source audit found no `wrangler.toml`, `wrangler.json/jsonc`, Cloudflare Worker module, Pages Functions tree, Workers Builds deployment workflow, or Cloudflare deployment command. The checked-out dependencies and workflows are Python-only. The recorded Cloudflare preview build `a4800e34-d7dd-45e6-94b2-1d73018617c2` for SHA `e3c75688584dece1cb71393a884a63dfbecb4613` failed at the Wrangler configuration check with `preview_url=null`; the failure remains a failed attempt, not a successful preview. The source audit did not independently query Cloudflare, so current out-of-band Worker/deployment state remains unknown. No Cloudflare configuration, settings, build/deployment API, or production operation was changed or invoked for this map.
+The repository inventory and source audit found no `wrangler.toml`, `wrangler.json/jsonc`, Cloudflare Worker module, Pages Functions tree, Workers Builds deployment workflow, or Cloudflare deployment command. The checked-out dependencies and workflows are Python-only. The Cloudflare preview build `a4800e34-d7dd-45e6-94b2-1d73018617c2` for SHA `e3c75688584dece1cb71393a884a63dfbecb4613` failed at the Wrangler configuration check with `preview_url=null`; that attempt remains failed. A push-triggered Cloudflare check for V1 SHA `0aa4f5de6a40285d1ec9ce247dee4d535ea87c44` also completed as `failure` (GitHub check `111087253066`, external build `78383d09-1a63-4449-84c9-767dd22d7b50`); its GitHub summary contains no preview URL or failure cause. This is not a successful preview. No Cloudflare configuration, settings, build/deployment API, or production operation was changed or manually invoked; current out-of-band Worker/deployment state remains unknown.
 
 ## Decisions that cannot be inferred safely
 
-The code does not choose whether the canonical runtime should remain the localhost Python bridge, move to Workers/Pages, or use another persistent backend. It also does not define a durable state migration, a worker ownership/restart model, whether stored Owner authorization may continue after a process restart, who may reconcile ambiguous external effects, whether execution proof is tamper-evident or adversary-resistant, or whether cross-store consistency must be atomic. Those choices remain `BLOCKED / OWNER DECISION REQUIRED`; this map does not invent platform, approval, credential, or deployment semantics.
+The code does not choose whether the canonical runtime should remain the localhost Python bridge, move to Workers/Pages, or use another persistent backend. It also does not define a durable state migration, an unattended worker/scheduler ownership model or its fresh Owner authority, who may reconcile ambiguous external effects, whether execution proof is tamper-evident or adversary-resistant, or whether cross-store consistency must be atomic. Those choices remain `BLOCKED / OWNER DECISION REQUIRED`; this map does not invent platform, approval, credential, or deployment semantics.
