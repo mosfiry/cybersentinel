@@ -67,3 +67,10 @@ Accordingly, **V14 records a verified non-production candidate, not production r
 ## Scope guard
 
 No production deployment, public bind, Cloudflare mutation, credential creation, production database access, or external target operation was performed as part of this verification.
+
+
+## V16 final rehearsal addendum (2026-10-03)
+
+This addendum supersedes no earlier phase snapshot. The exact-SHA V16 hosted run on `ecd970cbb287d154b0c0ef7635a4d0dffe0991de` passed the test job, Owner Charter audit, all twelve non-production rehearsal stages, and cleanup. The [tests/rehearsal run 37148693822](https://github.com/mosfiry/cybersentinel/actions/runs/37148693822) passed on test job `111277827221` and rehearsal job `111278099074`; the [Owner Charter audit run 37148693808](https://github.com/mosfiry/cybersentinel/actions/runs/37148693808) passed on job `111277827110`. Sanitized artifact [`11282529762`](https://github.com/mosfiry/cybersentinel/actions/runs/37148693822/artifacts/11282529762) reports all stages and cleanup `PASS`, with zero leftover containers, image tags, networks, or volumes and the temporary directory removed.
+
+The rehearsal confirms only the source-supported isolated single-host Compose lifecycle and local `watch` recovery path. It does not resolve production target/authority, unattended Owner delegation, all-store atomicity, or real-provider idempotency. The exact-SHA Workers Builds check `111277891236` failed for build `8d578524-4930-4f29-b46f-48c59c3f1257` without a diagnostic in the check summary. Accordingly, the candidate remains `NOT_READY`, the cutover remains `CUTOVER_BLOCKED`, and deployment remains `PRODUCTION_DEPLOYMENT_BLOCKED`; no production or Cloudflare mutation occurred. See [M3 Final Audit](M3_FINAL_AUDIT.md) and [M3 State](M3_STATE.md) for the complete evidence and final checkpoint SHA.

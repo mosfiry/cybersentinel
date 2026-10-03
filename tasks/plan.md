@@ -220,11 +220,11 @@ The rehearsal must exercise and retain evidence for all twelve required steps in
 
 **Checkpoint after Tasks 1–3 — PASSED:** exact-SHA CI at `909890e26670707acaf8d88f5586267d83859e8a` passed the full tests job, Owner Charter audit and all twelve non-production rehearsal stages plus cleanup. The stage artifact is `11282123873`; the separate Workers Builds failure does not change the isolated rehearsal result and continues to block production. Tasks 4–6 may now create the required evidence documents in order.
 
-**Task 4 — Architecture and runtime contracts (2 files):** create `docs/M3_ARCHITECTURE.md` and `docs/M3_RUNTIME_CONTRACT.md`, tied to actual source paths and verified deployment boundaries.
+**Task 4 — Architecture and runtime contracts (2 files; complete):** created `docs/M3_ARCHITECTURE.md` and `docs/M3_RUNTIME_CONTRACT.md`, tied to the inspected `AgentCore → MissionWorker → MissionRuntime` production call graph, actual source paths, persistent stores, and verified deployment boundaries.
 
-**Task 5 — Recovery, effect and process-failure records (3 files):** create `docs/M3_RECOVERY_MODEL.md`, `docs/M3_EXTERNAL_EFFECTS.md`, and `docs/M3_PROCESS_FAILURE_TESTS.md`, each linked to concrete implementation and tests.
+**Task 5 — Recovery, effect and process-failure records (3 files; complete):** created `docs/M3_RECOVERY_MODEL.md`, `docs/M3_EXTERNAL_EFFECTS.md`, and `docs/M3_PROCESS_FAILURE_TESTS.md`, linked to implementation/tests and explicit transaction/provider guarantees and limits.
 
-**Task 6 — Rehearsal and final audit (2 files):** create `docs/M3_CUTOVER_REHEARSAL.md` from exact-SHA stage evidence and `docs/M3_FINAL_AUDIT.md` with every M2E blocker mapped to M3 action, code evidence, test evidence and exactly one permitted status (`RESOLVED`, `PARTIALLY_RESOLVED`, `BLOCKED`, `NOT_APPLICABLE`, or `UNKNOWN`).
+**Task 6 — Rehearsal and final audit (2 files; complete):** created `docs/M3_CUTOVER_REHEARSAL.md` from exact-SHA artifact `11282529762` and `docs/M3_FINAL_AUDIT.md` with all five M2E blockers mapped to M3 action, code evidence, test evidence, and one permitted status per row. All five are `PARTIALLY_RESOLVED`; production remains blocked.
 
 **Task 7 — Phase closeout:** update `docs/M3_STATE.md` and `tasks/todo.md` with exact pushed SHA, run/check IDs, cleanup proof and remaining blockers; non-force push only to the existing M3 branch, then read back exact-SHA tests/audit/Workers checks. Never deploy production while V15 remains blocked.
 
