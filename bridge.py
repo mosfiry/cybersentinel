@@ -26,7 +26,7 @@ from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 from security.public_session import DEFAULT_PUBLIC_SESSIONS
 from api.missions import MissionService
-from agent.mission_worker import MissionQueue, MissionScheduler
+from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker
 from agent.mission_runtime import MissionRuntime
 from agent.mission import MissionStore
 from agent.agent_core import AgentCore
@@ -36,6 +36,17 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
+
+
+def build_mission_worker() -> MissionWorker:
+    """Construct the standalone worker over the bridge's existing durable stores."""
+    core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
+    queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"))
+
+    def runtime_factory() -> MissionRuntime:
+        return MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True)
+
+    return MissionWorker(queue, runtime_factory)
 
 
 class Handler(BaseHTTPRequestHandler):
