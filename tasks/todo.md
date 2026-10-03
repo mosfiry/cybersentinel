@@ -56,22 +56,30 @@
 
 ### Task 4: Whole-turn and cumulative-budget preflight
 
-- [ ] Apply Owner-configured cumulative `max_tool_calls` and exact-repeat signature budgets without inventing a lifetime cap below supported Owner settings; keep the provider's 10-calls-per-response and 32,000-character returned-text ceilings separate from the exact Owner-configured model-input budget (24K remains only the assembler compaction default).
+- [ ] Apply Owner-configured cumulative `max_tool_calls` and per-tool-name `max_same_tool_calls` across all argument values and turns (not per exact signature), preserving supported Owner increases; align AgentTaskRuntime's counter semantics.
+- [ ] Clamp `max_turns` to the Owner's `max_execution_steps`, count accepted turns from durable history across restarts, and block before another provider call at the limit.
+- [ ] Enforce one monotonic `max_execution_time_seconds` deadline per model-loop slice; check before/after provider calls and before dispatch, and pass remaining time into router/provider and tool execution.
 - [ ] Require exact, nonempty `mission_id`, `run_id`, `turn_id`, and `plan_version` on native proposals; derive `action_id` from mission/turn/call identity, bind request/step/auth/scope from trusted state, and reject supplied mismatches.
 - [ ] Enforce the actual assembled message count against the exact Owner limit with no hardcoded two-message minimum; prove one message is accepted when one is configured and the assembled request fits, and preserve the long-horizon run under an explicit supported 64K Owner input-context budget.
 - [ ] Bind nonempty provider/model/capability provenance to the configured router adapter; reject arbitrary or mismatched labels before durable turn recording.
 - [ ] Require supplied provider-facing tool definitions to equal the canonical registry schemas exactly; reject altered, duplicate, unknown, or extra-metadata definitions before calling the model.
 - [ ] Disable silent `CapabilityUnsupported` → `generate` fallback by default; permit only an explicit opt-in and persist the actual capability used.
-- [ ] Preflight every sibling before durable turn/proposal events, in-flight checkpoints, or effect-ledger reservations.
+- [ ] Preflight every sibling against remaining Owner step/tool/time/result budgets before durable turn/proposal events, in-flight checkpoints, or effect-ledger reservations; give parallel workers bounded deadlines and result allowances.
 - [ ] Prove a valid state-writing call paired with one malformed sibling causes no handler call, evidence append, checkpoint, or ledger event; retain per-call authorization denials for structurally valid proposals.
 
 ### Task 5: Bounded tool-result persistence
 
-- [ ] Bound per-result and total output persisted to MissionStore/provider context using existing result/output budgets.
-- [ ] Preserve deterministic digest/truncation provenance and the exact durable external-effect outcome.
-- [ ] Test oversized successful results and restart behavior to prove no ambiguous operation is replayed.
+- [ ] Enforce `max_result_chars` per serialized observation/result and `max_total_output_chars` across accepted model text plus tool results; recompute usage from persisted progress after restart.
+- [ ] Stream-measure/hash raw handler results, then persist only bounded output or a compact digest/length/truncation summary; reject/block before dispatch when a result record cannot fit at all.
+- [ ] If a completed side effect has oversized output, preserve the effect ledger's exact outcome, do not add success evidence based on truncated content, save the summary, and block later work as appropriate.
+- [ ] Test cumulative model text, oversized sequential/parallel results, storage bounds, and restart/no-replay behavior.
 
-### Task 6: V11 verification and checkpoint
+### Task 6: Parallel/time-budget enforcement
+
+- [ ] Prove parallel batches cannot exceed remaining call/step/time/output allowances; no worker starts after deadline or when its bounded result slot cannot be persisted.
+- [ ] Test slow/timed-out workers and step-boundary batches; ambiguous post-dispatch outcomes remain recovery-required and cannot be replayed.
+
+### Task 7: V11 verification and checkpoint
 
 - [ ] Run focused provider/tool adversarial tests, then the complete repository suite.
 - [ ] Run compileall, targeted py_compile, diff/secret/static bypass scans, protected-ref comparison, and independent read-only review.
