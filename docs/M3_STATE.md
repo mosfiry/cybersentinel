@@ -493,3 +493,10 @@ Workers Builds check `111281032067` failed for build `1ea5a8a4-d14b-4a3b-8651-18
 ### V16 state-file append-mode guard and recovery (2026-10-03)
 
 A subsequent state-ledger write call also omitted `append=true` and temporarily replaced the working `docs/M3_STATE.md` with only the new final-SHA section. The committed-prefix check caught this before staging or Git operations. The complete state file was restored from `HEAD` `5374a5b949f05adb63f56ffb365aff87b2fb2465`; SHA-256 equality with the committed blob was verified, then the new final-SHA entry and this recovery note were appended using explicit `append=true`. No committed history, remote ref, production/external state, or credential was altered.
+
+
+### V16 final-state checkpoint exact-SHA verification (2026-10-03)
+
+After the state-ledger push, exact final checkpoint `8eb2d00c6d140a64810f38c5bc31e26c64ab3cfd` was read back from `task/m3-production-runtime-20261003`. Test/rehearsal run [`37150080114`](https://github.com/mosfiry/cybersentinel/actions/runs/37150080114) passed: job `111281912202` reported **1,072 passed, 1 skipped**, and dedicated rehearsal job `111282200231` passed. Owner Charter audit run [`37150080093`](https://github.com/mosfiry/cybersentinel/actions/runs/37150080093), job `111281912317`, passed. Sanitized artifact [`11283661808`](https://github.com/mosfiry/cybersentinel/actions/runs/37150080114/artifacts/11283661808) was downloaded and verified: all twelve stages `PASS`, no credentials recorded, `PRODUCTION_DEPLOYMENT_BLOCKED`, and cleanup `PASS` with zero leftovers and temporary directory removed.
+
+The exact-SHA Workers Builds check `111281965139` failed for build `00cbe5d9-a870-4c85-9689-390831e3a366` without a diagnostic. Remote protected refs remained `main=8a3fd109c0e586db13ed48a7371ac9ad06465b74` and `task/m2d-cutover-20261002=9bf91ea37748a239e6a6e3b6327706fa614232cd`. The release decision remains `PARTIALLY_VERIFIED` / `CUTOVER_BLOCKED` / `PRODUCTION_DEPLOYMENT_BLOCKED`; no production or Cloudflare mutation occurred.

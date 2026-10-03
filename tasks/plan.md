@@ -226,7 +226,7 @@ The rehearsal must exercise and retain evidence for all twelve required steps in
 
 **Task 6 — Rehearsal and final audit (2 files; complete):** created `docs/M3_CUTOVER_REHEARSAL.md` and `docs/M3_FINAL_AUDIT.md` with all five M2E blockers mapped to M3 action, code evidence, test evidence, and one permitted status per row. The final exact-SHA artifact `11282434212` on `cba7de93dfc5ee1f7ae450ab28468a504657bd28` revalidated all twelve stages and cleanup. All five are `PARTIALLY_RESOLVED`; production remains blocked.
 
-**Task 7 — Phase closeout (complete):** `docs/M3_STATE.md`, `docs/M3_FINAL_AUDIT.md`, `docs/M3_CUTOVER_REHEARSAL.md`, `docs/M3_CUTOVER_CANDIDATE.md`, and `tasks/todo.md` record final branch head `5374a5b949f05adb63f56ffb365aff87b2fb2465`; exact test run `37149780259` (1,072 passed/1 skipped), audit run `37149780192`, rehearsal job `111281254002`, artifact `11283836005`, cleanup, Workers Builds failure `111281032067`, and remaining blockers. Pushes were fast-forward only to the existing M3 branch; main/M2D and production/Cloudflare remain untouched.
+**Task 7 — Phase closeout (complete):** `docs/M3_STATE.md`, `docs/M3_FINAL_AUDIT.md`, `docs/M3_CUTOVER_REHEARSAL.md`, `docs/M3_CUTOVER_CANDIDATE.md`, and `tasks/todo.md` record final verified branch head `8eb2d00c6d140a64810f38c5bc31e26c64ab3cfd`; exact test run `37150080114` (1,072 passed/1 skipped), audit run `37150080093`, rehearsal job `111282200231`, artifact `11283661808`, cleanup, Workers Builds failure `111281965139`, and remaining blockers. Pushes were fast-forward only to the existing M3 branch; main/M2D and production/Cloudflare remain untouched.
 
 ### V16 risk register
 
