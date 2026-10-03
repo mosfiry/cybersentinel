@@ -57,6 +57,11 @@
 ### Task 4: Whole-turn and cumulative-budget preflight
 
 - [ ] Apply Owner-configured cumulative `max_tool_calls` and exact-repeat signature budgets without inventing a lifetime cap below supported Owner settings; keep the provider's 10-calls-per-response ceiling and enforce the actual message payload against `min(Owner max_context_chars, 32,000)` (24K remains only the assembler default).
+- [ ] Require exact, nonempty `mission_id`, `run_id`, `turn_id`, and `plan_version` on native proposals; derive `action_id` from mission/turn/call identity, bind request/step/auth/scope from trusted state, and reject supplied mismatches.
+- [ ] Enforce the actual assembled message count against the exact Owner limit with no hardcoded two-message minimum; prove one message is accepted when one is configured and the assembled request fits.
+- [ ] Bind nonempty provider/model/capability provenance to the configured router adapter; reject arbitrary or mismatched labels before durable turn recording.
+- [ ] Require supplied provider-facing tool definitions to equal the canonical registry schemas exactly; reject altered, duplicate, unknown, or extra-metadata definitions before calling the model.
+- [ ] Disable silent `CapabilityUnsupported` → `generate` fallback by default; permit only an explicit opt-in and persist the actual capability used.
 - [ ] Preflight every sibling before durable turn/proposal events, in-flight checkpoints, or effect-ledger reservations.
 - [ ] Prove a valid state-writing call paired with one malformed sibling causes no handler call, evidence append, checkpoint, or ledger event; retain per-call authorization denials for structurally valid proposals.
 
