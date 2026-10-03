@@ -366,3 +366,43 @@ V3 validation is complete: focused suite `63 passed in 1.61s`; complete suite `7
 At 03:34:16 +02:00, existing V2 code-SHA Workers check `111090499896` (head `4e7a70ad986f0cf150a7a659e1646b1f3b97900b`, external build `947628a8-a733-4c4e-8660-707aee088686`) was still `in_progress`, `conclusion=null`, with no preview URL or result in its summary. The separate V2 docs-SHA check `111093936774` (head e926, build `5f7643af-2d11-496d-a00b-26e571bc926e`) is `completed / failure` without cause or preview URL. These results are distinct and external effect remains `UNKNOWN`; neither was relaunched or cancelled, and no Cloudflare API or production action was used.
 
 **Next exact action:** both local V3 commits (`c99f38c` code/docs and `2894c90` state closeout) are complete and remain unpushed over remote e926. Check `111090499896` was rechecked at 03:34:16 +02:00 and remains `in_progress`/`conclusion=null`. Do not push or retry it; use bounded read-only rechecks and keep the external effect `UNKNOWN`. Once the check is terminal and safe, non-force push only to M2E, verify exact-SHA GitHub `test`/`audit`, and separately record the new Workers result. V4 remains next after V3 exact-SHA CI is verified; never infer deployment.
+
+
+## Current checkpoint — V3 local checkpoint held; V4 atomicity decision blocked (2026-10-03 03:40 +02:00)
+
+At 03:39:10 +02:00, local M2E branch `task/m2e-cutover-20261002` was clean at `38f784e7f247906ffa2368332262a4c072ca11dd`, three local commits ahead of remote tip `e9265647cb469150ad813657be4bab3d9ba9550a`. The V3 implementation checkpoint is `c99f38cac247cb4e48a11ded046c29032664e270`; local state closeouts follow it. `main` remains `8a3fd109c0e586db13ed48a7371ac9ad06465b74` and M2D remains `9bf91ea37748a239e6a6e3b6327706fa614232cd`. No push occurred.
+
+The final bounded poll performed nine read-only GETs through 03:38:27 UTC (03:38:27 +02:00) and observed no terminal state. A fresh structured GitHub connector response at 03:39:09 +02:00 independently confirmed check `111090499896` is still `in_progress`, `conclusion=null`, for V2 code SHA `4e7a70ad986f0cf150a7a659e1646b1f3b97900b`, external build `947628a8-a733-4c4e-8660-707aee088686`; the summary has no preview URL or final build result. The separate docs-SHA check `111093936774` remains completed/failure without cause or preview URL. These must remain distinct. No check/build was relaunched or cancelled, no Cloudflare API or production action was used, and V3 remote push remains held to avoid overlap. External preview/deployment effect remains `UNKNOWN`.
+
+### Tool Failures & Recovery — bounded V3 status poll (2026-10-03)
+
+| Time / phase | Operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 03:35:23–03:38:27 +02:00; V3 checkpoint wait | The bounded read-only polling job completed normally after nine GET attempts; the rendered output concatenated status and null conclusion as `in_progressnull`, so that display alone was not used as a final conclusion. Classification: `READ_RESULT_FORMAT_AMBIGUITY`, not a build/CI failure. | GET-only observation; no external mutation. Target check `111090499896`, build `947628a8-a733-4c4e-8660-707aee088686`; no V3 push was attempted. | A structured independent GET at 03:39:09 returned `status=in_progress`, `conclusion=null`, and the expected V2 head/build ID. No build retry, cancellation, or Cloudflare call; keep V3 push held and preserve deployment effect as `UNKNOWN`. |
+
+### V4 source checkpoint — BLOCKED / OWNER DECISION REQUIRED
+
+Current source review confirms that V4 cannot safely choose a transaction/recovery contract from code alone. `bridge.py:83-87` constructs `MissionStore` on `missions.sqlite3`, `MissionQueue` on `mission_queue.sqlite3`, and `MissionScheduler` on `mission_scheduler.sqlite3`. `agent/mission.py:167-183` uses payload/integrity-hash compare-and-swap for mission writes but accepts no lease claim. `api/missions.py:48-53` saves a resumed mission and then enqueues it as separate operations; cancellation saves mission truth without cancelling the queue row (`:55-61`). `agent/mission_runtime.py:503-512, 521-562` persists an in-flight checkpoint, executes the effect, then persists observation/evidence separately from queue acknowledgement. `agent/mission_worker.py:447-463` likewise enqueues a due schedule before updating its separate scheduler database.
+
+The concrete unresolved choices are whether mission and queue truth should share one transactional SQLite database or remain separate with explicit reconciliation; what retry/effect contract applies (at-most-once, at-least-once with proven idempotency, or ambiguous-until-reconciled); and whether to authorize a claim-bound MissionStore/effect-intent redesign. No choice is inferred, no historical implementation was cherry-picked, and no V4 behavior change was made. Mark V4 `BLOCKED / OWNER DECISION REQUIRED`; do not ask the Owner or claim atomicity.
+
+**Next exact action:** continue safe, local-only V5 evidence-fencing source review and identify fixes/tests that do not decide V4 storage or external-effect policy. Keep all three M2E-local commits unpushed while check `111090499896` remains in progress. Recheck only that existing check on a bounded basis; after it is terminal and safe, push non-force only to M2E, verify exact-SHA GitHub `test`/`audit`, and record the resulting Workers check separately. Do not infer deployment. V4 remains blocked; V5 work must not be combined into the V3 checkpoint push.
+
+
+### Tool Failures & Recovery — V3/V4 citation validator false alarm (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 03:40:05 +02:00; V3/V4 state validation | A local documentation validator exited 1 after resolving three valid repository-relative citations from the repository root instead of accepting their unique tracked paths. Classification: `VALIDATOR_FAILURE` / false alarm; the validator ran, but its path-resolution assumption was wrong. | Local read-only validation only; no external effect. Active branch/HEAD remained `task/m2e-cutover-20261002` / `38f784e7f247906ffa2368332262a4c072ca11dd`; only the intentional `docs/M2E_STATE.md` update was dirty. | An independent `git ls-files` lookup confirmed `.github/workflows/tests.yml`, `.github/workflows/github-only-poc.yml`, and `docs/GITHUB_ONLY_DEPLOYMENT_ANALYSIS.md`; `git diff --check` passed and no other paths changed. Rerun only the local validator with unique tracked-suffix resolution, then record its result; no remote retry or mutation is relevant. |
+
+
+### Tool Failures & Recovery — citation-validator regex typo (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 03:40:36 +02:00; V3/V4 state validation | The corrected citation validator failed during Python `re.compile` with `missing ), unterminated subpattern`; its own citation checks did not run. Classification: `VALIDATOR_FAILURE` caused by a malformed local regex, not a repository or CI failure. | Validator-only local execution; no external effect. No repository content was changed by the failed validator. | Independent status at 03:40:45 confirmed the same M2E branch/HEAD/remote as before, only the intentional `docs/M2E_STATE.md` diff, and `git diff --check` passed. Correct the regex grouping and rerun local validation only; no remote operation or retry is involved. |
+
+
+#### Validator recovery result (2026-10-03 03:41 +02:00)
+
+The corrected read-only validation resolved unique tracked suffixes, fixed the local regex grouping, checked 43 source citations, verified the phase order and three four-column failure tables, found no control characters or secret-pattern matches, and passed `git diff --check`. Only the intended `docs/M2E_STATE.md` update is changed. Both validator incidents above are closed as local false alarms; no code or external state was affected.
