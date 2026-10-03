@@ -33,3 +33,9 @@ def make_test_snapshot(mission: Any, *, root: str = "/workspace/test") -> Missio
         created_at=now.isoformat(),
         expires_at=(now + timedelta(hours=1)).isoformat(),
     )
+
+
+def mission_model_tools(*names: str) -> list[dict[str, Any]]:
+    from tools.registry import model_tool_definitions
+
+    return model_tool_definitions(list(names))

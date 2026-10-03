@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, mission_model_tools
 """Round 2 P0-4 - deterministic failure -> recovery -> replan semantics.
 
 Exercises the real MissionRuntime with the real RecoveryPolicy. Invariants:
@@ -54,7 +54,6 @@ def _call(mission_id, run_id, turn_id, plan_version, n):
         turn_id=turn_id,
         plan_version=plan_version,
         step_id="observe",
-        action_id="a%d" % n,
         tool_call_id="call_%03d" % n,
     )
 
@@ -103,7 +102,7 @@ def _ambiguous_execution_runtime(tmp_path, monkeypatch, exception):
                 tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 1),),
             )
 
-    result = runtime.run_model_loop(mission.mission_id, OneShotModel(), tools=[{"name": "status"}], max_turns=5)
+    result = runtime.run_model_loop(mission.mission_id, OneShotModel(), tools=mission_model_tools("status"), max_turns=5)
     return runtime, mission, result, calls
 
 
@@ -148,7 +147,7 @@ def test_legacy_not_executed_boolean_cannot_authorize_retry(tmp_path, monkeypatc
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
             return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 2),))
 
-    resumed = runtime.run_model_loop(mission.mission_id, RetryModel(), tools=[{"name": "status"}], max_turns=5)
+    resumed = runtime.run_model_loop(mission.mission_id, RetryModel(), tools=mission_model_tools("status"), max_turns=5)
     assert executed == [], "recovery quarantine prevents a tool retry without authorized Owner reconciliation"
     assert resumed.status is MissionStatus.RECOVERY_REQUIRED
 
@@ -176,7 +175,7 @@ def test_legacy_executed_boolean_cannot_fabricate_evidence_or_resume(tmp_path, m
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
             return ModelTurn(turn_id, content="mission complete", finish_reason="stop")
 
-    finished = runtime.run_model_loop(mission.mission_id, FinalModel(), tools=[{"name": "status"}], max_turns=3)
+    finished = runtime.run_model_loop(mission.mission_id, FinalModel(), tools=mission_model_tools("status"), max_turns=3)
     assert execute_calls == [], "a reconciled side effect is never replayed"
     assert finished.status is MissionStatus.RECOVERY_REQUIRED
 
@@ -205,7 +204,7 @@ def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_pat
                 )
             return ModelTurn(turn_id, content="I could not gather evidence", finish_reason="stop")
 
-    result = runtime.run_model_loop(mission.mission_id, FailingThenFinalModel(), tools=[{"name": "status"}], max_turns=4)
+    result = runtime.run_model_loop(mission.mission_id, FailingThenFinalModel(), tools=mission_model_tools("status"), max_turns=4)
     assert result.observations and result.observations[0].get("ok") is False
     assert not any(item.get("criterion_id") == "goal" and item.get("passed") for item in result.evidence), "a failed tool result must never become verification evidence"
     assert result.status is MissionStatus.READY, "an unverifiable final claim must not complete the mission"
@@ -239,5 +238,8 @@ def test_unavailable_tool_is_rejected_at_authorization(tmp_path, monkeypatch):
 
     result = runtime.run_model_loop(mission.mission_id, UnknownToolModel(), tools=[], max_turns=1)
     assert calls == [], "an unknown tool must never reach execution"
-    assert result.progress["model_loop"]["tool_results"][0]["error"] == "unknown tool"
+    assert result.progress["model_loop"]["turns"] == []
+    assert result.progress["model_loop"]["tool_results"] == []
+    assert result.progress["model_failures"][-1]["kind"] == "INVALID_MODEL_RESPONSE"
+    assert not any(event["event"] in {"ModelTurn", "ToolProposed", "AuthorizationChecked"} for event in result.trajectory)
     assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, mission_model_tools
 """Round 2 P0-3 - real-provider long-horizon harness.
 
 HONESTY LABEL: UNVERIFIED - REAL PROVIDER UNAVAILABLE.
@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.context import RuntimeLimits
 from agent.model_protocol import RouterNativeModel
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
@@ -42,7 +43,12 @@ def test_real_provider_long_horizon(tmp_path):
     router = getattr(importlib.import_module(module_name), function_name)()
     assert callable(getattr(router, "tool_calling", None)), "router must expose tool_calling()"
 
-    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    runtime = MissionRuntime(
+        MissionStore(Path(tmp_path) / "missions.sqlite3"),
+        executor=lambda *_: {},
+        authorization_snapshot_factory=make_test_snapshot,
+        runtime_limits=RuntimeLimits(max_context_chars=64_000, max_tool_calls=30, max_same_tool_calls=30),
+    )
     plan = Plan.initial("live long-horizon audit").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="live"
     )
@@ -56,7 +62,7 @@ def test_real_provider_long_horizon(tmp_path):
     result = runtime.run_model_loop(
         mission.mission_id,
         RouterNativeModel(router),
-        tools=[{"name": "status"}],
+        tools=mission_model_tools("status"),
         max_turns=30,
     )
 

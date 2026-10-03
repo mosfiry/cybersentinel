@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, mission_model_tools
 """Round 2 P1 - deterministic goal verification.
 
 A MODEL CLAIM alone can never complete a mission. Completion requires
@@ -109,7 +109,7 @@ def test_completion_requires_passed_evidence_not_a_claim(tmp_path, monkeypatch):
                 )
             return ModelTurn(turn_id, content="goal achieved", finish_reason="stop")
 
-    result = runtime.run_model_loop(mission.mission_id, EvidenceThenFinalModel(), tools=[{"name": "status"}], max_turns=4)
+    result = runtime.run_model_loop(mission.mission_id, EvidenceThenFinalModel(), tools=mission_model_tools("status"), max_turns=4)
     assert result.status is MissionStatus.GOAL_COMPLETED
     assert result.verification_state.get("verified") is True
     events = [event["event"] for event in result.trajectory]
@@ -148,7 +148,7 @@ def test_turn_budget_exhaustion_is_an_honest_failure(tmp_path, monkeypatch):
                 ),
             )
 
-    result = runtime.run_model_loop(mission.mission_id, NeverConcludesModel(), tools=[{"name": "status"}], max_turns=3)
+    result = runtime.run_model_loop(mission.mission_id, NeverConcludesModel(), tools=mission_model_tools("status"), max_turns=3)
     assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED
     assert "budget exhausted" in result.error
     assert result.is_terminal

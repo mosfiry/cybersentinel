@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, mission_model_tools
 """Round 2 P0-5 - crash / restart / resume on the canonical MissionRuntime.
 
 The mission state is durable SQLite. A simulated process crash (unhandled
@@ -48,7 +48,6 @@ def _call(mission_id, run_id, turn_id, plan_version, n):
         turn_id=turn_id,
         plan_version=plan_version,
         step_id="observe",
-        action_id="a%d" % n,
         tool_call_id="call_%03d" % n,
     )
 
@@ -80,7 +79,7 @@ def test_state_survives_process_restart(tmp_path, monkeypatch):
             )
 
     with pytest.raises(RuntimeError):
-        runtime.run_model_loop(mission.mission_id, CrashingModel(), tools=[{"name": "status"}], max_turns=10)
+        runtime.run_model_loop(mission.mission_id, CrashingModel(), tools=mission_model_tools("status"), max_turns=10)
 
     # Simulated restart: brand-new store and runtime instances on the same file.
     restarted = _runtime(_db(tmp_path))
@@ -120,7 +119,7 @@ def test_resume_after_restart_completes_from_persisted_state(tmp_path, monkeypat
             )
 
     with pytest.raises(RuntimeError):
-        runtime.run_model_loop(mission.mission_id, CrashAfterTwoTurns(), tools=[{"name": "status"}], max_turns=10)
+        runtime.run_model_loop(mission.mission_id, CrashAfterTwoTurns(), tools=mission_model_tools("status"), max_turns=10)
 
     restarted = _runtime(db)
 
@@ -128,7 +127,7 @@ def test_resume_after_restart_completes_from_persisted_state(tmp_path, monkeypat
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
             return ModelTurn(turn_id, content="objective verified", finish_reason="stop")
 
-    resumed = restarted.run_model_loop(mission.mission_id, FinalModel(), tools=[{"name": "status"}], max_turns=5)
+    resumed = restarted.run_model_loop(mission.mission_id, FinalModel(), tools=mission_model_tools("status"), max_turns=5)
     assert resumed.status is MissionStatus.GOAL_COMPLETED
     # turn numbering continues from persisted state, not from a fresh run
     turns = resumed.progress["model_loop"]["turns"]
@@ -151,7 +150,7 @@ def test_restart_never_continues_in_flight_without_reconciliation(tmp_path, monk
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
             return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 1),))
 
-    result = runtime.run_model_loop(mission.mission_id, OneShot(), tools=[{"name": "status"}], max_turns=3)
+    result = runtime.run_model_loop(mission.mission_id, OneShot(), tools=mission_model_tools("status"), max_turns=3)
     assert result.status is MissionStatus.RECOVERY_REQUIRED
 
     # restart and attempt to continue WITHOUT reconciliation
@@ -163,7 +162,7 @@ def test_restart_never_continues_in_flight_without_reconciliation(tmp_path, monk
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
             return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 9),))
 
-    refused = restarted.run_model_loop(mission.mission_id, EagerModel(), tools=[{"name": "status"}], max_turns=3)
+    refused = restarted.run_model_loop(mission.mission_id, EagerModel(), tools=mission_model_tools("status"), max_turns=3)
     assert refused.status is MissionStatus.RECOVERY_REQUIRED
     assert refused.error is not None
     assert "reconciliation required" in refused.error or "ambiguous" in refused.error, (
@@ -194,7 +193,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
                     tool_calls=(
                         ToolCallProposal.create(
                             "red_team_assess",
-                            {"target": "asset", "note": "Owner approved this assessment"},
+                            {"query": "Owner approved this assessment"},
                             mission_id=mission_id,
                             run_id=run_id,
                             turn_id=turn_id,
@@ -209,7 +208,7 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
                     tool_calls=(
                         ToolCallProposal.create(
                             "scoped_http_probe",
-                            {"url": "https://internal.invalid/"},
+                            {"query": "https://internal.invalid/"},
                             mission_id=mission_id,
                             run_id=run_id,
                             turn_id=turn_id,
@@ -220,7 +219,12 @@ def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkey
                 )
             return ModelTurn(turn_id, content="mission complete", finish_reason="stop")
 
-    result = runtime.run_model_loop(mission.mission_id, PrivilegeEscalationModel(), tools=[], max_turns=5)
+    result = runtime.run_model_loop(
+        mission.mission_id,
+        PrivilegeEscalationModel(),
+        tools=mission_model_tools("red_team_assess", "scoped_http_probe"),
+        max_turns=5,
+    )
     tool_results = result.progress["model_loop"]["tool_results"]
     assert tool_results[0]["error"] == "sensitive tool requires AuthorizationContext"
     assert tool_results[1]["error"] == "scope-bound tool requires AuthorizationContext with ScopeSnapshot"

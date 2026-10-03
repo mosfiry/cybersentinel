@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, mission_model_tools
 """Round 2 P0-3 - long-horizon trajectory (MOCK-VERIFIED, 23 model turns).
 
 HONESTY LABEL: MOCK-VERIFIED. This harness drives the REAL MissionRuntime
@@ -18,6 +18,7 @@ final deterministic goal verification.
 
 from pathlib import Path
 
+from agent.context import RuntimeLimits
 from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
@@ -46,7 +47,6 @@ class LongHorizonModel:
                         turn_id=turn_id,
                         plan_version=plan_version,
                         step_id="observe",
-                        action_id="a%d" % self.turn_count,
                         tool_call_id="call_%03d" % self.turn_count,
                     ),
                 ),
@@ -85,7 +85,17 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
 
     monkeypatch.setattr(tools.registry, "execute", fixture)
 
-    runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    runtime = MissionRuntime(
+        MissionStore(Path(tmp_path) / "missions.sqlite3"),
+        executor=lambda *_: {},
+        authorization_snapshot_factory=make_test_snapshot,
+        runtime_limits=RuntimeLimits(
+            max_context_chars=64_000,
+            max_tool_calls=TOOL_TURNS,
+            max_execution_steps=TOOL_TURNS + 1,
+            max_same_tool_calls=TOOL_TURNS,
+        ),
+    )
     plan = Plan.initial("audit asset A across a long horizon").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
@@ -97,7 +107,7 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
     )
     model = LongHorizonModel()
 
-    result = runtime.run_model_loop(mission.mission_id, model, tools=[{"name": "status"}], max_turns=TOOL_TURNS + 5)
+    result = runtime.run_model_loop(mission.mission_id, model, tools=mission_model_tools("status"), max_turns=TOOL_TURNS + 5)
 
     # the loop really ran 20+ model turns
     assert model.turn_count == TOOL_TURNS + 1

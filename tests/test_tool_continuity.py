@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, mission_model_tools
 """Round 2 P1 - tool result continuity on the canonical model loop.
 
 Every tool result is bound to mission_id / run_id / turn_id / tool_call_id.
@@ -39,7 +39,6 @@ def _call(mission_id, run_id, turn_id, plan_version, n, tool_call_id=None):
         turn_id=turn_id,
         plan_version=plan_version,
         step_id="observe",
-        action_id="a%d" % n,
         tool_call_id=tool_call_id or ("call_%03d" % n),
     )
 
@@ -90,11 +89,12 @@ def test_duplicate_tool_call_id_is_rejected_prior_result_is_authoritative(tmp_pa
                 return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),))
             return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, self.count, "call_001"),))
 
-    result = runtime.run_model_loop(mission.mission_id, ReplayModel(), tools=[{"name": "status"}], max_turns=3)
+    result = runtime.run_model_loop(mission.mission_id, ReplayModel(), tools=mission_model_tools("status"), max_turns=3)
     assert len(executions) == 1, "a replayed tool_call_id must never execute twice"
     tool_results = result.progress["model_loop"]["tool_results"]
-    assert tool_results[1]["ok"] is False
-    assert tool_results[1]["error"] == "duplicate tool call rejected; prior result is authoritative"
+    assert len(tool_results) == 1
+    assert len(result.progress["model_loop"]["turns"]) == 1
+    assert result.progress["model_failures"][-1]["kind"] == "INVALID_MODEL_RESPONSE"
     assert result.progress["model_loop"]["seen_call_ids"] == ["call_001"]
 
 
@@ -123,9 +123,11 @@ def test_wrong_run_id_is_rejected_without_execution(tmp_path, monkeypatch):
                 ),
             )
 
-    result = runtime.run_model_loop(mission.mission_id, StaleRunModel(), tools=[], max_turns=1)
+    result = runtime.run_model_loop(mission.mission_id, StaleRunModel(), tools=mission_model_tools("status"), max_turns=1)
     assert executions == []
-    assert result.progress["model_loop"]["tool_results"][0]["error"] == "tool call belongs to another run"
+    assert result.progress["model_loop"]["turns"] == []
+    assert result.progress["model_loop"]["tool_results"] == []
+    assert result.progress["model_failures"][-1]["kind"] == "INVALID_MODEL_RESPONSE"
 
 
 def test_parallel_results_fold_deterministically(tmp_path, monkeypatch):
@@ -154,7 +156,7 @@ def test_parallel_results_fold_deterministically(tmp_path, monkeypatch):
                 )
             return ModelTurn(turn_id, content="parallel observations complete", finish_reason="stop")
 
-    result = runtime.run_model_loop(mission.mission_id, ParallelModel(), tools=[{"name": "status"}], max_turns=4)
+    result = runtime.run_model_loop(mission.mission_id, ParallelModel(), tools=mission_model_tools("status"), max_turns=4)
     tool_results = result.progress["model_loop"]["tool_results"]
     assert [item["tool_call_id"] for item in tool_results] == ["call_001", "call_002"], "parallel results must fold in proposal order"
     assert all(item["ok"] for item in tool_results)
@@ -188,16 +190,19 @@ def test_parallel_tool_exception_requires_reconciliation(tmp_path, monkeypatch):
                 ),
             )
 
-    result = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=2)
+    result = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=mission_model_tools("status"), max_turns=2)
     assert len(executions) == 2
     assert result.status.name == "RECOVERY_REQUIRED"
     assert result.checkpoint.get("status") == "in_flight_parallel"
     assert result.checkpoint.get("ambiguous_tool_call_ids") == ["call_002"]
     assert result.checkpoint.get("plan_version") == mission.plan.version
-    assert result.checkpoint.get("execution_ids") == ["a1", "a2"]
+    execution_ids = result.checkpoint.get("execution_ids")
+    assert len(execution_ids) == 2
+    assert len(set(execution_ids)) == 2
+    assert all(value.startswith("action_") and len(value) == 71 for value in execution_ids)
     assert result.checkpoint.get("task_ids") == ["observe", "observe"]
 
-    resumed_without_reconciliation = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=2)
+    resumed_without_reconciliation = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=mission_model_tools("status"), max_turns=2)
     assert len(executions) == 2, "restart must not replay any parallel side effect before reconciliation"
     assert resumed_without_reconciliation.status.name == "RECOVERY_REQUIRED"
 

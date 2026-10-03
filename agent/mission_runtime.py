@@ -6,24 +6,37 @@ from typing import Any, Callable
 import hashlib
 import inspect
 import json
+import time
 
 from .mission import Mission, MissionClaimBinding, MissionStatus, MissionStore
 from .execution_fence import ExecutionFence, ExecutionFenceError
+from .context import RuntimeLimits
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
 from .trajectory import EventType
 from .observation import Observation
 from .observation_intelligence import ObservationInterpreter, should_interpret_observation
 from .hypotheses import HypothesisEngine, HypothesisState
 from .strategy import StrategyState, decide as decide_strategy
-from .model_protocol import ConversationTurn, NativeModel, ToolCallResult, validate_model_turn
-from .provider_api import ProviderError
+from .model_protocol import ConversationTurn, NativeModel, RouterNativeModel, ToolCallResult, derive_action_id, validate_model_turn
+from .provider_api import InvalidModelResponse, MAX_PROVIDER_LABEL_CHARS, ProviderError
 from .model_intelligence.context import ContextAssembler
 from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
+
+MAX_TOOL_ERROR_CHARS = 128
+MAX_TOOL_ERROR_OUTPUT_CHARS = MAX_TOOL_ERROR_CHARS + 2
+
+
+class _MissionBudgetExceeded(RuntimeError):
+    def __init__(self, budget: str, limit: int) -> None:
+        super().__init__(budget)
+        self.budget = budget
+        self.limit = limit
+
 
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -35,6 +48,362 @@ class MissionRuntime:
         self.authorization_snapshot_factory = authorization_snapshot_factory
         self.execution_fence = execution_fence
         self.require_execution_fence = bool(require_execution_fence)
+        self.runtime_limits = runtime_limits if runtime_limits is not None else RuntimeLimits.from_owner_policy()
+        if not isinstance(self.runtime_limits, RuntimeLimits):
+            raise TypeError("MissionRuntime requires RuntimeLimits")
+
+    @staticmethod
+    def _limit_value(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    def _owner_execution_step_limit(self, mission: Mission) -> int:
+        current_limit = self._limit_value(self.runtime_limits.max_execution_steps)
+        if not isinstance(mission.provenance, dict):
+            raise _MissionBudgetExceeded("owner_execution_step_policy", 0)
+        snapshots = mission.provenance.get("owner_runtime_limits")
+        if snapshots is None:
+            snapshots = {}
+        if not isinstance(snapshots, dict):
+            raise _MissionBudgetExceeded("owner_execution_step_policy", 0)
+        if "max_execution_steps" not in snapshots:
+            saved_limit = current_limit
+        else:
+            saved_limit = snapshots["max_execution_steps"]
+            if isinstance(saved_limit, bool) or not isinstance(saved_limit, int) or saved_limit < 0:
+                raise _MissionBudgetExceeded("owner_execution_step_policy", 0)
+        effective_limit = min(saved_limit, current_limit)
+        if snapshots.get("max_execution_steps") != effective_limit:
+            snapshots = dict(snapshots)
+            snapshots["max_execution_steps"] = effective_limit
+            mission.provenance["owner_runtime_limits"] = snapshots
+            self._save(mission)
+        return effective_limit
+
+    def _context_limits(self) -> tuple[int, int]:
+        # This is the model-input budget. MAX_PROVIDER_TEXT_CHARS separately
+        # limits model-returned text and must not be applied to the request.
+        # The assembler's default is only a compaction target.
+        max_chars = self._limit_value(self.runtime_limits.max_context_chars)
+        max_messages = self._limit_value(self.runtime_limits.max_context_messages)
+        return max_chars, max_messages
+
+    @staticmethod
+    def _tool_output_payload(value: dict[str, Any]) -> dict[str, Any]:
+        # These fields are attached by MissionRuntime, not returned by the tool.
+        runtime_fields = {"type", "action_id", "step_id", "mission_id", "tool_call_id"}
+        return {key: item for key, item in value.items() if key not in runtime_fields}
+
+    @classmethod
+    def _output_usage(cls, progress: dict[str, Any], max_chars: int) -> tuple[int, bool]:
+        from tools.registry import canonical_json_stats
+
+        turns = progress.get("turns")
+        tool_results = progress.get("tool_results")
+        if not isinstance(turns, list) or not isinstance(tool_results, list):
+            raise InvalidModelResponse("mission output history is malformed")
+        used = 0
+        for turn in turns:
+            if not isinstance(turn, dict) or not isinstance(turn.get("content", ""), str):
+                raise InvalidModelResponse("mission model output history is malformed")
+            content_chars = len(turn.get("content", ""))
+            if content_chars > max_chars - used:
+                return max_chars, True
+            used += content_chars
+            calls = turn.get("tool_calls", [])
+            if not isinstance(calls, list):
+                raise InvalidModelResponse("mission model tool-output history is malformed")
+            if calls:
+                call_payloads = []
+                for call in calls:
+                    if not isinstance(call, dict) or not isinstance(call.get("name"), str) or not isinstance(call.get("arguments"), dict):
+                        raise InvalidModelResponse("mission model tool-output history is malformed")
+                    call_payloads.append({"name": call["name"], "arguments": call["arguments"]})
+                size, _digest, truncated = canonical_json_stats(call_payloads, max_chars=max_chars - used)
+                if truncated:
+                    return max_chars, True
+                used += size
+        for item in tool_results:
+            if not isinstance(item, dict) or not isinstance(item.get("result", {}), dict):
+                raise InvalidModelResponse("mission tool output history is malformed")
+            error = item.get("error", "")
+            if not isinstance(error, str):
+                raise InvalidModelResponse("mission tool error history is malformed")
+            payload = cls._tool_output_payload(item.get("result", {}))
+            size, _digest, truncated = canonical_json_stats(payload, max_chars=max_chars - used)
+            if truncated:
+                return max_chars, True
+            used += size
+            error_size, _error_digest, error_truncated = canonical_json_stats(error, max_chars=max_chars - used)
+            if error_truncated:
+                return max_chars, True
+            used += error_size
+        return used, False
+
+    def _remaining_output_chars(self, progress: dict[str, Any]) -> int:
+        limit = self._limit_value(self.runtime_limits.max_total_output_chars)
+        if limit < 1:
+            raise _MissionBudgetExceeded("max_total_output_chars", limit)
+        try:
+            used, exceeded = self._output_usage(progress, limit)
+        except InvalidModelResponse:
+            raise _MissionBudgetExceeded("model_loop_state", 0) from None
+        if exceeded:
+            raise _MissionBudgetExceeded("max_total_output_chars", limit)
+        return limit - used
+
+    def _allocate_result_caps(self, count: int, remaining_chars: int) -> list[int]:
+        if count == 0:
+            return []
+        total_limit = self._limit_value(self.runtime_limits.max_total_output_chars)
+        result_limit = self._limit_value(self.runtime_limits.max_result_chars)
+        if result_limit < 128:
+            raise _MissionBudgetExceeded("max_result_chars", result_limit)
+        reservation_per_call = 128 + MAX_TOOL_ERROR_OUTPUT_CHARS
+        if remaining_chars < count * reservation_per_call:
+            raise _MissionBudgetExceeded("max_total_output_chars", total_limit)
+        caps: list[int] = []
+        result_remaining = remaining_chars - count * MAX_TOOL_ERROR_OUTPUT_CHARS
+        for index in range(count):
+            cap = min(result_limit, result_remaining - 128 * (count - index - 1))
+            if cap < 128:
+                raise _MissionBudgetExceeded("max_total_output_chars", total_limit)
+            caps.append(cap)
+            result_remaining -= cap
+        return caps
+
+    @staticmethod
+    def _bounded_tool_error(value: Any) -> str:
+        if not isinstance(value, str):
+            return "invalid tool error"
+        safe_value = "".join(character if character.isprintable() and character not in {'"', "\\"} else " " for character in value)
+        if len(safe_value) <= MAX_TOOL_ERROR_CHARS:
+            return safe_value
+        suffix = "...[truncated]"
+        return safe_value[: MAX_TOOL_ERROR_CHARS - len(suffix)] + suffix
+
+    @staticmethod
+    def _remaining_seconds(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    @staticmethod
+    def _complete_with_timeout(model: Any, messages: Any, tools: Any, *, mission_id: str, run_id: str, turn_id: str, plan_version: int, timeout_seconds: float) -> Any:
+        complete = model.complete
+        kwargs = {
+            "mission_id": mission_id,
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "plan_version": plan_version,
+        }
+        try:
+            parameters = inspect.signature(complete).parameters.values()
+            if any(parameter.name == "timeout_seconds" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+                kwargs["timeout_seconds"] = timeout_seconds
+        except (TypeError, ValueError):
+            pass
+        return complete(messages, tools, **kwargs)
+
+    @staticmethod
+    def _canonical_model_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str]]:
+        from tools.registry import model_tool_definitions
+
+        if not isinstance(tools, (list, tuple)):
+            raise InvalidModelResponse("model tool definitions must be a list")
+        canonical = model_tool_definitions()
+        by_name = {item["function"]["name"]: item for item in canonical}
+        normalized: list[dict[str, Any]] = []
+        names: set[str] = set()
+        for definition in tools:
+            if not isinstance(definition, dict) or not isinstance(definition.get("function"), dict):
+                raise InvalidModelResponse("model tool definition is malformed")
+            name = definition["function"].get("name")
+            expected = by_name.get(name) if isinstance(name, str) else None
+            if expected is None or name in names or definition != expected:
+                raise InvalidModelResponse("model tool definition does not match the canonical registry")
+            names.add(name)
+            normalized.append(model_tool_definitions([name])[0])
+        return normalized, names
+
+    @staticmethod
+    def _bind_model_provenance(model: Any, turn: Any) -> Any:
+        if isinstance(model, RouterNativeModel):
+            instance_attributes = getattr(model, "__dict__", {})
+            if type(model).complete is not RouterNativeModel.complete or "complete" in instance_attributes:
+                raise InvalidModelResponse("router adapter subclass overrides trusted completion")
+            trusted = (
+                model.trusted_provider,
+                model.trusted_model,
+                model.trusted_capability,
+            )
+            if any(not isinstance(value, str) or not value.strip() for value in trusted):
+                raise InvalidModelResponse("router adapter has incomplete trusted provenance")
+            provider, model_name, capability = trusted
+        else:
+            provider = "native"
+            model_name = f"{type(model).__module__}.{type(model).__qualname__}"
+            if len(model_name) > MAX_PROVIDER_LABEL_CHARS:
+                model_name = type(model).__qualname__[:MAX_PROVIDER_LABEL_CHARS]
+            capability = "native"
+
+        if (
+            not isinstance(provider, str)
+            or not provider.strip()
+            or provider == "unknown"
+            or len(provider) > MAX_PROVIDER_LABEL_CHARS
+            or not isinstance(model_name, str)
+            or not model_name.strip()
+            or model_name == "unknown"
+            or len(model_name) > MAX_PROVIDER_LABEL_CHARS
+            or capability not in {"native", "tool_calling", "generate"}
+        ):
+            raise InvalidModelResponse("model adapter provenance is invalid")
+        if turn.provider and turn.provider != provider:
+            raise InvalidModelResponse("model returned mismatched provider provenance")
+        if turn.model and turn.model != model_name:
+            raise InvalidModelResponse("model returned mismatched model provenance")
+        if turn.capability and turn.capability != capability:
+            raise InvalidModelResponse("model returned mismatched capability provenance")
+        if capability == "generate" and turn.tool_calls:
+            raise InvalidModelResponse("generate-only fallback cannot dispatch tool calls")
+        return replace(turn, provider=provider, model=model_name, capability=capability)
+
+    @staticmethod
+    def _history_for_preflight(progress: dict[str, Any]) -> tuple[set[str], set[str], dict[str, int], int]:
+        turns = progress.get("turns", [])
+        seen_ids = progress.get("seen_call_ids", [])
+        if not isinstance(turns, list) or not isinstance(seen_ids, list):
+            raise InvalidModelResponse("mission model-loop history is malformed")
+        if any(not isinstance(item, str) or not item for item in seen_ids) or len(set(seen_ids)) != len(seen_ids):
+            raise InvalidModelResponse("mission model-loop identity history is malformed")
+        call_ids: set[str] = set()
+        action_ids: set[str] = set()
+        tool_counts: dict[str, int] = {}
+        history_count = 0
+        for turn_record in turns:
+            if not isinstance(turn_record, dict):
+                raise InvalidModelResponse("mission model-loop turn history is malformed")
+            calls = turn_record.get("tool_calls", [])
+            if not isinstance(calls, list):
+                raise InvalidModelResponse("mission model-loop proposal history is malformed")
+            for call in calls:
+                if not isinstance(call, dict):
+                    raise InvalidModelResponse("mission model-loop proposal history is malformed")
+                call_id = call.get("tool_call_id")
+                name = call.get("name")
+                arguments = call.get("arguments")
+                action_id = call.get("action_id")
+                if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not isinstance(arguments, dict):
+                    raise InvalidModelResponse("mission model-loop proposal history is malformed")
+                if call_id in call_ids:
+                    raise InvalidModelResponse("mission model-loop history contains duplicate call identities")
+                call_ids.add(call_id)
+                if isinstance(action_id, str) and action_id:
+                    if action_id in action_ids:
+                        raise InvalidModelResponse("mission model-loop history contains duplicate action identities")
+                    action_ids.add(action_id)
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+                history_count += 1
+        if len(seen_ids) != history_count or set(seen_ids) != call_ids:
+            raise InvalidModelResponse("mission model-loop call history is incomplete")
+        return call_ids, action_ids, tool_counts, history_count
+
+    def _preflight_model_turn(
+        self,
+        mission: Mission,
+        turn: Any,
+        *,
+        expected_turn_id: str,
+        run_id: str,
+        current_step: Any,
+        allowed_tool_names: set[str],
+        auth_context: Any,
+        progress: dict[str, Any],
+    ) -> Any:
+        if turn.turn_id != expected_turn_id:
+            raise InvalidModelResponse("model returned a stale turn identity")
+        output_remaining = self._remaining_output_chars(progress)
+        if len(turn.content) > output_remaining:
+            raise _MissionBudgetExceeded("max_total_output_chars", self._limit_value(self.runtime_limits.max_total_output_chars))
+        output_remaining -= len(turn.content)
+        if not turn.tool_calls:
+            return turn
+
+        from tools.registry import canonical_json_stats, get_tool
+
+        historical_ids, action_ids, tool_counts, prior_call_count = self._history_for_preflight(progress)
+        context_id = str(getattr(auth_context, "owner_evidence_fingerprint", "") or "") if auth_context is not None else ""
+        scope_id = str(getattr(getattr(auth_context, "scope_snapshot", None), "snapshot_id", "") or "") if auth_context is not None else ""
+        expected_step_id = str(getattr(current_step, "step_id", "") or "")
+        current_ids: set[str] = set()
+        current_actions: set[str] = set()
+        normalized: list[Any] = []
+
+        for proposal in turn.tool_calls:
+            # These four fields are explicit inputs to NativeModel.complete;
+            # missing values are not wildcards and must never be rebound.
+            if proposal.mission_id != mission.mission_id:
+                raise InvalidModelResponse("model proposed a cross-mission tool call")
+            if proposal.run_id != run_id:
+                raise InvalidModelResponse("model proposed a stale run identity")
+            if proposal.plan_version != mission.plan.version:
+                raise InvalidModelResponse("model proposed a stale plan identity")
+            # These identifiers are runtime-owned, not NativeModel inputs. Empty
+            # fields are filled from authoritative state; supplied stale values
+            # are rejected by the checks below.
+            if proposal.request_id and proposal.request_id != mission.request_id:
+                raise InvalidModelResponse("model proposed a stale request identity")
+            if proposal.step_id and proposal.step_id != expected_step_id:
+                raise InvalidModelResponse("model proposed a stale plan step")
+            if proposal.authorization_context_id and proposal.authorization_context_id != context_id:
+                raise InvalidModelResponse("model proposed a stale authorization identity")
+            if proposal.scope_snapshot_id and proposal.scope_snapshot_id != scope_id:
+                raise InvalidModelResponse("model proposed a stale scope identity")
+            if proposal.tool_call_id in historical_ids or proposal.tool_call_id in current_ids:
+                raise InvalidModelResponse("model proposed a duplicate tool-call identity")
+            if proposal.name not in allowed_tool_names:
+                raise InvalidModelResponse("model requested a tool not declared for this turn")
+            spec = get_tool(proposal.name)
+            if spec is None:
+                raise InvalidModelResponse("model requested an unknown tool")
+            valid, _reason, _argument = spec.validate_input(proposal.arguments)
+            if not valid:
+                raise InvalidModelResponse("model proposed arguments rejected by the registered schema")
+
+            expected_action_id = derive_action_id(mission.mission_id, expected_turn_id, proposal.tool_call_id)
+            if proposal.action_id and proposal.action_id != expected_action_id:
+                raise InvalidModelResponse("model proposed an invalid action identity")
+            action_id = expected_action_id
+            if action_id in action_ids or action_id in current_actions:
+                raise InvalidModelResponse("model proposed a duplicate action identity")
+            tool_counts[proposal.name] = tool_counts.get(proposal.name, 0) + 1
+            current_ids.add(proposal.tool_call_id)
+            current_actions.add(action_id)
+            normalized.append(replace(
+                proposal,
+                mission_id=mission.mission_id,
+                run_id=run_id,
+                request_id=mission.request_id,
+                plan_version=mission.plan.version,
+                step_id=proposal.step_id or expected_step_id,
+                action_id=action_id,
+                authorization_context_id=context_id,
+                scope_snapshot_id=scope_id,
+            ))
+
+        max_tool_calls = self._limit_value(self.runtime_limits.max_tool_calls)
+        if prior_call_count + len(normalized) > max_tool_calls:
+            raise _MissionBudgetExceeded("max_tool_calls", max_tool_calls)
+        max_same_tool_calls = self._limit_value(self.runtime_limits.max_same_tool_calls)
+        if any(count > max_same_tool_calls for count in tool_counts.values()):
+            raise _MissionBudgetExceeded("max_same_tool_calls", max_same_tool_calls)
+        call_payloads = [{"name": item.name, "arguments": item.arguments} for item in normalized]
+        call_output_chars, _call_output_sha256, truncated = canonical_json_stats(call_payloads, max_chars=output_remaining)
+        if truncated:
+            raise _MissionBudgetExceeded("max_total_output_chars", self._limit_value(self.runtime_limits.max_total_output_chars))
+        output_remaining -= call_output_chars
+        self._allocate_result_caps(len(normalized), output_remaining)
+        return replace(turn, tool_calls=tuple(normalized))
 
     def set_execution_fence(self, execution_fence: ExecutionFence) -> None:
         if not isinstance(execution_fence, ExecutionFence) or execution_fence.lease_epoch is None:
@@ -145,6 +514,9 @@ class MissionRuntime:
                 mission.authorization_snapshot = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
         if mission.authorization_snapshot:
             mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot.get("version", 1))
+        mission.provenance["owner_runtime_limits"] = {
+            "max_execution_steps": self._limit_value(self.runtime_limits.max_execution_steps),
+        }
         mission.transition(MissionStatus.READY, "plan persisted")
         return self.store.save(mission)
 
@@ -270,9 +642,21 @@ class MissionRuntime:
         mission: Mission,
         execution_fence: ExecutionFence | None,
         execution_id: str,
+        *,
+        timeout_seconds: float | None = None,
+        max_result_chars: int | None = None,
     ) -> Any:
         """Dispatch native-model tools with the same strict workspace/evidence boundary."""
-        from tools.registry import execute as execute_tool
+        from tools.registry import TOOL_TIMEOUTS, execute as execute_tool, get_tool
+
+        spec = get_tool(name)
+        if spec is None:
+            raise ValueError("unknown tool")
+        timeout = None
+        if timeout_seconds is not None:
+            if timeout_seconds <= 0:
+                raise _MissionBudgetExceeded("max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
+            timeout = min(timeout_seconds, TOOL_TIMEOUTS.get(name, spec.timeout))
 
         workspace = None
         evidence_store = None
@@ -323,7 +707,27 @@ class MissionRuntime:
             target_identity=target_identity,
             execution_fence=execution_fence,
             execution_id=execution_id,
+            timeout=timeout,
+            max_result_chars=max_result_chars,
         )
+
+    def _block_on_budget(self, mission: Mission, budget: str, limit: int) -> Mission:
+        mission.error = f"mission runtime budget exceeded: {budget}"
+        failure = {
+            "class": FailureClass.RESOURCE.value,
+            "reason": mission.error,
+            "budget": budget,
+            "limit": limit,
+        }
+        mission.failures.append(failure)
+        mission.emit(EventType.FAILURE_DETECTED, data=failure)
+        mission.emit(EventType.FAILURE_DIAGNOSED, data={
+            "class": FailureClass.RESOURCE.value,
+            "budget": budget,
+            "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
+        })
+        mission.transition(MissionStatus.RESOURCE_BLOCKED, mission.error)
+        return self._save(mission)
 
     def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20, heartbeat: Callable[[], None] | None = None) -> Mission:
         """Run a real model/tool/observation loop for a durable mission."""
@@ -337,10 +741,38 @@ class MissionRuntime:
             mission.error = "in-flight native tool outcome is unknown; reconciliation required"
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
             return self._save(mission)
+        model_tools, allowed_tool_names = self._canonical_model_tools(tools)
         run_id = run_id or str(mission.progress.get("model_run_id") or hashlib.sha256((mission.mission_id + mission.request_id).encode()).hexdigest()[:20])
         mission.progress["model_run_id"] = run_id
         progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
-        seen = set(str(item) for item in progress.setdefault("seen_call_ids", []))
+        progress.setdefault("turns", [])
+        progress.setdefault("tool_results", [])
+        progress.setdefault("seen_call_ids", [])
+        if (
+            not isinstance(progress["turns"], list)
+            or not isinstance(progress["tool_results"], list)
+            or not isinstance(progress["seen_call_ids"], list)
+            or any(not isinstance(item, str) or not item for item in progress["seen_call_ids"])
+            or len(set(progress["seen_call_ids"])) != len(progress["seen_call_ids"])
+        ):
+            return self._block_on_budget(mission, "model_loop_state", 0)
+        try:
+            max_execution_steps = self._owner_execution_step_limit(mission)
+        except _MissionBudgetExceeded as exc:
+            return self._block_on_budget(mission, exc.budget, exc.limit)
+        if max_execution_steps < 1 or len(progress["turns"]) >= max_execution_steps:
+            return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
+        if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 0:
+            return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
+        turn_budget = min(max_turns, max_execution_steps - len(progress["turns"]))
+        seen = set(progress["seen_call_ids"])
+        context_char_limit, context_message_limit = self._context_limits()
+        if context_char_limit < 1:
+            return self._block_on_budget(mission, "max_context_chars", context_char_limit)
+        execution_time_limit = self._limit_value(self.runtime_limits.max_execution_time_seconds)
+        if execution_time_limit < 1:
+            return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
+        deadline = time.monotonic() + execution_time_limit
         auth_context = None
         if mission.authorization_context:
             try:
@@ -348,12 +780,31 @@ class MissionRuntime:
             except (KeyError, TypeError, ValueError, PermissionError):
                 auth_context = None
 
-        for _ in range(max_turns):
+        for _ in range(turn_budget):
+            if len(progress["turns"]) >= max_execution_steps:
+                return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
+            remaining_seconds = self._remaining_seconds(deadline)
+            if remaining_seconds <= 0:
+                return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
+            try:
+                if self._remaining_output_chars(progress) <= 0:
+                    return self._block_on_budget(mission, "max_total_output_chars", self._limit_value(self.runtime_limits.max_total_output_chars))
+            except _MissionBudgetExceeded as exc:
+                return self._block_on_budget(mission, exc.budget, exc.limit)
             if heartbeat is not None:
                 heartbeat()
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
             current_step = mission.current_plan_step
-            assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools)
+            assembled = ContextAssembler().build(
+                mission,
+                tool_results=progress.get("tool_results", ()),
+                tools=model_tools,
+                max_chars=context_char_limit,
+            )
+            if assembled.context_chars > context_char_limit:
+                return self._block_on_budget(mission, "max_context_chars", context_char_limit)
+            if len(assembled.messages) > context_message_limit:
+                return self._block_on_budget(mission, "max_context_messages", context_message_limit)
             progress["last_context_hash"] = assembled.context_hash
             progress["context_compaction"] = {
                 "compacted": assembled.compacted,
@@ -367,7 +818,36 @@ class MissionRuntime:
             }
             messages = assembled.messages
             try:
-                turn = validate_model_turn(model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version))
+                remaining_seconds = self._remaining_seconds(deadline)
+                if remaining_seconds <= 0:
+                    raise _MissionBudgetExceeded("max_execution_time_seconds", execution_time_limit)
+                response = self._complete_with_timeout(
+                    model,
+                    messages,
+                    model_tools,
+                    mission_id=mission.mission_id,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    plan_version=mission.plan.version,
+                    timeout_seconds=remaining_seconds,
+                )
+                if self._remaining_seconds(deadline) <= 0:
+                    raise _MissionBudgetExceeded("max_execution_time_seconds", execution_time_limit)
+                turn = self._bind_model_provenance(model, validate_model_turn(response))
+                turn = self._preflight_model_turn(
+                    mission,
+                    turn,
+                    expected_turn_id=turn_id,
+                    run_id=run_id,
+                    current_step=current_step,
+                    allowed_tool_names=allowed_tool_names,
+                    auth_context=auth_context,
+                    progress=progress,
+                )
+                output_remaining = self._remaining_output_chars(progress) - len(turn.content)
+                result_caps = self._allocate_result_caps(len(turn.tool_calls), output_remaining)
+            except _MissionBudgetExceeded as exc:
+                return self._block_on_budget(mission, exc.budget, exc.limit)
             except ProviderError as exc:
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")
                 attempts = [
@@ -402,22 +882,13 @@ class MissionRuntime:
                 if mission.is_terminal:
                     return mission
                 continue
-            if auth_context is not None and turn.tool_calls:
-                from dataclasses import replace as replace_dataclass
-                turn = replace_dataclass(turn, tool_calls=tuple(
-                    replace_dataclass(
-                        proposal,
-                        request_id=mission.request_id,
-                        authorization_context_id=auth_context.owner_evidence_fingerprint,
-                        scope_snapshot_id=auth_context.scope_snapshot.snapshot_id if auth_context.scope_snapshot else "",
-                    )
-                    for proposal in turn.tool_calls
-                ))
             progress["turns"].append(turn.to_dict())
             mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
             if not turn.tool_calls:
                 progress["last_model_content"] = turn.content
                 progress["last_model_finish_reason"] = turn.finish_reason
+                if self._remaining_seconds(deadline) <= 0:
+                    return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
                 verification = self.verifier(mission)
                 mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
                 if verification.verified:
@@ -429,89 +900,121 @@ class MissionRuntime:
                     mission.transition(MissionStatus.READY, mission.error)
                 return self._save(mission)
             if len(turn.tool_calls) > 1:
-                self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, current_step=current_step, progress=progress, seen=seen)
+                self._run_parallel_model_calls(
+                    mission,
+                    turn.tool_calls,
+                    auth_context=auth_context,
+                    run_id=run_id,
+                    current_step=current_step,
+                    progress=progress,
+                    seen=seen,
+                    deadline=deadline,
+                    result_caps={proposal.tool_call_id: cap for proposal, cap in zip(turn.tool_calls, result_caps)},
+                )
                 self._save(mission)
                 if mission.is_terminal:
                     return mission
                 continue
-            for proposal in turn.tool_calls:
-                if proposal.mission_id and proposal.mission_id != mission.mission_id:
-                    result = ToolCallResult(proposal, False, error="tool call belongs to another mission")
-                elif proposal.run_id and proposal.run_id != run_id:
-                    result = ToolCallResult(proposal, False, error="tool call belongs to another run")
-                elif proposal.tool_call_id in seen:
-                    result = ToolCallResult(proposal, False, error="duplicate tool call rejected; prior result is authoritative")
+            for index, proposal in enumerate(turn.tool_calls):
+                seen.add(proposal.tool_call_id)
+                progress["seen_call_ids"].append(proposal.tool_call_id)
+                argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
+                decision = authorize_tool([proposal.name, argument], context=auth_context)
+                mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+                mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
+                if not decision.allowed:
+                    result = ToolCallResult(proposal, False, error=self._bounded_tool_error(decision.reason))
                 else:
-                    seen.add(proposal.tool_call_id)
-                    progress["seen_call_ids"].append(proposal.tool_call_id)
-                    argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
-                    decision = authorize_tool([proposal.name, argument], context=auth_context)
-                    mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
-                    mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
-                    if not decision.allowed:
-                        result = ToolCallResult(proposal, False, error=decision.reason)
-                    else:
-                        try:
-                            task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
-                            execution_id = proposal.action_id or proposal.tool_call_id
-                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": execution_id, "step_id": task_id, "run_id": run_id, "plan_version": mission.plan.version}
-                            dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
-                            if dispatch_fence is not None:
-                                dispatch_fence.assert_active_execution(mission)
-                            self._save(mission)
-                            if heartbeat is not None:
-                                heartbeat()
-                            if dispatch_fence is not None:
-                                dispatch_fence.assert_active_execution(mission)
-                            raw = self._execute_native_tool(
-                                proposal.name,
-                                argument,
-                                decision.decision,
-                                mission,
-                                dispatch_fence,
-                                execution_id,
-                            )
-                            observation = dict(raw or {})
-                            observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
-                            mission.record_observation(observation)
-                            if current_step is not None:
-                                self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
-                            if bool(observation.get("success", observation.get("ok", True))):
-                                criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
-                                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
-                            mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
-                            mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
-                            result = ToolCallResult(proposal, True, result=observation)
-                        except Exception as exc:
-                            mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
-                            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
-                            return self._save(mission)
+                    remaining_seconds = self._remaining_seconds(deadline)
+                    if remaining_seconds <= 0:
+                        mission.checkpoint = {"status": "not_dispatched", "tool_call_id": proposal.tool_call_id, "run_id": run_id}
+                        return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
+                    try:
+                        task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
+                        execution_id = proposal.action_id or proposal.tool_call_id
+                        mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": execution_id, "step_id": task_id, "run_id": run_id, "plan_version": mission.plan.version}
+                        dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
+                        if dispatch_fence is not None:
+                            dispatch_fence.assert_active_execution(mission)
+                        self._save(mission)
+                        if heartbeat is not None:
+                            heartbeat()
+                        if dispatch_fence is not None:
+                            dispatch_fence.assert_active_execution(mission)
+                        remaining_seconds = self._remaining_seconds(deadline)
+                        if remaining_seconds <= 0:
+                            mission.checkpoint = {"status": "not_dispatched", "tool_call_id": proposal.tool_call_id, "run_id": run_id}
+                            return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
+                        raw = self._execute_native_tool(
+                            proposal.name,
+                            proposal.arguments,
+                            decision.decision,
+                            mission,
+                            dispatch_fence,
+                            execution_id,
+                            timeout_seconds=remaining_seconds,
+                            max_result_chars=result_caps[index],
+                        )
+                        observation = dict(raw or {})
+                        observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
+                        mission.record_observation(observation)
+                        if current_step is not None:
+                            self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
+                        if bool(observation.get("success", observation.get("ok", True))):
+                            criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
+                            mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
+                        mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
+                        mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
+                        result = ToolCallResult(proposal, True, result=observation)
+                    except Exception as exc:
+                        mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
+                        mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+                        return self._save(mission)
                 progress["tool_results"].append(result.to_dict())
             self._save(mission)
+        if len(progress["turns"]) >= max_execution_steps and not mission.is_terminal:
+            return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
+        if self._remaining_seconds(deadline) <= 0 and not mission.is_terminal:
+            return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
         mission.error = "model turn budget exhausted"
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self._save(mission)
 
-    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str]) -> None:
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str], deadline: float, result_caps: dict[str, int]) -> None:
         """Authorize and execute independent proposals concurrently, then fold results deterministically."""
         from security.authorization import authorize_tool
         identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
         authorized: list[tuple[Any, Any, Any]] = []
         results: list[ToolCallResult] = []
+        staged_seen_ids: list[str] = []
+        staged_seen = set(seen)
         for proposal in proposals:
             mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
-            if any(proposal.tool_call_id == error.split(":", 1)[0] for error in identity_errors) or proposal.tool_call_id in seen:
+            if any(proposal.tool_call_id == error.split(":", 1)[0] for error in identity_errors) or proposal.tool_call_id in staged_seen:
                 results.append(ToolCallResult(proposal, False, error="invalid, stale, or duplicate tool call"))
                 continue
-            seen.add(proposal.tool_call_id)
-            progress["seen_call_ids"].append(proposal.tool_call_id)
+            staged_seen.add(proposal.tool_call_id)
+            staged_seen_ids.append(proposal.tool_call_id)
             argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
             decision = authorize_tool([proposal.name, argument], context=auth_context)
             mission.emit(EventType.AUTHORIZATION_CHECKED, data={"tool_call_id": proposal.tool_call_id, "allowed": decision.allowed, "reason": decision.reason})
             if decision.allowed:
                 authorized.append((proposal, argument, decision))
             else:
-                results.append(ToolCallResult(proposal, False, error=decision.reason))
+                results.append(ToolCallResult(proposal, False, error=self._bounded_tool_error(decision.reason)))
+        if self._remaining_seconds(deadline) <= 0:
+            results.extend(
+                ToolCallResult(proposal, False, error="runtime deadline expired before parallel dispatch")
+                for proposal, _argument, _decision in authorized
+            )
+            seen.update(staged_seen_ids)
+            progress["seen_call_ids"].extend(staged_seen_ids)
+            progress["tool_results"].extend(result.to_dict() for result in results)
+            mission.checkpoint = {"status": "not_dispatched_parallel", "run_id": run_id, "tool_call_ids": list(staged_seen_ids)}
+            self._block_on_budget(mission, "max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
+            return
+        seen.update(staged_seen_ids)
+        progress["seen_call_ids"].extend(staged_seen_ids)
         mission.checkpoint = {
             "status": "in_flight_parallel",
             "tool_call_ids": [item[0].tool_call_id for item in authorized],
@@ -527,30 +1030,45 @@ class MissionRuntime:
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
             proposal, argument, decision = item
             try:
+                remaining_seconds = self._remaining_seconds(deadline)
+                if remaining_seconds <= 0:
+                    raise _MissionBudgetExceeded("max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
                 task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
                 execution_id = proposal.action_id or proposal.tool_call_id
                 dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
                 if dispatch_fence is not None:
                     dispatch_fence.assert_active_execution(mission)
+                remaining_seconds = self._remaining_seconds(deadline)
+                if remaining_seconds <= 0:
+                    raise _MissionBudgetExceeded("max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
                 return dict(self._execute_native_tool(
                     proposal.name,
-                    argument,
+                    proposal.arguments,
                     decision.decision,
                     mission,
                     dispatch_fence,
                     execution_id,
+                    timeout_seconds=remaining_seconds,
+                    max_result_chars=result_caps[proposal.tool_call_id],
                 ) or {})
+            except _MissionBudgetExceeded as exc:
+                return {"_budget_exceeded": True, "budget": exc.budget, "limit": exc.limit}
             except Exception as exc:
                 # An exception after dispatch cannot prove that the external side effect did not happen.
                 # Preserve ambiguity so recovery cannot blindly replay this proposal.
                 return {"_ambiguous": True, "error": str(exc), "failure_class": FailureClass.UNKNOWN.value, "exception": type(exc).__name__}
         raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
         ambiguous: list[tuple[Any, dict[str, Any]]] = []
+        budget_exceeded: tuple[str, int] | None = None
         for item, raw in zip(authorized, raw_results):
             if raw.get("_ambiguous"):
                 ambiguous.append((item[0], raw))
                 continue
             proposal = item[0]
+            if raw.get("_budget_exceeded"):
+                budget_exceeded = (str(raw.get("budget", "max_execution_time_seconds")), self._limit_value(raw.get("limit", 0)))
+                results.append(ToolCallResult(proposal, False, error="runtime resource budget exceeded before dispatch"))
+                continue
             observation = dict(raw)
             observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
             mission.record_observation(observation)
@@ -561,7 +1079,7 @@ class MissionRuntime:
                 criterion_id = observation.get("criterion_id") or (mission.completion_criteria[0].get("criterion_id") if mission.completion_criteria else None) or proposal.step_id or proposal.name
                 mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id}})
             mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
-            results.append(ToolCallResult(proposal, success, result=observation, error=str(observation.get("error", ""))))
+            results.append(ToolCallResult(proposal, success, result=observation, error=self._bounded_tool_error(observation.get("error", ""))))
         progress["tool_results"].extend(result.to_dict() for result in results)
         if ambiguous:
             ambiguous_ids = [proposal.tool_call_id for proposal, _ in ambiguous]
@@ -581,6 +1099,11 @@ class MissionRuntime:
                 "run_id": run_id,
             }
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+            return
+        if budget_exceeded is not None:
+            budget_name, budget_limit = budget_exceeded
+            mission.checkpoint = {"status": "budget_blocked", "run_id": run_id, "tool_call_ids": [proposal.tool_call_id for proposal, _ in authorized]}
+            self._block_on_budget(mission, budget_name, budget_limit)
             return
         mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
 

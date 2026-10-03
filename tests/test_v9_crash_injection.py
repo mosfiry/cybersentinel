@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, mission_model_tools
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue, MissionWorker, WorkerMissionState
@@ -75,7 +75,7 @@ def test_every_resume_entrypoint_quarantines_every_inflight_checkpoint(
         resumed = runtime.run_model_loop(
             mission.mission_id,
             model,
-            tools=[{"name": "status"}],
+            tools=mission_model_tools("status"),
             max_turns=3,
         )
 
@@ -232,7 +232,6 @@ def test_parallel_dispatch_crash_is_durable_and_never_replayed(tmp_path, monkeyp
                     turn_id=turn_id,
                     plan_version=plan_version,
                     step_id="observe",
-                    action_id=f"action-{label}",
                     tool_call_id=f"parallel-{label}",
                 )
                 for label in ("a", "b")
@@ -243,7 +242,7 @@ def test_parallel_dispatch_crash_is_durable_and_never_replayed(tmp_path, monkeyp
         first_runtime.run_model_loop(
             mission.mission_id,
             ParallelModel(),
-            tools=[{"name": "status"}],
+            tools=mission_model_tools("status"),
             max_turns=3,
         )
 
@@ -262,7 +261,7 @@ def test_parallel_dispatch_crash_is_durable_and_never_replayed(tmp_path, monkeyp
     recovered = restarted.run_model_loop(
         mission.mission_id,
         NeverCallModel(),
-        tools=[{"name": "status"}],
+        tools=mission_model_tools("status"),
         max_turns=3,
     )
     assert recovered.status is MissionStatus.RECOVERY_REQUIRED
