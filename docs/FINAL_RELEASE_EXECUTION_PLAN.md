@@ -54,7 +54,7 @@ Every stage follows `INSPECT → IMPLEMENT → TEST → BREAK → RECOVER → HA
 |---|---|---|
 | V0 | Commit `86ef8f4bfe5da93ae7b35c939749d62343cc918a`; source baseline and staged release plan. | Pushed; exact-SHA CI passed (run `37151975771`). |
 | V1 | Commit `4f94ccb9760362eeb39ab82d82fe40c257b9066f`; authenticated readiness probe, bridge lifecycle integration tests, and operations documentation. | Pushed; exact-SHA CI passed (run [37152396766](https://github.com/mosfiry/cybersentinel/actions/runs/37152396766)), including pytest, hosted container build/smoke, hygiene, and sensitive-file scan. |
-| V2 | Owner reauthorization, restart quarantine, one-shot scheduler boundaries and resume were source-audited. Focused tests: **49 passed**. `compileall` passed; full local suite: **1,077 passed, 1 skipped**. This checkpoint documents verified existing implementation; no authorization behavior was broadened. | Local verification passed; docs checkpoint and exact-SHA CI pending. |
+| V2 | Commit `8934280d1839f13c01974906fc6106201be8e9d0`; Owner reauthorization, restart quarantine, one-shot scheduler boundaries and resume were source-audited. Focused tests: **49 passed**. `compileall` passed; full local suite: **1,077 passed, 1 skipped**. This checkpoint documents verified existing implementation; no authorization behavior was broadened. | Pushed; exact-SHA `tests` CI passed (run [37152890871](https://github.com/mosfiry/cybersentinel/actions/runs/37152890871)), including pytest, hosted container build/smoke, diff hygiene, and sensitive-file scan. Owner Charter audit passed (run [37152890883](https://github.com/mosfiry/cybersentinel/actions/runs/37152890883)); non-production cutover rehearsal passed. |
 
 ## V2 authorization boundary and evidence
 
