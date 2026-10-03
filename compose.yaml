@@ -1,0 +1,144 @@
+services:
+  bridge:
+    image: cybersentinel-runtime:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    user: "10001:10001"
+    working_dir: /var/lib/cybersentinel/workspace
+    command: ["python", "/app/bridge.py"]
+    restart: unless-stopped
+    stop_grace_period: 330s
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "127.0.0.1:${BRIDGE_PUBLISHED_PORT:-8787}:8787"
+    environment:
+      BRIDGE_HOST: "0.0.0.0"
+      BRIDGE_PORT: "8787"
+      BRIDGE_ALLOW_NON_LOOPBACK_BIND: "true"
+      BRIDGE_TOKEN: "${BRIDGE_TOKEN:?BRIDGE_TOKEN_required}"
+      PUBLIC_WEB_ENABLED: "false"
+      PYTHON_DOTENV_DISABLED: "true"
+      PYTHONPATH: "/app"
+      HOME: "/var/lib/cybersentinel"
+      DB_PATH: "/var/lib/cybersentinel/intel.db"
+      TASK_DB_PATH: "/var/lib/cybersentinel/tasks.sqlite3"
+      MEMORY_DB_PATH: "/var/lib/cybersentinel/memory.sqlite3"
+      KNOWLEDGE_DB_PATH: "/var/lib/cybersentinel/knowledge.sqlite3"
+      SCOPE_DB_PATH: "/var/lib/cybersentinel/scope.sqlite3"
+      OWNER_POLICY_STATE_PATH: "/var/lib/cybersentinel/owner_policy_state.json"
+      CYBERSENTINEL_OWNER_PHRASE: "${CYBERSENTINEL_OWNER_PHRASE:-Owner}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      LOCAL_LLM_BASE_URL: "${LOCAL_LLM_BASE_URL:-}"
+      LOCAL_LLM_API_KEY: "${LOCAL_LLM_API_KEY:-}"
+      LOCAL_LLM_MODEL: "${LOCAL_LLM_MODEL:-}"
+      COLAB_LLM_BASE_URL: "${COLAB_LLM_BASE_URL:-}"
+      COLAB_LLM_API_KEY: "${COLAB_LLM_API_KEY:-}"
+      COLAB_LLM_MODEL: "${COLAB_LLM_MODEL:-}"
+      HF_LLM_BASE_URL: "${HF_LLM_BASE_URL:-}"
+      HF_LLM_API_KEY: "${HF_LLM_API_KEY:-}"
+      HF_LLM_MODEL: "${HF_LLM_MODEL:-}"
+    volumes:
+      - cybersentinel-state:/var/lib/cybersentinel
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  mission-worker:
+    image: cybersentinel-runtime:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    user: "10001:10001"
+    working_dir: /var/lib/cybersentinel/workspace
+    command: ["python", "-m", "scripts.run_mission_worker", "--worker-id", "cybersentinel-worker", "--poll-interval", "1"]
+    restart: unless-stopped
+    stop_grace_period: 330s
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      BRIDGE_HOST: "0.0.0.0"
+      BRIDGE_PORT: "8787"
+      BRIDGE_ALLOW_NON_LOOPBACK_BIND: "true"
+      BRIDGE_TOKEN: "${BRIDGE_TOKEN:?BRIDGE_TOKEN_required}"
+      PUBLIC_WEB_ENABLED: "false"
+      PYTHON_DOTENV_DISABLED: "true"
+      PYTHONPATH: "/app"
+      HOME: "/var/lib/cybersentinel"
+      DB_PATH: "/var/lib/cybersentinel/intel.db"
+      TASK_DB_PATH: "/var/lib/cybersentinel/tasks.sqlite3"
+      MEMORY_DB_PATH: "/var/lib/cybersentinel/memory.sqlite3"
+      KNOWLEDGE_DB_PATH: "/var/lib/cybersentinel/knowledge.sqlite3"
+      SCOPE_DB_PATH: "/var/lib/cybersentinel/scope.sqlite3"
+      OWNER_POLICY_STATE_PATH: "/var/lib/cybersentinel/owner_policy_state.json"
+      CYBERSENTINEL_OWNER_PHRASE: "${CYBERSENTINEL_OWNER_PHRASE:-Owner}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      LOCAL_LLM_BASE_URL: "${LOCAL_LLM_BASE_URL:-}"
+      LOCAL_LLM_API_KEY: "${LOCAL_LLM_API_KEY:-}"
+      LOCAL_LLM_MODEL: "${LOCAL_LLM_MODEL:-}"
+      COLAB_LLM_BASE_URL: "${COLAB_LLM_BASE_URL:-}"
+      COLAB_LLM_API_KEY: "${COLAB_LLM_API_KEY:-}"
+      COLAB_LLM_MODEL: "${COLAB_LLM_MODEL:-}"
+      HF_LLM_BASE_URL: "${HF_LLM_BASE_URL:-}"
+      HF_LLM_API_KEY: "${HF_LLM_API_KEY:-}"
+      HF_LLM_MODEL: "${HF_LLM_MODEL:-}"
+    volumes:
+      - cybersentinel-state:/var/lib/cybersentinel
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os
+          import sys
+          from pathlib import Path
+
+          current_pid = os.getpid()
+          for process in Path("/proc").iterdir():
+              if not process.name.isdigit() or int(process.name) == current_pid:
+                  continue
+              try:
+                  argv = [arg for arg in (process / "cmdline").read_bytes().split(b"\0") if arg]
+              except OSError:
+                  continue
+              if b"-m" in argv and b"scripts.run_mission_worker" in argv:
+                  raise SystemExit(0)
+          raise SystemExit(1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  cybersentinel-state:

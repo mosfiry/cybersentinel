@@ -29,6 +29,63 @@ jobs:
         run: python -m compileall -q .
       - name: pytest
         run: python -m pytest -q
+      - name: Build and smoke-test container runtime (no publish)
+        shell: bash
+        env:
+          BRIDGE_TOKEN: "ci-only-test-token-not-a-credential-1234567890"
+          BRIDGE_PUBLISHED_PORT: "18787"
+          COMPOSE_PROJECT_NAME: "cybersentinel-ci-${{ github.run_id }}-${{ github.run_attempt }}"
+        run: |
+          set -euo pipefail
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker compose logs --no-color || true
+            fi
+            docker compose down --volumes --remove-orphans || true
+          }
+          trap cleanup EXIT
+
+          docker compose config --quiet
+          docker compose build --pull
+          docker compose up --detach --wait --wait-timeout 120
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:18787/api/health
+
+          current_generation() {
+            docker compose exec --no-TTY bridge python -c '
+          import sqlite3
+          db = sqlite3.connect("/var/lib/cybersentinel/mission_queue.sqlite3")
+          row = db.execute("SELECT runtime_generation,state FROM mission_worker_generations WHERE worker_id=? ORDER BY runtime_generation DESC LIMIT 1", ("cybersentinel-worker",)).fetchone()
+          if row is None or row[1] != "ACTIVE":
+              raise SystemExit("worker_generation_not_active")
+          print(row[0])
+          '
+          }
+          wait_generation() {
+            expected=$1
+            for attempt in $(seq 1 60); do
+              current=$(current_generation 2>/dev/null || true)
+              if [ -n "$current" ] && [ "$current" -ge "$expected" ]; then
+                printf '%s\n' "$current"
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
+          first=$(wait_generation 1)
+          test "$first" = "1"
+          docker compose restart mission-worker
+          second=$(wait_generation 2)
+          test "$second" = "2"
+
+          # Recreate containers but preserve the isolated named state volume.
+          docker compose down --remove-orphans
+          docker compose up --detach --wait --wait-timeout 120
+          third=$(wait_generation 3)
+          test "$third" = "3"
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:18787/api/health
       - name: git diff check
         run: git diff --check
       - name: Secret and sensitive-file scan
