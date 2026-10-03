@@ -181,3 +181,32 @@ The later read-only GET at 08:01:27 resolved build `26a8d8a9-e996-4b63-afd5-4a43
 ### V13 hosted checkpoint — current exact-SHA status
 
 The V13 documentation checkpoint is pushed to the M2E branch at `a294b0c62cf49c42bedf523659d801194e70a3d9`. GitHub audit completed successfully; the exact-SHA `test (3.13)` check was still in progress at the recorded observation. The natural Cloudflare `push_event` build for that SHA is confirmed queued, but has no outcome or preview URL yet; the independent preview list is empty while it is queued. Thus the hosted preview outcome remains **UNKNOWN / nonterminal**. The V13 push followed the terminal result for the preceding V12 build, and the next remote push is held until this V13 build becomes terminal. No manual build, deploy, or configuration mutation was used (`docs/M2E_STATE.md:1729-1735`).
+
+
+### V13 hosted follow-up — terminal prior build and current pushed SHA (2026-10-03 08:26 +02:00)
+
+The queued build for the earlier V13 SHA `a294b0c62cf49c42bedf523659d801194e70a3d9` is now terminal: Cloudflare build `29e89e9d-b6bd-4931-994f-293625504097` stopped with outcome `terminated`, and its final log says initialization timed out. Its exact preview-list query returned no records. This supersedes the earlier nonterminal observation for `a294b0c`; it does not establish production state. The V13 terminal-result checkpoint `21e1f853794c20239125f66be898af63a3aecb9c` was then pushed non-force and independently confirmed as the remote M2E tip. On that exact SHA, GitHub audit check `111146154484` passed while test check `111146153982` was still `in_progress` at the recorded observation.
+
+A separate natural Cloudflare `push_event` build `679155a9-6ec9-4e34-831e-aa436e3f9444` matches SHA `21e1f853794c20239125f66be898af63a3aecb9c`; it was `queued`, with no build outcome, at the 08:26:28 GET. Its exact Worker-tag preview-list query returned `total_count=0`. Thus the current preview result is **UNKNOWN / nonterminal**; do not push another checkpoint until this build is terminal. The GitHub test and Cloudflare build are distinct status sources; no manual build/deploy or production conclusion is recorded (`docs/M2E_STATE.md:1797-1801,1824-1830`).
+
+
+### V14 — security/integration/regression battery (local implementation)
+
+The reviewed path is Owner-authenticated mission creation and scope-bound authorization in `AgentCore.run_owner_mission()` (`agent/agent_core.py:230-296`), fresh Owner revalidation without a runtime slice before queueing (`agent/agent_core.py:378-385`; `api/missions.py:36-38,84-111`), lease-checked worker execution and acknowledgment (`agent/mission_worker.py:345-408`), and serialized EvidenceChain append plus hash verification (`agent/evidence.py:69-99`). The new deterministic regressions compose these boundaries rather than changing runtime policy: `tests/test_v14_security_integration_battery.py:68-137` verifies Owner-to-queue-to-worker completion and mission/request/tool/authorization-snapshot evidence provenance; `:139-179` proves stale Owner denial leaves the queue, worker factory, tool, and evidence untouched; `:181-204` proves an absent scope snapshot is rejected before provider planning or mission persistence.
+
+The CI workflow runs compile and the full Python test suite (`.github/workflows/tests.yml:1-60`). The local CI-equivalent run completed `compileall` and **781 passed, 1 skipped**; the focused V14 module passed all **3 tests** (`docs/M2E_STATE.md:1833-1837`). Existing V8 quarantine, V9 crash-injection, V10 multi-worker, and V12 provider-boundary regressions remained in that full run and are mapped above. This is deterministic local coverage, not a process-kill or production test. It does not bind Owner authority to unattended restart/reconciliation, establish cross-store atomicity or exactly-once effects, or resolve the V4/V6/V8/V11 owner-decision blockers.
+
+
+### V13 exact-SHA CI completion; natural build still nonterminal (2026-10-03 08:29 +02:00)
+
+The delayed check-run read confirms both GitHub jobs on SHA `21e1f853794c20239125f66be898af63a3aecb9c` are now successful: audit check `111146154484` and `test (3.13)` check `111146153982`. This supersedes the earlier `test=in_progress` snapshot. Separately, Cloudflare build `679155a9-6ec9-4e34-831e-aa436e3f9444` for that SHA remains `queued`, with only an initialization log and an exact preview-list result of `total_count=0`; its terminal preview result is still **UNKNOWN**. Do not push another commit until this natural build is terminal, and do not infer deployment or production status from the empty preview list (`docs/M2E_STATE.md:1840-1844`).
+
+
+### V13 exact-build recheck — still queued at 08:32 +02:00
+
+The one later read-only check of exact build `679155a9-6ec9-4e34-831e-aa436e3f9444` still returned `status=queued` and `build_outcome=null`; its log contained one initialization line/event, while the exact Worker preview list remained empty (`total_count=0`). The log event does not override the build record status. The final preview result remains **UNKNOWN / nonterminal**. Preserve the no-push gate and continue only V14 local review/validation; V15 remains held (`docs/M2E_STATE.md:1847-1851`).
+
+
+### V13 natural build terminal result — exact SHA `21e1f853` (2026-10-03 08:35 +02:00)
+
+The one delayed, bounded, read-only Cloudflare query resolved build `679155a9-6ec9-4e34-831e-aa436e3f9444` for exact pushed SHA `21e1f853794c20239125f66be898af63a3aecb9c`: `stopped / fail`. The natural `npx wrangler preview` log identifies the missing top-level Wrangler `previews` block; the exact Worker preview endpoint returned `total_count=0`. The preview-build attempt therefore failed without a returned/listed preview. This does not establish production or overall Worker state. The separate exact-SHA GitHub `test (3.13)` and `audit` checks passed (`111146153982`, `111146154484`), while GitHub Workers check `111147372852` failed; these are not interchangeable with the Cloudflare build API result. No manual build/deploy/retry, settings change, or production action occurred. The V13 terminal result and evidence are recorded in `docs/M2E_STATE.md` under “V13 natural Cloudflare build resolved”; prior queued observations remain as dated history and are superseded only for the final build state.
