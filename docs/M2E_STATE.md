@@ -960,3 +960,42 @@ V5 implementation SHA `db9fbf08fe2326756b4d3c98f54d2e404e66f38e` and final state
 The pushed V5 final result-log SHA `d56e5f90f964c73b1c1ffe6a42d775c47db54d49` has exact-SHA test/audit success and a directly confirmed Cloudflare terminal failure from missing Wrangler `previews`, with no build preview URL or deployment. The local documentation-only follow-up contains that result and the validator no-op record above. The only validation interruption was a misordered expected heading; no staging/commit/push occurred, as verified at 05:28:16. No V6 code has been changed.
 
 **Next exact action:** rerun local docs-only validation using the verified heading text, then commit and non-force push the final result log only to M2E after an exact-parent preflight. Verify exact-SHA tests/audit and natural preview for that state checkpoint, then resume V6. Do not manually trigger Cloudflare builds/deploys or change configuration.
+
+
+### V5 final state-log SHA exact-SHA check snapshot — 2026-10-03 05:29 +02:00
+
+| Time / phase | Exact observation and classification | Effect / identifiers | Verification and next action |
+|---|---|---|---|
+| 05:29:17 +02:00; V5 final state-log SHA `96a5386e5d0a97922c382798cf494f79ef980e33` | Remote branch GET confirmed exact SHA. Audit run `37093339723` / check `111118143681` completed `success`; test run `37093339773` / check `111118143969` was `in_progress`, conclusion null. Workers check `111118154638` was `in_progress`, conclusion null; details URL identifies build `880898dd-c746-4b30-9af5-f752dd162b04`. | New build is for the final V5 state-log commit. Its external preview effect was `UNKNOWN / IN_PROGRESS` at this GitHub observation. | One read-only exact-SHA query; no CI rerun or manual Cloudflare operation. Next permitted call is GET-only status/log/preview for this existing build; no further push while nonterminal. |
+
+## Current checkpoint — final V5 state-log SHA pushed; test/build pending (2026-10-03 05:30 +02:00)
+
+Final V5 state-log SHA `96a5386e5d0a97922c382798cf494f79ef980e33` is remote-confirmed. Its audit passed; test check `111118143969` and Workers check `111118154638` were `in_progress` / null at 05:29:17 +02:00. Cloudflare build `880898dd-c746-4b30-9af5-f752dd162b04` has not yet been directly queried. Earlier V5 exact tests/audits and direct preview failures are recorded above. No V6 code has changed.
+
+**Next exact action:** query only existing Cloudflare build `880898dd-c746-4b30-9af5-f752dd162b04` status/logs and preview/deployment endpoints. After a quiet interval, read exact-SHA GitHub test/Workers status once. Do not push while the build remains nonterminal. Once V5 final SHA checks and preview outcome are recorded, proceed to V6 in order.
+
+
+### V5 final state-log SHA Cloudflare direct-API follow-up — 2026-10-03 05:29 +02:00
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 05:29:47 +02:00; V5 state-log SHA `96a5386e5d0a97922c382798cf494f79ef980e33` | Read-only Cloudflare GET for build `880898dd-c746-4b30-9af5-f752dd162b04` returned HTTP 200, `status=stopped`, `build_outcome=fail`; logs returned HTTP 200 and show missing top-level Wrangler `previews` block. Classification: `OPERATION_CONFIRMED_FAILURE` for this natural preview build. | Build commit/branch match `96a5386` / M2E; command `npx wrangler preview`, trigger `push_event`. Build response omitted `preview_url`; build-worker preview list and branch-preview deployments endpoint each returned `total_count=0`. Existing branch-preview resource retains a configured URL but `deployed_on=null` and predates this build. | GET-only status/log/preview/deployment; no manual build, deploy, retry, cancellation, or configuration call. No preview artifact/deployment was returned. GitHub Workers check `111118154638` was `in_progress` / null at 05:29:17 +02:00; retain that observation separately from Cloudflare's terminal result. Do not infer production state. |
+
+## Current checkpoint — final V5 preview resolved; exact-SHA test pending (2026-10-03 05:30 +02:00)
+
+V5 final state-log SHA `96a5386e5d0a97922c382798cf494f79ef980e33` is remote-confirmed. Its audit passed; test check `111118143969` was `in_progress` / null at 05:29:17 +02:00. Its direct Cloudflare build `880898dd-c746-4b30-9af5-f752dd162b04` is stopped/fail due to the missing `previews` block, with no build `preview_url` or exact preview deployment. GitHub Workers check `111118154638` was also in progress at that snapshot; that is distinct from the Cloudflare build state. No V6 code has changed.
+
+**Next exact action:** after a quiet interval, query exact-SHA GitHub metadata once for test run `37093339773` / check `111118143969` and Workers check `111118154638`; preserve distinct check-run IDs. Then checkpoint the final V5 log outcome on M2E. The Cloudflare build overlap gate for `880898dd-c746-4b30-9af5-f752dd162b04` is terminal. No manual Cloudflare build/deploy or configuration calls.
+
+
+### V5 final state-log SHA exact-SHA terminal follow-up — 2026-10-03 05:30 +02:00
+
+| Time / phase | Exact observation and classification | External effect / identifiers | Verification and recovery |
+|---|---|---|---|
+| 05:30:19 +02:00; exact-SHA GitHub checks for `96a5386e5d0a97922c382798cf494f79ef980e33` | Remote branch GET confirmed exact SHA. Test run `37093339773` / check `111118143969` completed `success`; audit run `37093339723` / check `111118143681` completed `success`. Workers check `111118200930` completed `failure`, external ID `880898dd-c746-4b30-9af5-f752dd162b04`. Earlier check `111118154638` was observed `in_progress` / null at 05:29:17 +02:00 for the same external build. | Direct Cloudflare GETs above independently confirm build `880898dd-c746-4b30-9af5-f752dd162b04` stopped/fail from missing `previews`, with no `preview_url` or exact preview deployment. Preserve the two GitHub check-run IDs/statuses without inferring cause or production state. | Read-only GitHub exact-SHA metadata; no retry or mutation. Test/audit passed; Cloudflare result is terminal. |
+
+## Current checkpoint — V5 results fully verified; final state log ready to checkpoint (2026-10-03 05:31 +02:00)
+
+V5 implementation SHA `db9fbf08fe2326756b4d3c98f54d2e404e66f38e` and final state-log SHA `96a5386e5d0a97922c382798cf494f79ef980e33` are remote-confirmed; exact-SHA tests and audits succeeded. The matching Cloudflare build `880898dd-c746-4b30-9af5-f752dd162b04` is directly confirmed stopped/fail due to the absent top-level Wrangler `previews` block, with no `preview_url` or queried preview deployment. GitHub check `111118200930` completed failure; distinct check `111118154638` was observed in progress/null earlier for the same external build. V4 remains separately blocked on the architecture/owner decision. The only remaining local delta is this V5 state-result record; no V6 source has changed.
+
+**Next exact action:** validate this docs-only delta, verify remote parent `96a5386`, and commit/non-force push the state update only to M2E. Verify exact-SHA test/audit and natural Workers result for that state-log checkpoint; then proceed to V6 execution-proof source/design. Preserve unresolved V6 authority/trust choices as `BLOCKED`; no manual Cloudflare build/deploy or configuration calls.
