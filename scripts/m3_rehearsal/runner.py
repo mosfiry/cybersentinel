@@ -326,17 +326,21 @@ class RehearsalRunner:
         probe = self.host.state_probe(self.mission_id, self.keyword)
         queue = probe.get("queue") or {}
         generation = probe.get("generation") or {}
-        if (
-            queue.get("state") != "EXECUTING"
-            or queue.get("attempts") != 1
-            or queue.get("runtime_generation") != 1
-            or queue.get("lease_owned") is not True
-            or generation.get("runtime_generation") != 1
-            or generation.get("state") != "ACTIVE"
-            or probe.get("db_under_state") is not True
-            or probe.get("queue_db_under_state") is not True
-        ):
-            raise RehearsalFailure("pre_crash_queue_or_volume_invariant_failed")
+        checks = {
+            "queue_executing": queue.get("state") == "EXECUTING",
+            "single_attempt": queue.get("attempts") == 1,
+            "queue_generation_one": queue.get("runtime_generation") == 1,
+            "lease_owned": queue.get("lease_owned") is True,
+            "worker_generation_one": generation.get("runtime_generation") == 1,
+            "worker_active": generation.get("state") == "ACTIVE",
+            "mission_db_under_state": probe.get("db_under_state") is True,
+            "queue_db_under_state": probe.get("queue_db_under_state") is True,
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        if failed:
+            raise RehearsalFailure(
+                "pre_crash_queue_invariants_failed:" + ",".join(failed)
+            )
         self.lease_expires_at = str(queue.get("lease_expires_at") or "")
         if not self.lease_expires_at:
             raise RehearsalFailure("pre_crash_lease_expiry_missing")

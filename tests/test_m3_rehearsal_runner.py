@@ -53,6 +53,34 @@ def _stub_stages(
         monkeypatch.setattr(runner, name, lambda name=name: {"completed": name})
 
 
+def test_queue_state_failure_reports_only_static_invariant_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = rehearsal.RehearsalRunner(
+        output_path=tmp_path / "result.json", port_picker=lambda: 32991
+    )
+    runner.mission_id = "synthetic-mission"
+    probe = {
+        "queue": {
+            "state": "queue-state-secret",
+            "attempts": 1,
+            "runtime_generation": 1,
+            "lease_owned": True,
+            "lease_expires_at": "2099-01-01T00:00:00+00:00",
+        },
+        "generation": {"runtime_generation": 1, "state": "ACTIVE"},
+        "db_under_state": True,
+        "queue_db_under_state": True,
+    }
+    monkeypatch.setattr(runner.host, "state_probe", lambda *_args: probe)
+
+    with pytest.raises(host_module.RehearsalFailure) as caught:
+        runner._queue_state()
+
+    assert caught.value.reason == "pre_crash_queue_invariants_failed:queue_executing"
+    assert "queue-state-secret" not in caught.value.reason
+
+
 def test_safe_environment_removes_ambient_provider_and_runtime_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
