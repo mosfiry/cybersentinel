@@ -258,6 +258,55 @@ def test_parallel_crash_after_subset_fold_reconciles_only_unresolved_tools(tmp_p
     assert reconciled.checkpoint["status"] == "completed"
 
 
+def test_concurrent_runtimes_reject_stale_writer_before_duplicate_dispatch(tmp_path, monkeypatch):
+    import threading
+    import tools.registry
+
+    db = _db(tmp_path)
+    barrier = threading.Barrier(2)
+    executed = []
+    execute_lock = threading.Lock()
+
+    def execute(name, argument, **kwargs):
+        with execute_lock:
+            executed.append(name)
+        return {"ok": True, "criterion_id": "goal", "source": "concurrent-fixture"}
+
+    monkeypatch.setattr(tools.registry, "execute", execute)
+    first = _runtime(db)
+    mission = _mission(first)
+    second = _runtime(db)
+
+    class BarrierModel:
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            barrier.wait(timeout=3)
+            return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 1),))
+
+    results = []
+    errors = []
+
+    def run(runtime):
+        try:
+            results.append(runtime.run_model_loop(mission.mission_id, BarrierModel(), tools=[{"name": "status"}], max_turns=1))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(runtime,)) for runtime in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(executed) == 1, "only the runtime owning the checkpoint may dispatch the tool"
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "stale mission write rejected" in str(errors[0])
+    persisted = MissionStore(db).load(mission.mission_id)
+    assert persisted is not None
+    assert len(persisted.progress["model_loop"]["tool_results"]) == 1
+
+
 def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkeypatch):
     import tools.registry
 
