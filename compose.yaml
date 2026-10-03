@@ -1,4 +1,23 @@
 services:
+  workspace-init:
+    image: cybersentinel-runtime:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    user: "10001:10001"
+    working_dir: /var/lib/cybersentinel
+    entrypoint: ["/bin/sh", "/app/scripts/container_workspace_init.sh"]
+    command: ["--once"]
+    restart: "no"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      CYBERSENTINEL_STATE_DIR: "/var/lib/cybersentinel"
+    volumes:
+      - cybersentinel-state:/var/lib/cybersentinel
+
   bridge:
     image: cybersentinel-runtime:local
     build:
@@ -6,8 +25,12 @@ services:
       dockerfile: Dockerfile
     init: true
     user: "10001:10001"
-    working_dir: /var/lib/cybersentinel/workspace
+    working_dir: /var/lib/cybersentinel
+    entrypoint: ["/bin/sh", "/app/scripts/container_entrypoint.sh"]
     command: ["python", "/app/bridge.py"]
+    depends_on:
+      workspace-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     stop_grace_period: 330s
     read_only: true
@@ -23,6 +46,7 @@ services:
     ports:
       - "127.0.0.1:${BRIDGE_PUBLISHED_PORT:-8787}:8787"
     environment:
+      CYBERSENTINEL_STATE_DIR: "/var/lib/cybersentinel"
       BRIDGE_HOST: "0.0.0.0"
       BRIDGE_PORT: "8787"
       BRIDGE_ALLOW_NON_LOOPBACK_BIND: "true"
@@ -70,8 +94,12 @@ services:
       dockerfile: Dockerfile
     init: true
     user: "10001:10001"
-    working_dir: /var/lib/cybersentinel/workspace
+    working_dir: /var/lib/cybersentinel
+    entrypoint: ["/bin/sh", "/app/scripts/container_entrypoint.sh"]
     command: ["python", "-m", "scripts.run_mission_worker", "--worker-id", "cybersentinel-worker", "--poll-interval", "1"]
+    depends_on:
+      workspace-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     stop_grace_period: 330s
     read_only: true
@@ -85,6 +113,7 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     environment:
+      CYBERSENTINEL_STATE_DIR: "/var/lib/cybersentinel"
       BRIDGE_HOST: "0.0.0.0"
       BRIDGE_PORT: "8787"
       BRIDGE_ALLOW_NON_LOOPBACK_BIND: "true"
@@ -120,21 +149,8 @@ services:
         - python
         - -c
         - |
-          import os
-          import sys
-          from pathlib import Path
-
-          current_pid = os.getpid()
-          for process in Path("/proc").iterdir():
-              if not process.name.isdigit() or int(process.name) == current_pid:
-                  continue
-              try:
-                  argv = [arg for arg in (process / "cmdline").read_bytes().split(b"\0") if arg]
-              except OSError:
-                  continue
-              if b"-m" in argv and b"scripts.run_mission_worker" in argv:
-                  raise SystemExit(0)
-          raise SystemExit(1)
+          from scripts.worker_healthcheck import main
+          raise SystemExit(main())
       interval: 30s
       timeout: 5s
       retries: 3

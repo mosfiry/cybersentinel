@@ -46,10 +46,24 @@ jobs:
           }
           trap cleanup EXIT
 
+          wait_bridge() {
+            for attempt in $(seq 1 60); do
+              if curl --fail --silent --max-time 2 http://127.0.0.1:18787/api/health >/dev/null; then
+                return 0
+              fi
+              sleep 2
+            done
+            docker compose ps
+            curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18787/api/health
+          }
+
           docker compose config --quiet
           docker compose build --pull
-          docker compose up --detach --wait --wait-timeout 120
+          docker compose up --detach
+          wait_bridge
           curl --fail --silent --show-error --max-time 10 http://127.0.0.1:18787/api/health
+
+          python scripts/verify_container_contract.py
 
           current_generation() {
             docker compose exec --no-TTY bridge python -c '
@@ -82,7 +96,8 @@ jobs:
 
           # Recreate containers but preserve the isolated named state volume.
           docker compose down --remove-orphans
-          docker compose up --detach --wait --wait-timeout 120
+          docker compose up --detach
+          wait_bridge
           third=$(wait_generation 3)
           test "$third" = "3"
           curl --fail --silent --show-error --max-time 10 http://127.0.0.1:18787/api/health

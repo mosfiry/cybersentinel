@@ -39,6 +39,7 @@ security/*_state.json
 
 # The runtime does not need test, planning, or audit-diagnostic artifacts.
 tests/
+scripts/verify_container_contract.py
 docs/
 tasks/
 diagnostics/

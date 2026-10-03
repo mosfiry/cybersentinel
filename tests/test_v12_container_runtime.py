@@ -334,3 +334,184 @@ def test_bridge_server_close_waits_for_active_request_thread() -> None:
         else:
             close_thread.join(timeout=3)
         request_thread.join(timeout=3)
+
+
+CONTAINER_ENTRYPOINT = ROOT / "scripts" / "container_entrypoint.sh"
+WORKSPACE_INIT = ROOT / "scripts" / "container_workspace_init.sh"
+
+
+def _workspace_environment(state_dir: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["CYBERSENTINEL_STATE_DIR"] = str(state_dir)
+    return env
+
+
+def test_workspace_initializer_preserves_existing_state_volume_workspace(tmp_path: Path) -> None:
+    state_dir = tmp_path / "existing-state"
+    workspace = state_dir / "workspace"
+    workspace.mkdir(parents=True)
+    original = workspace / "prior-work.txt"
+    original.write_text("preserve this file\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/sh", str(WORKSPACE_INIT), "--once"],
+        cwd=ROOT,
+        env=_workspace_environment(state_dir),
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert original.read_text(encoding="utf-8") == "preserve this file\n"
+
+
+def test_workspace_initializer_creates_the_legacy_workspace_under_temp_state(tmp_path: Path) -> None:
+    state_dir = tmp_path / "fresh-state"
+    state_dir.mkdir()
+
+    result = subprocess.run(
+        ["/bin/sh", str(WORKSPACE_INIT), "--once"],
+        cwd=ROOT,
+        env=_workspace_environment(state_dir),
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (state_dir / "workspace").is_dir()
+
+
+def test_workspace_init_and_entrypoint_reject_symlink_substitution(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    outside = tmp_path / "outside"
+    state_dir.mkdir()
+    outside.mkdir()
+    (state_dir / "workspace").symlink_to(outside, target_is_directory=True)
+    env = _workspace_environment(state_dir)
+
+    initialized = subprocess.run(
+        ["/bin/sh", str(WORKSPACE_INIT), "--once"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    entered = subprocess.run(
+        ["/bin/sh", str(CONTAINER_ENTRYPOINT), sys.executable, "-c", "print('unexpected')"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert initialized.returncode != 0
+    assert "symlinked workspace" in initialized.stderr
+    assert entered.returncode != 0
+    assert "missing or symlinked" in entered.stderr
+    assert not list(outside.iterdir())
+
+
+def test_container_entrypoint_executes_application_in_preserved_workspace(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    workspace = state_dir / "workspace"
+    workspace.mkdir(parents=True)
+    sentinel = workspace / "prior-work.txt"
+    sentinel.write_text("persisted\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/sh", str(CONTAINER_ENTRYPOINT), sys.executable, "-c", "import os; print(os.getcwd())"],
+        cwd=ROOT,
+        env=_workspace_environment(state_dir),
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(workspace.resolve())
+    assert sentinel.read_text(encoding="utf-8") == "persisted\n"
+
+
+EXPECTED_WORKER_ARGV = [
+    b"python",
+    b"-m",
+    b"scripts.run_mission_worker",
+    b"--worker-id",
+    b"cybersentinel-worker",
+    b"--poll-interval",
+    b"1",
+]
+
+
+def _fake_proc_tree(proc_root: Path, *, children: list[int], processes: dict[int, tuple[list[bytes], str]]) -> None:
+    children_file = proc_root / "1/task/1/children"
+    children_file.parent.mkdir(parents=True, exist_ok=True)
+    children_file.write_text(" ".join(map(str, children)), encoding="ascii")
+    for pid, (argv, state) in processes.items():
+        process = proc_root / str(pid)
+        process.mkdir(parents=True, exist_ok=True)
+        (process / "cmdline").write_bytes(b"\0".join(argv) + b"\0")
+        (process / "stat").write_text(f"{pid} (python worker) {state} 1 0 0 0 0\n", encoding="ascii")
+
+
+def test_worker_health_requires_exact_active_worker_as_init_child(tmp_path: Path) -> None:
+    from scripts.worker_healthcheck import is_expected_worker_running
+
+    proc_root = tmp_path / "proc"
+    _fake_proc_tree(proc_root, children=[42], processes={42: (EXPECTED_WORKER_ARGV, "S")})
+    assert is_expected_worker_running(proc_root)
+
+
+def test_worker_health_rejects_unrelated_or_wrong_identity_processes(tmp_path: Path) -> None:
+    from scripts.worker_healthcheck import is_expected_worker_running
+
+    proc_root = tmp_path / "proc"
+    unrelated_argv = [b"python", b"-m", b"scripts.run_mission_worker", b"--worker-id", b"other", b"--poll-interval", b"1"]
+    _fake_proc_tree(
+        proc_root,
+        children=[42],
+        processes={42: (unrelated_argv, "S"), 77: (EXPECTED_WORKER_ARGV, "S")},
+    )
+    assert not is_expected_worker_running(proc_root)
+
+
+def test_worker_health_rejects_zombie_worker(tmp_path: Path) -> None:
+    from scripts.worker_healthcheck import is_expected_worker_running
+
+    proc_root = tmp_path / "proc"
+    _fake_proc_tree(proc_root, children=[42], processes={42: (EXPECTED_WORKER_ARGV, "Z")})
+    assert not is_expected_worker_running(proc_root)
+
+
+@pytest.mark.parametrize("state", ["T", "t"])
+def test_worker_health_rejects_stopped_or_traced_worker(tmp_path: Path, state: str) -> None:
+    from scripts.worker_healthcheck import is_expected_worker_running
+
+    proc_root = tmp_path / "proc"
+    _fake_proc_tree(proc_root, children=[42], processes={42: (EXPECTED_WORKER_ARGV, state)})
+    assert not is_expected_worker_running(proc_root)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [b"python3", *EXPECTED_WORKER_ARGV[1:]],
+        [*EXPECTED_WORKER_ARGV[:-1], b"2"],
+        [*EXPECTED_WORKER_ARGV, b"--unexpected"],
+    ],
+)
+def test_worker_health_requires_exact_executable_and_arguments(tmp_path: Path, argv: list[bytes]) -> None:
+    from scripts.worker_healthcheck import is_expected_worker_running
+
+    proc_root = tmp_path / "proc"
+    _fake_proc_tree(proc_root, children=[42], processes={42: (argv, "S")})
+    assert not is_expected_worker_running(proc_root)
