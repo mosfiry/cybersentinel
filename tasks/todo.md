@@ -168,12 +168,28 @@
 - V13 exact-SHA CI is green for `8d32d79fc4ebeb75205af8e0ef5f26434e57afdb`: GitHub tests run `37142559205` and audit `37142559226` succeeded; Compose smoke passed. Cloudflare check `111259925397` failed; exact check metadata contains no cause, while the earlier V12 read-only build log identified the missing preview config. No external settings were changed. This completes V13; no production deployment was attempted.
 
 
-### V14 — Cutover candidate + final verification (in progress)
+### V14 — Cutover candidate + final verification (complete)
 
 - [x] Create `docs/M3_CUTOVER_CANDIDATE.md` as a non-deployment readiness artifact with exact branch/SHA and CI evidence, the Compose target, known limitations, and explicit `PRODUCTION_DEPLOYMENT_BLOCKED` status.
 - [x] Run the full repository suite and focused V14 groups: integration/auth/fence/evidence 70 passed; process/multi-worker/recovery/effects 119 passed; provider-boundary 65 passed/1 credential-gated skip; full suite 1,048 passed/1 skip.
 - [x] Linter discovery: no repository or CI lint configuration exists. Temporary Ruff `E4,E7,E9,F` checks pass on all eight V13-touched Python files; the same baseline reports 291 findings repository-wide, so whole-repository lint is not green. No project config/dependency was added.
 - [x] V14 `compileall`, Compose/workflow YAML parse, container shell syntax, high-confidence secret/sensitive-file scan, and `git diff --check` pass. No diagnostic/temp artifacts were found in the repository.
-- [x] `main` and M2D refs remain unchanged; the current diff is confined to the V14 record, M3 ledger/checklists, and narrowly scoped lint cleanup. A final clean worktree check remains after commit.
-- [ ] Commit/push the candidate and verification evidence non-force to the existing M3 branch; verify exact-SHA CI and final clean tree before closing V14.
+- [x] Protected `main` and M2D refs were unchanged; the V14 candidate diff was confined to the candidate record, M3 ledger/checklists, and narrowly scoped lint cleanup. The candidate checkpoint had no diagnostic/temp artifacts and a clean post-commit tree before the later V15/V16 planning edits.
+- [x] Non-force push candidate SHA `c0982051dccc4425aadba4da154d951a52e9ed63`; remote readback matched; exact-SHA GitHub tests/Compose smoke and Owner Charter audit passed, Workers Builds failed without a detailed diagnostic; post-commit tree was clean.
 - [x] No Cloudflare settings were changed, no public listener was published, and no production deployment was performed in V14.
+
+
+### V15 — Real cutover decision gate (planned; not started)
+
+- [ ] After V14 exact-SHA tests/audit/Workers-build results are recorded, score every required cutover condition against source and test evidence; do not infer readiness from the Compose smoke alone.
+- [ ] Record `CUTOVER_BLOCKED` and `PRODUCTION_DEPLOYMENT_BLOCKED` if any essential CI, target/configuration, or authority condition is missing; make no production or Cloudflare mutation.
+- [ ] Commit/push the V15 gate decision to the existing M3 branch non-force, verify exact-SHA CI, and transition to V16.
+
+### V16 — Actual non-production cutover rehearsal (planned; not started)
+
+- [ ] Implement a host-side runner plus test-only provider-blocking crash hook; isolate the test to a unique ephemeral Compose project and named volume, synthetic Owner password, no provider credentials, and loopback-only API access.
+- [ ] Exercise, in order, deploy/build, startup, health, Owner login, mission creation, worker execution, queue state, evidence, controlled worker crash, same-identity restart, recovery and Owner reconciliation, graceful shutdown, and cleanup.
+- [ ] Emit and capture explicit evidence for each of the twelve rehearsal steps; verify the crash hook's state-volume containment and verify no Compose container/volume or temp directory survives cleanup.
+- [ ] Run the V16 rehearsal on the exact pushed SHA in hosted CI; report only that exact SHA's stage results, tests, audit, and external checks.
+- [ ] Create `docs/M3_CUTOVER_REHEARSAL.md`; ensure the final required M3 architecture/runtime/recovery/effects/process artifacts and `docs/M3_FINAL_AUDIT.md` exist, are evidence-linked, and accurately map every M2E blocker.
+- [ ] Keep production deployment blocked unless all required proof, target configuration, credentials, and authority are actually established; do not invent any.

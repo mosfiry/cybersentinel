@@ -185,7 +185,7 @@ V11 is complete only when provider/tool inputs, provenance, turn/step/time/outpu
 2. [x] Run the full suite and grouped matrices: integration/auth/fence/evidence 70 passed; process/multi-worker/recovery/effects 119 passed; provider boundaries 65 passed/1 credential-gated skip; full repository 1,048 passed/1 skipped.
 3. [x] `compileall`, Compose/workflow YAML parsing, shell syntax, high-confidence secret/sensitive-file scan, and whitespace checks pass. No repository/CI linter configuration exists; temporary Ruff `E4,E7,E9,F` passes on all changed V13 Python files, while the whole-repo baseline has 291 findings and is not green.
 4. [x] `main`/M2D refs unchanged; no diagnostic/temp artifacts found; only intended M3 source cleanup and verification/ledger files changed. Verify clean tree after checkpoint.
-5. [ ] Commit/push only to the existing M3 branch non-force and read back exact-SHA CI; do not deploy production or mutate Cloudflare.
+5. [x] Non-force push candidate SHA `c0982051dccc4425aadba4da154d951a52e9ed63` to the existing M3 branch; exact-SHA tests/Compose smoke and audit passed, Workers Builds failed without a detailed diagnostic; no production or Cloudflare mutation.
 
 ### V14 risk register
 
@@ -194,3 +194,27 @@ V11 is complete only when provider/tool inputs, provenance, turn/step/time/outpu
 | Cloudflare Workers preview build remains failed and its current exact-SHA check has no diagnostic detail | No evidence supports a Workers cutover; target configuration remains unresolved | Preserve read-only failure evidence, keep the Compose target separate, and mark production cutover blocked until the exact target/config/authority are verified |
 | Local Docker Engine is unavailable | Local container execution cannot be claimed | Use the exact-SHA GitHub Compose smoke logs as hosted evidence; do not represent them as local validation |
 | No project lint policy exists and the repo-wide ad-hoc Ruff E/F baseline is non-green | The verification cannot claim a clean repository lint gate | Keep the 291-finding baseline explicit, require a defined policy before claiming lint readiness, and do not broaden V14 into unrelated mass formatting |
+
+
+### V15 — Real cutover decision gate
+
+**Dependency:** V14 must close first with the candidate commit SHA and exact-SHA hosted results recorded. The gate does not authorize deployment by itself.
+
+Evaluate every required condition from the M3 brief against recorded code/test/CI evidence: runtime exists and starts/stops/restarts; health works; worker identity and fencing hold; Owner reauthorization, queue recovery, evidence integrity, effect ledger and reconciliation work; process-death and multi-process cases are tested; CI is green; and deployment configuration and target are known. Record each condition with its evidence and an explicit result. If any essential item is unproved, record `CUTOVER_BLOCKED`, keep production at `PRODUCTION_DEPLOYMENT_BLOCKED`, and continue to V16 without external mutation.
+
+### V16 — Actual isolated non-production cutover rehearsal
+
+**Dependency:** V15 decision recorded. Use only an ephemeral hosted CI runner and a uniquely named Docker Compose project/volume. No production credential, database, external provider, external effect target, public bind, Cloudflare mutation, or persistent user data may be used.
+
+The rehearsal must exercise and retain evidence for all twelve required steps in order: Compose deploy/build; startup; health; disposable Owner login; mission creation; worker execution; queue state; evidence; controlled crash; same-identity worker restart; quarantine/recovery and Owner reconciliation; graceful shutdown; then cleanup. Keep fault injection in a test-only read-only mount for a one-off worker, not in the production runtime path. Require the crash hook to prove its database is beneath the ephemeral Compose state volume, and prove Compose volumes/containers and temporary files are removed in a `finally`/workflow cleanup path.
+
+Implementation slices: (1) a host-side rehearsal runner and a test-only provider-blocking crash hook, with tests for isolation, status assertions and cleanup; (2) an exact-SHA GitHub Actions Compose step that emits a distinct pass/fail marker for every rehearsal stage and always cleans up; (3) run the candidate on the exact pushed SHA, inspect logs and cleanup, then complete `docs/M3_CUTOVER_REHEARSAL.md` with evidence for each step. After verification, create the other required M3 architecture/runtime/recovery/effects/process artifacts if still absent, and finish `docs/M3_FINAL_AUDIT.md` mapping every M2E blocker to code evidence, test evidence and one permitted status.
+
+### V16 risk register
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| A rehearsal hook or live provider could escape the disposable test boundary | External effects or production-like credentials could be touched | Block provider calls in the one-off test worker; allow only the local `watch` effect; assert the database is under the per-run named volume; keep the hook read-only and test-only |
+| Compose worker lease is still live immediately after the crash | Recovery assertion could be nondeterministic | Use a test-only short lease or wait for the recorded lease expiration before starting the replacement worker; never edit the database directly to simulate recovery |
+| Hosted CI runner cleanup fails | Ephemeral resources or temporary state could remain | Put `compose down --volumes --remove-orphans` and temp-directory deletion in unconditional cleanup; verify the project has no remaining containers or volumes |
+| Local Docker Engine is unavailable | No local rehearsal is possible | Use only the exact-SHA hosted runner for the isolated rehearsal and label the evidence as hosted, not local |
