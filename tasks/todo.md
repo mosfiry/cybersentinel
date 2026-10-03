@@ -113,7 +113,7 @@
 - [x] Test bridge health, active-request drain, and graceful SIGTERM using a disposable child process and temporary DBs only; prove cleanup and reopened state.
 - [x] Extend the existing GitHub Actions workflow to build/run the container without publishing and assert bridge/worker health, UID, read-only root, shared-volume identity, workspace writes, and loopback host binding, plus worker restart/generation persistence.
 - [x] Fix the exact-SHA 52b2803 first-start race (`_data/workspace: file exists`) with a non-root serialized initializer completed before either service; retain the existing workspace path and files.
-- [ ] Verify bridge/worker health, UID/read-only/mount/loopback contract, workspace writes, and worker generation advancement on the new exact SHA.
+- [x] Verify bridge/worker health, UID/read-only/mount/loopback contract, workspace writes, and worker generation advancement on exact SHA `8e84268a4574d697cbde20029d308cd86d9f87f7`; hosted smoke passed.
 - [x] Run focused tests and the full local suite after the Docker source-inclusion correction: V12 suite 22 passed; full suite 1,040 passed, 1 skipped.
 - [x] Inspect exact-SHA GitHub and Cloudflare checks read-only. SHA `52b2803924e9f88af7c0513d03e5f2e62baf76ee`: audit passed; test failed before service startup at the known workspace-volume `file exists` race; Cloudflare check `111242158919` failed for the known missing Wrangler `previews` block; no preview or setting change.
 - [x] Inspect current exact-SHA run `37138760819` on `bc65e8272f9b230f428060a11fa998962fdc0258`: audit passed, compileall/pytest passed, but container smoke failed because `.dockerignore` omitted tracked `workspace/` source; the earlier `file exists` race did not recur.
@@ -124,7 +124,7 @@
 - [x] Final independent review of the prior exact-argv snapshot confirmed command identity and corrected the LOW stale two-volume operations sentence.
 - [x] Independent read-only review of the current `.dockerignore`/Dockerfile correction found no material issues; the static guard is not a live image build, so exact-SHA CI remains required.
 - [x] Confirm local Docker Engine is unavailable (no Docker binary); do not claim a local container smoke test.
-- [ ] Commit and push the reviewed source-inclusion correction non-force to the existing M3 branch; verify build import, service health, UID/read-only/mount/loopback contract, workspace writes, and worker restart/generation on that exact SHA before V13.
+- [x] Commit and push the reviewed source-inclusion correction non-force to the existing M3 branch; exact SHA `8e84268a4574d697cbde20029d308cd86d9f87f7` is the remote head and hosted smoke passed before V13.
 
 ### V12 guardrails
 
@@ -140,4 +140,17 @@
 - [x] GitHub audit on exact SHA `52b2803924e9f88af7c0513d03e5f2e62baf76ee` succeeded.
 - [x] Container smoke on that SHA built the image but failed at simultaneous first creation of the nested workspace path in the shared volume; a non-root one-shot initializer now creates that existing path before the bridge/worker.
 - [x] Cloudflare build for the same SHA failed at `npx wrangler preview` due missing `previews` configuration; no preview artifact was produced.
-- [ ] Verify the initializer, health checks, mount/security contract, and worker restart on a fresh exact-SHA CI run after the source-inclusion fix; no local Docker engine is installed. Independent review of this correction found no material issues; the same-volume TOCTOU trust assumption remains explicitly documented.
+- [x] Final exact-SHA V12 run `37139297002` on `8e84268a4574d697cbde20029d308cd86d9f87f7` passed compileall, pytest, Compose build/health, UID 10001, read-only root, shared mount/workspace writes, loopback publish, and worker generations 1→2→3; no local Docker engine is installed. The trusted-volume TOCTOU remains documented.
+
+- [x] Final exact-SHA audit run `37139297065` / check `111250214581` passed; V12 tests run `37139297002` / check `111250214523` passed. The earlier race and omitted-source failures are historical and did not recur on this final SHA.
+- [x] Reverify Cloudflare Workers Builds check `111250300538` read-only: build `54f66543-87fe-45aa-967e-31a73dacd405` stopped at the known missing Wrangler `previews` block; no Cloudflare setting/resource changed.
+- [x] Confirm remote M3 head equals V12 SHA `8e84268a4574d697cbde20029d308cd86d9f87f7`; protected `main=8a3fd109c0e586db13ed48a7371ac9ad06465b74` and M2D `task/m2d-cutover-20261002=9bf91ea37748a239e6a6e3b6327706fa614232cd` unchanged; no production deployment/public bind.
+
+### V13 — Reproducible production-like E2E (in progress)
+
+- [ ] Build an isolated harness using a loopback-only live bridge, temporary SQLite/state/workspace paths, real temporary Owner login, real mission HTTP routes, and the production worker/queue/runtime classes; fail on any provider/network call.
+- [ ] Run a deterministic two-step Owner mission using `run_project_tests` on a fixture workspace and the local `watch` effect. Assert the authorization snapshot, queue claim/generation, execution fence, evidence/result/effect history, verified `FindingClaim`, terminal completion, and persisted API readback.
+- [ ] Add a bounded subprocess crash hook after the local effect applies but before its ledger success transition; prove restart quarantines the mission, no automatic replay occurs, Owner explicitly reconciles the exact effect, a fresh login reauthorizes, and restart completes exactly once.
+- [ ] Repeat the same isolated mission for stale-worker fencing, expired Owner session, and competing workers; assert unauthorized/stale workers cannot dispatch and a concurrent queue item executes exactly once.
+- [ ] Repeat successful runs and compare a documented canonical projection of mission/result/evidence/effect outcomes, excluding only generated session IDs and wall-clock metadata; verify all databases, files, and subprocesses remain under temporary state.
+- [ ] Run focused V13 and adjacent recovery/auth/effect/process/concurrency tests, the full suite, compile/static/secret checks, obtain independent read-only review, checkpoint and push non-force, and verify the exact-SHA CI result before V14.

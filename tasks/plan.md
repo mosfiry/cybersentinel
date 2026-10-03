@@ -104,7 +104,7 @@ Treat provider responses and model-proposed tool calls as bounded, untrusted inp
 V11 is complete only when provider/tool inputs, provenance, turn/step/time/output budgets, and all current schemas fail closed across production dispatch paths; malformed mixed batches create no side effects; parallel boundaries are bounded; oversized results retain durable effect outcomes without replay; the full local suite and independent review pass; and the local checkpoint is recorded without protected-ref changes or remote writes.
 
 
-## V12 — Deployment Target Implementation (in progress; 2026-10-03)
+## V12 — Deployment Target Implementation (COMPLETE; 2026-10-03)
 
 ### Source findings verified
 
@@ -129,7 +129,7 @@ V11 is complete only when provider/tool inputs, provenance, turn/step/time/outpu
 2. Add fail-closed container bind opt-in and bounded graceful SIGTERM/SIGINT shutdown for the bridge; test local defaults, allowed/denied bind cases, and bridge health/shutdown with only a temporary database.
 3. Add runtime-only requirements, Dockerfile, `.dockerignore`, and Compose configuration with the existing state volume, serialized workspace initialization, single worker, loopback host publish, required bridge secret, optional provider env passthrough, non-root/read-only hardening, restart behavior, and explicit Owner bootstrap/volume-retention upgrade instructions.
 4. Extend existing GitHub Actions CI (no publish/deploy) to build and run the container target, assert API/worker liveness, UID, read-only root, volume mount identity, path-preserving workspace writes, and loopback publish, then restart the worker and verify the same state volume retains monotonically increasing generations. Use only CI-only credentials and an isolated compose project/volume.
-5. Run focused tests and the full suite, inspect the Docker build/Compose smoke result on exact pushed SHA, scan secrets/static dispatch paths, obtain an independent read-only review, update state/todo, and checkpoint before V13.
+5. Run focused tests and the full suite, inspect the Docker build/Compose smoke result on exact pushed SHA `8e84268a4574d697cbde20029d308cd86d9f87f7`, scan secrets/static dispatch paths, obtain independent read-only review, and close the phase. Hosted smoke and audit passed; the known Cloudflare preview-config failure remains read-only and no production deploy occurred.
 
 ### Risks and non-goals
 
@@ -142,3 +142,31 @@ V11 is complete only when provider/tool inputs, provenance, turn/step/time/outpu
 | Bridge and worker concurrently create a nested workspace path in one fresh shared state volume | Docker rejects initial container creation with a `file exists` race | Add a read-only non-root initializer as the sole first creator; gate both services on its successful completion and verify on a new normal exact-SHA CI run |
 | Source package omitted from Docker build context | Container starts but runtime module imports fail | Keep tracked app packages such as `workspace/` in the context and verify `from workspace import Workspace` after `USER 10001:10001`; test the ignore rule |
 | Production endpoint/authority is absent | Cannot prove or authorize production cutover | Keep `PRODUCTION_DEPLOYMENT_BLOCKED`; continue V13–V16 non-production verification/rehearsal |
+
+## V13 — Reproducible Production-Like End-to-End (in progress; 2026-10-03)
+
+### Scope and design decisions
+
+- Use only temporary state: a loopback-only live bridge, isolated SQLite databases, isolated workspace, a real temporary Owner account/session, real mission HTTP routes, and the production MissionService/MissionQueue/MissionWorker/MissionRuntime/effect-ledger path. Do not use saved production credentials, public listeners, external providers, or network tools.
+- Use a fixed explicit two-step plan: `run_project_tests` over a tiny controlled workspace fixture, followed by the local `watch` state-write effect. This supplies deterministic execution, durable evidence, and a local effect-ledger record without external service dependencies.
+- Treat a `Finding` as an explicit `FindingClaim` validated by the existing `VerificationEngine` against persisted mission evidence and the isolated fixture. There is no first-class mission Finding-approval API in the current contract; do not invent one for V13.
+- Exercise the existing typed Owner approval path for an intentionally ambiguous post-dispatch effect: after verifying the first-step finding, crash a disposable worker after the local effect handler but before effect success is durably recorded; require exact-effect `OWNER_CONFIRM_APPLIED`, then a fresh Owner login/revalidation and resumed completion. This tests the existing authorization/reconciliation contract rather than adding a generic approval endpoint.
+- Use a test-only worker child hook guarded by a dedicated argument/environment and temporary DB paths. It may terminate only its own disposable subprocess. Normal execution uses the existing supervised worker entrypoint; the hook is absent from production code.
+- Compare deterministic canonical projections across repeated success runs; explicitly normalize only session identifiers and wall-clock metadata that are intentionally generated. Verify hashes and causal links inside each run rather than assuming random identifiers are byte-identical.
+
+### Ordered implementation tasks and acceptance
+
+1. Add a V13 fixture/harness that redirects `DB_PATH`, mission/queue/scheduler sibling stores, and Owner policy state into `tmp_path`; creates the temporary Owner account; serves the bridge only on `127.0.0.1`; and provides bounded HTTP/process cleanup.
+2. Traverse Owner login → explicit Owner instruction → authorization snapshot → persisted mission → queue enqueue/claim/fence → real worker execution → evidence/result/effect ledger → verified FindingClaim → `GOAL_COMPLETED`; assert every transition and read it back through Owner-authenticated APIs.
+3. Add a real disposable worker-crash case at the local effect transition; verify restart quarantines unresolved work, preserves prior finding evidence, performs no automatic replay, permits only exact typed Owner reconciliation, requires a fresh Owner session, and completes after worker restart with one effect application.
+4. Exercise stale-worker, expired-session, worker-restart, ambiguous-effect, and concurrent-worker variants from the same isolated mission setup; assert no stale or unauthorized dispatch, one queue claim, and no duplicate effect.
+5. Run the successful scenario repeatedly and compare canonical result/finding/evidence/effect projections; assert every DB, workspace file, and subprocess is isolated and cleaned up.
+6. Run focused V13 and adjacent Owner-auth/recovery/fencing/effect/process/concurrency suites plus the complete suite and static/secret checks; request an independent read-only review; commit/push non-force to the existing M3 branch and verify the exact-SHA CI run before V14.
+
+### V13 risks and explicit boundaries
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| No first-class Finding-approval endpoint exists | A generic approval workflow would invent product behavior and broaden the API | Verify `FindingClaim` from durable mission evidence; use only the existing typed Owner effect-reconciliation decision followed by fresh reauthorization; record this scope boundary in the ledger |
+| Child crash leaves live lease/effect records | Could poison shared state or cause duplicate dispatch | One test-owned worker subprocess, per-test temp DBs, bounded exit code, restart/recovery assertions, and fixture cleanup; never signal unrelated PIDs |
+| Real providers/network could make results nondeterministic | External effects or credential leakage | Use only local `run_project_tests` and `watch`; explicit plan; fail if model/provider routing is invoked |
