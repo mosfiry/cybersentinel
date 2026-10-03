@@ -587,10 +587,14 @@ def _common_projection(
     }
 
 
-def _run_scenario(scenario: str) -> dict[str, Any]:
+def _run_scenario(
+    scenario: str,
+    *,
+    harness_factory: type[_LiveBridge] = _LiveBridge,
+) -> dict[str, Any]:
     state_root = Path(os.environ["CYBERSENTINEL_V13_STATE_ROOT"]).resolve()
     state_root.mkdir(parents=True, exist_ok=True)
-    harness = _LiveBridge(state_root)
+    harness = harness_factory(state_root)
     try:
         health_status, health = harness.request("GET", "/api/health")
         if health_status != 200 or health.get("ok") is not True:
@@ -824,11 +828,53 @@ def _run_scenario(scenario: str) -> dict[str, Any]:
                 {"returncode": item["returncode"], "failure_events": item["failure_events"]}
                 for item in worker_results
             ]
+        report_status, report_payload = harness.request(
+            "GET", f"/api/missions/{mission_id}/report", session=session
+        )
+        report = report_payload.get("report")
+        if report_status != 200 or not isinstance(report, dict):
+            raise RuntimeError("mission_report_api_failed")
+        report_mission = report.get("mission_summary")
+        report_verification = (
+            report_mission.get("verification")
+            if isinstance(report_mission, dict)
+            else None
+        )
+        report_findings = report.get("findings")
+        report_evidence = report.get("evidence")
+        report_owner = report.get("owner_approval_status")
+        if (
+            not isinstance(report_mission, dict)
+            or report_mission.get("mission_status") != "GOAL_COMPLETED"
+            or report_mission.get("outcome") != "VERIFIED"
+            or not isinstance(report_verification, dict)
+            or report_verification.get("verified") is not True
+            or not isinstance(report_findings, list)
+            or len(report_findings) != 2
+            or any(
+                not isinstance(item, dict) or item.get("status") != "PASS"
+                for item in report_findings
+            )
+            or not isinstance(report_evidence, dict)
+            or report_evidence.get("execution_chain_integrity") != "VALID"
+            or not isinstance(report_owner, dict)
+            or report_owner.get("status") != "RECORDED"
+        ):
+            raise RuntimeError("mission_report_not_verified")
+        report_summary = {
+            "mission_status": report_mission["mission_status"],
+            "outcome": report_mission["outcome"],
+            "verified": report_verification["verified"],
+            "finding_count": len(report_findings),
+            "execution_chain_integrity": report_evidence["execution_chain_integrity"],
+            "owner_approval_status": report_owner["status"],
+        }
         return {
             "ok": True,
             "scenario": scenario,
             "mission_id": mission_id,
             "finding": finding,
+            "report": report_summary,
             "integrity": _verify_integrity(harness, mission),
             "canonical_projection": projection,
         }

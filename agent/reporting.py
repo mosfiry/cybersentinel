@@ -21,6 +21,9 @@ _FAILURE_STATUSES = {
 _TRUSTED_VERIFICATION_AUTHORITIES = {
     "deterministic_observation",
     "deterministic_tool_result",
+    "project_test_process_exit",
+    "validated_status_snapshot",
+    "persisted_watch_store",
 }
 
 

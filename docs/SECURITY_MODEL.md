@@ -19,6 +19,7 @@
 - Owner authorization is bound to an immutable mission snapshot, request identity, target, allowed actions/tools, boundaries, and expiry. Queue workers revalidate the snapshot and the live Owner session before dispatch.
 - Mission lifecycle operations enforce ownership using the authenticated session reference; possession of a mission ID alone does not authorize access or cancellation.
 - Tool/model observations are not completion evidence. Completion is accepted only through deterministic, independent verification of the criterion. A tool's `criterion_id`, `success` flag, or self-authored evidence cannot establish goal completion.
+- Mission reports trust only the explicit verifier authorities `deterministic_observation`, `deterministic_tool_result`, `project_test_process_exit`, `validated_status_snapshot`, and `persisted_watch_store`. Provider/model claims and unlisted authority labels remain unverified.
 - Evidence records are integrity-protected and linked to the mission/request provenance. Failed or missing verification remains unverified; it is not converted to success.
 
 ## Network and SSRF controls

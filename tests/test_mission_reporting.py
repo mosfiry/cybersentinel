@@ -194,3 +194,57 @@ def test_model_proposals_are_reported_as_unverified_not_supporting_evidence(tmp_
     assert report["supporting_evidence"] == []
     assert report["evidence"]["unverified_model_proposals"][0]["verification"] == "UNVERIFIED_MODEL_PROPOSAL"
     assert any("Model-proposed evidence" in item for item in report["limitations"])
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        "project_test_process_exit",
+        "validated_status_snapshot",
+        "persisted_watch_store",
+    ],
+)
+def test_independent_runtime_verifier_authorities_support_verified_reports(tmp_path, authority):
+    mission = _mission(
+        tmp_path,
+        status=MissionStatus.GOAL_COMPLETED,
+        verification={"verified": True, "missing_criteria": [], "evidence_count": 1},
+        evidence=[
+            {
+                "criterion_id": "goal",
+                "passed": True,
+                "source": "independent-runtime-verifier",
+                "provenance": {"verification_authority": authority},
+            }
+        ],
+    )
+
+    report = build_mission_report(mission, evidence_chain_integrity="VALID")
+
+    assert report["mission_summary"]["outcome"] == "VERIFIED"
+    assert report["mission_summary"]["verification"]["verified"] is True
+    assert report["findings"][0]["status"] == "PASS"
+    assert report["evidence"]["goal"][0]["report_verification"] == "TRUSTED_DETERMINISTIC_SOURCE"
+
+
+def test_unlisted_verification_authority_cannot_support_verified_report(tmp_path):
+    mission = _mission(
+        tmp_path,
+        status=MissionStatus.GOAL_COMPLETED,
+        verification={"verified": True, "missing_criteria": [], "evidence_count": 1},
+        evidence=[
+            {
+                "criterion_id": "goal",
+                "passed": True,
+                "source": "untrusted-fixture",
+                "provenance": {"verification_authority": "model_asserted_success"},
+            }
+        ],
+    )
+
+    report = build_mission_report(mission, evidence_chain_integrity="VALID")
+
+    assert report["mission_summary"]["outcome"] == "UNKNOWN"
+    assert report["mission_summary"]["verification"]["verified"] is False
+    assert report["findings"][0]["status"] == "UNVERIFIED_PROVENANCE"
+    assert report["supporting_evidence"] == []
