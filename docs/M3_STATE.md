@@ -15,14 +15,14 @@
 - **Known M2E blockers:** (1) no owned worker supervisor/process lifecycle; (2) Owner authority must be revalidated after restart; (3) mission, queue, evidence, tool, and external-effect writes lack one enforced fence/transaction boundary; (4) no durable external-effect ledger or authorized reconciliation contract; (5) no real process-death or multi-process recovery proof; (6) deployment target is not source-grounded; (7) API/tool authorization boundaries need enforcement tests.
 - **GitHub push/hosted-CI prerequisite:** the session connector catalogue reports GitHub enabled, but `$MANUS_CONFIG_HOME/connectors/github/gh` is absent and installed `gh auth status` reports no authenticated CLI. Public GitHub API reads and `git ls-remote` work. The first explicit V0 push failed before submission because HTTPS could not obtain a username; the exact remote M3 branch was then confirmed absent by successful empty `git ls-remote` and GitHub branch API HTTP 404. No workflow was triggered and no branch ref changed. Do not retry until a valid configured write path is available; local implementation proceeds, while hosted M3 CI remains blocked.
 - **V0 status:** baseline verified; state record created before application-code changes and committed at `0d115fe54c162524fcf2ca45dbc0bcff405df470` (parent `e6efb9b1ef790bbac3c19460f16c0558ddc39c49`).
-- **Next phase:** V1 production runtime contract and supervisor/worker lifecycle implementation.
+- **Next phase:** V2 durable worker identity and lease generation.
 
 ## Phase ledger
 
 | Phase | Scope | Status | Checkpoint/evidence |
 |---|---|---|---|
 | V0 | Baseline and gap lock | COMPLETE | `0d115fe54c162524fcf2ca45dbc0bcff405df470`; base `e6efb9b1`; 781 passed, 1 skipped; compileall passed; push `FAILED_BEFORE_EXECUTION` and remote absence reconciled |
-| V1 | Runtime supervisor/lifecycle | NOT STARTED | — |
+| V1 | Runtime supervisor/lifecycle | COMPLETE | Code `37bd391bfcec8528f187c7688b2fb09eafab5bc8`; focused 29 passed; full 789 passed, 1 skipped; compileall/CLI help passed; remote push/CI blocked by missing authenticated GitHub write path |
 | V2 | Durable worker identity and lease generation | NOT STARTED | — |
 | V3 | Unified ExecutionFence | NOT STARTED | — |
 | V4 | Mission/queue transaction or durable recovery boundary | NOT STARTED | — |
@@ -46,3 +46,9 @@ The first pre-commit allowlist check used `git diff --name-only`, which omits a 
 ### V0 checkpoint push reconciliation
 
 Commit `0d115fe54c162524fcf2ca45dbc0bcff405df470` is the local V0 checkpoint on `task/m3-production-runtime-20261003`. One authorized non-force push attempt exited 128 with `fatal: could not read Username for 'https://github.com': terminal prompts disabled`. **Classification:** `FAILED_BEFORE_EXECUTION` (credential acquisition failed before ref update). Reconciliation: `git ls-remote --heads` exited 0 with no M3 branch ref, and the public GitHub branch API returned HTTP 404. No blind retry was made; no M3 hosted checks exist because the branch was not published. The GitHub connector catalogue says enabled, but its documented CLI wrapper is absent and `gh auth status` reports no active login.
+
+### V1 — Production runtime contract and lifecycle
+
+Implemented in code commit `37bd391bfcec8528f187c7688b2fb09eafab5bc8`: `agent/runtime_supervisor.py` adds explicit STARTING/RECOVERING/RUNNING/DRAINING/STOPPED/FAILED transitions; recovery runs before polling; the supervisor assigns a unique per-process worker-instance ID to the queue lease owner; polling is bounded and observable through a non-secret health snapshot; and SIGINT/SIGTERM request graceful drain without claiming more work. `bridge.py` now exposes a worker factory using the same existing mission/queue SQLite paths, and `scripts/run_mission_worker.py` is a standalone module entrypoint with a bounded rehearsal option and structured lifecycle output.
+
+Adversarial/focused tests `tests/test_runtime_supervisor.py`, `tests/test_lease_fencing.py`, and `tests/test_v14_security_integration_battery.py` passed **29/29**. The full suite passed **789 passed, 1 skipped**; `compileall`, `git diff --check`, boundary-aware changed-source secret scanning, and `python -m scripts.run_mission_worker --help` passed. The V1 code commit is local on the M3 branch. Remote publication and exact-SHA hosted CI remain `BLOCKED` by the V0 credential-path failure; no repeat push was attempted. `main` and M2D remain unchanged. V1 identity is process-unique; durable monotonic generation/fencing is explicitly deferred to V2.
