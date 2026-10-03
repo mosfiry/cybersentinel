@@ -148,9 +148,21 @@
 
 ### V13 — Reproducible production-like E2E (in progress)
 
-- [ ] Build an isolated harness using a loopback-only live bridge, temporary SQLite/state/workspace paths, real temporary Owner login, real mission HTTP routes, and the production worker/queue/runtime classes; fail on any provider/network call.
-- [ ] Run a deterministic two-step Owner mission using `run_project_tests` on a fixture workspace and the local `watch` effect. Assert the authorization snapshot, queue claim/generation, execution fence, evidence/result/effect history, verified `FindingClaim`, terminal completion, and persisted API readback.
-- [ ] Add a bounded subprocess crash hook after the local effect applies but before its ledger success transition; prove restart quarantines the mission, no automatic replay occurs, Owner explicitly reconciles the exact effect, a fresh login reauthorizes, and restart completes exactly once.
-- [ ] Repeat the same isolated mission for stale-worker fencing, expired Owner session, and competing workers; assert unauthorized/stale workers cannot dispatch and a concurrent queue item executes exactly once.
-- [ ] Repeat successful runs and compare a documented canonical projection of mission/result/evidence/effect outcomes, excluding only generated session IDs and wall-clock metadata; verify all databases, files, and subprocesses remain under temporary state.
-- [ ] Run focused V13 and adjacent recovery/auth/effect/process/concurrency tests, the full suite, compile/static/secret checks, obtain independent read-only review, checkpoint and push non-force, and verify the exact-SHA CI result before V14.
+- [x] Build an isolated harness using a loopback-only live bridge, temporary SQLite/state/workspace paths, a real temporary Owner login, real mission HTTP routes, and production worker/queue/runtime classes; fail on any provider call.
+- [x] Run the deterministic two-step Owner mission (`run_project_tests` plus local `watch`), assert the snapshot, queue/fence, persisted evidence/effect/result, verified `FindingClaim`, completion, and Owner-authenticated API readback.
+- [x] Use a bounded disposable worker crash after local effect application but before its success transition; assert restart quarantine, ambiguous effect visibility, no auto-replay, exact typed Owner reconciliation, fresh Owner login/revalidation, and one effect at completion.
+- [x] Cover stale worker generation with a barrier proving generation 1 attempts only after generation 2 is registered; it cannot claim or dispatch. Cover expired-session denials and competing workers claiming/applying once.
+- [x] Run repeated successful scenarios and compare canonical result projections; all test-owned DBs, files, and subprocesses are isolated under each temporary root.
+- [x] V13 revealed a real recovery bug: Owner reauthorization replaced the snapshot required to inspect an already-dispatched effect. Persist snapshots in the mission integrity payload and match the effect digest to the latest valid snapshot active at `effect.created_at`; malformed, missing, wrong-owner, and wrong-time history fails closed.
+- [x] Focused V13 E2E: 4 passed; effect reconciliation: 40 passed; full suite: 1,048 passed, 1 skipped.
+- [x] First independent security review found that legacy rows with an empty effect Owner identity could be inspected/approved by deriving the mission Owner; both paths now require exact nonempty identity equality, and legacy blank-owner rows fail closed without mutation. New fenced reservations persist the Owner identity from the authorization snapshot.
+- [x] Final independent review confirmed strict Owner binding and snapshot-history validation; its low crash-projection concern was fixed by deriving approval status, Owner event count, dispatch count, and uniqueness from the HTTP response and post-resume ledger history. No remaining finding; focused/full tests reran successfully.
+- [x] Final compile, YAML/shell syntax, secret-pattern, `git diff --check`, protected-ref, and V13 child-cleanup checks passed.
+- [x] Local code checkpoints: recovery fix `2729fb593127506021693fe0f170826e2b0ae06f`; E2E harness `ac85df78d3dfeed63d18a951d10938ee41923a51`. The ledger update is being checkpointed; remote push/CI remain pending.
+
+
+#### V13 regression/closeout evidence (2026-10-03)
+
+- Regression reproduced after queue start/resume renewed Owner authority: the effect row retained the dispatch-time hash, but readback compared it only with the new current snapshot. The live crash scenario could not inspect its `DISPATCHED` effect after restart.
+- Fix is confined to Mission snapshot serialization/history, the shared execution-fence validator, AgentCore reauthorization, effect reconciliation/ledger authorization, and isolated tests. The current test matrix verifies exact historical snapshot acceptance and fail-closed missing/wrong-owner history.
+- Full local suite is green (1,048 passed, 1 skipped); legacy mission payloads lacking history still load/round-trip, while legacy effects lacking Owner identity fail closed. Final independent review is complete with no remaining finding. Local code checkpoints exist; non-force push and exact-SHA CI must still pass before V14.
