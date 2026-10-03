@@ -390,8 +390,12 @@ class MissionWorker:
             MissionStatus.SCOPE_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
         }.get(mission.status, WorkerMissionState.PARTIAL_SUCCESS if mission.evidence else WorkerMissionState.FAILED)
+        # Recovery-required work is quarantined, not held under a live claim.
+        # WAITING_FOR_TOOL is non-claimable until an authorized resolver changes
+        # the queue state; release clears stale ownership while preserving epoch.
+        persist_state = self.queue.release if state is WorkerMissionState.WAITING_FOR_TOOL else self.queue.update
         try:
-            return self.queue.update(
+            return persist_state(
                 item.mission_id,
                 state,
                 error=mission.error,
