@@ -82,6 +82,44 @@ class Task:
         self.updated_at = datetime.now(timezone.utc).isoformat()
         return True
 
+    def begin_tool_call(self, tool_call_id: str, tool_name: str, *, request_id: str, owner_session_id: str, argument_sha256: str, risk_class: str) -> bool:
+        """Persist a write-ahead intent without retaining raw arguments."""
+        if not tool_call_id:
+            raise ValueError("tool_call_id is required for an in-flight effect")
+        if any(item.get("tool_call_id") == tool_call_id for item in self.tool_calls):
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        self.tool_calls.append({
+            "tool_call_id": tool_call_id,
+            "task_id": self.task_id,
+            "conversation_id": self.conversation_id,
+            "tool_name": tool_name,
+            "argument_sha256": argument_sha256,
+            "risk_class": risk_class,
+            "status": "in_flight",
+            "request_id": request_id,
+            "owner_session_id": owner_session_id,
+            "result": None,
+            "timestamp": now,
+        })
+        self.updated_at = now
+        return True
+
+    def finish_tool_call(self, tool_call_id: str, status: str, *, result: Any, argument: Any = None) -> bool:
+        """Finalize an in-flight attempt once; ambiguous attempts stay non-replayable."""
+        if status not in {"completed", "unknown"}:
+            raise ValueError("tool call final status must be completed or unknown")
+        for item in self.tool_calls:
+            if item.get("tool_call_id") != tool_call_id:
+                continue
+            if item.get("status") != "in_flight":
+                return False
+            now = datetime.now(timezone.utc).isoformat()
+            item.update({"status": status, "result": result, "argument": argument, "updated_at": now})
+            self.updated_at = now
+            return True
+        return False
+
     def add_tool_call(self, tool_name: str, status: str, request_id: str | None = None) -> None:
         self.record_tool_call(uuid.uuid4().hex, tool_name, status, request_id=request_id or self.request_id, owner_session_id=self.owner_session_id)
 

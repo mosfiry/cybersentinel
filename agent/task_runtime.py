@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +30,7 @@ class AgentTaskRuntime:
         self.router = router
         self.executor = executor or self._default_executor
         self.limits = runtime_limits or RuntimeLimits.from_owner_policy()
+        self._state_lock = threading.RLock()
 
     @staticmethod
     def _default_executor(command: str, *, owner_session_token: str, owner_session_id: str | None = None, scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None, authorization_decision: Any = None) -> dict[str, Any]:
@@ -47,19 +50,19 @@ class AgentTaskRuntime:
             schemas.append({"type": "function", "function": {"name": spec.name, "description": spec.description[:512], "parameters": parameters}})
         return schemas
 
-    @staticmethod
-    def _event(task: Task, event: str, data: dict[str, Any] | None = None) -> None:
-        events = task.execution_state.setdefault("events", [])
-        events.append({"event": event, "task_id": task.task_id, "conversation_id": task.conversation_id, "request_id": task.request_id, "step": task.current_step, "data": data or {}, "timestamp": time.time()})
-        task.execution_state["events"] = events[-500:]
-        TaskManager.update_task(task)
+    def _event(self, task: Task, event: str, data: dict[str, Any] | None = None) -> None:
+        with self._state_lock:
+            events = task.execution_state.setdefault("events", [])
+            events.append({"event": event, "task_id": task.task_id, "conversation_id": task.conversation_id, "request_id": task.request_id, "step": task.current_step, "data": data or {}, "timestamp": time.time()})
+            task.execution_state["events"] = events[-500:]
+            TaskManager.update_task(task)
 
     @staticmethod
     def _tool_calls(response: dict[str, Any]) -> list[ToolCall]:
         calls = []
         for item in response.get("tool_calls") or []:
             if isinstance(item, ToolCall):
-                calls.append(item)
+                calls.append(item if item.call_id else ToolCall(item.name, item.arguments, uuid.uuid4().hex))
             elif isinstance(item, dict) and isinstance(item.get("name"), str):
                 args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
                 calls.append(ToolCall(item["name"], args, str(item.get("id") or uuid.uuid4().hex)))
@@ -173,11 +176,81 @@ class AgentTaskRuntime:
         value = call.arguments.get("query")
         return value if isinstance(value, str) else None
 
+    @staticmethod
+    def _pending_tool_call(task: Task) -> dict[str, Any] | None:
+        recovery = task.execution_state.get("recovery_required") if isinstance(task.execution_state, dict) else None
+        if isinstance(recovery, dict):
+            return recovery
+        for item in task.tool_calls:
+            if item.get("status") in {"in_flight", "unknown", "failed"}:
+                return item
+        # Older task records only persisted a tool.started event before dispatch.
+        # Treat an unmatched start as ambiguous instead of replaying it on resume.
+        started: dict[str, dict[str, Any]] = {}
+        completed: set[str] = set()
+        empty_id_starts = 0
+        empty_id_completions = 0
+        empty_id_tool = ""
+        for event in task.execution_state.get("events", []) if isinstance(task.execution_state, dict) else []:
+            if not isinstance(event, dict):
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            call_id = str(data.get("tool_call_id") or "")
+            if event.get("event") == "tool.started":
+                if call_id:
+                    started[call_id] = {"tool_call_id": call_id, "tool_name": data.get("tool", ""), "status": "in_flight"}
+                else:
+                    empty_id_starts += 1
+                    empty_id_tool = str(data.get("tool") or empty_id_tool)
+            elif event.get("event") in {"tool.completed", "tool.outcome_unknown"}:
+                if call_id:
+                    completed.add(call_id)
+                else:
+                    empty_id_completions += 1
+        recorded = {str(item.get("tool_call_id") or "") for item in task.tool_calls}
+        for call_id, item in started.items():
+            if call_id not in completed and call_id not in recorded:
+                return item
+        if empty_id_starts > empty_id_completions:
+            return {"tool_call_id": "", "tool_name": empty_id_tool, "status": "in_flight"}
+        return None
+
+    def _mark_tool_recovery(self, task: Task, record: dict[str, Any], *, reason: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
+        call_id = str(record.get("tool_call_id") or "")
+        result = result or {"ok": False, "error": "tool_outcome_unknown"}
+        with self._state_lock:
+            existing = next((item for item in task.tool_calls if item.get("tool_call_id") == call_id), None)
+            if existing is not None and existing.get("status") == "in_flight":
+                task.finish_tool_call(call_id, "unknown", result=result)
+            if not isinstance(task.execution_state.get("recovery_required"), dict):
+                details = {
+                    "tool_call_id": call_id,
+                    "tool_name": str(record.get("tool_name") or ""),
+                    "risk_class": str(record.get("risk_class") or "unknown"),
+                    "status": "unknown",
+                    "reason": reason,
+                    "request_id": task.request_id,
+                }
+                task.execution_state["recovery_required"] = details
+                task.error = "tool_outcome_unknown"
+                task.update_status(TaskStatus.WAITING_FOR_TOOL)
+                self._event(task, "tool.outcome_unknown", details)
+            else:
+                task.error = "tool_outcome_unknown"
+                if task.status != TaskStatus.WAITING_FOR_TOOL:
+                    task.update_status(TaskStatus.WAITING_FOR_TOOL)
+                TaskManager.update_task(task)
+        return {"ok": False, "error": "tool_outcome_unknown", "recovery_required": True, "tool_call_id": call_id}
+
     def _run_one(self, task: Task, call: ToolCall, owner_session_token: str, owner_session_id: str | None) -> dict[str, Any]:
-        if call.call_id and task.has_tool_call(call.call_id):
-            existing = next(item for item in task.tool_calls if item.get("tool_call_id") == call.call_id)
+        tool_call_id = call.call_id or uuid.uuid4().hex
+        if task.has_tool_call(tool_call_id):
+            existing = next(item for item in task.tool_calls if item.get("tool_call_id") == tool_call_id)
+            if existing.get("status") in {"in_flight", "unknown", "failed"}:
+                return self._mark_tool_recovery(task, existing, reason="replayed call has an unresolved prior outcome", result=existing.get("result"))
             return existing.get("result") or {"ok": False, "error": "replayed_tool_call"}
         argument = self._argument(call)
+        argument_sha256 = hashlib.sha256((argument or "").encode("utf-8")).hexdigest()
         item = call.name if argument is None else [call.name, argument]
         spec = get_tool(call.name)
         valid, reason = spec.validate(argument) if spec else (False, "unknown tool")
@@ -185,7 +258,7 @@ class AgentTaskRuntime:
             valid, reason = False, "unknown tool argument"
         authorization_context = self._authorization_context(task)
         decision = authorize_tool(item, context=authorization_context) if authorization_context is not None else authorize_tool(item)
-        self._event(task, "tool.selected", {"tool": call.name, "tool_call_id": call.call_id})
+        self._event(task, "tool.selected", {"tool": call.name, "tool_call_id": tool_call_id})
         if spec is not None and spec.scope_required:
             scope_context = task.execution_state.get("scope_context")
             if authorization_context is None or authorization_context.scope_snapshot is None or not isinstance(scope_context, dict) or scope_context.get("scope_snapshot_id") != authorization_context.scope_snapshot.snapshot_id:
@@ -203,10 +276,19 @@ class AgentTaskRuntime:
                         break
         if not decision.allowed or not valid:
             result = {"ok": False, "error": decision.reason if not decision.allowed else reason}
-            task.record_tool_call(call.call_id, call.name, "denied", request_id=task.request_id, owner_session_id=task.owner_session_id, result=result, argument=argument)
-            self._event(task, "tool.completed", {"tool": call.name, "tool_call_id": call.call_id, "status": "denied"})
+            task.record_tool_call(tool_call_id, call.name, "denied", request_id=task.request_id, owner_session_id=task.owner_session_id, result=result, argument=argument)
+            self._event(task, "tool.completed", {"tool": call.name, "tool_call_id": tool_call_id, "status": "denied"})
             return result
-        self._event(task, "tool.started", {"tool": call.name, "tool_call_id": call.call_id})
+
+        risk_class = spec.risk_class if spec is not None else "unknown"
+        intent = {"tool_call_id": tool_call_id, "tool_name": call.name, "risk_class": risk_class, "status": "in_flight"}
+        with self._state_lock:
+            if not task.begin_tool_call(tool_call_id, call.name, request_id=task.request_id, owner_session_id=task.owner_session_id, argument_sha256=argument_sha256, risk_class=risk_class):
+                existing = next((entry for entry in task.tool_calls if entry.get("tool_call_id") == tool_call_id), intent)
+                return self._mark_tool_recovery(task, existing, reason="tool intent already exists", result=existing.get("result"))
+            # _event commits the in-flight record to SQLite before any executor call.
+            self._event(task, "tool.started", {"tool": call.name, "tool_call_id": tool_call_id, "risk_class": risk_class, "argument_sha256": argument_sha256})
+
         try:
             scope_context = task.execution_state.get("scope_context")
             if spec is not None and spec.scope_required:
@@ -214,18 +296,24 @@ class AgentTaskRuntime:
             else:
                 result = self.executor(f"Owner {call.name}" + (f" {argument}" if argument else ""), owner_session_token=owner_session_token, owner_session_id=owner_session_id, scope_context=scope_context, authorization_context=authorization_context, authorization_decision=decision.decision)
             result = result if isinstance(result, dict) else {"ok": True, "result": result}
-            status = "completed" if result.get("ok", True) else "failed"
         except Exception as exc:
             result = {"ok": False, "error": type(exc).__name__}
-            status = "failed"
-        task.record_tool_call(call.call_id, call.name, status, request_id=task.request_id, owner_session_id=task.owner_session_id, result=result, argument=argument)
+            return self._mark_tool_recovery(task, intent, reason="executor raised after dispatch began", result=result)
+
+        if result.get("ok", True) is False:
+            return self._mark_tool_recovery(task, intent, reason="executor returned a non-success result after dispatch began", result=result)
+
+        with self._state_lock:
+            if not task.finish_tool_call(tool_call_id, "completed", result=result, argument=argument):
+                existing = next((entry for entry in task.tool_calls if entry.get("tool_call_id") == tool_call_id), intent)
+                return self._mark_tool_recovery(task, existing, reason="completion could not be durably bound to its intent", result={"ok": False, "error": "tool_outcome_unknown"})
+            self._event(task, "tool.completed", {"tool": call.name, "tool_call_id": tool_call_id, "status": "completed"})
         if result.get("request_id"):
             task.execution_state.setdefault("evidence_refs", []).append(result["request_id"])
             self._event(task, "evidence.added", {"request_id": result["request_id"], "tool": call.name})
-        memory_item = ConversationMemory.store_conversation_memory(task.conversation_id, json.dumps({"tool": call.name, "result": result}, ensure_ascii=False), MemoryType.TOOL_RESULT, source="tool", provenance=f"task:{task.task_id}", metadata={"tool_call_id": call.call_id})
+        memory_item = ConversationMemory.store_conversation_memory(task.conversation_id, json.dumps({"tool": call.name, "result": result}, ensure_ascii=False), MemoryType.TOOL_RESULT, source="tool", provenance=f"task:{task.task_id}", metadata={"tool_call_id": tool_call_id})
         task.execution_state.setdefault("memory_refs", []).append(memory_item.memory_id)
-        self._event(task, "memory.updated", {"type": "tool_result", "tool_call_id": call.call_id})
-        self._event(task, "tool.completed", {"tool": call.name, "tool_call_id": call.call_id, "status": status})
+        self._event(task, "memory.updated", {"type": "tool_result", "tool_call_id": tool_call_id})
         return result
 
     def _guard_call(self, task: Task, call: ToolCall) -> str | None:
@@ -247,6 +335,10 @@ class AgentTaskRuntime:
             raise KeyError("unknown_task")
         if not self._valid_owner_session(task, owner_session_token):
             raise PermissionError("owner authentication required")
+        pending_tool = self._pending_tool_call(task)
+        if pending_tool is not None:
+            self._mark_tool_recovery(task, pending_tool, reason="task resumed with an unresolved tool dispatch")
+            return task
         claimed = TaskManager.claim_task(task_id, task.owner_session_id, allow_paused=True)
         if claimed is None:
             return TaskManager.get_task(task_id) or task
@@ -314,9 +406,11 @@ class AgentTaskRuntime:
                             self._event(task, "task.cancelled")
                             break
                         self._run_one(task, call, owner_session_token, owner_session_id)
-                if not task.is_terminal and task.status == TaskStatus.WAITING_FOR_TOOL:
+                        if task.execution_state.get("recovery_required"):
+                            break
+                if not task.is_terminal and task.status == TaskStatus.WAITING_FOR_TOOL and not task.execution_state.get("recovery_required"):
                     task.update_status(TaskStatus.WAITING_FOR_MODEL)
-                if not task.is_terminal:
+                if not task.is_terminal and not task.execution_state.get("recovery_required"):
                     task.save_resume_state({"next": "model", "step": task.current_step})
         except Exception as exc:
             task.increment_retry()
@@ -331,6 +425,6 @@ class AgentTaskRuntime:
         while slices < (max_slices or self.limits.max_execution_steps):
             task = self.run_slice(task_id, owner_session_token=owner_session_token, owner_session_id=owner_session_id)
             slices += 1
-            if task.is_terminal or task.pause_requested or task.cancel_requested:
+            if task.is_terminal or task.pause_requested or task.cancel_requested or task.execution_state.get("recovery_required"):
                 return task
         return TaskManager.get_task(task_id) or task
