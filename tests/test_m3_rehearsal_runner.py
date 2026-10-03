@@ -106,8 +106,18 @@ def test_queue_state_accepts_persisted_lowercase_execution_state(
 
     result = runner._queue_state()
 
-    assert result["queue_state"] == "executing"
+    assert result["queue_state"] == WorkerMissionState.EXECUTING.value
     assert runner.lease_expires_at == "2099-01-01T00:00:00+00:00"
+
+
+def test_recovery_queue_status_constants_match_persisted_worker_enum() -> None:
+    from agent.mission_worker import WorkerMissionState
+
+    assert rehearsal.QUEUE_STATE_EXECUTING == WorkerMissionState.EXECUTING.value
+    assert rehearsal.QUEUE_STATE_WAITING_FOR_TOOL == (
+        WorkerMissionState.WAITING_FOR_TOOL.value
+    )
+    assert rehearsal.QUEUE_STATE_COMPLETED == WorkerMissionState.COMPLETED.value
 
 
 def test_safe_environment_removes_ambient_provider_and_runtime_credentials(

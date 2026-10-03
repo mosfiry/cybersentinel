@@ -15,6 +15,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from agent.mission_worker import WorkerMissionState
+
 from .host import (
     CRASH_EXIT_CODE,
     CRASH_MARKER,
@@ -31,6 +33,10 @@ from .host import (
     _free_loopback_port,
     _safe_environment,
 )
+
+QUEUE_STATE_EXECUTING = WorkerMissionState.EXECUTING.value
+QUEUE_STATE_WAITING_FOR_TOOL = WorkerMissionState.WAITING_FOR_TOOL.value
+QUEUE_STATE_COMPLETED = WorkerMissionState.COMPLETED.value
 
 
 class RehearsalRunner:
@@ -327,7 +333,7 @@ class RehearsalRunner:
         queue = probe.get("queue") or {}
         generation = probe.get("generation") or {}
         checks = {
-            "queue_executing": queue.get("state") == "executing",
+            "queue_executing": queue.get("state") == QUEUE_STATE_EXECUTING,
             "single_attempt": queue.get("attempts") == 1,
             "queue_generation_one": queue.get("runtime_generation") == 1,
             "lease_owned": queue.get("lease_owned") is True,
@@ -474,7 +480,7 @@ class RehearsalRunner:
             queue = probe.get("queue") or {}
             if (
                 mission.get("status") == "RECOVERY_REQUIRED"
-                and queue.get("state") == "WAITING_FOR_TOOL"
+                and queue.get("state") == QUEUE_STATE_WAITING_FOR_TOOL
                 and effects
                 and effects[0].get("state") == "DISPATCHED"
                 and probe.get("watch_count") == 1
@@ -545,7 +551,7 @@ class RehearsalRunner:
             final_queue = final_probe.get("queue") or {}
             if (
                 final_mission.get("status") == "GOAL_COMPLETED"
-                and final_queue.get("state") == "COMPLETED"
+                and final_queue.get("state") == QUEUE_STATE_COMPLETED
             ):
                 break
             if self.worker2 is not None and self.worker2.poll() is not None:
@@ -566,18 +572,30 @@ class RehearsalRunner:
             {},
         )
         event_types = final_effect.get("events", [])
-        if (
-            final_mission.get("status") != "GOAL_COMPLETED"
-            or final_queue.get("state") != "COMPLETED"
-            or len(final_effects) != 1
-            or final_effects[0].get("state") != "SUCCEEDED"
-            or final_probe.get("watch_count") != 1
-            or sum(1 for event in event_types if event == "DISPATCHED") != 1
-            or sum(1 for event in event_types if event == "OWNER_CONFIRMED_APPLIED")
-            != 1
-            or (final_probe.get("generation") or {}).get("runtime_generation") != 2
-        ):
-            raise RehearsalFailure("owner_reconciliation_or_no_duplicate_proof_failed")
+        proof_checks = {
+            "mission_completed": final_mission.get("status") == "GOAL_COMPLETED",
+            "queue_completed": final_queue.get("state") == QUEUE_STATE_COMPLETED,
+            "effect_count_one": len(final_effects) == 1,
+            "effect_succeeded": len(final_effects) == 1
+            and final_effects[0].get("state") == "SUCCEEDED",
+            "local_watch_once": final_probe.get("watch_count") == 1,
+            "dispatch_once": sum(1 for event in event_types if event == "DISPATCHED")
+            == 1,
+            "owner_confirmation_once": sum(
+                1 for event in event_types if event == "OWNER_CONFIRMED_APPLIED"
+            )
+            == 1,
+            "worker_generation_two": (final_probe.get("generation") or {}).get(
+                "runtime_generation"
+            )
+            == 2,
+        }
+        failed_checks = [name for name, passed in proof_checks.items() if not passed]
+        if failed_checks:
+            raise RehearsalFailure(
+                "owner_reconciliation_or_no_duplicate_proof_failed:"
+                + ",".join(failed_checks)
+            )
         return {
             "restart_quarantine": "RECOVERY_REQUIRED",
             "owner_confirmed_applied": True,
