@@ -5,7 +5,18 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .provider_api import MAX_PROVIDER_RESPONSE_BYTES, InvalidModelResponse, ProviderCapabilities, ProviderResponse, ToolCall
+from .provider_api import (
+    MAX_PROVIDER_ARGUMENT_BYTES,
+    MAX_PROVIDER_RESPONSE_BYTES,
+    MAX_PROVIDER_TOOL_CALLS,
+    MAX_PROVIDER_TOOL_NAME_CHARS,
+    InvalidModelResponse,
+    ProviderCapabilities,
+    ProviderResponse,
+    ToolCall,
+    enforce_json_byte_limit,
+    validate_provider_response,
+)
 
 
 class OpenAICompatibleProvider:
@@ -84,7 +95,7 @@ class OpenAICompatibleProvider:
         raw_calls = message.get("tool_calls")
         if raw_calls is None:
             raw_calls = []
-        if not isinstance(raw_calls, list):
+        if not isinstance(raw_calls, list) or len(raw_calls) > MAX_PROVIDER_TOOL_CALLS:
             raise invalid("provider returned malformed tool calls")
         calls: list[ToolCall] = []
         for raw in raw_calls:
@@ -94,19 +105,31 @@ class OpenAICompatibleProvider:
             if not isinstance(function, dict):
                 raise invalid("provider returned malformed tool function")
             name = function.get("name")
-            if not isinstance(name, str) or not name.strip():
+            if not isinstance(name, str) or len(name) > MAX_PROVIDER_TOOL_NAME_CHARS or not name.strip():
                 raise invalid("provider returned a tool call without a valid name")
             args = function.get("arguments", {})
             if args is None:
                 args = {}
             if isinstance(args, str):
+                enforce_json_byte_limit(
+                    args,
+                    max_bytes=MAX_PROVIDER_ARGUMENT_BYTES,
+                    message="provider returned oversized or malformed tool arguments",
+                    provider=self.name,
+                    model=self.model,
+                )
                 try:
                     args = json.loads(args)
                 except (json.JSONDecodeError, TypeError) as exc:
                     raise invalid("provider returned malformed tool arguments") from exc
             if not isinstance(args, dict):
                 raise invalid("provider tool arguments must be an object")
-            calls.append(ToolCall(name, args, str(raw.get("id") or "")))
+            call_id = raw.get("id", "")
+            if call_id is None:
+                call_id = ""
+            if not isinstance(call_id, str):
+                raise invalid("provider returned malformed tool-call identity")
+            calls.append(ToolCall(name, args, call_id))
         finish_reason = choice.get("finish_reason")
         if finish_reason is not None and not isinstance(finish_reason, str):
             raise invalid("provider returned malformed finish reason")
@@ -122,7 +145,7 @@ class OpenAICompatibleProvider:
             content = ""
         elif not isinstance(content, str):
             raise invalid("provider returned malformed text")
-        return ProviderResponse(
+        return validate_provider_response(ProviderResponse(
             text=content,
             tool_calls=calls,
             finish_reason=str(finish_reason or ("tool_calls" if calls else "stop")),
@@ -130,7 +153,7 @@ class OpenAICompatibleProvider:
             model=self.model,
             usage=usage,
             capability=capability,
-        )
+        ), provider=self.name, model=self.model)
 
     def generate(self, messages: list[dict], temperature: float = 0, timeout: int = 90, **kwargs: Any) -> ProviderResponse:
         payload = {"model": self.model, "messages": messages, "temperature": temperature, **kwargs}

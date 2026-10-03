@@ -4,7 +4,22 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence
 import uuid
 
-from .provider_api import CapabilityUnsupported, InvalidModelResponse
+from .provider_api import (
+    MAX_PROVIDER_ARGUMENT_BYTES,
+    MAX_PROVIDER_CALL_ID_CHARS,
+    MAX_PROVIDER_FINISH_REASON_CHARS,
+    MAX_PROVIDER_LABEL_CHARS,
+    MAX_PROVIDER_TEXT_CHARS,
+    MAX_PROVIDER_TOOL_CALLS,
+    MAX_PROVIDER_TOOL_NAME_CHARS,
+    MAX_PROVIDER_USAGE_BYTES,
+    CapabilityUnsupported,
+    InvalidModelResponse,
+    enforce_json_byte_limit,
+)
+
+
+MAX_MODEL_IDENTITY_CHARS = 512
 
 
 @dataclass(frozen=True)
@@ -112,20 +127,27 @@ def model_turn_from_provider(response: dict[str, Any], *, mission_id: str, run_i
     raw_calls = response.get("tool_calls")
     if raw_calls is None:
         raw_calls = []
-    if not isinstance(raw_calls, (list, tuple)):
+    if not isinstance(raw_calls, (list, tuple)) or len(raw_calls) > MAX_PROVIDER_TOOL_CALLS:
         raise InvalidModelResponse("model adapter received malformed tool calls")
     for raw in raw_calls:
         if not isinstance(raw, dict):
             raise InvalidModelResponse("model adapter received a malformed tool call")
         name = raw.get("name")
-        if not isinstance(name, str) or not name.strip():
+        if not isinstance(name, str) or len(name) > MAX_PROVIDER_TOOL_NAME_CHARS or not name.strip():
             raise InvalidModelResponse("model adapter received a tool call without a valid name")
         arguments = raw.get("arguments", {})
         if arguments is None:
             arguments = {}
         if not isinstance(arguments, dict):
             raise InvalidModelResponse("model adapter received non-object tool arguments")
-        call_id = str(raw.get("id") or "call_" + uuid.uuid4().hex)
+        enforce_json_byte_limit(arguments, max_bytes=MAX_PROVIDER_ARGUMENT_BYTES, message="model adapter received oversized or malformed tool arguments")
+        raw_call_id = raw.get("id")
+        if raw_call_id is None or raw_call_id == "":
+            call_id = "call_" + uuid.uuid4().hex
+        elif not isinstance(raw_call_id, str) or len(raw_call_id) > MAX_PROVIDER_CALL_ID_CHARS:
+            raise InvalidModelResponse("model adapter received malformed tool-call identity")
+        else:
+            call_id = raw_call_id
         calls.append(ToolCallProposal.create(name, arguments, mission_id=mission_id, run_id=run_id, turn_id=turn_id, action_id=f"{mission_id}:{turn_id}:{call_id}", tool_call_id=call_id, request_id=request_id, plan_version=plan_version, step_id=step_id))
     content = response.get("content", "")
     if content is None:
@@ -142,22 +164,81 @@ def model_turn_from_provider(response: dict[str, Any], *, mission_id: str, run_i
         usage = {}
     if not isinstance(usage, dict):
         raise InvalidModelResponse("model adapter received malformed usage metadata")
-    return ModelTurn(turn_id=turn_id, content=content, tool_calls=tuple(calls), provider=str(response.get("provider", "")), model=str(response.get("model", "")), finish_reason=finish_reason, usage=usage)
+    provider_name = response.get("provider", "")
+    model_name = response.get("model", "")
+    if not isinstance(provider_name, str) or not isinstance(model_name, str):
+        raise InvalidModelResponse("model adapter received malformed provider identity")
+    return validate_model_turn(ModelTurn(turn_id=turn_id, content=content, tool_calls=tuple(calls), provider=provider_name, model=model_name, finish_reason=finish_reason, usage=usage))
 
 
 def validate_model_turn(value: Any) -> ModelTurn:
     """Reject malformed NativeModel values before they enter mission orchestration."""
     if not isinstance(value, ModelTurn):
         raise InvalidModelResponse("model returned an unsupported turn")
-    if not isinstance(value.turn_id, str) or not isinstance(value.content, str):
+    if not isinstance(value.turn_id, str) or not value.turn_id or len(value.turn_id) > MAX_PROVIDER_CALL_ID_CHARS:
+        raise InvalidModelResponse("model returned malformed turn identity")
+    try:
+        value.turn_id.encode("utf-8")
+    except UnicodeError as exc:
+        raise InvalidModelResponse("model returned invalid turn identity encoding") from exc
+    if not isinstance(value.content, str) or len(value.content) > MAX_PROVIDER_TEXT_CHARS:
         raise InvalidModelResponse("model returned malformed turn text or identity")
-    if not isinstance(value.tool_calls, (list, tuple)):
+    try:
+        value.content.encode("utf-8")
+    except UnicodeError as exc:
+        raise InvalidModelResponse("model returned invalid text encoding") from exc
+    if not isinstance(value.tool_calls, (list, tuple)) or len(value.tool_calls) > MAX_PROVIDER_TOOL_CALLS:
         raise InvalidModelResponse("model returned malformed tool-call collection")
+    seen_ids: set[str] = set()
     for proposal in value.tool_calls:
-        if not isinstance(proposal, ToolCallProposal) or not isinstance(proposal.name, str) or not proposal.name.strip() or not isinstance(proposal.arguments, dict):
+        if (
+            not isinstance(proposal, ToolCallProposal)
+            or not isinstance(proposal.name, str)
+            or len(proposal.name) > MAX_PROVIDER_TOOL_NAME_CHARS
+            or not proposal.name.strip()
+            or not isinstance(proposal.arguments, dict)
+            or not isinstance(proposal.tool_call_id, str)
+            or not proposal.tool_call_id
+            or len(proposal.tool_call_id) > MAX_PROVIDER_CALL_ID_CHARS
+            or proposal.turn_id != value.turn_id
+        ):
             raise InvalidModelResponse("model returned malformed tool proposal")
-    if not isinstance(value.finish_reason, str) or not isinstance(value.usage, dict):
+        if proposal.tool_call_id in seen_ids:
+            raise InvalidModelResponse("model returned duplicate tool-call identifiers")
+        seen_ids.add(proposal.tool_call_id)
+        try:
+            proposal.name.encode("utf-8")
+            proposal.tool_call_id.encode("utf-8")
+        except UnicodeError as exc:
+            raise InvalidModelResponse("model returned invalid tool proposal encoding") from exc
+        for identity_name in ("mission_id", "run_id", "turn_id", "action_id", "request_id", "step_id", "authorization_context_id", "scope_snapshot_id"):
+            identity_value = getattr(proposal, identity_name)
+            if not isinstance(identity_value, str) or len(identity_value) > MAX_MODEL_IDENTITY_CHARS:
+                raise InvalidModelResponse("model returned malformed tool proposal identity")
+            try:
+                identity_value.encode("utf-8")
+            except UnicodeError as exc:
+                raise InvalidModelResponse("model returned invalid tool proposal identity encoding") from exc
+        if isinstance(proposal.plan_version, bool) or not isinstance(proposal.plan_version, int) or proposal.plan_version < 0:
+            raise InvalidModelResponse("model returned malformed plan identity")
+        enforce_json_byte_limit(proposal.arguments, max_bytes=MAX_PROVIDER_ARGUMENT_BYTES, message="model returned oversized or malformed tool arguments")
+    if (
+        not isinstance(value.finish_reason, str)
+        or len(value.finish_reason) > MAX_PROVIDER_FINISH_REASON_CHARS
+        or not isinstance(value.provider, str)
+        or len(value.provider) > MAX_PROVIDER_LABEL_CHARS
+        or not isinstance(value.model, str)
+        or len(value.model) > MAX_PROVIDER_LABEL_CHARS
+        or not isinstance(value.usage, dict)
+    ):
         raise InvalidModelResponse("model returned malformed turn metadata")
+    try:
+        value.finish_reason.encode("utf-8")
+        value.provider.encode("utf-8")
+        value.model.encode("utf-8")
+    except UnicodeError as exc:
+        raise InvalidModelResponse("model returned invalid turn metadata encoding") from exc
+    enforce_json_byte_limit(value.usage, max_bytes=MAX_PROVIDER_USAGE_BYTES, message="model returned oversized or malformed usage metadata")
     return value
 
 

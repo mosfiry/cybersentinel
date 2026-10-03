@@ -6,7 +6,7 @@ import urllib.error
 from dataclasses import dataclass
 from typing import Any
 
-from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, ToolCall, response_from_legacy
+from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, response_from_legacy, validate_provider_response
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
 
@@ -84,16 +84,7 @@ class ModelRouter:
             response = response_from_legacy(value, provider=name, model=model, capability=capability)
         else:
             raise InvalidModelResponse("provider returned unsupported response", provider=name, model=model)
-        if not isinstance(response.text, str):
-            raise InvalidModelResponse("provider returned malformed text", provider=name, model=model)
-        if not isinstance(response.tool_calls, (list, tuple)):
-            raise InvalidModelResponse("provider returned malformed tool calls", provider=name, model=model)
-        for call in response.tool_calls:
-            if not isinstance(call, ToolCall) or not isinstance(call.name, str) or not call.name.strip() or not isinstance(call.arguments, dict):
-                raise InvalidModelResponse("provider returned malformed tool call", provider=name, model=model)
-        if not isinstance(response.finish_reason, str) or not isinstance(response.usage, dict):
-            raise InvalidModelResponse("provider returned malformed response metadata", provider=name, model=model)
-        return response
+        return validate_provider_response(response, provider=name, model=model)
 
     @staticmethod
     def _classify(exc: Exception, provider: Any) -> ProviderError:

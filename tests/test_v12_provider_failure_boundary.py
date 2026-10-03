@@ -17,12 +17,19 @@ from agent.model_router import ModelRouter
 from agent.planning import Plan, PlanStep
 from agent.provider_api import (
     InvalidModelResponse,
+    MAX_PROVIDER_ARGUMENT_BYTES,
+    MAX_PROVIDER_CALL_ID_CHARS,
     MAX_PROVIDER_RESPONSE_BYTES,
+    MAX_PROVIDER_TEXT_CHARS,
+    MAX_PROVIDER_TOOL_CALLS,
+    MAX_PROVIDER_USAGE_BYTES,
     ProviderAuthenticationFailure,
     ProviderCapabilities,
     ProviderFailure,
+    ProviderResponse,
     ProviderTimeout,
     ToolCall,
+    validate_provider_response,
     response_from_legacy,
 )
 from agent.providers import OpenAICompatibleProvider
@@ -171,6 +178,130 @@ def test_provider_boundaries_reject_non_text_assistant_content(bad_content):
         provider._normalize(payload, "generate")
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_model_router_shares_hard_text_limit_for_typed_and_legacy_responses(legacy):
+    class StaticProvider:
+        name = "static"
+        model = "model-1"
+        capabilities = ProviderCapabilities(generate=True)
+
+        def __init__(self, content):
+            self.content = content
+
+        def generate(self, *_args, **_kwargs):
+            if legacy:
+                return {"content": self.content}
+            from agent.provider_api import ProviderResponse
+            return ProviderResponse(text=self.content)
+
+    provider = StaticProvider("x" * MAX_PROVIDER_TEXT_CHARS)
+    router = ModelRouter([provider])
+    assert len(router.generate([])["content"]) == MAX_PROVIDER_TEXT_CHARS
+
+    provider.content = "x" * (MAX_PROVIDER_TEXT_CHARS + 1) + "RESPONSE_SENTINEL"
+    with pytest.raises(ProviderFailure) as caught:
+        router.generate([])
+
+    assert caught.value.attempts[0]["kind"] == "INVALID_MODEL_RESPONSE"
+    assert "RESPONSE_SENTINEL" not in str(caught.value)
+    assert "RESPONSE_SENTINEL" not in repr(router.last_trace)
+
+
+def test_provider_response_enforces_tool_call_count_and_unique_identifiers():
+    valid_calls = [ToolCall("status", {}, f"call-{index}") for index in range(MAX_PROVIDER_TOOL_CALLS)]
+    valid = validate_provider_response(ProviderResponse(tool_calls=valid_calls))
+    assert len(valid.tool_calls) == MAX_PROVIDER_TOOL_CALLS
+
+    too_many = valid_calls + [ToolCall("status", {}, "call-extra")]
+    with pytest.raises(InvalidModelResponse):
+        validate_provider_response(ProviderResponse(tool_calls=too_many))
+    duplicate = [ToolCall("status", {}, "same-id"), ToolCall("status", {}, "same-id")]
+    with pytest.raises(InvalidModelResponse, match="duplicate"):
+        validate_provider_response(ProviderResponse(tool_calls=duplicate))
+    with pytest.raises(InvalidModelResponse, match="duplicate"):
+        response_from_legacy(
+            {"tool_calls": [{"id": call.call_id, "name": call.name, "arguments": call.arguments} for call in duplicate]},
+            provider="test",
+            model="model-1",
+        )
+    with pytest.raises(InvalidModelResponse):
+        response_from_legacy(
+            {"tool_calls": [{"id": str(index), "name": "status", "arguments": {}} for index in range(MAX_PROVIDER_TOOL_CALLS + 1)]},
+            provider="test",
+            model="model-1",
+        )
+    with pytest.raises(InvalidModelResponse):
+        response_from_legacy({"tool_calls": [{"id": 7, "name": "status", "arguments": {}}]}, provider="test", model="model-1")
+    with pytest.raises(InvalidModelResponse):
+        validate_provider_response(ProviderResponse(tool_calls=[ToolCall("status", {}, "x" * (MAX_PROVIDER_CALL_ID_CHARS + 1))]))
+
+
+def test_provider_response_enforces_argument_and_usage_byte_limits():
+    oversized_arguments = {"query": "x" * (MAX_PROVIDER_ARGUMENT_BYTES + 1)}
+    with pytest.raises(InvalidModelResponse):
+        response_from_legacy(
+            {"tool_calls": [{"id": "call-1", "name": "status", "arguments": oversized_arguments}]},
+            provider="test",
+            model="model-1",
+        )
+    with pytest.raises(InvalidModelResponse):
+        response_from_legacy(
+            {"tool_calls": [{"id": "call-1", "name": "status", "arguments": json.dumps(oversized_arguments)}]},
+            provider="test",
+            model="model-1",
+        )
+    with pytest.raises(InvalidModelResponse):
+        response_from_legacy({"usage": {"opaque": "x" * (MAX_PROVIDER_USAGE_BYTES + 1)}}, provider="test", model="model-1")
+    with pytest.raises(InvalidModelResponse):
+        validate_provider_response(ProviderResponse(usage={"opaque": "x" * (MAX_PROVIDER_USAGE_BYTES + 1)}))
+
+
+def test_provider_and_native_model_reject_invalid_utf8_text_and_identifiers():
+    with pytest.raises(InvalidModelResponse):
+        validate_provider_response(ProviderResponse(text="\ud800"))
+    with pytest.raises(InvalidModelResponse):
+        response_from_legacy(
+            {"tool_calls": [{"id": "\ud800", "name": "status", "arguments": {}}]},
+            provider="test",
+            model="model-1",
+        )
+    malformed = ToolCallProposal.create(
+        "status",
+        {},
+        mission_id="mission-1",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="\ud800",
+    )
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(ModelTurn("turn-1", tool_calls=(malformed,)))
+
+
+def test_openai_compatible_normalizer_uses_shared_text_call_and_argument_limits():
+    provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1", tool_calling=True)
+
+    def payload(content="", calls=(), finish_reason="stop"):
+        return {"choices": [{"message": {"content": content, "tool_calls": list(calls)}, "finish_reason": finish_reason}]}
+
+    exact = provider._normalize(payload(content="x" * MAX_PROVIDER_TEXT_CHARS), "generate")
+    assert len(exact.text) == MAX_PROVIDER_TEXT_CHARS
+    with pytest.raises(InvalidModelResponse):
+        provider._normalize(payload(content="x" * (MAX_PROVIDER_TEXT_CHARS + 1)), "generate")
+
+    calls = [
+        {"id": f"call-{index}", "function": {"name": "status", "arguments": {}}}
+        for index in range(MAX_PROVIDER_TOOL_CALLS + 1)
+    ]
+    with pytest.raises(InvalidModelResponse):
+        provider._normalize(payload(calls=calls, finish_reason="tool_calls"), "tool_calling")
+    oversized_args = json.dumps({"query": "x" * (MAX_PROVIDER_ARGUMENT_BYTES + 1)})
+    with pytest.raises(InvalidModelResponse):
+        provider._normalize(
+            payload(calls=[{"id": "call-large", "function": {"name": "status", "arguments": oversized_args}}], finish_reason="tool_calls"),
+            "tool_calling",
+        )
+
+
 def test_openai_compatible_normalizer_rejects_malformed_native_tool_call():
     provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1", tool_calling=True)
     payload = {
@@ -199,6 +330,64 @@ def test_model_protocol_rejects_invalid_arguments_and_native_turn_shapes():
     malformed = ModelTurn("turn-1", tool_calls=(ToolCallProposal(name="status", arguments="not-an-object"),))
     with pytest.raises(InvalidModelResponse):
         validate_model_turn(malformed)
+
+
+def test_native_model_turn_limits_and_call_identity_are_validated():
+    def proposal(turn_id, call_id, arguments=None):
+        return ToolCallProposal.create(
+            "status",
+            arguments or {},
+            mission_id="mission-1",
+            run_id="run-1",
+            turn_id=turn_id,
+            action_id=f"{turn_id}:{call_id}",
+            tool_call_id=call_id,
+        )
+
+    turn = ModelTurn(
+        "turn-1",
+        tool_calls=tuple(proposal("turn-1", f"call-{index}") for index in range(MAX_PROVIDER_TOOL_CALLS)),
+    )
+    assert validate_model_turn(turn) is turn
+
+    too_many = ModelTurn("turn-1", tool_calls=turn.tool_calls + (proposal("turn-1", "call-extra"),))
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(too_many)
+    duplicate = ModelTurn("turn-1", tool_calls=(proposal("turn-1", "same"), proposal("turn-1", "same")))
+    with pytest.raises(InvalidModelResponse, match="duplicate"):
+        validate_model_turn(duplicate)
+    stale_turn = ModelTurn("turn-1", tool_calls=(proposal("turn-old", "call-old"),))
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(stale_turn)
+    oversized_text = ModelTurn("turn-1", content="x" * (MAX_PROVIDER_TEXT_CHARS + 1))
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(oversized_text)
+    oversized_arguments = ModelTurn(
+        "turn-1",
+        tool_calls=(proposal("turn-1", "call-large", {"query": "x" * (MAX_PROVIDER_ARGUMENT_BYTES + 1)}),),
+    )
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(oversized_arguments)
+    oversized_call_id = ModelTurn(
+        "turn-1",
+        tool_calls=(proposal("turn-1", "x" * (MAX_PROVIDER_CALL_ID_CHARS + 1)),),
+    )
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(oversized_call_id)
+    with pytest.raises(InvalidModelResponse):
+        model_turn_from_provider(
+            {"tool_calls": [{"id": 9, "name": "status", "arguments": {}}]},
+            mission_id="mission-1",
+            run_id="run-1",
+            turn_id="turn-1",
+            request_id="request-1",
+            plan_version=1,
+        )
+    oversized_usage = ModelTurn("turn-1", usage={"opaque": "x" * (MAX_PROVIDER_USAGE_BYTES + 1)})
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(oversized_usage)
+    with pytest.raises(InvalidModelResponse):
+        validate_model_turn(ModelTurn("x" * (MAX_PROVIDER_CALL_ID_CHARS + 1)))
 
 
 class _FailingProvider:
