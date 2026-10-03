@@ -123,12 +123,18 @@ class TestIRPlaybook:
         assert action.evidence_ids == [strong]
         assert "security.authorization" in action.authority
 
+        ioc_action = IRPlaybook(case).recommend_block_ioc("203.0.113.7", evidence_ids=[strong])
+        assert ioc_action.to_dict()["kind"] == "BLOCK_IOC"
+        assert ioc_action.to_dict()["authority"].startswith("NONE")
+
     def test_evidence_less_containment_is_refused(self):
         case, strong, weak, _ = self._case_with_evidence()
         with pytest.raises(ValueError, match="evidence-less"):
             IRPlaybook(case).recommend_contain_host("synth-web-1", evidence_ids=[])
         with pytest.raises(ValueError, match="SUPPORTED"):
             IRPlaybook(case).recommend_contain_host("synth-web-1", evidence_ids=[weak])
+        with pytest.raises(ValueError, match="SUPPORTED"):
+            IRPlaybook(case).recommend_block_ioc("203.0.113.7", evidence_ids=[weak])
 
     def test_contradicted_evidence_is_refused_for_actions(self):
         case, _, _, contradicted = self._case_with_evidence()
@@ -146,6 +152,13 @@ class TestIRPlaybook:
         case, _, _, _ = self._case_with_evidence()
         with pytest.raises(ValueError, match="unknown evidence"):
             IRPlaybook(case).recommend_contain_host("synth-web-1", evidence_ids=["ev-999"])
+
+    def test_plan_is_recommendation_only_and_has_no_implicit_actions(self):
+        case, _, _, _ = self._case_with_evidence()
+        playbook = IRPlaybook(case)
+
+        assert playbook.plan() == []
+        assert case.next_actions == []
 
 
 class TestThreatHunting:
