@@ -51,11 +51,9 @@ class AgentTaskRuntime:
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
-        schemas = []
-        for spec in REGISTRY.values():
-            parameters = deepcopy(spec.input_schema)
-            schemas.append({"type": "function", "function": {"name": spec.name, "description": spec.description[:512], "parameters": parameters}})
-        return schemas
+        from tools.registry import model_tool_definitions
+
+        return model_tool_definitions()
 
     def _event(self, task: Task, event: str, data: dict[str, Any] | None = None) -> None:
         with self._state_lock:
@@ -395,18 +393,32 @@ class AgentTaskRuntime:
         self._event(task, "memory.updated", {"type": "tool_result", "tool_call_id": tool_call_id})
         return result
 
-    def _guard_call(self, task: Task, call: ToolCall) -> str | None:
-        if len(task.tool_calls) >= self.limits.max_tool_calls:
+    def _guard_batch(self, task: Task, calls: list[ToolCall]) -> str | None:
+        if len(task.tool_calls) + len(calls) > self.limits.max_tool_calls:
             return "max_tool_calls"
-        signature = json.dumps({"name": call.name, "arguments": call.arguments}, sort_keys=True, ensure_ascii=False)
-        signatures = task.execution_state.setdefault("call_signatures", {})
-        signatures[signature] = signatures.get(signature, 0) + 1
-        if signatures[signature] > self.limits.max_same_tool_calls:
-            return "repeated_tool_loop"
-        if task.execution_state.setdefault("last_signature", "") == signature and task.execution_state.get("last_result_hash") == task.execution_state.get("previous_result_hash"):
-            return "no_progress_cycle"
-        task.execution_state["last_signature"] = signature
+        counts: dict[str, int] = {}
+        for item in task.tool_calls:
+            name = item.get("tool_name")
+            if isinstance(name, str) and name:
+                counts[name] = counts.get(name, 0) + 1
+        signatures = dict(task.execution_state.get("call_signatures", {}))
+        last_signature = str(task.execution_state.get("last_signature", ""))
+        for call in calls:
+            counts[call.name] = counts.get(call.name, 0) + 1
+            if counts[call.name] > self.limits.max_same_tool_calls:
+                return "repeated_tool_loop"
+            signature = json.dumps({"name": call.name, "arguments": call.arguments}, sort_keys=True, ensure_ascii=False)
+            signatures[signature] = signatures.get(signature, 0) + 1
+            if last_signature == signature and task.execution_state.get("last_result_hash") == task.execution_state.get("previous_result_hash"):
+                return "no_progress_cycle"
+            last_signature = signature
+        task.execution_state["call_signatures"] = signatures
+        task.execution_state["last_signature"] = last_signature
         return None
+
+    def _guard_call(self, task: Task, call: ToolCall) -> str | None:
+        """Compatibility wrapper around the atomic batch budget check."""
+        return self._guard_batch(task, [call])
 
     def run_slice(self, task_id: str, *, owner_session_token: str = "", owner_session_id: str | None = None) -> Task:
         try:
@@ -492,11 +504,7 @@ class AgentTaskRuntime:
                         seen_batch_ids.add(call.call_id)
                     unique_calls.append(call)
                 value = unique_calls
-                guarded = None
-                for candidate in value:
-                    guarded = self._guard_call(task, candidate)
-                    if guarded:
-                        break
+                guarded = self._guard_batch(task, value)
                 if guarded:
                     task.error = guarded
                     task.update_status(TaskStatus.PARTIAL_SUCCESS if task.tool_calls else TaskStatus.FAILED)

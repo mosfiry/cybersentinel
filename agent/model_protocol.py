@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence
+import hashlib
+import inspect
 import uuid
 
 from .provider_api import (
@@ -20,6 +22,19 @@ from .provider_api import (
 
 
 MAX_MODEL_IDENTITY_CHARS = 512
+
+
+def derive_action_id(mission_id: str, turn_id: str, tool_call_id: str) -> str:
+    """Derive a stable server-owned action identity from the accepted call context."""
+    values = (mission_id, turn_id, tool_call_id)
+    if any(not isinstance(value, str) or not value for value in values):
+        raise InvalidModelResponse("cannot derive an action identity from incomplete context")
+    try:
+        encoded = [value.encode("utf-8") for value in values]
+    except UnicodeError as exc:
+        raise InvalidModelResponse("cannot derive an action identity from invalid text") from exc
+    payload = b"".join(len(value).to_bytes(8, "big") + value for value in encoded)
+    return "action_" + hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -45,7 +60,7 @@ class ConversationTurn:
 
 @dataclass(frozen=True)
 class ToolCallProposal:
-    """Untrusted model proposal. It is never an authorization decision."""
+    """Untrusted proposal; model-input identity must be echoed, runtime identity is rebound."""
 
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
@@ -91,13 +106,14 @@ class ModelTurn:
     model: str = ""
     finish_reason: str = "stop"
     usage: dict[str, Any] = field(default_factory=dict)
+    capability: str = ""
 
     @property
     def is_final(self) -> bool:
         return not self.tool_calls
 
     def to_dict(self) -> dict[str, Any]:
-        return {"turn_id": self.turn_id, "content": self.content, "tool_calls": [item.to_dict() for item in self.tool_calls], "provider": self.provider, "model": self.model, "finish_reason": self.finish_reason, "usage": dict(self.usage)}
+        return {"turn_id": self.turn_id, "content": self.content, "tool_calls": [item.to_dict() for item in self.tool_calls], "provider": self.provider, "model": self.model, "finish_reason": self.finish_reason, "usage": dict(self.usage), "capability": self.capability}
 
 
 @dataclass(frozen=True)
@@ -116,8 +132,13 @@ class ModelFinal:
 
 
 class NativeModel(Protocol):
-    def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int) -> ModelTurn:
-        """Return one real model turn; tool calls are proposals only."""
+    def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int, timeout_seconds: float | None = None) -> ModelTurn:
+        """Return one proposal turn; each call must echo mission/run/turn/plan inputs exactly.
+
+        Request, action, step, authorization-context, and scope-snapshot identities
+        are runtime-owned; MissionRuntime binds omitted values from authoritative
+        state and rejects any supplied mismatch before dispatch.
+        """
 
 
 def model_turn_from_provider(response: dict[str, Any], *, mission_id: str, run_id: str, turn_id: str, request_id: str, plan_version: int, step_id: str = "") -> ModelTurn:
@@ -142,13 +163,10 @@ def model_turn_from_provider(response: dict[str, Any], *, mission_id: str, run_i
             raise InvalidModelResponse("model adapter received non-object tool arguments")
         enforce_json_byte_limit(arguments, max_bytes=MAX_PROVIDER_ARGUMENT_BYTES, message="model adapter received oversized or malformed tool arguments")
         raw_call_id = raw.get("id")
-        if raw_call_id is None or raw_call_id == "":
-            call_id = "call_" + uuid.uuid4().hex
-        elif not isinstance(raw_call_id, str) or len(raw_call_id) > MAX_PROVIDER_CALL_ID_CHARS:
+        if not isinstance(raw_call_id, str) or len(raw_call_id) > MAX_PROVIDER_CALL_ID_CHARS or not raw_call_id.strip():
             raise InvalidModelResponse("model adapter received malformed tool-call identity")
-        else:
-            call_id = raw_call_id
-        calls.append(ToolCallProposal.create(name, arguments, mission_id=mission_id, run_id=run_id, turn_id=turn_id, action_id=f"{mission_id}:{turn_id}:{call_id}", tool_call_id=call_id, request_id=request_id, plan_version=plan_version, step_id=step_id))
+        call_id = raw_call_id
+        calls.append(ToolCallProposal.create(name, arguments, mission_id=mission_id, run_id=run_id, turn_id=turn_id, action_id=derive_action_id(mission_id, turn_id, call_id), tool_call_id=call_id, request_id=request_id, plan_version=plan_version, step_id=step_id))
     content = response.get("content", "")
     if content is None:
         content = ""
@@ -166,9 +184,10 @@ def model_turn_from_provider(response: dict[str, Any], *, mission_id: str, run_i
         raise InvalidModelResponse("model adapter received malformed usage metadata")
     provider_name = response.get("provider", "")
     model_name = response.get("model", "")
-    if not isinstance(provider_name, str) or not isinstance(model_name, str):
+    capability = response.get("capability", "")
+    if not isinstance(provider_name, str) or not isinstance(model_name, str) or not isinstance(capability, str):
         raise InvalidModelResponse("model adapter received malformed provider identity")
-    return validate_model_turn(ModelTurn(turn_id=turn_id, content=content, tool_calls=tuple(calls), provider=provider_name, model=model_name, finish_reason=finish_reason, usage=usage))
+    return validate_model_turn(ModelTurn(turn_id=turn_id, content=content, tool_calls=tuple(calls), provider=provider_name, model=model_name, finish_reason=finish_reason, usage=usage, capability=capability))
 
 
 def validate_model_turn(value: Any) -> ModelTurn:
@@ -229,13 +248,18 @@ def validate_model_turn(value: Any) -> ModelTurn:
         or len(value.provider) > MAX_PROVIDER_LABEL_CHARS
         or not isinstance(value.model, str)
         or len(value.model) > MAX_PROVIDER_LABEL_CHARS
+        or not isinstance(value.capability, str)
+        or len(value.capability) > MAX_PROVIDER_LABEL_CHARS
         or not isinstance(value.usage, dict)
     ):
         raise InvalidModelResponse("model returned malformed turn metadata")
+    if value.capability not in {"", "native", "tool_calling", "generate"}:
+        raise InvalidModelResponse("model returned unsupported capability provenance")
     try:
         value.finish_reason.encode("utf-8")
         value.provider.encode("utf-8")
         value.model.encode("utf-8")
+        value.capability.encode("utf-8")
     except UnicodeError as exc:
         raise InvalidModelResponse("model returned invalid turn metadata encoding") from exc
     enforce_json_byte_limit(value.usage, max_bytes=MAX_PROVIDER_USAGE_BYTES, message="model returned oversized or malformed usage metadata")
@@ -245,19 +269,63 @@ def validate_model_turn(value: Any) -> ModelTurn:
 class RouterNativeModel:
     """Adapter from the existing ModelRouter to the native protocol."""
 
-    def __init__(self, router: Any):
+    def __init__(self, router: Any, *, allow_generate_fallback: bool = False):
+        if not isinstance(allow_generate_fallback, bool):
+            raise TypeError("allow_generate_fallback must be a boolean")
         self.router = router
+        self.allow_generate_fallback = allow_generate_fallback
+        self.trusted_provider = ""
+        self.trusted_model = ""
+        self.trusted_capability = ""
 
-    def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int) -> ModelTurn:
+    def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int, timeout_seconds: float | None = None) -> ModelTurn:
         payload = [item.to_dict() for item in messages]
+        timeout_kwargs: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            import math
+            if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be a positive finite number")
+            timeout_kwargs["timeout"] = float(timeout_seconds)
+
+        def call_router(method: Any, *args: Any) -> Any:
+            if not timeout_kwargs:
+                return method(*args)
+            try:
+                parameters = inspect.signature(method).parameters.values()
+                accepts_timeout = any(parameter.name == "timeout" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+            except (TypeError, ValueError):
+                accepts_timeout = False
+            return method(*args, **timeout_kwargs) if accepts_timeout else method(*args)
+
+        capability = "tool_calling"
         try:
-            response = self.router.tool_calling(payload, list(tools))
+            response = call_router(self.router.tool_calling, payload, list(tools))
         except CapabilityUnsupported:
-            # Text-capable providers remain on the same canonical MissionRuntime;
-            # a real native provider failure must propagate into MissionRuntime
-            # recovery and must never be disguised as a generate() response.
-            response = self.router.generate(payload)
+            if not self.allow_generate_fallback:
+                raise
+            response = call_router(self.router.generate, payload)
+            capability = "generate"
+        if not isinstance(response, dict):
+            raise InvalidModelResponse("router returned an unsupported model response")
+        provider = response.get("provider")
+        model = response.get("model")
+        reported_capability = response.get("capability")
+        if (
+            not isinstance(provider, str)
+            or not provider.strip()
+            or provider == "unknown"
+            or len(provider) > MAX_PROVIDER_LABEL_CHARS
+            or not isinstance(model, str)
+            or not model.strip()
+            or model == "unknown"
+            or len(model) > MAX_PROVIDER_LABEL_CHARS
+            or reported_capability != capability
+        ):
+            raise InvalidModelResponse("router returned invalid provider provenance")
+        self.trusted_provider = provider
+        self.trusted_model = model
+        self.trusted_capability = capability
         return model_turn_from_provider(response, mission_id=mission_id, run_id=run_id, turn_id=turn_id, request_id="", plan_version=plan_version)
 
 
-__all__ = ["ConversationTurn", "ModelFinal", "ModelTurn", "NativeModel", "ReasoningContinuation", "RouterNativeModel", "ToolCallProposal", "ToolCallResult", "model_turn_from_provider", "validate_model_turn"]
+__all__ = ["ConversationTurn", "ModelFinal", "ModelTurn", "NativeModel", "ReasoningContinuation", "RouterNativeModel", "ToolCallProposal", "ToolCallResult", "derive_action_id", "model_turn_from_provider", "validate_model_turn"]

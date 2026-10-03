@@ -71,14 +71,9 @@ class AgentCore:
 
     @staticmethod
     def _schemas() -> list[dict[str, Any]]:
-        result = []
-        for spec in REGISTRY.values():
-            parameters: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
-            if spec.argument_type is str:
-                parameters["properties"]["query"] = {"type": "string", "maxLength": 256}
-                parameters["required"] = ["query"]
-            result.append({"type": "function", "function": {"name": spec.name, "description": spec.description[:512], "parameters": parameters}})
-        return result
+        from tools.registry import model_tool_definitions
+
+        return model_tool_definitions()
 
     @staticmethod
     def _calls(response: dict[str, Any]) -> list[ToolCall]:

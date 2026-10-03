@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import errno
+import math
+import time
 import urllib.error
 from dataclasses import dataclass
 from typing import Any
@@ -119,15 +121,27 @@ class ModelRouter:
             temperature = reasoning_profile.temperature
         if temperature is None:
             temperature = 0.2
+        timeout = kwargs.pop("timeout", None)
+        deadline = None
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be a positive finite number")
+            deadline = time.monotonic() + float(timeout)
         errors = []
         attempts: list[dict[str, str]] = []
         self.last_trace = []
         for provider in self.providers:
             if not self._caps(provider).generate:
                 continue
+            call_kwargs = dict(kwargs)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                call_kwargs["timeout"] = remaining
             try:
                 fn = getattr(provider, "generate", None) or getattr(provider, "chat", None)
-                response = self._trusted(self._normalize(fn(messages, temperature=temperature, **kwargs), provider, "generate"), provider, "generate")
+                response = self._trusted(self._normalize(fn(messages, temperature=temperature, **call_kwargs), provider, "generate"), provider, "generate")
                 self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return response
             except Exception as exc:
@@ -136,6 +150,8 @@ class ModelRouter:
                 attempts.append(attempt)
                 errors.append(f"{attempt['provider']}: {failure.kind.value}")
                 self.last_trace.append({"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProviderTimeout("provider call deadline expired", attempts=attempts)
         raise ProviderFailure("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured", attempts=attempts)
 
     def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
@@ -143,14 +159,26 @@ class ModelRouter:
             temperature = reasoning_profile.temperature
         if temperature is None:
             temperature = 0.1
+        timeout = kwargs.pop("timeout", None)
+        deadline = None
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be a positive finite number")
+            deadline = time.monotonic() + float(timeout)
         errors = []
         attempts: list[dict[str, str]] = []
         self.last_trace = []
         for provider in self.providers:
             if not self._caps(provider).tool_calling:
                 continue
+            call_kwargs = dict(kwargs)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                call_kwargs["timeout"] = remaining
             try:
-                response = provider.tool_calling(messages, tools, temperature=temperature, **kwargs)
+                response = provider.tool_calling(messages, tools, temperature=temperature, **call_kwargs)
                 result = self._trusted(self._normalize(response, provider, "tool_calling"), provider, "tool_calling")
                 self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return result
@@ -160,6 +188,8 @@ class ModelRouter:
                 attempts.append(attempt)
                 errors.append(f"{attempt['provider']}: {failure.kind.value}")
                 self.last_trace.append({"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProviderTimeout("provider call deadline expired", attempts=attempts)
         if errors:
             raise ProviderFailure("native tool providers failed: " + "; ".join(errors), attempts=attempts)
         raise CapabilityUnsupported("no provider supports native tool calling")

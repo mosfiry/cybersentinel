@@ -48,6 +48,16 @@ def test_registered_tool_schemas_are_explicit_and_exact():
     assert not REGISTRY["search"].validate_input({"query": "x" * (MAX_ARG_LENGTH + 1)})[0]
 
 
+def test_production_runtime_schema_builders_share_canonical_registry_contract():
+    from agent.agent_core import AgentCore
+
+    canonical = registry_module.model_tool_definitions()
+    assert AgentCore._schemas() == canonical
+    assert AgentTaskRuntime._schemas() == canonical
+    selected = registry_module.model_tool_definitions(["watch", "status"])
+    assert [item["function"]["name"] for item in selected] == ["watch", "status"]
+
+
 def test_registry_rejects_noncanonical_schema_at_construction():
     malformed = ToolSpec(
         "v11_bad_schema",

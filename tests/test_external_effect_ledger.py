@@ -124,7 +124,7 @@ def _effect_spec(name: str, handler, *, idempotency_supported: bool = False) -> 
     )
 
 
-def _execute(monkeypatch, spec: ToolSpec, mission, snapshot, fence, argument: str = "payload", scope_context=None):
+def _execute(monkeypatch, spec: ToolSpec, mission, snapshot, fence, argument: str = "payload", scope_context=None, max_result_chars: int | None = None):
     monkeypatch.setattr(registry_module, "get_tool", lambda name: spec if name == spec.name else None)
     return registry_module.execute(
         spec.name,
@@ -136,6 +136,7 @@ def _execute(monkeypatch, spec: ToolSpec, mission, snapshot, fence, argument: st
         scope_context=scope_context,
         execution_fence=fence,
         execution_id=fence.execution_id,
+        max_result_chars=max_result_chars,
     )
 
 
@@ -227,6 +228,34 @@ def test_tool_registry_persists_effect_before_handler_and_never_replays_success(
     with pytest.raises(EffectDispatchBlocked):
         _execute(monkeypatch, spec, mission, snapshot, fence, "private-payload")
     assert calls == ["private-payload"]
+
+
+def test_oversized_effect_result_is_summarized_before_ledger_persistence(tmp_path, monkeypatch):
+    _store, mission, snapshot, queue, _identity, _claim, fence = _leased_fence(
+        tmp_path,
+        tool_name="effect_bounded_result",
+    )
+    raw_result = {"ok": True, "payload": "x" * 20_000}
+    spec = _effect_spec("effect_bounded_result", lambda _value: raw_result)
+
+    result = _execute(
+        monkeypatch,
+        spec,
+        mission,
+        snapshot,
+        fence,
+        max_result_chars=128,
+    )
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(result["prefix_sha256"]) == 64
+    assert "payload" not in result
+    ledger = ExternalEffectLedger(queue.db_path)
+    record = ledger.list_effects(mission_id=mission.mission_id)[0]
+    assert record.state == EffectState.SUCCEEDED
+    assert record.result_sha256 == ledger._canonical_hash(result)
+    assert record.result_sha256 != ledger._canonical_hash(raw_result)
 
 
 def test_same_execution_with_changed_payload_is_rejected_before_second_dispatch(

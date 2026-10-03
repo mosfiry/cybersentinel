@@ -37,10 +37,42 @@ class BrokenNativeProvider:
         return {"content": "must not be used after native failure"}
 
 
-def test_capability_unsupported_uses_compatibility_generate():
+def test_capability_unsupported_is_rejected_by_default():
     model = RouterNativeModel(ModelRouter([UnsupportedProvider()]))
+    with pytest.raises(CapabilityUnsupported):
+        model.complete([], [], mission_id="m", run_id="r", turn_id="t", plan_version=1)
+
+
+def test_capability_unsupported_uses_generate_only_with_explicit_opt_in():
+    model = RouterNativeModel(ModelRouter([UnsupportedProvider()]), allow_generate_fallback=True)
     turn = model.complete([], [], mission_id="m", run_id="r", turn_id="t", plan_version=1)
     assert turn.content == json.dumps({"type": "final", "content": "compatibility"})
+    assert turn.provider == "text-only"
+    assert turn.model == "text-1"
+    assert turn.capability == "generate"
+
+
+def test_router_native_model_uses_configured_provider_identity_not_response_claims():
+    class ForgedIdentityProvider:
+        name = "configured-provider"
+        model = "configured-model"
+        capabilities = ProviderCapabilities(generate=True, tool_calling=True)
+
+        def tool_calling(self, _messages, _tools, **_kwargs):
+            return {
+                "content": "safe response",
+                "provider": "attacker-provider",
+                "model": "attacker-model",
+                "capability": "tool_calling",
+            }
+
+    turn = RouterNativeModel(ModelRouter([ForgedIdentityProvider()])).complete(
+        [], [], mission_id="m", run_id="r", turn_id="t", plan_version=1
+    )
+
+    assert turn.provider == "configured-provider"
+    assert turn.model == "configured-model"
+    assert turn.capability == "tool_calling"
 
 
 def test_native_provider_failure_does_not_fallback_to_generate():

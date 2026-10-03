@@ -18,6 +18,88 @@ DEFAULT_TOOL_TIMEOUT = 30
 TOOL_TIMEOUTS = {"run_project_tests": 65, "refresh_intel": 30}
 
 
+def _canonical_json_chunks(value: Any):
+    """Yield compact JSON text without materializing a second encoded copy."""
+    if value is None:
+        yield "null"
+    elif value is True:
+        yield "true"
+    elif value is False:
+        yield "false"
+    elif isinstance(value, int):
+        yield str(value)
+    elif isinstance(value, float):
+        yield json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    elif isinstance(value, str):
+        yield '"'
+        for char in value:
+            if char == '"':
+                yield '\\"'
+            elif char == "\\":
+                yield "\\\\"
+            elif ord(char) < 0x20:
+                yield f"\\u{ord(char):04x}"
+            else:
+                yield char
+        yield '"'
+    elif isinstance(value, dict):
+        yield "{"
+        for index, key in enumerate(value):
+            if not isinstance(key, str):
+                raise TypeError("tool result objects must have string keys")
+            if index:
+                yield ","
+            yield from _canonical_json_chunks(key)
+            yield ":"
+            yield from _canonical_json_chunks(value[key])
+        yield "}"
+    elif isinstance(value, (list, tuple)):
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _canonical_json_chunks(item)
+        yield "]"
+    else:
+        raise TypeError("tool result is not canonical-JSON serializable")
+
+
+def canonical_json_stats(value: Any, *, max_chars: int | None = None) -> tuple[int, str, bool]:
+    """Return canonical JSON character count, SHA-256, and whether the cap truncated it."""
+    if max_chars is not None and (isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 0):
+        raise ValueError("max_chars must be a non-negative integer")
+    digest = hashlib.sha256()
+    count = 0
+    for chunk in _canonical_json_chunks(value):
+        if max_chars is not None and count + len(chunk) > max_chars:
+            chunk = chunk[: max_chars - count]
+            if chunk:
+                digest.update(chunk.encode("utf-8"))
+                count += len(chunk)
+            return count, digest.hexdigest(), True
+        digest.update(chunk.encode("utf-8"))
+        count += len(chunk)
+    return count, digest.hexdigest(), False
+
+
+def bounded_result(value: Any, max_result_chars: int) -> tuple[Any, bool]:
+    """Preserve small results and replace oversized results with a fixed-size summary."""
+    if isinstance(max_result_chars, bool) or not isinstance(max_result_chars, int) or max_result_chars < 128:
+        raise ValueError("max_result_chars must be an integer of at least 128")
+    _size, prefix_sha256, truncated = canonical_json_stats(value, max_chars=max_result_chars)
+    if not truncated:
+        return value, False
+    if isinstance(value, dict):
+        decision_key = next((key for key in ("ok", "success") if isinstance(value.get(key), bool)), "ok")
+        decision_value = value.get(decision_key, True)
+    else:
+        decision_key, decision_value = "ok", True
+    summary = {decision_key: decision_value, "truncated": True, "prefix_sha256": prefix_sha256}
+    if canonical_json_stats(summary, max_chars=max_result_chars)[2]:
+        raise ValueError("max_result_chars is too small for the required result summary")
+    return summary, True
+
+
 class ToolTimeout(TimeoutError):
     pass
 
@@ -332,11 +414,49 @@ def tool_definitions() -> list[dict[str, Any]]:
     return definitions
 
 
+def model_tool_definitions(names: list[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+    """Build detached OpenAI-compatible schemas from canonical ToolSpecs."""
+    if names is None:
+        specs = tuple(REGISTRY.values())
+    else:
+        if not isinstance(names, (list, tuple)):
+            raise ValueError("tool names must be a list or tuple")
+        seen: set[str] = set()
+        selected = []
+        for name in names:
+            if not isinstance(name, str) or not name or name in seen:
+                raise ValueError("tool names must be nonempty, unique strings")
+            spec = REGISTRY.get(name)
+            if spec is None:
+                raise ValueError("unknown registered tool")
+            seen.add(name)
+            selected.append(spec)
+        specs = tuple(selected)
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description[:512],
+                "parameters": deepcopy(spec.input_schema),
+            },
+        }
+        for spec in specs
+    ]
+
+
 def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: Any = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None):
+def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None):
+    import math
+
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError("timeout must be a positive finite number")
+    if max_result_chars is not None and (isinstance(max_result_chars, bool) or not isinstance(max_result_chars, int) or max_result_chars < 128):
+        raise ValueError("max_result_chars must be an integer of at least 128")
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
@@ -492,6 +612,31 @@ def execute(name: str, argument: Any = None, *, timeout: int | None = None, auth
                 EffectState.RECOVERY_REQUIRED,
                 "HANDLER_EXCEPTION",
             ) from None
+        if max_result_chars is not None:
+            try:
+                result, _truncated = bounded_result(result, max_result_chars)
+            except Exception:
+                if effect is None:
+                    raise
+                try:
+                    effect_ledger.mark_recovery_required(
+                        effect.effect_id,
+                        execution_fence,
+                        dispatch_id=dispatch_id,
+                        reason_code="RESULT_BOUNDARY_FAILED",
+                        authorization_snapshot=mission_authorization,
+                    )
+                except Exception as ledger_exc:
+                    raise EffectRecoveryRequired(
+                        effect.effect_id,
+                        EffectState.DISPATCHED,
+                        "OUTCOME_PERSISTENCE_FAILED",
+                    ) from ledger_exc
+                raise EffectRecoveryRequired(
+                    effect.effect_id,
+                    EffectState.RECOVERY_REQUIRED,
+                    "RESULT_BOUNDARY_FAILED",
+                ) from None
         if effect is not None:
             try:
                 effect_ledger.mark_succeeded(
@@ -511,7 +656,7 @@ def execute(name: str, argument: Any = None, *, timeout: int | None = None, auth
                 ) from exc
         return result
 
-    limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
+    limit = timeout if timeout is not None else TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
         workspace_authorization = mission_authorization
