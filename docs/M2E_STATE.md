@@ -1738,3 +1738,8 @@ Separately, the natural Cloudflare `push_event` build `29e89e9d-b6bd-4931-994f-2
 ### V13 hosted-results documentation gate — passed (2026-10-03 08:07)
 
 The read-only validation passed after recording the exact pushed checkpoint: all 80 active architecture-map citations resolve within their source files; the complete state and map prefixes remain byte-exact; the V13 GitHub audit/test statuses and the distinct queued Cloudflare build are present; the invalid-query failure and schema-guided recovery remain recorded; and all V0–V16 markers are intact. Both docs remain additions-only relative to pushed `a294b0c`; `git diff --check`, control-byte/secret-pattern checks, and exact two-path/empty-index checks passed. No runtime code changed. The current natural build remains queued, so this local documentation closeout must not be pushed until that build is terminal.
+
+
+### V13 hosted-results closeout commit `0fb15d8` — local, unpushed (2026-10-03 08:07)
+
+The state/map record of the exact V13 pushed SHA and its initial hosted results is local commit `0fb15d8415155a18bfd4033c28c4768baf30fc3c`, parent `a294b0c62cf49c42bedf523659d801194e70a3d9`, on `task/m2e-cutover-20261002`; Git reported exactly two documentation files changed and the worktree was clean. It is intentionally not pushed while natural build `29e89e9d-b6bd-4931-994f-293625504097` remains queued. The remote M2E tip remains last verified at `a294b0c`. The next external step is one delayed read-only status/log/preview check after a quiet interval; no push or retry until the build is terminal. Independent local-only work remains safe without altering the remote branch.
