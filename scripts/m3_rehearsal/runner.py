@@ -248,6 +248,7 @@ class RehearsalRunner:
                         "The isolated runtime status was recorded before the "
                         "controlled local-watch recovery boundary"
                     ),
+                    "check": "status_snapshot",
                     "required": True,
                 }
             ],

@@ -159,6 +159,45 @@ def test_safe_environment_removes_ambient_provider_and_runtime_credentials(
         assert value not in result.values()
 
 
+def test_v16_mission_requests_independent_status_snapshot_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = rehearsal.RehearsalRunner(
+        output_path=tmp_path / "v16-result.json", port_picker=lambda: 32991
+    )
+    runner.owner_session = "synthetic-owner-session"
+    captured: dict[str, Any] = {}
+    mission_id = "synthetic-mission"
+
+    def fake_http_json(method: str, path: str, body: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        captured["method"] = method
+        captured["path"] = path
+        captured["body"] = body
+        return {
+            "mission_id": mission_id,
+            "mission": {
+                "owner_identity_ref": "owner-ref",
+                "authorization_snapshot": {
+                    "mission_id": mission_id,
+                    "owner_identity": "owner-ref",
+                    "owner_approval": "synthetic-approval",
+                    "authorization_hash": "a" * 64,
+                },
+            },
+        }
+
+    monkeypatch.setattr(runner, "_http_json", fake_http_json)
+
+    result = runner._create_mission()
+
+    assert result["mission_created"] is True
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/api/missions"
+    criterion = captured["body"]["completion_criteria"][0]
+    assert criterion["criterion_id"] == "mission-goal"
+    assert criterion["check"] == "status_snapshot"
+
+
 def test_embedded_container_probe_programs_compile() -> None:
     programs = (
         host_module._BOOTSTRAP_OWNER,
