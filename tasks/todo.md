@@ -56,7 +56,7 @@
 
 ### Task 4: Whole-turn and cumulative-budget preflight
 
-- [ ] Apply Owner-configured cumulative `max_tool_calls` and exact-repeat signature budgets without inventing a lifetime cap below supported Owner settings; keep the provider's 10-calls-per-response and existing context-assembler ceilings, and enforce lower Owner context limits.
+- [ ] Apply Owner-configured cumulative `max_tool_calls` and exact-repeat signature budgets without inventing a lifetime cap below supported Owner settings; keep the provider's 10-calls-per-response ceiling and enforce the actual message payload against `min(Owner max_context_chars, 32,000)` (24K remains only the assembler default).
 - [ ] Preflight every sibling before durable turn/proposal events, in-flight checkpoints, or effect-ledger reservations.
 - [ ] Prove a valid state-writing call paired with one malformed sibling causes no handler call, evidence append, checkpoint, or ledger event; retain per-call authorization denials for structurally valid proposals.
 
