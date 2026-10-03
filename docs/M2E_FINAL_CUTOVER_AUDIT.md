@@ -120,3 +120,22 @@ The natural Cloudflare Workers build for that checkpoint, `ec384356-26f2-401b-8f
 **Final disposition remains: production cutover is not established.** Successful GitHub tests and audit are not Cloudflare or production evidence, and no production deployment is inferred. The three pre-existing ignored, untracked runtime databases (`tasks.sqlite3`, `memory.sqlite3`, `knowledge.sqlite3`) remain local and outside the diff; they were not read, modified, or deleted.
 
 The V16 integrity/truncation recovery remains part of the preserved record: the V16 audit append incident replaced the 61-line, 11,802-byte V15 audit with a 9-line, 1,748-byte supplement; the additions-only gate caught `4 added / 56 deleted` before stage or external action. The checksum-verified V15 backup `/tmp/m2e-v16-preserve-20261003T065500Z/M2E_FINAL_CUTOVER_AUDIT.md` (SHA-256 `5be750733352fa1153f415f6ee7d701089608041e8db2a94ba95998a38b4c660`) was restored byte-for-byte and verified with `cmp` and SHA-256; the V16 material was then appended explicitly. The separate historical state-file integrity recovery is retained in `M2E_STATE.md`. This addendum itself is append-only; the pre-edit document copies were checksum-backed before the append. The final-closeout documentation commit has its own exact-SHA GitHub checks and natural Cloudflare build, assessed separately from the `02afe06` results recorded here.
+
+
+### V16 final reconciliation — exact checkpoint `ca8dda23` (2026-10-03 09:19 +02:00)
+
+At exact commit `ca8dda23be155316afd971df580d9d5b591691c0` on `task/m2e-cutover-20261002`, GitHub test run [`37105742624`](https://github.com/mosfiry/cybersentinel/actions/runs/37105742624) / check `111153775583` and owner-charter audit run [`37105742689`](https://github.com/mosfiry/cybersentinel/actions/runs/37105742689) / check `111153775784` both completed `success` for this exact SHA. Read-only GitHub run and check details confirmed the same `head_sha`. The M2E remote tip matched `ca8dda23`; `main` remained `8a3fd109c0e586db13ed48a7371ac9ad06465b74`, and M2D remained `9bf91ea37748a239e6a6e3b6327706fa614232cd`.
+
+At `2026-10-03T09:19:29+02:00`, a bounded read-only query of the natural Cloudflare Workers build `bc7a2be1-035c-4b1a-bbdb-b4258d8b5da0` for this exact SHA returned HTTP 200, `status=queued`, and `build_outcome=null`. Its logs contained only `Initializing build environment...`; the exact Worker's preview list returned HTTP 200 with `total_count=0`. The build/preview result remains **UNKNOWN**. No manual build, deploy, retry, cancellation, settings change, indefinite wait, or production action was performed.
+
+**Final disposition: production cutover is not established.** Successful exact-SHA GitHub checks are separate from Cloudflare and do not establish a preview or deployment. `main` and M2D are unchanged, and no production state or deployment is inferred.
+
+
+### Closeout gate validation failures and recovery — 2026-10-03 09:20 +02:00
+
+Two local read-only post-append gate scripts stopped before completing: Python rejected a non-ASCII bytes literal, then a corrected script used an erroneous three-newline append-boundary assumption. Neither failure changed repository files, index, remote refs, or production state. UTF-8 boundary handling and the actual two-blank-line append boundary were corrected; the complete integrity gate then passed.
+
+
+### Closeout diagnostic command failure and recovery — 2026-10-03 09:21 +02:00
+
+After the audit-only commit was created locally, the chained summary command `git show --stat --oneline --format=HEAD` exited 128 because `HEAD` is not a valid pretty-format value. The commit had already succeeded; no file, index, or remote ref changed, and no push had been attempted. Recovery used `git show --stat --oneline -1` and confirmed the local commit changed only this audit; the local commit is updated with this append before its first push.
