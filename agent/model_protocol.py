@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence
 import uuid
 
-from .provider_api import CapabilityUnsupported
+from .provider_api import CapabilityUnsupported, InvalidModelResponse
 
 
 @dataclass(frozen=True)
@@ -106,12 +106,59 @@ class NativeModel(Protocol):
 
 
 def model_turn_from_provider(response: dict[str, Any], *, mission_id: str, run_id: str, turn_id: str, request_id: str, plan_version: int, step_id: str = "") -> ModelTurn:
+    if not isinstance(response, dict):
+        raise InvalidModelResponse("model adapter received a non-object response")
     calls: list[ToolCallProposal] = []
-    for raw in response.get("tool_calls") or []:
-        if not isinstance(raw, dict) or not isinstance(raw.get("name"), str):
-            continue
-        calls.append(ToolCallProposal.create(raw["name"], raw.get("arguments") if isinstance(raw.get("arguments"), dict) else {}, mission_id=mission_id, run_id=run_id, turn_id=turn_id, action_id=f"{mission_id}:{turn_id}:{raw.get('id') or uuid.uuid4().hex}", tool_call_id=str(raw.get("id") or "call_" + uuid.uuid4().hex), request_id=request_id, plan_version=plan_version, step_id=step_id))
-    return ModelTurn(turn_id=turn_id, content=str(response.get("content", "") or ""), tool_calls=tuple(calls), provider=str(response.get("provider", "")), model=str(response.get("model", "")), finish_reason=str(response.get("finish_reason", "tool_calls" if calls else "stop")), usage=dict(response.get("usage") or {}))
+    raw_calls = response.get("tool_calls")
+    if raw_calls is None:
+        raw_calls = []
+    if not isinstance(raw_calls, (list, tuple)):
+        raise InvalidModelResponse("model adapter received malformed tool calls")
+    for raw in raw_calls:
+        if not isinstance(raw, dict):
+            raise InvalidModelResponse("model adapter received a malformed tool call")
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise InvalidModelResponse("model adapter received a tool call without a valid name")
+        arguments = raw.get("arguments", {})
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise InvalidModelResponse("model adapter received non-object tool arguments")
+        call_id = str(raw.get("id") or "call_" + uuid.uuid4().hex)
+        calls.append(ToolCallProposal.create(name, arguments, mission_id=mission_id, run_id=run_id, turn_id=turn_id, action_id=f"{mission_id}:{turn_id}:{call_id}", tool_call_id=call_id, request_id=request_id, plan_version=plan_version, step_id=step_id))
+    content = response.get("content", "")
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        raise InvalidModelResponse("model adapter received malformed text")
+    finish_reason = response.get("finish_reason", "tool_calls" if calls else "stop")
+    if finish_reason is None:
+        finish_reason = "tool_calls" if calls else "stop"
+    if not isinstance(finish_reason, str):
+        raise InvalidModelResponse("model adapter received malformed finish reason")
+    usage = response.get("usage")
+    if usage is None:
+        usage = {}
+    if not isinstance(usage, dict):
+        raise InvalidModelResponse("model adapter received malformed usage metadata")
+    return ModelTurn(turn_id=turn_id, content=content, tool_calls=tuple(calls), provider=str(response.get("provider", "")), model=str(response.get("model", "")), finish_reason=finish_reason, usage=usage)
+
+
+def validate_model_turn(value: Any) -> ModelTurn:
+    """Reject malformed NativeModel values before they enter mission orchestration."""
+    if not isinstance(value, ModelTurn):
+        raise InvalidModelResponse("model returned an unsupported turn")
+    if not isinstance(value.turn_id, str) or not isinstance(value.content, str):
+        raise InvalidModelResponse("model returned malformed turn text or identity")
+    if not isinstance(value.tool_calls, (list, tuple)):
+        raise InvalidModelResponse("model returned malformed tool-call collection")
+    for proposal in value.tool_calls:
+        if not isinstance(proposal, ToolCallProposal) or not isinstance(proposal.name, str) or not proposal.name.strip() or not isinstance(proposal.arguments, dict):
+            raise InvalidModelResponse("model returned malformed tool proposal")
+    if not isinstance(value.finish_reason, str) or not isinstance(value.usage, dict):
+        raise InvalidModelResponse("model returned malformed turn metadata")
+    return value
 
 
 class RouterNativeModel:
@@ -132,4 +179,4 @@ class RouterNativeModel:
         return model_turn_from_provider(response, mission_id=mission_id, run_id=run_id, turn_id=turn_id, request_id="", plan_version=plan_version)
 
 
-__all__ = ["ConversationTurn", "ModelFinal", "ModelTurn", "NativeModel", "ReasoningContinuation", "RouterNativeModel", "ToolCallProposal", "ToolCallResult", "model_turn_from_provider"]
+__all__ = ["ConversationTurn", "ModelFinal", "ModelTurn", "NativeModel", "ReasoningContinuation", "RouterNativeModel", "ToolCallProposal", "ToolCallResult", "model_turn_from_provider", "validate_model_turn"]

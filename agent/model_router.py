@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import errno
+import urllib.error
 from dataclasses import dataclass
 from typing import Any
 
-from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, response_from_legacy
+from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, ToolCall, response_from_legacy
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
 
@@ -74,24 +76,52 @@ class ModelRouter:
 
     @staticmethod
     def _normalize(value: Any, provider: Any, capability: str) -> ProviderResponse:
+        name = str(getattr(provider, "name", "unknown") or "unknown")
+        model = str(getattr(provider, "model", "unknown") or "unknown")
         if isinstance(value, ProviderResponse):
-            return value
-        if isinstance(value, dict):
-            return response_from_legacy(value, provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"), capability=capability)
-        raise InvalidModelResponse("provider returned unsupported response", provider=getattr(provider, "name", "unknown"), model=getattr(provider, "model", "unknown"))
+            response = value
+        elif isinstance(value, dict):
+            response = response_from_legacy(value, provider=name, model=model, capability=capability)
+        else:
+            raise InvalidModelResponse("provider returned unsupported response", provider=name, model=model)
+        if not isinstance(response.text, str):
+            raise InvalidModelResponse("provider returned malformed text", provider=name, model=model)
+        if not isinstance(response.tool_calls, (list, tuple)):
+            raise InvalidModelResponse("provider returned malformed tool calls", provider=name, model=model)
+        for call in response.tool_calls:
+            if not isinstance(call, ToolCall) or not isinstance(call.name, str) or not call.name.strip() or not isinstance(call.arguments, dict):
+                raise InvalidModelResponse("provider returned malformed tool call", provider=name, model=model)
+        if not isinstance(response.finish_reason, str) or not isinstance(response.usage, dict):
+            raise InvalidModelResponse("provider returned malformed response metadata", provider=name, model=model)
+        return response
 
     @staticmethod
     def _classify(exc: Exception, provider: Any) -> ProviderError:
-        details = {"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown")}
+        details = {"provider": str(getattr(provider, "name", "unknown") or "unknown"), "model": str(getattr(provider, "model", "unknown") or "unknown")}
         if isinstance(exc, ProviderError):
+            if not exc.provider:
+                exc.provider = details["provider"]
+            if not exc.model:
+                exc.model = details["model"]
             return exc
+        if isinstance(exc, urllib.error.HTTPError):
+            if exc.code in {401, 403}:
+                return ProviderAuthenticationFailure(f"HTTP {exc.code}", **details)
+            return ProviderFailure(f"HTTP {exc.code}", **details)
+        if isinstance(exc, urllib.error.URLError):
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError) or (isinstance(reason, OSError) and reason.errno == errno.ETIMEDOUT):
+                return ProviderTimeout("provider transport timeout", **details)
+            if isinstance(reason, PermissionError):
+                return ProviderAuthenticationFailure("provider transport authentication failure", **details)
+            return ProviderFailure("provider transport failure", **details)
         if isinstance(exc, TimeoutError):
-            return ProviderTimeout(str(exc) or "provider timeout", **details)
+            return ProviderTimeout("provider timeout", **details)
         if isinstance(exc, PermissionError):
-            return ProviderAuthenticationFailure(str(exc) or "provider authentication failed", **details)
-        if isinstance(exc, (TypeError, ValueError)):
-            return InvalidModelResponse(str(exc) or "invalid provider response", **details)
-        return ProviderFailure(f"{type(exc).__name__}: {exc}", **details)
+            return ProviderAuthenticationFailure("provider authentication failed", **details)
+        if isinstance(exc, (TypeError, ValueError, UnicodeError)):
+            return InvalidModelResponse("invalid provider response", **details)
+        return ProviderFailure(type(exc).__name__, **details)
 
     def generate(self, messages: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
@@ -99,6 +129,7 @@ class ModelRouter:
         if temperature is None:
             temperature = 0.2
         errors = []
+        attempts: list[dict[str, str]] = []
         self.last_trace = []
         for provider in self.providers:
             if not self._caps(provider).generate:
@@ -110,9 +141,11 @@ class ModelRouter:
                 return response
             except Exception as exc:
                 failure = self._classify(exc, provider)
-                errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
-                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
-        raise ProviderFailure("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured")
+                attempt = {"provider": failure.provider or "unknown", "model": failure.model or "unknown", "kind": failure.kind.value}
+                attempts.append(attempt)
+                errors.append(f"{attempt['provider']}: {failure.kind.value}")
+                self.last_trace.append({"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
+        raise ProviderFailure("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured", attempts=attempts)
 
     def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
@@ -120,6 +153,7 @@ class ModelRouter:
         if temperature is None:
             temperature = 0.1
         errors = []
+        attempts: list[dict[str, str]] = []
         self.last_trace = []
         for provider in self.providers:
             if not self._caps(provider).tool_calling:
@@ -131,10 +165,12 @@ class ModelRouter:
                 return result
             except Exception as exc:
                 failure = self._classify(exc, provider)
-                errors.append(f"{getattr(provider, 'name', 'unknown')}: {failure.kind.value}")
-                self.last_trace.append({"provider": getattr(provider, "name", "unknown"), "model": getattr(provider, "model", "unknown"), "status": "failure", "failure_kind": failure.kind.value, "failure_reason": str(failure), "capabilities": self._caps(provider).__dict__.copy()})
+                attempt = {"provider": failure.provider or "unknown", "model": failure.model or "unknown", "kind": failure.kind.value}
+                attempts.append(attempt)
+                errors.append(f"{attempt['provider']}: {failure.kind.value}")
+                self.last_trace.append({"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
         if errors:
-            raise ProviderFailure("native tool providers failed: " + "; ".join(errors))
+            raise ProviderFailure("native tool providers failed: " + "; ".join(errors), attempts=attempts)
         raise CapabilityUnsupported("no provider supports native tool calling")
 
     def chat(self, messages: list[dict], temperature: float | None = None, *, tools: list[dict] | None = None, reasoning_profile: ReasoningProfile | None = None) -> dict:

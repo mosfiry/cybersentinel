@@ -11,8 +11,7 @@ from typing import Any, Callable
 
 from agent.context import ContextEngine, ExecutionState, RuntimeLimits
 from agent.memory import ConversationMemory, MemoryProvider, MemoryType, TrustClassification
-from agent.provider_api import ToolCall
-from agent.provider_api import CapabilityUnsupported
+from agent.provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderError, ToolCall
 from agent.task import Task, TaskStatus
 from agent.task_manager import TaskManager, TaskVersionConflictError
 from agent.planning import select_reasoning_profile
@@ -59,21 +58,44 @@ class AgentTaskRuntime:
 
     @staticmethod
     def _tool_calls(response: dict[str, Any]) -> list[ToolCall]:
-        calls = []
-        for item in response.get("tool_calls") or []:
+        if not isinstance(response, dict):
+            raise InvalidModelResponse("task model returned a non-object response")
+        calls: list[ToolCall] = []
+        raw_calls = response.get("tool_calls")
+        if raw_calls is None:
+            return calls
+        if not isinstance(raw_calls, (list, tuple)):
+            raise InvalidModelResponse("task model returned malformed tool calls")
+        for item in raw_calls:
             if isinstance(item, ToolCall):
-                calls.append(item if item.call_id else ToolCall(item.name, item.arguments, uuid.uuid4().hex))
-            elif isinstance(item, dict) and isinstance(item.get("name"), str):
-                args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-                calls.append(ToolCall(item["name"], args, str(item.get("id") or uuid.uuid4().hex)))
+                name, args, call_id = item.name, item.arguments, item.call_id
+            elif isinstance(item, dict):
+                name = item.get("name")
+                args = item.get("arguments", {})
+                call_id = item.get("id")
+            else:
+                raise InvalidModelResponse("task model returned a malformed tool call")
+            if not isinstance(name, str) or not name.strip():
+                raise InvalidModelResponse("task model returned a tool call without a valid name")
+            if args is None:
+                args = {}
+            if not isinstance(args, dict):
+                raise InvalidModelResponse("task model returned non-object tool arguments")
+            calls.append(ToolCall(name, args, str(call_id or uuid.uuid4().hex)))
         return calls
 
     @staticmethod
     def _parse(response: dict[str, Any]) -> tuple[str, Any]:
+        if not isinstance(response, dict):
+            raise InvalidModelResponse("task model returned a non-object response")
         calls = AgentTaskRuntime._tool_calls(response)
         if calls:
             return "tool_calls", calls
-        content = str(response.get("content", "") or "")
+        content = response.get("content", "")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            raise InvalidModelResponse("task model returned malformed text")
         try:
             value = json.loads(content)
         except json.JSONDecodeError:
@@ -82,8 +104,16 @@ class AgentTaskRuntime:
             return "final", str(value.get("content", value.get("answer", "")))
         if isinstance(value, dict) and value.get("type") == "clarification":
             return "needs_input", str(value.get("question", "معلومات إضافية مطلوبة."))
-        if isinstance(value, dict) and value.get("type") == "tool_call" and isinstance(value.get("name"), str):
-            return "tool_calls", [ToolCall(value["name"], value.get("arguments") or {}, uuid.uuid4().hex)]
+        if isinstance(value, dict) and value.get("type") == "tool_call":
+            name = value.get("name")
+            arguments = value.get("arguments", {})
+            if not isinstance(name, str) or not name.strip():
+                raise InvalidModelResponse("task model returned a tool call without a valid name")
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                raise InvalidModelResponse("task model returned non-object tool arguments")
+            return "tool_calls", [ToolCall(name, arguments, uuid.uuid4().hex)]
         return "final", content
 
     def create_task(self, conversation_id: str, objective: str, *, owner_session_id: str = "", authentication_method: str = "username_password", scope_context: dict[str, Any] | None = None, authorization_context: AuthorizationContext | None = None) -> Task:
@@ -440,6 +470,24 @@ class AgentTaskRuntime:
                     task.save_resume_state({"next": "model", "step": task.current_step})
         except TaskVersionConflictError:
             raise
+        except ProviderError as exc:
+            task.increment_retry()
+            kind = str(getattr(exc, "kind", "PROVIDER_FAILURE"))
+            task.error = f"provider_failure:{kind}"
+            attempts = [
+                {key: str(item.get(key, "")) for key in ("provider", "model", "kind")}
+                for item in getattr(exc, "attempts", ())
+                if isinstance(item, dict)
+            ]
+            self._event(task, "model.provider_failure", {
+                "kind": kind,
+                "provider": str(getattr(exc, "provider", "") or ""),
+                "model": str(getattr(exc, "model", "") or ""),
+                "attempts": attempts,
+                "retry_count": task.retry_count,
+            })
+            task.update_status(TaskStatus.PARTIAL_SUCCESS if task.tool_calls else TaskStatus.FAILED)
+            self._event(task, "task.failed", {"reason": task.error, "retry_count": task.retry_count})
         except Exception as exc:
             task.increment_retry()
             task.error = type(exc).__name__

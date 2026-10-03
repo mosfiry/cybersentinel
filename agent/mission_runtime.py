@@ -13,11 +13,10 @@ from .observation import Observation
 from .observation_intelligence import ObservationInterpreter, should_interpret_observation
 from .hypotheses import HypothesisEngine, HypothesisState
 from .strategy import StrategyState, decide as decide_strategy
-from .model_protocol import ConversationTurn, NativeModel, ToolCallResult
+from .model_protocol import ConversationTurn, NativeModel, ToolCallResult, validate_model_turn
 from .provider_api import ProviderError
 from .model_intelligence.context import ContextAssembler
 from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
-
 
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
@@ -279,10 +278,24 @@ class MissionRuntime:
             }
             messages = assembled.messages
             try:
-                turn = model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version)
+                turn = validate_model_turn(model.complete(messages, tools, mission_id=mission.mission_id, run_id=run_id, turn_id=turn_id, plan_version=mission.plan.version))
             except ProviderError as exc:
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")
-                failure = {"class": FailureClass.PROVIDER.value, "kind": str(kind), "reason": str(exc), "turn_id": turn_id, "run_id": run_id}
+                attempts = [
+                    {key: str(item.get(key, "")) for key in ("provider", "model", "kind")}
+                    for item in getattr(exc, "attempts", ())
+                    if isinstance(item, dict)
+                ]
+                failure = {
+                    "class": FailureClass.PROVIDER.value,
+                    "kind": str(kind),
+                    "provider": str(getattr(exc, "provider", "") or ""),
+                    "model": str(getattr(exc, "model", "") or ""),
+                    "attempts": attempts,
+                    "reason": "provider/model call failed",
+                    "turn_id": turn_id,
+                    "run_id": run_id,
+                }
                 mission.failures.append(failure)
                 mission.progress.setdefault("model_failures", []).append(failure)
                 mission.emit(EventType.FAILURE_DETECTED, data=failure)

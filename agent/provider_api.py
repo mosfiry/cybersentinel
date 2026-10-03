@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -16,11 +17,16 @@ class ProviderFailureKind(StrEnum):
 class ProviderError(RuntimeError):
     """Typed provider boundary error; never silently changes execution mode."""
 
-    def __init__(self, kind: ProviderFailureKind, message: str, *, provider: str = "", model: str = "") -> None:
+    def __init__(self, kind: ProviderFailureKind, message: str, *, provider: str = "", model: str = "", attempts: list[dict[str, str]] | tuple[dict[str, str], ...] = ()) -> None:
         super().__init__(message)
         self.kind = kind
         self.provider = provider
         self.model = model
+        self.attempts = tuple(
+            {key: str(item.get(key, "")) for key in ("provider", "model", "kind")}
+            for item in attempts
+            if isinstance(item, dict)
+        )
 
 
 class CapabilityUnsupported(ProviderError):
@@ -93,28 +99,62 @@ class ProviderResponse:
 
 
 def response_from_legacy(value: dict[str, Any], *, provider: str, model: str, capability: str = "generate") -> ProviderResponse:
+    if not isinstance(value, dict):
+        raise InvalidModelResponse("provider returned a non-object response", provider=provider, model=model)
     calls: list[ToolCall] = []
-    for item in value.get("tool_calls") or []:
+    raw_calls = value.get("tool_calls")
+    if raw_calls is None:
+        raw_calls = []
+    if not isinstance(raw_calls, (list, tuple)):
+        raise InvalidModelResponse("provider returned malformed tool calls", provider=provider, model=model)
+    for item in raw_calls:
         if not isinstance(item, dict):
-            continue
-        function = item.get("function") if isinstance(item.get("function"), dict) else item
+            raise InvalidModelResponse("provider returned malformed tool call", provider=provider, model=model)
+        if "function" in item:
+            function = item.get("function")
+            if not isinstance(function, dict):
+                raise InvalidModelResponse("provider returned malformed tool function", provider=provider, model=model)
+        else:
+            function = item
         name = function.get("name")
-        if not isinstance(name, str):
-            continue
+        if not isinstance(name, str) or not name.strip():
+            raise InvalidModelResponse("provider returned a tool call without a valid name", provider=provider, model=model)
         arguments = function.get("arguments", {})
+        if arguments is None:
+            arguments = {}
         if isinstance(arguments, str):
             try:
-                arguments = __import__("json").loads(arguments)
-            except Exception:
-                arguments = {}
-        calls.append(ToolCall(name, arguments if isinstance(arguments, dict) else {}, str(item.get("id") or "")))
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise InvalidModelResponse("provider returned malformed tool arguments", provider=provider, model=model) from exc
+        if not isinstance(arguments, dict):
+            raise InvalidModelResponse("provider tool arguments must be an object", provider=provider, model=model)
+        calls.append(ToolCall(name, arguments, str(item.get("id") or "")))
+    text = value.get("content", value.get("text", ""))
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        raise InvalidModelResponse("provider returned malformed text", provider=provider, model=model)
+    default_finish_reason = "tool_calls" if calls else "stop"
+    finish_reason = value.get("finish_reason")
+    if finish_reason is None:
+        finish_reason = default_finish_reason
+    elif not isinstance(finish_reason, str):
+        raise InvalidModelResponse("provider returned malformed finish reason", provider=provider, model=model)
+    elif not finish_reason:
+        finish_reason = default_finish_reason
+    usage = value.get("usage")
+    if usage is None:
+        usage = {}
+    elif not isinstance(usage, dict):
+        raise InvalidModelResponse("provider returned malformed usage metadata", provider=provider, model=model)
     return ProviderResponse(
-        text=str(value.get("content", value.get("text", "")) or ""),
+        text=text,
         tool_calls=calls,
-        finish_reason=str(value.get("finish_reason") or ("tool_calls" if calls else "stop")),
+        finish_reason=finish_reason,
         provider=provider,
         model=model,
-        usage=value.get("usage") or {},
+        usage=usage,
         capability=capability,
     )
 
