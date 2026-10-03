@@ -44,9 +44,9 @@
 
 ### Task 2: Shared provider/model response contract
 
-- [ ] Apply text, call-count, identifier, usage-metadata, and argument-size limits consistently to OpenAI-compatible, typed, legacy, router, and NativeModel paths.
-- [ ] Reject duplicate/malformed model-turn identities before a mission turn is recorded.
-- [ ] Preserve typed `INVALID_MODEL_RESPONSE` handling without provider-secret/body leakage or silent fallback.
+- [x] Apply text, call-count, identifier, usage-metadata, and argument-size limits consistently to OpenAI-compatible, typed, legacy, router, and NativeModel paths.
+- [x] Reject duplicate/malformed model-turn identities before a mission turn is recorded.
+- [x] Preserve typed `INVALID_MODEL_RESPONSE` handling without provider-secret/body leakage or silent fallback.
 
 ### Task 3: Exact tool-input schema enforcement
 
