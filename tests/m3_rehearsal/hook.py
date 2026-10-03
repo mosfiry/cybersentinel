@@ -9,13 +9,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 import os
+import time
 
 
 STATE_ROOT = Path("/var/lib/cybersentinel")
 CRASH_MARKER_NAME = ".m3-v16-crash-once"
+DISPATCHED_MARKER_NAME = ".m3-v16-effect-dispatched"
+RELEASE_MARKER_NAME = ".m3-v16-crash-release"
 PROVIDER_MARKER_NAME = ".m3-v16-provider-violation"
 CRASH_EXIT_CODE = 73
 DEFAULT_LEASE_SECONDS = 5
+DEFAULT_CRASH_WAIT_SECONDS = 45
 
 
 class BlockedProviderRouter:
@@ -49,11 +53,15 @@ def validate_rehearsal_paths(
     state_root: str | Path,
     database_path: str | Path,
     crash_marker: str | Path,
+    dispatched_marker: str | Path,
+    release_marker: str | Path,
     provider_marker: str | Path,
-) -> tuple[Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     root = _resolved(state_root)
     database = _resolved(database_path)
     crash = _resolved(crash_marker)
+    dispatched = _resolved(dispatched_marker)
+    release = _resolved(release_marker)
     provider = _resolved(provider_marker)
     if root != STATE_ROOT:
         raise RuntimeError(
@@ -67,11 +75,19 @@ def validate_rehearsal_paths(
         raise RuntimeError(
             "M3 rehearsal crash marker is outside its fixed state-volume path"
         )
+    if dispatched.parent != root or dispatched.name != DISPATCHED_MARKER_NAME:
+        raise RuntimeError(
+            "M3 rehearsal dispatched marker is outside its fixed state-volume path"
+        )
+    if release.parent != root or release.name != RELEASE_MARKER_NAME:
+        raise RuntimeError(
+            "M3 rehearsal release marker is outside its fixed state-volume path"
+        )
     if provider.parent != root or provider.name != PROVIDER_MARKER_NAME:
         raise RuntimeError(
             "M3 rehearsal provider marker is outside its fixed state-volume path"
         )
-    return root, database, crash, provider
+    return root, database, crash, dispatched, release, provider
 
 
 def should_crash_after_dispatch(
@@ -110,6 +126,30 @@ def should_crash_after_dispatch(
     return True
 
 
+def wait_for_crash_release(
+    *, state_root: str | Path, release_marker: str | Path, timeout_seconds: float
+) -> bool:
+    """Wait only for a bounded host release marker inside the state volume."""
+    root = _resolved(state_root)
+    marker = Path(release_marker)
+    if (
+        root != STATE_ROOT
+        or marker.is_symlink()
+        or marker.parent.resolve(strict=False) != root
+        or marker.name != RELEASE_MARKER_NAME
+    ):
+        raise RuntimeError("M3 crash gate refused an unsafe release marker")
+    if not 0 < timeout_seconds <= 60:
+        raise ValueError("M3 crash wait must be between zero and sixty seconds")
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if marker.is_file():
+            marker.unlink()
+            return True
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    return False
+
+
 def wrap_worker_builder(
     builder: Callable[..., Any], *, lease_seconds: int
 ) -> Callable[..., Any]:
@@ -138,12 +178,22 @@ def install() -> None:
     lease_seconds = int(
         os.environ.get("CYBERSENTINEL_M3_LEASE_SECONDS", str(DEFAULT_LEASE_SECONDS))
     )
+    crash_wait_seconds = float(
+        os.environ.get(
+            "CYBERSENTINEL_M3_CRASH_WAIT_SECONDS",
+            str(DEFAULT_CRASH_WAIT_SECONDS),
+        )
+    )
     crash_marker = state_root / CRASH_MARKER_NAME
+    dispatched_marker = state_root / DISPATCHED_MARKER_NAME
+    release_marker = state_root / RELEASE_MARKER_NAME
     provider_marker = state_root / PROVIDER_MARKER_NAME
-    root, database, crash, provider = validate_rehearsal_paths(
+    root, database, crash, dispatched, release, provider = validate_rehearsal_paths(
         state_root=state_root,
         database_path=database_path,
         crash_marker=crash_marker,
+        dispatched_marker=dispatched_marker,
+        release_marker=release_marker,
         provider_marker=provider_marker,
     )
     if state_dir != root:
@@ -152,6 +202,10 @@ def install() -> None:
         )
     if not 1 <= lease_seconds <= 10:
         raise RuntimeError("M3 rehearsal lease must be between one and ten seconds")
+    if not 0 < crash_wait_seconds <= 60:
+        raise RuntimeError(
+            "M3 rehearsal crash wait must be between zero and sixty seconds"
+        )
 
     import core.engine
 
@@ -173,6 +227,20 @@ def install() -> None:
             state_root=root,
             crash_marker=crash,
         ):
+            if (
+                dispatched.is_symlink()
+                or dispatched.parent.resolve(strict=False) != root
+            ):
+                raise RuntimeError("M3 rehearsal dispatched marker path changed")
+            dispatched.write_text(
+                "local watch effect is DISPATCHED\n", encoding="utf-8"
+            )
+            if not wait_for_crash_release(
+                state_root=root,
+                release_marker=release,
+                timeout_seconds=crash_wait_seconds,
+            ):
+                raise RuntimeError("M3 rehearsal host release timed out")
             os._exit(CRASH_EXIT_CODE)
         return original_mark_succeeded(self, effect_id, fence, **kwargs)
 

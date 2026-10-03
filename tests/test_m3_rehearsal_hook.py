@@ -29,20 +29,71 @@ def test_path_validation_accepts_only_fixed_markers_inside_state_volume(
 ) -> None:
     state_root, database, crash_marker = _sandbox(tmp_path, monkeypatch)
     provider_marker = state_root / hook.PROVIDER_MARKER_NAME
+    dispatched_marker = state_root / hook.DISPATCHED_MARKER_NAME
+    release_marker = state_root / hook.RELEASE_MARKER_NAME
 
     assert hook.validate_rehearsal_paths(
         state_root=state_root,
         database_path=database,
         crash_marker=crash_marker,
+        dispatched_marker=dispatched_marker,
+        release_marker=release_marker,
         provider_marker=provider_marker,
-    ) == (state_root, database, crash_marker, provider_marker)
+    ) == (
+        state_root,
+        database,
+        crash_marker,
+        dispatched_marker,
+        release_marker,
+        provider_marker,
+    )
     with pytest.raises(RuntimeError, match="provider marker is outside"):
         hook.validate_rehearsal_paths(
             state_root=state_root,
             database_path=database,
             crash_marker=crash_marker,
+            dispatched_marker=dispatched_marker,
+            release_marker=release_marker,
             provider_marker=tmp_path / "provider-violation",
         )
+
+
+def test_crash_release_marker_is_bounded_and_volume_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, _database, _crash_marker = _sandbox(tmp_path, monkeypatch)
+    release_marker = state_root / hook.RELEASE_MARKER_NAME
+
+    assert (
+        hook.wait_for_crash_release(
+            state_root=state_root,
+            release_marker=release_marker,
+            timeout_seconds=0.01,
+        )
+        is False
+    )
+    release_marker.write_text("host release\n", encoding="utf-8")
+    assert (
+        hook.wait_for_crash_release(
+            state_root=state_root,
+            release_marker=release_marker,
+            timeout_seconds=0.1,
+        )
+        is True
+    )
+    assert not release_marker.exists()
+
+    outside_marker = tmp_path / hook.RELEASE_MARKER_NAME
+    outside_marker.write_text("do not consume\n", encoding="utf-8")
+    unsafe_marker = state_root / hook.RELEASE_MARKER_NAME
+    unsafe_marker.symlink_to(outside_marker)
+    with pytest.raises(RuntimeError, match="unsafe release marker"):
+        hook.wait_for_crash_release(
+            state_root=state_root,
+            release_marker=unsafe_marker,
+            timeout_seconds=0.1,
+        )
+    assert outside_marker.is_file()
 
 
 def test_crash_is_one_shot_after_exact_dispatched_local_watch(
