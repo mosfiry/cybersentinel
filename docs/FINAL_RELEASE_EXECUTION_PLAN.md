@@ -48,4 +48,18 @@ Every stage follows `INSPECT → IMPLEMENT → TEST → BREAK → RECOVER → HA
 | V13 | Verifiable distribution artifacts, checksums, setup/backup/restore/upgrade material, and release notes. |
 | V14 | Full release gate, final audit, exact-SHA CI, and a separate user-confirmed release/tag decision. |
 
+## Checkpoint ledger
+
+| Stage | Checkpoint / verification | Status |
+|---|---|---|
+| V0 | Commit `86ef8f4bfe5da93ae7b35c939749d62343cc918a`; source baseline and staged release plan. | Pushed; exact-SHA CI passed (run `37151975771`). |
+| V1 | Commit `4f94ccb9760362eeb39ab82d82fe40c257b9066f`; authenticated readiness probe, bridge lifecycle integration tests, and operations documentation. | Pushed; exact-SHA CI passed (run [37152396766](https://github.com/mosfiry/cybersentinel/actions/runs/37152396766)), including pytest, hosted container build/smoke, hygiene, and sensitive-file scan. |
+| V2 | Owner reauthorization, restart quarantine, one-shot scheduler boundaries and resume were source-audited. Focused tests: **49 passed**. `compileall` passed; full local suite: **1,077 passed, 1 skipped**. This checkpoint documents verified existing implementation; no authorization behavior was broadened. | Local verification passed; docs checkpoint and exact-SHA CI pending. |
+
+## V2 authorization boundary and evidence
+
+Owner identity and policy proof are rebound to a fresh server-side session before queueing or resuming. Restarted nonterminal work is moved to `OWNER_REAUTH_REQUIRED`/`NEEDS_INPUT`; ambiguous in-flight effects remain in `RECOVERY_REQUIRED` until reconciled. Scheduled dispatch checks the exact mission/Owner/snapshot hash, version, expiry, live Owner session and account state, and mission readiness; stale, revoked, expired, or mismatched authority is quarantined before queue promotion. Existing isolated V13 E2E tests perform a test-only username/password login over the loopback bridge and exercise expired-session denial, worker restart, and Owner reconciliation.
+
+Recurring execution and scheduled retries are intentionally rejected by both the service and scheduler, with regression tests. The Owner policy does not authorize unattended recurring delegation; the user-provided scheduler requirements say that when unattended execution is not permitted, the mission must stop in an Owner-input/reauthorization state rather than execute. Therefore no recurring grant or automatic high-risk approval is inferred here. A previously valid scheduled mission is not resurrected after restart; fresh Owner reauthorization is required. This is a documented fail-closed boundary, not an unverified capability.
+
 **No final release tag is to be created by this plan.** V14 will stop for a separate confirmation containing the exact proposed tag and artifacts if and only if all release gates are evidenced.
