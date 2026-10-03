@@ -205,6 +205,35 @@ def test_provider_idempotency_key_is_stable_and_only_created_when_supported(tmp_
     assert ledger.get(first.effect_id).idempotency_key == first.idempotency_key
 
 
+def test_registry_passes_durable_idempotency_key_to_fixture_and_blocks_duplicate(
+    tmp_path, monkeypatch
+):
+    _store, mission, snapshot, queue, _identity, _claim, fence = _leased_fence(tmp_path)
+    received: list[tuple[str, str]] = []
+
+    def fixture_provider(value: str, *, idempotency_key: str):
+        received.append((value, idempotency_key))
+        return {"ok": True}
+
+    spec = _effect_spec(
+        "effect_probe", fixture_provider, idempotency_supported=True
+    )
+    assert registry_module.build_registry([spec]) == {spec.name: spec}
+
+    assert _execute(monkeypatch, spec, mission, snapshot, fence, "payload") == {"ok": True}
+
+    ledger = ExternalEffectLedger(queue.db_path)
+    effect = ledger.list_effects(mission_id=mission.mission_id)[0]
+    assert effect.state == EffectState.SUCCEEDED
+    assert effect.idempotency_supported is True
+    assert effect.idempotency_key.startswith("csfx_")
+    assert received == [("payload", effect.idempotency_key)]
+
+    with pytest.raises(EffectDispatchBlocked):
+        _execute(monkeypatch, spec, mission, snapshot, fence, "payload")
+    assert received == [("payload", effect.idempotency_key)]
+
+
 def test_tool_registry_persists_effect_before_handler_and_never_replays_success(
     tmp_path, monkeypatch
 ):
