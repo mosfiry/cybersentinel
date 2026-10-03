@@ -63,7 +63,8 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
     decision = authorize_tool(["run_project_tests", "."], context=context)
     assert decision.allowed and decision.decision is not None
 
-    queue = MissionQueue(tmp_path / "mission-queue.sqlite3", require_execution_fence=True)
+    mission_store = MissionStore(tmp_path / "missions.sqlite3")
+    queue = MissionQueue(tmp_path / "mission-queue.sqlite3", require_execution_fence=True, mission_store=mission_store)
     queue.enqueue("m1")
     identity = queue.register_worker("governed-test-worker")
     identity_fence = ExecutionFence.for_worker(queue, identity)
@@ -85,9 +86,13 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
         owner_identity_ref=snapshot.owner_identity,
         authorization_snapshot=snapshot.to_dict(),
     )
+    mission_record.transition(MissionStatus.READY, "test mission ready")
+    mission_store.save(mission_record)
     fence = identity_fence.with_lease(claim).for_mission(
         mission_record, task_id="workspace-step", execution_id="workspace-execution-1"
     )
+    binding = mission_store.bind_execution_claim("m1", fence)
+    assert binding.terminal_status is None and binding.lease_binding_id is not None
     store = EvidenceChainStore(
         tmp_path / "evidence.sqlite3", execution_fence=fence, require_execution_fence=True
     )

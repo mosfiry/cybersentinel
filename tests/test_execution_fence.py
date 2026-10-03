@@ -60,7 +60,7 @@ def _mission(store: MissionStore, mission_id: str = "fenced-mission") -> tuple[M
 def _leased_fence(tmp_path: Path):
     store = MissionStore(tmp_path / "missions.sqlite3")
     mission, snapshot = _mission(store)
-    queue = MissionQueue(tmp_path / "queue.sqlite3", require_execution_fence=True)
+    queue = MissionQueue(tmp_path / "queue.sqlite3", require_execution_fence=True, mission_store=store)
     queue.enqueue(mission.mission_id)
     identity = queue.register_worker("stable-test-worker")
     identity_fence = ExecutionFence.for_worker(queue, identity)
@@ -77,11 +77,17 @@ def _leased_fence(tmp_path: Path):
     fence = identity_fence.with_lease(claim).for_mission(
         mission, task_id="step-1", execution_id="execution-1"
     )
+    binding = store.bind_execution_claim(mission.mission_id, fence)
+    assert binding.terminal_status is None and binding.lease_binding_id is not None
+    mission = store.load(mission.mission_id)
+    assert mission is not None
     return store, mission, snapshot, queue, identity, claim, fence
 
 
 def test_strict_queue_claim_heartbeat_update_release_and_retirement_require_fence(tmp_path):
-    queue = MissionQueue(tmp_path / "strict.sqlite3", require_execution_fence=True)
+    store = MissionStore(tmp_path / "strict-missions.sqlite3")
+    mission, _snapshot = _mission(store, "strict-mission")
+    queue = MissionQueue(tmp_path / "strict.sqlite3", require_execution_fence=True, mission_store=store)
     queue.enqueue("strict-mission")
     identity = queue.register_worker("strict-worker")
     now = datetime.now(timezone.utc).isoformat()
@@ -99,7 +105,12 @@ def test_strict_queue_claim_heartbeat_update_release_and_retirement_require_fenc
         execution_fence=identity_fence,
     )
     assert claim is not None
-    fence = identity_fence.with_lease(claim)
+    fence = identity_fence.with_lease(claim).for_mission(mission)
+    with pytest.raises(ExecutionFenceError, match="MissionStore claim marker"):
+        queue.mark_claim_bound(fence)
+    assert queue.get(claim.mission_id).claim_phase == "CLAIMED"
+    store.bind_execution_claim(mission.mission_id, fence)
+    assert queue.get(claim.mission_id).claim_phase == "BOUND"
 
     with pytest.raises(ExecutionFenceError, match="recovery requires"):
         queue.recover_after_restart(now=now)
@@ -298,7 +309,7 @@ def test_strict_mission_runtime_fails_closed_without_a_worker_fence(tmp_path):
     assert dispatched == []
 
 
-def test_strict_runtime_rejects_executor_without_fence_before_state_change(tmp_path):
+def test_strict_runtime_rejects_executor_without_fence_before_slice_mutation(tmp_path):
     store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
     dispatched: list[str] = []
     runtime = MissionRuntime(
@@ -312,7 +323,7 @@ def test_strict_runtime_rejects_executor_without_fence_before_state_change(tmp_p
         runtime.run_slice(mission.mission_id)
 
     persisted = store.load(mission.mission_id)
-    assert persisted.status is MissionStatus.READY
+    assert persisted.status is MissionStatus.RUNNING
     assert persisted.checkpoint == {}
     assert persisted.iteration_count == 0
     assert dispatched == []

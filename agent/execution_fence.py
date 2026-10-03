@@ -108,6 +108,20 @@ class ExecutionFence:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    @property
+    def lease_binding_id(self) -> str:
+        if not self.mission_id or self.lease_epoch is None:
+            raise ExecutionFenceError("lease binding requires a mission and lease epoch")
+        payload = {
+            "mission_id": self.mission_id,
+            "worker_id": self.worker_id,
+            "worker_instance_id": self.worker_instance_id,
+            "runtime_generation": self.runtime_generation,
+            "lease_epoch": self.lease_epoch,
+        }
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
     def metadata(self) -> dict[str, Any]:
         return {
             "mission_id": self.mission_id or "",
@@ -123,7 +137,7 @@ class ExecutionFence:
             "fence_id": self.fence_id,
         }
 
-    def assert_queue_state(self, state: Mapping[str, Any]) -> None:
+    def assert_queue_state(self, state: Mapping[str, Any], *, allow_claimed: bool = False) -> None:
         expected = {
             "worker_id": self.worker_id,
             "worker_instance_id": self.worker_instance_id,
@@ -157,6 +171,12 @@ class ExecutionFence:
             or state.get("queue_runtime_generation") != self.runtime_generation
         ):
             raise ExecutionFenceError("mission lease is no longer owned by this execution fence")
+        allowed_claim_phases = {"CLAIMED", "BOUND"} if allow_claimed else {"BOUND"}
+        if (
+            state.get("claim_phase") not in allowed_claim_phases
+            or state.get("claim_fence_id") != self.lease_binding_id
+        ):
+            raise ExecutionFenceError("mission claim is not durably bound to this execution fence")
         expiry = state.get("lease_expires_at")
         if not isinstance(expiry, str):
             raise ExecutionFenceError("mission lease expiry is missing")
@@ -180,6 +200,7 @@ class ExecutionFence:
         execution_id: str | None = None,
         authorization_snapshot: Any | None = None,
         db: Any | None = None,
+        allow_claimed: bool = False,
     ) -> "ExecutionFence":
         if mission is not None:
             mission_id = str(getattr(mission, "mission_id", ""))
@@ -198,7 +219,7 @@ class ExecutionFence:
             raise ExecutionFenceError("execution fence execution identity mismatch")
         if authorization_snapshot is not None and authorization_digest(authorization_snapshot) != self.authorization_hash:
             raise ExecutionFenceError("execution fence authorization snapshot mismatch")
-        self.queue.validate_execution_fence(self, db=db)
+        self.queue.validate_execution_fence(self, db=db, allow_claimed=allow_claimed)
         return self
 
     def assert_dispatch(

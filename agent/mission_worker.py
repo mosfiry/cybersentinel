@@ -11,7 +11,7 @@ import sqlite3
 import uuid
 
 from .execution_fence import ExecutionFence, ExecutionFenceError
-from .mission import MissionStatus
+from .mission import MissionClaimBinding, MissionStatus
 
 
 class WorkerMissionState(str, Enum):
@@ -69,6 +69,8 @@ class QueueItem:
     lease_epoch: int = 0
     worker_instance_id: str | None = None
     runtime_generation: int = 0
+    claim_phase: str = "NONE"
+    claim_fence_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,9 +83,12 @@ class WorkerIdentity:
 class MissionQueue:
     """Durable queue metadata; mission truth remains in MissionStore."""
 
-    def __init__(self, db_path: str | Path, *, require_execution_fence: bool = False):
+    def __init__(self, db_path: str | Path, *, require_execution_fence: bool = False, mission_store: Any | None = None):
         self.db_path = str(db_path)
         self.require_execution_fence = bool(require_execution_fence)
+        self.mission_store = mission_store
+        if self.require_execution_fence and self.mission_store is None:
+            raise ExecutionFenceError("strict MissionQueue requires its authoritative MissionStore")
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("CREATE TABLE IF NOT EXISTS mission_queue (mission_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, claimed_at TEXT, last_error TEXT NOT NULL DEFAULT '')")
@@ -95,6 +100,8 @@ class MissionQueue:
                 ("lease_epoch", "INTEGER NOT NULL DEFAULT 0"),
                 ("worker_instance_id", "TEXT"),
                 ("runtime_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("claim_phase", "TEXT NOT NULL DEFAULT 'NONE'"),
+                ("claim_fence_id", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if column not in columns:
                     db.execute(f"ALTER TABLE mission_queue ADD COLUMN {column} {definition}")
@@ -125,6 +132,8 @@ class MissionQueue:
             int(row[8]),
             row[9],
             int(row[10]),
+            str(row[11]),
+            str(row[12]),
         )
 
     def register_worker(self, worker_id: str) -> WorkerIdentity:
@@ -182,20 +191,28 @@ class MissionQueue:
             raise LeaseLostError("worker instance is not the registered current generation")
         return generation
 
-    def validate_execution_fence(self, fence: ExecutionFence, *, db: sqlite3.Connection | None = None) -> None:
+    def validate_execution_fence(self, fence: ExecutionFence, *, db: sqlite3.Connection | None = None, allow_claimed: bool = False) -> None:
         """Read authoritative queue facts and let ExecutionFence compare them centrally."""
         if not isinstance(fence, ExecutionFence) or fence.queue is not self:
             raise ExecutionFenceError("execution fence belongs to another queue")
         context = nullcontext(db) if db is not None else sqlite3.connect(self.db_path)
         with context as connection:
+            target_path = str(Path(self.db_path).resolve())
+            schema = None
+            for _seq, name, path in connection.execute("PRAGMA database_list"):
+                if path and str(Path(path).resolve()) == target_path:
+                    schema = '"' + str(name).replace('"', '""') + '"'
+                    break
+            if schema is None:
+                raise ExecutionFenceError("queue database is not attached to the validation transaction")
             registered = connection.execute(
-                "SELECT worker_id,runtime_generation,worker_instance_id,state FROM mission_worker_generations WHERE worker_instance_id=?",
+                f"SELECT worker_id,runtime_generation,worker_instance_id,state FROM {schema}.mission_worker_generations WHERE worker_instance_id=?",
                 (fence.worker_instance_id,),
             ).fetchone()
             if registered is None:
                 raise ExecutionFenceError("execution fence worker instance is not registered")
             current = connection.execute(
-                "SELECT runtime_generation,worker_instance_id,state FROM mission_worker_generations WHERE worker_id=? ORDER BY runtime_generation DESC LIMIT 1",
+                f"SELECT runtime_generation,worker_instance_id,state FROM {schema}.mission_worker_generations WHERE worker_id=? ORDER BY runtime_generation DESC LIMIT 1",
                 (fence.worker_id,),
             ).fetchone()
             state: dict[str, Any] = {
@@ -211,7 +228,7 @@ class MissionQueue:
                 if not fence.mission_id:
                     raise ExecutionFenceError("execution fence mission is missing")
                 row = connection.execute(
-                    "SELECT mission_id,state,lease_owner,lease_epoch,lease_expires_at,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
+                    f"SELECT mission_id,state,lease_owner,lease_epoch,lease_expires_at,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM {schema}.mission_queue WHERE mission_id=?",
                     (fence.mission_id,),
                 ).fetchone()
                 if row is None:
@@ -224,8 +241,10 @@ class MissionQueue:
                     "lease_expires_at": row[4],
                     "queue_worker_instance_id": row[5],
                     "queue_runtime_generation": int(row[6]),
+                    "claim_phase": str(row[7]),
+                    "claim_fence_id": str(row[8]),
                 })
-        fence.assert_queue_state(state)
+        fence.assert_queue_state(state, allow_claimed=allow_claimed)
 
     def deactivate_worker(self, identity: WorkerIdentity, *, execution_fence: ExecutionFence | None = None) -> None:
         """Retire a normally stopped generation without releasing its lease."""
@@ -250,9 +269,9 @@ class MissionQueue:
         available = _utc_text(_utc_datetime(available_at, field_name="available_at"))
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0 WHERE mission_queue.state != ?", (mission_id, state.value, 0, available, WorkerMissionState.EXECUTING.value))
+            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_queue.state != ?", (mission_id, state.value, 0, available, WorkerMissionState.EXECUTING.value))
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -262,7 +281,7 @@ class MissionQueue:
 
     def get(self, mission_id: str) -> QueueItem:
         with sqlite3.connect(self.db_path) as db:
-            row = db.execute("SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
+            row = db.execute("SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
         if row is None:
             raise KeyError("unknown queued mission")
         return self._item_from_row(row)
@@ -292,7 +311,7 @@ class MissionQueue:
                 return None
             mission_id = row[0]
             updated = db.execute(
-                "UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=?, worker_instance_id=?, runtime_generation=?, lease_epoch=lease_epoch+1 "
+                "UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=?, worker_instance_id=?, runtime_generation=?, lease_epoch=lease_epoch+1,claim_phase='CLAIMED',claim_fence_id='' "
                 "WHERE mission_id=? AND state IN (?, ?, ?) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
                 (
                     WorkerMissionState.EXECUTING.value,
@@ -312,12 +331,192 @@ class MissionQueue:
             if updated.rowcount != 1:
                 raise LeaseLostError("queue claim changed before commit")
             claimed = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if claimed is None:
+                raise KeyError("unknown queued mission")
+            item = self._item_from_row(claimed)
+            lease_fence = (
+                execution_fence.with_lease(item)
+                if execution_fence is not None
+                else ExecutionFence(
+                    queue=self,
+                    worker_id=worker_id,
+                    worker_instance_id=instance_id,
+                    runtime_generation=generation,
+                    mission_id=mission_id,
+                    lease_epoch=item.lease_epoch,
+                )
+            )
+            db.execute(
+                "UPDATE mission_queue SET claim_fence_id=? WHERE mission_id=? AND lease_epoch=? AND claim_phase='CLAIMED'",
+                (lease_fence.lease_binding_id, mission_id, item.lease_epoch),
+            )
+            claimed = db.execute(
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if claimed is None:
                 raise KeyError("unknown queued mission")
             return self._item_from_row(claimed)
+
+    def mark_claim_bound(self, execution_fence: ExecutionFence, *, mission_store: Any | None = None) -> QueueItem:
+        """Verify MissionStore's complete durable marker before allowing dispatch."""
+        if not execution_fence.mission_id or execution_fence.lease_epoch is None:
+            raise ExecutionFenceError("claim binding requires a leased mission fence")
+        if self.require_execution_fence and self.mission_store is None:
+            raise ExecutionFenceError("strict queue claim binding requires its configured MissionStore")
+        if self.mission_store is not None and mission_store is not None and self.mission_store is not mission_store:
+            raise ExecutionFenceError("claim binding MissionStore does not match strict queue configuration")
+        store = self.mission_store or mission_store
+        if self.require_execution_fence and store is None:
+            raise ExecutionFenceError("strict queue claim binding requires MissionStore verification")
+
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            mission_schema = None
+            schemas = ["main"]
+            if store is not None:
+                from pathlib import Path
+
+                queue_path = str(Path(self.db_path).resolve())
+                mission_path = str(Path(store.db_path).resolve())
+                if queue_path != mission_path:
+                    db.execute("ATTACH DATABASE ? AS mission_store_db", (mission_path,))
+                    schemas.append("mission_store_db")
+                for schema in schemas:
+                    mode = str(db.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
+                    if mode not in {"delete", "truncate", "persist"}:
+                        raise ExecutionFenceError("claim binding requires rollback-journal mode for queue and mission stores")
+                for _seq, name, path in db.execute("PRAGMA database_list"):
+                    if path and str(Path(path).resolve()) == mission_path:
+                        mission_schema = '"' + str(name).replace('"', '""') + '"'
+                        break
+                if mission_schema is None:
+                    raise ExecutionFenceError("MissionStore database is not attached to claim transaction")
+
+            db.execute("BEGIN IMMEDIATE")
+            execution_fence.assert_current(db=db, allow_claimed=True)
+            if store is not None:
+                import json
+                from .mission import Mission
+
+                row = db.execute(
+                    f"SELECT payload FROM {mission_schema}.missions WHERE mission_id=?",
+                    (execution_fence.mission_id,),
+                ).fetchone()
+                if row is None:
+                    raise ExecutionFenceError("MissionStore record is missing for queue claim binding")
+                try:
+                    mission = Mission.from_dict(json.loads(row[0]))
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ExecutionFenceError("MissionStore record is invalid for queue claim binding") from exc
+                execution_fence.assert_current(mission=mission, db=db, allow_claimed=True)
+                marker = mission.progress.get("active_execution_claim")
+                expected = execution_fence.metadata()
+                if (
+                    not isinstance(marker, dict)
+                    or marker.get("lease_binding_id") != execution_fence.lease_binding_id
+                    or any(marker.get(key) != value for key, value in expected.items())
+                ):
+                    raise ExecutionFenceError("MissionStore claim marker does not match the complete execution fence")
+
+            updated = db.execute(
+                "UPDATE mission_queue SET claim_phase='BOUND' WHERE mission_id=? AND state=? AND lease_owner=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND claim_fence_id=? AND claim_phase IN ('CLAIMED','BOUND')",
+                (
+                    execution_fence.mission_id,
+                    WorkerMissionState.EXECUTING.value,
+                    execution_fence.worker_id,
+                    execution_fence.lease_epoch,
+                    execution_fence.worker_instance_id,
+                    execution_fence.runtime_generation,
+                    execution_fence.lease_binding_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LeaseLostError("mission claim changed before binding")
+            row = db.execute(
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
+                (execution_fence.mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown queued mission")
+            return self._item_from_row(row)
+
+    def abort_unstarted_claim(self, execution_fence: ExecutionFence, *, error: str) -> QueueItem:
+        """Quarantine a claim that could not bind MissionStore before dispatch."""
+        if not execution_fence.mission_id or execution_fence.lease_epoch is None:
+            raise ExecutionFenceError("claim abort requires a leased mission fence")
+        moment = _utc_text(datetime.now(timezone.utc))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            execution_fence.assert_current(db=db, allow_claimed=True)
+            updated = db.execute(
+                "UPDATE mission_queue SET state=?,available_at=?,last_error=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_id=? AND state=? AND lease_owner=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND claim_fence_id=? AND claim_phase IN ('CLAIMED','BOUND')",
+                (
+                    WorkerMissionState.WAITING_FOR_TOOL.value,
+                    moment,
+                    error[:500],
+                    execution_fence.mission_id,
+                    WorkerMissionState.EXECUTING.value,
+                    execution_fence.worker_id,
+                    execution_fence.lease_epoch,
+                    execution_fence.worker_instance_id,
+                    execution_fence.runtime_generation,
+                    execution_fence.lease_binding_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LeaseLostError("unstarted mission claim is no longer current")
+            row = db.execute(
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
+                (execution_fence.mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown queued mission")
+            return self._item_from_row(row)
+
+    def finalize_unstarted_claim(self, execution_fence: ExecutionFence, state: WorkerMissionState, *, error: str) -> QueueItem:
+        """Repair queue state from an already-persisted terminal mission without redispatch."""
+        if state not in {
+            WorkerMissionState.COMPLETED,
+            WorkerMissionState.FAILED,
+            WorkerMissionState.CANCELLED,
+            WorkerMissionState.NEEDS_INPUT,
+            WorkerMissionState.PARTIAL_SUCCESS,
+            WorkerMissionState.WAITING_FOR_TOOL,
+        }:
+            raise ValueError("terminal reconciliation requires a terminal or quarantined queue state")
+        if not execution_fence.mission_id or execution_fence.lease_epoch is None:
+            raise ExecutionFenceError("terminal reconciliation requires a leased mission fence")
+        moment = _utc_text(datetime.now(timezone.utc))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            execution_fence.assert_current(db=db, allow_claimed=True)
+            updated = db.execute(
+                "UPDATE mission_queue SET state=?,last_error=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_id=? AND state=? AND lease_owner=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND lease_expires_at>? AND claim_fence_id=? AND claim_phase IN ('CLAIMED','BOUND')",
+                (
+                    state.value,
+                    error[:500],
+                    execution_fence.mission_id,
+                    WorkerMissionState.EXECUTING.value,
+                    execution_fence.worker_id,
+                    execution_fence.lease_epoch,
+                    execution_fence.worker_instance_id,
+                    execution_fence.runtime_generation,
+                    moment,
+                    execution_fence.lease_binding_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LeaseLostError("terminal mission claim is no longer current")
+            row = db.execute(
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
+                (execution_fence.mission_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown queued mission")
+            return self._item_from_row(row)
 
     def update(
         self,
@@ -355,7 +554,7 @@ class MissionQueue:
             if terminal:
                 updated = db.execute(
                     "UPDATE mission_queue SET state=?,available_at=COALESCE(?,available_at),last_error=?,"
-                    "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0 "
+                    "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' "
                     "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND lease_expires_at > ?",
                     (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, instance_id, generation, moment),
                 )
@@ -368,7 +567,7 @@ class MissionQueue:
             if updated.rowcount != 1:
                 raise LeaseLostError("worker lease is expired, superseded, or no longer current")
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -413,14 +612,14 @@ class MissionQueue:
                 generation = self._assert_worker_generation(db, instance_id, runtime_generation)
             updated = db.execute(
                 "UPDATE mission_queue SET state=?,available_at=COALESCE(?,available_at),last_error=?,"
-                "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0 "
+                "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' "
                 "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND lease_expires_at > ?",
                 (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, instance_id, generation, moment),
             )
             if updated.rowcount != 1:
                 raise LeaseLostError("worker lease is expired, superseded, or no longer current")
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -428,7 +627,7 @@ class MissionQueue:
             item = self._item_from_row(row)
         return item
 
-    def heartbeat(self, mission_id: str, *, worker_id: str, lease_epoch: int | None = None, runtime_generation: int | None = None, worker_instance_id: str | None = None, execution_fence: ExecutionFence | None = None, now: str | None = None, lease_seconds: int = 60) -> QueueItem:
+    def heartbeat(self, mission_id: str, *, worker_id: str, lease_epoch: int | None = None, runtime_generation: int | None = None, worker_instance_id: str | None = None, execution_fence: ExecutionFence | None = None, now: str | None = None, lease_seconds: int = 60, allow_claimed: bool = False) -> QueueItem:
         if not worker_id.strip():
             raise LeaseLostError("worker heartbeat requires a lease owner")
         if lease_epoch is None:
@@ -446,7 +645,7 @@ class MissionQueue:
             if execution_fence is not None:
                 if execution_fence.mission_id != mission_id or execution_fence.worker_id != worker_id or execution_fence.worker_instance_id != instance_id or execution_fence.lease_epoch != lease_epoch:
                     raise ExecutionFenceError("queue heartbeat identity does not match execution fence")
-                execution_fence.assert_current(db=db)
+                execution_fence.assert_current(db=db, allow_claimed=allow_claimed)
                 generation = execution_fence.runtime_generation
             else:
                 generation = self._assert_worker_generation(db, instance_id, runtime_generation)
@@ -458,7 +657,7 @@ class MissionQueue:
             if updated.rowcount != 1:
                 raise LeaseLostError("worker lease is expired, superseded, or no longer current")
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -480,7 +679,7 @@ class MissionQueue:
             if not rows:
                 return []
             updated = db.execute(
-                "UPDATE mission_queue SET state=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, worker_instance_id=NULL, runtime_generation=0, lease_epoch=lease_epoch+1, last_error=? "
+                "UPDATE mission_queue SET state=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, worker_instance_id=NULL, runtime_generation=0, lease_epoch=lease_epoch+1, last_error=?,claim_phase='NONE',claim_fence_id='' "
                 "WHERE state=? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
                 (WorkerMissionState.QUEUED.value, "worker lease expired", WorkerMissionState.EXECUTING.value, moment),
             )
@@ -489,7 +688,7 @@ class MissionQueue:
             recovered = []
             for (mission_id,) in rows:
                 row = db.execute(
-                    "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
+                    "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
                     (mission_id,),
                 ).fetchone()
                 if row is None:
@@ -545,8 +744,9 @@ class MissionWorker:
         if item is None:
             return None
         execution_fence = self.identity_fence.with_lease(item)
+        claim_bound = False
 
-        def heartbeat() -> None:
+        def heartbeat(*, allow_claimed: bool = False) -> None:
             self.queue.heartbeat(
                 item.mission_id,
                 worker_id=self.worker_id,
@@ -555,26 +755,76 @@ class MissionWorker:
                 worker_instance_id=self.worker_instance_id,
                 execution_fence=execution_fence,
                 lease_seconds=self.lease_seconds,
+                allow_claimed=allow_claimed,
             )
 
         try:
-            heartbeat()
+            # The initial renewal verifies a live CLAIMED lease before runtime
+            # construction; it does not authorize dispatch.
+            heartbeat(allow_claimed=True)
             runtime = self.runtime_factory()
             set_fence = getattr(runtime, "set_execution_fence", None)
             if callable(set_fence):
                 set_fence(execution_fence)
             elif self.queue.require_execution_fence:
                 raise ExecutionFenceError("strict worker runtime does not accept execution fences")
+            bind_claim = getattr(runtime, "bind_execution_claim", None)
+            if callable(bind_claim):
+                binding = bind_claim(item.mission_id, execution_fence)
+                if isinstance(binding, MissionClaimBinding) and binding.terminal_status is not None:
+                    terminal_queue_state = {
+                        MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
+                        MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
+                        MissionStatus.AUTHORIZATION_BLOCKED: WorkerMissionState.FAILED,
+                        MissionStatus.RECOVERY_REQUIRED: WorkerMissionState.WAITING_FOR_TOOL,
+                        MissionStatus.CANCELLED: WorkerMissionState.CANCELLED,
+                        MissionStatus.FAILED_RETRY_EXHAUSTED: WorkerMissionState.FAILED,
+                        MissionStatus.SCOPE_BLOCKED: WorkerMissionState.FAILED,
+                        MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
+                        MissionStatus.RESOURCE_BLOCKED: WorkerMissionState.FAILED,
+                    }.get(binding.terminal_status, WorkerMissionState.FAILED)
+                    return self.queue.finalize_unstarted_claim(
+                        execution_fence,
+                        terminal_queue_state,
+                        error=f"mission already terminal: {binding.terminal_status.value}",
+                    )
+                if self.queue.require_execution_fence:
+                    # The runtime's MissionStore must have committed the full
+                    # marker and advanced the queue through its strict verifier.
+                    self.queue.validate_execution_fence(execution_fence)
+                elif self.queue.get(item.mission_id).claim_phase != "BOUND":
+                    self.queue.mark_claim_bound(execution_fence)
+            elif self.queue.require_execution_fence:
+                raise ExecutionFenceError("strict worker runtime cannot durably bind mission state")
+            else:
+                self.queue.mark_claim_bound(execution_fence)
+            claim_bound = True
             heartbeat()
             mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=heartbeat)
         except (LeaseLostError, ExecutionFenceError):
-            # A lease may be reclaimed while this worker is between slices. The
-            # stale worker must not overwrite the queue outcome or report FAILED.
+            # Before BOUND, no runtime slice or handler has run; quarantine this
+            # lease if it is still current. After BOUND, stale ownership must not
+            # modify the replacement worker's outcome.
+            if not claim_bound:
+                try:
+                    return self.queue.abort_unstarted_claim(
+                        execution_fence,
+                        error="mission claim could not be durably bound before dispatch",
+                    )
+                except (LeaseLostError, ExecutionFenceError):
+                    pass
             return self.queue.get(item.mission_id)
         except Exception:
+            if not claim_bound:
+                try:
+                    return self.queue.abort_unstarted_claim(
+                        execution_fence,
+                        error="worker could not bind mission claim before dispatch",
+                    )
+                except (LeaseLostError, ExecutionFenceError):
+                    return self.queue.get(item.mission_id)
             # An unexpected runtime exception may follow an external effect.
-            # Never convert that ambiguity into FAILED or retry it automatically,
-            # and do not persist exception text that could contain sensitive data.
+            # Never convert that ambiguity into FAILED or retry it automatically.
             try:
                 return self.queue.release(
                     item.mission_id,

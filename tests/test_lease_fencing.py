@@ -347,8 +347,9 @@ def test_worker_does_not_construct_runtime_when_initial_lease_validation_fails(t
     result = worker.run_once()
 
     assert result is not None
-    assert result.state is WorkerMissionState.EXECUTING
-    assert result.lease_owner == "worker-a"
+    assert result.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert result.lease_owner is None
+    assert result.claim_phase == "NONE"
     assert runtime_created == []
 
 

@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+from datetime import datetime, timezone
 import uuid
 import hashlib
 import json
 
 from .planning import Plan, GoalVerification
 from .trajectory import EventType, TrajectoryEvent, verify_trajectory
-from .execution_fence import ExecutionFence
+from .execution_fence import ExecutionFence, ExecutionFenceError
 
 
 class MissionStatus(str, Enum):
@@ -29,6 +30,12 @@ class MissionStatus(str, Enum):
     SAFETY_BLOCKED = "SAFETY_BLOCKED"
     FAILED_RETRY_EXHAUSTED = "FAILED_RETRY_EXHAUSTED"
     CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True)
+class MissionClaimBinding:
+    lease_binding_id: str | None
+    terminal_status: MissionStatus | None = None
 
 
 TERMINAL_MISSION_STATUSES = frozenset({
@@ -165,17 +172,54 @@ class MissionStore:
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS missions (mission_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
 
-    def save(self, mission: Mission, *, execution_fence: ExecutionFence | None = None) -> Mission:
+    def _attach_queue_database(self, db, execution_fence: ExecutionFence) -> None:
+        from pathlib import Path
+
+        mission_path = str(Path(self.db_path).resolve())
+        queue_path = str(Path(execution_fence.queue.db_path).resolve())
+        if mission_path == queue_path:
+            schemas = ("main",)
+        else:
+            db.execute("ATTACH DATABASE ? AS execution_queue", (queue_path,))
+            schemas = ("main", "execution_queue")
+        for schema in schemas:
+            mode = str(db.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
+            if mode not in {"delete", "truncate", "persist"}:
+                raise ExecutionFenceError("mission and queue writes require SQLite rollback-journal mode")
+
+    def _save(self, mission: Mission, *, execution_fence: ExecutionFence | None, allow_claimed: bool) -> Mission:
         import json, sqlite3
         if execution_fence is not None:
-            execution_fence.assert_current(mission=mission)
-        with sqlite3.connect(self.db_path) as db:
+            execution_fence.assert_current(mission=mission, allow_claimed=allow_claimed)
+            if execution_fence.queue.require_execution_fence:
+                marker = mission.progress.get("active_execution_claim")
+                if not isinstance(marker, dict) or marker.get("lease_binding_id") != execution_fence.lease_binding_id:
+                    raise ExecutionFenceError("mission write requires its current durable claim marker")
+                bound_at = marker.get("bound_at")
+                marker.update(execution_fence.metadata())
+                marker["lease_binding_id"] = execution_fence.lease_binding_id
+                marker["bound_at"] = bound_at
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            if execution_fence is not None:
+                self._attach_queue_database(db, execution_fence)
             db.execute("BEGIN IMMEDIATE")
             if execution_fence is not None:
-                execution_fence.assert_current(mission=mission)
+                # The queue DB is attached to this write transaction, preventing
+                # lease recovery/reclaim between fence validation and mission CAS.
+                execution_fence.assert_current(mission=mission, db=db, allow_claimed=allow_claimed)
             payload = mission.to_dict()
             encoded = json.dumps(payload, ensure_ascii=False)
             existing = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
+            if execution_fence is None:
+                current_marker = None
+                if existing is not None:
+                    current_progress = json.loads(existing[0]).get("progress", {})
+                    if not isinstance(current_progress, dict):
+                        raise ExecutionFenceError("stored mission claim marker state is invalid")
+                    current_marker = current_progress.get("active_execution_claim")
+                proposed_marker = mission.progress.get("active_execution_claim")
+                if proposed_marker != current_marker:
+                    raise ExecutionFenceError("active execution claim can only be changed by its current fence")
             if existing is None:
                 db.execute("INSERT INTO missions(mission_id,payload) VALUES(?,?)", (mission.mission_id, encoded))
             else:
@@ -188,6 +232,50 @@ class MissionStore:
             mission.integrity_hash = str(payload["integrity_hash"])
         return mission
 
+    def save(self, mission: Mission, *, execution_fence: ExecutionFence | None = None) -> Mission:
+        return self._save(mission, execution_fence=execution_fence, allow_claimed=False)
+
+    def bind_execution_claim(self, mission_id: str, execution_fence: ExecutionFence) -> MissionClaimBinding:
+        """Persist mission RUNNING + lease marker before the queue allows dispatch."""
+        mission = self.load(mission_id)
+        if mission is None:
+            raise KeyError("unknown mission")
+        if mission.is_terminal:
+            execution_fence.assert_current(mission=mission, allow_claimed=True)
+            return MissionClaimBinding(None, mission.status)
+        if mission.status not in {
+            MissionStatus.READY,
+            MissionStatus.RUNNING,
+            MissionStatus.OBSERVING,
+            MissionStatus.VERIFYING,
+            MissionStatus.REPLANNING,
+        }:
+            raise ExecutionFenceError("mission state is not eligible for worker claim binding")
+        bound_fence = (
+            execution_fence
+            if execution_fence.task_version is not None and execution_fence.authorization_hash
+            else execution_fence.for_mission(mission)
+        )
+        bound_fence.assert_current(mission=mission, allow_claimed=True)
+        if bound_fence.queue.require_execution_fence and bound_fence.queue.mission_store is not self:
+            raise ExecutionFenceError("strict queue must be configured with this MissionStore")
+        if mission.status is not MissionStatus.RUNNING:
+            mission.transition(
+                MissionStatus.RUNNING,
+                "durable queue claim bound before execution",
+                worker_instance_id=bound_fence.worker_instance_id,
+                runtime_generation=bound_fence.runtime_generation,
+                lease_epoch=bound_fence.lease_epoch,
+            )
+        mission.progress["active_execution_claim"] = {
+            **bound_fence.metadata(),
+            "lease_binding_id": bound_fence.lease_binding_id,
+            "bound_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save(mission, execution_fence=bound_fence, allow_claimed=True)
+        bound_fence.queue.mark_claim_bound(bound_fence, mission_store=self)
+        return MissionClaimBinding(bound_fence.lease_binding_id)
+
     def load(self, mission_id: str) -> Mission | None:
         import json, sqlite3
         with sqlite3.connect(self.db_path) as db:
@@ -195,4 +283,4 @@ class MissionStore:
         return Mission.from_dict(json.loads(row[0])) if row else None
 
 
-__all__ = ["Mission", "MissionStatus", "MissionStore", "TERMINAL_MISSION_STATUSES"]
+__all__ = ["Mission", "MissionStatus", "MissionClaimBinding", "MissionStore", "TERMINAL_MISSION_STATUSES"]

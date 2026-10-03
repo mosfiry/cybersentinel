@@ -239,6 +239,9 @@ class AgentCore:
             def set_execution_fence(self, fence):
                 runtime.set_execution_fence(fence)
 
+            def bind_execution_claim(self, requested_mission_id, fence):
+                return runtime.bind_execution_claim(requested_mission_id, fence)
+
             def run_to_completion(self, requested_mission_id, *, max_slices=None, heartbeat=None):
                 if native_model is not None:
                     result = runtime.run_model_loop(
@@ -261,7 +264,7 @@ class AgentCore:
 
         self_max_slices = max_slices
         queue_path = Path(self.store.db_path).with_name("mission_queue.sqlite3")
-        queue = MissionQueue(queue_path, require_execution_fence=True)
+        queue = MissionQueue(queue_path, require_execution_fence=True, mission_store=self.store)
         worker = MissionWorker(
             queue,
             RuntimeAdapter,

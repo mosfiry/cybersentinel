@@ -7,7 +7,7 @@ import hashlib
 import inspect
 import json
 
-from .mission import Mission, MissionStatus, MissionStore
+from .mission import Mission, MissionClaimBinding, MissionStatus, MissionStore
 from .execution_fence import ExecutionFence, ExecutionFenceError
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
 from .trajectory import EventType
@@ -40,6 +40,17 @@ class MissionRuntime:
         if not isinstance(execution_fence, ExecutionFence) or execution_fence.lease_epoch is None:
             raise ExecutionFenceError("runtime requires a leased execution fence")
         self.execution_fence = execution_fence
+
+    def bind_execution_claim(self, mission_id: str, execution_fence: ExecutionFence) -> MissionClaimBinding:
+        """Persist a mission-side claim marker before MissionQueue permits tool dispatch."""
+        self.set_execution_fence(execution_fence)
+        mission = self._load(mission_id)
+        claim_fence = self._fence_for(mission)
+        if claim_fence is None:
+            raise ExecutionFenceError("mission claim binding requires an execution fence")
+        marker_id = self.store.bind_execution_claim(mission_id, claim_fence)
+        self.execution_fence = claim_fence
+        return marker_id
 
     def _fence_for(self, mission: Mission, *, task_id: str | None = None, execution_id: str | None = None) -> ExecutionFence | None:
         if self.execution_fence is None:
