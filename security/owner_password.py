@@ -21,6 +21,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 import core.db as core_db
+from security.session_reference import is_session_reference, session_reference
 
 OWNER_USERNAME = "mosfiry"
 KDF_ALGORITHM = "scrypt"
@@ -121,13 +122,14 @@ def create_owner_account(username: str, password: str) -> int:
 
 def _create_session(owner_id: int) -> dict:
     session_id = secrets.token_urlsafe(32)
+    session_ref = session_reference(session_id)
     now = _now()
     expires = now + timedelta(seconds=SESSION_TTL_SECONDS)
     with core_db.connect() as con:
         con.execute(
             "INSERT INTO owner_sessions (session_id, owner_id, created_at, authenticated_at, expires_at, status, auth_method)"
             " VALUES (?, ?, ?, ?, ?, 'active', ?)",
-            (session_id, owner_id, _iso(now), _iso(now), _iso(expires), AUTH_METHOD),
+            (session_ref, owner_id, _iso(now), _iso(now), _iso(expires), AUTH_METHOD),
         )
         con.commit()
     return {
@@ -162,9 +164,8 @@ def login(username: str, password: str) -> dict:
     return _create_session(int(row["owner_id"]))
 
 
-def resolve_session(session_id) -> dict | None:
-    """Resolve a server-side Owner session; None when unknown/expired/revoked."""
-    if not isinstance(session_id, str) or not session_id:
+def _resolve_session_reference(session_ref: str) -> dict | None:
+    if not is_session_reference(session_ref):
         return None
     with core_db.connect() as con:
         row = con.execute(
@@ -172,7 +173,7 @@ def resolve_session(session_id) -> dict | None:
             " a.username, a.status AS account_status"
             " FROM owner_sessions s JOIN owner_accounts a ON a.owner_id = s.owner_id"
             " WHERE s.session_id = ?",
-            (session_id,),
+            (session_ref,),
         ).fetchone()
     if row is None or row["status"] != "active" or row["account_status"] != "active":
         return None
@@ -193,14 +194,25 @@ def resolve_session(session_id) -> dict | None:
     }
 
 
+def resolve_session(session_id) -> dict | None:
+    """Resolve a bearer token or server-generated reference; never return the bearer."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    reference = session_id if is_session_reference(session_id) else session_reference(session_id)
+    return _resolve_session_reference(reference)
+
+
 def authenticated_owner(session_id) -> dict | None:
     """The ONLY way any caller obtains an authenticated Owner identity.
 
-    Accepts ONLY a server-side session reference. Client-supplied booleans,
-    roles, tokens, and magic strings are irrelevant by construction: there
-    is no parameter through which they could authenticate anyone.
+    Accepts a bearer token at HTTP-facing boundaries or a server-generated
+    SHA-256 reference at internal boundaries. Both resolve against the same
+    server-side session row; client claims cannot authenticate anyone.
     """
-    session = resolve_session(session_id)
+    if is_session_reference(session_id):
+        session = _resolve_session_reference(session_id)
+    else:
+        session = resolve_session(session_id)
     if session is None:
         return None
     return {
@@ -214,11 +226,12 @@ def authenticated_owner(session_id) -> dict | None:
 def revoke_session(session_id) -> bool:
     if not isinstance(session_id, str) or not session_id:
         return False
+    session_ref = session_reference(session_id)
     with core_db.connect() as con:
         cur = con.execute(
             "UPDATE owner_sessions SET status = 'revoked'"
             " WHERE session_id = ? AND status = 'active'",
-            (session_id,),
+            (session_ref,),
         )
         con.commit()
         return cur.rowcount > 0

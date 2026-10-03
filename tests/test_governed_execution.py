@@ -24,8 +24,9 @@ from agent.filesystem_verification import FilesystemVerifier
 from security.authorization import authorize_tool
 from security.authorization_context import AuthorizationContext
 from security.mission_authorization import MissionAuthorizationSnapshot
+from security.session_reference import session_reference
 from tools.registry import execute
-from workspace import Workspace, WorkspaceBoundaryError, WorkspacePolicyError
+from workspace import ProcessManager, Workspace, WorkspaceBoundaryError, WorkspacePolicy, WorkspacePolicyError
 
 
 def auth(root: str, *, mission_id: str = "m1", owner: str = "owner-proof", actions=None, tools=None, forbidden=None, expiry=None):
@@ -142,6 +143,63 @@ def test_workspace_requires_snapshot_and_blocks_boundary_and_symlink(tmp_path):
         pytest.skip("symlink unavailable")
     with pytest.raises(WorkspaceBoundaryError):
         workspace.read("escape")
+
+
+def test_workspace_rejects_symlink_swapped_after_authorization(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("do-not-read")
+    entry = tmp_path / "entry"
+    entry.mkdir()
+    workspace = Workspace(
+        tmp_path,
+        authorization_snapshot=auth(str(tmp_path), actions=["read"], tools=[]),
+    )
+    original_authorize = workspace._authorize
+
+    def authorize_then_swap(operation, **kwargs):
+        original_authorize(operation, **kwargs)
+        if operation == "read" and kwargs.get("path") == "entry/secret.txt":
+            entry.rmdir()
+            entry.symlink_to(outside, target_is_directory=True)
+
+    workspace._authorize = authorize_then_swap
+    with pytest.raises(WorkspaceBoundaryError):
+        workspace.read("entry/secret.txt")
+    assert (outside / "secret.txt").read_text() == "do-not-read"
+
+
+def test_process_manager_requires_snapshot_and_does_not_store_raw_argv(tmp_path):
+    secret_arg = "OWNER_PROCESS_SECRET_SENTINEL"
+    workspace = Workspace(
+        tmp_path,
+        authorization_snapshot=auth(str(tmp_path), actions=["process"], tools=[]),
+    )
+    handle = ProcessManager(workspace).start(
+        ("python", "-c", f"print({secret_arg!r})"),
+        cwd=".",
+    )
+    result = handle.monitor(timeout=5)
+    assert result.ok and secret_arg in result.stdout
+    event = workspace.audit[-1]
+    assert event.operation == "process_start"
+    assert event.command == ("python",)
+    assert event.command_hash
+    assert secret_arg not in repr(event)
+
+
+def test_process_output_is_bounded_while_captured(tmp_path):
+    workspace = Workspace(
+        tmp_path,
+        policy=WorkspacePolicy(max_output_bytes=128),
+        authorization_snapshot=auth(str(tmp_path), actions=["process"], tools=[]),
+    )
+    result = workspace.run_process(
+        ("python", "-c", "import sys; sys.stdout.write('x' * 1000000)"),
+        timeout=5,
+    )
+    assert result.ok
+    assert len(result.stdout.encode("utf-8")) <= 128
 
 
 def test_snapshot_tamper_expiry_wrong_mission_target_and_forbidden_tool_are_blocked(tmp_path):
@@ -276,10 +334,14 @@ def test_worker_heartbeat_during_execution_and_stale_update_rejected(tmp_path):
 def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, monkeypatch):
     import bridge
     import core.db as core_db
+    import agent.task_manager as task_db
+    from core.lifecycle import bind_owner, begin as begin_execution, get as get_execution
     monkeypatch.setattr(bridge, "BRIDGE_TOKEN", "bridge-test")
-    allow_owner_sessions(monkeypatch, "owner-test")
+    allow_owner_sessions(monkeypatch, "owner-test", "other-owner")
     monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "api.sqlite3")
     monkeypatch.setattr(core_db, "DB_PATH", tmp_path / "owner_auth.sqlite3")
+    monkeypatch.setattr(task_db, "DB_PATH", tmp_path / "tasks.sqlite3")
+    task_db._init_db()
     now = datetime.now(timezone.utc).isoformat()
     with core_db.connect() as auth_db:
         auth_db.execute(
@@ -290,8 +352,11 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
         auth_db.execute(
             "INSERT INTO owner_sessions(session_id,owner_id,created_at,authenticated_at,expires_at,status,auth_method) "
             "VALUES(?,?,?,?,?,?,?)",
-            ("owner-test", 1, now, now, "2999-01-01T00:00:00+00:00", "active", "username_password"),
+            (session_reference("owner-test"), 1, now, now, "2999-01-01T00:00:00+00:00", "active", "username_password"),
         )
+    # Exercise the same startup migration that converts legacy raw references.
+    with core_db.connect():
+        pass
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -325,23 +390,48 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
                 assert body["report"]["schema_version"] == "cybersentinel.mission-report.v1"
                 assert body["report"]["mission_summary"]["outcome"] == "UNKNOWN"
                 assert report_chain.read_bytes() == chain_before
-        code, _ = request("POST", f"/api/missions/{mission_id}/start")
-        assert code == 200
+        code, start_result = request("POST", f"/api/missions/{mission_id}/start")
+        assert code == 200, start_result
         code, _ = request("POST", f"/api/missions/{mission_id}/pause")
         assert code == 200
         code, _ = request("POST", f"/api/missions/{mission_id}/resume")
         assert code == 200
-        code, _ = request(
+        code, schedule_result = request(
             "POST",
             f"/api/missions/{mission_id}/schedule",
             {"run_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()},
         )
-        assert code == 201
+        assert code == 201, schedule_result
         code, _ = request("POST", f"/api/missions/{mission_id}/cancel")
         assert code == 200
         assert request("GET", f"/api/missions/{mission_id}", bridge_token="wrong")[0] == 401
         assert request("GET", f"/api/missions/{mission_id}", token="wrong")[0] == 403
         assert request("GET", f"/api/missions/{mission_id}/report", token="wrong")[0] == 403
+
+        core_db.ensure_conversation("owner-conversation", "owner-test")
+        core_db.add_conversation_message("owner-conversation", "user", "owner-private")
+        core_db.ensure_conversation("foreign-conversation", "other-owner")
+        core_db.add_conversation_message("foreign-conversation", "user", "foreign-private")
+        code, owner_session = request("GET", "/api/session/owner-conversation")
+        assert code == 200 and owner_session["session"]["owner_session_id"]
+        assert owner_session["session"]["messages"][0]["content"] == "owner-private"
+        code, _ = request("GET", "/api/session/foreign-conversation")
+        assert code == 404
+        code, foreign_session = request("GET", "/api/session/foreign-conversation", token="other-owner")
+        assert code == 200 and foreign_session["session"]["messages"][0]["content"] == "foreign-private"
+        missing_status, missing = request("GET", "/api/session/not-found")
+        assert missing_status == 404 and missing == {"ok": False, "error": "unknown_session"}
+        assert request("GET", "/api/session/foreign-conversation")[1] == missing
+
+        begin_execution("cancel-owned", "http-test")
+        bind_owner("cancel-owned", "owner-test")
+        assert request("POST", "/api/cancel", {"request_id": "cancel-owned"}, bridge_token="wrong")[0] == 401
+        assert request("POST", "/api/cancel", {"request_id": "cancel-owned"}, token="")[0] == 403
+        assert request("POST", "/api/cancel", {"request_id": "cancel-owned"}, token="other-owner")[0] == 404
+        assert get_execution("cancel-owned").cancel_requested is False
+        code, cancelled = request("POST", "/api/cancel", {"request_id": "cancel-owned"})
+        assert code == 200 and cancelled["cancel_requested"] is True
+        assert get_execution("cancel-owned").cancel_requested is True
     finally:
         server.shutdown()
         server.server_close()
@@ -351,17 +441,25 @@ def test_restart_e2e_persists_mission_worker_evidence_and_revalidates(tmp_path):
     mission_db = tmp_path / "missions.sqlite3"
     queue_db = tmp_path / "queue.sqlite3"
     evidence_db = tmp_path / "evidence.sqlite3"
-    plan = Plan.initial("restart objective").replan(steps=(PlanStep("s1", "write", action="write"),), reason="test")
+    plan = Plan.initial("restart objective run project tests").replan(
+        steps=(
+            PlanStep("s1", "write artifact", action="write"),
+            PlanStep("s2", "run project tests", action="run_project_tests"),
+        ),
+        reason="test",
+    )
     evidence_store = EvidenceChainStore(evidence_db)
 
-    def execute(mission, _step, _action):
+    def execute(mission, step, _action):
+        if step.action == "run_project_tests":
+            return {"success": True, "source": "run_project_tests", "result": {"ok": True, "returncode": 0, "timed_out": False}}
         snapshot = MissionAuthorizationSnapshot.from_dict(mission.authorization_snapshot)
         workspace = Workspace(tmp_path, authorization_snapshot=snapshot).bind(mission_id=mission.mission_id, request_id=mission.request_id, tool_id="write", authorization_snapshot=snapshot, evidence_store=evidence_store)
         workspace.write("artifact.txt", "persisted")
-        return {"success": True, "criterion_id": "write", "source": "workspace"}
+        return {"success": True, "source": "workspace"}
 
     first = MissionRuntime(MissionStore(mission_db), executor=execute, authorization_snapshot_factory=lambda mission: make_test_snapshot(mission, root=str(tmp_path)))
-    mission = first.create("restart objective", "restart objective", plan, owner_identity_ref="test-owner", request_id="restart-request")
+    mission = first.create("restart objective", "restart objective run project tests", plan, owner_identity_ref="test-owner", request_id="restart-request", completion_criteria=[{"criterion_id": "tests", "check": "pytest_success"}])
     queue = MissionQueue(queue_db)
     queue.enqueue(mission.mission_id)
     worker_item = queue.claim_next(worker_id="worker-a", lease_seconds=60)

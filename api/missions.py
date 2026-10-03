@@ -21,6 +21,7 @@ from agent.evidence import EvidenceChainStore
 from agent.reporting import build_mission_report
 from security.mission_authorization import MissionAuthorizationSnapshot
 from security.owner_policy import OwnerAuthenticationEvidence
+from security.session_reference import session_reference
 
 
 class MissionService:
@@ -242,6 +243,40 @@ class MissionService:
                 }
                 mission.record_observation(observation)
                 mission.record_action(execution_id, task_id, "completed", observation)
+                reconciled_step = next((item for item in mission.plan.steps if item.step_id == task_id), None)
+                if reconciled_step is not None:
+                    retry_policy = reconciled_step.retry_policy if isinstance(reconciled_step.retry_policy, dict) else {}
+                    arguments = retry_policy.get("arguments", {})
+                    tool_argument = arguments.get("query") if isinstance(arguments, dict) else None
+                    verified_evidence = self.runtime._successful_observation_evidence(
+                        mission,
+                        {"success": True, "result": {}},
+                        tool_name=reconciled_step.action,
+                        tool_argument=tool_argument,
+                    )
+                    if verified_evidence:
+                        criterion_id, verified_result = verified_evidence
+                    else:
+                        criterion_id, verified_result = "", {}
+                    if criterion_id and not any(
+                        item.get("criterion_id") == criterion_id
+                        and isinstance(item.get("provenance"), dict)
+                        and item["provenance"].get("action_id") == execution_id
+                        for item in mission.evidence
+                        if isinstance(item, dict)
+                    ):
+                        mission.evidence.append({
+                            "criterion_id": criterion_id,
+                            "passed": True,
+                            "source": reconciled_step.action,
+                            "result": {"source": reconciled_step.action, "result": {**verified_result, "reconciliation": "owner_confirmed_applied"}},
+                            "provenance": {
+                                "mission_id": mission.mission_id,
+                                "step_id": task_id,
+                                "action_id": execution_id,
+                                "verification_authority": self.runtime._verification_authority(reconciled_step.action),
+                            },
+                        })
                 self._append_reconciled_model_result(
                     mission, effect, tool_call_id, success=True
                 )
@@ -366,7 +401,7 @@ class MissionService:
         mission, owner_ref = self._authorized_mission(mission_id, owner_session_token)
         if not isinstance(evidence, OwnerAuthenticationEvidence) or not evidence.is_valid(
             mission.request_id,
-            session_id=owner_session_token,
+            session_id=session_reference(owner_session_token),
         ):
             raise PermissionError("owner revalidation evidence is invalid")
         if mission.owner_identity_ref != owner_ref:

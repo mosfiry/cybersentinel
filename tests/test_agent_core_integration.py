@@ -79,7 +79,8 @@ def test_agent_041_api_chat_mission_mode_uses_agent_core(mission_env, monkeypatc
     monkeypatch.setattr(chat_mod, "_agent_core", lambda: core)
     result = chat_mod.chat({"text": "ابحث وحلل النتيجة", "conversation_id": "mission-chat", "mode": "mission"}, owner_session_token="valid-owner")
     assert result["mission_id"]
-    assert result["status"] == MissionStatus.GOAL_COMPLETED.value
+    assert result["status"] != MissionStatus.GOAL_COMPLETED.value
+    assert result["mission"]["evidence"] == []
     assert result["mission"]["owner_instruction"] == "ابحث وحلل النتيجة"
 
 

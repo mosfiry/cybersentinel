@@ -98,7 +98,7 @@ def test_bridge_queued_mission_route_passes_authenticated_session(action):
 
     handler = bridge.Handler.__new__(bridge.Handler)
     handler.path = f"/api/missions/mission-1/{action}"
-    handler._mission_owner = lambda: {"session_id": "live-session"}
+    handler._mission_owner = lambda: {"session_id": "owner-ref", "session_token": "live-session"}
     handler._mission_service = lambda: Service()
     handler._send = lambda status, payload: (status, payload)
 
@@ -136,7 +136,7 @@ def test_bridge_effect_get_routes_bind_authenticated_owner(path, expected_call, 
 
     handler = bridge.Handler.__new__(bridge.Handler)
     handler.path = path
-    handler._mission_owner = lambda: {"session_id": "owner-session"}
+    handler._mission_owner = lambda: {"session_id": "owner-ref", "session_token": "owner-session"}
     handler._mission_service = lambda: Service()
     handler._send = lambda status, payload: (status, payload)
 
@@ -157,7 +157,7 @@ def test_bridge_effect_reconcile_route_passes_typed_owner_decision():
 
     handler = bridge.Handler.__new__(bridge.Handler)
     handler.path = "/api/missions/mission-1/effects/effect-1/reconcile"
-    handler._mission_owner = lambda: {"session_id": "owner-session"}
+    handler._mission_owner = lambda: {"session_id": "owner-ref", "session_token": "owner-session"}
     handler._mission_service = lambda: Service()
     handler._read_json = lambda: {"outcome": "OWNER_CONFIRM_APPLIED", "evidence_reference": "owner-receipt-reference"}
     handler._send = lambda status, payload: (status, payload)
@@ -178,7 +178,7 @@ def test_bridge_effect_route_maps_foreign_owner_denial_to_403():
 
     handler = bridge.Handler.__new__(bridge.Handler)
     handler.path = "/api/missions/mission-1/effects"
-    handler._mission_owner = lambda: {"session_id": "foreign-owner-session"}
+    handler._mission_owner = lambda: {"session_id": "foreign-owner-ref", "session_token": "foreign-owner-session"}
     handler._mission_service = lambda: Service()
     handler._send = lambda status, payload: (status, payload)
 

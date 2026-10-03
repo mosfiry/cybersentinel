@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import uuid
 from typing import Any, Iterator
 
@@ -11,6 +12,7 @@ from agent.mission import MissionStatus
 from core.db import add_conversation_message, conversation_info, conversation_messages, ensure_conversation
 from core.engine import RUNTIME
 from security import owner_password
+from security.session_reference import session_reference
 
 
 def _owner_session(owner_session_token: str) -> dict[str, Any]:
@@ -57,6 +59,11 @@ def resume_task(task_id: str, *, owner_session_token: str, run: bool = True) -> 
     task = TaskManager.get_task(task_id)
     if task is None:
         raise KeyError("unknown_task")
+    owner = _owner_session(owner_session_token)
+    if not task.owner_session_id or not hmac.compare_digest(
+        session_reference(task.owner_session_id), owner["session_id"]
+    ):
+        raise PermissionError("task access denied")
     if run:
         task = _runtime().resume_task(task_id, owner_session_token=owner_session_token)
     return {"task": _task_public(task)}
@@ -140,12 +147,18 @@ def chat(payload: dict[str, Any], *, owner_session_token: str) -> dict[str, Any]
     }
 
 
-def get_session(conversation_id: str) -> dict[str, Any] | None:
+def get_session(conversation_id: str, *, owner_session_id: str) -> dict[str, Any] | None:
+    owner_ref = session_reference(owner_session_id)
     info = conversation_info(conversation_id)
-    if info is None:
+    if info is None or not info.get("owner_session_id") or not hmac.compare_digest(
+        session_reference(info["owner_session_id"]), owner_ref
+    ):
         return None
     info["messages"] = conversation_messages(conversation_id)
-    info["tasks"] = [_task_public(task) for task in TaskManager.get_tasks_by_conversation(conversation_id)]
+    info["tasks"] = [
+        _task_public(task)
+        for task in TaskManager.get_tasks_by_conversation(conversation_id, owner_session_id=owner_ref)
+    ]
     return info
 
 

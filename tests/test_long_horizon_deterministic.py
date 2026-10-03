@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot, mission_model_tools
+from runtime_authorization import make_test_snapshot, mission_model_tools, valid_status_snapshot
 """Round 2 P0-3 - long-horizon trajectory (MOCK-VERIFIED, 23 model turns).
 
 HONESTY LABEL: MOCK-VERIFIED. This harness drives the REAL MissionRuntime
@@ -59,19 +59,21 @@ def _executor_script(execution_index):
         return {"ok": False, "error": "deterministic tool failure", "error_type": "provider_unavailable"}
     if execution_index == 5:
         return {
+            **valid_status_snapshot(),
             "ok": True,
             "hypothesis_updates": [{"hypothesis_id": "h1", "statement": "asset A is compromised by the reported CVE"}],
             "evidence": [{"evidence_id": "e1", "summary": "suspicious outbound log entry"}],
         }
     if execution_index == 12:
         return {
+            **valid_status_snapshot(),
             "ok": True,
             "counter_evidence": [{"evidence_id": "c1", "summary": "asset A runs the patched version"}],
             "confidence_changes": [
                 {"hypothesis_id": "h1", "delta": -0.9, "reason": "patched version contradicts compromise", "counter_evidence_ids": ["c1"]}
             ],
         }
-    return {"ok": True, "criterion_id": "goal", "source": "long-horizon-fixture"}
+    return valid_status_snapshot()
 
 
 def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monkeypatch):
@@ -96,14 +98,14 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
             max_same_tool_calls=TOOL_TURNS,
         ),
     )
-    plan = Plan.initial("audit asset A across a long horizon").replan(
+    plan = Plan.initial("audit system status for asset A across a long horizon").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
     mission = runtime.create(
-        "audit asset A across a long horizon",
-        "audit asset A across a long horizon",
+        "audit system status for asset A across a long horizon",
+        "audit system status for asset A across a long horizon",
         plan,
-        completion_criteria=[{"criterion_id": "goal"}],
+        completion_criteria=[{"criterion_id": "status", "check": "status_snapshot"}],
     )
     model = LongHorizonModel()
 
@@ -140,4 +142,4 @@ def test_long_horizon_trajectory_records_full_reasoning_lifecycle(tmp_path, monk
     # completion came from deterministic verification, not the model claim
     assert result.status is MissionStatus.GOAL_COMPLETED
     assert result.verification_state.get("verified") is True
-    assert any(item.get("criterion_id") == "goal" and item.get("passed") for item in result.evidence)
+    assert any(item.get("criterion_id") == "status" and item.get("passed") for item in result.evidence)

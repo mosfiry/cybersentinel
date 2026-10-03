@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 
 import core.db as db
-from core.lifecycle import begin, complete, get, recover_incomplete, request_cancel, transition
+from core.lifecycle import bind_owner, begin, complete, get, recover_incomplete, request_cancel, transition
 from tools import registry
 from tools.registry import ToolSpec, ToolTimeout, execute
 
@@ -36,7 +36,11 @@ def test_crash_recovery_never_reports_success(monkeypatch, tmp_path):
 def test_cancellation_is_persisted(monkeypatch, tmp_path):
     isolated_db(monkeypatch, tmp_path)
     begin("cancel-me", "test")
-    record = request_cancel("cancel-me")
+    bind_owner("cancel-me", "owner-session")
+    with __import__("pytest").raises(PermissionError):
+        request_cancel("cancel-me", owner_session_id="different-session")
+    assert get("cancel-me").cancel_requested is False
+    record = request_cancel("cancel-me", owner_session_id="owner-session")
     assert record.cancel_requested is True
     assert get("cancel-me").cancel_requested is True
 

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot, mission_model_tools
+from runtime_authorization import make_test_snapshot, mission_model_tools, valid_status_snapshot
 
 from pathlib import Path
 
@@ -32,12 +32,12 @@ def test_native_loop_executes_tool_then_models_again(tmp_path, monkeypatch):
 
     def fixture(name, arguments, **kwargs):
         executions.append((name, arguments))
-        return {"ok": True, "criterion_id": "goal", "source": "fixture-result"}
+        return {**valid_status_snapshot(), "source": "fixture-result"}
 
     monkeypatch.setattr(tools.registry, "execute", fixture)
     runtime = MissionRuntime(MissionStore(Path(tmp_path) / "missions.sqlite3"), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
-    plan = Plan.initial("investigate").replan(steps=(PlanStep("observe", "observe", action="status"),), reason="test")
-    mission = runtime.create("investigate", "investigate", plan, completion_criteria=[{"criterion_id": "goal"}])
+    plan = Plan.initial("check system status").replan(steps=(PlanStep("observe", "observe", action="status"),), reason="test")
+    mission = runtime.create("check system status", "check system status", plan, completion_criteria=[{"criterion_id": "status", "check": "status_snapshot"}])
     model = ScriptedModel(mission.mission_id)
 
     result = runtime.run_model_loop(mission.mission_id, model, tools=mission_model_tools("status"), max_turns=3)

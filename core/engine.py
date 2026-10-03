@@ -19,7 +19,7 @@ from .version import PRODUCT_NAME, VERSION
 from .context import ExecutionContext
 from tools.registry import KNOWN_TOOLS, execute as execute_tool, get_tool
 from security.plan_integrity import plan_hash
-from .lifecycle import begin as begin_lifecycle, complete as complete_lifecycle, get as get_lifecycle, is_cancelled, recover_incomplete, transition as transition_lifecycle
+from .lifecycle import begin as begin_lifecycle, bind_owner as bind_lifecycle_owner, complete as complete_lifecycle, get as get_lifecycle, is_cancelled, recover_incomplete, transition as transition_lifecycle
 from evaluation.critic import critique
 from .response import InternalDiagnostic
 
@@ -74,6 +74,7 @@ def _handle_once(text, source="web", presented_token=None, owner_session_token=N
     }
     try:
         auth_evidence = authenticate_owner(owner_session_token, request_id)
+        bind_lifecycle_owner(request_id, auth_evidence.session_id)
         owner_ok, owner_reason = True, "owner-authenticated"
         auth_context = {
             "owner_authenticated": True,

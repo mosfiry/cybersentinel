@@ -12,6 +12,7 @@ from typing import Any
 
 from .state import TaskState
 from .task import TERMINAL_STATUSES, Task, TaskStatus
+from security.session_reference import normalize_persisted_session_fields, session_reference
 
 
 class TaskVersionConflictError(RuntimeError):
@@ -52,6 +53,35 @@ def _init_db():
             conn.execute("ALTER TABLE tasks ADD COLUMN authentication_method TEXT NOT NULL DEFAULT 'username_password'")
         if "task_version" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN task_version INTEGER NOT NULL DEFAULT 0")
+        rows = conn.execute(
+            "SELECT task_id, owner_session_id, tool_calls, execution_state, result, resume_state FROM tasks"
+        ).fetchall()
+        for row in rows:
+            owner_ref = session_reference(row["owner_session_id"] or "")
+            updates: dict[str, str | None] = {}
+            for column in ("tool_calls", "execution_state", "result", "resume_state"):
+                raw = row[column]
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                normalized = normalize_persisted_session_fields(payload)
+                encoded = json.dumps(normalized, ensure_ascii=False)
+                if encoded != raw:
+                    updates[column] = encoded
+            if owner_ref != (row["owner_session_id"] or "") or updates:
+                assignments = ["owner_session_id=?"]
+                values: list[Any] = [owner_ref]
+                for column, value in updates.items():
+                    assignments.append(f"{column}=?")
+                    values.append(value)
+                values.append(row["task_id"])
+                conn.execute(
+                    f"UPDATE tasks SET {', '.join(assignments)} WHERE task_id=?",
+                    values,
+                )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_conversation ON tasks(conversation_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner_session ON tasks(owner_session_id)")
@@ -78,21 +108,22 @@ def _from_row(row: sqlite3.Row) -> Task:
 class TaskManager:
     @staticmethod
     def create_task(conversation_id: str, request_id: str, owner_session_id: str, objective: str, provider: str = "", model: str = "", authentication_method: str = "username_password") -> Task:
-        task = Task.create(conversation_id, request_id, owner_session_id, objective, provider, model, authentication_method)
+        task = Task.create(conversation_id, request_id, session_reference(owner_session_id), objective, provider, model, authentication_method)
         TaskManager._save_task(task, allow_insert=True)
         return task
 
     @staticmethod
     def _save_task(task: Task, *, allow_insert: bool = False) -> None:
+        task.owner_session_id = session_reference(task.owner_session_id)
         values = (
             task.conversation_id, task.request_id, task.owner_session_id, task.authentication_method,
             task.status.value, task.created_at, task.updated_at, task.started_at, task.finished_at,
-            task.current_step, json.dumps(task.tool_calls, ensure_ascii=False), task.retry_count,
+            task.current_step, json.dumps(normalize_persisted_session_fields(task.tool_calls), ensure_ascii=False), task.retry_count,
             task.provider, task.model, task.objective,
-            json.dumps(task.execution_state, ensure_ascii=False),
-            json.dumps(task.result, ensure_ascii=False) if task.result is not None else None,
+            json.dumps(normalize_persisted_session_fields(task.execution_state), ensure_ascii=False),
+            json.dumps(normalize_persisted_session_fields(task.result), ensure_ascii=False) if task.result is not None else None,
             task.error, int(task.cancel_requested), int(task.pause_requested),
-            json.dumps(task.resume_state, ensure_ascii=False) if task.resume_state is not None else None,
+            json.dumps(normalize_persisted_session_fields(task.resume_state), ensure_ascii=False) if task.resume_state is not None else None,
         )
         next_version = task.task_version
         with _db_lock, _get_db() as conn:
@@ -140,6 +171,7 @@ class TaskManager:
 
     @staticmethod
     def claim_task(task_id: str, owner_session_id: str, *, allow_paused: bool = True) -> Task | None:
+        owner_session_id = session_reference(owner_session_id)
         allowed = [TaskStatus.QUEUED.value, TaskStatus.WAITING_FOR_MODEL.value, TaskStatus.WAITING_FOR_TOOL.value]
         if allow_paused:
             allowed.append(TaskStatus.PAUSED.value)
@@ -164,6 +196,7 @@ class TaskManager:
     def _update_control_request(task_id: str, owner_session_id: str, *, pause: bool = False, cancel: bool = False) -> Task | None:
         if not pause and not cancel:
             raise ValueError("at least one task control request is required")
+        owner_session_id = session_reference(owner_session_id)
         now = datetime.now(timezone.utc).isoformat()
         with _db_lock, _get_db() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -201,6 +234,7 @@ class TaskManager:
         sql = "SELECT * FROM tasks WHERE conversation_id = ?"
         params: list[Any] = [conversation_id]
         if owner_session_id is not None:
+            owner_session_id = session_reference(owner_session_id)
             sql += " AND owner_session_id = ?"
             params.append(owner_session_id)
         sql += " ORDER BY created_at DESC"
@@ -214,6 +248,7 @@ class TaskManager:
         sql = f"SELECT * FROM tasks WHERE status NOT IN ({placeholders})"
         params: list[Any] = list(terminal)
         if owner_session_id:
+            owner_session_id = session_reference(owner_session_id)
             sql += " AND owner_session_id = ?"
             params.append(owner_session_id)
         sql += " ORDER BY created_at DESC"

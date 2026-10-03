@@ -39,3 +39,18 @@ def mission_model_tools(*names: str) -> list[dict[str, Any]]:
     from tools.registry import model_tool_definitions
 
     return model_tool_definitions(list(names))
+
+
+def valid_status_snapshot() -> dict[str, Any]:
+    return {
+        "service": "CyberSentinel",
+        "version": "test",
+        "online": True,
+        "event_counts": {"info": 0, "warning": 0},
+        "watch_count": 0,
+        "watches": [],
+        "llm": [],
+        "agent": {},
+        "owner_policy": {},
+        "recent_events": [],
+    }

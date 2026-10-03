@@ -21,6 +21,7 @@ from agent.planning import Plan, PlanStep
 from api.missions import MissionService
 from owner_session_testutils import allow_owner_sessions
 from runtime_authorization import make_test_snapshot
+from security.session_reference import session_reference
 
 
 def _fixture(tmp_path: Path, monkeypatch, *, failpoint=None):
@@ -39,7 +40,7 @@ def _fixture(tmp_path: Path, monkeypatch, *, failpoint=None):
             "INSERT INTO owner_sessions(session_id,owner_id,created_at,authenticated_at,expires_at,status,auth_method) "
             "VALUES(?,?,?,?,?,?,?)",
             (
-                "current-owner-session",
+                session_reference("current-owner-session"),
                 1,
                 now,
                 now,
@@ -489,7 +490,7 @@ def test_revoked_owner_session_before_due_dispatch_quarantines_scheduled_mission
     with sqlite3.connect(core_db.DB_PATH) as auth_db:
         auth_db.execute(
             "UPDATE owner_sessions SET status='revoked' WHERE session_id=?",
-            ("current-owner-session",),
+            (session_reference("current-owner-session"),),
         )
 
     result = scheduler.dispatch_due(now=datetime.now(timezone.utc).isoformat())
@@ -573,6 +574,7 @@ def test_serialized_owner_context_uses_active_session_after_process_key_rotation
     from security.authorization_context import AuthorizationContext
 
     persistent_resolver = owner_password.resolve_session
+    persistent_reference_resolver = owner_password._resolve_session_reference
     store, _runtime, _queue, _scheduler, service, mission, worker, _executions = _fixture(tmp_path, monkeypatch)
     worker.recover_after_restart()
     _schedule(service, mission.mission_id)
@@ -580,6 +582,7 @@ def test_serialized_owner_context_uses_active_session_after_process_key_rotation
     assert isinstance(persisted.authorization_context, dict)
     monkeypatch.setattr(owner_policy, "_EVIDENCE_SECRET", b"independent-worker-process-key")
     monkeypatch.setattr(owner_password, "resolve_session", persistent_resolver)
+    monkeypatch.setattr(owner_password, "_resolve_session_reference", persistent_reference_resolver)
 
     context = AuthorizationContext.from_dict(dict(persisted.authorization_context))
     assert context.request_id == persisted.request_id
@@ -589,7 +592,7 @@ def test_serialized_owner_context_uses_active_session_after_process_key_rotation
     with pytest.raises(PermissionError, match="stale or invalid Owner evidence"):
         AuthorizationContext.from_dict(forged)
     with sqlite3.connect(core_db.DB_PATH) as auth_db:
-        auth_db.execute("UPDATE owner_sessions SET status='revoked' WHERE session_id=?", ("current-owner-session",))
+        auth_db.execute("UPDATE owner_sessions SET status='revoked' WHERE session_id=?", (session_reference("current-owner-session"),))
     with pytest.raises(PermissionError, match="stale or invalid Owner evidence"):
         AuthorizationContext.from_dict(dict(persisted.authorization_context))
 

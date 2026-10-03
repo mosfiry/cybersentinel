@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot, mission_model_tools
+from runtime_authorization import make_test_snapshot, mission_model_tools, valid_status_snapshot
 """Round 2 P0-5 - crash / restart / resume on the canonical MissionRuntime.
 
 The mission state is durable SQLite. A simulated process crash (unhandled
@@ -28,14 +28,14 @@ def _runtime(db):
 
 
 def _mission(runtime):
-    plan = Plan.initial("audit the asset").replan(
+    plan = Plan.initial("audit the asset status").replan(
         steps=(PlanStep("observe", "observe", action="status"),), reason="test"
     )
     return runtime.create(
-        "audit the asset",
-        "audit the asset",
+        "audit the asset status",
+        "audit the asset status",
         plan,
-        completion_criteria=[{"criterion_id": "goal"}],
+        completion_criteria=[{"criterion_id": "status", "check": "status_snapshot"}],
     )
 
 
@@ -56,7 +56,7 @@ def test_state_survives_process_restart(tmp_path, monkeypatch):
     import tools.registry
 
     def fixture(name, argument, **kwargs):
-        return {"ok": True, "criterion_id": "goal", "source": "fixture"}
+        return valid_status_snapshot()
 
     monkeypatch.setattr(tools.registry, "execute", fixture)
 
@@ -86,7 +86,7 @@ def test_state_survives_process_restart(tmp_path, monkeypatch):
     loaded = restarted.store.load(mission.mission_id)
     assert loaded is not None
     assert loaded.mission_id == mission.mission_id
-    assert loaded.objective == "audit the asset"
+    assert loaded.objective == "audit the asset status"
     assert len(loaded.progress["model_loop"]["turns"]) == 2
     assert loaded.progress["model_loop"]["seen_call_ids"] == ["call_001", "call_002"]
     assert len(loaded.observations) == 2
@@ -100,7 +100,7 @@ def test_state_survives_process_restart(tmp_path, monkeypatch):
 def test_resume_after_restart_completes_from_persisted_state(tmp_path, monkeypatch):
     import tools.registry
 
-    monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "criterion_id": "goal", "source": "fixture"})
+    monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: valid_status_snapshot())
     db = _db(tmp_path)
     runtime = _runtime(db)
     mission = _mission(runtime)

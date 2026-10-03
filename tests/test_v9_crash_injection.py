@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from runtime_authorization import make_test_snapshot, mission_model_tools
+from runtime_authorization import make_test_snapshot, mission_model_tools, valid_status_snapshot
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue, MissionWorker, WorkerMissionState
@@ -26,15 +26,15 @@ def _runtime(db_path: Path, executor):
 
 
 def _create_mission(runtime: MissionRuntime):
-    plan = Plan.initial("audit the asset").replan(
+    plan = Plan.initial("audit the asset status").replan(
         steps=(PlanStep("observe", "observe", action="status"),),
         reason="V9 crash-injection fixture",
     )
     return runtime.create(
-        "audit the asset",
-        "audit the asset",
+        "audit the asset status",
+        "audit the asset status",
         plan,
-        completion_criteria=[{"criterion_id": "goal"}],
+        completion_criteria=[{"criterion_id": "status", "check": "status_snapshot"}],
     )
 
 
@@ -97,7 +97,7 @@ def test_worker_restart_quarantines_writeahead_crashes_without_replay(tmp_path, 
         effects.append("external-effect")
         if crash_point == "after_effect":
             raise SimulatedProcessDeath("death after effect, before result")
-        return {"success": True, "criterion_id": "goal", "source": "fixture"}
+        return {"success": True, "result": valid_status_snapshot(), "source": "fixture"}
 
     first_runtime = _runtime(mission_db, first_executor)
     mission = _create_mission(first_runtime)
@@ -132,7 +132,7 @@ def test_worker_restart_quarantines_writeahead_crashes_without_replay(tmp_path, 
 
     def forbidden_replay(*args):
         effects.append("replayed-effect")
-        return {"success": True, "criterion_id": "goal", "source": "replay-fixture"}
+        return {"success": True, "result": valid_status_snapshot(), "source": "replay-fixture"}
 
     restarted_worker = MissionWorker(
         queue,
@@ -165,7 +165,7 @@ def test_terminal_mission_does_not_repeat_effect_after_queue_ack_crash(
 
     def executor(*args):
         effects.append("effect-once")
-        return {"success": True, "criterion_id": "goal", "source": "fixture"}
+        return {"success": True, "result": valid_status_snapshot(), "source": "fixture"}
 
     first_runtime = _runtime(mission_db, executor)
     mission = _create_mission(first_runtime)

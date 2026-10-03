@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sqlite3
 from .config import DB_PATH
+from security.session_reference import is_session_reference, session_reference
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS executions (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     source TEXT NOT NULL,
     status TEXT NOT NULL,
+    owner_session_id TEXT NOT NULL DEFAULT '',
     plan_hash TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL DEFAULT '',
     model TEXT NOT NULL DEFAULT '',
@@ -104,6 +106,51 @@ CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner ON owner_sessions(owner_id);
 CREATE INDEX IF NOT EXISTS idx_owner_sessions_status ON owner_sessions(status);
 """
 
+def _migrate_legacy_owner_session_references(con: sqlite3.Connection) -> None:
+    """Replace persisted bearer session tokens with stable, non-bearer hashes."""
+    legacy_tokens = [
+        str(row[0])
+        for row in con.execute("SELECT session_id FROM owner_sessions").fetchall()
+        if row[0] and not is_session_reference(str(row[0]))
+    ]
+    if legacy_tokens:
+        tables = [
+            str(row[0])
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        for token in legacy_tokens:
+            reference = session_reference(token)
+            for table in tables:
+                escaped_table = table.replace('"', '""')
+                columns = con.execute(f'PRAGMA table_info("{escaped_table}")').fetchall()
+                for column in columns:
+                    if "TEXT" not in str(column[2]).upper():
+                        continue
+                    escaped_column = str(column[1]).replace('"', '""')
+                    con.execute(
+                        f'UPDATE "{escaped_table}" SET "{escaped_column}" = replace("{escaped_column}", ?, ?) '
+                        f'WHERE instr("{escaped_column}", ?) > 0',
+                        (token, reference, token),
+                    )
+
+    # Fail closed and normalize orphaned references too, including older
+    # conversations or lifecycle rows whose session record was already pruned.
+    for table in ("conversations", "executions"):
+        columns = {str(row[1]) for row in con.execute(f'PRAGMA table_info("{table}")')}
+        if "owner_session_id" not in columns:
+            continue
+        rows = con.execute(f'SELECT rowid, owner_session_id FROM "{table}"').fetchall()
+        for row in rows:
+            value = str(row[1] or "")
+            if value and not is_session_reference(value):
+                con.execute(
+                    f'UPDATE "{table}" SET owner_session_id=? WHERE rowid=?',
+                    (session_reference(value), row[0]),
+                )
+
+
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
@@ -113,6 +160,12 @@ def connect():
         con.execute("ALTER TABLE executions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    try:
+        con.execute("ALTER TABLE executions ADD COLUMN owner_session_id TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    _migrate_legacy_owner_session_references(con)
+    con.commit()
     return con
 
 def add_event(kind, title, body, source, severity="info", trusted=False, metadata=None):
@@ -216,6 +269,7 @@ def clear_database():
         con.execute("DELETE FROM watches")
 
 def ensure_conversation(conversation_id, owner_session_id=""):
+    owner_session_id = session_reference(str(owner_session_id or ""))
     with connect() as con:
         con.execute(
             "INSERT OR IGNORE INTO conversations(conversation_id,owner_session_id) VALUES(?,?)",

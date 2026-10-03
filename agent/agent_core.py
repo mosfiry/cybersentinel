@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -343,12 +344,35 @@ class AgentCore:
                 owner_approval=authorization_context.owner_evidence.proof_fingerprint,
                 expires_at=authorization_context.owner_evidence.expires_at,
             )
+
+        criteria = completion_criteria
+        if criteria is None:
+            objective_text = instruction.casefold()
+            planned_tools = {step.action for step in plan.steps}
+            asks_to_run_tests = (
+                bool({"test", "tests", "testing", "pytest"} & set(re.findall(r"[a-z]+", objective_text)))
+                and bool({"run", "execute", "verify"} & set(re.findall(r"[a-z]+", objective_text)))
+            )
+            asks_to_register_watch = (
+                "watch" in objective_text
+                and any(word in objective_text for word in ("register", "add", "create", "monitor"))
+            )
+            asks_for_status = any(word in objective_text for word in ("status", "health", "حالة"))
+            criteria = []
+            if "run_project_tests" in planned_tools and asks_to_run_tests:
+                criteria.append({"criterion_id": "project-tests-pass", "description": "project test process exits successfully", "check": "pytest_success", "required": True})
+            if "watch" in planned_tools and asks_to_register_watch:
+                criteria.append({"criterion_id": "watch-registered", "description": "requested defensive watch is present in persistent local state", "check": "watch_registered", "required": True})
+            if "status" in planned_tools and asks_for_status:
+                criteria.append({"criterion_id": "system-status-snapshot", "description": "system status snapshot has the expected deterministic schema", "check": "status_snapshot", "required": True})
+            if not criteria:
+                criteria = [{"criterion_id": "mission-goal", "description": "Owner objective has independently verified evidence", "check": "tool observation", "required": True}]
         mission = runtime.create_from_owner_instruction(
             instruction,
             plan,
             authorization_context=authorization_context,
             scope_snapshot=scope_context,
-            completion_criteria=completion_criteria or [{"criterion_id": "mission-goal", "description": "Owner objective has a verified successful observation", "check": "tool observation", "required": True}],
+            completion_criteria=criteria,
             provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
             authorization_snapshot_factory=authorization_snapshot_factory,
         )

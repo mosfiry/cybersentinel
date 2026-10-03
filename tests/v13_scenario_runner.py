@@ -13,6 +13,8 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from security.session_reference import session_reference
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WATCH_KEYWORD = "m3-v13-local-fixture"
@@ -271,7 +273,7 @@ class _LiveBridge:
                         "expected_observation": "The single fixture test passes",
                         "authorization_requirement": "owner",
                         "scope_requirement": "workspace",
-                        "verification": ["mission-goal"],
+                        "verification": ["tests-pass"],
                     },
                     {
                         "step_id": "local-watch",
@@ -282,7 +284,7 @@ class _LiveBridge:
                         "expected_observation": "The local watch keyword is present exactly once",
                         "authorization_requirement": "owner",
                         "scope_requirement": "workspace",
-                        "verification": ["mission-goal"],
+                        "verification": ["watch-registered"],
                     },
                 ],
             },
@@ -293,7 +295,8 @@ class _LiveBridge:
                 "allowed_credentials": [],
             },
             "completion_criteria": [
-                {"criterion_id": "mission-goal", "description": "Both local fixture steps have persisted success evidence", "required": True}
+                {"criterion_id": "tests-pass", "description": "project pytest process exits successfully", "check": "pytest_success", "required": True},
+                {"criterion_id": "watch-registered", "description": "requested local defensive watch is persisted", "check": "watch_registered", "required": True},
             ],
         }
         status, response = self.request("POST", "/api/missions", payload, session)
@@ -319,7 +322,7 @@ class _LiveBridge:
         with sqlite3.connect(self.db_path) as db:
             changed = db.execute(
                 "UPDATE owner_sessions SET expires_at=? WHERE session_id=? AND status='active'",
-                ("2000-01-01T00:00:00+00:00", stale_session),
+                ("2000-01-01T00:00:00+00:00", session_reference(stale_session)),
             ).rowcount
             db.commit()
         if changed != 1:
@@ -374,7 +377,8 @@ def _wait_for_status(harness: _LiveBridge, mission_id: str, session: str, expect
             if mission.get("status") == expected:
                 return mission
             if mission.get("status") in {"FAILED_RETRY_EXHAUSTED", "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "SAFETY_BLOCKED"}:
-                raise RuntimeError("mission_terminated_" + str(mission.get("status")))
+                reason = "".join(char for char in str(mission.get("error", "")) if char.isalnum() or char in " _-")[:100]
+                raise RuntimeError("mission_terminated_" + str(mission.get("status")) + (":" + reason if reason else ""))
         time.sleep(0.05)
     raise RuntimeError("mission_status_timeout_" + str(last.get("status", "unknown")))
 
@@ -760,7 +764,11 @@ def _run_scenario(scenario: str) -> dict[str, Any]:
         if mission.get("status") != "GOAL_COMPLETED":
             raise RuntimeError("mission_not_completed_after_verified_lifecycle")
         if scenario == "crash":
-            if len(evidence) != 1 or evidence[0].get("source") != "run_project_tests" or evidence[0].get("passed") is not True:
+            if (
+                len(evidence) != 2
+                or {item.get("source") for item in evidence} != {"run_project_tests", "watch"}
+                or not all(item.get("passed") is True for item in evidence)
+            ):
                 raise RuntimeError("recovery_finding_evidence_missing")
             if not any(
                 item.get("event") == "effects_reconciled_for_resume"

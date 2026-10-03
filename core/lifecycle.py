@@ -6,6 +6,7 @@ import sqlite3
 from typing import Any
 
 from .db import connect
+from security.session_reference import session_reference
 
 STATES = frozenset({"created", "planned", "validated", "authorized", "executing", "succeeded", "failed", "completed"})
 TRANSITIONS = {
@@ -32,22 +33,58 @@ class LifecycleRecord:
     cancel_requested: bool
     final_result: dict[str, Any] | None
     error: str
+    owner_session_id: str = ""
     claimed: bool = False
 
 
 def _decode(row) -> LifecycleRecord | None:
     if row is None:
         return None
-    return LifecycleRecord(row["request_id"], row["status"], row["source"], row["plan_hash"], row["provider"], row["model"], row["attempt"], bool(row["cancel_requested"]), json.loads(row["final_result_json"]) if row["final_result_json"] else None, row["error"])
+    return LifecycleRecord(row["request_id"], row["status"], row["source"], row["plan_hash"], row["provider"], row["model"], row["attempt"], bool(row["cancel_requested"]), json.loads(row["final_result_json"]) if row["final_result_json"] else None, row["error"], row["owner_session_id"])
 
 
-def request_cancel(request_id: str) -> LifecycleRecord:
+def bind_owner(request_id: str, owner_session_id: str) -> LifecycleRecord:
+    owner_ref = session_reference(owner_session_id)
+    if not owner_ref:
+        raise PermissionError("owner authentication required")
     with connect() as con:
-        con.execute("UPDATE executions SET cancel_requested=1,updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status != 'completed'", (request_id,))
-    record = get(request_id)
-    if record is None:
-        raise ValueError("unknown request_id")
-    return record
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM executions WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown request_id")
+        current_ref = str(row["owner_session_id"] or "")
+        if current_ref and current_ref != owner_ref:
+            raise PermissionError("request access denied")
+        con.execute(
+            "UPDATE executions SET owner_session_id=? WHERE request_id=? AND (owner_session_id='' OR owner_session_id=?)",
+            (owner_ref, request_id, owner_ref),
+        )
+        row = con.execute("SELECT * FROM executions WHERE request_id=?", (request_id,)).fetchone()
+        if row is None or row["owner_session_id"] != owner_ref:
+            raise PermissionError("request access denied")
+        return _decode(row)
+
+
+def request_cancel(request_id: str, *, owner_session_id: str) -> LifecycleRecord:
+    owner_ref = session_reference(owner_session_id)
+    if not owner_ref:
+        raise PermissionError("owner authentication required")
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM executions WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown request_id")
+        current_ref = str(row["owner_session_id"] or "")
+        if not current_ref or current_ref != owner_ref:
+            raise PermissionError("request access denied")
+        if row["status"] != "completed":
+            con.execute(
+                "UPDATE executions SET cancel_requested=1,updated_at=CURRENT_TIMESTAMP "
+                "WHERE request_id=? AND owner_session_id=? AND status != 'completed'",
+                (request_id, owner_ref),
+            )
+        row = con.execute("SELECT * FROM executions WHERE request_id=?", (request_id,)).fetchone()
+        return _decode(row)
 
 
 def is_cancelled(request_id: str) -> bool:

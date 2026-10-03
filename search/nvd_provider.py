@@ -30,9 +30,11 @@ from .exceptions import (
     ParseError,
     NetworkError,
     ResponseTooLargeError,
+    SSRFError,
 )
 from .ssrf import check_url_ssrf
 from core.config import NVD_CVE_API
+from security.pinned_http import PinnedRequestError, PinnedSession
 
 
 class NVDProvider(SearchProvider):
@@ -68,41 +70,11 @@ class NVDProvider(SearchProvider):
     def _get_session(self) -> Any:
         """Get or create HTTP session with proper headers."""
         if self._session is None:
-            try:
-                import httpx
-                headers = {
-                    "Accept": "application/json",
-                }
-                self._session = httpx.Client(
-                    headers=headers,
-                    timeout=self.timeout,
-                    follow_redirects=False,
-                )
-            except ImportError:
-                try:
-                    import requests
-                    from requests.adapters import HTTPAdapter
-                    from urllib3.util.retry import Retry
-                    
-                    headers = {
-                        "Accept": "application/json",
-                    }
-                    
-                    retry = Retry(
-                        total=3,
-                        backoff_factor=0.5,
-                        status_forcelist=[429, 500, 502, 503, 504],
-                    )
-                    adapter = HTTPAdapter(max_retries=retry)
-                    self._session = requests.Session()
-                    self._session.mount("https://", adapter)
-                    self._session.mount("http://", adapter)
-                    self._session.headers.update(headers)
-                except ImportError:
-                    raise ProviderUnavailableError(
-                        "No HTTP library available (neither httpx nor requests)",
-                        provider=self.name,
-                    )
+            self._session = PinnedSession(
+                headers={"Accept": "application/json", "User-Agent": "CyberSentinel-X/1.0"},
+                timeout=self.timeout,
+                max_response_bytes=self.max_response_bytes,
+            )
         return self._session
     
     def _check_availability(self) -> ProviderStatus:
@@ -112,22 +84,7 @@ class NVDProvider(SearchProvider):
         try:
             session = self._get_session()
             if hasattr(session, 'get'):
-                import httpx
-                import requests
-                
-                # Try a simple HEAD request to check API availability
-                if isinstance(session, httpx.Client):
-                    response = session.head(
-                        self.NVD_API_URL,
-                        timeout=5.0,
-                    )
-                elif isinstance(session, requests.Session):
-                    response = session.head(
-                        self.NVD_API_URL,
-                        timeout=5.0,
-                    )
-                else:
-                    return ProviderStatus.UNAVAILABLE
+                response = session.head(self.NVD_API_URL, timeout=5.0)
                 
                 # NVD may return 403 if rate limited, but that means it's available
                 if response.status_code in (200, 403, 400):
@@ -153,9 +110,6 @@ class NVDProvider(SearchProvider):
         Returns:
             tuple of (response_data, status_code, headers)
         """
-        import httpx
-        import requests
-        
         url = f"{self.NVD_API_URL}{endpoint}"
         
         # Validate URL for SSRF
@@ -164,58 +118,35 @@ class NVDProvider(SearchProvider):
         session = self._get_session()
         
         try:
-            if isinstance(session, httpx.Client):
-                response = session.request(
-                    method,
-                    url,
-                    params=params,
-                    timeout=self.timeout,
-                )
-                status_code = response.status_code
-                headers = dict(response.headers)
-                response_data = response.json()
-            elif isinstance(session, requests.Session):
-                response = session.request(
-                    method,
-                    url,
-                    params=params,
-                    timeout=self.timeout,
-                )
-                status_code = response.status_code
-                headers = dict(response.headers)
-                response_data = response.json()
-            else:
-                raise ProviderUnavailableError(
-                    "No valid HTTP session",
-                    provider=self.name,
-                )
-        except Exception as e:
-            if isinstance(e, httpx.TimeoutException) or isinstance(e, requests.exceptions.Timeout):
-                raise ProviderTimeoutError(
-                    f"NVD API request timed out: {e}",
-                    provider=self.name,
-                )
-            elif isinstance(e, httpx.ConnectError) or isinstance(e, requests.exceptions.ConnectionError):
-                raise NetworkError(
-                    f"Failed to connect to NVD API: {e}",
-                    provider=self.name,
-                )
-            else:
-                raise NetworkError(
-                    f"NVD API request failed: {e}",
-                    provider=self.name,
-                )
+            response = session.request(method, url, params=params, timeout=self.timeout)
+            status_code = response.status_code
+            headers = dict(response.headers)
+            response_data = response.json()
+            if not isinstance(response_data, dict):
+                raise ParseError("NVD API returned a non-object response", provider=self.name)
+        except PinnedRequestError as exc:
+            if "response exceeds" in str(exc):
+                raise ResponseTooLargeError("NVD API response exceeds the configured size limit", provider=self.name) from exc
+            raise SSRFError("NVD API request rejected by network safety policy", provider=self.name) from exc
+        except TimeoutError as exc:
+            raise ProviderTimeoutError("NVD API request timed out", provider=self.name) from exc
+        except ParseError:
+            raise
+        except Exception as exc:
+            raise NetworkError("NVD API request failed", provider=self.name) from exc
         
         return response_data, status_code, headers
     
     def _handle_rate_limit(self, headers: dict[str, str]) -> None:
         """Check and handle rate limiting."""
         # NVD uses different rate limit headers
-        rate_limit_remaining = headers.get("X-RateLimit-Remaining")
-        rate_limit_reset = headers.get("X-RateLimit-Reset")
+        rate_limit_remaining = headers.get("x-ratelimit-remaining", headers.get("X-RateLimit-Remaining"))
+        rate_limit_reset = headers.get("x-ratelimit-reset", headers.get("X-RateLimit-Reset"))
         
         # Check for NVD-specific rate limit headers
-        if "RateLimit-Remaining" in headers:
+        if "ratelimit-remaining" in headers:
+            rate_limit_remaining = headers.get("ratelimit-remaining")
+        elif "RateLimit-Remaining" in headers:
             rate_limit_remaining = headers.get("RateLimit-Remaining")
         
         if rate_limit_remaining and int(rate_limit_remaining) == 0:

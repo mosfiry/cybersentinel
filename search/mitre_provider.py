@@ -33,6 +33,7 @@ from .exceptions import (
     ResponseTooLargeError,
 )
 from .ssrf import check_url_ssrf
+from security.pinned_http import PinnedSession
 
 
 class MITREProvider(SearchProvider):
@@ -81,41 +82,11 @@ class MITREProvider(SearchProvider):
     def _get_session(self) -> Any:
         """Get or create HTTP session with proper headers."""
         if self._session is None:
-            try:
-                import httpx
-                headers = {
-                    "Accept": "application/json",
-                }
-                self._session = httpx.Client(
-                    headers=headers,
-                    timeout=self.timeout,
-                    follow_redirects=False,
-                )
-            except ImportError:
-                try:
-                    import requests
-                    from requests.adapters import HTTPAdapter
-                    from urllib3.util.retry import Retry
-                    
-                    headers = {
-                        "Accept": "application/json",
-                    }
-                    
-                    retry = Retry(
-                        total=3,
-                        backoff_factor=0.5,
-                        status_forcelist=[429, 500, 502, 503, 504],
-                    )
-                    adapter = HTTPAdapter(max_retries=retry)
-                    self._session = requests.Session()
-                    self._session.mount("https://", adapter)
-                    self._session.mount("http://", adapter)
-                    self._session.headers.update(headers)
-                except ImportError:
-                    raise ProviderUnavailableError(
-                        "No HTTP library available (neither httpx nor requests)",
-                        provider=self.name,
-                    )
+            self._session = PinnedSession(
+                headers={"Accept": "application/json", "User-Agent": "CyberSentinel-X/1.0"},
+                timeout=self.timeout,
+                max_response_bytes=self.max_response_bytes,
+            )
         return self._session
     
     def _check_availability(self) -> ProviderStatus:
@@ -124,27 +95,10 @@ class MITREProvider(SearchProvider):
         # But we should check if we can reach it
         try:
             session = self._get_session()
-            if hasattr(session, 'get'):
-                import httpx
-                import requests
-                
-                # Try a simple HEAD request to check API availability
-                if isinstance(session, httpx.Client):
-                    response = session.head(
-                        self.MITRE_API_URL,
-                        timeout=5.0,
-                    )
-                elif isinstance(session, requests.Session):
-                    response = session.head(
-                        self.MITRE_API_URL,
-                        timeout=5.0,
-                    )
-                else:
-                    return ProviderStatus.UNAVAILABLE
-                
-                if response.status_code in (200, 403, 400):
-                    return ProviderStatus.AVAILABLE
-                return ProviderStatus.UNAVAILABLE
+            response = session.head(self.MITRE_API_URL, timeout=5.0)
+            if response.status_code in (200, 403, 400):
+                return ProviderStatus.AVAILABLE
+            return ProviderStatus.UNAVAILABLE
         except Exception:
             # Network error - API might be down
             return ProviderStatus.UNAVAILABLE
@@ -156,9 +110,6 @@ class MITREProvider(SearchProvider):
     
     def _load_stix_data(self) -> dict[str, Any] | None:
         """Load MITRE ATT&CK STIX data from GitHub."""
-        import httpx
-        import requests
-        
         # Check if we have cached data
         if self._stix_data is not None:
             import time
@@ -166,10 +117,7 @@ class MITREProvider(SearchProvider):
                 return self._stix_data
         
         # Load from GitHub
-        urls = [
-            f"{self.MITRE_STIX_API_URL}/enterprise-attack.json",
-            f"{self.MITRE_STIX_API_URL}/enterprise-attack.json",
-        ]
+        urls = [f"{self.MITRE_STIX_API_URL}/enterprise-attack.json"]
         
         session = self._get_session()
         
@@ -177,12 +125,7 @@ class MITREProvider(SearchProvider):
             check_url_ssrf(url, raise_on_block=True)
             
             try:
-                if isinstance(session, httpx.Client):
-                    response = session.get(url, timeout=self.timeout)
-                elif isinstance(session, requests.Session):
-                    response = session.get(url, timeout=self.timeout)
-                else:
-                    continue
+                response = session.get(url, timeout=self.timeout)
                 
                 if response.status_code == 200:
                     self._stix_data = response.json()

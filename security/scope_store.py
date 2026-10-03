@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .scope import ProgramAuthorization, ScopeSnapshot, TargetIdentity, make_snapshot
+from .session_reference import normalize_persisted_session_fields
 
 SCOPE_DB_PATH = Path(__import__("os").environ.get("SCOPE_DB_PATH", "~/.cybersentinel-x/scope.sqlite3")).expanduser()
 _LOCK = threading.RLock()
@@ -37,6 +38,18 @@ def init_scope_store() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_scope_rate_events ON scope_rate_events(rate_key, occurred_at);
         """)
+        for row in conn.execute("SELECT snapshot_id, snapshot_json FROM scope_snapshots").fetchall():
+            payload = json.loads(row["snapshot_json"])
+            authorization = payload.get("authorization")
+            if not isinstance(authorization, dict):
+                continue
+            normalized = normalize_persisted_session_fields(authorization)
+            if normalized != authorization:
+                payload["authorization"] = normalized
+                conn.execute(
+                    "UPDATE scope_snapshots SET snapshot_json=? WHERE snapshot_id=?",
+                    (json.dumps(payload, ensure_ascii=False, sort_keys=True), row["snapshot_id"]),
+                )
 
 
 init_scope_store()

@@ -38,35 +38,32 @@ from agent.task_manager import TaskManager
 from agent.task_runtime import AgentTaskRuntime
 from owner_session_testutils import allow_owner_sessions
 from runtime_authorization import make_test_snapshot
+from security.pinned_http import PinnedHTTPResponse, PinnedRequestError
 
 
 def test_openai_compatible_adapter_passes_timeout_to_transport(monkeypatch):
     observed = {}
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, size=-1):
-            observed["read_size"] = size
-            return b'{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}'
-
-    def fake_urlopen(request, *, timeout):
+    def fake_pinned_request(url, *, method, headers, body, timeout, max_response_bytes, allow_loopback):
+        observed["url"] = url
+        observed["method"] = method
+        observed["headers"] = headers
         observed["timeout"] = timeout
-        observed["payload"] = json.loads(request.data.decode("utf-8"))
-        return Response()
+        observed["payload"] = json.loads(body.decode("utf-8"))
+        observed["max_response_bytes"] = max_response_bytes
+        observed["allow_loopback"] = allow_loopback
+        return PinnedHTTPResponse(200, {}, b'{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}')
 
-    monkeypatch.setattr("agent.providers.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("agent.providers.pinned_http_request", fake_pinned_request)
     provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1")
 
     result = provider.generate([{"role": "user", "content": "ping"}], timeout=7)
 
     assert result.text == "ok"
     assert observed["timeout"] == 7
-    assert observed["read_size"] == MAX_PROVIDER_RESPONSE_BYTES + 1
+    assert observed["max_response_bytes"] == MAX_PROVIDER_RESPONSE_BYTES
+    assert observed["method"] == "POST"
+    assert observed["allow_loopback"] is True
     assert "timeout" not in observed["payload"]
 
 
@@ -80,24 +77,15 @@ def test_openai_compatible_provider_accepts_exact_response_limit_despite_inaccur
     assert len(body) == MAX_PROVIDER_RESPONSE_BYTES
     observed = []
 
-    class Response:
-        headers = {"Content-Length": "0"}
+    def fake_pinned_request(_url, *, max_response_bytes, **_kwargs):
+        observed.append(max_response_bytes)
+        return PinnedHTTPResponse(200, {"content-length": "0"}, body)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, size=-1):
-            observed.append(size)
-            return body
-
-    monkeypatch.setattr("agent.providers.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr("agent.providers.pinned_http_request", fake_pinned_request)
 
     result = provider._request({})
 
-    assert observed == [MAX_PROVIDER_RESPONSE_BYTES + 1]
+    assert observed == [MAX_PROVIDER_RESPONSE_BYTES]
     assert result["choices"][0]["message"]["content"] == content
 
 
@@ -107,42 +95,26 @@ def test_openai_compatible_provider_rejects_oversized_body_without_trusting_cont
 ):
     observed = []
 
-    class Response:
-        headers = {} if content_length is None else {"Content-Length": content_length}
+    def fake_pinned_request(_url, *, max_response_bytes, **_kwargs):
+        observed.append(max_response_bytes)
+        raise PinnedRequestError("HTTP response exceeds the configured size limit")
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, size=-1):
-            observed.append(size)
-            return b"x" * size
-
-    monkeypatch.setattr("agent.providers.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr("agent.providers.pinned_http_request", fake_pinned_request)
     provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1")
 
     with pytest.raises(InvalidModelResponse, match="exceeds the configured size limit"):
         provider._request({})
 
-    assert observed == [MAX_PROVIDER_RESPONSE_BYTES + 1]
+    assert observed == [MAX_PROVIDER_RESPONSE_BYTES]
 
 
 def test_openai_compatible_provider_malformed_response_body_is_redacted(monkeypatch):
     body = b"UNTRUSTED_PROVIDER_BODY_SENTINEL"
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _size=-1):
-            return body
-
-    monkeypatch.setattr("agent.providers.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(
+        "agent.providers.pinned_http_request",
+        lambda *_args, **_kwargs: PinnedHTTPResponse(200, {}, body),
+    )
     provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1")
 
     with pytest.raises(InvalidModelResponse, match="malformed JSON") as caught:

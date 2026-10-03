@@ -35,6 +35,7 @@ from .exceptions import (
     ResponseTooLargeError,
 )
 from .ssrf import check_url_ssrf
+from security.pinned_http import PinnedRequestError, PinnedSession
 
 
 class GitHubProvider(SearchProvider):
@@ -83,47 +84,17 @@ class GitHubProvider(SearchProvider):
     def _get_session(self) -> Any:
         """Get or create HTTP session with proper headers."""
         if self._session is None:
-            try:
-                import httpx
-                headers = {
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                }
-                if self._token:
-                    headers["Authorization"] = f"Bearer {self._token}"
-                self._session = httpx.Client(
-                    headers=headers,
-                    timeout=self.timeout,
-                    follow_redirects=False,
-                )
-            except ImportError:
-                try:
-                    import requests
-                    from requests.adapters import HTTPAdapter
-                    from urllib3.util.retry import Retry
-                    
-                    headers = {
-                        "Accept": "application/vnd.github+json",
-                        "X-GitHub-Api-Version": "2022-11-28",
-                    }
-                    if self._token:
-                        headers["Authorization"] = f"Bearer {self._token}"
-                    
-                    retry = Retry(
-                        total=3,
-                        backoff_factor=0.5,
-                        status_forcelist=[429, 500, 502, 503, 504],
-                    )
-                    adapter = HTTPAdapter(max_retries=retry)
-                    self._session = requests.Session()
-                    self._session.mount("https://", adapter)
-                    self._session.mount("http://", adapter)
-                    self._session.headers.update(headers)
-                except ImportError:
-                    raise ProviderUnavailableError(
-                        "No HTTP library available (neither httpx nor requests)",
-                        provider=self.name,
-                    )
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "CyberSentinel-X/1.0",
+            }
+            if self._token:
+                headers["Authorization"] = f"Bearer {self._token}"
+            self._session = PinnedSession(
+                headers=headers, timeout=self.timeout,
+                max_response_bytes=self.max_response_bytes,
+            )
         return self._session
     
     def _check_availability(self) -> ProviderStatus:
@@ -147,7 +118,7 @@ class GitHubProvider(SearchProvider):
                 elif response.status_code == 403:
                     # Check rate limit
                     rate_limit_remaining = int(
-                        response.headers.get("X-RateLimit-Remaining", 0)
+                        response.headers.get("x-ratelimit-remaining", 0)
                     )
                     if rate_limit_remaining == 0:
                         return ProviderStatus.RATE_LIMITED
@@ -175,9 +146,6 @@ class GitHubProvider(SearchProvider):
         Returns:
             tuple of (response_data, status_code, headers)
         """
-        import httpx
-        import requests
-        
         url = f"{self.GITHUB_API_URL}{endpoint}"
         
         # Validate URL for SSRF
@@ -186,54 +154,29 @@ class GitHubProvider(SearchProvider):
         session = self._get_session()
         
         try:
-            if isinstance(session, httpx.Client):
-                response = session.request(
-                    method,
-                    url,
-                    params=params,
-                    timeout=self.timeout,
-                )
-                status_code = response.status_code
-                headers = dict(response.headers)
-                response_data = response.json()
-            elif isinstance(session, requests.Session):
-                response = session.request(
-                    method,
-                    url,
-                    params=params,
-                    timeout=self.timeout,
-                )
-                status_code = response.status_code
-                headers = dict(response.headers)
-                response_data = response.json()
-            else:
-                raise ProviderUnavailableError(
-                    "No valid HTTP session",
-                    provider=self.name,
-                )
-        except Exception as e:
-            if isinstance(e, httpx.TimeoutException) or isinstance(e, requests.exceptions.Timeout):
-                raise ProviderTimeoutError(
-                    f"GitHub API request timed out: {e}",
-                    provider=self.name,
-                )
-            elif isinstance(e, httpx.ConnectError) or isinstance(e, requests.exceptions.ConnectionError):
-                raise NetworkError(
-                    f"Failed to connect to GitHub API: {e}",
-                    provider=self.name,
-                )
-            else:
-                raise NetworkError(
-                    f"GitHub API request failed: {e}",
-                    provider=self.name,
-                )
+            response = session.request(method, url, params=params, timeout=self.timeout)
+            status_code = response.status_code
+            headers = dict(response.headers)
+            response_data = response.json()
+            if not isinstance(response_data, dict):
+                raise ParseError("GitHub API returned a non-object response", provider=self.name)
+        except PinnedRequestError as exc:
+            if "response exceeds" in str(exc):
+                raise ResponseTooLargeError("GitHub API response exceeds the configured size limit", provider=self.name) from exc
+            raise SSRFError("GitHub API request rejected by network safety policy", provider=self.name) from exc
+        except TimeoutError as exc:
+            raise ProviderTimeoutError("GitHub API request timed out", provider=self.name) from exc
+        except ParseError:
+            raise
+        except Exception as exc:
+            raise NetworkError("GitHub API request failed", provider=self.name) from exc
         
         return response_data, status_code, headers
     
     def _handle_rate_limit(self, headers: dict[str, str]) -> None:
         """Check and handle rate limiting."""
-        rate_limit_remaining = int(headers.get("X-RateLimit-Remaining", 0))
-        rate_limit_reset = int(headers.get("X-RateLimit-Reset", 0))
+        rate_limit_remaining = int(headers.get("x-ratelimit-remaining", headers.get("X-RateLimit-Remaining", 0)))
+        rate_limit_reset = int(headers.get("x-ratelimit-reset", headers.get("X-RateLimit-Reset", 0)))
         
         if rate_limit_remaining == 0:
             raise RateLimitError(

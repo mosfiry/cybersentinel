@@ -50,7 +50,8 @@ def test_successful_observation_that_changes_hypothesis_replans(tmp_path):
     mission.hypotheses = [HypothesisState("H1", "CVE caused initial access", HypothesisStatus.ACTIVE, 0.8).to_dict()]
     rt.store.save(mission)
     result = rt.run_to_completion(mission.mission_id)
-    assert result.status is MissionStatus.GOAL_COMPLETED
+    assert result.status is not MissionStatus.GOAL_COMPLETED
+    assert result.evidence == []
     assert result.hypotheses[0]["status"] == "WEAKENED"
     assert result.plan.version == 3
     assert len(result.replan_history) == 1
@@ -210,7 +211,9 @@ def test_twenty_one_turn_trajectory_retains_observations_and_events(tmp_path):
     )
     result = rt.run_to_completion(mission.mission_id, max_slices=turn_count + 5)
 
-    assert result.status is MissionStatus.GOAL_COMPLETED
+    assert result.status is not MissionStatus.GOAL_COMPLETED
+    assert result.verification_state.get("verified") is False
+    assert result.verification_state.get("missing_criteria") == ["required_verification_criterion"]
     assert len(result.observations) == turn_count
     assert len(result.action_history) == turn_count
     assert result.iteration_count >= turn_count

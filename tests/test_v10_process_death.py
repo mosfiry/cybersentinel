@@ -59,7 +59,15 @@ class V10Environment:
 
     def create_mission(self, *, action: str = "watch", keyword: str | None = None):
         request_id = "v10-" + uuid.uuid4().hex
-        objective = f"V10 process durability fixture {request_id}"
+        if action == "run_project_tests":
+            objective = f"Run project tests to verify local changes {request_id}"
+            criterion = {"criterion_id": "project-tests-pass", "description": "pytest process exits successfully", "check": "pytest_success", "required": True}
+        elif action == "status":
+            objective = f"Check system status for {request_id}"
+            criterion = {"criterion_id": "system-status-snapshot", "description": "validated status snapshot", "check": "status_snapshot", "required": True}
+        else:
+            objective = f"Register a local defensive watch for {request_id}"
+            criterion = {"criterion_id": "watch-registered", "description": "requested watch is persisted", "check": "watch_registered", "required": True}
         context, _policy_context = self.core._auth(
             objective, self.owner_session_id, request_id
         )
@@ -107,14 +115,7 @@ class V10Environment:
                 "allowed_networks": [],
                 "allowed_credentials": [],
             },
-            completion_criteria=[
-                {
-                    "criterion_id": "mission-goal",
-                    "description": "the one-step local action completed",
-                    "check": "runtime",
-                    "required": True,
-                }
-            ],
+            completion_criteria=[criterion],
             authorization_snapshot_factory=snapshot_factory,
         )
         return mission, query

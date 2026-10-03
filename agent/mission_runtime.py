@@ -507,35 +507,96 @@ class MissionRuntime:
         return GoalVerification.evaluate(mission.objective, criteria, evidence)
 
     @staticmethod
-    def _successful_observation_criterion_id(
+    def _verification_result_payload(observation: dict[str, Any]) -> dict[str, Any]:
+        result = observation.get("result")
+        return result if isinstance(result, dict) else observation
+
+    @staticmethod
+    def _successful_observation_evidence(
         mission: Mission,
         observation: dict[str, Any],
         *,
         tool_name: str,
-        step_id: str,
-        step_verification: tuple[str, ...] | list[str] = (),
-    ) -> str:
-        explicit = observation.get("criterion_id")
-        if explicit is not None and str(explicit).strip():
-            return str(explicit)
-
+        tool_argument: Any = None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        if not isinstance(observation, dict):
+            return None
         criteria = [item for item in mission.completion_criteria if isinstance(item, dict)]
-        criterion_ids = {str(item.get("criterion_id") or "") for item in criteria}
-        for candidate in step_verification:
-            if str(candidate) in criterion_ids and str(candidate):
-                return str(candidate)
-
         objective_tokens = set(re.findall(r"[a-z]+", str(mission.objective or "").casefold()))
         explicitly_requests_tests = bool(objective_tokens & {"test", "tests", "testing", "pytest"}) and bool(
             objective_tokens & {"run", "execute", "verify"}
         )
         required = [item for item in criteria if item.get("required", True) is not False]
-        if tool_name == "run_project_tests" and explicitly_requests_tests and len(required) == 1:
-            check = str(required[0].get("check", "runtime")).casefold()
-            criterion_id = str(required[0].get("criterion_id") or "")
-            if criterion_id and check in {"tool observation", "pytest", "pytest_success", "test_result"}:
-                return criterion_id
-        return str(step_id or tool_name)
+        result = MissionRuntime._verification_result_payload(observation)
+
+        if tool_name == "run_project_tests" and explicitly_requests_tests:
+            if isinstance(result, dict) and (
+                result.get("ok") is True
+                and type(result.get("returncode")) is int
+                and result.get("returncode") == 0
+                and result.get("timed_out") is False
+            ):
+                for item in required:
+                    check = str(item.get("check", "runtime")).casefold()
+                    criterion_id = str(item.get("criterion_id") or "")
+                    if criterion_id and check in {"pytest", "pytest_success", "test_result"}:
+                        return criterion_id, result
+
+        status_requested = bool(objective_tokens & {"status", "health"}) or "حالة" in str(mission.objective or "")
+        if tool_name == "status" and status_requested:
+            try:
+                from core.engine import status as read_independent_status
+
+                independent_status = read_independent_status()
+            except Exception:
+                independent_status = None
+            counts = independent_status.get("event_counts") if isinstance(independent_status, dict) else None
+            status_valid = (
+                isinstance(independent_status, dict)
+                and isinstance(independent_status.get("service"), str)
+                and bool(independent_status.get("service"))
+                and isinstance(independent_status.get("version"), str)
+                and independent_status.get("online") is True
+                and isinstance(counts, dict)
+                and all(isinstance(key, str) and type(value) is int and value >= 0 for key, value in counts.items())
+                and type(independent_status.get("watch_count")) is int
+                and independent_status.get("watch_count") >= 0
+                and isinstance(independent_status.get("watches"), list)
+                and isinstance(independent_status.get("llm"), list)
+                and isinstance(independent_status.get("agent"), dict)
+                and isinstance(independent_status.get("owner_policy"), dict)
+                and isinstance(independent_status.get("recent_events"), list)
+            )
+            if status_valid:
+                for item in required:
+                    check = str(item.get("check", "runtime")).casefold()
+                    criterion_id = str(item.get("criterion_id") or "")
+                    if criterion_id and check in {"status_snapshot", "system_status"}:
+                        return criterion_id, independent_status
+
+        watch_requested = "watch" in objective_tokens and bool(objective_tokens & {"register", "add", "create", "monitor"})
+        if tool_name == "watch" and watch_requested and isinstance(tool_argument, str) and tool_argument.strip():
+            try:
+                from core.db import watches
+
+                persisted_watches = watches()
+            except Exception:
+                persisted_watches = []
+            if any(isinstance(item, str) and item.casefold() == tool_argument.strip().casefold() for item in persisted_watches):
+                for item in required:
+                    check = str(item.get("check", "runtime")).casefold()
+                    criterion_id = str(item.get("criterion_id") or "")
+                    if criterion_id and check in {"watch_registered", "local_watch"}:
+                        return criterion_id, {"keyword": tool_argument.strip(), "persisted": True}
+        return None
+
+    @staticmethod
+    def _verification_authority(tool_name: str) -> str:
+        return {
+            "run_project_tests": "project_test_process_exit",
+            "status": "validated_status_snapshot",
+            "watch": "persisted_watch_store",
+        }.get(tool_name, "")
 
     def create(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> Mission:
         snapshot_factory = kwargs.pop("authorization_snapshot_factory", None) or self.authorization_snapshot_factory
@@ -624,23 +685,9 @@ class MissionRuntime:
         engine = HypothesisEngine(HypothesisState.from_dict(item) for item in mission.hypotheses)
         hypothesis_updates = engine.apply(proposal, goal_verified=False, deterministic_validation=False)
         mission.hypotheses = engine.snapshot()
-        # Model interpretation remains analysis-only. Preserve it in the
-        # interpretation record, but never promote it to goal-verification
-        # evidence without an independent deterministic observation.
-        if proposal.new_evidence and proposal.provenance.get("proposal_origin") != "model":
-            for item in proposal.new_evidence:
-                normalized = dict(item)
-                normalized.setdefault("criterion_id", str(normalized.get("evidence_id") or proposal.observation_id))
-                normalized.setdefault("passed", True)
-                normalized.setdefault("source", "observation_interpreter")
-                normalized.setdefault("result", dict(item))
-                normalized.setdefault("provenance", {"mission_id": mission.mission_id, "observation_id": proposal.observation_id, "authority": None})
-                provenance = normalized.get("provenance")
-                normalized["provenance"] = {
-                    **(dict(provenance) if isinstance(provenance, dict) else {}),
-                    "verification_authority": "deterministic_observation",
-                }
-                mission.evidence.append(normalized)
+        # Interpreter output is analysis only, regardless of whether its fields
+        # originated in a model proposal or in untrusted tool output. Completion
+        # evidence is issued only by tool-specific deterministic verifiers.
         mission.knowledge_context = list(mission.knowledge_context)
         mission.interpretations.append(proposal.to_dict())
         mission.emit(EventType.OBSERVATION_INTERPRETED, step_id=step.step_id, data=proposal.to_dict())
@@ -1001,14 +1048,15 @@ class MissionRuntime:
                         if current_step is not None:
                             self._interpret_observation(mission, current_step, observation, success=bool(observation.get("success", observation.get("ok", True))))
                         if bool(observation.get("success", observation.get("ok", True))):
-                            criterion_id = self._successful_observation_criterion_id(
+                            verified_evidence = self._successful_observation_evidence(
                                 mission,
                                 observation,
                                 tool_name=proposal.name,
-                                step_id=proposal.step_id,
-                                step_verification=current_step.verification if current_step is not None else (),
+                                tool_argument=argument,
                             )
-                            mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id, "verification_authority": "deterministic_tool_result"}})
+                            if verified_evidence:
+                                criterion_id, verified_result = verified_evidence
+                                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": proposal.name, "result": {"source": proposal.name, "result": verified_result}, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id, "verification_authority": self._verification_authority(proposal.name)}})
                         mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
                         mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                         result = ToolCallResult(proposal, True, result=observation)
@@ -1122,14 +1170,15 @@ class MissionRuntime:
             if current_step is not None:
                 self._interpret_observation(mission, current_step, observation, success=success)
             if success:
-                criterion_id = self._successful_observation_criterion_id(
+                verified_evidence = self._successful_observation_evidence(
                     mission,
                     observation,
                     tool_name=proposal.name,
-                    step_id=proposal.step_id,
-                    step_verification=current_step.verification if current_step is not None else (),
+                    tool_argument=proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None,
                 )
-                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", proposal.name), "result": observation, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id, "verification_authority": "deterministic_tool_result"}})
+                if verified_evidence:
+                    criterion_id, verified_result = verified_evidence
+                    mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": proposal.name, "result": {"source": proposal.name, "result": verified_result}, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id, "verification_authority": self._verification_authority(proposal.name)}})
             mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed" if success else "failed", observation)
             results.append(ToolCallResult(proposal, success, result=observation, error=self._bounded_tool_error(observation.get("error", ""))))
         progress["tool_results"].extend(result.to_dict() for result in results)
@@ -1326,15 +1375,18 @@ class MissionRuntime:
             mission.transition(MissionStatus.SCOPE_BLOCKED, mission.error)
             return self._save(mission)
         if success:
-            criterion_id = self._successful_observation_criterion_id(
+            step_arguments = dict(step.retry_policy).get("arguments", {})
+            tool_argument = step_arguments.get("query") if isinstance(step_arguments, dict) else None
+            verified_evidence = self._successful_observation_evidence(
                 mission,
                 observation,
                 tool_name=step.action,
-                step_id=step.step_id,
-                step_verification=step.verification,
+                tool_argument=tool_argument,
             )
-            mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": observation.get("source", step.action), "result": observation, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id, "verification_authority": "deterministic_tool_result"}})
-            mission.emit(EventType.EVIDENCE_ADDED, step_id=step.step_id, data={"criterion_id": criterion_id})
+            if verified_evidence:
+                criterion_id, verified_result = verified_evidence
+                mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": step.action, "result": {"source": step.action, "result": verified_result}, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id, "verification_authority": self._verification_authority(step.action)}})
+                mission.emit(EventType.EVIDENCE_ADDED, step_id=step.step_id, data={"criterion_id": criterion_id})
             if strategy_decision is not None and strategy_decision.decision.value in {"REPLAN", "CHANGE_HYPOTHESIS", "ADD_EVIDENCE"}:
                 mission.transition(MissionStatus.REPLANNING, strategy_decision.reason)
                 mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data=strategy_decision.to_dict())

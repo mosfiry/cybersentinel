@@ -21,11 +21,14 @@ def test_end_to_end_observation_failure_replan_verify_and_persistence(tmp_path):
         calls.append((mission.plan.version, step.step_id))
         if len(calls) == 1:
             return {"success": False, "failure_class": "COMPILATION", "error": "compiler error", "source": "build"}
-        return {"success": True, "criterion_id": "tests", "source": "pytest", "result": {"passed": 3}}
+        return {"success": True, "source": "pytest", "result": {"ok": True, "returncode": 0, "timed_out": False}}
 
-    plan = Plan.initial("build and verify artifact").replan(steps=(PlanStep("build", "build", action="build", verification=("tests",)),), reason="initial plan")
-    rt = runtime(tmp_path, execute)
-    mission = rt.create("build it", "build and verify artifact", plan, completion_criteria=[{"criterion_id": "tests", "description": "tests pass", "check": "pytest"}])
+    def replan(mission, observation):
+        return mission.plan.replan(steps=(PlanStep("repair-2-1", "run project tests", action="run_project_tests"),), reason="execute deterministic verifier")
+
+    plan = Plan.initial("run tests to verify artifact").replan(steps=(PlanStep("build", "build", action="build", verification=("tests",)),), reason="initial plan")
+    rt = runtime(tmp_path, execute, replanner=replan)
+    mission = rt.create("run tests to verify artifact", "run tests to verify artifact", plan, completion_criteria=[{"criterion_id": "tests", "description": "tests pass", "check": "pytest"}])
     after_failure = rt.run_slice(mission.mission_id)
     assert after_failure.status is MissionStatus.READY
     assert after_failure.plan.version == 3
@@ -104,7 +107,7 @@ def test_goal_verification_blocks_completion_until_required_evidence(tmp_path):
     assert after_step.status is MissionStatus.READY
     checked = rt.run_slice(mission.mission_id)
     assert checked.status is MissionStatus.RUNNING
-    assert checked.verification_state["missing_criteria"] == ["tests"]
+    assert checked.verification_state["missing_criteria"] == ["implementation", "tests"]
     assert checked.status is not MissionStatus.GOAL_COMPLETED
 
 
@@ -113,11 +116,11 @@ def test_authorization_intervention_persists_and_allow_resumes(tmp_path, monkeyp
 
     def execute(mission, step, action_id):
         executed.append(action_id)
-        return {"success": True, "criterion_id": "sensitive", "source": "tool"}
+        return {"success": True, "source": "run_project_tests", "result": {"ok": True, "returncode": 0, "timed_out": False}}
 
-    plan = Plan.initial("sensitive").replan(steps=(PlanStep("sensitive", "sensitive", action="tool", authorization_requirement="owner"),), reason="initial")
+    plan = Plan.initial("run tests after owner approval").replan(steps=(PlanStep("sensitive", "sensitive", action="run_project_tests", authorization_requirement="owner"),), reason="initial")
     rt = runtime(tmp_path, execute)
-    mission = rt.create("do sensitive", "sensitive", plan, completion_criteria=[{"criterion_id": "sensitive"}])
+    mission = rt.create("do sensitive", "run tests after owner approval", plan, completion_criteria=[{"criterion_id": "tests", "check": "pytest_success"}])
     blocked = rt.run_slice(mission.mission_id)
     assert blocked.status is MissionStatus.OWNER_INPUT_REQUIRED
     assert executed == []
@@ -126,7 +129,7 @@ def test_authorization_intervention_persists_and_allow_resumes(tmp_path, monkeyp
     assert denied.status is MissionStatus.AUTHORIZATION_BLOCKED
     assert executed == []
 
-    mission2 = rt.create("do sensitive 2", "sensitive", plan, completion_criteria=[{"criterion_id": "sensitive"}])
+    mission2 = rt.create("do sensitive 2", "run tests after owner approval", plan, completion_criteria=[{"criterion_id": "tests", "check": "pytest_success"}])
     assert rt.run_slice(mission2.mission_id).status is MissionStatus.OWNER_INPUT_REQUIRED
     import security.owner_policy as policy
     from security.authorization_context import AuthorizationContext

@@ -11,6 +11,7 @@ import json
 from .planning import Plan
 from .trajectory import EventType, TrajectoryEvent, verify_trajectory
 from .execution_fence import ExecutionFence, ExecutionFenceError
+from security.session_reference import normalize_persisted_session_fields
 
 
 class MissionStatus(str, Enum):
@@ -222,6 +223,39 @@ class MissionStore:
         self.db_path = str(db_path)
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS missions (mission_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            rows = db.execute("SELECT mission_id, payload FROM missions").fetchall()
+            for mission_id, encoded in rows:
+                payload = json.loads(encoded)
+                changed = False
+                for field_name in (
+                    "authorization_context",
+                    "authorization_snapshot",
+                    "authorization_snapshot_history",
+                    "scope_snapshot",
+                    "policy_snapshot",
+                ):
+                    value = payload.get(field_name)
+                    if value is None:
+                        continue
+                    normalized = normalize_persisted_session_fields(value)
+                    if normalized != value:
+                        payload[field_name] = normalized
+                        changed = True
+                if changed:
+                    payload.pop("integrity_hash", None)
+                    payload["integrity_hash"] = hashlib.sha256(
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode()
+                    ).hexdigest()
+                    db.execute(
+                        "UPDATE missions SET payload=? WHERE mission_id=?",
+                        (json.dumps(payload, ensure_ascii=False), mission_id),
+                    )
 
     def _attach_queue_database(self, db, execution_fence: ExecutionFence) -> None:
         from pathlib import Path

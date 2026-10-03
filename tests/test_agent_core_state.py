@@ -1,5 +1,5 @@
 from __future__ import annotations
-from runtime_authorization import make_test_snapshot
+from runtime_authorization import make_test_snapshot, valid_status_snapshot
 
 from pathlib import Path
 
@@ -26,9 +26,9 @@ def test_agent_state_projection_contains_auditable_fields(tmp_path):
 
 
 def test_trajectory_is_typed_and_persisted(tmp_path):
-    rt = _runtime(tmp_path, lambda m, s, a: {"success": True, "criterion_id": "goal"})
-    plan = Plan.initial("goal").replan(steps=(PlanStep("s", "observe", action="status"),), reason="initial")
-    mission = rt.create("Owner goal", "goal", plan, request_id="r")
+    rt = _runtime(tmp_path, lambda m, s, a: {"success": True, "result": valid_status_snapshot()})
+    plan = Plan.initial("check system status").replan(steps=(PlanStep("s", "observe", action="status"),), reason="initial")
+    mission = rt.create("Check system status", "check system status", plan, request_id="r", completion_criteria=[{"criterion_id": "status", "check": "status_snapshot"}])
     done = rt.run_to_completion(mission.mission_id)
     events = [item["event"] for item in done.trajectory]
     assert "MissionStarted" in events
@@ -45,12 +45,12 @@ def test_malformed_or_unknown_action_replans_instead_of_silent_success(tmp_path)
         calls["n"] += 1
         if calls["n"] == 1:
             return {"success": False, "failure_class": "LOGIC", "error": "unknown tool"}
-        return {"success": True, "criterion_id": "mission-goal", "source": "status"}
+        return {"success": True, "result": valid_status_snapshot()}
     def replan(mission, observation):
         return mission.plan.replan(steps=(PlanStep("recovered", "recover", action="status"),), reason="malformed proposal")
     rt = _runtime(tmp_path, execute, replan)
-    plan = Plan.initial("goal").replan(steps=(PlanStep("bad", "bad", action="__planning_failure__"),), reason="initial")
-    mission = rt.create("Owner goal", "goal", plan)
+    plan = Plan.initial("check system status").replan(steps=(PlanStep("bad", "bad", action="__planning_failure__"),), reason="initial")
+    mission = rt.create("Owner goal", "check system status", plan, completion_criteria=[{"criterion_id": "status", "check": "status_snapshot"}])
     result = rt.run_to_completion(mission.mission_id)
     assert result.plan.version >= 2
     assert result.status is MissionStatus.GOAL_COMPLETED

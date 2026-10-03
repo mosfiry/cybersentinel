@@ -12,6 +12,7 @@ import pytest
 import core.db as core_db
 from security import owner_password as op
 from security.owner_password_bootstrap import main as bootstrap_main
+from security.session_reference import session_reference
 
 TEST_PASSWORD = "correct-horse-battery-staple-42"
 
@@ -91,6 +92,48 @@ def test_login_success(tmp_db, monkeypatch):
     assert "password_hash" not in session
 
 
+def test_owner_session_bearer_token_is_not_persisted(tmp_db, monkeypatch):
+    assert _bootstrap(monkeypatch) == 0
+    session = op.login("mosfiry", TEST_PASSWORD)
+    reference = session_reference(session["session_id"])
+    with sqlite3.connect(tmp_db) as con:
+        stored = con.execute("SELECT session_id FROM owner_sessions").fetchone()[0]
+    assert stored == reference
+    assert session["session_id"] not in tmp_db.read_bytes().decode("utf-8", errors="ignore")
+    resolved = op.resolve_session(session["session_id"])
+    assert resolved is not None and resolved["session_id"] == reference
+
+
+def test_legacy_session_token_migrates_to_digest_and_remains_usable(tmp_db, monkeypatch):
+    owner_id = op.create_owner_account("mosfiry", TEST_PASSWORD)
+    raw_token = "legacy-owner-session-token"
+    expires = "2999-01-01T00:00:00+00:00"
+    with sqlite3.connect(tmp_db) as con:
+        con.execute(
+            "INSERT INTO owner_sessions(session_id,owner_id,created_at,authenticated_at,expires_at,status,auth_method) "
+            "VALUES(?,?,?,?,?,'active','username_password')",
+            (raw_token, owner_id, expires, expires, expires),
+        )
+        con.execute(
+            "INSERT INTO conversations(conversation_id,owner_session_id) VALUES(?,?)",
+            ("legacy-conversation", raw_token),
+        )
+        con.execute(
+            "INSERT INTO events(kind,severity,title,body,source,trusted,metadata_json) VALUES(?,?,?,?,?,?,?)",
+            ("auth", "info", "test", "test", "test", 1, '{"session_id":"legacy-owner-session-token"}'),
+        )
+        con.commit()
+    with core_db.connect() as con:
+        stored = con.execute("SELECT session_id FROM owner_sessions").fetchone()[0]
+        conversation = con.execute(
+            "SELECT owner_session_id FROM conversations WHERE conversation_id='legacy-conversation'"
+        ).fetchone()[0]
+    assert stored == session_reference(raw_token)
+    assert conversation == stored
+    assert op.resolve_session(raw_token)["session_id"] == stored
+    assert raw_token.encode() not in tmp_db.read_bytes()
+
+
 def test_login_wrong_password(tmp_db, monkeypatch):
     assert _bootstrap(monkeypatch) == 0
     with pytest.raises(PermissionError):
@@ -142,7 +185,7 @@ def test_expired_session_rejected(tmp_db, monkeypatch):
     assert _bootstrap(monkeypatch) == 0
     session = op.login("mosfiry", TEST_PASSWORD)
     with sqlite3.connect(tmp_db) as con:
-        con.execute("UPDATE owner_sessions SET expires_at = '2000-01-01T00:00:00+00:00' WHERE session_id = ?", (session["session_id"],))
+        con.execute("UPDATE owner_sessions SET expires_at = '2000-01-01T00:00:00+00:00' WHERE session_id = ?", (session_reference(session["session_id"]),))
         con.commit()
     assert op.resolve_session(session["session_id"]) is None
 
@@ -167,7 +210,7 @@ def test_corrupt_expiry_rejected(tmp_db, monkeypatch):
     assert _bootstrap(monkeypatch) == 0
     session = op.login("mosfiry", TEST_PASSWORD)
     with sqlite3.connect(tmp_db) as con:
-        con.execute("UPDATE owner_sessions SET expires_at = 'not-a-timestamp' WHERE session_id = ?", (session["session_id"],))
+        con.execute("UPDATE owner_sessions SET expires_at = 'not-a-timestamp' WHERE session_id = ?", (session_reference(session["session_id"]),))
         con.commit()
     assert op.resolve_session(session["session_id"]) is None
 

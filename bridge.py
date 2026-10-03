@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -83,7 +84,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _bridge_auth(self):
-        return bool(BRIDGE_TOKEN) and self.headers.get("X-CyberSentinel-Token", "") == BRIDGE_TOKEN
+        supplied = self.headers.get("X-CyberSentinel-Token", "")
+        return bool(BRIDGE_TOKEN) and hmac.compare_digest(supplied, BRIDGE_TOKEN)
 
     def _static(self, name):
         p = (WEB / name).resolve()
@@ -101,10 +103,11 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("X-CyberSentinel-Owner-Session", "")
 
     def _owner_session(self):
-        session = owner_password.resolve_session(self._chat_auth())
+        token = self._chat_auth()
+        session = owner_password.resolve_session(token)
         if session is None or session.get("auth_method") != "username_password":
             return None
-        return session
+        return {**session, "session_token": token}
 
     def _mission_service(self) -> MissionService:
         core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
@@ -217,16 +220,16 @@ class Handler(BaseHTTPRequestHandler):
                     value = service.inspect_effect(
                         mission_id,
                         parts[2],
-                        owner_session_token=auth["session_id"],
+                        owner_session_token=auth["session_token"],
                     )
                     return self._send(200, {"ok": True, "mission_id": mission_id, "effect": value})
                 if action == "effects" and len(parts) == 2:
-                    value = service.effects(mission_id, owner_session_token=auth["session_id"])
+                    value = service.effects(mission_id, owner_session_token=auth["session_token"])
                     return self._send(200, {"ok": True, "mission_id": mission_id, "effects": value})
                 values = {"status": service.status, "timeline": service.timeline, "evidence": service.evidence, "artifacts": service.artifacts, "logs": service.logs, "report": service.report}
                 if len(parts) > 2 or action not in values:
                     return self._send(404, {"ok": False, "error": "unknown_mission_action"})
-                return self._send(200, {"ok": True, "mission_id": mission_id, action: values[action](mission_id, owner_session_token=auth["session_id"])})
+                return self._send(200, {"ok": True, "mission_id": mission_id, action: values[action](mission_id, owner_session_token=auth["session_token"])})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
             except KeyError:
@@ -239,9 +242,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
             session_id = parsed.path[len("/api/session/"):]
-            if self._owner_session() is None:
+            owner_session = self._owner_session()
+            if owner_session is None:
                 return self._send(403, {"ok": False, "error": "owner authentication required"})
-            value = get_session(session_id)
+            value = get_session(session_id, owner_session_id=owner_session["session_id"])
             return self._send(200 if value else 404, {"ok": bool(value), "session": value} if value else {"ok": False, "error": "unknown_session"})
         if parsed.path == "/api/chat/stream":
             if not self._bridge_auth():
@@ -251,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
             owner_session = self._owner_session()
             if owner_session is None:
                 return self._send(403, {"ok": False, "error": "owner authentication required"})
-            return self._send_sse(stream(payload, owner_session_token=owner_session["session_id"]))
+            return self._send_sse(stream(payload, owner_session_token=owner_session["session_token"]))
         if parsed.path.startswith("/api/tasks/"):
             if not self._bridge_auth():
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
@@ -264,12 +268,14 @@ class Handler(BaseHTTPRequestHandler):
                 task = TaskManager.get_task(task_id)
                 if task is None:
                     return self._send(404, {"ok": False, "error": "unknown_task"})
+                if not task.owner_session_id or task.owner_session_id != owner_session["session_id"]:
+                    return self._send(404, {"ok": False, "error": "unknown_task"})
                 return self._send_sse(task_stream(task_id, owner_session_token=self._chat_auth()))
             task = TaskManager.get_task(task_id)
             if task is None:
                 return self._send(404, {"ok": False, "error": "unknown_task"})
-            if task.owner_session_id and task.owner_session_id != owner_session["session_id"]:
-                return self._send(403, {"ok": False, "error": "task access denied"})
+            if not task.owner_session_id or task.owner_session_id != owner_session["session_id"]:
+                return self._send(404, {"ok": False, "error": "unknown_task"})
             return self._send(200, {"ok": True, "task": task.to_dict()})
         if self.path in {"/app.js", "/style.css"}:
             return self._static(self.path[1:])
@@ -280,19 +286,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(401, {"ok": False, "error": "bridge authentication required"})
             return self._send(200, status())
         if self.path.startswith("/api/execution/"):
-            if not self._bridge_auth():
-                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            owner_session = self._mission_owner()
+            if owner_session is None:
+                return
             request_id = self.path[len("/api/execution/"):]
             record = get_lifecycle(request_id)
-            if record is None:
+            if record is None or not record.owner_session_id or record.owner_session_id != owner_session["session_id"]:
                 return self._send(404, {"ok": False, "error": "unknown_request_id"})
             return self._send(200, {"ok": True, "request_id": request_id, "lifecycle": record.__dict__, "events": events_for_request(request_id)})
         if self.path.startswith("/api/reasoning/"):
-            if not self._bridge_auth():
-                return self._send(401, {"ok": False, "error": "bridge authentication required"})
-            if self._owner_session() is None:
-                return self._send(403, {"ok": False, "error": "owner authentication required"})
+            owner_session = self._mission_owner()
+            if owner_session is None:
+                return
             request_id = self.path[len("/api/reasoning/"):]
+            record = get_lifecycle(request_id)
+            if record is None or not record.owner_session_id or record.owner_session_id != owner_session["session_id"]:
+                return self._send(404, {"ok": False, "error": "unknown_reasoning_request"})
             memory = reasoning_for_request(request_id)
             if memory is None:
                 return self._send(404, {"ok": False, "error": "unknown_reasoning_request"})
@@ -317,7 +326,7 @@ class Handler(BaseHTTPRequestHandler):
                     owner_identity = f"owner:{int(auth['owner_id'])}"
                     mission = self._mission_service().create_mission(objective, objective, plan, owner_identity_ref=owner_identity, scope_snapshot=payload.get("scope_context"), completion_criteria=payload.get("completion_criteria") or [], authorization_snapshot_factory=self._mission_snapshot_factory(owner_identity, payload.get("scope_context")))
                     return self._send(201, {"ok": True, "mission": mission, "mission_id": mission["mission_id"], "status": mission["status"]})
-                result = chat(payload, owner_session_token=auth["session_id"])
+                result = chat(payload, owner_session_token=auth["session_token"])
                 return self._send(201, {"ok": True, "mission": result.get("mission"), "mission_id": result.get("mission_id"), "status": result.get("status")})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -336,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = service.reconcile_effect(
                         mission_id,
                         parts[2],
-                        owner_session_token=auth["session_id"],
+                        owner_session_token=auth["session_token"],
                         outcome=str(payload.get("outcome", "")),
                         evidence_reference=str(payload.get("evidence_reference", "")),
                     )
@@ -344,20 +353,20 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "start" or action == "resume":
                     if action == "start":
                         result = service.start_mission(
-                            mission_id, owner_session_token=auth["session_id"]
+                            mission_id, owner_session_token=auth["session_token"]
                         )
                     else:
                         result = service.resume_mission(
-                            mission_id, owner_session_token=auth["session_id"]
+                            mission_id, owner_session_token=auth["session_token"]
                         )
                     return self._send(200, {"ok": True, "mission": result})
                 if action == "pause":
-                    return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id, owner_session_token=auth["session_id"])})
+                    return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id, owner_session_token=auth["session_token"])})
                 if action == "cancel":
-                    return self._send(200, {"ok": True, "mission": service.cancel_mission(mission_id, owner_session_token=auth["session_id"])})
+                    return self._send(200, {"ok": True, "mission": service.cancel_mission(mission_id, owner_session_token=auth["session_token"])})
                 if action == "schedule":
                     payload = self._read_json()
-                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, owner_session_token=auth["session_id"], run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
+                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, owner_session_token=auth["session_token"], run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
                 return self._send(404, {"ok": False, "error": "unknown_mission_action"})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -410,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
                 owner_session = self._owner_session()
                 if owner_session is None:
                     raise PermissionError("owner authentication required")
-                result = chat(payload, owner_session_token=owner_session["session_id"])
+                result = chat(payload, owner_session_token=owner_session["session_token"])
                 return self._send(200, {"ok": True, **result})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -424,7 +433,7 @@ class Handler(BaseHTTPRequestHandler):
                 owner_session = self._owner_session()
                 if owner_session is None:
                     raise PermissionError("owner authentication required")
-                result = create_task(payload, owner_session_token=owner_session["session_id"], run=bool(payload.get("run", True)))
+                result = create_task(payload, owner_session_token=owner_session["session_token"], run=bool(payload.get("run", True)))
                 return self._send(201, {"ok": True, **result})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -437,11 +446,11 @@ class Handler(BaseHTTPRequestHandler):
                 if owner_session is None:
                     raise PermissionError("owner authentication required")
                 if action == "resume":
-                    result = resume_task(task_id, owner_session_token=owner_session["session_id"], run=True)
+                    result = resume_task(task_id, owner_session_token=owner_session["session_token"], run=True)
                 elif action == "pause":
-                    result = pause_task(task_id, owner_session_token=owner_session["session_id"])
+                    result = pause_task(task_id, owner_session_token=owner_session["session_token"])
                 elif action == "cancel":
-                    result = cancel_task(task_id, owner_session_token=owner_session["session_id"])
+                    result = cancel_task(task_id, owner_session_token=owner_session["session_token"])
                 else:
                     return self._send(404, {"ok": False, "error": "unknown_task_action"})
                 return self._send(200, {"ok": True, **result})
@@ -450,16 +459,30 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, KeyError) as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
         if self.path == "/api/cancel":
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            owner_session = self._owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
             try:
-                n = int(self.headers.get("Content-Length", "0"))
-                data = json.loads(self.rfile.read(n) or b"{}")
+                data = self._read_json()
+                if not isinstance(data, dict):
+                    return self._send(400, {"ok": False, "error": "invalid_request"})
                 request_id = str(data.get("request_id", "")).strip()
                 if not request_id:
                     return self._send(400, {"ok": False, "error": "request_id_required"})
-                record = request_cancel(request_id)
+                record = request_cancel(request_id, owner_session_id=owner_session["session_id"])
                 return self._send(200, {"ok": True, "request_id": request_id, "lifecycle": record.status, "cancel_requested": record.cancel_requested})
-            except ValueError:
+            except PermissionError:
                 return self._send(404, {"ok": False, "error": "unknown_request_id"})
+            except ValueError as exc:
+                if str(exc) == "request_too_large":
+                    return self._send(413, {"ok": False, "error": "request_too_large"})
+                if str(exc) == "unknown request_id":
+                    return self._send(404, {"ok": False, "error": "unknown_request_id"})
+                return self._send(400, {"ok": False, "error": "invalid_request"})
+            except Exception:
+                return self._send(400, {"ok": False, "error": "invalid_request"})
         if self.path != "/api/command":
             return self._send(404, {"ok": False, "error": "not_found"})
         try:
@@ -478,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, {"ok": False, "error": "owner authentication required"})
             result = chat(
                 {**data, "text": text, "request_id": request_id or None},
-                owner_session_token=owner_session["session_id"],
+                owner_session_token=owner_session["session_token"],
             )
             return self._send(200, {"ok": True, **result})
         except Exception:

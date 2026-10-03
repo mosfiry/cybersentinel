@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import urllib.error
-import urllib.request
+import io
 from typing import Any
+from urllib.parse import urlsplit
+
+from security.pinned_http import PinnedRequestError, pinned_http_request
 
 from .provider_api import (
     MAX_PROVIDER_ARGUMENT_BYTES,
@@ -23,6 +26,9 @@ class OpenAICompatibleProvider:
     def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, structured_output: bool = False, priority: int = 100, parallel_tool_calls: bool = False, reasoning: bool = False, reasoning_budget: bool = False, long_context: bool = False, vision: bool = False):
         self.name = name
         self.base_url = base_url.rstrip("/")
+        parsed_base = urlsplit(self.base_url)
+        if parsed_base.query or parsed_base.username is not None or parsed_base.password is not None or parsed_base.fragment:
+            raise ValueError("provider base_url must not contain credentials, query parameters, or a fragment")
         self.model = model
         self.api_key = api_key
         self.failure_count = 0
@@ -43,29 +49,46 @@ class OpenAICompatibleProvider:
         }
 
     def _request(self, payload: dict[str, Any], timeout: int = 90) -> dict[str, Any]:
-        req = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        url = self.base_url + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
         if self.api_key:
-            req.add_header("Authorization", "Bearer " + self.api_key)
+            headers["Authorization"] = "Bearer " + self.api_key
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                raw_body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
-                if not isinstance(raw_body, (bytes, bytearray)):
-                    raise InvalidModelResponse("provider returned a non-byte response body", provider=self.name, model=self.model)
-                if len(raw_body) > MAX_PROVIDER_RESPONSE_BYTES:
-                    raise InvalidModelResponse("provider response exceeds the configured size limit", provider=self.name, model=self.model)
-                try:
-                    data = json.loads(bytes(raw_body).decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise InvalidModelResponse("provider returned malformed JSON", provider=self.name, model=self.model) from exc
+            response = pinned_http_request(
+                url,
+                method="POST",
+                headers=headers,
+                body=json.dumps(payload).encode(),
+                timeout=timeout,
+                max_response_bytes=MAX_PROVIDER_RESPONSE_BYTES,
+                allow_loopback=True,
+            )
+            if response.status >= 400:
+                raise urllib.error.HTTPError(
+                    url,
+                    response.status,
+                    "provider returned an HTTP error",
+                    response.headers,
+                    io.BytesIO(response.body),
+                )
+            raw_body = response.body
+            if not isinstance(raw_body, (bytes, bytearray)):
+                raise InvalidModelResponse("provider returned a non-byte response body", provider=self.name, model=self.model)
+            try:
+                data = json.loads(bytes(raw_body).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise InvalidModelResponse("provider returned malformed JSON", provider=self.name, model=self.model) from exc
             if not isinstance(data, dict):
                 raise InvalidModelResponse("provider returned a non-object response", provider=self.name, model=self.model)
             self.last_error = ""
             return data
+        except PinnedRequestError as exc:
+            self.failure_count += 1
+            if str(exc) == "HTTP response exceeds the configured size limit":
+                self.last_error = "InvalidModelResponse"
+                raise InvalidModelResponse("provider response exceeds the configured size limit", provider=self.name, model=self.model) from exc
+            self.last_error = type(exc).__name__
+            raise
         except urllib.error.HTTPError as exc:
             self.failure_count += 1
             self.last_error = f"HTTP {exc.code}"

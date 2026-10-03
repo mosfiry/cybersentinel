@@ -321,6 +321,7 @@ def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path, m
     from agent.agent_core import AgentCore
     from agent.model_router import ModelRouter
     from owner_session_testutils import allow_owner_sessions
+    from security.session_reference import session_reference
 
     allow_owner_sessions(monkeypatch, "service-owner")
     monkeypatch.setattr(core_db, "DB_PATH", Path(tmp_path) / "owner_auth.sqlite3")
@@ -334,7 +335,7 @@ def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path, m
         auth_db.execute(
             "INSERT INTO owner_sessions(session_id,owner_id,created_at,authenticated_at,expires_at,status,auth_method) "
             "VALUES(?,?,?,?,?,?,?)",
-            ("service-owner", 1, now, now, "2999-01-01T00:00:00+00:00", "active", "username_password"),
+            (session_reference("service-owner"), 1, now, now, "2999-01-01T00:00:00+00:00", "active", "username_password"),
         )
     store = MissionStore(Path(tmp_path) / "missions.sqlite3")
     runtime = MissionRuntime(store, executor=lambda _mission, _step, _action: {"success": True, "criterion_id": "done", "source": "test"}, authorization_snapshot_factory=make_test_snapshot)

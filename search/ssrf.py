@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .exceptions import SSRFError
+from security.pinned_http import PinnedRequestError, resolve_public_addresses
 
 
 # =============================================================================
@@ -112,6 +113,9 @@ def validate_url(url: str) -> tuple[bool, str]:
     # Check scheme
     if parsed.scheme not in ssrf_protection.allowed_schemes:
         return False, f"Scheme '{parsed.scheme}' is not allowed. Allowed: {ssrf_protection.allowed_schemes}"
+
+    if parsed.username is not None or parsed.password is not None:
+        return False, "URL user information is not allowed"
     
     # Check empty host
     if not parsed.hostname:
@@ -128,9 +132,16 @@ def validate_url(url: str) -> tuple[bool, str]:
         if hostname.endswith(suffix):
             return False, f"Host ends with blocked suffix '{suffix}'"
     
-    # Check port
-    if parsed.port and parsed.port not in ssrf_protection.allowed_ports:
-        return False, f"Port {parsed.port} is not allowed. Allowed: {ssrf_protection.allowed_ports}"
+    # Accessing ``parsed.port`` itself raises for malformed/out-of-range values.
+    try:
+        port = parsed.port
+    except ValueError:
+        return False, "URL contains an invalid port"
+    if port is not None and port not in ssrf_protection.allowed_ports:
+        return False, f"Port {port} is not allowed. Allowed: {ssrf_protection.allowed_ports}"
+    expected_port = 443 if parsed.scheme == "https" else 80
+    if port is not None and port != expected_port:
+        return False, f"Port {port} does not match the {parsed.scheme} scheme"
     
     # Check IP address
     try:
@@ -306,23 +317,16 @@ def check_url_ssrf(url: str, raise_on_block: bool = False) -> bool:
             raise SSRFError("URL is a cloud metadata endpoint", provider="ssrf")
         return False
 
-    # Validate DNS results at the network boundary as well as the URL text.
-    # A public-looking hostname may resolve to a private address (or change
-    # between validation and connection), so unresolved DNS must fail closed.
+    # This is a user-facing preflight check. Actual requests must use the
+    # pinned transport too, which connects to one of these validated addresses
+    # without resolving the hostname again.
     hostname = urlparse(url).hostname or ""
     try:
-        ipaddress.ip_address(hostname)
-        resolved = [hostname]
-    except ValueError:
-        resolved = get_ip_addresses(hostname)
-    if not resolved:
+        port = urlparse(url).port or (443 if urlparse(url).scheme == "https" else 80)
+        resolve_public_addresses(hostname, port)
+    except PinnedRequestError as exc:
         if raise_on_block:
-            raise SSRFError("hostname could not be resolved safely", provider="ssrf")
+            raise SSRFError(f"SSRF protection blocked URL: {exc}", provider="ssrf") from exc
         return False
-    for resolved_ip in resolved:
-        if is_private_ip(resolved_ip):
-            if raise_on_block:
-                raise SSRFError("hostname resolves to a blocked private address", provider="ssrf")
-            return False
 
     return True
