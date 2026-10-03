@@ -54,33 +54,79 @@
 - [x] Test unknown tools, malformed/oversized queries, and extra properties against the same production registry path.
 - [x] Keep provider-facing schema definitions copy-isolated from canonical registry state.
 
-### Task 4: Whole-turn and cumulative-budget preflight
+### Task 4: Whole-turn and Owner-budget preflight
 
-- [ ] Apply Owner-configured cumulative `max_tool_calls` and per-tool-name `max_same_tool_calls` across all argument values and turns (not per exact signature), preserving supported Owner increases; align AgentTaskRuntime's counter semantics.
-- [ ] Clamp `max_turns` to the Owner's `max_execution_steps`, count accepted turns from durable history across restarts, and block before another provider call at the limit.
-- [ ] Enforce one monotonic `max_execution_time_seconds` deadline per model-loop slice; check before/after provider calls and before dispatch, and pass remaining time into router/provider and tool execution.
-- [ ] Require exact, nonempty `mission_id`, `run_id`, `turn_id`, and `plan_version` on native proposals; derive `action_id` from mission/turn/call identity, bind request/step/auth/scope from trusted state, and reject supplied mismatches.
-- [ ] Enforce the actual assembled message count against the exact Owner limit with no hardcoded two-message minimum; prove one message is accepted when one is configured and the assembled request fits, and preserve the long-horizon run under an explicit supported 64K Owner input-context budget.
-- [ ] Bind nonempty provider/model/capability provenance to the configured router adapter; reject arbitrary or mismatched labels before durable turn recording.
-- [ ] Require supplied provider-facing tool definitions to equal the canonical registry schemas exactly; reject altered, duplicate, unknown, or extra-metadata definitions before calling the model.
-- [ ] Disable silent `CapabilityUnsupported` → `generate` fallback by default; permit only an explicit opt-in and persist the actual capability used.
-- [ ] Preflight every sibling against remaining Owner step/tool/time/result budgets before durable turn/proposal events, in-flight checkpoints, or effect-ledger reservations; give parallel workers bounded deadlines and result allowances.
-- [ ] Prove a valid state-writing call paired with one malformed sibling causes no handler call, evidence append, checkpoint, or ledger event; retain per-call authorization denials for structurally valid proposals.
+- [x] Apply Owner-configured cumulative `max_tool_calls` and per-tool-name `max_same_tool_calls` across all argument values and turns (not per exact signature), preserving supported Owner increases; align AgentTaskRuntime's counter semantics.
+- [x] Clamp `max_turns` to the Owner's `max_execution_steps`, count accepted turns from durable history across restarts, and block before another provider call at the limit.
+- [x] Enforce one monotonic `max_execution_time_seconds` deadline per model-loop slice; check before/after provider calls and before dispatch, and pass remaining time into router/provider and tool execution.
+- [x] Require exact, nonempty `mission_id`, `run_id`, `turn_id`, and `plan_version` on native proposals; derive `action_id` from mission/turn/call identity, bind request/step/auth/scope from trusted state, and reject supplied mismatches.
+- [x] Enforce the actual assembled message count against the exact Owner limit with no hardcoded two-message minimum; prove one message is accepted when one is configured and the assembled request fits, and preserve the long-horizon run under an explicit supported 64K Owner input-context budget.
+- [x] Bind nonempty provider/model/capability provenance to the configured router adapter; reject arbitrary or mismatched labels before durable turn recording.
+- [x] Require supplied provider-facing tool definitions to equal the canonical registry schemas exactly; reject altered, duplicate, unknown, or extra-metadata definitions before calling the model.
+- [x] Disable silent `CapabilityUnsupported` → `generate` fallback by default; permit only an explicit opt-in and persist the actual capability used.
+- [x] Preflight every sibling against remaining Owner step/tool/time/result budgets before durable turn/proposal events, in-flight checkpoints, or effect-ledger reservations; give parallel workers bounded deadlines and result allowances.
+- [x] Prove a valid state-writing call paired with one malformed sibling causes no handler call, evidence append, checkpoint, or ledger event; retain per-call authorization denials for structurally valid proposals.
 
 ### Task 5: Bounded tool-result persistence
 
-- [ ] Enforce `max_result_chars` per serialized observation/result and `max_total_output_chars` across accepted model text plus tool results; recompute usage from persisted progress after restart.
-- [ ] Stream-measure/hash raw handler results, then persist only bounded output or a compact digest/length/truncation summary; reject/block before dispatch when a result record cannot fit at all.
-- [ ] If a completed side effect has oversized output, preserve the effect ledger's exact outcome, do not add success evidence based on truncated content, save the summary, and block later work as appropriate.
-- [ ] Test cumulative model text, oversized sequential/parallel results, storage bounds, and restart/no-replay behavior.
+- [x] Enforce `max_result_chars` per serialized observation/result and `max_total_output_chars` across accepted model text plus tool results; recompute usage from persisted progress after restart.
+- [x] Stream-measure/hash raw handler results, then persist only bounded output or a compact digest/length/truncation summary; reject/block before dispatch when a result record cannot fit at all.
+- [x] If a completed side effect has oversized output, preserve the effect ledger's exact outcome, do not add success evidence based on truncated content, save the summary, and block later work as appropriate.
+- [x] Test cumulative model text, oversized sequential/parallel results, storage bounds, and restart/no-replay behavior.
 
 ### Task 6: Parallel/time-budget enforcement
 
-- [ ] Prove parallel batches cannot exceed remaining call/step/time/output allowances; no worker starts after deadline or when its bounded result slot cannot be persisted.
-- [ ] Test slow/timed-out workers and step-boundary batches; ambiguous post-dispatch outcomes remain recovery-required and cannot be replayed.
+- [x] Prove parallel batches cannot exceed remaining call/step/time/output allowances; no worker starts after deadline or when its bounded result slot cannot be persisted.
+- [x] Test slow/timed-out workers and step-boundary batches; ambiguous post-dispatch outcomes remain recovery-required and cannot be replayed.
 
 ### Task 7: V11 verification and checkpoint
 
-- [ ] Run focused provider/tool adversarial tests, then the complete repository suite.
-- [ ] Run compileall, targeted py_compile, diff/secret/static bypass scans, protected-ref comparison, and independent read-only review.
-- [ ] Commit the V11 implementation/tests locally and update `docs/M3_STATE.md`; do not retry remote writes or deploy without new authorization and all external safeguards.
+- [x] Run focused provider/tool adversarial tests, then the complete repository suite.
+- [x] Run compileall, targeted py_compile, diff/secret/static bypass scans, protected-ref comparison, and independent read-only review.
+- [x] Commit the V11 implementation/tests locally and update `docs/M3_STATE.md`; do not retry remote writes or deploy without new authorization and all external safeguards.
+
+
+## V12 Implementation Checklist — Deployment Target
+
+### Task 1: Source-compatible target decision
+
+- [x] Inspect the bridge, supervised mission worker, SQLite stores, runtime defaults, existing static-host configuration, and current Cloudflare build evidence.
+- [x] Verify official Cloudflare Python runtime limitations against the actual thread/process/filesystem needs; reject a Worker backend and do not alter external Cloudflare settings.
+- [x] Select a host-agnostic, single-machine container model; keep production hosting blocked until an exact authorized host is known.
+
+### Task 2: Durable container state and bind safety
+
+- [x] Make task, memory, and Owner-policy state paths environment-overridable while preserving local defaults; route all production writable stores to one persistent state volume.
+- [x] Keep loopback the default bind; allow container-interface binding only with an explicit opt-in and a non-placeholder strong bridge secret.
+- [x] Add regression tests for default/invalid/explicit bind cases and isolated state-path initialization.
+
+### Task 3: Container and operations configuration
+
+- [x] Add a non-root Python 3.12 runtime image, a `.dockerignore` that excludes credentials, local DBs, caches, tests, and diagnostics, and a runtime-only dependency file.
+- [x] Add Compose services for the HTTP bridge and one supervised worker, sharing the named state volume; bind the host port to 127.0.0.1, disable public web mode by default, and pass provider secrets only as runtime environment.
+- [x] Configure read-only root, writable state/workspace and `/tmp` mounts, process initialization, restart policy, bounded stop grace, log rotation, and liveness checks.
+- [x] Require Docker Engine 28.0.0+ for the documented localhost-publish boundary and link its upstream version caveat.
+- [x] Document interactive Owner-password bootstrap, safe start/stop/restart/health commands, state-volume retention/backup cautions, and no production public-ingress claim.
+
+### Task 4: Lifecycle and CI verification
+
+- [x] Test bridge health, active-request drain, and graceful SIGTERM using a disposable child process and temporary DBs only; prove cleanup and reopened state.
+- [ ] Extend the existing GitHub Actions workflow to build/run the container without publishing; verify bridge/worker health, worker restart/generation advancement, and state-volume persistence.
+- [x] Run focused tests and the full local suite; 1,027 passed and 1 skipped after an isolated retry of one intermittent V10 child-identity failure.
+- [ ] Inspect exact-SHA GitHub checks and the related Cloudflare check, with no redeploy/rebuild retry or service-setting mutation.
+- [x] Obtain an independent read-only review; after Compose corrections, it found no remaining actionable V12 issue.
+- [ ] Record the unavailable local Docker engine, inspect exact-SHA CI/external checks, update `docs/M3_STATE.md`, and checkpoint V12 before starting V13.
+
+### V12 guardrails
+
+- [x] No production deployment, public host bind, domain/project/secret invention, Cloudflare setting change, or Firebase rewrite.
+- [x] No worker horizontal scaling or shared network-filesystem SQLite assumption.
+- [x] Keep the existing frontend/static configuration and M3 protected branches unchanged.
+
+### Preliminary V12 evidence (2026-10-03)
+
+- [x] Focused V12 bridge/state/shutdown, API-boundary, supervisor, and V10 process-death regression set: 62 passed.
+- [x] Modified Python modules pass `py_compile`.
+- [x] Full repository suite: 1,027 passed, 1 skipped. One prior V10 child-PID identity check failed in a full run, then passed in isolation and on the complete rerun.
+- [ ] Docker Compose build/restart smoke on GitHub CI and exact-SHA external checks remain pending; no local Docker engine is installed.
+- [x] Independent re-review after the Compose fixes: no remaining actionable findings.

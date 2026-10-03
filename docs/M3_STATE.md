@@ -31,9 +31,9 @@
 | V7 | Authorized reconciliation | COMPLETE | Code `bcb1e2e76c67a9524ad0e39893851f7f0253cf09`; full 873 passed, 1 skipped; compileall/diff hygiene passed; separate-connection UDF spoof and attached-MissionStore race regressions; independent review closed all findings; local-only, push withheld pending Cloudflare UNKNOWN |
 | V8 | Owner reauthorization after restart | COMPLETE | Code `0ce8730ca7a0a49d2e51ece94fadfb0139890b4f`; full 892 passed, 1 skipped; focused V8 control-plane/bridge/recovery 27 passed; compileall, static route/recovery audit, secret-pattern scan, and diff hygiene passed; local-only pending unresolved Cloudflare build status |
 | V9 | Scheduled-mission authorization snapshots | COMPLETE | Implementation `18a25a81619b2e15e2e2f0819e424b806f0392b6`; tests `c9178fa1ee4e34100457aacff705afbb04af3209`; full suite 931 passed/1 skipped, V9-specific 39 passed; static gates and final independent review passed; recurring/cron explicitly blocked |
-| V10 | Real subprocess process-death and multi-process harness | IN PROGRESS | Ten-case process-death/multi-worker matrix planned from existing production call paths; implementation pending |
-| V11 | Provider/tool hardening integrated with fence and ledger | NOT STARTED | — |
-| V12 | Source-justified deployment target decision/configuration | NOT STARTED | — |
+| V10 | Real subprocess process-death and multi-process harness | COMPLETE | Stable worker checkpoint `28a24ed8`; subprocess/matrix checkpoint `cc708643`; 15 V10 tests passed three consecutive runs; full suite 946 passed, 1 skipped |
+| V11 | Provider/tool hardening integrated with fence and ledger | COMPLETE | Final ledger SHA `7add9fe79efab2d26073cc2903295be4602ab423`; full suite 1,018 passed, 1 skipped; GitHub tests/audit passed; Cloudflare preview check failed, see V11 closeout |
+| V12 | Source-justified deployment target decision/configuration | IN PROGRESS | Non-root single-host Compose target, isolated state paths, explicit private bind and loopback host publish; 62 focused and 1,027/1 local tests pass; YAML structure parses; independent review closed; exact-SHA Docker CI pending |
 | V13 | Reproducible production-like E2E | NOT STARTED | — |
 | V14 | Cutover candidate and final verification | NOT STARTED | — |
 | V15 | Explicit production cutover decision gate | NOT STARTED | — |

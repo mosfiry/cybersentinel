@@ -102,3 +102,41 @@ Treat provider responses and model-proposed tool calls as bounded, untrusted inp
 ### Phase gate
 
 V11 is complete only when provider/tool inputs, provenance, turn/step/time/output budgets, and all current schemas fail closed across production dispatch paths; malformed mixed batches create no side effects; parallel boundaries are bounded; oversized results retain durable effect outcomes without replay; the full local suite and independent review pass; and the local checkpoint is recorded without protected-ref changes or remote writes.
+
+
+## V12 — Deployment Target Implementation (in progress; 2026-10-03)
+
+### Source findings verified
+
+- The application entrypoint is `bridge.py`, which uses `http.server.ThreadingHTTPServer`; durable mission processing is a separate supervised process started by `python -m scripts.run_mission_worker`.
+- Writable SQLite state is spread across `DB_PATH` and sibling mission/evidence/queue databases, `agent/task_manager.py`, `agent/memory.py`, `knowledge/store.py`, `security/scope_store.py`, and `security/owner_policy_state.json`. The last four currently resolve to source-tree/home paths and must be redirected to one persistent state volume without changing local defaults.
+- `core/config.py` intentionally rejects non-loopback bridge binds. A container needs an explicit opt-in to listen on its private interface; Compose must publish the API only on host loopback by default.
+- `firebase.json` configures static hosting of `web/` only. No backend domain/project or ingress rewrite is configured. The observed Cloudflare Worker build uses `npx wrangler preview` but fails because its Wrangler configuration has no `previews` block.
+- Current official Cloudflare Python docs describe a Pyodide/V8 Worker runtime; `threading` and `multiprocessing` are nonfunctional and the filesystem is ephemeral. This conflicts with the actual threaded HTTP server, separate worker process, and durable SQLite-file design. Do not add `previews: {}` or attempt to force the backend into Workers. References: [Python Workers](https://developers.cloudflare.com/workers/languages/python/), [supported standard library](https://developers.cloudflare.com/workers/languages/python/stdlib/), and [how Python Workers work](https://developers.cloudflare.com/workers/languages/python/how-python-workers-work/).
+- Docker's official port-publishing documentation warns that Engine releases older than 28.0.0 may allow same-layer-2 peers to reach localhost-published ports; the runbook therefore requires Engine 28.0.0 or newer and keeps the host mapping on `127.0.0.1`. Reference: [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/).
+
+### Architecture decisions
+
+1. Implement a portable single-host OCI/Docker Compose target: one image, separate `bridge` and `mission-worker` services, one stable logical worker, and a shared named local volume for every writable database, policy state file, and workspace. Keep SQLite rollback-journal files on the same local host; do not scale the worker horizontally or put this volume on an unverified network filesystem.
+2. Keep the bridge loopback-only by default. Container mode may opt in to `0.0.0.0` only with an explicit non-loopback-bind flag and a non-placeholder strong bridge secret; Compose publishes `127.0.0.1:${BRIDGE_PUBLISHED_PORT:-8787}:8787`. Do not configure a public listener, domain, TLS proxy, or production secrets.
+3. Use a non-root, read-only-root container with writable state and temporary mounts, signal forwarding, restart policy, and liveness health checks. Provide interactive Owner account bootstrap using the existing `security.owner_password_bootstrap` flow; do not treat the unused `OWNER_TOKEN` sample variable as Owner identity.
+4. Preserve `firebase.json` and all external service settings. The application image serves the existing frontend and backend together; public Firebase/Cloudflare split routing is not configured because no backend origin/authority is known.
+5. Do not deploy. Production host/domain/credentials are unknown, so the production deployment gate remains separate. The local container target and no-provider rehearsal are the implementation/test scope.
+
+### Ordered implementation tasks and acceptance
+
+1. Add environment-overridable paths for task, memory, and Owner policy state stores; preserve existing defaults and verify all stores can initialize under an isolated state directory.
+2. Add fail-closed container bind opt-in and bounded graceful SIGTERM/SIGINT shutdown for the bridge; test local defaults, allowed/denied bind cases, and bridge health/shutdown with only a temporary database.
+3. Add runtime-only requirements, Dockerfile, `.dockerignore`, and Compose configuration with the shared volume, single worker, loopback host publish, required bridge secret, optional provider env passthrough, non-root/read-only hardening, restart behavior, and explicit Owner bootstrap/volume-retention instructions.
+4. Extend existing GitHub Actions CI (no publish/deploy) to build and run the container target, assert API/worker liveness, restart the worker, and verify the same state volume retains monotonically increasing worker generations. Use only CI-only credentials and an isolated compose project/volume.
+5. Run focused tests and the full suite, inspect the Docker build/Compose smoke result on exact pushed SHA, scan secrets/static dispatch paths, obtain an independent read-only review, update state/todo, and checkpoint before V13.
+
+### Risks and non-goals
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Writable state is split across fixed paths | Read-only images fail or data silently resets on restart | Route every identified DB/state file to the named volume; assert paths in an isolated subprocess test |
+| Container bind accidentally becomes public | Exposes an authenticated local-only bridge without ingress hardening | Require an explicit bind opt-in and publish only on host loopback; no public port mapping |
+| Cloudflare preview failure tempts a config-only workaround | Produces a green build for an incompatible runtime without fixing the architecture | Record the missing `previews` block, but keep Cloudflare Worker out of the backend target |
+| No Docker/Podman engine is installed on the active computer | Local image build cannot be claimed | Verify container build/runtime smoke in the existing GitHub-hosted Linux CI, without pushing an image |
+| Production endpoint/authority is absent | Cannot prove or authorize production cutover | Keep `PRODUCTION_DEPLOYMENT_BLOCKED`; continue V13–V16 non-production verification/rehearsal |

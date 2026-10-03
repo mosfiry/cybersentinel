@@ -9,7 +9,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp .env.example .env
-# Set different random BRIDGE_TOKEN and OWNER_TOKEN values in .env
+# Replace BRIDGE_TOKEN with a private, random value of at least 32 characters
+python -m security.owner_password_bootstrap
 python -m compileall -q .
 pytest -q
 python bridge.py
@@ -17,7 +18,7 @@ python bridge.py
 
 Open `http://127.0.0.1:8787/` locally. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for configuration and [docs/AGENT_ARCHITECTURE.md](docs/AGENT_ARCHITECTURE.md) for the request path.
 
-The bridge binds only to localhost. Never commit `.env`, tokens, API keys, provider credentials, databases, or runtime state.
+By default, the bridge binds only to localhost. Compose opts into the private container interface but publishes the service only on host loopback. `BRIDGE_TOKEN` is transport authentication; Owner identity is a username/password account initialized by the interactive bootstrap command above. Never commit `.env`, tokens, API keys, provider credentials, databases, or runtime state.
 
 ## Agent Core Fusion
 
