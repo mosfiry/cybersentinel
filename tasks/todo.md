@@ -1,34 +1,36 @@
-# V9 Implementation Checklist — Scheduled-Mission Authorization Snapshots
+# V10 Implementation Checklist — Real Process Death and Multi-Process Harness
 
-## Task 1: Fresh Owner authority when scheduling
+## Task 1: Process-test contract and bounded harness
 
-- [x] Require a current authenticated Owner session and exact durable mission Owner identity.
-- [x] Run existing Owner revalidation before persisting a schedule; do not use `created_by`, `owner_id`, or a stored session alone as authority.
-- [x] Authenticate fresh Owner evidence through the bridge revalidator; verify snapshot integrity, mission/Owner binding, provenance version, active expiry, and current session/account status.
-- [x] Reject active leases, recovery-required missions, terminal missions, unbound legacy missions, and invalid schedule inputs.
+- [x] Re-read the original V10 requirements and map current production worker, supervisor, SQLite, Owner-session, evidence, and external-effect call paths.
+- [x] Confirm existing V9 crash coverage is failpoint-based and current multi-worker tests do not kill supervised mission-worker processes.
+- [ ] Add an optional stable logical `worker_id` to the existing bridge worker factory and supervised CLI, preserving the current default.
+- [ ] Create a test-only subprocess harness using `Popen`, isolated `DB_PATH`, JSON-line/stdin barriers, timeouts, real signals, and unconditional child cleanup.
+- [ ] Ensure all test processes use only temporary rollback-journal databases and local deterministic handlers; make no network/provider calls.
 
-## Task 2: Durable schedule snapshot binding
+## Task 2: Real process-death cases at durability boundaries
 
-- [x] Add an additive, idempotent schema migration for stable Owner identity, snapshot digest/version, and expiry.
-- [x] Persist no session token or raw Owner evidence in a schedule row; validate durable evidence-to-snapshot bindings through MissionStore and the Owner auth store.
-- [x] Ensure legacy schedules lacking an explicit binding cannot dispatch and are quarantined rather than adopted.
-- [x] Normalize due times consistently; Owner-bound recurring intervals and retries are rejected, and low-level schedule/dispatch mutations fail closed without an authoritative MissionStore.
+- [ ] SIGTERM before claim; prove no claim/effect, then prove restart recovery quarantines pending Owner work.
+- [ ] SIGKILL after claim but before bind; reopen in a fresh worker and prove no unauthorized claim retry.
+- [ ] SIGKILL during execution after durable in-flight checkpoint; prove no implicit replay.
+- [ ] SIGKILL after effect-ledger DISPATCHED and before handler outcome; preserve the ambiguous ledger state.
+- [ ] SIGKILL after evidence-chain append; verify committed evidence/hash chain and no duplicate execution.
+- [ ] SIGKILL after terminal MissionStore commit but before queue completion; prove recovery recognizes terminal state.
 
-## Task 3: Due-time validation and crash-safe queue handoff
+## Task 3: Independent-worker and stale-writer races
 
-- [x] Reload authoritative MissionStore data and validate schedule, mission, Owner, exact snapshot hash/version, evidence request/proof/expiry fields, active Owner session/account, and expiry immediately before dispatch.
-- [x] Prevent terminal, recovery-required, cancelled, active-lease, already-claimed, or mismatched queue states from being reopened by `enqueue`.
-- [x] Atomically transition schedule and queue with the existing rollback-journal attached SQLite transaction spanning scheduler, queue, MissionStore, and Owner-authentication stores.
-- [x] Quarantine stale, expired, revoked, tampered, mismatched, legacy-unbound, or structurally malformed authority/data; never queue execution.
-- [x] Wire bounded due dispatch into existing supervised `MissionWorker.run_once()` before claim; no hidden thread or new infrastructure.
-- [!] BLOCKED SUB-CAPABILITY: recurring/cron execution and auto-retries remain rejected until the Owner-approved per-occurrence mission-identity/authorization contract exists. Do not reopen a terminal mission or reuse one snapshot for repeat executions.
+- [ ] Start two distinct supervised worker processes simultaneously against one queue; assert exactly one durable claim and at-most-once dispatch.
+- [ ] Hold an old worker across lease/generation retirement, let a new worker claim, then release the old worker; prove every stale mission/queue/effect write is rejected and the new claim is unchanged.
 
-## Task 4: Adversarial negative tests and checkpoint
+## Task 4: Ambiguous-effect restart and Owner authority
 
-- [x] Cover stale/revoked/foreign Owner sessions, unbound legacy rows, tampered hash/version, identity mismatch, expired snapshot, and expiry-window rejection.
-- [x] Cover schedule-insert/queue-write/queue-promotion crash boundaries, duplicate due polling, restart quarantine, terminal/cancelled missions, active-worker races, and revoked Owner-session status at due time.
-- [x] Prove invalid cases never reach executor or a claimable queue state; direct `SCHEDULED` rows remain unclaimable.
-- [x] Cover independent-review fixes: no unbound scheduler mutation, malformed mission/service provenance/queue/schedule state and timestamps, strict Owner-bound offset normalization, due-poll/start race, and immediate start/resume/cancel schedule retirement.
-- [x] Rerun final full repository suite and checkpoint hygiene after the independent-review fixes (931 passed, 1 skipped; V9 suite 39 passed; compileall, py_compile, diff hygiene, dispatch/call-graph, secret-pattern, and protected-ref checks passed).
-- [ ] Commit V9 code and evidence locally on `task/m3-production-runtime-20261003`; preserve `main` and M2D.
-- [x] Keep remote push withheld while exact-SHA V6 Cloudflare build outcome remains unresolved and potentially production-associated.
+- [ ] Kill after the local ledgered side effect has committed but before a terminal outcome is recorded; restart and prove the effect remains ambiguous, is not replayed, and the local side-effect count remains one.
+- [ ] Revoke the pre-crash Owner session and reject its resume; create a fresh active test Owner session, reauthorize through MissionService, and prove only the exact renewed snapshot can requeue.
+- [ ] Map test assertions to the relevant V0–V9 durability/fence/evidence/effect boundaries; do not treat exception failpoints as process-death coverage.
+
+## Task 5: Phase gates and checkpoint
+
+- [ ] Run the process-death matrix repeatedly, then the full repository suite; preserve exact exit codes, signal, and durable post-crash state.
+- [ ] Run compileall, py_compile, diff hygiene, dispatch/recovery/worker-ID static scans, secret-pattern scan, protected-ref comparison, and an independent read-only review.
+- [ ] Commit V10 helper/tests and any narrowly required runtime/CLI fix locally; update `docs/M3_STATE.md` and preserve `main`/M2D.
+- [ ] Keep all remote pushes and production deployment withheld; V6 Cloudflare production-associated check remains unresolved.
