@@ -14,7 +14,6 @@ import sqlite3
 from .execution_fence import (
     ExecutionFence,
     ExecutionFenceError,
-    authorization_digest,
     authorization_snapshot_matches_mission,
 )
 

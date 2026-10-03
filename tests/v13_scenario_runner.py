@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -673,8 +672,7 @@ def _run_scenario(scenario: str) -> dict[str, Any]:
                 cwd=REPO_ROOT,
                 env={**os.environ, "CYBERSENTINEL_V13_CRASH_AFTER_WATCH": "0"},
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,

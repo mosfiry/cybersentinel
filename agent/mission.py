@@ -8,7 +8,7 @@ import uuid
 import hashlib
 import json
 
-from .planning import Plan, GoalVerification
+from .planning import Plan
 from .trajectory import EventType, TrajectoryEvent, verify_trajectory
 from .execution_fence import ExecutionFence, ExecutionFenceError
 
@@ -239,7 +239,7 @@ class MissionStore:
                 raise ExecutionFenceError("mission and queue writes require SQLite rollback-journal mode")
 
     def _save(self, mission: Mission, *, execution_fence: ExecutionFence | None, allow_claimed: bool) -> Mission:
-        import json, sqlite3
+        import sqlite3
         if execution_fence is not None:
             execution_fence.assert_current(mission=mission, allow_claimed=allow_claimed)
             if execution_fence.queue.require_execution_fence:
@@ -328,7 +328,7 @@ class MissionStore:
         return MissionClaimBinding(bound_fence.lease_binding_id)
 
     def load(self, mission_id: str) -> Mission | None:
-        import json, sqlite3
+        import sqlite3
         with sqlite3.connect(self.db_path) as db:
             row = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
         return Mission.from_dict(json.loads(row[0])) if row else None

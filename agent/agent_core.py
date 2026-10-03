@@ -16,7 +16,7 @@ from security.owner_policy import (
     policy_context_from_snapshot,
 )
 from security.scope_store import get_snapshot
-from tools.registry import REGISTRY, execute as execute_tool, get_tool
+from tools.registry import execute as execute_tool, get_tool
 from agent.evidence import EvidenceChainStore
 from workspace import Workspace
 from security.mission_authorization import MissionAuthorizationSnapshot

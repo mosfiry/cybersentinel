@@ -146,7 +146,7 @@
 - [x] Reverify Cloudflare Workers Builds check `111250300538` read-only: build `54f66543-87fe-45aa-967e-31a73dacd405` stopped at the known missing Wrangler `previews` block; no Cloudflare setting/resource changed.
 - [x] Confirm remote M3 head equals V12 SHA `8e84268a4574d697cbde20029d308cd86d9f87f7`; protected `main=8a3fd109c0e586db13ed48a7371ac9ad06465b74` and M2D `task/m2d-cutover-20261002=9bf91ea37748a239e6a6e3b6327706fa614232cd` unchanged; no production deployment/public bind.
 
-### V13 — Reproducible production-like E2E (in progress)
+### V13 — Reproducible production-like E2E (complete)
 
 - [x] Build an isolated harness using a loopback-only live bridge, temporary SQLite/state/workspace paths, a real temporary Owner login, real mission HTTP routes, and production worker/queue/runtime classes; fail on any provider call.
 - [x] Run the deterministic two-step Owner mission (`run_project_tests` plus local `watch`), assert the snapshot, queue/fence, persisted evidence/effect/result, verified `FindingClaim`, completion, and Owner-authenticated API readback.
@@ -158,11 +158,22 @@
 - [x] First independent security review found that legacy rows with an empty effect Owner identity could be inspected/approved by deriving the mission Owner; both paths now require exact nonempty identity equality, and legacy blank-owner rows fail closed without mutation. New fenced reservations persist the Owner identity from the authorization snapshot.
 - [x] Final independent review confirmed strict Owner binding and snapshot-history validation; its low crash-projection concern was fixed by deriving approval status, Owner event count, dispatch count, and uniqueness from the HTTP response and post-resume ledger history. No remaining finding; focused/full tests reran successfully.
 - [x] Final compile, YAML/shell syntax, secret-pattern, `git diff --check`, protected-ref, and V13 child-cleanup checks passed.
-- [x] Local code checkpoints: recovery fix `2729fb593127506021693fe0f170826e2b0ae06f`; E2E harness `ac85df78d3dfeed63d18a951d10938ee41923a51`. The ledger update is being checkpointed; remote push/CI remain pending.
+- [x] Non-force push to the existing M3 branch; exact remote read-back `8d32d79fc4ebeb75205af8e0ef5f26434e57afdb` matches local HEAD. Protected `main`/M2D unchanged.
 
 
 #### V13 regression/closeout evidence (2026-10-03)
 
 - Regression reproduced after queue start/resume renewed Owner authority: the effect row retained the dispatch-time hash, but readback compared it only with the new current snapshot. The live crash scenario could not inspect its `DISPATCHED` effect after restart.
 - Fix is confined to Mission snapshot serialization/history, the shared execution-fence validator, AgentCore reauthorization, effect reconciliation/ledger authorization, and isolated tests. The current test matrix verifies exact historical snapshot acceptance and fail-closed missing/wrong-owner history.
-- Full local suite is green (1,048 passed, 1 skipped); legacy mission payloads lacking history still load/round-trip, while legacy effects lacking Owner identity fail closed. Final independent review is complete with no remaining finding. Local code checkpoints exist; non-force push and exact-SHA CI must still pass before V14.
+- V13 exact-SHA CI is green for `8d32d79fc4ebeb75205af8e0ef5f26434e57afdb`: GitHub tests run `37142559205` and audit `37142559226` succeeded; Compose smoke passed. Cloudflare check `111259925397` failed; exact check metadata contains no cause, while the earlier V12 read-only build log identified the missing preview config. No external settings were changed. This completes V13; no production deployment was attempted.
+
+
+### V14 — Cutover candidate + final verification (in progress)
+
+- [x] Create `docs/M3_CUTOVER_CANDIDATE.md` as a non-deployment readiness artifact with exact branch/SHA and CI evidence, the Compose target, known limitations, and explicit `PRODUCTION_DEPLOYMENT_BLOCKED` status.
+- [x] Run the full repository suite and focused V14 groups: integration/auth/fence/evidence 70 passed; process/multi-worker/recovery/effects 119 passed; provider-boundary 65 passed/1 credential-gated skip; full suite 1,048 passed/1 skip.
+- [x] Linter discovery: no repository or CI lint configuration exists. Temporary Ruff `E4,E7,E9,F` checks pass on all eight V13-touched Python files; the same baseline reports 291 findings repository-wide, so whole-repository lint is not green. No project config/dependency was added.
+- [x] V14 `compileall`, Compose/workflow YAML parse, container shell syntax, high-confidence secret/sensitive-file scan, and `git diff --check` pass. No diagnostic/temp artifacts were found in the repository.
+- [x] `main` and M2D refs remain unchanged; the current diff is confined to the V14 record, M3 ledger/checklists, and narrowly scoped lint cleanup. A final clean worktree check remains after commit.
+- [ ] Commit/push the candidate and verification evidence non-force to the existing M3 branch; verify exact-SHA CI and final clean tree before closing V14.
+- [x] No Cloudflare settings were changed, no public listener was published, and no production deployment was performed in V14.

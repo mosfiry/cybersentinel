@@ -164,6 +164,7 @@ V11 is complete only when provider/tool inputs, provenance, turn/step/time/outpu
 5. [x] Run the successful scenario repeatedly and compare canonical result/finding/evidence/effect projections; assert every DB, workspace file, and subprocess is isolated and cleaned up.
 6. [x] Complete focused/full suites, Python compile, YAML/shell parse, secret/diff hygiene, child cleanup, and independent read-only reviews; no remaining findings.
 7. [x] Commit the production recovery fix (`2729fb5`) and live E2E harness (`ac85df7`) as separate local checkpoints; prepare the reviewed phase-ledger update.
+8. [x] Non-force push to the existing M3 branch; exact remote SHA `8d32d79fc4ebeb75205af8e0ef5f26434e57afdb`; exact-SHA tests/audit and Compose smoke passed. Cloudflare Workers Builds check failed, with no settings changed.
 
 ### V13 risks and explicit boundaries
 
@@ -174,4 +175,22 @@ V11 is complete only when provider/tool inputs, provenance, turn/step/time/outpu
 | Child crash leaves live lease/effect records | Could poison shared state or cause duplicate dispatch | One test-owned worker subprocess, per-test temp DBs, bounded exit code, restart/recovery assertions, and fixture cleanup; never signal unrelated PIDs |
 | Real providers/network could make results nondeterministic | External effects or credential leakage | Use only local `run_project_tests` and `watch`; explicit plan; fail if model/provider routing is invoked |
 | Legacy effect rows have an empty Owner identity | Mission identity alone cannot prove which Owner was immutably bound to the effect at creation | New fenced reservations persist the nonempty identity from the validated authorization snapshot; inspection and transition require exact equality; migrated blank-owner rows fail closed and require a separate explicit repair/migration before any cutover |
-8. [ ] Non-force push the reviewed commits only to the existing M3 branch and verify exact-SHA CI before V14.
+
+
+### V14 — Cutover candidate + final verification
+
+**Boundary:** V14 records readiness evidence only. It does not deploy or imply that production authority/target prerequisites exist.
+
+1. [x] Create `docs/M3_CUTOVER_CANDIDATE.md` with candidate SHA/branch, Docker Compose rationale, verified evidence IDs, limitations, and `PRODUCTION_DEPLOYMENT_BLOCKED` status.
+2. [x] Run the full suite and grouped matrices: integration/auth/fence/evidence 70 passed; process/multi-worker/recovery/effects 119 passed; provider boundaries 65 passed/1 credential-gated skip; full repository 1,048 passed/1 skipped.
+3. [x] `compileall`, Compose/workflow YAML parsing, shell syntax, high-confidence secret/sensitive-file scan, and whitespace checks pass. No repository/CI linter configuration exists; temporary Ruff `E4,E7,E9,F` passes on all changed V13 Python files, while the whole-repo baseline has 291 findings and is not green.
+4. [x] `main`/M2D refs unchanged; no diagnostic/temp artifacts found; only intended M3 source cleanup and verification/ledger files changed. Verify clean tree after checkpoint.
+5. [ ] Commit/push only to the existing M3 branch non-force and read back exact-SHA CI; do not deploy production or mutate Cloudflare.
+
+### V14 risk register
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Cloudflare Workers preview build remains failed and its current exact-SHA check has no diagnostic detail | No evidence supports a Workers cutover; target configuration remains unresolved | Preserve read-only failure evidence, keep the Compose target separate, and mark production cutover blocked until the exact target/config/authority are verified |
+| Local Docker Engine is unavailable | Local container execution cannot be claimed | Use the exact-SHA GitHub Compose smoke logs as hosted evidence; do not represent them as local validation |
+| No project lint policy exists and the repo-wide ad-hoc Ruff E/F baseline is non-green | The verification cannot claim a clean repository lint gate | Keep the 291-finding baseline explicit, require a defined policy before claiming lint readiness, and do not broaden V14 into unrelated mass formatting |
