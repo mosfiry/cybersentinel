@@ -224,9 +224,9 @@ The rehearsal must exercise and retain evidence for all twelve required steps in
 
 **Task 5 — Recovery, effect and process-failure records (3 files; complete):** created `docs/M3_RECOVERY_MODEL.md`, `docs/M3_EXTERNAL_EFFECTS.md`, and `docs/M3_PROCESS_FAILURE_TESTS.md`, linked to implementation/tests and explicit transaction/provider guarantees and limits.
 
-**Task 6 — Rehearsal and final audit (2 files; complete):** created `docs/M3_CUTOVER_REHEARSAL.md` from exact-SHA artifact `11282529762` and `docs/M3_FINAL_AUDIT.md` with all five M2E blockers mapped to M3 action, code evidence, test evidence, and one permitted status per row. All five are `PARTIALLY_RESOLVED`; production remains blocked.
+**Task 6 — Rehearsal and final audit (2 files; complete):** created `docs/M3_CUTOVER_REHEARSAL.md` and `docs/M3_FINAL_AUDIT.md` with all five M2E blockers mapped to M3 action, code evidence, test evidence, and one permitted status per row. The final exact-SHA artifact `11282434212` on `cba7de93dfc5ee1f7ae450ab28468a504657bd28` revalidated all twelve stages and cleanup. All five are `PARTIALLY_RESOLVED`; production remains blocked.
 
-**Task 7 — Phase closeout:** update `docs/M3_STATE.md` and `tasks/todo.md` with exact pushed SHA, run/check IDs, cleanup proof and remaining blockers; non-force push only to the existing M3 branch, then read back exact-SHA tests/audit/Workers checks. Never deploy production while V15 remains blocked.
+**Task 7 — Phase closeout (complete):** `docs/M3_STATE.md`, `docs/M3_FINAL_AUDIT.md`, `docs/M3_CUTOVER_REHEARSAL.md`, `docs/M3_CUTOVER_CANDIDATE.md`, and `tasks/todo.md` record the exact pushed SHA `cba7de93dfc5ee1f7ae450ab28468a504657bd28`, test run `37149476169` (1,072 passed/1 skipped), audit run `37149476272`, rehearsal job `111280357328`, artifact `11282434212`, cleanup, Workers Builds failure `111280138674`, and remaining blockers. The push was fast-forward only to the existing M3 branch; main/M2D and production/Cloudflare remain untouched.
 
 ### V16 risk register
 
