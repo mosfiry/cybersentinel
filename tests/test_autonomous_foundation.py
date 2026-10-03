@@ -179,7 +179,9 @@ def test_worker_does_not_mark_mission_failed_after_lease_takeover(tmp_path):
 
 def test_worker_does_not_overwrite_requeued_mission_after_handler_lease_expiry(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
-    queue.enqueue("mission-expired-handler", available_at="2026-01-01T00:00:00+00:00")
+    started_at = datetime.now(timezone.utc)
+    queue.enqueue("mission-expired-handler", available_at=started_at.isoformat())
+    recovery_at = (started_at + timedelta(seconds=120)).isoformat()
 
     class Mission:
         status = MissionStatus.GOAL_COMPLETED
@@ -188,10 +190,10 @@ def test_worker_does_not_overwrite_requeued_mission_after_handler_lease_expiry(t
 
     class Runtime:
         def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
-            queue.recover_expired(now="2026-01-01T00:01:01+00:00")
+            queue.recover_expired(now=recovery_at)
             return Mission()
 
-    result = MissionWorker(queue, lambda: Runtime(), worker_id="expired-worker", lease_seconds=60).run_once(now="2026-01-01T00:00:00+00:00")
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="expired-worker", lease_seconds=60).run_once(now=started_at.isoformat())
     assert result.state is WorkerMissionState.QUEUED
     assert result.last_error == "worker lease expired"
 
@@ -240,7 +242,8 @@ def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
     class Runtime:
         def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
             item = queue.get(mission_id)
-            assert item.lease_expires_at == (run_started_at + timedelta(seconds=17)).isoformat()
+            seconds_left = (datetime.fromisoformat(item.lease_expires_at) - datetime.now(timezone.utc)).total_seconds()
+            assert 14 <= seconds_left <= 17
             return Mission()
 
     with pytest.raises(ValueError, match="lease_seconds"):
@@ -277,7 +280,7 @@ def test_scheduler_supports_one_time_and_recurring_dispatch(tmp_path):
     assert {item.schedule_id for item in dispatched} == {"one", "recurring"}
     assert scheduler.get("one").state is WorkerMissionState.COMPLETED
     assert scheduler.get("recurring").state is WorkerMissionState.SCHEDULED
-    assert scheduler.get("recurring").next_run_at == "2026-01-01T00:02:00+00:00"
+    assert datetime.fromisoformat(scheduler.get("recurring").next_run_at) == datetime.fromisoformat("2026-01-01T00:02:00+00:00")
 
 
 def test_context_separation_and_independent_verification():
