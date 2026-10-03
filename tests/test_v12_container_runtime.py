@@ -19,6 +19,19 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_docker_context_keeps_workspace_application_package() -> None:
+    ignored = {
+        line.strip()
+        for line in (ROOT / ".dockerignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert "workspace/" not in ignored
+    assert (ROOT / "workspace" / "__init__.py").is_file()
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "COPY . /app" in dockerfile
+    assert 'RUN python -c "from workspace import Workspace"' in dockerfile
+
+
 def _isolated_environment(state_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     for name in (

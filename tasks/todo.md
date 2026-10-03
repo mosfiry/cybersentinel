@@ -114,14 +114,17 @@
 - [x] Extend the existing GitHub Actions workflow to build/run the container without publishing and assert bridge/worker health, UID, read-only root, shared-volume identity, workspace writes, and loopback host binding, plus worker restart/generation persistence.
 - [x] Fix the exact-SHA 52b2803 first-start race (`_data/workspace: file exists`) with a non-root serialized initializer completed before either service; retain the existing workspace path and files.
 - [ ] Verify bridge/worker health, UID/read-only/mount/loopback contract, workspace writes, and worker generation advancement on the new exact SHA.
-- [x] Run focused tests and the full local suite after the exact-command correction: V12 suite 21 passed; full suite 1,039 passed, 1 skipped.
+- [x] Run focused tests and the full local suite after the Docker source-inclusion correction: V12 suite 22 passed; full suite 1,040 passed, 1 skipped.
 - [x] Inspect exact-SHA GitHub and Cloudflare checks read-only. SHA `52b2803924e9f88af7c0513d03e5f2e62baf76ee`: audit passed; test failed before service startup at the known workspace-volume `file exists` race; Cloudflare check `111242158919` failed for the known missing Wrangler `previews` block; no preview or setting change.
+- [x] Inspect current exact-SHA run `37138760819` on `bc65e8272f9b230f428060a11fa998962fdc0258`: audit passed, compileall/pytest passed, but container smoke failed because `.dockerignore` omitted tracked `workspace/` source; the earlier `file exists` race did not recur.
+- [x] Recheck Cloudflare build `aefd2931-0b83-4ddc-b961-5516e75ad5a8` read-only: status `stopped`; logs confirm missing Wrangler `previews` block; no changes made.
 - [x] First independent review found no critical/high findings, one medium false-positive health probe and a low same-volume symlink TOCTOU; exact init-child/worker-ID matching, fake-`/proc` negatives, CI health waiting, and an explicit trust-boundary caveat address them.
 - [x] Second independent review found stopped/traced (`T`/`t`) processes could still appear healthy; restrict accepted states to `R`/`S`/`D` and add parameterized regression cases.
 - [x] Further independent review found suffix-only argv comparison; require exact full Compose argv and add wrong-executable, changed-poll-interval, and extra-argument negatives.
-- [x] Final independent review confirmed full argv/entrypoint identity and no runtime findings; correct its LOW stale operations sentence about two volumes to the actual single-volume topology.
+- [x] Final independent review of the prior exact-argv snapshot confirmed command identity and corrected the LOW stale two-volume operations sentence.
+- [x] Independent read-only review of the current `.dockerignore`/Dockerfile correction found no material issues; the static guard is not a live image build, so exact-SHA CI remains required.
 - [x] Confirm local Docker Engine is unavailable (no Docker binary); do not claim a local container smoke test.
-- [ ] Verify the correction on the next exact-SHA CI run, record its outcome, update `docs/M3_STATE.md`, and checkpoint V12 before starting V13.
+- [ ] Commit and push the reviewed source-inclusion correction non-force to the existing M3 branch; verify build import, service health, UID/read-only/mount/loopback contract, workspace writes, and worker restart/generation on that exact SHA before V13.
 
 ### V12 guardrails
 
@@ -131,10 +134,10 @@
 
 ### V12 current evidence (2026-10-03)
 
-- [x] Final V12 bind/store/bridge-shutdown/workspace-initializer and exact-worker-health tests: 21 passed; adjacent API-boundary, supervisor, and V10 process-death regression set: 62 passed in the earlier focused regression.
+- [x] Final V12 bind/store/bridge-shutdown/workspace-initializer, source-inclusion, and exact-worker-health tests: 22 passed; adjacent API-boundary, supervisor, and V10 process-death regression set: 62 passed in the earlier focused regression.
 - [x] Modified Python modules pass `py_compile`.
-- [x] Full repository suite after the exact-command correction: 1,039 passed, 1 skipped (30.01 seconds). One earlier full attempt failed before signal at the V10 child-PID identity guard; `/proc` inspection found no live harness child, the case passed in isolation, and the full rerun passed.
+- [x] Full repository suite after the Docker source-inclusion correction: 1,040 passed, 1 skipped (29.82 seconds). One earlier full attempt failed before signal at the V10 child-PID identity guard; `/proc` inspection found no live harness child, the case passed in isolation, and the full rerun passed.
 - [x] GitHub audit on exact SHA `52b2803924e9f88af7c0513d03e5f2e62baf76ee` succeeded.
 - [x] Container smoke on that SHA built the image but failed at simultaneous first creation of the nested workspace path in the shared volume; a non-root one-shot initializer now creates that existing path before the bridge/worker.
 - [x] Cloudflare build for the same SHA failed at `npx wrangler preview` due missing `previews` configuration; no preview artifact was produced.
-- [ ] Verify the initializer, health checks, mount/security contract, and worker restart on a fresh exact-SHA CI run; no local Docker engine is installed. Final independent review is complete; the same-volume TOCTOU trust assumption remains explicitly documented.
+- [ ] Verify the initializer, health checks, mount/security contract, and worker restart on a fresh exact-SHA CI run after the source-inclusion fix; no local Docker engine is installed. Independent review of this correction found no material issues; the same-volume TOCTOU trust assumption remains explicitly documented.

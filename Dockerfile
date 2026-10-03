@@ -19,6 +19,7 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements-runtime.txt \
 COPY . /app
 
 USER 10001:10001
+RUN python -c "from workspace import Workspace"
 EXPOSE 8787
 
 CMD ["python", "/app/bridge.py"]

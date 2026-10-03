@@ -43,7 +43,6 @@ scripts/verify_container_contract.py
 docs/
 tasks/
 diagnostics/
-workspace/
 .github/
 firebase.json
 
