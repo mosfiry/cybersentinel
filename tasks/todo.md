@@ -56,7 +56,7 @@
 
 ### Task 4: Whole-turn and cumulative-budget preflight
 
-- [ ] Apply Owner-configured cumulative `max_tool_calls` and exact-repeat signature budgets without inventing a lifetime cap below supported Owner settings; keep the provider's 10-calls-per-response ceiling and enforce the actual message payload against `min(Owner max_context_chars, 32,000)` (24K remains only the assembler default).
+- [ ] Apply Owner-configured cumulative `max_tool_calls` and exact-repeat signature budgets without inventing a lifetime cap below supported Owner settings; keep the provider's 10-calls-per-response and 32,000-character returned-text ceilings separate from the exact Owner-configured model-input budget (24K remains only the assembler compaction default).
 - [ ] Require exact, nonempty `mission_id`, `run_id`, `turn_id`, and `plan_version` on native proposals; derive `action_id` from mission/turn/call identity, bind request/step/auth/scope from trusted state, and reject supplied mismatches.
 - [ ] Enforce the actual assembled message count against the exact Owner limit with no hardcoded two-message minimum; prove one message is accepted when one is configured and the assembled request fits.
 - [ ] Bind nonempty provider/model/capability provenance to the configured router adapter; reject arbitrary or mismatched labels before durable turn recording.
