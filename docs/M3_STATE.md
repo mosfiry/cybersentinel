@@ -160,3 +160,12 @@ V10 is complete on local branch `task/m3-production-runtime-20261003`. The stabl
 Local protected refs remain `main=8a3fd109c0e586db13ed48a7371ac9ad06465b74` and M2D `task/m2d-cutover-20261002=9bf91ea37748a239e6a6e3b6327706fa614232cd`; the remote refs match those SHAs. Remote M3 remains at V6 `375a55c4fb0e094417a50a374d12f90db3c77352`. No push or deployment was attempted: per the Owner's latest instruction, there was no HTTPS-auth retry without new authentication; no suitable GitHub write MCP was available. Consequently no exact-SHA hosted CI is claimed for V10. The V6 Cloudflare production-associated build result remains unresolved/UNKNOWN, and `PRODUCTION_DEPLOYMENT_BLOCKED` remains in force.
 
 **Current phase cursor:** V10 is complete. V11 — provider/tool hardening integrated with the fence and effect ledger — is planned in `tasks/plan.md` and `tasks/todo.md`; local implementation continues without remote writes or production actions.
+
+
+### V11 progress — bounded provider ingress (2026-10-03)
+
+Task 1 is implemented and locally checkpointed at `2947c0db6ccf44cbc2a01808197eff6cbea834f8` (`fix: cap provider response body reads`). `MAX_PROVIDER_RESPONSE_BYTES` is an immutable 1,048,576-byte ceiling; the OpenAI-compatible synchronous transport requests at most ceiling + 1 bytes and rejects overflow before UTF-8 decoding or JSON parsing. Enforcement does not trust `Content-Length`. Provider failure state keeps only the typed error name, not the returned body.
+
+Fake-transport coverage verifies the exact-limit body is accepted, oversized bodies are rejected with absent, undersized, and oversized `Content-Length`, malformed-body errors do not echo response content, and the transport timeout is preserved. Focused `tests/test_v12_provider_failure_boundary.py`: **24 passed**; targeted `py_compile` and `git diff --check` passed. Tests made no live provider requests. No remote write or deployment was attempted.
+
+**Current phase cursor:** V10 remains complete; V11 Task 1 is complete. Next: apply the same bounded response/model-turn contract to typed, legacy, router-normalized, and custom NativeModel paths before tool orchestration.

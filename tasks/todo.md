@@ -39,8 +39,8 @@
 
 ### Task 1: Provider ingress limits
 
-- [ ] Define an immutable 1 MiB response-body ceiling and enforce it while reading, before JSON parsing.
-- [ ] Add fake-transport tests for boundary, overflow, misleading/missing content-length, malformed JSON, and redacted failure behavior.
+- [x] Define an immutable 1 MiB response-body ceiling and enforce it while reading, before JSON parsing.
+- [x] Add fake-transport tests for boundary, overflow, misleading/missing content-length, malformed JSON, and redacted failure behavior.
 
 ### Task 2: Shared provider/model response contract
 
