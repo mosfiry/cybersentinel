@@ -204,13 +204,29 @@ Evaluate every required condition from the M3 brief against recorded code/test/C
 
 **Outcome (2026-10-03):** The 17-condition scorecard is recorded in `docs/M3_STATE.md`. Runtime and safety controls are evidenced, but exact-SHA Workers Builds checks failed and no production-specific configuration or actual production target is established. The result is `CUTOVER_BLOCKED`; no production/Cloudflare mutation is allowed. Commit/push and exact-SHA verification of this decision remain the V15 checkpoint.
 
+**V15 checkpoint:** Decision commit `6c82099e850656835a8aaef8c4f00d2a24d7b9ea` is the exact remote branch head. Exact-SHA [tests run 37144113555](https://github.com/mosfiry/cybersentinel/actions/runs/37144113555) and [Owner Charter audit run 37144113525](https://github.com/mosfiry/cybersentinel/actions/runs/37144113525) passed. Workers Builds check `111264480916` failed for build `aafe8678-5cc1-4c95-86cd-48baba82840f`; the [build record](https://dash.cloudflare.com/075054bd680de1984297e37b34d8ba54/workers/services/view/cybersentinel/production/builds/aafe8678-5cc1-4c95-86cd-48baba82840f) has no diagnostic in the GitHub summary. V15 is complete as a blocked cutover decision; proceed with V16 only.
+
 ### V16 — Actual isolated non-production cutover rehearsal
 
 **Dependency:** V15 decision recorded. Use only an ephemeral hosted CI runner and a uniquely named Docker Compose project/volume. No production credential, database, external provider, external effect target, public bind, Cloudflare mutation, or persistent user data may be used.
 
 The rehearsal must exercise and retain evidence for all twelve required steps in order: Compose deploy/build; startup; health; disposable Owner login; mission creation; worker execution; queue state; evidence; controlled crash; same-identity worker restart; quarantine/recovery and Owner reconciliation; graceful shutdown; then cleanup. Keep fault injection in a test-only read-only mount for a one-off worker, not in the production runtime path. Require the crash hook to prove its database is beneath the ephemeral Compose state volume, and prove Compose volumes/containers and temporary files are removed in a `finally`/workflow cleanup path.
 
-Implementation slices: (1) a host-side rehearsal runner and a test-only provider-blocking crash hook, with tests for isolation, status assertions and cleanup; (2) an exact-SHA GitHub Actions Compose step that emits a distinct pass/fail marker for every rehearsal stage and always cleans up; (3) run the candidate on the exact pushed SHA, inspect logs and cleanup, then complete `docs/M3_CUTOVER_REHEARSAL.md` with evidence for each step. After verification, create the other required M3 architecture/runtime/recovery/effects/process artifacts if still absent, and finish `docs/M3_FINAL_AUDIT.md` mapping every M2E blocker to code evidence, test evidence and one permitted status.
+**Task 1 — Test-only overlay and hook (3 files):** add `tests/compose.m3-rehearsal.yaml`, `tests/m3_rehearsal/sitecustomize.py`, and `tests/test_m3_rehearsal_hook.py`. Acceptance: providers are replaced by a fail-closed empty router; the one-shot crash is permitted only for the expected local `watch` effect with its DB under `/var/lib/cybersentinel` and a marker inside that disposable volume; the short lease applies only when the test overlay is used. Verification: focused hook tests reject wrong provider/operation, missing or out-of-volume markers, and external DB paths; production `compose.yaml` remains unchanged.
+
+**Task 2 — Host-side lifecycle runner (2 files):** add `scripts/rehearse_nonproduction_cutover.py` and `tests/test_m3_rehearsal_runner.py`. Acceptance: use argv-based Compose subprocesses and a unique project, temporary volume, loopback ephemeral port, synthetic Owner password and Bridge token; execute the twelve stages in order; emit per-stage evidence without any credential; cleanup and assert no project container/volume/network or temp directory remains, including failure paths. Verification: focused runner tests mock subprocess/network boundaries; hosted run proves the actual service lifecycle and cleanup.
+
+**Task 3 — Hosted CI integration (1 file):** extend `.github/workflows/tests.yml`. Acceptance: run the script on the exact commit after the existing test/Compose smoke, publish a structured secret-free run summary/evidence artifact, and run cleanup even on failure. Verification: YAML parsing, full tests, `git diff --check`, secret/sensitive-file scans and exact-SHA hosted test/audit results.
+
+**Checkpoint after Tasks 1–3:** all local focused/full tests pass; hosted CI reports every V16 step separately; the runner proves unique state, provider isolation, worker generation change, Owner reconciliation, graceful stop and complete cleanup. Do not start final-audit documentation until the exact-SHA rehearsal result is available.
+
+**Task 4 — Architecture and runtime contracts (2 files):** create `docs/M3_ARCHITECTURE.md` and `docs/M3_RUNTIME_CONTRACT.md`, tied to actual source paths and verified deployment boundaries.
+
+**Task 5 — Recovery, effect and process-failure records (3 files):** create `docs/M3_RECOVERY_MODEL.md`, `docs/M3_EXTERNAL_EFFECTS.md`, and `docs/M3_PROCESS_FAILURE_TESTS.md`, each linked to concrete implementation and tests.
+
+**Task 6 — Rehearsal and final audit (2 files):** create `docs/M3_CUTOVER_REHEARSAL.md` from exact-SHA stage evidence and `docs/M3_FINAL_AUDIT.md` with every M2E blocker mapped to M3 action, code evidence, test evidence and exactly one permitted status (`RESOLVED`, `PARTIALLY_RESOLVED`, `BLOCKED`, `NOT_APPLICABLE`, or `UNKNOWN`).
+
+**Task 7 — Phase closeout:** update `docs/M3_STATE.md` and `tasks/todo.md` with exact pushed SHA, run/check IDs, cleanup proof and remaining blockers; non-force push only to the existing M3 branch, then read back exact-SHA tests/audit/Workers checks. Never deploy production while V15 remains blocked.
 
 ### V16 risk register
 
@@ -220,3 +236,4 @@ Implementation slices: (1) a host-side rehearsal runner and a test-only provider
 | Compose worker lease is still live immediately after the crash | Recovery assertion could be nondeterministic | Use a test-only short lease or wait for the recorded lease expiration before starting the replacement worker; never edit the database directly to simulate recovery |
 | Hosted CI runner cleanup fails | Ephemeral resources or temporary state could remain | Put `compose down --volumes --remove-orphans` and temp-directory deletion in unconditional cleanup; verify the project has no remaining containers or volumes |
 | Local Docker Engine is unavailable | No local rehearsal is possible | Use only the exact-SHA hosted runner for the isolated rehearsal and label the evidence as hosted, not local |
+**Outcome (2026-10-03):** The 17-condition scorecard is recorded in `docs/M3_STATE.md`. Runtime and safety controls are evidenced, but exact-SHA Workers Builds checks failed and no production-specific configuration or actual production target is established. The result is `CUTOVER_BLOCKED`; no production/Cloudflare mutation is allowed. The V15 decision checkpoint is complete.

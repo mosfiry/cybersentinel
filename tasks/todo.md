@@ -179,17 +179,21 @@
 - [x] No Cloudflare settings were changed, no public listener was published, and no production deployment was performed in V14.
 
 
-### V15 — Real cutover decision gate (in progress; CUTOVER_BLOCKED decision recorded)
+### V15 — Real cutover decision gate (complete; CUTOVER_BLOCKED)
 
 - [x] Score all 17 required conditions against source, test, and exact-SHA evidence; do not infer readiness from the Compose smoke alone.
 - [x] Record `CUTOVER_BLOCKED` and `PRODUCTION_DEPLOYMENT_BLOCKED`: exact-SHA Workers Builds checks failed and no production-specific configuration/target is established; no production or Cloudflare mutation.
-- [ ] Commit/push the V15 gate decision to the existing M3 branch non-force, verify exact-SHA CI, and transition to V16.
+- [x] Non-force push the V15 gate decision to the existing M3 branch; verify exact-SHA tests/audit passed, record Workers Builds failure, and transition to V16.
 
-### V16 — Actual non-production cutover rehearsal (planned; not started)
+### V16 — Actual non-production cutover rehearsal (in progress; hosted isolated project only)
 
-- [ ] Implement a host-side runner plus test-only provider-blocking crash hook; isolate the test to a unique ephemeral Compose project and named volume, synthetic Owner password, no provider credentials, and loopback-only API access.
-- [ ] Exercise, in order, deploy/build, startup, health, Owner login, mission creation, worker execution, queue state, evidence, controlled worker crash, same-identity restart, recovery and Owner reconciliation, graceful shutdown, and cleanup.
-- [ ] Emit and capture explicit evidence for each of the twelve rehearsal steps; verify the crash hook's state-volume containment and verify no Compose container/volume or temp directory survives cleanup.
-- [ ] Run the V16 rehearsal on the exact pushed SHA in hosted CI; report only that exact SHA's stage results, tests, audit, and external checks.
-- [ ] Create `docs/M3_CUTOVER_REHEARSAL.md`; ensure the final required M3 architecture/runtime/recovery/effects/process artifacts and `docs/M3_FINAL_AUDIT.md` exist, are evidence-linked, and accurately map every M2E blocker.
-- [ ] Keep production deployment blocked unless all required proof, target configuration, credentials, and authority are actually established; do not invent any.
+- [ ] **Task 1 — Test-only overlay and hook** (`tests/compose.m3-rehearsal.yaml`, `tests/m3_rehearsal/sitecustomize.py`, `tests/test_m3_rehearsal_hook.py`). Acceptance: provider router is fail-closed; crash can occur only once, after the exact local `watch` effect is dispatched, with its DB and marker inside the ephemeral state volume; production Compose/runtime files are not modified. Verification: focused tests reject wrong provider/operation, missing marker and out-of-volume DB.
+- [ ] **Task 2 — Host-side runner** (`scripts/rehearse_nonproduction_cutover.py`, `tests/test_m3_rehearsal_runner.py`). Acceptance: argv-only Docker Compose calls, unique project/image/volume, loopback port, synthetic Owner and Bridge credentials, twelve ordered stage results, secret-free JSON/summary, and unconditional cleanup assertions for containers/volume/network/temp directory. Verification: mocked boundary tests plus actual hosted lifecycle.
+- [ ] **Task 3 — Hosted CI integration** (`.github/workflows/tests.yml`). Acceptance: invoke V16 runner after existing CI smoke; retain the per-stage summary/evidence artifact and always run cleanup. Verification: workflow YAML parse, diff/secret/sensitive-file scans and exact-SHA Actions run.
+- [ ] **Checkpoint after Tasks 1–3:** focused and full suite pass; hosted run proves provider isolation, stable logical worker with new generation, queue quarantine, Owner reauthorization/reconciliation, evidence/effect counts, graceful shutdown and cleanup. Do not start final audit documentation until V16 exact-SHA evidence exists.
+- [ ] **Task 4 — Architecture/runtime docs** (`docs/M3_ARCHITECTURE.md`, `docs/M3_RUNTIME_CONTRACT.md`): document only source-verified contracts and explicit deployment boundaries.
+- [ ] **Task 5 — Recovery/effects/process docs** (`docs/M3_RECOVERY_MODEL.md`, `docs/M3_EXTERNAL_EFFECTS.md`, `docs/M3_PROCESS_FAILURE_TESTS.md`): tie every stated guarantee to code and completed tests.
+- [ ] **Task 6 — Rehearsal/final audit docs** (`docs/M3_CUTOVER_REHEARSAL.md`, `docs/M3_FINAL_AUDIT.md`): record all 12 stages plus cleanup from the exact hosted SHA, and map every M2E blocker to M3 action, code/test evidence and one permitted status.
+- [ ] **Task 7 — Closeout:** update state/todo with exact SHA, run/check IDs, cleanup proof and remaining blockers; non-force push only to the existing M3 branch, then verify exact-SHA tests, audit and Workers Builds. Production deployment remains blocked.
+
+The exact required order is: 1) deploy/build, 2) startup, 3) health, 4) Owner login, 5) mission, 6) worker, 7) queue, 8) evidence, 9) crash, 10) same-identity restart, 11) recovery, 12) shutdown; then cleanup. Every stage must emit explicit evidence. No production credentials, production database, external provider/target, public bind, or Cloudflare mutation may be used.
