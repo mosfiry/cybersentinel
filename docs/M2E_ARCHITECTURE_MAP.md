@@ -102,3 +102,9 @@ The Owner's independent Cloudflare API evidence reports V3 build `5dadb20d-402d-
 For the same V3 SHA, GitHub Actions `tests` run `37087663913` / check `111101185308` and `owner-charter-audit` run `37087663916` / check `111101185368` are successful. A separate GitHub GET at 04:27:54 still showed Workers check `111101190438` as `in_progress` with no conclusion. Both provider-build and GitHub-check observations are preserved separately; no success or production inference is made from the GitHub check's nonterminal state.
 
 V4 remains a documentation-only `BLOCKED / OWNER DECISION REQUIRED` checkpoint for unresolved Mission/Queue atomicity authority. No source/owner decision was supplied, so no architectural change is made. V4 is pushed as the next M2E checkpoint before V5; V5/V6 code is excluded from this V4 tip.
+
+### V4 exact-SHA checks terminal — 2026-10-03 04:32 +02:00
+
+For V4 SHA `a5cbb828cc59d816a1845ae8edf8dcb6477bfc08`, GitHub audit run `37090085541` / check `111108378136` and test run `37090085552` / check `111108378436` completed successfully. The naturally triggered Workers check `111108436527` completed `failure`, external build `fa23f980-a3f7-4683-99ae-5b2f9e0cd43f`; GitHub reported no cause or preview URL. This confirms a failed Workers Build check, not a production outcome or any specific preview artifact state.
+
+The separate GitHub commit-status endpoint returned `pending` with no status records at 04:32:43, although exact check-run records were terminal. The check-run statuses are kept explicit and separate. V4 remains a docs-only `BLOCKED / OWNER DECISION REQUIRED` checkpoint; no V4 architecture/code choice was made.

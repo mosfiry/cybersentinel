@@ -500,3 +500,44 @@ The exact V3 `tests` run is [GitHub Actions run 37087663913](https://github.com/
 The detached V4 worktree at `/tmp/cybersentinel-v4-checkpoint` is based on V4 blocker commit `a79773e1c0fd7162df5e21a43760f1bd0a9158a1`, a descendant of the currently pushed V3 SHA `38f784e7f247906ffa2368332262a4c072ca11dd`. Its only intended file changes are `docs/M2E_STATE.md` and `docs/M2E_ARCHITECTURE_MAP.md`; it contains no V5 source. It carries the owner-supplied terminal V2/V3 preview evidence, the exact V3 GitHub Actions successes, the separately observed GitHub Workers check `in_progress` state, source links, and all subsequent tool-failure entries.
 
 V4 remains `BLOCKED / OWNER DECISION REQUIRED`; this checkpoint makes no Mission/Queue architectural or source change. **Next exact action:** validate the two documentation files and exact commit scope, create the V4 docs-only checkpoint commit, verify its parent/path set and unchanged protected refs, then push that tip non-force only to the approved M2E branch. Verify exact-SHA GitHub CI and separately record the naturally triggered Workers result before advancing to V5. No V5 source is included in the V4 push.
+
+
+## V4 pushed checkpoint and exact-SHA checks — 2026-10-03 04:31 +02:00
+
+The V4 documentation-only tip `a5cbb828cc59d816a1845ae8edf8dcb6477bfc08` (parent `a79773e1c0fd7162df5e21a43760f1bd0a9158a1`; grandparent V3 `38f784e7f247906ffa2368332262a4c072ca11dd`) was pushed non-force to `task/m2e-cutover-20261002` at 04:31:11. GitHub independently confirmed that exact M2E branch tip; live `main` remained `8a3fd109c0e586db13ed48a7371ac9ad06465b74` and M2D remained `9bf91ea37748a239e6a6e3b6327706fa614232cd`. The push delta from V3 contains only `docs/M2E_STATE.md` and `docs/M2E_ARCHITECTURE_MAP.md`; no V5 source was included.
+
+Exact-SHA GitHub evidence fetched at 04:31:42: audit run `37090085541` / check `111108378136` is `completed / success`; test run `37090085552` / check `111108378436` (`test (3.13)`) is `in_progress`, so aggregate commit status is `pending`; naturally triggered Workers check `111108436527` is `completed / failure`, external build `fa23f980-a3f7-4683-99ae-5b2f9e0cd43f`. Its GitHub summary supplies only build/script links and no failure cause or preview URL. Classification is confirmed Workers-check/build failure, with cause and preview outcome unreported; do not infer a cause from the earlier V2/V3 failures. No manual build, retry, Cloudflare API, deployment API, or production operation was performed.
+
+The prior V3 Cloudflare build failure `5dadb20d-402d-46e9-a97b-0ce7ef23e39f` and the still-`in_progress` GitHub Workers check `111101190438` remain distinct observations; the V4 check above is a different build and SHA. The V4 source/transaction decision remains `BLOCKED / OWNER DECISION REQUIRED`.
+
+**Next exact action:** wait for V4 test check `111108378436` to reach a terminal state, using one direct read-only check-ID query before the next remote step. Record its terminal result, then rebase the unpushed V5 commits onto the V4 checkpoint and prepare the V5-only push; verify exact-SHA CI and separately record the naturally triggered preview. Keep V6 on hold until V5 CI/preview observations are recorded.
+
+### V4 exact-SHA source links
+
+The audit is [GitHub Actions run 37090085541](https://github.com/mosfiry/cybersentinel/actions/runs/37090085541), check [111108378136](https://github.com/mosfiry/cybersentinel/actions/runs/37090085541/job/111108378136). The Python test run is [37090085552](https://github.com/mosfiry/cybersentinel/actions/runs/37090085552), check [111108378436](https://github.com/mosfiry/cybersentinel/actions/runs/37090085552/job/111108378436). The naturally triggered Workers check is [111108436527](https://dash.cloudflare.com/075054bd680de1984297e37b34d8ba54/workers/services/view/cybersentinel/production/builds/fa23f980-a3f7-4683-99ae-5b2f9e0cd43f); this link path alone is not evidence of a production deployment.
+
+
+## V4 exact-SHA checks terminal — 2026-10-03 04:32 +02:00
+
+For V4 tip `a5cbb828cc59d816a1845ae8edf8dcb6477bfc08`, audit run `37090085541` / check `111108378136` is `completed / success`; direct check-ID GET at 04:32:20 confirmed test run `37090085552` / check `111108378436` is `completed / success`. The naturally triggered Workers check `111108436527` is `completed / failure`, external build `fa23f980-a3f7-4683-99ae-5b2f9e0cd43f`; its check summary exposes only build/script links, not a cause or preview URL. Classification: `OPERATION_CONFIRMED_FAILURE` for this exact Workers Build check. Do not attribute a cause based on earlier builds, and do not infer preview artifact or production state from the check failure.
+
+At 04:32:43, the GitHub commit-status endpoint separately returned `state=pending` with an empty `statuses` array for the same SHA, despite all three exact check-run records being terminal (test/audit success; Workers failure). Preserve this as a non-specific aggregate-status observation; the named check-run results above are the exact workflow/build evidence. No workflow was rerun or manually dispatched, and no Cloudflare or deployment API was called.
+
+The earlier V3 direct GitHub Workers check `111101190438` still reported `in_progress` at 04:27:54, while the Owner independently supplied terminal Cloudflare failure evidence for the V3 build; those V3 observations remain distinct from this terminal V4 Workers check. V4 remains `BLOCKED / OWNER DECISION REQUIRED` and documentation-only.
+
+**Next exact action:** commit this V4 results/state update locally as the parent checkpoint for V5; rebase only the existing unpublished V5 source/test/docs commits onto the V4 checkpoint, verify the resulting V5-only source diff and local tests, then push the V5 checkpoint non-force to M2E. Verify V5 exact-SHA test/audit and separately record its naturally triggered Workers result. Keep V6 on hold until those V5 observations are recorded.
+
+
+### Tool Failures & Recovery — V4 results-validator wording false negative (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 04:33:20 +02:00; V4 status documentation validation | A local validator exited 1 because it required the literal phrase `no production outcome`; the architecture map instead says the check failure is `not a production outcome` and does not establish production state. Classification: `VALIDATOR_FAILURE` / wording false negative; the expected state fragment was too specific. | Read-only local validation; no external effect and no repository mutation from the failed check. No run/build ID. | A direct read of the V4 map confirmed exact check IDs, `completed failure`, the absent cause/preview URL, and the production-state caveat; `git status` confirmed only the two intended docs changed and `git diff --check` passed. Correct the assertion to accept the recorded wording and rerun validation; no remote retry is relevant. |
+
+
+### Tool Failures & Recovery — V4 map replacement and incomplete validator (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 04:32:05 +02:00; V4 check-result documentation | The map writer was called without `append=true`, so it replaced the local V4 worktree's full `M2E_ARCHITECTURE_MAP.md` with only the V4 check-result addendum. Classification: `LOCAL_CONTENT_REPLACEMENT_CONFIRMED` / wrong-scope file write. | Local worktree only; no external effect. Pushed V4 commit `a5cbb828cc59d816a1845ae8edf8dcb6477bfc08` and remote refs were unchanged. | `git diff --stat` exposed 100 deleted lines before any commit. Restored the exact committed map from `a5cbb828...` and reattached the saved V4 check-result paragraph; the resulting diff is six map additions, with the complete architecture map preserved. Revalidate citations and diff scope before committing. |
+| 04:33:45 +02:00; V4 document validation | A validator printed `0 source ranges` yet returned success because it did not require a nonzero citation count; this masked the map replacement. Classification: `VALIDATOR_FALSE_NEGATIVE` / missing minimum-count assertion. | Local read-only validation only; no external effect or remote mutation. | The diff-stat diagnosis above confirmed the map replacement; the exact committed V4 map was restored. The corrected validator must require the expected existing citation set (33 ranges), no removed base-map lines, and only the intended V4 status additions. Do not treat the earlier validator output as a successful validation. |
