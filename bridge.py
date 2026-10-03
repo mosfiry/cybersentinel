@@ -38,8 +38,13 @@ WEB = ROOT / "web"
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
 
 
-def build_mission_worker() -> MissionWorker:
-    """Construct the standalone worker over the bridge's existing durable stores."""
+def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
+    """Construct a worker over the bridge's stores with a stable logical identity.
+
+    Keep the historical default for one-worker deployments. Independent worker
+    processes should be assigned distinct IDs; a restarted process should reuse
+    its logical ID so the queue advances and enforces its durable generation.
+    """
     core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
     scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
@@ -47,7 +52,7 @@ def build_mission_worker() -> MissionWorker:
     def runtime_factory() -> MissionRuntime:
         return MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True, require_execution_fence=True)
 
-    return MissionWorker(queue, runtime_factory, scheduler=scheduler)
+    return MissionWorker(queue, runtime_factory, worker_id=worker_id, scheduler=scheduler)
 
 
 class Handler(BaseHTTPRequestHandler):
