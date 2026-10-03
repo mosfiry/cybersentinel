@@ -23,6 +23,7 @@ class MissionStatus(str, Enum):
     REPLANNING = "REPLANNING"
     GOAL_COMPLETED = "GOAL_COMPLETED"
     OWNER_INPUT_REQUIRED = "OWNER_INPUT_REQUIRED"
+    OWNER_REAUTH_REQUIRED = "OWNER_REAUTH_REQUIRED"
     AUTHORIZATION_BLOCKED = "AUTHORIZATION_BLOCKED"
     SCOPE_BLOCKED = "SCOPE_BLOCKED"
     RESOURCE_BLOCKED = "RESOURCE_BLOCKED"
@@ -40,6 +41,7 @@ class MissionClaimBinding:
 
 TERMINAL_MISSION_STATUSES = frozenset({
     MissionStatus.GOAL_COMPLETED, MissionStatus.OWNER_INPUT_REQUIRED,
+    MissionStatus.OWNER_REAUTH_REQUIRED,
     MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.SCOPE_BLOCKED,
     MissionStatus.RESOURCE_BLOCKED, MissionStatus.RECOVERY_REQUIRED, MissionStatus.SAFETY_BLOCKED,
     MissionStatus.FAILED_RETRY_EXHAUSTED, MissionStatus.CANCELLED,
@@ -109,11 +111,18 @@ class Mission:
     def transition(self, target: MissionStatus, reason: str, **data: Any) -> None:
         if not isinstance(target, MissionStatus):
             raise TypeError("mission transition requires MissionStatus")
-        if self.status is MissionStatus.RECOVERY_REQUIRED and target not in {MissionStatus.RECOVERY_REQUIRED, MissionStatus.READY}:
+        recovery_reauthorization = (
+            self.status is MissionStatus.RECOVERY_REQUIRED
+            and target is MissionStatus.OWNER_REAUTH_REQUIRED
+            and self.progress.get("reconciliation_complete") is True
+        )
+        if self.status is MissionStatus.RECOVERY_REQUIRED and target not in {MissionStatus.RECOVERY_REQUIRED, MissionStatus.READY} and not recovery_reauthorization:
             raise ValueError("recovery requires reconciliation before continuation")
         recovery_reconciled = self.status is MissionStatus.RECOVERY_REQUIRED and target is MissionStatus.READY
         owner_intervention = self.status is MissionStatus.OWNER_INPUT_REQUIRED and target in {MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.READY}
-        if self.is_terminal and target is not self.status and not recovery_reconciled and not owner_intervention:
+        owner_reauthorized = self.status is MissionStatus.OWNER_REAUTH_REQUIRED and target is MissionStatus.READY
+        owner_cancelled = self.status in {MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.OWNER_REAUTH_REQUIRED} and target is MissionStatus.CANCELLED
+        if self.is_terminal and target is not self.status and not recovery_reconciled and not recovery_reauthorization and not owner_intervention and not owner_reauthorized and not owner_cancelled:
             raise ValueError(f"terminal mission cannot transition {self.status.value}->{target.value}")
         self.status = target
         self.transitions.append({"from": self.transitions[-1]["to"] if self.transitions else "CREATED", "to": target.value, "reason": reason, "data": data, "iteration": self.iteration_count})

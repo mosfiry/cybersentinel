@@ -44,6 +44,7 @@ def _setup(tmp_path: Path):
         "queue authorization",
         plan,
         request_id="queue-auth-request",
+        owner_identity_ref="owner:1",
     )
     return store, runtime, queue, mission
 
@@ -78,7 +79,7 @@ def test_resume_requires_fresh_owner_proof_and_only_then_clears_pause(
         owner_revalidator=core.prepare_mission_for_queue,
     )
 
-    service.pause_mission(mission.mission_id)
+    service.pause_mission(mission.mission_id, owner_session_token="fresh-owner")
     assert store.load(mission.mission_id).progress["pause_requested"] is True
 
     with pytest.raises(PermissionError, match="owner authentication required"):
@@ -88,9 +89,9 @@ def test_resume_requires_fresh_owner_proof_and_only_then_clears_pause(
         )
 
     still_paused = store.load(mission.mission_id)
-    assert still_paused.status is MissionStatus.OWNER_INPUT_REQUIRED
+    assert still_paused.status is MissionStatus.READY
     assert still_paused.progress["pause_requested"] is True
-    _assert_not_queued(queue, mission.mission_id)
+    assert queue.get(mission.mission_id).state is WorkerMissionState.PAUSED
 
     resumed = service.resume_mission(
         mission.mission_id,
@@ -107,7 +108,8 @@ def test_resume_requires_fresh_owner_proof_and_only_then_clears_pause(
     assert renewed.iteration_count == mission.iteration_count
 
 
-def test_recovery_required_mission_is_not_reauthorized_or_enqueued(tmp_path):
+def test_recovery_required_mission_is_not_reauthorized_or_enqueued(tmp_path, monkeypatch):
+    allow_owner_sessions(monkeypatch, "fresh-owner")
     store, runtime, queue, mission = _setup(tmp_path)
     mission.transition(MissionStatus.RECOVERY_REQUIRED, "ambiguous in-flight action")
     store.save(mission)

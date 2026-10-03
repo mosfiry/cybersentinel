@@ -665,16 +665,155 @@ class MissionQueue:
             item = self._item_from_row(row)
         return item
 
+    def _recover_strict(self, *, now: str | None, execution_fence: ExecutionFence | None, include_pending: bool) -> list[QueueItem]:
+        """Atomically quarantine strict Owner missions at a restart/recovery boundary."""
+        if execution_fence is None or execution_fence.lease_epoch is not None:
+            raise ExecutionFenceError("strict mission recovery requires a supervisor identity fence")
+        if self.mission_store is None:
+            raise ExecutionFenceError("strict mission recovery requires its authoritative MissionStore")
+        from pathlib import Path
+        from .mission import Mission, TERMINAL_MISSION_STATUSES
+
+        moment = _utc_text(_utc_datetime(now, field_name="now"))
+        queue_path = str(Path(self.db_path).resolve())
+        mission_path = str(Path(self.mission_store.db_path).resolve())
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            if queue_path != mission_path:
+                db.execute("ATTACH DATABASE ? AS mission_store_db", (mission_path,))
+            mission_schema = None
+            for _sequence, name, path in db.execute("PRAGMA database_list"):
+                if path and str(Path(path).resolve()) == mission_path:
+                    mission_schema = '"' + str(name).replace('"', '""') + '"'
+                    break
+            if mission_schema is None:
+                raise ExecutionFenceError("MissionStore is not attached to the restart recovery transaction")
+            for schema in ("main", mission_schema):
+                mode = str(db.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
+                if mode not in {"delete", "truncate", "persist"}:
+                    raise ExecutionFenceError("restart recovery requires rollback-journal mode for queue and mission stores")
+
+            db.execute("BEGIN IMMEDIATE")
+            execution_fence.assert_current(db=db)
+            columns = "mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id"
+            if include_pending:
+                pending_states = (
+                    WorkerMissionState.QUEUED.value,
+                    WorkerMissionState.SCHEDULED.value,
+                    WorkerMissionState.SLEEPING.value,
+                    WorkerMissionState.PLANNING.value,
+                    WorkerMissionState.WAITING_FOR_TOOL.value,
+                    WorkerMissionState.WAITING_FOR_MODEL.value,
+                    WorkerMissionState.PAUSED.value,
+                )
+                placeholders = ",".join("?" for _ in pending_states)
+                query = (
+                    f"SELECT {columns} FROM mission_queue WHERE state IN ({placeholders}) "
+                    "OR (state=? AND lease_expires_at IS NOT NULL AND lease_expires_at<=?) ORDER BY available_at,mission_id"
+                )
+                args = (*pending_states, WorkerMissionState.EXECUTING.value, moment)
+            else:
+                query = (
+                    f"SELECT {columns} FROM mission_queue WHERE state=? "
+                    "AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY available_at,mission_id"
+                )
+                args = (WorkerMissionState.EXECUTING.value, moment)
+            rows = db.execute(query, args).fetchall()
+            recovered: list[QueueItem] = []
+            for queue_row in rows:
+                item = self._item_from_row(queue_row)
+                expired_claim = (
+                    item.state is WorkerMissionState.EXECUTING
+                    and item.lease_expires_at is not None
+                    and _utc_datetime(item.lease_expires_at, field_name="lease_expires_at") <= _utc_datetime(moment, field_name="now")
+                )
+                mission_row = db.execute(
+                    f"SELECT payload FROM {mission_schema}.missions WHERE mission_id=?",
+                    (item.mission_id,),
+                ).fetchone()
+                if mission_row is None:
+                    raise ExecutionFenceError("MissionStore record is missing during strict restart recovery")
+                try:
+                    encoded_before = str(mission_row[0])
+                    mission = Mission.from_dict(json.loads(encoded_before))
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ExecutionFenceError("MissionStore record is invalid during strict restart recovery") from exc
+
+                checkpoint_status = str((mission.checkpoint or {}).get("status", ""))
+                in_flight = checkpoint_status in {"in_flight", "in_flight_parallel"}
+                recovery_required = in_flight or mission.status is MissionStatus.RECOVERY_REQUIRED
+                mission_changed = False
+                if recovery_required:
+                    if mission.status not in TERMINAL_MISSION_STATUSES:
+                        mission.error = "worker restarted with an in-flight execution; effect reconciliation required"
+                        mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, restart_recovery=True)
+                        mission_changed = True
+                    if mission.status is not MissionStatus.RECOVERY_REQUIRED and mission.status in TERMINAL_MISSION_STATUSES:
+                        # A genuinely terminal mission is not rewritten merely because a stale checkpoint remains.
+                        recovery_required = False
+
+                if not recovery_required and not mission.is_terminal:
+                    mission.error = "Owner reauthorization required after worker restart"
+                    mission.transition(MissionStatus.OWNER_REAUTH_REQUIRED, mission.error, restart_recovery=True)
+                    mission.recovery_events.append({"event": "owner_reauthorization_required", "reason": "worker_restart"})
+                    mission_changed = True
+
+                active_claim = mission.progress.pop("active_execution_claim", None)
+                if active_claim is not None:
+                    mission_changed = True
+                    if not mission.recovery_events or mission.recovery_events[-1].get("event") != "owner_reauthorization_required":
+                        mission.recovery_events.append({"event": "worker_claim_retired", "reason": "worker_restart"})
+
+                if mission_changed:
+                    payload = mission.to_dict()
+                    encoded_after = json.dumps(payload, ensure_ascii=False)
+                    updated_mission = db.execute(
+                        f"UPDATE {mission_schema}.missions SET payload=? WHERE mission_id=? AND payload=?",
+                        (encoded_after, item.mission_id, encoded_before),
+                    )
+                    if updated_mission.rowcount != 1:
+                        raise LeaseLostError("mission changed during strict restart recovery")
+
+                if mission.status is MissionStatus.RECOVERY_REQUIRED:
+                    next_state = WorkerMissionState.WAITING_FOR_TOOL
+                elif mission.status is MissionStatus.OWNER_REAUTH_REQUIRED or mission.status is MissionStatus.OWNER_INPUT_REQUIRED:
+                    next_state = WorkerMissionState.NEEDS_INPUT
+                elif mission.status is MissionStatus.GOAL_COMPLETED:
+                    next_state = WorkerMissionState.COMPLETED
+                elif mission.status is MissionStatus.CANCELLED:
+                    next_state = WorkerMissionState.CANCELLED
+                elif mission.is_terminal:
+                    next_state = WorkerMissionState.FAILED
+                else:
+                    # This branch is unreachable for a valid nonterminal mission,
+                    # but conservatively prevents a malformed state from dispatch.
+                    next_state = WorkerMissionState.NEEDS_INPUT
+
+                reason = (
+                    "external effect requires reconciliation"
+                    if next_state is WorkerMissionState.WAITING_FOR_TOOL
+                    else "Owner reauthorization required after worker restart"
+                    if next_state is WorkerMissionState.NEEDS_INPUT
+                    else item.last_error
+                )
+                epoch = item.lease_epoch + 1 if expired_claim else item.lease_epoch
+                updated_queue = db.execute(
+                    "UPDATE mission_queue SET state=?,lease_epoch=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='',last_error=? WHERE mission_id=? AND state=? AND lease_epoch=?",
+                    (next_state.value, epoch, str(reason)[:500], item.mission_id, item.state.value, item.lease_epoch),
+                )
+                if updated_queue.rowcount != 1:
+                    raise LeaseLostError("queue item changed during strict restart recovery")
+                final_row = db.execute(f"SELECT {columns} FROM mission_queue WHERE mission_id=?", (item.mission_id,)).fetchone()
+                if final_row is None:
+                    raise KeyError("unknown queued mission")
+                recovered.append(self._item_from_row(final_row))
+            return recovered
+
     def recover_expired(self, *, now: str | None = None, execution_fence: ExecutionFence | None = None) -> list[QueueItem]:
+        if self.require_execution_fence:
+            return self._recover_strict(now=now, execution_fence=execution_fence, include_pending=False)
         moment = _utc_text(_utc_datetime(now, field_name="now"))
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
-            if self.require_execution_fence and execution_fence is None:
-                raise ExecutionFenceError("lease recovery requires an execution fence")
-            if execution_fence is not None:
-                if execution_fence.lease_epoch is not None:
-                    raise ExecutionFenceError("lease recovery requires a supervisor identity fence")
-                execution_fence.assert_current(db=db)
             rows = db.execute("SELECT mission_id FROM mission_queue WHERE state=? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?", (WorkerMissionState.EXECUTING.value, moment)).fetchall()
             if not rows:
                 return []
@@ -692,12 +831,14 @@ class MissionQueue:
                     (mission_id,),
                 ).fetchone()
                 if row is None:
-                    raise KeyError("unknown queued mission")
+                    raise KeyError("unknown mission")
                 recovered.append(self._item_from_row(row))
             return recovered
 
     def recover_after_restart(self, *, now: str | None = None, execution_fence: ExecutionFence | None = None) -> list[QueueItem]:
-        """Recover only expired executing leases; never steal a live claim at startup."""
+        """Recover leases and quarantine durable Owner work before the first poll."""
+        if self.require_execution_fence:
+            return self._recover_strict(now=now, execution_fence=execution_fence, include_pending=True)
         return self.recover_expired(now=now, execution_fence=execution_fence)
 
     def list(self, states: tuple[WorkerMissionState, ...] | None = None) -> list[QueueItem]:
@@ -727,17 +868,26 @@ class MissionWorker:
         self.runtime_generation = self.identity.runtime_generation
         self.worker_id = self.identity.worker_id
         self.lease_seconds = lease_seconds
+        self._recovery_complete = not queue.require_execution_fence
 
     def enqueue(self, mission_id: str) -> QueueItem:
         return self.queue.enqueue(mission_id)
 
     def recover_after_restart(self, *, now: str | None = None) -> list[QueueItem]:
-        return self.queue.recover_after_restart(now=now, execution_fence=self.identity_fence)
+        recovered = self.queue.recover_after_restart(now=now, execution_fence=self.identity_fence)
+        self._recovery_complete = True
+        return recovered
 
     def stop(self) -> None:
         self.queue.deactivate_worker(self.identity, execution_fence=self.identity_fence)
 
     def run_once(self, *, now: str | None = None, max_slices: int | None = None) -> QueueItem | None:
+        if self.queue.require_execution_fence and not self._recovery_complete:
+            raise ExecutionFenceError("strict worker startup restart recovery must complete before polling")
+        if self.queue.require_execution_fence:
+            # Expired claims can become recoverable after startup; quarantine
+            # them before any subsequent claim instead of returning them to QUEUED.
+            self.queue.recover_expired(now=now, execution_fence=self.identity_fence)
         # `now` is a claim-time override only. Renewals and writes use live UTC
         # time so a frozen caller timestamp cannot keep an expired lease alive.
         item = self.queue.claim_next(now=now, worker_id=self.worker_id, lease_seconds=self.lease_seconds, worker_instance_id=self.worker_instance_id, runtime_generation=self.runtime_generation, execution_fence=self.identity_fence)
@@ -775,6 +925,7 @@ class MissionWorker:
                     terminal_queue_state = {
                         MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
                         MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
+                        MissionStatus.OWNER_REAUTH_REQUIRED: WorkerMissionState.NEEDS_INPUT,
                         MissionStatus.AUTHORIZATION_BLOCKED: WorkerMissionState.FAILED,
                         MissionStatus.RECOVERY_REQUIRED: WorkerMissionState.WAITING_FOR_TOOL,
                         MissionStatus.CANCELLED: WorkerMissionState.CANCELLED,
@@ -841,6 +992,7 @@ class MissionWorker:
         state = {
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
             MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
+            MissionStatus.OWNER_REAUTH_REQUIRED: WorkerMissionState.NEEDS_INPUT,
             MissionStatus.AUTHORIZATION_BLOCKED: WorkerMissionState.FAILED,
             MissionStatus.RECOVERY_REQUIRED: WorkerMissionState.WAITING_FOR_TOOL,
             MissionStatus.CANCELLED: WorkerMissionState.CANCELLED,

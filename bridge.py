@@ -178,10 +178,22 @@ class Handler(BaseHTTPRequestHandler):
             mission_id, action = parts[0], parts[1] if len(parts) > 1 else "status"
             try:
                 service = self._mission_service()
+                if action == "effects" and len(parts) == 3:
+                    value = service.inspect_effect(
+                        mission_id,
+                        parts[2],
+                        owner_session_token=auth["session_id"],
+                    )
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "effect": value})
+                if action == "effects" and len(parts) == 2:
+                    value = service.effects(mission_id, owner_session_token=auth["session_id"])
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "effects": value})
                 values = {"status": service.status, "timeline": service.timeline, "evidence": service.evidence, "artifacts": service.artifacts, "logs": service.logs}
-                if action not in values:
+                if len(parts) > 2 or action not in values:
                     return self._send(404, {"ok": False, "error": "unknown_mission_action"})
-                return self._send(200, {"ok": True, "mission_id": mission_id, action: values[action](mission_id)})
+                return self._send(200, {"ok": True, "mission_id": mission_id, action: values[action](mission_id, owner_session_token=auth["session_id"])})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
             except KeyError:
                 return self._send(404, {"ok": False, "error": "unknown_mission"})
         if parsed.path == "/api/tools":
@@ -284,6 +296,16 @@ class Handler(BaseHTTPRequestHandler):
             mission_id, action = parts[0], parts[1] if len(parts) > 1 else "start"
             try:
                 service = self._mission_service()
+                if len(parts) == 4 and parts[1] == "effects" and parts[3] == "reconcile":
+                    payload = self._read_json()
+                    result = service.reconcile_effect(
+                        mission_id,
+                        parts[2],
+                        owner_session_token=auth["session_id"],
+                        outcome=str(payload.get("outcome", "")),
+                        evidence_reference=str(payload.get("evidence_reference", "")),
+                    )
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "reconciliation": result})
                 if action == "start" or action == "resume":
                     if action == "start":
                         result = service.start_mission(
@@ -295,12 +317,12 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     return self._send(200, {"ok": True, "mission": result})
                 if action == "pause":
-                    return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id)})
+                    return self._send(200, {"ok": True, "mission": service.pause_mission(mission_id, owner_session_token=auth["session_id"])})
                 if action == "cancel":
-                    return self._send(200, {"ok": True, "mission": service.cancel_mission(mission_id)})
+                    return self._send(200, {"ok": True, "mission": service.cancel_mission(mission_id, owner_session_token=auth["session_id"])})
                 if action == "schedule":
                     payload = self._read_json()
-                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
+                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, owner_session_token=auth["session_id"], run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
                 return self._send(404, {"ok": False, "error": "unknown_mission_action"})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})

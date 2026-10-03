@@ -134,6 +134,13 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
         queue,
         owner_revalidator=core.prepare_mission_for_queue,
     )
+    worker = MissionWorker(
+        queue,
+        lambda: MissionRuntime(store, executor=core._executor),
+        worker_id="v14-worker",
+        lease_seconds=60,
+    )
+    worker.recover_after_restart()
     service.start_mission(mission.mission_id, owner_session_token="owner-session")
 
     queued = queue.get(mission.mission_id)
@@ -144,12 +151,6 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     ]["proof_fingerprint"]
     assert any(item.get("event") == "owner_revalidated" for item in renewed.recovery_events)
 
-    worker = MissionWorker(
-        queue,
-        lambda: MissionRuntime(store, executor=core._executor),
-        worker_id="v14-worker",
-        lease_seconds=60,
-    )
     completed = worker.run_once(max_slices=5)
 
     assert completed is not None
@@ -253,8 +254,8 @@ def test_stale_owner_cannot_enqueue_or_reach_worker_effect_boundary(tmp_path, mo
         service.start_mission(mission.mission_id, owner_session_token="expired-session")
 
     persisted = store.load(mission.mission_id)
-    assert persisted.status is MissionStatus.OWNER_INPUT_REQUIRED
-    assert any(item.get("event") == "owner_revalidation_failed" for item in persisted.recovery_events)
+    assert persisted.status is MissionStatus.READY
+    assert not any(item.get("event") == "owner_revalidation_failed" for item in persisted.recovery_events)
     assert queue.list() == []
 
     executions = []

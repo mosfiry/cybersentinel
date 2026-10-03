@@ -66,7 +66,7 @@ def test_strict_queue_requires_authoritative_mission_store(tmp_path):
         MissionQueue(tmp_path / "queue.sqlite3", require_execution_fence=True)
 
 
-def test_crash_after_queue_claim_before_mission_binding_is_recovered_without_mission_mutation(tmp_path):
+def test_crash_after_queue_claim_before_mission_binding_requires_owner_reauthorization(tmp_path):
     store, mission = _ready_mission(tmp_path)
     queue = MissionQueue(tmp_path / "queue.sqlite3", require_execution_fence=True, mission_store=store)
     queue.enqueue(mission.mission_id)
@@ -91,17 +91,17 @@ def test_crash_after_queue_claim_before_mission_binding_is_recovered_without_mis
     recovered = queue.recover_after_restart(now=recovery_time, execution_fence=replacement_fence)
 
     assert len(recovered) == 1
-    assert recovered[0].state is WorkerMissionState.QUEUED
+    assert recovered[0].state is WorkerMissionState.NEEDS_INPUT
     assert recovered[0].claim_phase == "NONE"
     assert recovered[0].claim_fence_id == ""
     assert recovered[0].lease_epoch > claim.lease_epoch
     persisted = store.load(mission.mission_id)
-    assert persisted.status is MissionStatus.READY
+    assert persisted.status is MissionStatus.OWNER_REAUTH_REQUIRED
     assert "active_execution_claim" not in persisted.progress
     assert replacement.runtime_generation == identity.runtime_generation + 1
 
 
-def test_crash_after_mission_marker_before_queue_bound_allows_only_new_generation_to_resume(tmp_path, monkeypatch):
+def test_crash_after_mission_marker_before_queue_bound_is_quarantined_for_owner_reauthorization(tmp_path, monkeypatch):
     store, mission = _ready_mission(tmp_path)
     queue = MissionQueue(tmp_path / "queue.sqlite3", require_execution_fence=True, mission_store=store)
     queue.enqueue(mission.mission_id)
@@ -141,32 +141,15 @@ def test_crash_after_mission_marker_before_queue_bound_allows_only_new_generatio
         now=recovery_time,
         execution_fence=replacement_identity_fence,
     )
-    assert recovered[0].state is WorkerMissionState.QUEUED
-
-    replacement_claim = queue.claim_next(
-        now=recovery_time,
-        worker_id=replacement_identity.worker_id,
-        worker_instance_id=replacement_identity.worker_instance_id,
-        runtime_generation=replacement_identity.runtime_generation,
-        lease_seconds=600,
-        execution_fence=replacement_identity_fence,
-    )
-    assert replacement_claim is not None
+    assert recovered[0].state is WorkerMissionState.NEEDS_INPUT
     current_mission = store.load(mission.mission_id)
-    replacement_fence = replacement_identity_fence.with_lease(replacement_claim).for_mission(
-        current_mission, task_id="saga-step", execution_id="new-execution"
-    )
-    replacement_binding = store.bind_execution_claim(mission.mission_id, replacement_fence)
-    assert replacement_binding.lease_binding_id == replacement_fence.lease_binding_id
-
-    current_mission = store.load(mission.mission_id)
-    new_marker = current_mission.progress["active_execution_claim"]["lease_binding_id"]
-    assert new_marker == replacement_fence.lease_binding_id
+    assert current_mission.status is MissionStatus.OWNER_REAUTH_REQUIRED
+    assert "active_execution_claim" not in current_mission.progress
     stale_mission.progress["stale_write"] = True
     with pytest.raises(ExecutionFenceError):
         store.save(stale_mission, execution_fence=old_fence)
-    assert store.load(mission.mission_id).progress["active_execution_claim"]["lease_binding_id"] == new_marker
-    assert queue.get(mission.mission_id).claim_phase == "BOUND"
+    assert store.load(mission.mission_id).status is MissionStatus.OWNER_REAUTH_REQUIRED
+    assert queue.get(mission.mission_id).claim_phase == "NONE"
 
 
 def test_strict_queue_cannot_advance_to_bound_without_mission_store_marker(tmp_path):
@@ -238,12 +221,10 @@ def test_terminal_mission_after_completion_crash_is_reconciled_without_dispatch(
         lease_seconds=60,
     )
     recovered = replacement_worker.recover_after_restart(now=replacement_time)
-    assert recovered[0].state is WorkerMissionState.QUEUED
+    assert recovered[0].state is WorkerMissionState.COMPLETED
 
     result = replacement_worker.run_once(now=replacement_time)
-    assert result is not None
-    assert result.state is WorkerMissionState.COMPLETED
-    assert result.claim_phase == "NONE"
+    assert result is None
     assert dispatched == []
     assert store.load(mission.mission_id).status is MissionStatus.GOAL_COMPLETED
 

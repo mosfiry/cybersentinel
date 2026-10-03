@@ -18,7 +18,7 @@ def _mission(db: Path):
     store = MissionStore(db)
     runtime = MissionRuntime(store, executor=lambda *args, **kwargs: {"success": True, "criterion_id": "goal", "source": "fixture"}, authorization_snapshot_factory=make_test_snapshot)
     plan = Plan.initial("resume objective").replan(steps=(PlanStep("status", "status", action="status", authorization_requirement="owner"),), reason="test")
-    mission = runtime.create("resume objective", "resume objective", plan, completion_criteria=[{"criterion_id": "goal"}], request_id="resume-request")
+    mission = runtime.create("resume objective", "resume objective", plan, completion_criteria=[{"criterion_id": "goal"}], request_id="resume-request", owner_identity_ref="owner:1")
     return store, mission
 
 
