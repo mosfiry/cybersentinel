@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -11,7 +11,12 @@ import json
 import re
 import sqlite3
 
-from .execution_fence import ExecutionFence, ExecutionFenceError, authorization_digest
+from .execution_fence import (
+    ExecutionFence,
+    ExecutionFenceError,
+    authorization_digest,
+    authorization_snapshot_matches_mission,
+)
 
 
 class EffectState(StrEnum):
@@ -1066,8 +1071,12 @@ class ExternalEffectLedger:
                 or mission.request_id != record.request_id
                 or snapshot.mission_id != record.mission_id
                 or snapshot.owner_identity != owner_identity_ref
-                or authorization_digest(snapshot) != record.authorization_hash
-                or record.owner_identity_ref not in {"", owner_identity_ref}
+                or not authorization_snapshot_matches_mission(
+                    mission,
+                    record.authorization_hash,
+                    at=record.created_at,
+                )
+                or record.owner_identity_ref != owner_identity_ref
                 or authorization.mission_id != record.mission_id
                 or authorization.task_id != record.task_id
                 or authorization.task_version != record.task_version
@@ -1100,8 +1109,6 @@ class ExternalEffectLedger:
                 checkpoint_matches = False
             if not checkpoint_matches:
                 raise EffectTransitionError("effect no longer matches the durable mission checkpoint")
-            if not record.owner_identity_ref:
-                record = replace(record, owner_identity_ref=owner_identity_ref)
             authorization.assert_valid_for(
                 record,
                 owner_identity_ref=owner_identity_ref,

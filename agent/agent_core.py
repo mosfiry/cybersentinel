@@ -21,6 +21,7 @@ from agent.evidence import EvidenceChainStore
 from workspace import Workspace
 from security.mission_authorization import MissionAuthorizationSnapshot
 
+from .execution_fence import authorization_digest, authorization_snapshot_matches_mission
 from .mission import Mission, MissionStatus, MissionStore
 from .mission_runtime import MissionRuntime
 from .mission_worker import MissionQueue, MissionWorker
@@ -443,8 +444,23 @@ class AgentCore:
                 != old_authorization.version
             ):
                 raise PermissionError("authorization snapshot is not bound to the persisted mission Owner")
-            mission.authorization_snapshot = old_authorization.amend(owner_approval=evidence.proof_fingerprint, changes={}, expires_at=evidence.expires_at).to_dict()
-            mission.provenance["authorization_snapshot_version"] = int(mission.authorization_snapshot["version"])
+            if not authorization_snapshot_matches_mission(
+                mission,
+                authorization_digest(old_authorization),
+                at=old_authorization.created_at,
+            ):
+                raise PermissionError("authorization snapshot history is invalid")
+            renewed_authorization = old_authorization.amend(
+                owner_approval=evidence.proof_fingerprint,
+                changes={},
+                expires_at=evidence.expires_at,
+            )
+            mission.authorization_snapshot_history = [
+                *mission.authorization_snapshot_history,
+                old_authorization.to_dict(),
+            ]
+            mission.authorization_snapshot = renewed_authorization.to_dict()
+            mission.provenance["authorization_snapshot_version"] = renewed_authorization.version
         except (KeyError, TypeError, ValueError, PermissionError) as exc:
             if not mission.is_terminal:
                 mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, "authorization snapshot cannot be renewed")

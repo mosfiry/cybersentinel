@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
@@ -8,7 +8,7 @@ import re
 from typing import Any, Callable, Mapping, Protocol
 
 from .external_effects import EffectState, ExternalEffect, ExternalEffectLedger
-from .execution_fence import authorization_digest
+from .execution_fence import authorization_snapshot_matches_mission
 from .mission import Mission, MissionStatus, MissionStore
 from security.authorization_context import AuthorizationContext, AuthorizationDecision
 from security.mission_authorization import MissionAuthorizationSnapshot
@@ -386,11 +386,15 @@ class EffectReconciliationEngine:
             raise EffectReconciliationError("mission authorization snapshot is invalid") from exc
         if (
             snapshot.mission_id != effect.mission_id
-            or authorization_digest(snapshot) != effect.authorization_hash
+            or not authorization_snapshot_matches_mission(
+                mission,
+                effect.authorization_hash,
+                at=effect.created_at,
+            )
             or mission.request_id != effect.request_id
             or not mission.owner_identity_ref
             or snapshot.owner_identity != mission.owner_identity_ref
-            or effect.owner_identity_ref not in {"", mission.owner_identity_ref}
+            or effect.owner_identity_ref != mission.owner_identity_ref
         ):
             raise EffectReconciliationError("effect owner or authorization is not bound to the persisted mission")
         return effect, mission
@@ -423,7 +427,7 @@ class EffectReconciliationEngine:
             has_idempotency_key=bool(effect.idempotency_key),
             error_code=effect.error_code,
             requires_reconciliation=effect.requires_reconciliation,
-            owner_binding_status="DERIVED_FROM_MISSION" if not effect.owner_identity_ref else "BOUND",
+            owner_binding_status="BOUND",
         )
 
     def authorize(
@@ -437,8 +441,6 @@ class EffectReconciliationEngine:
         """Issue an exact-effect grant only after resolving its durable mission owner."""
         effect, mission = self._load(effect_id)
         self._assert_owner_context(context, mission)
-        if not effect.owner_identity_ref:
-            effect = replace(effect, owner_identity_ref=mission.owner_identity_ref)
         return EffectReconciliationAuthorization.issue(
             context,
             effect=effect,
@@ -458,14 +460,9 @@ class EffectReconciliationEngine:
         if not isinstance(authorization, EffectReconciliationAuthorization):
             raise EffectReconciliationError("Owner reconciliation authorization is required")
         self._assert_owner_context(authorization.context, mission)
-        authorized_effect = (
-            replace(effect, owner_identity_ref=mission.owner_identity_ref)
-            if not effect.owner_identity_ref
-            else effect
-        )
         for action in actions:
             if authorization.validate_for(
-                authorized_effect,
+                effect,
                 owner_identity_ref=mission.owner_identity_ref,
                 action=action,
             ):

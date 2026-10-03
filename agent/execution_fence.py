@@ -20,6 +20,72 @@ def authorization_digest(snapshot: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def authorization_snapshot_matches_mission(
+    mission: Any,
+    expected_digest: str,
+    *,
+    at: str,
+) -> bool:
+    """Match an effect to the latest valid Owner snapshot at its creation time.
+
+    Renewing Owner authority changes the current snapshot but must not erase
+    which prior snapshot authorized an already-dispatched effect. Historical
+    snapshots are durable mission data and are validated just like the current
+    snapshot before they can satisfy this binding.
+    """
+    from security.mission_authorization import MissionAuthorizationSnapshot
+
+    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+        return False
+    if any(char not in "0123456789abcdef" for char in expected_digest):
+        return False
+    current_raw = getattr(mission, "authorization_snapshot", None)
+    history_raw = getattr(mission, "authorization_snapshot_history", [])
+    if not isinstance(current_raw, Mapping) or not current_raw:
+        return False
+    if not isinstance(history_raw, list):
+        return False
+    if any(not isinstance(item, Mapping) or not item for item in history_raw):
+        return False
+    try:
+        history = [MissionAuthorizationSnapshot.from_dict(dict(item)) for item in history_raw]
+        current = MissionAuthorizationSnapshot.from_dict(dict(current_raw))
+        effect_time = _aware_utc(at)
+        snapshots = [*history, current]
+        history_versions = [item.version for item in history]
+        if history_versions != sorted(set(history_versions)) or any(
+            version >= current.version for version in history_versions
+        ):
+            return False
+        if any(
+            item.mission_id != mission.mission_id
+            or item.owner_identity != mission.owner_identity_ref
+            for item in snapshots
+        ):
+            return False
+        created = [_aware_utc(item.created_at) for item in snapshots]
+        if any(left > right for left, right in zip(created, created[1:])):
+            return False
+        eligible = [
+            (created_at, item)
+            for created_at, item in zip(created, snapshots)
+            if created_at <= effect_time
+        ]
+        if not eligible:
+            return False
+        _created_at, effective = max(eligible, key=lambda pair: (pair[0], pair[1].version))
+        return effective.is_active(at=at) and authorization_digest(effective) == expected_digest
+    except (KeyError, TypeError, ValueError, PermissionError, ExecutionFenceError):
+        return False
+
+
+def _aware_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("authorization timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
 @dataclass(frozen=True)
 class ExecutionFence:
     """Immutable proof tying one execution operation to its current durable owner.
@@ -317,4 +383,9 @@ class ExecutionFence:
         return stamped
 
 
-__all__ = ["ExecutionFence", "ExecutionFenceError", "authorization_digest"]
+__all__ = [
+    "ExecutionFence",
+    "ExecutionFenceError",
+    "authorization_digest",
+    "authorization_snapshot_matches_mission",
+]

@@ -903,32 +903,11 @@ def test_ambiguous_parallel_effect_can_be_owner_reconciled_by_exact_pair(tmp_pat
     assert ledger.get(effect.effect_id).state == EffectState.SUCCEEDED
 
 
-def test_legacy_v6_effect_row_uses_immutable_mission_owner_binding(tmp_path, monkeypatch):
+def test_legacy_v6_effect_row_without_owner_binding_fails_closed(tmp_path, monkeypatch):
     store, _snapshot, _queue, _identity, _claim, _fence, ledger, effect = _fixture(
         tmp_path, state=EffectState.RECOVERY_REQUIRED
     )
-    with sqlite3.connect(ledger.db_path) as connection:
-        connection.execute("DROP TRIGGER IF EXISTS external_effect_owner_identity_immutable")
-        connection.execute("ALTER TABLE external_effects DROP COLUMN owner_identity_ref")
-
-    migrated_ledger = ExternalEffectLedger(ledger.db_path)
-    with migrated_ledger._transaction() as connection:
-        migrated_ledger._ensure_schema(connection)
-    engine = _engine(migrated_ledger, store)
-
-    inspection = engine.inspect(effect.effect_id, context=_owner_context(monkeypatch))
-    assert inspection.owner_binding_status == "DERIVED_FROM_MISSION"
-    assert migrated_ledger.get(effect.effect_id).owner_identity_ref == ""
-
-    foreign_context = _owner_context(monkeypatch, token="foreign-owner", owner_id=2)
-    with pytest.raises(EffectReconciliationError, match="does not own"):
-        engine.authorize(
-            effect.effect_id,
-            context=foreign_context,
-            action=EffectReconciliationAction.PROVIDER_LOOKUP,
-        )
-    assert migrated_ledger.get(effect.effect_id).owner_identity_ref == ""
-
+    engine = _engine(ledger, store)
     owner_context = _owner_context(monkeypatch, token="original-owner", owner_id=1)
     grant = engine.authorize(
         effect.effect_id,
@@ -937,11 +916,34 @@ def test_legacy_v6_effect_row_uses_immutable_mission_owner_binding(tmp_path, mon
         evidence_reference="owner-report:legacy-effect-confirmation",
     )
     assert grant.owner_identity_ref == "owner:1"
-    result = engine.apply_owner_decision(effect.effect_id, authorization=grant)
-    assert result.status is ReconciliationStatus.OWNER_CONFIRMED_APPLIED
+
+    with sqlite3.connect(ledger.db_path) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS external_effect_owner_identity_immutable")
+        connection.execute("ALTER TABLE external_effects DROP COLUMN owner_identity_ref")
+
+    migrated_ledger = ExternalEffectLedger(ledger.db_path)
+    with migrated_ledger._transaction() as connection:
+        migrated_ledger._ensure_schema(connection)
+    engine = _engine(migrated_ledger, store)
     assert migrated_ledger.get(effect.effect_id).owner_identity_ref == ""
-    assert migrated_ledger.history(effect.effect_id)[-1]["event_type"] == "OWNER_CONFIRMED_APPLIED"
-    assert engine.inspect(effect.effect_id, context=owner_context).owner_binding_status == "DERIVED_FROM_MISSION"
+
+    foreign_context = _owner_context(monkeypatch, token="foreign-owner", owner_id=2)
+    with pytest.raises(EffectReconciliationError, match="not bound to the persisted mission"):
+        engine.inspect(effect.effect_id, context=owner_context)
+    with pytest.raises(EffectReconciliationError, match="not bound to the persisted mission"):
+        engine.authorize(
+            effect.effect_id,
+            context=foreign_context,
+            action=EffectReconciliationAction.PROVIDER_LOOKUP,
+        )
+    with pytest.raises(EffectReconciliationError, match="not bound to the persisted mission"):
+        engine.apply_owner_decision(effect.effect_id, authorization=grant)
+    assert migrated_ledger.get(effect.effect_id).owner_identity_ref == ""
+    assert migrated_ledger.get(effect.effect_id).state == EffectState.RECOVERY_REQUIRED
+    assert all(
+        event["event_type"] != "OWNER_CONFIRMED_APPLIED"
+        for event in migrated_ledger.history(effect.effect_id)
+    )
     with sqlite3.connect(ledger.db_path) as connection:
         connection.create_function("external_effect_owner_binding_permit", 5, lambda *args: 1)
         connection.execute(
@@ -1058,3 +1060,116 @@ def test_reconciliation_serializes_mission_checkpoint_with_effect_commit(tmp_pat
     assert ledger.get(effect.effect_id).state == EffectState.SUCCEEDED
     assert not writer_errors
     assert store.load(effect.mission_id).checkpoint["step_id"] == "changed-after-reconcile"
+
+
+
+def _renew_snapshot(snapshot: MissionAuthorizationSnapshot) -> MissionAuthorizationSnapshot:
+    created_at = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    return snapshot.amend(
+        owner_approval="owner-proof-reauthorized",
+        changes={},
+        created_at=created_at,
+        expires_at=expires_at,
+    )
+
+
+def test_owner_effect_inspection_accepts_exact_historical_snapshot(tmp_path: Path, monkeypatch) -> None:
+    store, snapshot, _queue, _identity, _claim, _fence, ledger, effect = _fixture(
+        tmp_path,
+        state=EffectState.DISPATCHED,
+    )
+    mission = store.load("reconcile-mission")
+    assert mission is not None
+    renewed = _renew_snapshot(snapshot)
+    mission.authorization_snapshot_history.append(snapshot.to_dict())
+    mission.authorization_snapshot = renewed.to_dict()
+    mission.provenance["authorization_snapshot_version"] = renewed.version
+    store.save(mission)
+
+    inspection = EffectReconciliationEngine(
+        ledger=ledger,
+        mission_store=store,
+    ).inspect(
+        effect.effect_id,
+        context=_owner_context(monkeypatch, request_id="effect-request"),
+    )
+
+    assert inspection.effect_id == effect.effect_id
+    assert inspection.state is EffectState.DISPATCHED
+    assert inspection.owner_binding_status == "BOUND"
+    assert ledger.get(effect.effect_id).state == EffectState.DISPATCHED
+
+
+@pytest.mark.parametrize("history_mode", ["missing", "wrong-owner"])
+def test_owner_effect_inspection_rejects_unbound_historical_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+    history_mode: str,
+) -> None:
+    store, snapshot, _queue, _identity, _claim, _fence, ledger, effect = _fixture(
+        tmp_path,
+        state=EffectState.DISPATCHED,
+    )
+    mission = store.load("reconcile-mission")
+    assert mission is not None
+    renewed = _renew_snapshot(snapshot)
+    if history_mode == "wrong-owner":
+        wrong_owner_snapshot = MissionAuthorizationSnapshot.create(
+            owner_identity="owner:2",
+            mission_id=snapshot.mission_id,
+            target_identity=snapshot.target_identity,
+            scope=snapshot.scope,
+            allowed_actions=snapshot.allowed_actions,
+            forbidden_actions=snapshot.forbidden_actions,
+            allowed_tools=snapshot.allowed_tools,
+            time_window=snapshot.time_window,
+            max_duration=snapshot.max_duration,
+            rate_limits=snapshot.rate_limits,
+            network_boundary=snapshot.network_boundary,
+            data_boundary=snapshot.data_boundary,
+            credential_boundary=snapshot.credential_boundary,
+            workspace_boundary=snapshot.workspace_boundary,
+            policy_version=snapshot.policy_version,
+            owner_approval="other-owner-proof",
+            created_at=snapshot.created_at,
+            expires_at=snapshot.expires_at,
+        )
+        mission.authorization_snapshot_history.append(wrong_owner_snapshot.to_dict())
+    mission.authorization_snapshot = renewed.to_dict()
+    mission.provenance["authorization_snapshot_version"] = renewed.version
+    store.save(mission)
+
+    engine = EffectReconciliationEngine(ledger=ledger, mission_store=store)
+    with pytest.raises(EffectReconciliationError):
+        engine.inspect(
+            effect.effect_id,
+            context=_owner_context(monkeypatch, request_id="effect-request"),
+        )
+    assert ledger.get(effect.effect_id).state == EffectState.DISPATCHED
+
+
+
+def test_mission_payload_without_authorization_history_remains_loadable(tmp_path: Path) -> None:
+    store, _snapshot, _queue, _identity, _claim, _fence, _ledger, _effect = _fixture(tmp_path)
+    mission = store.load("reconcile-mission")
+    assert mission is not None
+    legacy_payload = mission.to_dict()
+    legacy_payload.pop("authorization_snapshot_history")
+    legacy_payload.pop("integrity_hash")
+    import json
+    legacy_payload["integrity_hash"] = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+    loaded = Mission.from_dict(legacy_payload)
+
+    assert loaded.authorization_snapshot_history == []
+    round_trip = Mission.from_dict(loaded.to_dict())
+    assert round_trip.authorization_snapshot_history == []
