@@ -50,8 +50,9 @@
 
 ### Task 3: Exact tool-input schema enforcement
 
-- [ ] Enforce registered `ToolSpec` input shapes exactly, including extra/missing keys and `None`-argument tools.
-- [ ] Test unknown tools, malformed/oversized queries, and extra properties against the same production registry path.
+- [x] Enforce registered `ToolSpec` input shapes exactly at registry execution and `AgentTaskRuntime` parse boundaries, including extra/missing keys and `None`-argument tools.
+- [x] Test unknown tools, malformed/oversized queries, and extra properties against the same production registry path.
+- [x] Keep provider-facing schema definitions copy-isolated from canonical registry state.
 
 ### Task 4: Whole-turn and cumulative-budget preflight
 
