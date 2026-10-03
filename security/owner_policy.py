@@ -14,7 +14,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "security" / "owner_policy.json"
-STATE_PATH = ROOT / "security" / "owner_policy_state.json"
+STATE_PATH = Path(
+    os.getenv("OWNER_POLICY_STATE_PATH", str(ROOT / "security" / "owner_policy_state.json"))
+).expanduser()
 OWNER_PHRASE = os.getenv("CYBERSENTINEL_OWNER_PHRASE", "Owner").strip()
 _STATE_LOCK = threading.RLock()
 _EVIDENCE_SECRET = secrets.token_bytes(32)
@@ -299,6 +301,7 @@ def load_state() -> dict[str, Any]:
 
 
 def _save_state(state: dict[str, Any]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, STATE_PATH)

@@ -1,16 +1,23 @@
 from __future__ import annotations
+
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
+
 def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
 
 BRIDGE_HOST = env("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(env("BRIDGE_PORT", "8787"))
 BRIDGE_TOKEN = env("BRIDGE_TOKEN")
+BRIDGE_ALLOW_NON_LOOPBACK_BIND = env(
+    "BRIDGE_ALLOW_NON_LOOPBACK_BIND", "false"
+).lower() in {"1", "true", "yes"}
 PUBLIC_WEB_ENABLED = env("PUBLIC_WEB_ENABLED", "false").lower() in {"1", "true", "yes"}
 PUBLIC_SESSION_COOKIE = env("PUBLIC_SESSION_COOKIE", "cs_public_session")
 PUBLIC_SESSION_TTL_SECONDS = int(env("PUBLIC_SESSION_TTL_SECONDS", "1800"))
@@ -30,5 +37,22 @@ RSS_FEEDS = {
     "CISA Advisories": "https://www.cisa.gov/cybersecurity-advisories/all.xml",
 }
 
-if BRIDGE_HOST != "127.0.0.1":
-    raise RuntimeError("BRIDGE_HOST must remain 127.0.0.1.")
+if BRIDGE_HOST == "127.0.0.1":
+    pass
+elif BRIDGE_HOST == "0.0.0.0":
+    if not BRIDGE_ALLOW_NON_LOOPBACK_BIND:
+        raise RuntimeError(
+            "BRIDGE_HOST=0.0.0.0 requires BRIDGE_ALLOW_NON_LOOPBACK_BIND=true."
+        )
+    token_lower = BRIDGE_TOKEN.lower()
+    if len(BRIDGE_TOKEN) < 32 or any(
+        marker in token_lower
+        for marker in ("replace_with", "change_me", "your_", "placeholder")
+    ):
+        raise RuntimeError(
+            "A non-loopback bind requires a non-placeholder BRIDGE_TOKEN of at least 32 characters."
+        )
+else:
+    raise RuntimeError(
+        "BRIDGE_HOST must be 127.0.0.1 or explicitly opted-in 0.0.0.0."
+    )

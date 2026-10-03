@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -17,7 +18,7 @@ class TaskVersionConflictError(RuntimeError):
     """Raised when a stale Task snapshot attempts to overwrite a newer row."""
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "tasks.sqlite3"
+DB_PATH = Path(os.getenv("TASK_DB_PATH", str(ROOT / "tasks.sqlite3"))).expanduser()
 _db_lock = threading.RLock()
 
 
@@ -36,6 +37,7 @@ def _get_db():
 
 
 def _init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _get_db() as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, request_id TEXT NOT NULL,

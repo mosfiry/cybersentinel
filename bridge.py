@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from http.cookies import SimpleCookie
+import threading
 from urllib.parse import parse_qs, urlparse
 from core.config import (
     BRIDGE_HOST,
@@ -36,6 +38,13 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
+
+
+class BridgeHTTPServer(ThreadingHTTPServer):
+    """Threaded bridge server that drains active requests during shutdown."""
+
+    daemon_threads = False
+    block_on_close = True
 
 
 def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
@@ -462,10 +471,36 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not BRIDGE_TOKEN:
         raise SystemExit("BRIDGE_TOKEN is required in .env")
-    server = ThreadingHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
-    print(f"{PRODUCT_NAME} {VERSION}: http://{BRIDGE_HOST}:{BRIDGE_PORT}")
-    print("Local-only defensive engine, threat intelligence, planner and audit enabled.")
-    server.serve_forever()
+    server = BridgeHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
+    print(f"{PRODUCT_NAME} {VERSION}: http://{BRIDGE_HOST}:{server.server_address[1]}", flush=True)
+    print("Local-only defensive engine, threat intelligence, planner and audit enabled.", flush=True)
+    shutdown_started = threading.Event()
+    shutdown_thread: threading.Thread | None = None
+    stop_signals = (signal.SIGINT, signal.SIGTERM)
+    previous_handlers = {signum: signal.getsignal(signum) for signum in stop_signals}
+
+    def request_shutdown(_signum, _frame):
+        nonlocal shutdown_thread
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
+        shutdown_thread = threading.Thread(
+            target=server.shutdown,
+            name="bridge-http-shutdown",
+            daemon=True,
+        )
+        shutdown_thread.start()
+
+    try:
+        for signum in stop_signals:
+            signal.signal(signum, request_shutdown)
+        server.serve_forever()
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        server.server_close()
+        if shutdown_thread is not None:
+            shutdown_thread.join()
 
 
 if __name__ == "__main__":
