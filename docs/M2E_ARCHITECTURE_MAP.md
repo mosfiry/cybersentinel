@@ -215,3 +215,12 @@ The one delayed, bounded, read-only Cloudflare query resolved build `679155a9-6e
 ### V14 exact-SHA hosted checkpoint — commit `eec7c80e`
 
 The V14 M2E checkpoint is `eec7c80e8f5cb9496271f874831bb6a748611856` (parent V13 `21e1f853794c20239125f66be898af63a3aecb9c`). GitHub's exact-SHA audit check `111148721586` and `test (3.13)` check `111148721484` both completed successfully. Separately, Cloudflare natural build `cfd58846-d101-426f-b0ff-acf8376b7829` for the same SHA remained `queued` with `build_outcome=null`; its exact preview list returned `total_count=0`, so final preview outcome is **UNKNOWN**. No manual build/deploy/retry or production action occurred; `main` remained unchanged. Full request/response timestamps and status details are in `docs/M2E_STATE.md` under the V14 hosted checkpoint entry.
+
+
+### V15 — final cutover audit (2026-10-03)
+
+The repository still describes a loopback Python bridge and static Firebase Hosting, with no source-grounded Cloudflare Worker/Wrangler entrypoint (`README.md:5-20`; `docs/OPERATIONS.md:1-14`; `firebase.json:1-29`). V14 security/integration coverage passed locally and on exact GitHub SHAs `eec7c80e8f5cb9496271f874831bb6a748611856` and `eeaf9f01df234fd92f3f97bc705dee6be13e4ec6`; check IDs and local test totals are recorded in `docs/M2E_FINAL_CUTOVER_AUDIT.md` and `docs/M2E_STATE.md`.
+
+Cloudflare evidence remains distinct: V13 build `679155a9-6ec9-4e34-831e-aa436e3f9444` stopped/fail at the missing `previews` configuration with no preview; V14 code build `cfd58846-d101-426f-b0ff-acf8376b7829` was last observed queued/unknown; V14 hosted-results build `528e8ac2-8933-4189-9f54-605fd40da4ed` was observed queued with no running build and no preview record. No production state is inferred, and no manual Cloudflare operation occurred.
+
+Unattended Owner authority, unified cross-store fencing/atomicity, ambiguous external-effect reconciliation, and production worker lifecycle remain blocked or unverified. V14 regressions do not close those contracts. `main` and M2D remain at their separately verified SHAs; V16 repository hygiene follows in order.
