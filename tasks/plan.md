@@ -202,6 +202,8 @@ V11 is complete only when provider/tool inputs, provenance, turn/step/time/outpu
 
 Evaluate every required condition from the M3 brief against recorded code/test/CI evidence: runtime exists and starts/stops/restarts; health works; worker identity and fencing hold; Owner reauthorization, queue recovery, evidence integrity, effect ledger and reconciliation work; process-death and multi-process cases are tested; CI is green; and deployment configuration and target are known. Record each condition with its evidence and an explicit result. If any essential item is unproved, record `CUTOVER_BLOCKED`, keep production at `PRODUCTION_DEPLOYMENT_BLOCKED`, and continue to V16 without external mutation.
 
+**Outcome (2026-10-03):** The 17-condition scorecard is recorded in `docs/M3_STATE.md`. Runtime and safety controls are evidenced, but exact-SHA Workers Builds checks failed and no production-specific configuration or actual production target is established. The result is `CUTOVER_BLOCKED`; no production/Cloudflare mutation is allowed. Commit/push and exact-SHA verification of this decision remain the V15 checkpoint.
+
 ### V16 — Actual isolated non-production cutover rehearsal
 
 **Dependency:** V15 decision recorded. Use only an ephemeral hosted CI runner and a uniquely named Docker Compose project/volume. No production credential, database, external provider, external effect target, public bind, Cloudflare mutation, or persistent user data may be used.

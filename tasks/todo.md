@@ -179,10 +179,10 @@
 - [x] No Cloudflare settings were changed, no public listener was published, and no production deployment was performed in V14.
 
 
-### V15 — Real cutover decision gate (planned; not started)
+### V15 — Real cutover decision gate (in progress; CUTOVER_BLOCKED decision recorded)
 
-- [ ] After V14 exact-SHA tests/audit/Workers-build results are recorded, score every required cutover condition against source and test evidence; do not infer readiness from the Compose smoke alone.
-- [ ] Record `CUTOVER_BLOCKED` and `PRODUCTION_DEPLOYMENT_BLOCKED` if any essential CI, target/configuration, or authority condition is missing; make no production or Cloudflare mutation.
+- [x] Score all 17 required conditions against source, test, and exact-SHA evidence; do not infer readiness from the Compose smoke alone.
+- [x] Record `CUTOVER_BLOCKED` and `PRODUCTION_DEPLOYMENT_BLOCKED`: exact-SHA Workers Builds checks failed and no production-specific configuration/target is established; no production or Cloudflare mutation.
 - [ ] Commit/push the V15 gate decision to the existing M3 branch non-force, verify exact-SHA CI, and transition to V16.
 
 ### V16 — Actual non-production cutover rehearsal (planned; not started)
