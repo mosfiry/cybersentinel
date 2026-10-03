@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .provider_api import InvalidModelResponse, ProviderCapabilities, ProviderResponse, ToolCall
+from .provider_api import MAX_PROVIDER_RESPONSE_BYTES, InvalidModelResponse, ProviderCapabilities, ProviderResponse, ToolCall
 
 
 class OpenAICompatibleProvider:
@@ -42,8 +42,13 @@ class OpenAICompatibleProvider:
             req.add_header("Authorization", "Bearer " + self.api_key)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw_body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                if not isinstance(raw_body, (bytes, bytearray)):
+                    raise InvalidModelResponse("provider returned a non-byte response body", provider=self.name, model=self.model)
+                if len(raw_body) > MAX_PROVIDER_RESPONSE_BYTES:
+                    raise InvalidModelResponse("provider response exceeds the configured size limit", provider=self.name, model=self.model)
                 try:
-                    data = json.loads(response.read().decode("utf-8"))
+                    data = json.loads(bytes(raw_body).decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise InvalidModelResponse("provider returned malformed JSON", provider=self.name, model=self.model) from exc
             if not isinstance(data, dict):

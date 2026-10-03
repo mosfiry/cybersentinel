@@ -6,6 +6,9 @@ from enum import StrEnum
 from typing import Any
 
 
+MAX_PROVIDER_RESPONSE_BYTES = 1_048_576
+
+
 class ProviderFailureKind(StrEnum):
     CAPABILITY_UNSUPPORTED = "CAPABILITY_UNSUPPORTED"
     PROVIDER_FAILURE = "PROVIDER_FAILURE"
@@ -162,5 +165,5 @@ def response_from_legacy(value: dict[str, Any], *, provider: str, model: str, ca
 __all__ = [
     "CapabilityUnsupported", "InvalidModelResponse", "ProviderAuthenticationFailure", "ProviderError",
     "ProviderFailure", "ProviderFailureKind", "ProviderResponse", "ProviderTimeout", "ProviderCapabilities", "ToolCall",
-    "response_from_legacy",
+    "MAX_PROVIDER_RESPONSE_BYTES", "response_from_legacy",
 ]

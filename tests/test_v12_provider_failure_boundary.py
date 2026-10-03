@@ -17,6 +17,7 @@ from agent.model_router import ModelRouter
 from agent.planning import Plan, PlanStep
 from agent.provider_api import (
     InvalidModelResponse,
+    MAX_PROVIDER_RESPONSE_BYTES,
     ProviderAuthenticationFailure,
     ProviderCapabilities,
     ProviderFailure,
@@ -42,7 +43,8 @@ def test_openai_compatible_adapter_passes_timeout_to_transport(monkeypatch):
         def __exit__(self, *_args):
             return False
 
-        def read(self):
+        def read(self, size=-1):
+            observed["read_size"] = size
             return b'{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}'
 
     def fake_urlopen(request, *, timeout):
@@ -57,7 +59,90 @@ def test_openai_compatible_adapter_passes_timeout_to_transport(monkeypatch):
 
     assert result.text == "ok"
     assert observed["timeout"] == 7
+    assert observed["read_size"] == MAX_PROVIDER_RESPONSE_BYTES + 1
     assert "timeout" not in observed["payload"]
+
+
+def test_openai_compatible_provider_accepts_exact_response_limit_despite_inaccurate_length(monkeypatch):
+    provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1")
+    payload = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+    empty_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    content = "x" * (MAX_PROVIDER_RESPONSE_BYTES - len(empty_body))
+    payload["choices"][0]["message"]["content"] = content
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    assert len(body) == MAX_PROVIDER_RESPONSE_BYTES
+    observed = []
+
+    class Response:
+        headers = {"Content-Length": "0"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            observed.append(size)
+            return body
+
+    monkeypatch.setattr("agent.providers.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+
+    result = provider._request({})
+
+    assert observed == [MAX_PROVIDER_RESPONSE_BYTES + 1]
+    assert result["choices"][0]["message"]["content"] == content
+
+
+@pytest.mark.parametrize("content_length", [None, "1", str(MAX_PROVIDER_RESPONSE_BYTES * 4)])
+def test_openai_compatible_provider_rejects_oversized_body_without_trusting_content_length(
+    monkeypatch, content_length
+):
+    observed = []
+
+    class Response:
+        headers = {} if content_length is None else {"Content-Length": content_length}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            observed.append(size)
+            return b"x" * size
+
+    monkeypatch.setattr("agent.providers.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1")
+
+    with pytest.raises(InvalidModelResponse, match="exceeds the configured size limit"):
+        provider._request({})
+
+    assert observed == [MAX_PROVIDER_RESPONSE_BYTES + 1]
+
+
+def test_openai_compatible_provider_malformed_response_body_is_redacted(monkeypatch):
+    body = b"UNTRUSTED_PROVIDER_BODY_SENTINEL"
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return body
+
+    monkeypatch.setattr("agent.providers.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    provider = OpenAICompatibleProvider("test", "https://provider.invalid/v1", "model-1")
+
+    with pytest.raises(InvalidModelResponse, match="malformed JSON") as caught:
+        provider._request({})
+
+    assert "UNTRUSTED_PROVIDER_BODY_SENTINEL" not in str(caught.value)
+    assert provider.last_error == "InvalidModelResponse"
 
 
 def test_legacy_provider_tool_arguments_fail_closed():
