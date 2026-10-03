@@ -26,6 +26,7 @@ from api.chat import chat, get_session, sse, stream, task_stream, create_task, r
 from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
+from core.health import readiness_snapshot
 from security.public_session import DEFAULT_PUBLIC_SESSIONS
 from api.missions import MissionService
 from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker
@@ -178,6 +179,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/health":
             return self._send(200, {"ok": True, "service": PRODUCT_NAME, "version": VERSION})
+        if self.path == "/api/health/live":
+            return self._send(
+                200,
+                {
+                    "ok": True,
+                    "service": PRODUCT_NAME,
+                    "version": VERSION,
+                    "state": "PROCESS_ALIVE",
+                },
+            )
+        if self.path == "/api/health/ready":
+            if not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
+            providers = getattr(getattr(RUNTIME, "router", None), "providers", ())
+            snapshot = readiness_snapshot(DB_PATH, provider_configured=bool(providers))
+            return self._send(
+                200 if snapshot["ready"] else 503,
+                {"ok": snapshot["ready"], **snapshot},
+            )
         if self.path == "/api/public/health":
             if not self._public_enabled() or not self._public_origin_allowed():
                 return self._send(404, {"ok": False, "error": "not_found"})

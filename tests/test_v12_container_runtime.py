@@ -250,6 +250,30 @@ def test_bridge_sigterm_stops_cleanly_and_leaves_temporary_database_reopenable(t
             assert response.status == 200
             assert b'"ok": true' in response.read()
 
+        with urlopen(f"http://127.0.0.1:{port}/api/health/live", timeout=3) as response:
+            assert response.status == 200
+            assert b'"state": "PROCESS_ALIVE"' in response.read()
+
+        from urllib.error import HTTPError
+        from urllib.request import Request
+
+        ready_url = f"http://127.0.0.1:{port}/api/health/ready"
+        with pytest.raises(HTTPError) as unauthenticated:
+            urlopen(ready_url, timeout=3)
+        assert unauthenticated.value.code == 401
+
+        request = Request(
+            ready_url,
+            headers={"X-CyberSentinel-Token": env["BRIDGE_TOKEN"]},
+        )
+        with pytest.raises(HTTPError) as owner_setup_required:
+            urlopen(request, timeout=3)
+        assert owner_setup_required.value.code == 503
+        readiness = owner_setup_required.value.read()
+        assert b'"database": "DATABASE_READY"' in readiness
+        assert b'"authority": "OWNER_SETUP_REQUIRED"' in readiness
+        assert b'"worker": "SEPARATE_COMPOSE_HEALTHCHECK"' in readiness
+
         # Signal only the exact child launched above, which has only temporary DB paths.
         child.send_signal(signal.SIGTERM)
         assert child.wait(timeout=10) == 0

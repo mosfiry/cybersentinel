@@ -12,6 +12,10 @@
 
 Optional OpenAI-compatible providers may be configured through `LLM_*`, `LOCAL_LLM_*`, `COLAB_LLM_*`, or `HF_LLM_*` environment variables. Provider keys are runtime credentials; never place them in a source file, image build argument, or public frontend asset.
 
+### Health and readiness
+
+`GET /api/health` remains the backward-compatible, unauthenticated process-liveness probe; `GET /api/health/live` reports the same liveness explicitly. `GET /api/health/ready` requires the transport-only `X-CyberSentinel-Token` header and returns `200` only when the core SQLite store passes a read-only integrity/schema check and an active Owner account has been initialized. It returns `503` while the database or Owner setup is unavailable; the probe does not create a database, run migrations, expose paths, or establish Owner identity. Provider configuration is reported as unverified without making a network request, and worker health remains an independent Compose process check; neither is inferred from bridge readiness.
+
 ## Single-host container runtime (loopback only)
 
 The repository includes a Docker Compose target for the source-compatible runtime: one HTTP bridge and one supervised mission worker sharing a single local named `cybersentinel-state` volume for database/policy state and workspace files. This is a single-host configuration; it is not a public internet deployment and does not claim high availability. SQLite state must remain on a local filesystem, with one configured worker.
