@@ -424,6 +424,63 @@ def test_router_classifies_failover_attempts_and_redacts_error_bodies():
     assert all("PRIVATE_PROVIDER_BODY_DO_NOT_PERSIST" not in repr(row) for row in router.last_trace)
 
 
+def test_router_fails_over_once_per_provider_with_shared_deadline_and_trusted_identity():
+    import time
+
+    calls: list[tuple[str, float | None]] = []
+
+    class Provider:
+        capabilities = ProviderCapabilities(generate=True)
+
+        def __init__(self, name, model, error=None):
+            self.name = name
+            self.model = model
+            self.error = error
+
+        def generate(self, _messages, **kwargs):
+            calls.append((self.name, kwargs.get("timeout")))
+            if self.error is not None:
+                time.sleep(0.01)
+                raise self.error
+            return {"content": "accepted", "provider": "forged", "model": "forged"}
+
+    router = ModelRouter([
+        Provider("first", "model-a", TimeoutError("private timeout detail")),
+        Provider("second", "model-b"),
+    ])
+
+    result = router.generate([], timeout=3)
+
+    assert result["content"] == "accepted"
+    assert (result["provider"], result["model"]) == ("second", "model-b")
+    assert [name for name, _timeout in calls] == ["first", "second"]
+    assert calls[0][1] is not None and 0 < calls[0][1] <= 3
+    assert calls[1][1] is not None and 0 < calls[1][1] <= calls[0][1]
+    assert [item["status"] for item in router.last_trace] == ["failure", "success"]
+
+
+def test_model_router_from_env_configures_local_qwen_compatible_endpoint_without_key(monkeypatch):
+    for prefix in ("LOCAL", "COLAB", "HF"):
+        for suffix in ("BASE_URL", "MODEL", "API_KEY", "TOOL_CALLING", "STREAMING", "STRUCTURED_OUTPUT", "PRIORITY"):
+            monkeypatch.delenv(f"{prefix}_LLM_{suffix}", raising=False)
+    for key in ("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "LLM_TOOL_CALLING", "LLM_STREAMING", "LLM_STRUCTURED_OUTPUT"):
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "Qwen/Qwen3-Coder-Next")
+
+    router = ModelRouter.from_env()
+
+    assert len(router.providers) == 1
+    provider = router.providers[0]
+    assert provider.name == "local"
+    assert provider.model == "Qwen/Qwen3-Coder-Next"
+    assert provider.base_url == "http://127.0.0.1:8000/v1"
+    assert provider.api_key == ""
+    assert provider.capabilities.generate is True
+    assert provider.capabilities.tool_calling is False
+
+
 def test_task_runtime_rejects_bad_tool_response_before_executor(tmp_path, monkeypatch):
     task_path = Path(tmp_path) / "tasks.sqlite3"
     monkeypatch.setattr(task_db, "DB_PATH", task_path)
