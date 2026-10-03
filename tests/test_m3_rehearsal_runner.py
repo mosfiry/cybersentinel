@@ -81,6 +81,35 @@ def test_queue_state_failure_reports_only_static_invariant_names(
     assert "queue-state-secret" not in caught.value.reason
 
 
+def test_queue_state_accepts_persisted_lowercase_execution_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent.mission_worker import WorkerMissionState
+
+    runner = rehearsal.RehearsalRunner(
+        output_path=tmp_path / "result.json", port_picker=lambda: 32991
+    )
+    runner.mission_id = "synthetic-mission"
+    probe = {
+        "queue": {
+            "state": WorkerMissionState.EXECUTING.value,
+            "attempts": 1,
+            "runtime_generation": 1,
+            "lease_owned": True,
+            "lease_expires_at": "2099-01-01T00:00:00+00:00",
+        },
+        "generation": {"runtime_generation": 1, "state": "ACTIVE"},
+        "db_under_state": True,
+        "queue_db_under_state": True,
+    }
+    monkeypatch.setattr(runner.host, "state_probe", lambda *_args: probe)
+
+    result = runner._queue_state()
+
+    assert result["queue_state"] == "executing"
+    assert runner.lease_expires_at == "2099-01-01T00:00:00+00:00"
+
+
 def test_safe_environment_removes_ambient_provider_and_runtime_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

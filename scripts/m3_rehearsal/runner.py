@@ -327,7 +327,7 @@ class RehearsalRunner:
         queue = probe.get("queue") or {}
         generation = probe.get("generation") or {}
         checks = {
-            "queue_executing": queue.get("state") == "EXECUTING",
+            "queue_executing": queue.get("state") == "executing",
             "single_attempt": queue.get("attempts") == 1,
             "queue_generation_one": queue.get("runtime_generation") == 1,
             "lease_owned": queue.get("lease_owned") is True,
