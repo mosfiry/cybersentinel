@@ -449,12 +449,34 @@ class MissionRuntime:
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
             mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
             return self.store.save(mission)
-        if (mission.checkpoint or {}).get("status") == "in_flight":
-            action_id = str(mission.checkpoint.get("action_id", ""))
-            mission.error = "in-flight action outcome is unknown; reconciliation required"
-            mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id})
-            mission.emit(EventType.FAILURE_DIAGNOSED, step_id=str(mission.checkpoint.get("step_id", "")), data={"class": FailureClass.UNKNOWN.value, "reason": mission.error, "recovery": "reconciliation_required", "action_id": action_id})
-            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
+        checkpoint = dict(mission.checkpoint or {})
+        checkpoint_status = checkpoint.get("status")
+        if checkpoint_status in {"in_flight", "in_flight_parallel"}:
+            if checkpoint_status == "in_flight_parallel":
+                tool_call_ids = [
+                    str(item)
+                    for item in checkpoint.get("ambiguous_tool_call_ids", checkpoint.get("tool_call_ids", []))
+                ]
+                mission.error = "parallel in-flight action outcome is unknown; reconciliation required"
+                failure = {"class": FailureClass.UNKNOWN.value, "reason": mission.error, "tool_call_ids": tool_call_ids}
+                mission.failures.append(failure)
+                mission.emit(
+                    EventType.FAILURE_DIAGNOSED,
+                    step_id=str(checkpoint.get("step_id", "")),
+                    data={**failure, "recovery": "reconciliation_required"},
+                )
+                mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, tool_call_ids=tool_call_ids)
+            else:
+                action_id = str(checkpoint.get("action_id", ""))
+                mission.error = "in-flight action outcome is unknown; reconciliation required"
+                failure = {"class": FailureClass.UNKNOWN.value, "reason": mission.error, "action_id": action_id}
+                mission.failures.append(failure)
+                mission.emit(
+                    EventType.FAILURE_DIAGNOSED,
+                    step_id=str(checkpoint.get("step_id", "")),
+                    data={**failure, "recovery": "reconciliation_required"},
+                )
+                mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
             return self.store.save(mission)
         if mission.iteration_count >= mission.max_iterations:
             mission.error = "iteration budget exhausted"
