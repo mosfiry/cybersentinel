@@ -108,3 +108,9 @@ V4 remains a documentation-only `BLOCKED / OWNER DECISION REQUIRED` checkpoint f
 For V4 SHA `a5cbb828cc59d816a1845ae8edf8dcb6477bfc08`, GitHub audit run `37090085541` / check `111108378136` and test run `37090085552` / check `111108378436` completed successfully. The naturally triggered Workers check `111108436527` completed `failure`, external build `fa23f980-a3f7-4683-99ae-5b2f9e0cd43f`; GitHub reported no cause or preview URL. This confirms a failed Workers Build check, not a production outcome or any specific preview artifact state.
 
 The separate GitHub commit-status endpoint returned `pending` with no status records at 04:32:43, although exact check-run records were terminal. The check-run statuses are kept explicit and separate. V4 remains a docs-only `BLOCKED / OWNER DECISION REQUIRED` checkpoint; no V4 architecture/code choice was made.
+
+## V5 evidence append serialization checkpoint
+
+`EvidenceChainStore.append()` now begins with SQLite `BEGIN IMMEDIATE` before reading the current chain head, assigning the sequence/previous hash, and inserting the rehashed record (`agent/evidence.py:69-83`). This serializes concurrent appenders at the chain-position boundary. The focused tests verify rehashing, 64 concurrent appends across eight store instances with one valid sequence, detection of payload tampering, and rollback after non-JSON serialization failure (`tests/test_evidence_chain_store.py:8-84`).
+
+This is a narrow V5 integrity improvement, not full worker-lease fencing or adversary-resistant authenticity. The chain remains unkeyed SHA-256, can be recomputed by a database writer, is stored separately from mission/queue state, and native mission evidence is not automatically appended to it. Binding evidence writes to a live worker claim still depends on the unresolved V4 storage/transaction decision; do not claim unified mission, queue, evidence, or external-effect atomicity.

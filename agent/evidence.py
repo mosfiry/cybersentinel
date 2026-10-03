@@ -68,6 +68,7 @@ class EvidenceChainStore:
 
     def append(self, item: dict[str, Any]) -> dict[str, Any]:
         with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
             last = db.execute("SELECT sequence,current_hash FROM evidence_chain ORDER BY sequence DESC LIMIT 1").fetchone()
             sequence = int(last[0] if last else 0) + 1
             previous = str(last[1] if last else "")
