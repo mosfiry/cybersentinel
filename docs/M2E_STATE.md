@@ -1645,3 +1645,8 @@ The complete V12 code/test diff was reviewed, followed by review of the exact st
 ### V12 commit preflight — exact M2E parent verified (2026-10-03 07:49)
 
 The final precommit read-only check confirmed branch `task/m2e-cutover-20261002`, local HEAD `aeeda116902de532483bf7fa679783fd9c21b535`, and remote M2E tip `aeeda116902de532483bf7fa679783fd9c21b535`. The worktree contains exactly the nine reviewed V12 paths; the index is empty and `git diff --check` passes. No Git mutation or external operation occurred. With independent source/test review and the restored-state integrity gate complete, the next exact action is to stage only these nine paths and create the local V12 checkpoint using repository-local command options for the existing author identity; do not modify global Git configuration. Then recheck the commit and push non-force only to the authorized M2E branch.
+
+
+### V12 local code checkpoint — committed, not yet pushed (2026-10-03 07:49:36)
+
+The reviewed V12 implementation checkpoint is local commit `de74d1e702b3977b41cb2f4c4fed064260d84e22`, parent `aeeda116902de532483bf7fa679783fd9c21b535`, on `task/m2e-cutover-20261002`. It contains exactly the nine preflighted V12 code, regression-test, architecture-map, and mission-state paths; the worktree was clean after commit. The prior 07:49:17 sequential cursor was a precommit snapshot and is superseded by this entry. The code commit has not been pushed, and no hosted CI check or new Cloudflare build has been triggered or observed for it. Next, verify this local commit and the exact remote parent again; push non-force only if the remote tip still equals its recorded parent. After that, record exact-SHA GitHub CI and the separate natural Cloudflare outcome before considering V13.
