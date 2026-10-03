@@ -65,6 +65,15 @@ class QueueItem:
     lease_owner: str | None = None
     lease_expires_at: str | None = None
     lease_epoch: int = 0
+    worker_instance_id: str | None = None
+    runtime_generation: int = 0
+
+
+@dataclass(frozen=True)
+class WorkerIdentity:
+    worker_id: str
+    worker_instance_id: str
+    runtime_generation: int
 
 
 class MissionQueue:
@@ -75,11 +84,14 @@ class MissionQueue:
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("CREATE TABLE IF NOT EXISTS mission_queue (mission_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, claimed_at TEXT, last_error TEXT NOT NULL DEFAULT '')")
+            db.execute("CREATE TABLE IF NOT EXISTS mission_worker_generations (worker_id TEXT NOT NULL, runtime_generation INTEGER NOT NULL, worker_instance_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, started_at TEXT NOT NULL, PRIMARY KEY(worker_id,runtime_generation))")
             columns = {row[1] for row in db.execute("PRAGMA table_info(mission_queue)")}
             for column, definition in (
                 ("lease_owner", "TEXT"),
                 ("lease_expires_at", "TEXT"),
                 ("lease_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                ("worker_instance_id", "TEXT"),
+                ("runtime_generation", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in columns:
                     db.execute(f"ALTER TABLE mission_queue ADD COLUMN {column} {definition}")
@@ -108,7 +120,75 @@ class MissionQueue:
             row[6],
             row[7],
             int(row[8]),
+            row[9],
+            int(row[10]),
         )
+
+    def register_worker(self, worker_id: str) -> WorkerIdentity:
+        """Atomically allocate a new durable generation for a logical worker."""
+        if not isinstance(worker_id, str) or not worker_id.strip() or len(worker_id) > 128:
+            raise ValueError("worker_id must be a non-empty string of at most 128 characters")
+        instance_id = uuid.uuid4().hex
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute(
+                "SELECT runtime_generation FROM mission_worker_generations WHERE worker_id=? ORDER BY runtime_generation DESC LIMIT 1",
+                (worker_id,),
+            ).fetchone()
+            generation = int(previous[0]) + 1 if previous else 1
+            db.execute(
+                "UPDATE mission_worker_generations SET state='SUPERSEDED' WHERE worker_id=? AND state='ACTIVE'",
+                (worker_id,),
+            )
+            db.execute(
+                "INSERT INTO mission_worker_generations(worker_id,runtime_generation,worker_instance_id,state,started_at) VALUES(?,?,?,'ACTIVE',?)",
+                (worker_id, generation, instance_id, _utc_text(datetime.now(timezone.utc))),
+            )
+        return WorkerIdentity(worker_id, instance_id, generation)
+
+    @staticmethod
+    def _assert_worker_generation(db: sqlite3.Connection, worker_instance_id: str, runtime_generation: int | None) -> int:
+        row = db.execute(
+            "SELECT worker_id,runtime_generation,state FROM mission_worker_generations WHERE worker_instance_id=?",
+            (worker_instance_id,),
+        ).fetchone()
+        if row is None:
+            # Preserve the low-level queue API for legacy callers and migration
+            # tests, but never allow a known logical worker to bypass registration.
+            logical = db.execute(
+                "SELECT 1 FROM mission_worker_generations WHERE worker_id=? LIMIT 1",
+                (worker_instance_id,),
+            ).fetchone()
+            if logical or runtime_generation is not None:
+                raise LeaseLostError("worker instance is not the registered current generation")
+            return 0
+        worker_id, generation, state = str(row[0]), int(row[1]), str(row[2])
+        current = db.execute(
+            "SELECT runtime_generation,worker_instance_id,state FROM mission_worker_generations WHERE worker_id=? ORDER BY runtime_generation DESC LIMIT 1",
+            (worker_id,),
+        ).fetchone()
+        if (
+            state != "ACTIVE"
+            or runtime_generation is None
+            or int(runtime_generation) != generation
+            or current is None
+            or int(current[0]) != generation
+            or str(current[1]) != worker_instance_id
+            or str(current[2]) != "ACTIVE"
+        ):
+            raise LeaseLostError("worker instance is not the registered current generation")
+        return generation
+
+    def deactivate_worker(self, identity: WorkerIdentity) -> None:
+        """Retire a normally stopped generation without releasing its lease."""
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            updated = db.execute(
+                "UPDATE mission_worker_generations SET state='STOPPED' WHERE worker_id=? AND runtime_generation=? AND worker_instance_id=? AND state='ACTIVE'",
+                (identity.worker_id, identity.runtime_generation, identity.worker_instance_id),
+            )
+            if updated.rowcount != 1:
+                raise LeaseLostError("worker generation was superseded before shutdown")
 
     def enqueue(self, mission_id: str, *, available_at: str | None = None, state: WorkerMissionState = WorkerMissionState.QUEUED) -> QueueItem:
         if not mission_id.strip():
@@ -116,9 +196,9 @@ class MissionQueue:
         available = _utc_text(_utc_datetime(available_at, field_name="available_at"))
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL WHERE mission_queue.state != ?", (mission_id, state.value, 0, available, WorkerMissionState.EXECUTING.value))
+            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0 WHERE mission_queue.state != ?", (mission_id, state.value, 0, available, WorkerMissionState.EXECUTING.value))
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -128,12 +208,12 @@ class MissionQueue:
 
     def get(self, mission_id: str) -> QueueItem:
         with sqlite3.connect(self.db_path) as db:
-            row = db.execute("SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
+            row = db.execute("SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?", (mission_id,)).fetchone()
         if row is None:
             raise KeyError("unknown queued mission")
         return self._item_from_row(row)
 
-    def claim_next(self, *, now: str | None = None, worker_id: str = "worker", lease_seconds: int = 60) -> QueueItem | None:
+    def claim_next(self, *, now: str | None = None, worker_id: str = "worker", lease_seconds: int = 60, worker_instance_id: str | None = None, runtime_generation: int | None = None) -> QueueItem | None:
         if not worker_id.strip():
             raise ValueError("worker_id required")
         if lease_seconds <= 0:
@@ -141,20 +221,24 @@ class MissionQueue:
         moment_dt = _utc_datetime(now, field_name="now")
         moment = _utc_text(moment_dt)
         expiry = _utc_text(moment_dt + timedelta(seconds=lease_seconds))
+        instance_id = worker_instance_id or worker_id
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
+            generation = self._assert_worker_generation(db, instance_id, runtime_generation)
             row = db.execute("SELECT mission_id FROM mission_queue WHERE state IN (?, ?, ?) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?) ORDER BY available_at,mission_id LIMIT 1", (WorkerMissionState.QUEUED.value, WorkerMissionState.SCHEDULED.value, WorkerMissionState.SLEEPING.value, moment, moment)).fetchone()
             if row is None:
                 return None
             mission_id = row[0]
             updated = db.execute(
-                "UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=?, lease_epoch=lease_epoch+1 "
+                "UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=?, worker_instance_id=?, runtime_generation=?, lease_epoch=lease_epoch+1 "
                 "WHERE mission_id=? AND state IN (?, ?, ?) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
                 (
                     WorkerMissionState.EXECUTING.value,
                     moment,
                     worker_id,
                     expiry,
+                    instance_id,
+                    generation,
                     mission_id,
                     WorkerMissionState.QUEUED.value,
                     WorkerMissionState.SCHEDULED.value,
@@ -166,7 +250,7 @@ class MissionQueue:
             if updated.rowcount != 1:
                 raise LeaseLostError("queue claim changed before commit")
             claimed = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if claimed is None:
@@ -182,6 +266,8 @@ class MissionQueue:
         error: str = "",
         worker_id: str | None = None,
         lease_epoch: int | None = None,
+        runtime_generation: int | None = None,
+        worker_instance_id: str | None = None,
         now: str | None = None,
     ) -> QueueItem:
         if not isinstance(worker_id, str) or not worker_id.strip():
@@ -191,25 +277,27 @@ class MissionQueue:
         moment = _utc_text(_utc_datetime(now, field_name="now"))
         next_available = _utc_text(_utc_datetime(available_at, field_name="available_at")) if available_at is not None else None
         terminal = state.value in {"completed", "failed", "cancelled", "needs_input", "partial_success"}
+        instance_id = worker_instance_id or worker_id
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
+            generation = self._assert_worker_generation(db, instance_id, runtime_generation)
             if terminal:
                 updated = db.execute(
                     "UPDATE mission_queue SET state=?,available_at=COALESCE(?,available_at),last_error=?,"
-                    "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL "
-                    "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND lease_expires_at > ?",
-                    (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, moment),
+                    "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0 "
+                    "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND lease_expires_at > ?",
+                    (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, instance_id, generation, moment),
                 )
             else:
                 updated = db.execute(
                     "UPDATE mission_queue SET state=?,available_at=COALESCE(?,available_at),last_error=? "
-                    "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND lease_expires_at > ?",
-                    (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, moment),
+                    "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND lease_expires_at > ?",
+                    (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, instance_id, generation, moment),
                 )
             if updated.rowcount != 1:
                 raise LeaseLostError("worker lease is expired, superseded, or no longer current")
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -226,6 +314,8 @@ class MissionQueue:
         lease_epoch: int | None = None,
         available_at: str | None = None,
         error: str = "",
+        runtime_generation: int | None = None,
+        worker_instance_id: str | None = None,
         now: str | None = None,
     ) -> QueueItem:
         """Release a current live claim into an explicit nonterminal state."""
@@ -237,18 +327,20 @@ class MissionQueue:
             raise LeaseLostError("worker mutation requires a lease epoch")
         moment = _utc_text(_utc_datetime(now, field_name="now"))
         next_available = _utc_text(_utc_datetime(available_at, field_name="available_at")) if available_at is not None else None
+        instance_id = worker_instance_id or worker_id
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
+            generation = self._assert_worker_generation(db, instance_id, runtime_generation)
             updated = db.execute(
                 "UPDATE mission_queue SET state=?,available_at=COALESCE(?,available_at),last_error=?,"
-                "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL "
-                "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND lease_expires_at > ?",
-                (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, moment),
+                "claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0 "
+                "WHERE mission_id=? AND lease_owner=? AND state=? AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND lease_expires_at > ?",
+                (state.value, next_available, error, mission_id, worker_id, WorkerMissionState.EXECUTING.value, lease_epoch, instance_id, generation, moment),
             )
             if updated.rowcount != 1:
                 raise LeaseLostError("worker lease is expired, superseded, or no longer current")
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -256,7 +348,7 @@ class MissionQueue:
             item = self._item_from_row(row)
         return item
 
-    def heartbeat(self, mission_id: str, *, worker_id: str, lease_epoch: int | None = None, now: str | None = None, lease_seconds: int = 60) -> QueueItem:
+    def heartbeat(self, mission_id: str, *, worker_id: str, lease_epoch: int | None = None, runtime_generation: int | None = None, worker_instance_id: str | None = None, now: str | None = None, lease_seconds: int = 60) -> QueueItem:
         if not worker_id.strip():
             raise LeaseLostError("worker heartbeat requires a lease owner")
         if lease_epoch is None:
@@ -266,17 +358,19 @@ class MissionQueue:
         moment_dt = _utc_datetime(now, field_name="now")
         moment = _utc_text(moment_dt)
         expiry = _utc_text(moment_dt + timedelta(seconds=lease_seconds))
+        instance_id = worker_instance_id or worker_id
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
+            generation = self._assert_worker_generation(db, instance_id, runtime_generation)
             updated = db.execute(
                 "UPDATE mission_queue SET lease_expires_at=? WHERE mission_id=? AND state=? AND lease_owner=? "
-                "AND lease_epoch=? AND lease_expires_at > ?",
-                (expiry, mission_id, WorkerMissionState.EXECUTING.value, worker_id, lease_epoch, moment),
+                "AND lease_epoch=? AND worker_instance_id=? AND runtime_generation=? AND lease_expires_at > ?",
+                (expiry, mission_id, WorkerMissionState.EXECUTING.value, worker_id, lease_epoch, instance_id, generation, moment),
             )
             if updated.rowcount != 1:
                 raise LeaseLostError("worker lease is expired, superseded, or no longer current")
             row = db.execute(
-                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch FROM mission_queue WHERE mission_id=?",
+                "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
             ).fetchone()
             if row is None:
@@ -292,7 +386,7 @@ class MissionQueue:
             if not rows:
                 return []
             updated = db.execute(
-                "UPDATE mission_queue SET state=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, lease_epoch=lease_epoch+1, last_error=? "
+                "UPDATE mission_queue SET state=?, claimed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, worker_instance_id=NULL, runtime_generation=0, lease_epoch=lease_epoch+1, last_error=? "
                 "WHERE state=? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
                 (WorkerMissionState.QUEUED.value, "worker lease expired", WorkerMissionState.EXECUTING.value, moment),
             )
@@ -301,7 +395,7 @@ class MissionQueue:
             recovered = []
             for (mission_id,) in rows:
                 row = db.execute(
-                    "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch FROM mission_queue WHERE mission_id=?",
+                    "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation FROM mission_queue WHERE mission_id=?",
                     (mission_id,),
                 ).fetchone()
                 if row is None:
@@ -333,7 +427,11 @@ class MissionWorker:
             raise ValueError("lease_seconds must be positive")
         self.queue = queue
         self.runtime_factory = runtime_factory
-        self.worker_id = worker_id
+        self.identity = queue.register_worker(worker_id)
+        self.logical_worker_id = self.identity.worker_id
+        self.worker_instance_id = self.identity.worker_instance_id
+        self.runtime_generation = self.identity.runtime_generation
+        self.worker_id = self.identity.worker_id
         self.lease_seconds = lease_seconds
 
     def enqueue(self, mission_id: str) -> QueueItem:
@@ -342,10 +440,13 @@ class MissionWorker:
     def recover_after_restart(self, *, now: str | None = None) -> list[QueueItem]:
         return self.queue.recover_after_restart(now=now)
 
+    def stop(self) -> None:
+        self.queue.deactivate_worker(self.identity)
+
     def run_once(self, *, now: str | None = None, max_slices: int | None = None) -> QueueItem | None:
         # `now` is a claim-time override only. Renewals and writes use live UTC
         # time so a frozen caller timestamp cannot keep an expired lease alive.
-        item = self.queue.claim_next(now=now, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+        item = self.queue.claim_next(now=now, worker_id=self.worker_id, lease_seconds=self.lease_seconds, worker_instance_id=self.worker_instance_id, runtime_generation=self.runtime_generation)
         if item is None:
             return None
 
@@ -354,6 +455,8 @@ class MissionWorker:
                 item.mission_id,
                 worker_id=self.worker_id,
                 lease_epoch=item.lease_epoch,
+                runtime_generation=self.runtime_generation,
+                worker_instance_id=self.worker_instance_id,
                 lease_seconds=self.lease_seconds,
             )
 
@@ -377,6 +480,8 @@ class MissionWorker:
                     error="worker runtime failed; execution outcome requires reconciliation",
                     worker_id=self.worker_id,
                     lease_epoch=item.lease_epoch,
+                    runtime_generation=self.runtime_generation,
+                    worker_instance_id=self.worker_instance_id,
                 )
             except LeaseLostError:
                 return self.queue.get(item.mission_id)
@@ -401,6 +506,8 @@ class MissionWorker:
                 error=mission.error,
                 worker_id=self.worker_id,
                 lease_epoch=item.lease_epoch,
+                runtime_generation=self.runtime_generation,
+                worker_instance_id=self.worker_instance_id,
             )
         except LeaseLostError:
             # A long-running handler may finish after another worker reclaimed
@@ -476,4 +583,4 @@ class MissionScheduler:
         return self.get(schedule_id)
 
 
-__all__ = ["MissionQueue", "MissionQueue", "MissionSchedule", "MissionScheduler", "MissionWorker", "QueueItem", "WorkerMissionState"]
+__all__ = ["MissionQueue", "MissionSchedule", "MissionScheduler", "MissionWorker", "QueueItem", "WorkerIdentity", "WorkerMissionState"]

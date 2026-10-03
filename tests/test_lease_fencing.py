@@ -195,7 +195,14 @@ def test_worker_stale_completion_cannot_ack_reclaimed_same_worker_lease(tmp_path
         def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
             assert mission_id == "stale-completion"
             queue.recover_expired(now=takeover_time)
-            replacement = queue.claim_next(now=takeover_time, worker_id="worker-a", lease_seconds=60)
+            replacement_identity = queue.register_worker("worker-a")
+            replacement = queue.claim_next(
+                now=takeover_time,
+                worker_id="worker-a",
+                worker_instance_id=replacement_identity.worker_instance_id,
+                runtime_generation=replacement_identity.runtime_generation,
+                lease_seconds=60,
+            )
             assert replacement is not None
             assert replacement.lease_epoch > 1
             return completed

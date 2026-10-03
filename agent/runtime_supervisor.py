@@ -49,13 +49,18 @@ class RuntimeSupervisor:
             raise ValueError("poll_interval_seconds must be non-negative")
         self.worker = worker
         self.poll_interval_seconds = float(poll_interval_seconds)
-        self.worker_instance_id = uuid.uuid4().hex
-        # The queue lease owner is the process-instance identity, not a
-        # reusable configured worker name. V2 adds durable generation proof.
-        try:
-            self.worker.worker_id = self.worker_instance_id
-        except (AttributeError, TypeError) as exc:
-            raise TypeError("worker must allow a unique worker_id assignment") from exc
+        registered_instance = getattr(worker, "worker_instance_id", None)
+        registered_generation = getattr(worker, "runtime_generation", None)
+        if registered_instance and registered_generation is not None:
+            self.worker_instance_id = str(registered_instance)
+            self.runtime_generation: int | None = int(registered_generation)
+        else:
+            self.worker_instance_id = uuid.uuid4().hex
+            self.runtime_generation = None
+            try:
+                self.worker.worker_id = self.worker_instance_id
+            except (AttributeError, TypeError) as exc:
+                raise TypeError("worker must allow a unique worker_id assignment") from exc
         self._state = SupervisorState.STARTING
         self._lock = threading.RLock()
         self._stop_requested = threading.Event()
@@ -82,6 +87,7 @@ class RuntimeSupervisor:
                 "state": self._state.value,
                 "pid": os.getpid(),
                 "worker_instance_id": self.worker_instance_id,
+                "runtime_generation": self.runtime_generation,
                 "started_at": self._started_at,
                 "last_poll_at": self._last_poll_at,
                 "poll_count": self._poll_count,
@@ -152,9 +158,9 @@ class RuntimeSupervisor:
         """Poll until signalled, bounded by max_iterations when used in tests."""
         if max_iterations is not None and max_iterations < 0:
             raise ValueError("max_iterations must be non-negative")
-        self.start()
         iterations = 0
         try:
+            self.start()
             while self.state is SupervisorState.RUNNING:
                 if self._stop_requested.is_set() or (stop_event is not None and stop_event.is_set()):
                     self.request_stop()
@@ -167,7 +173,17 @@ class RuntimeSupervisor:
                 if result is None and self.poll_interval_seconds:
                     self._stop_requested.wait(self.poll_interval_seconds)
         finally:
+            stop = getattr(self.worker, "stop", None)
+            stop_error: Exception | None = None
+            if callable(stop):
+                try:
+                    stop()
+                except Exception as exc:
+                    stop_error = exc
             with self._lock:
+                if stop_error is not None and self._state in {SupervisorState.RUNNING, SupervisorState.DRAINING}:
+                    self._error_code = type(stop_error).__name__
+                    self._transition_locked(SupervisorState.FAILED)
                 if self._state is SupervisorState.RUNNING:
                     self._transition_locked(SupervisorState.DRAINING)
                 if self._state is SupervisorState.DRAINING:
