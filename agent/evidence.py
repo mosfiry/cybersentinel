@@ -39,6 +39,8 @@ class Evidence:
     fence_id: str = ""
 
     def __post_init__(self):
+        if type(self.confidence) is not int or not 0 <= self.confidence <= 10:
+            raise ValueError("evidence confidence must be an integer from 0 to 10")
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
         if not self.evidence_id:
@@ -66,10 +68,27 @@ def observed(claim: str, source: str, evidence: Any, confidence: int = 10, *, re
 
 def verify_chain(records: list[dict]) -> bool:
     previous = ""
+    seen_evidence_ids: set[str] = set()
     for expected_sequence, record in enumerate(records, start=1):
-        item = Evidence(**record)
-        if item.sequence != expected_sequence or item.previous_hash != previous or not item.verify():
+        if (
+            not isinstance(record, dict)
+            or not record.get("evidence_id")
+            or not record.get("current_hash")
+            or "previous_hash" not in record
+        ):
             return False
+        try:
+            item = Evidence(**record)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            item.evidence_id in seen_evidence_ids
+            or item.sequence != expected_sequence
+            or item.previous_hash != previous
+            or not item.verify()
+        ):
+            return False
+        seen_evidence_ids.add(item.evidence_id)
         previous = item.current_hash
     return True
 
@@ -213,6 +232,12 @@ class EvidenceChainStore:
             receipt = self._receipt(record.to_dict())
             if any(isinstance(existing, dict) and existing.get("evidence_id") == receipt["evidence_id"] for existing in refs):
                 raise ExecutionFenceError("duplicate evidence identity")
+            duplicate = db.execute(
+                "SELECT 1 FROM evidence_chain WHERE json_extract(payload,'$.evidence_id')=? LIMIT 1",
+                (record.evidence_id,),
+            ).fetchone()
+            if duplicate:
+                raise ExecutionFenceError("duplicate evidence identity")
             updated_refs = [*refs, receipt]
             stored_mission.progress["execution_evidence_refs"] = updated_refs
             encoded_mission_payload = stored_mission.to_dict()
@@ -250,6 +275,12 @@ class EvidenceChainStore:
             # Evidence factories may precompute a hash before the chain position is known.
             payload.pop("current_hash", None)
             record = Evidence(**payload)
+            duplicate = db.execute(
+                "SELECT 1 FROM evidence_chain WHERE json_extract(payload,'$.evidence_id')=? LIMIT 1",
+                (record.evidence_id,),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("duplicate evidence identity")
             db.execute(
                 "INSERT INTO evidence_chain(sequence,current_hash,payload) VALUES(?,?,?)",
                 (sequence, record.current_hash, json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)),
@@ -299,27 +330,47 @@ class EvidenceChainStore:
     def verify(self) -> bool:
         try:
             records = self.list()
+            return self.verify_records(
+                records,
+                mission_store=self.mission_store,
+                require_execution_fence=self.require_execution_fence,
+            )
+        except (sqlite3.Error, KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            return False
+
+    @classmethod
+    def verify_records(
+        cls,
+        records: list[dict[str, Any]],
+        *,
+        mission_store: Any | None = None,
+        require_execution_fence: bool = False,
+    ) -> bool:
+        try:
             if not verify_chain(records):
                 return False
-            if self.mission_store is None:
-                return True
+            if mission_store is None:
+                return not require_execution_fence or all(
+                    isinstance(record, dict) and bool(record.get("fence_id"))
+                    for record in records
+                )
             for record in records:
                 if not isinstance(record, dict):
                     return False
                 if not record.get("fence_id"):
-                    if self.require_execution_fence:
+                    if require_execution_fence:
                         return False
                     continue
                 mission_id = str(record.get("mission_id", ""))
                 if not mission_id:
                     return False
-                mission = self.mission_store.load(mission_id)
+                mission = mission_store.load(mission_id)
                 if mission is None:
                     return False
                 refs = mission.progress.get("execution_evidence_refs", [])
                 if not isinstance(refs, list):
                     return False
-                expected = self._receipt(record)
+                expected = cls._receipt(record)
                 if not any(
                     isinstance(receipt, dict)
                     and all(receipt.get(name) == value for name, value in expected.items())

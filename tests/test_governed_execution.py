@@ -314,9 +314,17 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
         status, created = request("POST", "/api/missions", {"objective": "api mission", "plan": plan})
         assert status == 201
         mission_id = created["mission_id"]
-        for suffix in ("", "/status", "/timeline", "/evidence", "/artifacts", "/logs"):
+        report_chain = tmp_path / "evidence_chain.db"
+        if not report_chain.exists():
+            EvidenceChainStore(report_chain)
+        for suffix in ("", "/status", "/timeline", "/evidence", "/artifacts", "/logs", "/report"):
+            chain_before = report_chain.read_bytes() if suffix == "/report" else None
             code, body = request("GET", f"/api/missions/{mission_id}{suffix}")
             assert code == 200 and body["ok"] is True
+            if suffix == "/report":
+                assert body["report"]["schema_version"] == "cybersentinel.mission-report.v1"
+                assert body["report"]["mission_summary"]["outcome"] == "UNKNOWN"
+                assert report_chain.read_bytes() == chain_before
         code, _ = request("POST", f"/api/missions/{mission_id}/start")
         assert code == 200
         code, _ = request("POST", f"/api/missions/{mission_id}/pause")
@@ -333,6 +341,7 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
         assert code == 200
         assert request("GET", f"/api/missions/{mission_id}", bridge_token="wrong")[0] == 401
         assert request("GET", f"/api/missions/{mission_id}", token="wrong")[0] == 403
+        assert request("GET", f"/api/missions/{mission_id}/report", token="wrong")[0] == 403
     finally:
         server.shutdown()
         server.server_close()

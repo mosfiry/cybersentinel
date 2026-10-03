@@ -223,7 +223,7 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "effects" and len(parts) == 2:
                     value = service.effects(mission_id, owner_session_token=auth["session_id"])
                     return self._send(200, {"ok": True, "mission_id": mission_id, "effects": value})
-                values = {"status": service.status, "timeline": service.timeline, "evidence": service.evidence, "artifacts": service.artifacts, "logs": service.logs}
+                values = {"status": service.status, "timeline": service.timeline, "evidence": service.evidence, "artifacts": service.artifacts, "logs": service.logs, "report": service.report}
                 if len(parts) > 2 or action not in values:
                     return self._send(404, {"ok": False, "error": "unknown_mission_action"})
                 return self._send(200, {"ok": True, "mission_id": mission_id, action: values[action](mission_id, owner_session_token=auth["session_id"])})

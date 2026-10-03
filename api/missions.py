@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from agent.effect_reconciliation import (
     EffectReconciliationAction,
@@ -13,6 +17,8 @@ from agent.mission import Mission, MissionStatus
 from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue, MissionScheduler, WorkerMissionState
 from agent.planning import Plan
+from agent.evidence import EvidenceChainStore
+from agent.reporting import build_mission_report
 from security.mission_authorization import MissionAuthorizationSnapshot
 from security.owner_policy import OwnerAuthenticationEvidence
 
@@ -609,6 +615,51 @@ class MissionService:
     def logs(self, mission_id: str, *, owner_session_token: str | None = None) -> list[dict[str, Any]]:
         mission = self._authorized_mission(mission_id, owner_session_token, allow_unbound_read=True)[0]
         return list(mission.progress.get("logs", ()))
+
+    def report(self, mission_id: str, *, owner_session_token: str | None = None) -> dict[str, Any]:
+        mission = self._authorized_mission(
+            mission_id, owner_session_token, allow_unbound_read=True
+        )[0]
+        evidence_path = Path(self.runtime.store.db_path).with_name("evidence_chain.db")
+        chain_integrity = "NOT_PRESENT"
+        mission_records: list[dict[str, Any]] = []
+        if evidence_path.is_file():
+            try:
+                uri = "file:" + quote(str(evidence_path.resolve()), safe="/:") + "?mode=ro"
+                with sqlite3.connect(uri, uri=True) as db:
+                    rows = db.execute(
+                        "SELECT payload FROM evidence_chain ORDER BY sequence"
+                    ).fetchall()
+                records = [json.loads(row[0]) for row in rows]
+                chain_integrity = (
+                    "VALID"
+                    if EvidenceChainStore.verify_records(
+                        records,
+                        mission_store=self.runtime.store,
+                    )
+                    else "INVALID"
+                )
+                mission_records = [
+                    item
+                    for item in records
+                    if isinstance(item, dict)
+                    and (
+                        item.get("mission_id") == mission.mission_id
+                        or (
+                            not item.get("mission_id")
+                            and mission.request_id
+                            and item.get("request_id") == mission.request_id
+                        )
+                    )
+                ]
+            except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
+                chain_integrity = "UNREADABLE"
+                mission_records = []
+        return build_mission_report(
+            mission,
+            execution_evidence=mission_records,
+            evidence_chain_integrity=chain_integrity,
+        )
 
     def _load(self, mission_id: str) -> Mission:
         mission = self.runtime.store.load(mission_id)

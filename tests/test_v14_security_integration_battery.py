@@ -214,6 +214,12 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
 
     assert provider.calls == 3
     assert mission.status is MissionStatus.GOAL_COMPLETED
+    goal_criterion = mission.completion_criteria[0]["criterion_id"]
+    goal_evidence = [item for item in mission.evidence if item.get("criterion_id") == goal_criterion]
+    assert len(goal_evidence) == 1
+    assert goal_evidence[0]["source"] == "run_project_tests"
+    assert goal_evidence[0]["provenance"]["tool_call_id"].endswith("native-workspace-call")
+    assert not goal_evidence[0]["provenance"]["tool_call_id"].endswith("native-status-call")
     evidence_store = EvidenceChainStore(
         tmp_path / "evidence_chain.db",
         mission_store=store,

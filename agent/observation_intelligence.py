@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
 import json
@@ -182,7 +182,13 @@ class ObservationInterpreter:
         proposal.setdefault("summary", base.summary)
         proposal.setdefault("provenance", {"source": "model_proposal", "base": base.provenance})
         try:
-            return self._validate_model_proposal(proposal, base)
+            candidate = self._validate_model_proposal(proposal, base)
+            # This marker is written after parsing and validation, so model output
+            # cannot impersonate deterministic evidence provenance.
+            return replace(
+                candidate,
+                provenance={**candidate.provenance, "proposal_origin": "model"},
+            )
         except (TypeError, ValueError, KeyError) as exc:
             return ObservationInterpretationProposal(
                 **{**base.__dict__, "provenance": {**base.provenance, "model_status": "proposal_rejected", "model_error": type(exc).__name__}}

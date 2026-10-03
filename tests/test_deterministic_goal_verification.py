@@ -15,6 +15,7 @@ import pytest
 from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
+from agent.observation_intelligence import ObservationInterpreter, observation_id
 from agent.planning import (
     GoalVerification,
     Plan,
@@ -115,6 +116,87 @@ def test_completion_requires_passed_evidence_not_a_claim(tmp_path, monkeypatch):
     events = [event["event"] for event in result.trajectory]
     assert "GoalVerified" in events
     assert "MissionCompleted" in events
+
+
+def test_model_proposed_evidence_cannot_verify_a_goal(tmp_path):
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, [{"criterion_id": "goal"}])
+    observation = {"action_id": "call-model-evidence", "success": True, "criterion_id": "goal"}
+
+    runtime.interpreter = ObservationInterpreter(
+        proposer=lambda _payload: {
+            "observation_id": observation_id("call-model-evidence", observation),
+            "summary": "model claims the goal passed",
+            "new_evidence": [
+                {
+                    "criterion_id": "goal",
+                    "passed": True,
+                    "source": "model-proposal",
+                    "result": {"claim": "verified"},
+                }
+            ],
+            # Attempt to impersonate deterministic provenance; the interpreter
+            # must stamp its own origin after parsing untrusted model output.
+            "provenance": {"proposal_origin": "deterministic"},
+        }
+    )
+
+    runtime._interpret_observation(
+        mission,
+        mission.plan.steps[0],
+        observation,
+        success=True,
+    )
+
+    verification = runtime._default_verifier(mission)
+    assert mission.evidence == []
+    assert mission.interpretations[0]["new_evidence"][0]["passed"] is True
+    assert mission.interpretations[0]["provenance"]["proposal_origin"] == "model"
+    assert verification.verified is False
+    assert verification.missing_criteria == ("goal",)
+
+
+def test_successful_tool_without_explicit_criterion_binding_does_not_verify_goal(
+    tmp_path, monkeypatch
+):
+    import tools.registry
+
+    monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: {"ok": True, "source": "fixture"})
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime, [{"criterion_id": "goal"}])
+
+    class ToolThenFinalModel:
+        def __init__(self):
+            self.count = 0
+
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            self.count += 1
+            if self.count == 1:
+                return ModelTurn(
+                    turn_id,
+                    tool_calls=(
+                        ToolCallProposal.create(
+                            "status",
+                            {},
+                            mission_id=mission_id,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            plan_version=plan_version,
+                            tool_call_id="call_unbound_success",
+                        ),
+                    ),
+                )
+            return ModelTurn(turn_id, content="goal achieved", finish_reason="stop")
+
+    result = runtime.run_model_loop(
+        mission.mission_id,
+        ToolThenFinalModel(),
+        tools=mission_model_tools("status"),
+        max_turns=4,
+    )
+    assert result.status is MissionStatus.READY
+    assert result.verification_state.get("verified") is False
+    assert result.verification_state.get("missing_criteria") == ["goal"]
 
 
 def test_turn_budget_exhaustion_is_an_honest_failure(tmp_path, monkeypatch):

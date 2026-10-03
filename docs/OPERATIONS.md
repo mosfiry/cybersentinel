@@ -16,6 +16,10 @@ Optional OpenAI-compatible providers may be configured through `LLM_*`, `LOCAL_L
 
 `GET /api/health` remains the backward-compatible, unauthenticated process-liveness probe; `GET /api/health/live` reports the same liveness explicitly. `GET /api/health/ready` requires the transport-only `X-CyberSentinel-Token` header and returns `200` only when the core SQLite store passes a read-only integrity/schema check and an active Owner account has been initialized. It returns `503` while the database or Owner setup is unavailable; the probe does not create a database, run migrations, expose paths, or establish Owner identity. Provider configuration is reported as unverified without making a network request, and worker health remains an independent Compose process check; neither is inferred from bridge readiness.
 
+### Owner-scoped mission reports
+
+`GET /api/missions/{mission_id}/report` uses the existing bridge transport token and live Owner-session checks; it is not a public report endpoint. It reads mission evidence and the durable evidence chain without running a tool, contacting a provider, or modifying either SQLite database. `VERIFIED` requires the persisted completed state, recorded runtime verification, required criteria supported by deterministic tool/observation provenance, and a valid evidence chain when one is present. Model proposals and legacy evidence without the deterministic provenance marker remain explicitly unverified; invalid or unreadable chain state withholds a verified outcome. The report's Owner-approval field reflects only the mission authorization snapshot and does not assert current authority or action-level approval.
+
 ## Single-host container runtime (loopback only)
 
 The repository includes a Docker Compose target for the source-compatible runtime: one HTTP bridge and one supervised mission worker sharing a single local named `cybersentinel-state` volume for database/policy state and workspace files. This is a single-host configuration; it is not a public internet deployment and does not claim high availability. SQLite state must remain on a local filesystem, with one configured worker.
