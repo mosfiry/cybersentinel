@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from pathlib import Path
@@ -19,6 +20,19 @@ TOOL_TIMEOUTS = {"run_project_tests": 65, "refresh_intel": 30}
 
 class ToolTimeout(TimeoutError):
     pass
+
+
+def _default_input_schema(argument_type: type | None) -> dict[str, Any]:
+    if argument_type is str:
+        return {
+            "type": "object",
+            "properties": {"query": {"type": "string", "maxLength": MAX_ARG_LENGTH}},
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+    if argument_type is None:
+        return {"type": "object", "properties": {}, "additionalProperties": False}
+    return {}
 
 
 @dataclass(frozen=True)
@@ -45,6 +59,10 @@ class ToolSpec:
     effect_provider: str = ""
     idempotency_supported: bool = False
 
+    def __post_init__(self) -> None:
+        if not self.input_schema:
+            object.__setattr__(self, "input_schema", _default_input_schema(self.argument_type))
+
     @property
     def tool_id(self) -> str:
         return self.name
@@ -60,7 +78,7 @@ class ToolSpec:
             "tool_id": self.tool_id,
             "version": self.version,
             "description": self.description,
-            "input_schema": self.input_schema or {"type": "string" if self.argument_type is str else "null"},
+            "input_schema": deepcopy(self.input_schema),
             "output_schema": self.output_schema or {"type": "object"},
             "risk_class": self.risk_class,
             "required_authorization": self.required_authorization,
@@ -83,11 +101,36 @@ class ToolSpec:
             return True, "valid"
         if not isinstance(argument, self.argument_type):
             return False, f"{self.name} requires a string argument"
+        if len(argument) > MAX_ARG_LENGTH:
+            return False, "tool argument exceeds maximum length"
+        try:
+            argument.encode("utf-8")
+        except UnicodeError:
+            return False, "tool argument has invalid text encoding"
         if not argument.strip():
             return False, f"{self.name} requires a non-empty string argument"
-        if len(argument.strip()) > MAX_ARG_LENGTH:
-            return False, "tool argument exceeds maximum length"
         return True, "valid"
+
+    def validate_input(self, arguments: Any) -> tuple[bool, str, str | None]:
+        """Validate a provider argument object against the exact registered schema.
+
+        Scalar/None inputs remain accepted for existing internal callers; model
+        adapters must pass the complete object so extra and missing keys cannot
+        be hidden by extracting only ``query``.
+        """
+        if not isinstance(arguments, dict):
+            valid, reason = self.validate(arguments)
+            return valid, reason, arguments if valid else None
+        if self.input_schema != _default_input_schema(self.argument_type):
+            return False, "tool input schema is unsupported", None
+        if self.argument_type is None:
+            if arguments:
+                return False, f"{self.name} does not accept properties", None
+            return True, "valid", None
+        if len(arguments) != 1 or "query" not in arguments:
+            return False, "tool arguments must contain exactly the required query property", None
+        valid, reason = self.validate(arguments["query"])
+        return valid, reason, arguments["query"] if valid else None
 
 
 def _status(_):
@@ -250,6 +293,8 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
+        if spec.input_schema != _default_input_schema(spec.argument_type):
+            raise ValueError(f"unsupported input schema for {spec.name}")
         registry[spec.name] = spec
     return registry
 
@@ -275,17 +320,7 @@ def tool_definitions() -> list[dict[str, Any]]:
     """Build provider-neutral tool metadata from the canonical registry."""
     definitions: list[dict[str, Any]] = []
     for spec in REGISTRY.values():
-        parameters: dict[str, Any] = {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        }
-        if spec.argument_type is str:
-            parameters["properties"]["query"] = {
-                "type": "string",
-                "maxLength": MAX_ARG_LENGTH,
-            }
-            parameters["required"] = ["query"]
+        parameters = deepcopy(spec.input_schema)
         definitions.append({
             "name": spec.name,
             "description": spec.description[:512],
@@ -301,10 +336,13 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None):
+def execute(name: str, argument: Any = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+    valid, reason, argument = spec.validate_input(argument)
+    if not valid:
+        raise ValueError(reason)
     if (mission_id is not None or mission_authorization is not None or spec.effect_provider) and execution_fence is None:
         from agent.execution_fence import ExecutionFenceError
         raise ExecutionFenceError(
@@ -350,9 +388,6 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
         allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
         if not allowed:
             raise PermissionError("mission authorization blocked: " + reason)
-    valid, reason = spec.validate(argument)
-    if not valid:
-        raise ValueError(reason)
     if execution_fence is not None:
         execution_fence.assert_dispatch(
             mission_id=str(mission_id or ""),

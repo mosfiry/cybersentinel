@@ -5,13 +5,24 @@ import hashlib
 import threading
 import time
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any, Callable
 
 from agent.context import ContextEngine, ExecutionState, RuntimeLimits
 from agent.memory import ConversationMemory, MemoryProvider, MemoryType, TrustClassification
-from agent.provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderError, ToolCall
+from agent.provider_api import (
+    MAX_PROVIDER_CALL_ID_CHARS,
+    MAX_PROVIDER_LABEL_CHARS,
+    MAX_PROVIDER_TEXT_CHARS,
+    MAX_PROVIDER_TOOL_CALLS,
+    MAX_PROVIDER_TOOL_NAME_CHARS,
+    CapabilityUnsupported,
+    InvalidModelResponse,
+    ProviderError,
+    ToolCall,
+)
 from agent.task import Task, TaskStatus
 from agent.task_manager import TaskManager, TaskVersionConflictError
 from agent.planning import select_reasoning_profile
@@ -42,10 +53,7 @@ class AgentTaskRuntime:
     def _schemas() -> list[dict[str, Any]]:
         schemas = []
         for spec in REGISTRY.values():
-            parameters = {"type": "object", "properties": {}, "additionalProperties": False}
-            if spec.argument_type is str:
-                parameters["properties"]["query"] = {"type": "string", "maxLength": 256}
-                parameters["required"] = ["query"]
+            parameters = deepcopy(spec.input_schema)
             schemas.append({"type": "function", "function": {"name": spec.name, "description": spec.description[:512], "parameters": parameters}})
         return schemas
 
@@ -64,8 +72,9 @@ class AgentTaskRuntime:
         raw_calls = response.get("tool_calls")
         if raw_calls is None:
             return calls
-        if not isinstance(raw_calls, (list, tuple)):
+        if not isinstance(raw_calls, (list, tuple)) or len(raw_calls) > MAX_PROVIDER_TOOL_CALLS:
             raise InvalidModelResponse("task model returned malformed tool calls")
+        seen_call_ids: set[str] = set()
         for item in raw_calls:
             if isinstance(item, ToolCall):
                 name, args, call_id = item.name, item.arguments, item.call_id
@@ -75,27 +84,61 @@ class AgentTaskRuntime:
                 call_id = item.get("id")
             else:
                 raise InvalidModelResponse("task model returned a malformed tool call")
-            if not isinstance(name, str) or not name.strip():
+            if not isinstance(name, str) or len(name) > MAX_PROVIDER_TOOL_NAME_CHARS or not name.strip():
                 raise InvalidModelResponse("task model returned a tool call without a valid name")
             if args is None:
                 args = {}
             if not isinstance(args, dict):
                 raise InvalidModelResponse("task model returned non-object tool arguments")
-            calls.append(ToolCall(name, args, str(call_id or uuid.uuid4().hex)))
+            spec = get_tool(name)
+            if spec is None:
+                raise InvalidModelResponse("task model returned an unknown tool name")
+            valid, _reason, _normalized = spec.validate_input(args)
+            if not valid:
+                raise InvalidModelResponse("task model returned tool arguments outside the registered schema")
+            if call_id is None:
+                call_id = uuid.uuid4().hex
+            elif not isinstance(call_id, str):
+                raise InvalidModelResponse("task model returned malformed tool-call identity")
+            elif call_id == "":
+                call_id = uuid.uuid4().hex
+            elif len(call_id) > MAX_PROVIDER_CALL_ID_CHARS:
+                raise InvalidModelResponse("task model returned malformed tool-call identity")
+            try:
+                name.encode("utf-8")
+                call_id.encode("utf-8")
+            except UnicodeError as exc:
+                raise InvalidModelResponse("task model returned invalid tool-call identity encoding") from exc
+            if call_id in seen_call_ids:
+                raise InvalidModelResponse("task model returned duplicate tool-call identifiers")
+            seen_call_ids.add(call_id)
+            calls.append(ToolCall(name, args, call_id))
         return calls
 
     @staticmethod
     def _parse(response: dict[str, Any]) -> tuple[str, Any]:
         if not isinstance(response, dict):
             raise InvalidModelResponse("task model returned a non-object response")
-        calls = AgentTaskRuntime._tool_calls(response)
-        if calls:
-            return "tool_calls", calls
+        for field_name in ("provider", "model", "capability"):
+            metadata_value = response.get(field_name, "")
+            if not isinstance(metadata_value, str) or len(metadata_value) > MAX_PROVIDER_LABEL_CHARS:
+                raise InvalidModelResponse("task model returned malformed response identity metadata")
+            try:
+                metadata_value.encode("utf-8")
+            except UnicodeError as exc:
+                raise InvalidModelResponse("task model returned invalid response identity encoding") from exc
         content = response.get("content", "")
         if content is None:
             content = ""
-        if not isinstance(content, str):
-            raise InvalidModelResponse("task model returned malformed text")
+        if not isinstance(content, str) or len(content) > MAX_PROVIDER_TEXT_CHARS:
+            raise InvalidModelResponse("task model returned malformed or oversized text")
+        try:
+            content.encode("utf-8")
+        except UnicodeError as exc:
+            raise InvalidModelResponse("task model returned invalid text encoding") from exc
+        calls = AgentTaskRuntime._tool_calls(response)
+        if calls:
+            return "tool_calls", calls
         try:
             value = json.loads(content)
         except json.JSONDecodeError:
@@ -107,12 +150,18 @@ class AgentTaskRuntime:
         if isinstance(value, dict) and value.get("type") == "tool_call":
             name = value.get("name")
             arguments = value.get("arguments", {})
-            if not isinstance(name, str) or not name.strip():
+            if not isinstance(name, str) or len(name) > MAX_PROVIDER_TOOL_NAME_CHARS or not name.strip():
                 raise InvalidModelResponse("task model returned a tool call without a valid name")
             if arguments is None:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise InvalidModelResponse("task model returned non-object tool arguments")
+            spec = get_tool(name)
+            if spec is None:
+                raise InvalidModelResponse("task model returned an unknown tool name")
+            valid, _reason, _normalized = spec.validate_input(arguments)
+            if not valid:
+                raise InvalidModelResponse("task model returned tool arguments outside the registered schema")
             return "tool_calls", [ToolCall(name, arguments, uuid.uuid4().hex)]
         return "final", content
 
@@ -420,9 +469,9 @@ class AgentTaskRuntime:
             if latest.task_version != task.task_version:
                 raise TaskVersionConflictError("task row changed while awaiting model response")
             task.execution_state["reasoning_profile"] = select_reasoning_profile(task.objective).to_dict()
+            kind, value = self._parse(response)
             task.provider = response.get("provider", task.provider)
             task.model = response.get("model", task.model)
-            kind, value = self._parse(response)
             if kind == "final":
                 task.result = {"answer": value, "provenance": {"provider": task.provider, "model": task.model}, "context_hash": context.context_hash}
                 add_conversation_message(task.conversation_id, "assistant", value, {"task_id": task.task_id, "step": task.current_step})
@@ -438,7 +487,7 @@ class AgentTaskRuntime:
                 seen_batch_ids = set()
                 for call in value:
                     if call.call_id and (call.call_id in seen_batch_ids or task.has_tool_call(call.call_id)):
-                        continue
+                        raise InvalidModelResponse("task model returned duplicate tool-call identifiers")
                     if call.call_id:
                         seen_batch_ids.add(call.call_id)
                     unique_calls.append(call)
