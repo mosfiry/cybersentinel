@@ -14,7 +14,7 @@ from agent.memory import ConversationMemory, MemoryProvider, MemoryType, TrustCl
 from agent.provider_api import ToolCall
 from agent.provider_api import CapabilityUnsupported
 from agent.task import Task, TaskStatus
-from agent.task_manager import TaskManager
+from agent.task_manager import TaskManager, TaskVersionConflictError
 from agent.planning import select_reasoning_profile
 from core.db import add_conversation_message, conversation_messages, ensure_conversation
 from security.authorization import authorize_tool
@@ -330,6 +330,27 @@ class AgentTaskRuntime:
         return None
 
     def run_slice(self, task_id: str, *, owner_session_token: str = "", owner_session_id: str | None = None) -> Task:
+        try:
+            return self._run_slice_once(task_id, owner_session_token=owner_session_token, owner_session_id=owner_session_id)
+        except TaskVersionConflictError:
+            # A concurrent control request or worker advanced the durable row.
+            # Never overwrite it with this stale in-memory snapshot.
+            latest = TaskManager.get_task(task_id)
+            if latest is None:
+                raise KeyError("unknown_task")
+            if latest.status is TaskStatus.EXECUTING and (latest.cancel_requested or latest.pause_requested):
+                try:
+                    if latest.cancel_requested:
+                        latest.update_status(TaskStatus.CANCELLED)
+                        self._event(latest, "task.cancelled")
+                    else:
+                        latest.update_status(TaskStatus.PAUSED)
+                        TaskManager.update_task(latest)
+                except TaskVersionConflictError:
+                    return TaskManager.get_task(task_id) or latest
+            return latest
+
+    def _run_slice_once(self, task_id: str, *, owner_session_token: str = "", owner_session_id: str | None = None) -> Task:
         task = TaskManager.get_task(task_id)
         if task is None:
             raise KeyError("unknown_task")
@@ -355,13 +376,19 @@ class AgentTaskRuntime:
             TaskManager.update_task(task)
             return task
         task.increment_step()
-        task.update_status(TaskStatus.WAITING_FOR_MODEL)
+        # Keep the task non-claimable while this synchronous slice is actively
+        # requesting a model response or dispatching its proposed tools.
         self._event(task, "task.started", {"step": task.current_step})
         TaskManager.update_task(task)
         try:
             context = self._context(task)
             self._event(task, "assistant.started", {"context_hash": context.context_hash})
             response = self._ask_model(context, task.objective)
+            latest = TaskManager.get_task(task_id)
+            if latest is None:
+                raise KeyError("unknown_task")
+            if latest.task_version != task.task_version:
+                raise TaskVersionConflictError("task row changed while awaiting model response")
             task.execution_state["reasoning_profile"] = select_reasoning_profile(task.objective).to_dict()
             task.provider = response.get("provider", task.provider)
             task.model = response.get("model", task.model)
@@ -377,7 +404,6 @@ class AgentTaskRuntime:
                 task.update_status(TaskStatus.NEEDS_INPUT)
                 self._event(task, "assistant.completed", {"needs_input": True})
             else:
-                task.update_status(TaskStatus.WAITING_FOR_TOOL)
                 unique_calls = []
                 seen_batch_ids = set()
                 for call in value:
@@ -408,10 +434,12 @@ class AgentTaskRuntime:
                         self._run_one(task, call, owner_session_token, owner_session_id)
                         if task.execution_state.get("recovery_required"):
                             break
-                if not task.is_terminal and task.status == TaskStatus.WAITING_FOR_TOOL and not task.execution_state.get("recovery_required"):
+                if not task.is_terminal and not task.execution_state.get("recovery_required"):
                     task.update_status(TaskStatus.WAITING_FOR_MODEL)
                 if not task.is_terminal and not task.execution_state.get("recovery_required"):
                     task.save_resume_state({"next": "model", "step": task.current_step})
+        except TaskVersionConflictError:
+            raise
         except Exception as exc:
             task.increment_retry()
             task.error = type(exc).__name__

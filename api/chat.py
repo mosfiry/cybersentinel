@@ -4,7 +4,6 @@ import json
 import uuid
 from typing import Any, Iterator
 
-from agent.task import TaskStatus
 from agent.task_manager import TaskManager
 from agent.mission_task_adapter import MissionTaskAdapter
 from agent.agent_core import AgentCore
@@ -31,6 +30,7 @@ def _agent_core() -> AgentCore:
 
 def _task_public(task) -> dict[str, Any]:
     value = task.to_dict()
+    value.pop("task_version", None)
     value["events"] = task.execution_state.get("events", [])
     return value
 
@@ -64,26 +64,27 @@ def resume_task(task_id: str, *, owner_session_token: str, run: bool = True) -> 
 
 def pause_task(task_id: str, *, owner_session_token: str) -> dict[str, Any]:
     owner = _owner_session(owner_session_token)
-    task = TaskManager.get_task(task_id)
+    task = TaskManager.request_pause(task_id, owner["session_id"])
     if task is None:
-        raise KeyError("unknown_task")
-    if task.owner_session_id and task.owner_session_id != owner["session_id"]:
-        raise PermissionError("task access denied")
-    task.request_pause()
-    task.update_status(TaskStatus.PAUSED)
-    TaskManager.update_task(task)
+        existing = TaskManager.get_task(task_id)
+        if existing is None:
+            raise KeyError("unknown_task")
+        if existing.owner_session_id and existing.owner_session_id != owner["session_id"]:
+            raise PermissionError("task access denied")
+        raise RuntimeError("task pause request could not be committed")
     return {"task": _task_public(task)}
 
 
 def cancel_task(task_id: str, *, owner_session_token: str) -> dict[str, Any]:
     owner = _owner_session(owner_session_token)
-    task = TaskManager.get_task(task_id)
+    task = TaskManager.request_cancel(task_id, owner["session_id"])
     if task is None:
-        raise KeyError("unknown_task")
-    if task.owner_session_id and task.owner_session_id != owner["session_id"]:
-        raise PermissionError("task access denied")
-    task.request_cancel()
-    TaskManager.update_task(task)
+        existing = TaskManager.get_task(task_id)
+        if existing is None:
+            raise KeyError("unknown_task")
+        if existing.owner_session_id and existing.owner_session_id != owner["session_id"]:
+            raise PermissionError("task access denied")
+        raise RuntimeError("task cancel request could not be committed")
     return {"task": _task_public(task)}
 
 

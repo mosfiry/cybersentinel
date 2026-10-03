@@ -79,7 +79,8 @@ def test_durable_tool_intent_precedes_executor_and_restart_requires_recovery(iso
 
     after_crash = TaskManager.get_task(task_id)
     assert after_crash is not None
-    assert after_crash.status == TaskStatus.WAITING_FOR_TOOL
+    # The intent is durable, but the live slice is not advertised as claimable.
+    assert after_crash.status == TaskStatus.EXECUTING
     assert any(item["tool_call_id"] == "crash-call" and item["status"] == "in_flight" for item in after_crash.tool_calls)
     assert any(event["event"] == "tool.started" and event["data"].get("tool_call_id") == "crash-call" for event in after_crash.execution_state["events"])
 

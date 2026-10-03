@@ -50,6 +50,7 @@ class Task:
     pause_requested: bool = False
     resume_state: dict[str, Any] | None = None
     authentication_method: str = "username_password"
+    task_version: int = 0
 
     @classmethod
     def create(cls, conversation_id: str, request_id: str, owner_session_id: str, objective: str, provider: str = "", model: str = "", authentication_method: str = "username_password") -> "Task":
@@ -64,6 +65,7 @@ class Task:
         data = data.copy()
         data["status"] = TaskStatus(data["status"])
         data.setdefault("authentication_method", "username_password")
+        data.setdefault("task_version", 0)
         return cls(**data)
 
     def update_status(self, new_status: TaskStatus) -> None:
