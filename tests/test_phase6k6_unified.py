@@ -68,7 +68,11 @@ def test_boolean_cannot_create_or_authorize_sensitive_context(monkeypatch, tmp_p
 def test_decision_argument_binding_blocks_confused_deputy(monkeypatch, tmp_path):
     context = make_context(monkeypatch, tmp_path)
     decision = AuthorizationDecision.issue(context, allowed=True, reason="accepted", tool="search", risk_class="read", argument="safe")
+    from tools import registry as registry_module
+    from tools.registry import ToolSpec
     from tools.registry import execute
+    spec = ToolSpec("search", "authorization-only test double", "read", True, str, lambda _value: pytest.fail("invalid decision must not dispatch"))
+    monkeypatch.setattr(registry_module, "get_tool", lambda name: spec if name == spec.name else None)
     with pytest.raises(PermissionError, match="argument-mismatched"):
         execute("search", "different", authorization_decision=decision, request_id=context.request_id)
 

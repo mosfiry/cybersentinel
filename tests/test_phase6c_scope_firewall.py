@@ -59,16 +59,18 @@ def test_scope_blocks_host_path_method_and_redirect(snapshot):
 
 
 def test_direct_registry_execution_cannot_bypass_scope(snapshot):
-    with pytest.raises(PermissionError, match="scope-bound AuthorizationDecision"):
+    from agent.execution_fence import ExecutionFenceError
+    with pytest.raises(ExecutionFenceError, match="execution fence"):
         execute("scoped_http_probe", "https://target.example.com/api")
     evidence = _issue_evidence("username_password", "scope-direct", "scope-direct")
     auth_context = AuthorizationContext("scope-direct", evidence, capture_policy_snapshot("scope-direct", evidence), scope_snapshot=snapshot)
     denied = authorize_tool(["scoped_http_probe", "https://other.example.com/api"], context=auth_context)
-    with pytest.raises(PermissionError, match="scope denied"):
+    with pytest.raises(ExecutionFenceError, match="execution fence"):
         execute("scoped_http_probe", "https://other.example.com/api", authorization_decision=denied.decision, scope_context=context("https://other.example.com/api"), request_id="scope-direct")
     allowed = authorize_tool(["scoped_http_probe", "https://target.example.com/api"], context=auth_context)
-    result = execute("scoped_http_probe", "https://target.example.com/api", authorization_decision=allowed.decision, scope_context=context(), request_id="scope-direct")
-    assert result["ok"] is True
+    assert allowed.allowed
+    with pytest.raises(ExecutionFenceError, match="execution fence"):
+        execute("scoped_http_probe", "https://target.example.com/api", authorization_decision=allowed.decision, scope_context=context(), request_id="scope-direct")
 
 
 def test_rate_limit_is_persistent_and_enforced(snapshot):
@@ -120,7 +122,7 @@ def test_canonicalization_and_snapshot_integrity(snapshot):
 def test_registry_rejects_scoped_namespace_without_firewall_metadata():
     from tools.registry import ToolSpec, build_registry
     with pytest.raises(ValueError, match="invalid registry metadata"):
-        build_registry([ToolSpec("recon.http_probe", "probe", "network-read", True, str, lambda value: value)])
+        build_registry([ToolSpec("recon.http_probe", "probe", "network-read", True, str, lambda value: value, effect_provider="fixture.network")])
 
 
 def test_scope_snapshot_write_requires_owner_token(tmp_path, monkeypatch):

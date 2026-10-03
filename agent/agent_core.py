@@ -197,6 +197,7 @@ class AgentCore:
 
     def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None) -> dict[str, Any]:
         from .execution_fence import ExecutionFenceError
+        from .external_effects import EffectRecoveryRequired
         if execution_fence is None:
             raise ExecutionFenceError("AgentCore tool dispatch requires an execution fence")
         execution_fence.assert_active_execution(mission)
@@ -234,6 +235,16 @@ class AgentCore:
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
             value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
+        except EffectRecoveryRequired as exc:
+            return {
+                "success": False,
+                "failure_class": "UNKNOWN",
+                "error": "external effect requires reconciliation",
+                "effect_id": exc.effect_id,
+                "effect_state": exc.state,
+                "reason_code": exc.reason_code,
+                "execution_id": action_id,
+            }
         except ExecutionFenceError:
             raise
         except Exception as exc:

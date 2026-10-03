@@ -6,6 +6,10 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import os
 import sys
+import hashlib
+import inspect
+import json
+import uuid
 
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
@@ -38,6 +42,8 @@ class ToolSpec:
     timeout: int = DEFAULT_TOOL_TIMEOUT
     rate_limit: str = "bounded"
     evidence_requirements: tuple[str, ...] = ("authorization_decision", "observation")
+    effect_provider: str = ""
+    idempotency_supported: bool = False
 
     @property
     def tool_id(self) -> str:
@@ -66,6 +72,8 @@ class ToolSpec:
             "timeout": self.timeout,
             "rate_limit": self.rate_limit,
             "evidence_requirements": list(self.evidence_requirements),
+            "external_effect_ledger": bool(self.effect_provider),
+            "idempotency_supported": self.idempotency_supported,
         }
 
     def validate(self, argument: Any) -> tuple[bool, str]:
@@ -211,6 +219,17 @@ def _scoped_http_probe(argument):
     return {"ok": True, "operation": "scoped_http_probe", "url": argument, "note": "scope-authorized observation placeholder"}
 
 
+def _accepts_keyword(handler: Callable[..., Any], name: str) -> bool:
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -218,7 +237,16 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             raise ValueError("duplicate or invalid tool specification")
         scope_namespace = spec.name.split(".", 1)[0]
         scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "report"}
-        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner) or (scope_namespace in scope_namespaces and not spec.scope_required):
+        if (
+            not spec.description
+            or spec.risk_class not in VALID_RISK_CLASSES
+            or not callable(spec.handler)
+            or (spec.owner_only and not spec.requires_owner)
+            or (scope_namespace in scope_namespaces and not spec.scope_required)
+            or (spec.effect_provider and (not spec.effect_provider.strip() or len(spec.effect_provider) > 128))
+            or (spec.risk_class in {"network-read", "state-write", "bounded-exec"} and not spec.effect_provider)
+            or (spec.idempotency_supported and (not spec.effect_provider or not _accepts_keyword(spec.handler, "idempotency_key")))
+        ):
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
             raise ValueError(f"unsupported argument schema for {spec.name}")
@@ -229,15 +257,15 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
 REGISTRY = build_registry([
     ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status),
     ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel),
-    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel),
+    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel, effect_provider="cybersentinel.intel-collectors"),
     ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security),
     ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info),
-    ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search),
-    ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch),
-    ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch),
-    ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests),
+    ToolSpec("search", "بحث في الأحداث والاستخبارات المحلية", "read", True, str, _search, effect_provider="cybersentinel.search-aggregate"),
+    ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch, effect_provider="cybersentinel.local-state"),
+    ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch, effect_provider="cybersentinel.local-state"),
+    ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests, effect_provider="cybersentinel.workspace-process"),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
-    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True),
+    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True, effect_provider="cybersentinel.scoped-http"),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -277,9 +305,14 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
-    if (mission_id is not None or mission_authorization is not None) and execution_fence is None:
+    if (mission_id is not None or mission_authorization is not None or spec.effect_provider) and execution_fence is None:
         from agent.execution_fence import ExecutionFenceError
-        raise ExecutionFenceError("mission-bound tool dispatch requires an execution fence")
+        raise ExecutionFenceError(
+            "mission-bound tool dispatch requires an execution fence; effect-capable tool dispatch requires one as well"
+        )
+    if spec.effect_provider and mission_authorization is None:
+        from agent.execution_fence import ExecutionFenceError
+        raise ExecutionFenceError("effect-capable tool dispatch requires a mission authorization snapshot")
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
@@ -310,6 +343,7 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             )
             if not decision.allowed:
                 raise PermissionError("scope denied: " + decision.reason)
+    snapshot = None
     if mission_authorization is not None:
         from security.mission_authorization import MissionAuthorizationSnapshot
         snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
@@ -326,6 +360,122 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             execution_id=str(execution_id or ""),
             authorization_snapshot=mission_authorization,
         )
+    effect_ledger = None
+    effect = None
+    dispatch_id = ""
+    if execution_fence is not None and spec.effect_provider:
+        from agent.external_effects import ExternalEffectLedger
+
+        argument_sha256 = hashlib.sha256((argument or "").encode("utf-8")).hexdigest()
+        effect_context = {
+            "target_identity": str(target_identity or (snapshot.target_identity if snapshot is not None else "")),
+            "scope_context": scope_context if isinstance(scope_context, dict) else {},
+            "workspace_boundary": dict(snapshot.workspace_boundary) if snapshot is not None else {},
+            "network_boundary": dict(snapshot.network_boundary) if snapshot is not None else {},
+            "credential_boundary": dict(snapshot.credential_boundary) if snapshot is not None else {},
+        }
+        effect_context_sha256 = hashlib.sha256(
+            json.dumps(
+                effect_context,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        fingerprint_value = {
+            "tool_id": spec.tool_id,
+            "version": spec.version,
+            "argument_sha256": argument_sha256,
+            "effect_context_sha256": effect_context_sha256,
+        }
+        operation_fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        effect_ledger = ExternalEffectLedger(execution_fence.queue.db_path)
+        effect = effect_ledger.reserve(
+            execution_fence,
+            operation=spec.tool_id,
+            operation_fingerprint=operation_fingerprint,
+            argument_sha256=argument_sha256,
+            provider=spec.effect_provider,
+            idempotency_supported=spec.idempotency_supported,
+            authorization_snapshot=mission_authorization,
+        )
+        dispatch_id = uuid.uuid4().hex
+    elif spec.idempotency_supported:
+        from agent.execution_fence import ExecutionFenceError
+        raise ExecutionFenceError("provider idempotency requires a fenced effect reservation")
+
+    def invoke_handler(*, workspace_context=None):
+        from agent.execution_fence import ExecutionFenceError
+        from agent.external_effects import EffectRecoveryRequired, EffectState
+
+        if execution_fence is not None:
+            execution_fence.assert_dispatch(
+                mission_id=str(mission_id or ""),
+                request_id=str(request_id or ""),
+                execution_id=str(execution_id or ""),
+                authorization_snapshot=mission_authorization,
+            )
+        if effect is not None:
+            effect_ledger.mark_dispatched(
+                effect.effect_id,
+                execution_fence,
+                dispatch_id=dispatch_id,
+                authorization_snapshot=mission_authorization,
+            )
+        handler_kwargs = {}
+        if name == "run_project_tests":
+            handler_kwargs["workspace"] = workspace_context
+        if spec.idempotency_supported:
+            handler_kwargs["idempotency_key"] = effect.idempotency_key
+        try:
+            result = spec.handler(argument, **handler_kwargs)
+        except ExecutionFenceError:
+            raise
+        except Exception as exc:
+            if effect is None:
+                raise
+            try:
+                effect_ledger.mark_recovery_required(
+                    effect.effect_id,
+                    execution_fence,
+                    dispatch_id=dispatch_id,
+                    reason_code=type(exc).__name__.upper()[:64],
+                    authorization_snapshot=mission_authorization,
+                )
+            except ExecutionFenceError:
+                raise
+            except Exception as ledger_exc:
+                raise EffectRecoveryRequired(
+                    effect.effect_id,
+                    EffectState.DISPATCHED,
+                    "OUTCOME_PERSISTENCE_FAILED",
+                ) from ledger_exc
+            raise EffectRecoveryRequired(
+                effect.effect_id,
+                EffectState.RECOVERY_REQUIRED,
+                "HANDLER_EXCEPTION",
+            ) from None
+        if effect is not None:
+            try:
+                effect_ledger.mark_succeeded(
+                    effect.effect_id,
+                    execution_fence,
+                    dispatch_id=dispatch_id,
+                    result=result,
+                    authorization_snapshot=mission_authorization,
+                )
+            except ExecutionFenceError:
+                raise
+            except Exception as exc:
+                raise EffectRecoveryRequired(
+                    effect.effect_id,
+                    EffectState.DISPATCHED,
+                    "OUTCOME_PERSISTENCE_FAILED",
+                ) from exc
+        return result
+
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
@@ -341,20 +491,46 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             workspace_authorization = compatibility_snapshot
         workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
         def dispatch_workspace():
-            if execution_fence is not None:
-                execution_fence.assert_dispatch(mission_id=str(mission_id or ""), request_id=str(request_id or ""), execution_id=str(execution_id or ""), authorization_snapshot=mission_authorization)
-            return spec.handler(argument, workspace=workspace)
+            return invoke_handler(workspace_context=workspace)
         future = executor.submit(dispatch_workspace)
     else:
         def dispatch_tool():
-            if execution_fence is not None:
-                execution_fence.assert_dispatch(mission_id=str(mission_id or ""), request_id=str(request_id or ""), execution_id=str(execution_id or ""), authorization_snapshot=mission_authorization)
-            return spec.handler(argument)
+            return invoke_handler()
         future = executor.submit(dispatch_tool)
     try:
         return future.result(timeout=limit)
     except FutureTimeout as exc:
-        future.cancel()
+        cancelled = future.cancel()
+        if effect is not None:
+            from agent.external_effects import EffectRecoveryRequired, EffectState
+
+            if cancelled:
+                try:
+                    effect_ledger.mark_failed(
+                        effect.effect_id,
+                        execution_fence,
+                        reason_code="CANCELLED_BEFORE_DISPATCH",
+                        provider_confirmed_no_effect=True,
+                        authorization_snapshot=mission_authorization,
+                    )
+                except Exception:
+                    pass
+                state = EffectState.FAILED
+                reason_code = "DISPATCH_CANCELLED"
+            else:
+                try:
+                    effect_ledger.mark_recovery_required(
+                        effect.effect_id,
+                        execution_fence,
+                        dispatch_id=dispatch_id,
+                        reason_code="TOOL_TIMEOUT",
+                        authorization_snapshot=mission_authorization,
+                    )
+                    state = EffectState.RECOVERY_REQUIRED
+                except Exception:
+                    state = EffectState.DISPATCHED
+                reason_code = "TOOL_TIMEOUT"
+            raise EffectRecoveryRequired(effect.effect_id, state, reason_code) from exc
         raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
     finally:
         executor.shutdown(wait=False, cancel_futures=True)

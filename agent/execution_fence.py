@@ -295,7 +295,7 @@ class ExecutionFence:
             stamped[name] = value
         return stamped
 
-    def assert_effect_reservation(self, reservation: Mapping[str, Any]) -> dict[str, Any]:
+    def assert_effect_reservation(self, reservation: Mapping[str, Any], *, db: Any | None = None) -> dict[str, Any]:
         """Validate and stamp a durable effect reservation before any provider call."""
         if not self.task_id or self.task_version is None or not self.authorization_hash or not self.execution_id:
             raise ExecutionFenceError("effect reservation requires a task-bound execution fence")
@@ -306,6 +306,7 @@ class ExecutionFence:
             task_version=int(reservation.get("task_version", self.task_version)),
             execution_id=str(reservation.get("execution_id", self.execution_id)),
             authorization_snapshot=reservation.get("authorization_snapshot") if reservation.get("authorization_snapshot") is not None else None,
+            db=db,
         )
         stamped = dict(reservation)
         for name, value in self.metadata().items():

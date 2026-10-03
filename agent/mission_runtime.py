@@ -720,6 +720,37 @@ class MissionRuntime:
         observation.setdefault("action_id", action_id)
         observation.setdefault("step_id", step.step_id)
         observation.setdefault("mission_id", mission.mission_id)
+        effect_id = str(observation.get("effect_id", "") or "")
+        effect_state = str(observation.get("effect_state", "") or "")
+        if effect_id and effect_state:
+            mission.error = "external effect requires reconciliation"
+            mission.failures.append({
+                "class": FailureClass.UNKNOWN.value,
+                "reason": mission.error,
+                "step_id": step.step_id,
+                "action_id": action_id,
+                "effect_id": effect_id,
+                "effect_state": effect_state,
+            })
+            mission.emit(
+                EventType.FAILURE_DETECTED,
+                step_id=step.step_id,
+                data={"class": FailureClass.UNKNOWN.value, "effect_id": effect_id, "effect_state": effect_state},
+            )
+            checkpoint = dict(mission.checkpoint or {})
+            checkpoint.update({"status": "in_flight", "effect_id": effect_id, "effect_state": effect_state})
+            mission.checkpoint = checkpoint
+            mission.record_observation({
+                "type": "external_effect_recovery_required",
+                "success": False,
+                "effect_id": effect_id,
+                "effect_state": effect_state,
+                "reason_code": observation.get("reason_code", "UNCLASSIFIED"),
+                "action_id": action_id,
+                "step_id": step.step_id,
+            })
+            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+            return self._save(mission)
         typed_observation = Observation.from_result(step.action, action_id, observation, request_id=mission.request_id, scope=mission.scope_snapshot)
         observation["observation"] = typed_observation.to_dict()
         mission.transition(MissionStatus.OBSERVING, "action returned observation", action_id=action_id)

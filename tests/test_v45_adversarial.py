@@ -58,8 +58,31 @@ def test_unknown_tool_cannot_reach_handler():
 
 
 def test_run_project_tests_is_bounded_and_not_shell(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from agent.execution_fence import ExecutionFenceError
+    from tools.registry import REGISTRY
+
     monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(tmp_path))
-    result = execute("run_project_tests", ".")
+    with pytest.raises(ExecutionFenceError, match="effect-capable tool dispatch requires"):
+        execute("run_project_tests", ".")
+
+    commands = []
+
+    class WorkspaceDouble:
+        def resolve(self, target):
+            if target == "../":
+                raise PermissionError("outside test root")
+            return tmp_path
+
+        def develop(self, argv, *, cwd, timeout):
+            commands.append((argv, cwd, timeout))
+            return SimpleNamespace(ok=True, timed_out=False, exit_code=0, stdout="", stderr="")
+
+    spec = REGISTRY["run_project_tests"]
+    result = spec.handler(".", workspace=WorkspaceDouble())
     assert set(result) == {"ok", "timed_out", "returncode", "output"}
-    with pytest.raises(ValueError):
-        execute("run_project_tests", "../")
+    assert commands == [((sys.executable, "-m", "pytest", "-q"), ".", 60)]
+    with pytest.raises(ValueError, match="outside the configured test root"):
+        spec.handler("../", workspace=WorkspaceDouble())
