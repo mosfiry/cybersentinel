@@ -406,3 +406,97 @@ The concrete unresolved choices are whether mission and queue truth should share
 #### Validator recovery result (2026-10-03 03:41 +02:00)
 
 The corrected read-only validation resolved unique tracked suffixes, fixed the local regex grouping, checked 43 source citations, verified the phase order and three four-column failure tables, found no control characters or secret-pattern matches, and passed `git diff --check`. Only the intended `docs/M2E_STATE.md` update is changed. Both validator incidents above are closed as local false alarms; no code or external state was affected.
+
+## Current checkpoint — prior Workers gate resolved; V3-only push target verified (2026-10-03 03:48 +02:00)
+
+Owner-supplied independent read-only Cloudflare API evidence resolves the prior pending V2 code-SHA check. For exact SHA `4e7a70ad986f0cf150a7a659e1646b1f3b97900b` on `task/m2e-cutover-20261002`, Workers build `947628a8-a733-4c4e-8660-707aee088686` is terminal `fail`; command `npx wrangler preview`; failure reason: missing top-level `previews` config; `preview_url=null`. The branch's Preview record has `auto_build=true`; the queried Preview deployments endpoint returned `total_count=0`.
+
+**Failure protocol classification:** `OPERATION_CONFIRMED_FAILURE` for the preview-build operation. The queried Preview deployments endpoint reported zero records, so no preview deployment record was observed there; this is not a global deployment inventory or production-state assertion. Production state was not queried and is not inferred. This observation is distinct from the earlier V1 failed build and the V2 docs-SHA check `111093936774` failure. No build was retried or manually triggered, no Cloudflare mutation API was called, and no production operation was performed.
+
+Exact phase boundaries from the verified local first-parent history: remote M2E base `e9265647cb469150ad813657be4bab3d9ba9550a` → V3 implementation `c99f38cac247cb4e48a11ded046c29032664e270` → V3 state closeout `2894c901b7ffdfe48a4ca98bd7e00ef0d2514cca` → **V3 checkpoint `38f784e7f247906ffa2368332262a4c072ca11dd`**. That V3 checkpoint contains only V3 implementation/state paths. The following commit `a79773e1c0fd7162df5e21a43760f1bd0a9158a1` is the distinct V4 `BLOCKED / OWNER DECISION REQUIRED` state checkpoint; V5 code is later at `435ddcfa9c1dbf938bc1d3c58aa9c6d85436b749`; latest local HEAD is `df455fb7782e480ba7723a5fa6935502e1d90469`. The live-verified remote M2E tip was still e926 at this checkpoint. Do not include a797 or any V5 commit in the first push.
+
+**Next exact action:** verify the live GitHub M2E, main, and M2D refs and V3 checkpoint ancestry one final time, then non-force push only `38f784e7f247906ffa2368332262a4c072ca11dd` to `task/m2e-cutover-20261002`. Observe exact-SHA GitHub Actions and the naturally triggered Workers check for that V3 SHA separately; do not manually trigger/retry. After V3 checks are terminal and recorded, checkpoint/push the V4 blocked state in order, then V5. No V6 edit/commit until V5's push, exact-SHA GitHub CI, and separate Workers outcome are recorded.
+
+
+### Tool Failures & Recovery — pre-push V3 check-run lookup (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 03:50:34 +02:00; V3 pre-push verification | GitHub connector GET `commits/38f784e7f247906ffa2368332262a4c072ca11dd/check-runs` returned HTTP 422, `No commit found for SHA`. Classification: `READ_ONLY_QUERY_REJECTED_PRECONDITION`; the commit is a local-only checkpoint not yet present on GitHub, so no exact-SHA checks can exist remotely yet. | Read-only GET, no external mutation. No check/run ID was created; no push was attempted in this call. | The preceding live branch GETs independently confirmed remote M2E `e9265647cb469150ad813657be4bab3d9ba9550a`, `main=8a3fd109c0e586db13ed48a7371ac9ad06465b74`, and M2D `9bf91ea37748a239e6a6e3b6327706fa614232cd`. Do not repeat this pre-push check-run query. After the separately authorized non-force push of V3 SHA `38f784e7f247906ffa2368332262a4c072ca11dd`, query exact-SHA GitHub checks once and classify their returned state; do not retry any build. |
+
+
+### Tool Failures & Recovery — V3 status-header patch context (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 03:52:09 +02:00; V3 status update | The state-file editor rejected a multi-hunk header patch because an unchanged `Start-of-resumption M2E HEAD` line was mistakenly expressed as an insertion, so no replacement occurred. Classification: `TOOL_FAILED_BEFORE_EXECUTION` / patch-context failure. | Local document edit only; no external effect. No file content was replaced by the failed patch. | Independent read/status confirmed the historical header remains unchanged, local HEAD `df455fb7782e480ba7723a5fa6935502e1d90469`, remote M2E tracking ref `38f784e7f247906ffa2368332262a4c072ca11dd`, and only intended state/map addenda are dirty; `git diff --check` passed. Keep the header as a historical snapshot and append the authoritative latest checkpoint instead of retrying the failed multi-hunk patch. |
+
+## Current checkpoint — V3 pushed; exact-SHA test and Workers checks in progress (2026-10-03 03:51 +02:00)
+
+V3 checkpoint `38f784e7f247906ffa2368332262a4c072ca11dd` was pushed non-force at 03:51:09 +02:00; GitHub independently confirmed the M2E branch at that exact SHA at 03:51:36. The pushed target included only the V3 changes relative to remote e926: `agent/mission_worker.py`, `tests/test_autonomous_foundation.py`, `tests/test_lease_fencing.py`, `docs/M2E_ARCHITECTURE_MAP.md`, and `docs/M2E_STATE.md`. V4 checkpoint `a79773e1c0fd7162df5e21a43760f1bd0a9158a1` and V5 commits remain unpushed.
+
+Exact-SHA GitHub evidence at 03:51:36: `owner-charter-audit` run `37087663916` / check `111101185368` completed `success`; `tests` run `37087663913` / check `111101185308` is `in_progress` (test check `test (3.13)`). Naturally triggered Workers check `111101190438` is `in_progress`, `conclusion=null`, external build `5dadb20d-402d-46e9-a97b-0ce7ef23e39f`; no final result or preview URL was returned. The V3 preview outcome remains `UNKNOWN`/nonterminal; it is distinct from the independently confirmed V2 build failure. No manual build, retry, Cloudflare API, or production operation occurred.
+
+The prior V2 code-SHA build `947628a8-a733-4c4e-8660-707aee088686` is now separately classified as `OPERATION_CONFIRMED_FAILURE` based on the owner-supplied independent Cloudflare result: `npx wrangler preview` failed because the top-level `previews` config is missing; `preview_url=null`; Preview deployments endpoint `total_count=0`. The endpoint result is limited to that query; no overall production state is inferred.
+
+**Next exact action:** do not push V4 or V5 while the V3 exact-SHA test and Workers checks are nonterminal. Use a single structured read-only GitHub check when preparing the next remote step, not repeated short polling. After both checks are terminal, record their exact outcomes; then checkpoint/push V4 `BLOCKED / OWNER DECISION REQUIRED` in phase order, and only then push V5. No V6 source edit/commit until V5's push, exact-SHA GitHub CI, and distinct Workers outcome are recorded.
+
+
+### Tool Failures & Recovery — V3 status marker validator (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 03:53:01 +02:00; V3 status documentation validation | A local validator exited 1 because two expected exact phrases did not match the document's wording (`Workers build ... is terminal` and the audit run phrase includes `/ check <id>` between the run ID and conclusion). The evidence itself is present; classification: `VALIDATOR_FAILURE` / false-negative exact-string assertions. | Local read-only validation only; no external effect and no repository mutation from the failed check. | Independent grep/status confirmed the V2 build ID, failure/cause/preview fields, V3 run/check/build IDs, local HEAD `df455fb7782e480ba7723a5fa6935502e1d90469`, remote M2E `38f784e7f247906ffa2368332262a4c072ca11dd`, and only state/map paths dirty; `git diff --check` passed. Correct the validator to check independent evidence fragments rather than over-specific sentence strings; no external retry is relevant. |
+
+
+### Tool Failures & Recovery — bounded V3 exact-SHA monitor (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 03:53:58–04:24:11 +02:00; V3 CI observation | The bounded read-only monitor exited 3 at its 30-minute deadline. Across seven GitHub check-list GETs, its filtered response returned the test check but omitted Workers check `111101190438`; therefore its terminal predicate could not complete. Classification: `TOOL_RESULT_UNKNOWN` for the Workers outcome / bounded-monitor timeout, not a build failure. | All actions were read-only GitHub GETs; no remote mutation. Exact SHA `38f784e7f247906ffa2368332262a4c072ca11dd`; test check `111101185308`; Workers check `111101190438`, external build `5dadb20d-402d-46e9-a97b-0ce7ef23e39f`. | One direct GET by exact check ID at 04:24:31 independently confirmed Workers check `111101190438` remains `in_progress`, `conclusion=null`, head SHA 38f; test check `111101185308` is `completed / success`; remote M2E remains 38f. Do not rerun the list monitor or any build. Preserve the Workers final outcome as `UNKNOWN` while the check is nonterminal; query the direct existing check ID once when preparing the next remote step. |
+
+## Current checkpoint — V3 GitHub CI passed; Workers build nonterminal (2026-10-03 04:24 +02:00)
+
+V3 checkpoint `38f784e7f247906ffa2368332262a4c072ca11dd` remains the independently verified M2E remote tip. Exact-SHA `owner-charter-audit` run `37087663916` and `tests` run `37087663913` / check `111101185308` are both `completed / success` (direct test-check query at 04:24:31). The separate naturally triggered Workers check `111101190438` remains `in_progress`, `conclusion=null`, head 38f, external build `5dadb20d-402d-46e9-a97b-0ce7ef23e39f`; its summary has no terminal result or preview URL. Thus GitHub Actions CI is green, but the preview/build outcome remains nonterminal and `UNKNOWN`; no deployment effect is inferred.
+
+The previous V2 code-SHA build failure remains separately confirmed by the owner's independent read-only Cloudflare API evidence: build `947628a8-a733-4c4e-8660-707aee088686`, command `npx wrangler preview`, missing top-level `previews` config, `preview_url=null`, queried Preview deployments endpoint `total_count=0`. This does not describe the V3 build and is not a production-state claim. No Cloudflare API, manual build, retry, cancellation, or production operation was performed.
+
+V4 remains `BLOCKED / OWNER DECISION REQUIRED`; its existing local documentation checkpoint is `a79773e1c0fd7162df5e21a43760f1bd0a9158a1`. V5 code remains local at `435ddcfa9c1dbf938bc1d3c58aa9c6d85436b749`; current local branch HEAD is `df455fb7782e480ba7723a5fa6935502e1d90469`, and the state/map status addenda are uncommitted. No V4 or V5 push has occurred.
+
+**Next exact action:** do not push another branch update while Workers check `111101190438` is nonterminal. Do not rerun the monitor or build; when preparing the next remote step, query the existing check directly by ID once. If it has a terminal result, record it separately, then publish the V4 blocked-state checkpoint before V5. If it remains nonterminal, preserve `UNKNOWN` and continue only work that cannot create an overlapping preview; no claim is made about production state.
+
+
+### Source links for current read-only observations
+
+- V3 `tests` workflow run: [GitHub Actions run 37087663913](https://github.com/mosfiry/cybersentinel/actions/runs/37087663913); exact Python 3.13 check job: [check 111101185308](https://github.com/mosfiry/cybersentinel/actions/runs/37087663913/job/111101185308).
+- V3 `owner-charter-audit` workflow run: [GitHub Actions run 37087663916](https://github.com/mosfiry/cybersentinel/actions/runs/37087663916); check ID `111101185368`.
+- V3 naturally triggered Workers check `111101190438` referenced [this build-details URL](https://dash.cloudflare.com/075054bd680de1984297e37b34d8ba54/workers/services/view/cybersentinel/production/builds/5dadb20d-402d-46e9-a97b-0ce7ef23e39f). The GitHub check still reports `in_progress`; the URL path is not evidence of a deployment.
+- Prior V2 Workers build `947628a8-a733-4c4e-8660-707aee088686` referenced [this build-details URL](https://dash.cloudflare.com/075054bd680de1984297e37b34d8ba54/workers/services/view/cybersentinel/production/builds/947628a8-a733-4c4e-8660-707aee088686). Its terminal `fail`, missing top-level `previews` cause, `preview_url=null`, Preview `auto_build=true`, and queried deployments `total_count=0` came from the Owner's independent read-only Cloudflare API verification relayed in the 2026-10-03 03:48:31 +02:00 message; that message supplied no API endpoint URL. No overall production status is inferred.
+
+
+## Current checkpoint — V3 build terminal failure; V4 blocked checkpoint next (2026-10-03 04:26–04:27 +02:00)
+
+Owner-supplied independent Cloudflare API evidence at 04:26:53 reports that V3 build `5dadb20d-402d-46e9-a97b-0ce7ef23e39f` for exact SHA `38f784e7f247906ffa2368332262a4c072ca11dd` is terminal `fail` under `npx wrangler preview`: the existing Python repository has no Wrangler `previews` block. The branch preview-deployments API returned `total_count=0`; `preview_url` is absent. **Classification:** `OPERATION_CONFIRMED_FAILURE` for this preview build. The zero-count result is limited to that queried preview endpoint; production state was not queried, and no production success/failure claim is made. No build/deploy retry occurred and no Cloudflare API was called by this agent.
+
+V3 exact-SHA GitHub Actions are `completed / success`: `tests` run `37087663913` / check `111101185308`, and `owner-charter-audit` run `37087663916` / check `111101185368`. At 04:27:54, the GitHub connector's direct GET for Workers check `111101190438` still reported `in_progress`, `conclusion=null`, head SHA 38f, despite the owner-supplied Cloudflare provider result showing the build terminally failed. Preserve both observations: the Cloudflare build itself is confirmed failed by the independent provider evidence, while the GitHub check-run status remains nonterminal at that query time. Do not treat the GitHub status as evidence that the build succeeded, and do not infer production state.
+
+V4 remains `BLOCKED / OWNER DECISION REQUIRED`; do not introduce Mission/Queue atomicity changes without the missing source/owner decision. The V4 checkpoint is documentation-only and will be pushed as its own M2E branch tip before V5. V5 is not included in the V4 checkpoint. No force push, merge, Cloudflare settings change, manual build/deploy, or production operation is authorized or performed.
+
+**Next exact action:** prepare a docs-only V4 blocker checkpoint that carries this V2/V3 terminal preview evidence, the exact V3 GitHub CI results, and all subsequent tool-failure log entries; verify it is a descendant of the current remote V3 SHA and contains no V5 source. Push only that V4 tip non-force to `task/m2e-cutover-20261002`, then verify exact-SHA GitHub CI and separately record the naturally triggered Workers result. After V4 checkpoint/CI/preview observation is recorded, push V5 as the next checkpoint. Keep V6 on hold until V5's exact-SHA GitHub CI and preview observation are recorded.
+
+### Source links for terminal V3 evidence
+
+The exact V3 `tests` run is [GitHub Actions run 37087663913](https://github.com/mosfiry/cybersentinel/actions/runs/37087663913), and its Python 3.13 check is [111101185308](https://github.com/mosfiry/cybersentinel/actions/runs/37087663913/job/111101185308). The audit is [GitHub Actions run 37087663916](https://github.com/mosfiry/cybersentinel/actions/runs/37087663916). The Workers check points to [build 5dadb20d-402d-46e9-a97b-0ce7ef23e39f](https://dash.cloudflare.com/075054bd680de1984297e37b34d8ba54/workers/services/view/cybersentinel/production/builds/5dadb20d-402d-46e9-a97b-0ce7ef23e39f); the link path is not evidence of production deployment. The terminal build outcome and preview-deployments API count came from the Owner's independent Cloudflare API verification relayed at 04:26:53 +02:00; no Cloudflare API endpoint URL was supplied in that message.
+
+
+### Tool Failures & Recovery — V4 checkpoint read-range request (2026-10-03)
+
+| Time / phase | Failed operation and classification | External effect / identifiers | Verification, retry decision, and recovery |
+|---|---|---|---|
+| 04:29:37 +02:00; V4 documentation inspection | A `read` request asked for state-file lines 495 through EOF, but the V4 worktree's current state file ended at line 489; the file viewer rejected the out-of-range request. Classification: `TOOL_FAILED_BEFORE_EXECUTION` / invalid read range. | Local read only; no repository content or external state changed. No operation/run/build ID. | `wc -l` confirmed 489 lines; a valid read of lines 455–489 verified the terminal V3 evidence and next action, and lines 90–104 of the map confirmed the same. No retry of the invalid range; continue with verified content. |
+
+## Current checkpoint — V4 blocker evidence prepared for commit (2026-10-03 04:30 +02:00)
+
+The detached V4 worktree at `/tmp/cybersentinel-v4-checkpoint` is based on V4 blocker commit `a79773e1c0fd7162df5e21a43760f1bd0a9158a1`, a descendant of the currently pushed V3 SHA `38f784e7f247906ffa2368332262a4c072ca11dd`. Its only intended file changes are `docs/M2E_STATE.md` and `docs/M2E_ARCHITECTURE_MAP.md`; it contains no V5 source. It carries the owner-supplied terminal V2/V3 preview evidence, the exact V3 GitHub Actions successes, the separately observed GitHub Workers check `in_progress` state, source links, and all subsequent tool-failure entries.
+
+V4 remains `BLOCKED / OWNER DECISION REQUIRED`; this checkpoint makes no Mission/Queue architectural or source change. **Next exact action:** validate the two documentation files and exact commit scope, create the V4 docs-only checkpoint commit, verify its parent/path set and unchanged protected refs, then push that tip non-force only to the approved M2E branch. Verify exact-SHA GitHub CI and separately record the naturally triggered Workers result before advancing to V5. No V5 source is included in the V4 push.

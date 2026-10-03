@@ -1,6 +1,6 @@
 # CyberSentinel M2E Architecture Map
 
-**Source-audit baseline:** initial inventory at `e3c75688584dece1cb71393a884a63dfbecb4613`, subsequently advanced through V2 to remote M2E head `e9265647cb469150ad813657be4bab3d9ba9550a`. This map records the locally validated V3 queue-fencing changes over that remote head; V3 is not yet pushed, and this checkpoint does not claim a running production service or an out-of-band deployment.
+**Source-audit baseline:** initial inventory at `e3c75688584dece1cb71393a884a63dfbecb4613`; V3 queue-fencing checkpoint `38f784e7f247906ffa2368332262a4c072ca11dd` is pushed to the M2E branch. V4 remains `BLOCKED / OWNER DECISION REQUIRED` for Mission/Queue atomicity. This map does not claim a running production service, an out-of-band deployment, or any production outcome.
 
 ## Runtime and request path
 
@@ -73,3 +73,32 @@ The repository inventory and source audit found no `wrangler.toml`, `wrangler.js
 ## Decisions that cannot be inferred safely
 
 The code does not choose whether the canonical runtime should remain the localhost Python bridge, move to Workers/Pages, or use another persistent backend. It also does not define a durable state migration, an unattended worker/scheduler ownership model or its fresh Owner authority, who may reconcile ambiguous external effects, whether execution proof is tamper-evident or adversary-resistant, or whether cross-store consistency must be atomic. Those choices remain `BLOCKED / OWNER DECISION REQUIRED`; this map does not invent platform, approval, credential, or deployment semantics.
+
+### Terminal result for prior V2 Workers check — 2026-10-03 03:48 +02:00
+
+Owner-supplied independent read-only Cloudflare API evidence reports exact V2 code SHA `4e7a70ad986f0cf150a7a659e1646b1f3b97900b`, branch `task/m2e-cutover-20261002`, build `947628a8-a733-4c4e-8660-707aee088686`: terminal `fail`, command `npx wrangler preview`, cause missing top-level `previews` configuration, `preview_url=null`. The branch Preview record has `auto_build=true`; the queried Preview deployments endpoint returned `total_count=0`. Classification is confirmed preview-build failure; zero records is limited to that endpoint query and does not establish overall production state. No retry or Cloudflare mutation was performed.
+
+First-parent boundaries are V3 checkpoint `38f784e7f247906ffa2368332262a4c072ca11dd`, V4 blocked-state commit `a79773e1c0fd7162df5e21a43760f1bd0a9158a1`, and V5 code commit `435ddcfa9c1dbf938bc1d3c58aa9c6d85436b749` (latest local state/map descendant `df455fb7782e480ba7723a5fa6935502e1d90469`). The V3 push must target 38f only; V4 and V5 remain separate later checkpoints. No production-state claim is made.
+
+
+### V3 exact-SHA hosted checks — 2026-10-03 03:51 +02:00
+
+After non-force push of V3 checkpoint `38f784e7f247906ffa2368332262a4c072ca11dd`, GitHub confirmed that exact remote M2E head. Exact-SHA `owner-charter-audit` run `37087663916` passed; `tests` run `37087663913` / check `111101185308` and the naturally triggered Workers check `111101190438` were still `in_progress` at 03:51:36. The Workers external build ID is `5dadb20d-402d-46e9-a97b-0ce7ef23e39f`; no final result or preview URL was yet available. The V3 preview remains unknown/nonterminal; no manual trigger or retry occurred.
+
+The separate previous V2 code-SHA build `947628a8-a733-4c4e-8660-707aee088686` is confirmed failed by the owner's independent read-only Cloudflare API evidence: command `npx wrangler preview`, missing top-level `previews` config, `preview_url=null`, and queried Preview deployments endpoint `total_count=0`. This is a confirmed preview-build failure and no-preview-record result for that query, not a conclusion about overall production state. V4 and V5 remain separate later checkpoints.
+
+
+### V3 CI follow-up — 2026-10-03 04:24 +02:00
+
+The exact-SHA `tests` run `37087663913` / check `111101185308` and `owner-charter-audit` run `37087663916` completed successfully for V3 SHA `38f784e7f247906ffa2368332262a4c072ca11dd`. A direct read-only GET by Workers check ID `111101190438` at 04:24:31 confirmed `status=in_progress`, `conclusion=null`, external build `5dadb20d-402d-46e9-a97b-0ce7ef23e39f`; no terminal result or preview URL was reported. The V3 preview/build outcome remains `UNKNOWN` while nonterminal. No V4/V5 push, manual build, Cloudflare mutation, retry, or production operation occurred.
+
+The preceding bounded monitor timed out after 30 minutes because its filtered check-list responses included the test check but omitted the Workers check; the direct exact-ID query resolved its current status without inferring the final result. This monitoring failure is recorded in `docs/M2E_STATE.md` and must not be conflated with the prior V2 preview build, which independently failed for missing top-level `previews` configuration.
+
+
+### V3 terminal preview observation and V4 boundary — 2026-10-03 04:26–04:27 +02:00
+
+The Owner's independent Cloudflare API evidence reports V3 build `5dadb20d-402d-46e9-a97b-0ce7ef23e39f` for SHA `38f784e7f247906ffa2368332262a4c072ca11dd` as terminal `fail` under `npx wrangler preview` because the existing Python repository has no Wrangler `previews` block. The branch preview-deployments API returned `total_count=0` and `preview_url` was absent. This is classified as a confirmed preview-build failure; the API result is limited to the queried preview endpoint and does not establish production state. No retry or Cloudflare API call was made by this agent.
+
+For the same V3 SHA, GitHub Actions `tests` run `37087663913` / check `111101185308` and `owner-charter-audit` run `37087663916` / check `111101185368` are successful. A separate GitHub GET at 04:27:54 still showed Workers check `111101190438` as `in_progress` with no conclusion. Both provider-build and GitHub-check observations are preserved separately; no success or production inference is made from the GitHub check's nonterminal state.
+
+V4 remains a documentation-only `BLOCKED / OWNER DECISION REQUIRED` checkpoint for unresolved Mission/Queue atomicity authority. No source/owner decision was supplied, so no architectural change is made. V4 is pushed as the next M2E checkpoint before V5; V5/V6 code is excluded from this V4 tip.
