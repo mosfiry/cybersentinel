@@ -9,7 +9,9 @@ execution; parallel results fold deterministically.
 
 
 from pathlib import Path
+import pytest
 
+from agent.execution_fence import ExecutionFenceError
 from agent.model_intelligence.tool_calls import validate_proposals
 from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStore
@@ -191,16 +193,19 @@ def test_parallel_tool_exception_requires_reconciliation(tmp_path, monkeypatch):
     assert result.status.name == "RECOVERY_REQUIRED"
     assert result.checkpoint.get("status") == "in_flight_parallel"
     assert result.checkpoint.get("ambiguous_tool_call_ids") == ["call_002"]
+    assert result.checkpoint.get("plan_version") == mission.plan.version
+    assert result.checkpoint.get("execution_ids") == ["a1", "a2"]
+    assert result.checkpoint.get("task_ids") == ["observe", "observe"]
 
     resumed_without_reconciliation = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=2)
     assert len(executions) == 2, "restart must not replay any parallel side effect before reconciliation"
     assert resumed_without_reconciliation.status.name == "RECOVERY_REQUIRED"
 
-    reconciled = runtime.reconcile_in_flight(
-        mission.mission_id,
-        executed=True,
-        observation={"success": True, "criterion_id": "goal", "source": "parallel-external-receipt"},
-    )
-    assert reconciled.status.name == "READY"
-    assert reconciled.checkpoint.get("status") == "completed"
-    assert reconciled.checkpoint.get("reconciled") is True
+    with pytest.raises(ExecutionFenceError, match="authenticated Owner"):
+        runtime.reconcile_in_flight(
+            mission.mission_id,
+            executed=True,
+            observation={"success": True, "criterion_id": "goal", "source": "parallel-external-receipt"},
+        )
+    assert runtime.store.load(mission.mission_id).status.name == "RECOVERY_REQUIRED"
+    assert len(executions) == 2, "unsigned reconciliation must not replay parallel effects"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -11,7 +11,7 @@ import json
 import re
 import sqlite3
 
-from .execution_fence import ExecutionFence, ExecutionFenceError
+from .execution_fence import ExecutionFence, ExecutionFenceError, authorization_digest
 
 
 class EffectState(StrEnum):
@@ -83,6 +83,7 @@ class ExternalEffect:
     evidence_ref: str
     fence_ref: str
     authorization_hash: str
+    owner_identity_ref: str
     worker_id: str
     worker_instance_id: str
     runtime_generation: int
@@ -139,10 +140,24 @@ class ExternalEffectLedger:
         return value
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(self, *, mission_store: Any | None = None) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
         try:
+            if mission_store is not None:
+                mission_path_value = getattr(mission_store, "db_path", None)
+                if not isinstance(mission_path_value, (str, Path)) or not str(mission_path_value):
+                    raise EffectLedgerError("reconciliation MissionStore must expose its durable database path")
+                mission_path = str(Path(mission_path_value).resolve())
+                ledger_path = str(Path(self.db_path).resolve())
+                mission_schema = "main"
+                if mission_path != ledger_path:
+                    connection.execute("ATTACH DATABASE ? AS mission_store_db", (mission_path,))
+                    mission_schema = "mission_store_db"
+                for schema in ("main", mission_schema) if mission_schema != "main" else ("main",):
+                    journal_mode = str(connection.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
+                    if journal_mode not in {"delete", "truncate", "persist"}:
+                        raise EffectLedgerError("reconciliation requires rollback-journal mode for all stores")
             connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
@@ -177,6 +192,7 @@ class ExternalEffectLedger:
                 evidence_ref TEXT NOT NULL,
                 fence_ref TEXT NOT NULL,
                 authorization_hash TEXT NOT NULL,
+                owner_identity_ref TEXT NOT NULL DEFAULT '',
                 worker_id TEXT NOT NULL,
                 worker_instance_id TEXT NOT NULL,
                 runtime_generation INTEGER NOT NULL,
@@ -186,6 +202,44 @@ class ExternalEffectLedger:
                 error_code TEXT NOT NULL DEFAULT '',
                 UNIQUE(mission_id, task_id, task_version, execution_id)
             )"""
+        )
+        effect_columns = {row[1] for row in db.execute("PRAGMA table_info(external_effects)")}
+        if "owner_identity_ref" not in effect_columns:
+            db.execute("ALTER TABLE external_effects ADD COLUMN owner_identity_ref TEXT NOT NULL DEFAULT ''")
+        db.execute("DROP TRIGGER IF EXISTS external_effect_owner_binding_ticket_authorized")
+        db.execute(
+            """CREATE TRIGGER IF NOT EXISTS external_effect_identity_immutable
+               BEFORE UPDATE OF effect_id,mission_id,task_id,task_version,execution_id,request_id,
+                   operation,operation_fingerprint,argument_sha256,provider,idempotency_key,
+                   idempotency_supported,created_at,evidence_ref,authorization_hash,worker_id,
+                   worker_instance_id,runtime_generation,lease_epoch ON external_effects
+               WHEN OLD.effect_id IS NOT NEW.effect_id
+                 OR OLD.mission_id IS NOT NEW.mission_id
+                 OR OLD.task_id IS NOT NEW.task_id
+                 OR OLD.task_version IS NOT NEW.task_version
+                 OR OLD.execution_id IS NOT NEW.execution_id
+                 OR OLD.request_id IS NOT NEW.request_id
+                 OR OLD.operation IS NOT NEW.operation
+                 OR OLD.operation_fingerprint IS NOT NEW.operation_fingerprint
+                 OR OLD.argument_sha256 IS NOT NEW.argument_sha256
+                 OR OLD.provider IS NOT NEW.provider
+                 OR OLD.idempotency_key IS NOT NEW.idempotency_key
+                 OR OLD.idempotency_supported IS NOT NEW.idempotency_supported
+                 OR OLD.created_at IS NOT NEW.created_at
+                 OR OLD.evidence_ref IS NOT NEW.evidence_ref
+                 OR OLD.authorization_hash IS NOT NEW.authorization_hash
+                 OR OLD.worker_id IS NOT NEW.worker_id
+                 OR OLD.worker_instance_id IS NOT NEW.worker_instance_id
+                 OR OLD.runtime_generation IS NOT NEW.runtime_generation
+                 OR OLD.lease_epoch IS NOT NEW.lease_epoch
+               BEGIN SELECT RAISE(ABORT, 'external effect identity is immutable'); END"""
+        )
+        db.execute("DROP TRIGGER IF EXISTS external_effect_owner_identity_immutable")
+        db.execute(
+            """CREATE TRIGGER external_effect_owner_identity_immutable
+               BEFORE UPDATE OF owner_identity_ref ON external_effects
+               WHEN OLD.owner_identity_ref IS NOT NEW.owner_identity_ref
+               BEGIN SELECT RAISE(ABORT, 'external effect owner identity is immutable'); END"""
         )
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_external_effects_mission_state "
@@ -202,9 +256,23 @@ class ExternalEffectLedger:
                 fence_ref TEXT NOT NULL,
                 dispatch_id TEXT NOT NULL DEFAULT '',
                 result_sha256 TEXT NOT NULL DEFAULT '',
-                error_code TEXT NOT NULL DEFAULT ''
+                error_code TEXT NOT NULL DEFAULT '',
+                resolution_source TEXT NOT NULL DEFAULT '',
+                authorization_ref TEXT NOT NULL DEFAULT '',
+                evidence_sha256 TEXT NOT NULL DEFAULT '',
+                control_request_id TEXT NOT NULL DEFAULT ''
             )"""
         )
+        event_columns = {row[1] for row in db.execute("PRAGMA table_info(external_effect_events)")}
+        for column in (
+            ("resolution_source", "TEXT NOT NULL DEFAULT ''"),
+            ("authorization_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("evidence_sha256", "TEXT NOT NULL DEFAULT ''"),
+            ("control_request_id", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column[0] not in event_columns:
+                db.execute(f"ALTER TABLE external_effect_events ADD COLUMN {column[0]} {column[1]}")
+                event_columns.add(column[0])
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_external_effect_events_effect "
             "ON external_effect_events(effect_id, event_id)"
@@ -241,6 +309,7 @@ class ExternalEffectLedger:
             evidence_ref=str(row["evidence_ref"]),
             fence_ref=str(row["fence_ref"]),
             authorization_hash=str(row["authorization_hash"]),
+            owner_identity_ref=str(row["owner_identity_ref"] or ""),
             worker_id=str(row["worker_id"]),
             worker_instance_id=str(row["worker_instance_id"]),
             runtime_generation=int(row["runtime_generation"]),
@@ -272,12 +341,17 @@ class ExternalEffectLedger:
         dispatch_id: str = "",
         result_sha256: str = "",
         error_code: str = "",
+        resolution_source: str = "",
+        authorization_ref: str = "",
+        evidence_sha256: str = "",
+        control_request_id: str = "",
     ) -> None:
         db.execute(
             """INSERT INTO external_effect_events
                (effect_id,from_state,to_state,event_type,created_at,fence_ref,
-                dispatch_id,result_sha256,error_code)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
+                dispatch_id,result_sha256,error_code,resolution_source,
+                authorization_ref,evidence_sha256,control_request_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 effect_id,
                 from_state,
@@ -288,6 +362,10 @@ class ExternalEffectLedger:
                 dispatch_id,
                 result_sha256,
                 error_code,
+                resolution_source,
+                authorization_ref,
+                evidence_sha256,
+                control_request_id,
             ),
         )
 
@@ -345,9 +423,17 @@ class ExternalEffectLedger:
         operation: str,
         operation_fingerprint: str,
     ) -> dict[str, Any]:
+        owner_identity_ref = (
+            authorization_snapshot.get("owner_identity", "")
+            if isinstance(authorization_snapshot, Mapping)
+            else getattr(authorization_snapshot, "owner_identity", "")
+        )
+        if not isinstance(owner_identity_ref, str) or not owner_identity_ref.strip():
+            raise ExecutionFenceError("effect reservation requires a durable mission Owner identity")
         return {
             **fence.metadata(),
             "authorization_snapshot": authorization_snapshot,
+            "owner_identity_ref": owner_identity_ref,
             "effect_id": effect_id,
             "provider": provider,
             "operation": operation,
@@ -385,6 +471,7 @@ class ExternalEffectLedger:
         idempotency_key: str | None,
         idempotency_supported: bool,
         request_id: str,
+        owner_identity_ref: str,
     ) -> None:
         if (
             record.effect_id != effect_id
@@ -395,6 +482,7 @@ class ExternalEffectLedger:
             or record.idempotency_supported != idempotency_supported
             or record.idempotency_key != idempotency_key
             or record.request_id != request_id
+            or record.owner_identity_ref != owner_identity_ref
         ):
             raise EffectIdentityConflict(record.effect_id, record.state)
 
@@ -437,6 +525,7 @@ class ExternalEffectLedger:
                 idempotency_key=idempotency_key,
                 idempotency_supported=idempotency_supported,
                 request_id=request_id,
+                owner_identity_ref=str(reservation["owner_identity_ref"]),
             )
             now = self._now()
             self._refresh_fence_fields(db, fence, effect_id, now)
@@ -529,6 +618,7 @@ class ExternalEffectLedger:
                     idempotency_key=idem_key,
                     idempotency_supported=idempotency_supported,
                     request_id=str(metadata["request_id"]),
+                    owner_identity_ref=str(reservation["owner_identity_ref"]),
                 )
                 if record.state not in {EffectState.PLANNED, EffectState.RESERVED}:
                     raise EffectDispatchBlocked(record.effect_id, record.state)
@@ -549,9 +639,9 @@ class ExternalEffectLedger:
                        effect_id,mission_id,task_id,task_version,execution_id,request_id,
                        operation,operation_fingerprint,argument_sha256,provider,idempotency_key,
                        idempotency_supported,created_at,updated_at,state,evidence_ref,fence_ref,
-                       authorization_hash,worker_id,worker_instance_id,runtime_generation,
+                       authorization_hash,owner_identity_ref,worker_id,worker_instance_id,runtime_generation,
                        lease_epoch,dispatch_id,result_sha256,error_code)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         effect_id,
                         metadata["mission_id"],
@@ -571,6 +661,7 @@ class ExternalEffectLedger:
                         safe_evidence_ref,
                         stamped["fence_id"],
                         stamped["authorization_hash"],
+                        reservation["owner_identity_ref"],
                         stamped["worker_id"],
                         stamped["worker_instance_id"],
                         stamped["runtime_generation"],
@@ -867,6 +958,251 @@ class ExternalEffectLedger:
                 fence_ref=str(stamped["fence_id"]),
                 dispatch_id=dispatch_id,
                 error_code=safe_reason,
+            )
+            return self._effect_from_row(self._get_in_transaction(db, effect_id))
+
+    def has_active_worker_lease(self, mission_id: str) -> bool:
+        """Fail closed if queue ownership is absent or a worker still holds a claim."""
+        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        try:
+            if not self._table_exists(connection, "mission_queue"):
+                raise EffectLedgerError("reconciliation requires the durable mission queue")
+            row = connection.execute(
+                "SELECT lease_owner FROM mission_queue WHERE mission_id=?", (mission_id,)
+            ).fetchone()
+            if row is None:
+                raise EffectLedgerError("reconciliation mission has no durable queue record")
+            return row["lease_owner"] is not None
+        finally:
+            connection.close()
+
+    def apply_reconciliation(
+        self,
+        effect_id: str,
+        *,
+        target_state: EffectState,
+        authorization: Any,
+        mission_store: Any,
+        resolution_source: str,
+        reason_code: str,
+        evidence_sha256: str = "",
+    ) -> ExternalEffect:
+        """Atomically revalidate mission/Owner/lease and append an effect reconciliation."""
+        from .effect_reconciliation import (
+            EffectReconciliationAction,
+            EffectReconciliationAuthorization,
+        )
+        from security.mission_authorization import MissionAuthorizationSnapshot
+
+        if not isinstance(target_state, EffectState):
+            raise EffectTransitionError("reconciliation target state must be typed")
+        source_actions = {
+            "LEDGER_NOT_DISPATCHED": EffectReconciliationAction.RECONCILE,
+            "PROVIDER_STATUS": EffectReconciliationAction.PROVIDER_LOOKUP,
+        }
+        if resolution_source == "OWNER":
+            expected_action = (
+                EffectReconciliationAction.OWNER_CONFIRM_APPLIED
+                if target_state is EffectState.SUCCEEDED
+                else EffectReconciliationAction.OWNER_CONFIRM_NO_EFFECT
+                if target_state is EffectState.FAILED
+                else None
+            )
+        else:
+            expected_action = source_actions.get(resolution_source)
+        if expected_action is None or not isinstance(authorization, EffectReconciliationAuthorization):
+            raise EffectTransitionError("reconciliation source or authorization is invalid")
+        if mission_store is None or not callable(getattr(mission_store, "load", None)):
+            raise EffectTransitionError("reconciliation requires the authoritative mission store")
+        if evidence_sha256 and not _FINGERPRINT_RE.fullmatch(evidence_sha256):
+            raise EffectTransitionError("reconciliation evidence must be a SHA-256 digest")
+        safe_reason = self._safe_code(reason_code)
+
+        with self._transaction(mission_store=mission_store) as db:
+            self._ensure_schema(db)
+            row = self._get_in_transaction(db, effect_id)
+            if row is None:
+                raise KeyError("unknown_effect")
+            record = self._effect_from_row(row)
+            identity_metadata = {
+                "mission_id": record.mission_id,
+                "task_id": record.task_id,
+                "task_version": record.task_version,
+                "execution_id": record.execution_id,
+                "request_id": record.request_id,
+            }
+            if self._effect_id(identity_metadata, record.provider, record.operation_fingerprint) != record.effect_id:
+                raise EffectTransitionError("effect identity does not match its deterministic key")
+            mission_path = str(Path(mission_store.db_path).resolve())
+            ledger_path = str(Path(self.db_path).resolve())
+            mission_schema = "main" if mission_path == ledger_path else "mission_store_db"
+            mission_table = db.execute(
+                f"SELECT 1 FROM {mission_schema}.sqlite_master WHERE type='table' AND name='missions'"
+            ).fetchone()
+            if mission_table is None:
+                raise EffectTransitionError("authoritative MissionStore table is missing")
+            mission_row = db.execute(
+                f"SELECT payload FROM {mission_schema}.missions WHERE mission_id=?",
+                (record.mission_id,),
+            ).fetchone()
+            if mission_row is None:
+                raise EffectTransitionError("authoritative mission record is missing")
+            from .mission import Mission
+
+            try:
+                mission = Mission.from_dict(json.loads(mission_row["payload"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise EffectTransitionError("authoritative mission record is invalid") from exc
+            if mission.mission_id != record.mission_id:
+                raise EffectTransitionError("authoritative mission record is missing")
+            try:
+                snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+            except (KeyError, TypeError, ValueError, PermissionError) as exc:
+                raise EffectTransitionError("mission authorization snapshot is invalid") from exc
+            owner_identity_ref = str(mission.owner_identity_ref or "")
+            if (
+                not owner_identity_ref
+                or mission.request_id != record.request_id
+                or snapshot.mission_id != record.mission_id
+                or snapshot.owner_identity != owner_identity_ref
+                or authorization_digest(snapshot) != record.authorization_hash
+                or record.owner_identity_ref not in {"", owner_identity_ref}
+                or authorization.mission_id != record.mission_id
+                or authorization.task_id != record.task_id
+                or authorization.task_version != record.task_version
+                or authorization.execution_id != record.execution_id
+                or authorization.origin_request_id != record.request_id
+            ):
+                raise EffectTransitionError("effect is not bound to the authoritative mission Owner and request")
+            checkpoint = mission.checkpoint if isinstance(mission.checkpoint, dict) else {}
+            if (
+                getattr(mission.status, "value", str(mission.status)) != "RECOVERY_REQUIRED"
+                or record.task_version != mission.plan.version
+                or checkpoint.get("plan_version") != record.task_version
+            ):
+                raise EffectTransitionError("mission recovery checkpoint changed before reconciliation")
+            checkpoint_status = checkpoint.get("status")
+            if checkpoint_status == "in_flight":
+                action_id = checkpoint.get("action_id") or checkpoint.get("tool_call_id")
+                checkpoint_matches = (
+                    checkpoint.get("step_id") == record.task_id
+                    and str(action_id or "") == record.execution_id
+                )
+            elif checkpoint_status == "in_flight_parallel":
+                execution_ids = [str(item) for item in checkpoint.get("execution_ids", ())]
+                task_ids = [str(item) for item in checkpoint.get("task_ids", ())]
+                checkpoint_matches = len(execution_ids) == len(task_ids) and any(
+                    execution_id == record.execution_id and task_id == record.task_id
+                    for execution_id, task_id in zip(execution_ids, task_ids)
+                )
+            else:
+                checkpoint_matches = False
+            if not checkpoint_matches:
+                raise EffectTransitionError("effect no longer matches the durable mission checkpoint")
+            if not record.owner_identity_ref:
+                record = replace(record, owner_identity_ref=owner_identity_ref)
+            authorization.assert_valid_for(
+                record,
+                owner_identity_ref=owner_identity_ref,
+                action=expected_action,
+            )
+            if resolution_source == "OWNER" and evidence_sha256 != authorization.evidence_sha256:
+                raise EffectTransitionError("Owner evidence digest does not match the signed decision")
+
+            if not self._table_exists(db, "mission_queue"):
+                raise EffectTransitionError("reconciliation requires the durable mission queue")
+            queue_row = db.execute(
+                "SELECT lease_owner FROM mission_queue WHERE mission_id=?", (record.mission_id,)
+            ).fetchone()
+            if queue_row is None:
+                raise EffectTransitionError("reconciliation mission has no durable queue record")
+            if queue_row["lease_owner"] is not None:
+                raise EffectTransitionError("active worker lease blocks reconciliation")
+
+            current_state = EffectState(record.state)
+            if current_state == target_state:
+                if target_state in {EffectState.SUCCEEDED, EffectState.FAILED}:
+                    return record
+                if target_state is not EffectState.RECOVERY_REQUIRED:
+                    return record
+                if resolution_source == "PROVIDER_STATUS":
+                    previous = db.execute(
+                        """SELECT to_state,error_code,resolution_source,evidence_sha256
+                           FROM external_effect_events WHERE effect_id=?
+                           ORDER BY event_id DESC LIMIT 1""",
+                        (effect_id,),
+                    ).fetchone()
+                    if (
+                        previous is not None
+                        and previous["to_state"] == EffectState.RECOVERY_REQUIRED.value
+                        and previous["error_code"] == safe_reason
+                        and previous["resolution_source"] == resolution_source
+                        and previous["evidence_sha256"] == evidence_sha256
+                    ):
+                        return record
+            elif current_state in {EffectState.SUCCEEDED, EffectState.FAILED}:
+                raise EffectTransitionError("conflicting reconciliation cannot overwrite a terminal effect state")
+
+            valid = False
+            if target_state is EffectState.FAILED:
+                if resolution_source == "LEDGER_NOT_DISPATCHED":
+                    valid = current_state in {EffectState.PLANNED, EffectState.RESERVED}
+                else:
+                    valid = current_state in {
+                        EffectState.DISPATCHED,
+                        EffectState.AMBIGUOUS,
+                        EffectState.UNKNOWN,
+                        EffectState.RECOVERY_REQUIRED,
+                    }
+            elif target_state is EffectState.SUCCEEDED:
+                valid = current_state in {
+                    EffectState.DISPATCHED,
+                    EffectState.AMBIGUOUS,
+                    EffectState.UNKNOWN,
+                    EffectState.RECOVERY_REQUIRED,
+                }
+            elif target_state is EffectState.RECOVERY_REQUIRED:
+                valid = current_state in {
+                    EffectState.DISPATCHED,
+                    EffectState.AMBIGUOUS,
+                    EffectState.UNKNOWN,
+                    EffectState.RECOVERY_REQUIRED,
+                }
+            if not valid:
+                raise EffectTransitionError(
+                    f"cannot reconcile effect from {current_state.value} to {target_state.value}"
+                )
+
+            event_types = {
+                ("LEDGER_NOT_DISPATCHED", EffectState.FAILED): "RECONCILED_NOT_DISPATCHED",
+                ("PROVIDER_STATUS", EffectState.SUCCEEDED): "PROVIDER_CONFIRMED_APPLIED",
+                ("PROVIDER_STATUS", EffectState.FAILED): "PROVIDER_CONFIRMED_NO_EFFECT",
+                ("PROVIDER_STATUS", EffectState.RECOVERY_REQUIRED): "PROVIDER_STATUS_UNKNOWN",
+                ("OWNER", EffectState.SUCCEEDED): "OWNER_CONFIRMED_APPLIED",
+                ("OWNER", EffectState.FAILED): "OWNER_CONFIRMED_NO_EFFECT",
+            }
+            event_type = event_types.get((resolution_source, target_state))
+            if event_type is None:
+                raise EffectTransitionError("unsupported reconciliation transition")
+            now = self._now()
+            db.execute(
+                "UPDATE external_effects SET state=?,updated_at=?,error_code=? WHERE effect_id=?",
+                (target_state.value, now, "" if target_state is EffectState.SUCCEEDED else safe_reason, effect_id),
+            )
+            self._append_event(
+                db,
+                effect_id=effect_id,
+                from_state=current_state.value,
+                to_state=target_state.value,
+                event_type=event_type,
+                fence_ref="",
+                dispatch_id=record.dispatch_id,
+                error_code="" if target_state is EffectState.SUCCEEDED else safe_reason,
+                resolution_source=resolution_source,
+                authorization_ref=authorization.authorization_ref,
+                evidence_sha256=evidence_sha256,
+                control_request_id=authorization.control_request_id,
             )
             return self._effect_from_row(self._get_in_transaction(db, effect_id))
 

@@ -156,12 +156,23 @@ class MissionRuntime:
         objective = str(instruction).strip()
         if not objective:
             raise ValueError("Owner Instruction cannot be empty")
+        if authorization_context.session_id:
+            from security.owner_password import authenticated_owner
+            owner = authenticated_owner(authorization_context.session_id)
+            if owner is None:
+                raise PermissionError("active Owner session is required to bind mission identity")
+            stable_owner_ref = f"owner:{int(owner['owner_id'])}"
+            if owner_identity_ref and owner_identity_ref != stable_owner_ref:
+                raise PermissionError("mission Owner identity does not match the authenticated account")
+            owner_identity_ref = stable_owner_ref
+        else:
+            owner_identity_ref = owner_identity_ref or authorization_context.owner_evidence_fingerprint
         return self.create(
             objective,
             objective,
             plan,
             request_id=authorization_context.request_id,
-            owner_identity_ref=owner_identity_ref or authorization_context.owner_evidence_fingerprint,
+            owner_identity_ref=owner_identity_ref,
             owner_instruction=objective,
             authorization_context=authorization_context.to_dict(),
             scope_snapshot=scope_snapshot,
@@ -242,54 +253,14 @@ class MissionRuntime:
         return decision
 
     def reconcile_in_flight(self, mission_id: str, *, executed: bool, observation: dict[str, Any] | None = None, execution_fence: ExecutionFence | None = None) -> Mission:
-        """Resolve an ambiguous external side effect without silently replaying it.
+        """Reject unsigned boolean outcomes; use EffectReconciliationEngine.
 
-        ``executed=True`` records the external receipt as completed.  ``False``
-        records that reconciliation found no side effect and permits one safe
-        retry.  The runtime never infers either outcome from a process crash.
+        Retained as a fail-closed compatibility surface so old clients cannot
+        turn a caller assertion into mission evidence or a retry permission.
         """
-        if self.require_execution_fence and execution_fence is None:
-            raise ExecutionFenceError("in-flight reconciliation requires its authorized control-plane workflow")
-        mission = self._load(mission_id)
-        checkpoint = dict(mission.checkpoint or {})
-        checkpoint_status = checkpoint.get("status")
-        if checkpoint_status not in {"in_flight", "in_flight_parallel"}:
-            raise ValueError("mission has no in-flight action requiring reconciliation")
-        if checkpoint_status == "in_flight_parallel":
-            ambiguous_ids = [str(item) for item in checkpoint.get("ambiguous_tool_call_ids", checkpoint.get("tool_call_ids", []))]
-            if not ambiguous_ids:
-                raise ValueError("parallel checkpoint has no ambiguous tool calls")
-            if executed:
-                base_observation = dict(observation or {"success": True, "source": "external_reconciliation"})
-                base_observation.setdefault("success", True)
-                for tool_call_id in ambiguous_ids:
-                    result = {**base_observation, "tool_call_id": tool_call_id, "type": "reconciled_observation"}
-                    mission.record_observation(result)
-                    mission.record_action(tool_call_id, str(checkpoint.get("step_id", "")), "completed", result)
-                    mission.evidence.append({"criterion_id": result.get("criterion_id", str(checkpoint.get("step_id", ""))), "passed": bool(result.get("success")), "source": result.get("source", "external_reconciliation"), "result": result, "provenance": {"mission_id": mission.mission_id, "tool_call_id": tool_call_id, "reconciled": True}})
-                mission.checkpoint = {**checkpoint, "status": "completed", "reconciled": True}
-                mission.current_step += 1
-                mission.transition(MissionStatus.READY, "parallel in-flight actions reconciled as executed", tool_call_ids=ambiguous_ids)
-            else:
-                mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
-                mission.transition(MissionStatus.READY, "parallel in-flight actions reconciled as not executed", tool_call_ids=ambiguous_ids)
-            return self._save(mission, execution_fence=execution_fence)
-        action_id = str(checkpoint.get("action_id", ""))
-        step_id = str(checkpoint.get("step_id", ""))
-        if executed:
-            result = dict(observation or {"success": True, "source": "external_reconciliation"})
-            result.setdefault("success", True)
-            result.update({"action_id": action_id, "step_id": step_id, "type": "reconciled_observation"})
-            mission.record_observation(result)
-            mission.record_action(action_id, step_id, "completed", result)
-            mission.checkpoint = {**checkpoint, "status": "completed", "reconciled": True}
-            mission.evidence.append({"criterion_id": result.get("criterion_id", step_id), "passed": bool(result.get("success")), "source": result.get("source", "external_reconciliation"), "result": result, "provenance": {"mission_id": mission.mission_id, "action_id": action_id, "reconciled": True}})
-            mission.current_step += 1
-            mission.transition(MissionStatus.READY, "in-flight action reconciled as executed", action_id=action_id)
-        else:
-            mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
-            mission.transition(MissionStatus.READY, "in-flight action reconciled as not executed", action_id=action_id)
-        return self._save(mission, execution_fence=execution_fence)
+        raise ExecutionFenceError(
+            "in-flight reconciliation requires authenticated Owner authorization through EffectReconciliationEngine"
+        )
 
     def _execute_native_tool(
         self,
@@ -483,7 +454,7 @@ class MissionRuntime:
                         try:
                             task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
                             execution_id = proposal.action_id or proposal.tool_call_id
-                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": execution_id, "step_id": task_id, "run_id": run_id}
+                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": execution_id, "step_id": task_id, "run_id": run_id, "plan_version": mission.plan.version}
                             dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
                             if dispatch_fence is not None:
                                 dispatch_fence.assert_active_execution(mission)
@@ -550,6 +521,7 @@ class MissionRuntime:
                 for item in authorized
             ],
             "run_id": run_id,
+            "plan_version": mission.plan.version,
         }
         self._save(mission)
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
@@ -600,6 +572,12 @@ class MissionRuntime:
                 "status": "in_flight_parallel",
                 "tool_call_ids": [item[0].tool_call_id for item in authorized],
                 "ambiguous_tool_call_ids": ambiguous_ids,
+                "execution_ids": [item[0].action_id or item[0].tool_call_id for item in authorized],
+                "task_ids": [
+                    item[0].step_id or str(getattr(current_step, "step_id", "") or "__mission__")
+                    for item in authorized
+                ],
+                "plan_version": mission.plan.version,
                 "run_id": run_id,
             }
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)

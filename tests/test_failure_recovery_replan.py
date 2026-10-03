@@ -6,7 +6,7 @@ Exercises the real MissionRuntime with the real RecoveryPolicy. Invariants:
 - an exception during a side-effecting tool is AMBIGUOUS, never a failure that
   permits blind retry: the mission goes to RECOVERY_REQUIRED with an in-flight
   checkpoint and reconciliation is mandatory.
-- reconciliation as not-executed permits exactly one safe retry.
+- unsigned boolean reconciliation is denied; recovery remains quarantined.
 - a deterministic failed tool result is a failure observation, never evidence.
 - recovery is bounded: no infinite retry loop exists in the policy matrix.
 """
@@ -19,6 +19,7 @@ import pytest
 from agent.model_protocol import ModelTurn, ToolCallProposal
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
+from agent.execution_fence import ExecutionFenceError
 from agent.planning import (
     FailureClass,
     Plan,
@@ -125,65 +126,48 @@ def test_tool_timeout_is_ambiguous_and_requires_recovery(tmp_path, monkeypatch):
     assert result.is_terminal
 
 
-def test_reconcile_requires_an_in_flight_checkpoint(tmp_path):
+def test_legacy_boolean_reconcile_is_denied_even_without_a_checkpoint(tmp_path):
     runtime = _runtime(tmp_path)
     mission = _mission(runtime)
-    with pytest.raises(ValueError):
+    with pytest.raises(ExecutionFenceError, match="authenticated Owner"):
         runtime.reconcile_in_flight(mission.mission_id, executed=False)
 
 
-def test_reconcile_not_executed_permits_exactly_one_safe_retry(tmp_path, monkeypatch):
+def test_legacy_not_executed_boolean_cannot_authorize_retry(tmp_path, monkeypatch):
     import tools.registry
 
     runtime, mission, result, _ = _ambiguous_execution_runtime(tmp_path, monkeypatch, RuntimeError("crash"))
     assert result.status is MissionStatus.RECOVERY_REQUIRED
 
-    reconciled = runtime.reconcile_in_flight(mission.mission_id, executed=False)
-    assert reconciled.status is MissionStatus.READY
-    assert reconciled.checkpoint.get("status") == "reconciled_not_executed"
-    assert reconciled.checkpoint.get("reconciled") is True
-    assert not reconciled.is_terminal
-
-    # reconciliation is single-shot: a second reconciliation is refused
-    with pytest.raises(ValueError):
+    with pytest.raises(ExecutionFenceError, match="authenticated Owner"):
         runtime.reconcile_in_flight(mission.mission_id, executed=False)
-
     executed = []
-
-    def ok(name, argument, **kwargs):
-        executed.append(name)
-        return {"ok": True, "criterion_id": "goal", "source": "retry-after-reconciliation"}
-
-    monkeypatch.setattr(tools.registry, "execute", ok)
+    monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: executed.append(a) or {"ok": True})
 
     class RetryModel:
         def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
-            if len(executed) < 1:
-                return ModelTurn(
-                    turn_id,
-                    tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 2),),
-                )
-            return ModelTurn(turn_id, content="goal reached", finish_reason="stop")
+            return ModelTurn(turn_id, tool_calls=(_call(mission_id, run_id, turn_id, plan_version, 2),))
 
     resumed = runtime.run_model_loop(mission.mission_id, RetryModel(), tools=[{"name": "status"}], max_turns=5)
-    assert executed == ["status"], "exactly one safe retry after reconciliation"
-    assert resumed.status is MissionStatus.GOAL_COMPLETED
+    assert executed == [], "recovery quarantine prevents a tool retry without authorized Owner reconciliation"
+    assert resumed.status is MissionStatus.RECOVERY_REQUIRED
 
 
-def test_reconcile_executed_records_evidence_without_replay(tmp_path, monkeypatch):
+def test_legacy_executed_boolean_cannot_fabricate_evidence_or_resume(tmp_path, monkeypatch):
     import tools.registry
 
     runtime, mission, result, calls = _ambiguous_execution_runtime(tmp_path, monkeypatch, RuntimeError("crash"))
     assert result.status is MissionStatus.RECOVERY_REQUIRED
 
-    reconciled = runtime.reconcile_in_flight(
-        mission.mission_id,
-        executed=True,
-        observation={"success": True, "criterion_id": "goal", "source": "external_receipt_confirmed"},
-    )
-    assert reconciled.checkpoint.get("status") == "completed"
-    assert reconciled.checkpoint.get("reconciled") is True
-    assert any(item.get("source") == "external_receipt_confirmed" and item.get("passed") for item in reconciled.evidence)
+    with pytest.raises(ExecutionFenceError, match="authenticated Owner"):
+        runtime.reconcile_in_flight(
+            mission.mission_id,
+            executed=True,
+            observation={"success": True, "criterion_id": "goal", "source": "external_receipt_confirmed"},
+        )
+    quarantined = runtime.store.load(mission.mission_id)
+    assert quarantined.checkpoint.get("status") == "in_flight"
+    assert not any(item.get("source") == "external_receipt_confirmed" for item in quarantined.evidence)
 
     execute_calls = []
     monkeypatch.setattr(tools.registry, "execute", lambda *a, **k: execute_calls.append(a) or {"ok": True})
@@ -194,7 +178,7 @@ def test_reconcile_executed_records_evidence_without_replay(tmp_path, monkeypatc
 
     finished = runtime.run_model_loop(mission.mission_id, FinalModel(), tools=[{"name": "status"}], max_turns=3)
     assert execute_calls == [], "a reconciled side effect is never replayed"
-    assert finished.status is MissionStatus.GOAL_COMPLETED
+    assert finished.status is MissionStatus.RECOVERY_REQUIRED
 
 
 def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_path, monkeypatch):

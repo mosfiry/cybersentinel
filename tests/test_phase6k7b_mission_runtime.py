@@ -2,9 +2,11 @@ from __future__ import annotations
 from runtime_authorization import make_test_snapshot
 
 from pathlib import Path
+import pytest
 
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
+from agent.execution_fence import ExecutionFenceError
 from agent.planning import FailureClass, Plan, PlanStep
 
 
@@ -60,12 +62,12 @@ def test_new_runtime_instance_resumes_after_simulated_process_crash(tmp_path):
     assert len(recovery_required.action_history) == 0
     assert attempts["count"] == 1
 
-    reconciled = second.reconcile_in_flight(mission.mission_id, executed=False)
-    assert reconciled.status is MissionStatus.READY
-    resumed = second.run_to_completion(mission.mission_id)
-    assert resumed.status is MissionStatus.GOAL_COMPLETED
-    assert len(resumed.action_history) == 1
-    assert attempts["count"] == 2
+    with pytest.raises(ExecutionFenceError, match="authenticated Owner"):
+        second.reconcile_in_flight(mission.mission_id, executed=False)
+    still_quarantined = second.run_to_completion(mission.mission_id)
+    assert still_quarantined.status is MissionStatus.RECOVERY_REQUIRED
+    assert len(still_quarantined.action_history) == 0
+    assert attempts["count"] == 1
 
 
 def test_in_flight_receipt_reconciliation_prevents_duplicate_side_effect(tmp_path):
@@ -80,10 +82,11 @@ def test_in_flight_receipt_reconciliation_prevents_duplicate_side_effect(tmp_pat
     mission = rt.create("receipt", "receipt", plan)
     rt.run_slice(mission.mission_id)
     assert rt.run_slice(mission.mission_id).status is MissionStatus.RECOVERY_REQUIRED
-    reconciled = rt.reconcile_in_flight(mission.mission_id, executed=True, observation={"success": True, "criterion_id": "step", "source": "receipt"})
-    assert reconciled.status is MissionStatus.READY
-    completed = rt.run_to_completion(mission.mission_id)
-    assert completed.status is MissionStatus.GOAL_COMPLETED
+    with pytest.raises(ExecutionFenceError, match="authenticated Owner"):
+        rt.reconcile_in_flight(mission.mission_id, executed=True, observation={"success": True, "criterion_id": "step", "source": "receipt"})
+    still_quarantined = rt.run_to_completion(mission.mission_id)
+    assert still_quarantined.status is MissionStatus.RECOVERY_REQUIRED
+    assert still_quarantined.evidence == []
     assert calls == ["%s:2:step:0" % mission.mission_id]
 
 
