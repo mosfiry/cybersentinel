@@ -291,11 +291,73 @@ class MissionRuntime:
             mission.transition(MissionStatus.READY, "in-flight action reconciled as not executed", action_id=action_id)
         return self._save(mission, execution_fence=execution_fence)
 
+    def _execute_native_tool(
+        self,
+        name: str,
+        argument: Any,
+        authorization_decision: Any,
+        mission: Mission,
+        execution_fence: ExecutionFence | None,
+        execution_id: str,
+    ) -> Any:
+        """Dispatch native-model tools with the same strict workspace/evidence boundary."""
+        from tools.registry import execute as execute_tool
+
+        workspace = None
+        evidence_store = None
+        target_identity = None
+        mission_authorization = mission.authorization_snapshot
+        if name == "run_project_tests":
+            if execution_fence is None:
+                raise ExecutionFenceError("native workspace dispatch requires an execution fence")
+            if (
+                not execution_fence.queue.require_execution_fence
+                or execution_fence.queue.mission_store is not self.store
+            ):
+                raise ExecutionFenceError("native workspace dispatch requires its strict queue and MissionStore")
+            execution_fence.assert_active_execution(mission)
+            from security.mission_authorization import MissionAuthorizationSnapshot
+            from workspace import Workspace
+            from .evidence import EvidenceChainStore
+
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+            mission_authorization = snapshot
+            workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
+            if not workspace_root:
+                raise ExecutionFenceError("native workspace dispatch requires the Owner-authorized workspace root")
+            workspace = Workspace(workspace_root)
+            evidence_store = EvidenceChainStore(
+                Path(self.store.db_path).with_name("evidence_chain.db"),
+                execution_fence=execution_fence,
+                mission_store=self.store,
+                mission=mission,
+                require_execution_fence=True,
+            )
+            target_identity = (
+                str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity)
+                if isinstance(mission.scope_snapshot, dict)
+                else snapshot.target_identity
+            )
+
+        return execute_tool(
+            name,
+            argument,
+            authorization_decision=authorization_decision,
+            scope_context=mission.scope_snapshot,
+            request_id=mission.request_id,
+            mission_authorization=mission_authorization,
+            workspace=workspace,
+            evidence_store=evidence_store,
+            mission_id=mission.mission_id,
+            target_identity=target_identity,
+            execution_fence=execution_fence,
+            execution_id=execution_id,
+        )
+
     def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20, heartbeat: Callable[[], None] | None = None) -> Mission:
         """Run a real model/tool/observation loop for a durable mission."""
         from security.authorization import authorize_tool
         from security.authorization_context import AuthorizationContext
-        from tools.registry import execute as execute_tool
 
         mission = self._load(mission_id)
         if mission.is_terminal:
@@ -419,16 +481,25 @@ class MissionRuntime:
                         result = ToolCallResult(proposal, False, error=decision.reason)
                     else:
                         try:
-                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                             task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
                             execution_id = proposal.action_id or proposal.tool_call_id
+                            mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": execution_id, "step_id": task_id, "run_id": run_id}
                             dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
                             if dispatch_fence is not None:
-                                dispatch_fence.assert_current(mission=mission, task_id=task_id, execution_id=execution_id)
+                                dispatch_fence.assert_active_execution(mission)
                             self._save(mission)
                             if heartbeat is not None:
                                 heartbeat()
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, mission_authorization=mission.authorization_snapshot, execution_fence=dispatch_fence, execution_id=execution_id)
+                            if dispatch_fence is not None:
+                                dispatch_fence.assert_active_execution(mission)
+                            raw = self._execute_native_tool(
+                                proposal.name,
+                                argument,
+                                decision.decision,
+                                mission,
+                                dispatch_fence,
+                                execution_id,
+                            )
                             observation = dict(raw or {})
                             observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
                             mission.record_observation(observation)
@@ -453,7 +524,6 @@ class MissionRuntime:
     def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str]) -> None:
         """Authorize and execute independent proposals concurrently, then fold results deterministically."""
         from security.authorization import authorize_tool
-        from tools.registry import execute as execute_tool
         identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
         authorized: list[tuple[Any, Any, Any]] = []
         results: list[ToolCallResult] = []
@@ -471,7 +541,16 @@ class MissionRuntime:
                 authorized.append((proposal, argument, decision))
             else:
                 results.append(ToolCallResult(proposal, False, error=decision.reason))
-        mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
+        mission.checkpoint = {
+            "status": "in_flight_parallel",
+            "tool_call_ids": [item[0].tool_call_id for item in authorized],
+            "execution_ids": [item[0].action_id or item[0].tool_call_id for item in authorized],
+            "task_ids": [
+                item[0].step_id or str(getattr(current_step, "step_id", "") or "__mission__")
+                for item in authorized
+            ],
+            "run_id": run_id,
+        }
         self._save(mission)
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
             proposal, argument, decision = item
@@ -480,8 +559,15 @@ class MissionRuntime:
                 execution_id = proposal.action_id or proposal.tool_call_id
                 dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
                 if dispatch_fence is not None:
-                    dispatch_fence.assert_current(mission=mission, task_id=task_id, execution_id=execution_id)
-                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, mission_authorization=mission.authorization_snapshot, execution_fence=dispatch_fence, execution_id=execution_id) or {})
+                    dispatch_fence.assert_active_execution(mission)
+                return dict(self._execute_native_tool(
+                    proposal.name,
+                    argument,
+                    decision.decision,
+                    mission,
+                    dispatch_fence,
+                    execution_id,
+                ) or {})
             except Exception as exc:
                 # An exception after dispatch cannot prove that the external side effect did not happen.
                 # Preserve ambiguity so recovery cannot blindly replay this proposal.
@@ -611,7 +697,7 @@ class MissionRuntime:
         self._save(mission)
         dispatch_fence = self._fence_for(mission, task_id=step.step_id, execution_id=action_id)
         if dispatch_fence is not None:
-            dispatch_fence.assert_current(mission=mission, task_id=step.step_id, execution_id=action_id)
+            dispatch_fence.assert_active_execution(mission)
         try:
             if dispatch_fence is None:
                 result = self.executor(mission, step, action_id)

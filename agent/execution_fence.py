@@ -232,12 +232,50 @@ class ExecutionFence:
     ) -> "ExecutionFence":
         if not self.task_id or self.task_version is None or not self.authorization_hash:
             raise ExecutionFenceError("tool dispatch requires a task-bound execution fence")
-        return self.assert_current(
+        self.assert_current(
             mission_id=mission_id,
             request_id=request_id,
             execution_id=execution_id,
             authorization_snapshot=authorization_snapshot,
         )
+        if not self.queue.require_execution_fence:
+            return self
+        mission_store = getattr(self.queue, "mission_store", None)
+        if mission_store is None:
+            raise ExecutionFenceError("strict tool dispatch requires its authoritative MissionStore")
+        mission = mission_store.load(mission_id)
+        if mission is None:
+            raise ExecutionFenceError("strict tool dispatch mission is not durably persisted")
+        return self.assert_active_execution(mission)
+
+    def assert_active_execution(self, mission: Any, *, db: Any | None = None) -> "ExecutionFence":
+        """Prove this task/execution is recorded as the mission's active dispatch."""
+        self.assert_current(mission=mission, db=db)
+        checkpoint = getattr(mission, "checkpoint", None)
+        if not isinstance(checkpoint, Mapping):
+            raise ExecutionFenceError("execution fence has no active mission checkpoint")
+        status = str(checkpoint.get("status", ""))
+        if status not in {"in_flight", "in_flight_parallel"}:
+            raise ExecutionFenceError("execution fence does not match an in-flight mission checkpoint")
+
+        task_ids = {str(checkpoint.get("step_id", ""))}
+        execution_ids = {
+            str(checkpoint.get("action_id", "")),
+            str(checkpoint.get("tool_call_id", "")),
+        }
+        for name, destination in (
+            ("task_ids", task_ids),
+            ("execution_ids", execution_ids),
+            ("action_ids", execution_ids),
+            ("tool_call_ids", execution_ids),
+        ):
+            values = checkpoint.get(name, ())
+            if not isinstance(values, (list, tuple, set, frozenset)):
+                raise ExecutionFenceError("active mission checkpoint identity list is invalid")
+            destination.update(str(value) for value in values if value)
+        if self.task_id not in task_ids or self.execution_id not in execution_ids:
+            raise ExecutionFenceError("execution fence does not match the active mission checkpoint")
+        return self
 
     def assert_evidence(self, item: Mapping[str, Any]) -> dict[str, Any]:
         if not self.task_id or self.task_version is None or not self.authorization_hash or not self.execution_id:

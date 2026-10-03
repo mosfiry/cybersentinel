@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
+import sqlite3
 
 import pytest
 
@@ -82,6 +86,16 @@ def _leased_fence(tmp_path: Path):
     mission = store.load(mission.mission_id)
     assert mission is not None
     return store, mission, snapshot, queue, identity, claim, fence
+
+
+def _mark_active_execution(store: MissionStore, mission: Mission, fence: ExecutionFence) -> Mission:
+    mission.checkpoint = {
+        "status": "in_flight",
+        "step_id": fence.task_id,
+        "action_id": fence.execution_id,
+        "plan_version": mission.plan.version,
+    }
+    return store.save(mission, execution_fence=fence)
 
 
 def test_strict_queue_claim_heartbeat_update_release_and_retirement_require_fence(tmp_path):
@@ -183,6 +197,19 @@ def test_superseded_generation_cannot_write_mission_evidence_or_dispatch_tools(t
         )
     assert effects == []
 
+    with pytest.raises(ExecutionFenceError, match="in-flight mission checkpoint"):
+        registry_module.execute(
+            "fence_probe",
+            request_id=mission.request_id,
+            mission_authorization=snapshot,
+            mission_id=mission.mission_id,
+            target_identity=snapshot.target_identity,
+            execution_fence=fence,
+            execution_id="execution-1",
+        )
+    assert effects == []
+    mission = _mark_active_execution(store, mission, fence)
+
     wrong_identity = queue.register_worker("wrong-worker")
     wrong_worker_fence = ExecutionFence.for_worker(queue, wrong_identity).with_lease(claim).for_mission(
         mission, task_id="step-1", execution_id="execution-1"
@@ -239,6 +266,8 @@ def test_superseded_generation_cannot_write_mission_evidence_or_dispatch_tools(t
     evidence_store = EvidenceChainStore(
         tmp_path / "evidence.sqlite3",
         execution_fence=fence,
+        mission_store=store,
+        mission=mission,
         require_execution_fence=True,
     )
     appended = evidence_store.append({
@@ -256,6 +285,11 @@ def test_superseded_generation_cannot_write_mission_evidence_or_dispatch_tools(t
     assert appended["authorization_hash"] == fence.authorization_hash
     assert appended["fence_id"] == fence.fence_id
     assert evidence_store.verify()
+    stored_after_evidence = store.load(mission.mission_id)
+    assert stored_after_evidence.progress["execution_evidence_refs"] == [
+        evidence_store._receipt(appended)
+    ]
+    assert mission.integrity_hash == stored_after_evidence.integrity_hash
 
     mission.progress["current_fenced_write"] = True
     store.save(mission, execution_fence=fence)
@@ -290,6 +324,181 @@ def test_superseded_generation_cannot_write_mission_evidence_or_dispatch_tools(t
     assert effects == ["ran"]
 
 
+def test_evidence_append_rejects_wrong_execution_and_epoch(tmp_path):
+    store, mission, _snapshot, _queue, _identity, claim, fence = _leased_fence(tmp_path)
+    mission = _mark_active_execution(store, mission, fence)
+    evidence_store = EvidenceChainStore(
+        tmp_path / "bound-evidence.sqlite3",
+        execution_fence=fence,
+        mission_store=store,
+        mission=mission,
+        require_execution_fence=True,
+    )
+    item = {
+        "claim": "fenced evidence",
+        "source": "test",
+        "evidence": {"ok": True},
+        "mission_id": mission.mission_id,
+        "request_id": mission.request_id,
+    }
+
+    with pytest.raises(ExecutionFenceError, match="active mission checkpoint"):
+        evidence_store.append(item, execution_fence=replace(fence, task_id="wrong-task"))
+    with pytest.raises(ExecutionFenceError, match="active mission checkpoint"):
+        evidence_store.append(item, execution_fence=replace(fence, execution_id="wrong-execution"))
+    with pytest.raises(ExecutionFenceError):
+        evidence_store.append(item, execution_fence=replace(fence, lease_epoch=claim.lease_epoch + 1))
+    assert evidence_store.list() == []
+    assert store.load(mission.mission_id).progress.get("execution_evidence_refs", []) == []
+
+
+def test_evidence_append_rejects_stale_mission_snapshot_without_partial_write(tmp_path):
+    store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
+    mission = _mark_active_execution(store, mission, fence)
+    stale_mission = store.load(mission.mission_id)
+    current_mission = store.load(mission.mission_id)
+    current_mission.progress["owner_visible_update"] = "committed first"
+    store.save(current_mission, execution_fence=fence)
+    evidence_store = EvidenceChainStore(
+        tmp_path / "stale-mission-evidence.sqlite3",
+        execution_fence=fence,
+        mission_store=store,
+        mission=stale_mission,
+        require_execution_fence=True,
+    )
+
+    with pytest.raises(ExecutionFenceError, match="mission state is stale"):
+        evidence_store.append({
+            "claim": "must not append",
+            "source": "test",
+            "evidence": {"ok": True},
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+        })
+
+    assert evidence_store.list() == []
+    assert store.load(mission.mission_id).progress.get("execution_evidence_refs", []) == []
+
+
+def test_strict_evidence_chain_detects_reordered_records(tmp_path):
+    store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
+    mission = _mark_active_execution(store, mission, fence)
+    database = tmp_path / "reordered-evidence.sqlite3"
+    evidence_store = EvidenceChainStore(
+        database,
+        execution_fence=fence,
+        mission_store=store,
+        mission=mission,
+        require_execution_fence=True,
+    )
+    for index in range(2):
+        evidence_store.append({
+            "claim": f"evidence-{index}",
+            "source": "test",
+            "evidence": {"index": index},
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+        })
+    assert evidence_store.verify()
+    records = evidence_store.list()
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE evidence_chain SET payload=? WHERE sequence=1", (json.dumps(records[1]),))
+        db.execute("UPDATE evidence_chain SET payload=? WHERE sequence=2", (json.dumps(records[0]),))
+    assert evidence_store.verify() is False
+
+
+def test_evidence_verification_fails_closed_for_malformed_fenced_record(tmp_path, monkeypatch):
+    store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
+    mission = _mark_active_execution(store, mission, fence)
+    evidence_store = EvidenceChainStore(
+        tmp_path / "malformed-evidence.sqlite3",
+        execution_fence=fence,
+        mission_store=store,
+        mission=mission,
+        require_execution_fence=True,
+    )
+    record = evidence_store.append({
+        "claim": "valid before mutation",
+        "source": "test",
+        "evidence": {"ok": True},
+        "mission_id": mission.mission_id,
+        "request_id": mission.request_id,
+    })
+    malformed = dict(record)
+    malformed.pop("execution_id")
+    monkeypatch.setattr("agent.evidence.verify_chain", lambda _records: True)
+    evidence_store.list = lambda: [malformed]
+
+    assert evidence_store.verify() is False
+
+
+def test_evidence_and_mission_receipt_rollback_together_when_mission_write_fails(tmp_path):
+    store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
+    mission = _mark_active_execution(store, mission, fence)
+    database = tmp_path / "atomic-rollback-evidence.sqlite3"
+    evidence_store = EvidenceChainStore(
+        database,
+        execution_fence=fence,
+        mission_store=store,
+        mission=mission,
+        require_execution_fence=True,
+    )
+    with sqlite3.connect(store.db_path) as db:
+        db.execute(
+            "CREATE TRIGGER reject_mission_receipt BEFORE UPDATE ON missions "
+            "WHEN NEW.mission_id = 'fenced-mission' BEGIN "
+            "SELECT RAISE(ABORT, 'injected mission receipt failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected mission receipt failure"):
+        evidence_store.append({
+            "claim": "must roll back",
+            "source": "test",
+            "evidence": {"ok": True},
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+        })
+
+    assert evidence_store.list() == []
+    assert store.load(mission.mission_id).progress.get("execution_evidence_refs", []) == []
+
+
+def test_concurrent_fenced_evidence_appends_are_atomic_and_serialized(tmp_path):
+    store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
+    mission = _mark_active_execution(store, mission, fence)
+    database = tmp_path / "parallel-evidence.sqlite3"
+    stores = [
+        EvidenceChainStore(
+            database,
+            execution_fence=fence,
+            mission_store=store,
+            mission=mission,
+            require_execution_fence=True,
+        )
+        for _ in range(8)
+    ]
+
+    def append(index: int):
+        return stores[index % len(stores)].append({
+            "claim": f"parallel-{index}",
+            "source": "test",
+            "evidence": {"index": index},
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+        })
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        returned = list(pool.map(append, range(32)))
+
+    records = stores[0].list()
+    verifier = EvidenceChainStore(database, mission_store=store)
+    assert len(returned) == 32
+    assert [record["sequence"] for record in records] == list(range(1, 33))
+    assert len({record["current_hash"] for record in records}) == 32
+    assert len(store.load(mission.mission_id).progress["execution_evidence_refs"]) == 32
+    assert verifier.verify()
+
+
 def test_strict_mission_runtime_fails_closed_without_a_worker_fence(tmp_path):
     store = MissionStore(tmp_path / "missions.sqlite3")
     mission, _snapshot = _mission(store)
@@ -307,6 +516,34 @@ def test_strict_mission_runtime_fails_closed_without_a_worker_fence(tmp_path):
     assert persisted.status is MissionStatus.READY
     assert persisted.iteration_count == 0
     assert dispatched == []
+
+
+def test_run_slice_rechecks_active_checkpoint_immediately_before_executor(tmp_path, monkeypatch):
+    store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
+    effects: list[str] = []
+
+    def executor(_mission, _step, _action_id, *, execution_fence):
+        effects.append(execution_fence.execution_id)
+        return {"success": True}
+
+    runtime = MissionRuntime(store, executor=executor, require_execution_fence=True)
+    runtime.set_execution_fence(fence)
+    original_save = runtime._save
+
+    def save_then_stale_checkpoint(saved_mission, *, execution_fence=None):
+        result = original_save(saved_mission, execution_fence=execution_fence)
+        if saved_mission.checkpoint.get("status") == "in_flight":
+            saved_mission.checkpoint["action_id"] = "superseded-execution"
+        return result
+
+    monkeypatch.setattr(runtime, "_save", save_then_stale_checkpoint)
+    with pytest.raises(ExecutionFenceError, match="active mission checkpoint"):
+        runtime.run_slice(mission.mission_id)
+
+    assert effects == []
+    persisted = store.load(mission.mission_id)
+    assert persisted.checkpoint["status"] == "in_flight"
+    assert persisted.checkpoint["action_id"] != "superseded-execution"
 
 
 def test_strict_runtime_rejects_executor_without_fence_before_slice_mutation(tmp_path):

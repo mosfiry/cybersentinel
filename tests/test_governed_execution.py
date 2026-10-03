@@ -93,8 +93,20 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
     )
     binding = mission_store.bind_execution_claim("m1", fence)
     assert binding.terminal_status is None and binding.lease_binding_id is not None
+    mission_record = mission_store.load("m1")
+    mission_record.checkpoint = {
+        "status": "in_flight",
+        "step_id": fence.task_id,
+        "action_id": fence.execution_id,
+        "plan_version": mission_record.plan.version,
+    }
+    mission_store.save(mission_record, execution_fence=fence)
     store = EvidenceChainStore(
-        tmp_path / "evidence.sqlite3", execution_fence=fence, require_execution_fence=True
+        tmp_path / "evidence.sqlite3",
+        execution_fence=fence,
+        mission_store=mission_store,
+        mission=mission_record,
+        require_execution_fence=True,
     )
     result = execute(
         "run_project_tests", ".", authorization_decision=decision.decision,

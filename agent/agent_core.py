@@ -199,7 +199,7 @@ class AgentCore:
         from .execution_fence import ExecutionFenceError
         if execution_fence is None:
             raise ExecutionFenceError("AgentCore tool dispatch requires an execution fence")
-        execution_fence.assert_current(mission=mission, task_id=step.step_id, task_version=mission.plan.version, execution_id=action_id)
+        execution_fence.assert_active_execution(mission)
         if step.action == "__planning_failure__":
             return {"success": False, "failure_class": dict(step.retry_policy).get("failure_class", "LOGIC"), "error": "malformed, empty, or unknown tool proposal"}
         arguments = dict(step.retry_policy).get("arguments", {})
@@ -224,7 +224,13 @@ class AgentCore:
             if not workspace_root:
                 raise PermissionError("mission workspace boundary required")
             workspace = Workspace(workspace_root)
-            evidence_store = EvidenceChainStore(Path(self.store.db_path).with_name("evidence_chain.db"), execution_fence=execution_fence, require_execution_fence=True)
+            evidence_store = EvidenceChainStore(
+                Path(self.store.db_path).with_name("evidence_chain.db"),
+                execution_fence=execution_fence,
+                mission_store=self.store,
+                mission=mission,
+                require_execution_fence=True,
+            )
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
             value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}

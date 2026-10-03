@@ -7,6 +7,7 @@ from typing import Any
 import hashlib
 import json
 import sqlite3
+import threading
 import uuid
 
 from .execution_fence import ExecutionFence, ExecutionFenceError
@@ -74,23 +75,170 @@ def verify_chain(records: list[dict]) -> bool:
 
 
 class EvidenceChainStore:
-    """Durable adapter for the existing hash-linked Evidence schema."""
+    """Durable hash chain; strict appends atomically bind evidence to mission and lease state."""
 
-    def __init__(self, db_path: str | Path, *, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False):
+    _mission_append_lock = threading.RLock()
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        execution_fence: ExecutionFence | None = None,
+        mission_store: Any | None = None,
+        mission: Any | None = None,
+        require_execution_fence: bool = False,
+    ):
         self.db_path = str(db_path)
         self.execution_fence = execution_fence
+        self.mission_store = mission_store
+        self.mission = mission
         self.require_execution_fence = bool(require_execution_fence)
+        if self.require_execution_fence and (self.mission_store is None or self.mission is None):
+            raise ExecutionFenceError("strict evidence store requires its MissionStore and live mission")
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS evidence_chain (sequence INTEGER PRIMARY KEY AUTOINCREMENT, current_hash TEXT UNIQUE NOT NULL, payload TEXT NOT NULL)")
 
-    def append(self, item: dict[str, Any], *, execution_fence: ExecutionFence | None = None) -> dict[str, Any]:
-        fence = execution_fence or self.execution_fence
-        if self.require_execution_fence and fence is None:
-            raise ExecutionFenceError("evidence append requires an execution fence")
-        payload = dict(item)
-        if fence is not None:
-            payload = fence.assert_evidence(payload)
-        with sqlite3.connect(self.db_path) as db:
+    @staticmethod
+    def _schema_name(schema: str) -> str:
+        return '"' + schema.replace('"', '""') + '"'
+
+    def _attach_atomic_stores(self, db: sqlite3.Connection, fence: ExecutionFence) -> str:
+        if self.db_path == ":memory:":
+            raise ExecutionFenceError("strict evidence requires a durable rollback-journal database")
+        paths: dict[str, str] = {"main": str(Path(self.db_path).resolve())}
+        schemas_by_path = {paths["main"]: "main"}
+        for alias, path in (
+            ("mission_store_db", self.mission_store.db_path),
+            ("execution_queue_db", fence.queue.db_path),
+        ):
+            resolved = str(Path(path).resolve())
+            schema = schemas_by_path.get(resolved)
+            if schema is None:
+                db.execute(f"ATTACH DATABASE ? AS {alias}", (resolved,))
+                schema = alias
+                paths[schema] = resolved
+                schemas_by_path[resolved] = schema
+            schemas_by_path[resolved] = schema
+        for schema in dict.fromkeys(schemas_by_path.values()):
+            mode = str(db.execute(f"PRAGMA {self._schema_name(schema)}.journal_mode").fetchone()[0]).lower()
+            if mode not in {"delete", "truncate", "persist"}:
+                raise ExecutionFenceError("evidence, mission, and queue writes require SQLite rollback-journal mode")
+        return self._schema_name(schemas_by_path[str(Path(self.mission_store.db_path).resolve())])
+
+    @staticmethod
+    def _fence_marker_matches(mission: Any, fence: ExecutionFence) -> bool:
+        marker = mission.progress.get("active_execution_claim")
+        if not isinstance(marker, dict) or marker.get("lease_binding_id") != fence.lease_binding_id:
+            return False
+        expected = fence.metadata()
+        # The lease identity is stable while a mission can have several sequential
+        # task executions (or a declared parallel batch) under the same claim.
+        for name in (
+            "mission_id",
+            "request_id",
+            "worker_id",
+            "worker_instance_id",
+            "runtime_generation",
+            "lease_epoch",
+            "task_version",
+            "authorization_hash",
+        ):
+            if marker.get(name) != expected.get(name):
+                return False
+        return True
+
+    @staticmethod
+    def _receipt(record: dict[str, Any]) -> dict[str, Any]:
+        names = (
+            "mission_id",
+            "task_id",
+            "execution_id",
+            "request_id",
+            "worker_id",
+            "worker_instance_id",
+            "runtime_generation",
+            "lease_epoch",
+            "task_version",
+            "authorization_hash",
+            "fence_id",
+        )
+        return {
+            "evidence_id": record["evidence_id"],
+            "sequence": int(record["sequence"]),
+            "current_hash": str(record["current_hash"]),
+            **{name: record[name] for name in names},
+        }
+
+    def _append_fenced(self, payload: dict[str, Any], fence: ExecutionFence) -> dict[str, Any]:
+        from .mission import Mission
+
+        if self.mission_store is None or self.mission is None:
+            raise ExecutionFenceError("fenced evidence append requires its MissionStore and live mission")
+        if not fence.queue.require_execution_fence or fence.queue.mission_store is not self.mission_store:
+            raise ExecutionFenceError("fenced evidence append requires the queue's authoritative MissionStore")
+        if str(getattr(self.mission, "mission_id", "")) != str(fence.mission_id):
+            raise ExecutionFenceError("evidence live mission does not match execution fence")
+
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            mission_schema = self._attach_atomic_stores(db, fence)
+            db.execute("BEGIN IMMEDIATE")
+            # This single transaction holds the evidence chain, mission payload,
+            # and current queue lease stable through both writes.
+            stamped = fence.assert_evidence(payload)
+            row = db.execute(
+                f"SELECT payload FROM {mission_schema}.missions WHERE mission_id=?",
+                (fence.mission_id,),
+            ).fetchone()
+            if row is None:
+                raise ExecutionFenceError("evidence mission is not durably persisted")
+            stored_mission = Mission.from_dict(json.loads(row[0]))
+            fence.assert_active_execution(stored_mission, db=db)
+            if not self._fence_marker_matches(stored_mission, fence):
+                raise ExecutionFenceError("evidence execution does not match the durable mission claim")
+            if str(getattr(self.mission, "integrity_hash", "")) != stored_mission.integrity_hash:
+                raise ExecutionFenceError("evidence append mission state is stale")
+
+            last = db.execute("SELECT sequence,current_hash FROM evidence_chain ORDER BY sequence DESC LIMIT 1").fetchone()
+            sequence = int(last[0] if last else 0) + 1
+            previous = str(last[1] if last else "")
+            stamped["sequence"] = sequence
+            stamped["previous_hash"] = previous
+            # Factories may precompute a hash before the chain position is known.
+            stamped.pop("current_hash", None)
+            record = Evidence(**stamped)
+            encoded_evidence = json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)
+            refs = stored_mission.progress.get("execution_evidence_refs", [])
+            if not isinstance(refs, list):
+                raise ExecutionFenceError("mission execution evidence references are invalid")
+            receipt = self._receipt(record.to_dict())
+            if any(isinstance(existing, dict) and existing.get("evidence_id") == receipt["evidence_id"] for existing in refs):
+                raise ExecutionFenceError("duplicate evidence identity")
+            updated_refs = [*refs, receipt]
+            stored_mission.progress["execution_evidence_refs"] = updated_refs
+            encoded_mission_payload = stored_mission.to_dict()
+            encoded_mission = json.dumps(encoded_mission_payload, ensure_ascii=False)
+
+            db.execute(
+                "INSERT INTO evidence_chain(sequence,current_hash,payload) VALUES(?,?,?)",
+                (sequence, record.current_hash, encoded_evidence),
+            )
+            updated = db.execute(
+                f"UPDATE {mission_schema}.missions SET payload=? WHERE mission_id=? AND payload=?",
+                (encoded_mission, fence.mission_id, row[0]),
+            )
+            if updated.rowcount != 1:
+                raise ExecutionFenceError("mission changed during evidence append")
+            new_integrity_hash = str(encoded_mission_payload["integrity_hash"])
+
+        # Keep the in-flight runtime object synchronized with the transaction so
+        # its subsequent fenced mission save continues from the new CAS version.
+        with self._mission_append_lock:
+            self.mission.progress["execution_evidence_refs"] = updated_refs
+            self.mission.integrity_hash = new_integrity_hash
+        return record.to_dict()
+
+    def _append_legacy(self, payload: dict[str, Any], fence: ExecutionFence | None) -> dict[str, Any]:
+        with sqlite3.connect(self.db_path, timeout=30) as db:
             db.execute("BEGIN IMMEDIATE")
             if fence is not None:
                 payload = fence.assert_evidence(payload)
@@ -100,11 +248,27 @@ class EvidenceChainStore:
             payload["sequence"] = sequence
             payload["previous_hash"] = previous
             # Evidence factories may precompute a hash before the chain position is known.
-            # Recompute it after assigning sequence and previous_hash.
             payload.pop("current_hash", None)
             record = Evidence(**payload)
-            db.execute("INSERT INTO evidence_chain(sequence,current_hash,payload) VALUES(?,?,?)", (sequence, record.current_hash, json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)))
+            db.execute(
+                "INSERT INTO evidence_chain(sequence,current_hash,payload) VALUES(?,?,?)",
+                (sequence, record.current_hash, json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)),
+            )
         return record.to_dict()
+
+    def append(self, item: dict[str, Any], *, execution_fence: ExecutionFence | None = None) -> dict[str, Any]:
+        fence = execution_fence or self.execution_fence
+        if self.require_execution_fence and fence is None:
+            raise ExecutionFenceError("evidence append requires an execution fence")
+        payload = dict(item)
+        if fence is not None:
+            payload = fence.assert_evidence(payload)
+        if self.require_execution_fence or (fence is not None and self.mission_store is not None and self.mission is not None):
+            if fence is None:
+                raise ExecutionFenceError("evidence append requires an execution fence")
+            with self._mission_append_lock:
+                return self._append_fenced(payload, fence)
+        return self._append_legacy(payload, fence)
 
     def append_workspace_event(self, event: Any) -> dict[str, Any]:
         payload = asdict(event) if hasattr(event, "__dataclass_fields__") else dict(event)
@@ -133,7 +297,38 @@ class EvidenceChainStore:
         return [json.loads(row[0]) for row in rows]
 
     def verify(self) -> bool:
-        return verify_chain(self.list())
+        try:
+            records = self.list()
+            if not verify_chain(records):
+                return False
+            if self.mission_store is None:
+                return True
+            for record in records:
+                if not isinstance(record, dict):
+                    return False
+                if not record.get("fence_id"):
+                    if self.require_execution_fence:
+                        return False
+                    continue
+                mission_id = str(record.get("mission_id", ""))
+                if not mission_id:
+                    return False
+                mission = self.mission_store.load(mission_id)
+                if mission is None:
+                    return False
+                refs = mission.progress.get("execution_evidence_refs", [])
+                if not isinstance(refs, list):
+                    return False
+                expected = self._receipt(record)
+                if not any(
+                    isinstance(receipt, dict)
+                    and all(receipt.get(name) == value for name, value in expected.items())
+                    for receipt in refs
+                ):
+                    return False
+            return True
+        except (sqlite3.Error, KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            return False
 
 
 __all__ = ["Evidence", "EvidenceChainStore", "observed", "verify_chain"]

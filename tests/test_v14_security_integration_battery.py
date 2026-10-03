@@ -37,6 +37,39 @@ class _StaticMissionProvider:
         raise AssertionError("the V14 fixture does not require an additional provider call")
 
 
+class _NativeWorkspaceProvider:
+    name = "native-workspace-fixture"
+    model = "native-workspace-fixture-1"
+    capabilities = ProviderCapabilities(
+        generate=True,
+        tool_calling=True,
+        native_chat=True,
+        parallel_tool_calls=True,
+    )
+
+    def __init__(self, tool_calls: list[ToolCall]):
+        self.responses = [
+            ProviderResponse(tool_calls=tool_calls),
+            ProviderResponse(
+                tool_calls=[
+                    ToolCall(call.name, dict(call.arguments), f"native-{call.call_id}")
+                    for call in tool_calls
+                ]
+            ),
+            ProviderResponse(text="The authorized workspace checks are complete."),
+        ]
+        self.calls = 0
+
+    def tool_calling(self, *_args, **_kwargs):
+        self.calls += 1
+        if not self.responses:
+            raise AssertionError("unexpected additional native model turn")
+        return self.responses.pop(0)
+
+    def generate(self, *_args, **_kwargs):
+        raise AssertionError("native tool calling should not use generate")
+
+
 class _EmptyKnowledge:
     def retrieve_relevant(self, *_args, **_kwargs):
         return []
@@ -90,7 +123,11 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     assert mission.authorization_snapshot["owner_approval"]
     assert mission.authorization_context["request_id"] == mission.request_id
 
-    queue = MissionQueue(tmp_path / "queue.sqlite3")
+    queue = MissionQueue(
+        tmp_path / "queue.sqlite3",
+        require_execution_fence=True,
+        mission_store=store,
+    )
     runtime = MissionRuntime(store, executor=core._executor)
     service = MissionService(
         runtime,
@@ -123,7 +160,10 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     assert persisted.evidence
     assert queue.get(mission.mission_id).state is WorkerMissionState.COMPLETED
 
-    evidence_store = EvidenceChainStore(tmp_path / "evidence_chain.db")
+    evidence_store = EvidenceChainStore(
+        tmp_path / "evidence_chain.db",
+        mission_store=store,
+    )
     records = evidence_store.list(request_id=mission.request_id)
     assert records
     assert evidence_store.verify()
@@ -134,6 +174,60 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     assert provenance["authorization_snapshot_hash"] == persisted.authorization_snapshot[
         "authorization_hash"
     ]
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_path, monkeypatch, parallel):
+    allow_owner_sessions(monkeypatch, "native-owner-session")
+    authorized_root = tmp_path / "authorized-native-project"
+    authorized_root.mkdir()
+    (authorized_root / "test_ok.py").write_text(
+        "def test_ok():\n    assert 4 == 2 + 2\n",
+        encoding="utf-8",
+    )
+    decoy_root = tmp_path / "decoy-project"
+    decoy_root.mkdir()
+    (decoy_root / "test_fail.py").write_text(
+        "def test_fail():\n    assert False\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(decoy_root))
+    tool_calls = [ToolCall("run_project_tests", {"query": "."}, "native-workspace-call")]
+    if parallel:
+        tool_calls.append(ToolCall("status", {}, "native-status-call"))
+    provider = _NativeWorkspaceProvider(tool_calls)
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    core = AgentCore(
+        ModelRouter([provider]),
+        store=store,
+        max_iterations=5,
+        knowledge_retriever=_EmptyKnowledge(),
+    )
+
+    mission = core.run_owner_mission(
+        "Run the authorized local project tests and verify their result",
+        owner_session_token="native-owner-session",
+        request_id=f"native-workspace-{parallel}",
+        scope_context={"workspace_root": str(authorized_root)},
+    )
+
+    assert provider.calls == 3
+    assert mission.status is MissionStatus.GOAL_COMPLETED
+    evidence_store = EvidenceChainStore(
+        tmp_path / "evidence_chain.db",
+        mission_store=store,
+    )
+    records = evidence_store.list(request_id=mission.request_id)
+    assert len(records) == 1
+    assert evidence_store.verify()
+    assert records[0]["task_id"]
+    assert records[0]["execution_id"]
+    assert records[0]["evidence"]["result"] == "success"
+    assert records[0]["evidence"]["provenance"]["workspace"] == str(authorized_root.resolve())
+    assert any(
+        receipt["evidence_id"] == records[0]["evidence_id"]
+        for receipt in store.load(mission.mission_id).progress["execution_evidence_refs"]
+    )
 
 
 def test_stale_owner_cannot_enqueue_or_reach_worker_effect_boundary(tmp_path, monkeypatch):
