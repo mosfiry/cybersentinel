@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.mission import MissionStatus
-from agent.mission_worker import LeaseLostError, MissionQueue, MissionScheduler, MissionWorker, WorkerMissionState
+from agent.mission_worker import ExecutionFenceError, LeaseLostError, MissionQueue, MissionScheduler, MissionWorker, WorkerMissionState
 
 
 BASE = "2026-01-01T00:00:00+00:00"
@@ -353,15 +353,18 @@ def test_worker_does_not_construct_runtime_when_initial_lease_validation_fails(t
     assert runtime_created == []
 
 
-def test_scheduler_due_time_compares_equivalent_offset_instants(tmp_path):
+def test_unbound_scheduler_cannot_dispatch_equivalent_offset_instants(tmp_path):
     queue = MissionQueue(tmp_path / "schedule-offset-queue.sqlite3")
     scheduler = MissionScheduler(tmp_path / "schedule-offset.sqlite3", queue)
-    scheduler.schedule("offset-schedule", run_at="2026-01-01T01:00:00+01:00", schedule_id="offset")
+    with pytest.raises(ExecutionFenceError, match="authoritative MissionStore"):
+        scheduler.schedule("offset-schedule", run_at="2026-01-01T01:00:00+01:00", schedule_id="offset")
 
-    dispatched = scheduler.dispatch_due(now="2026-01-01T00:30:00+00:00")
+    queue.enqueue("offset-schedule", available_at="2026-01-01T00:00:00+00:00", state=WorkerMissionState.SCHEDULED)
+    with pytest.raises(ExecutionFenceError, match="authoritative MissionStore"):
+        scheduler.dispatch_due(now="2026-01-01T00:30:00+00:00")
 
-    assert [item.schedule_id for item in dispatched] == ["offset"]
-    assert queue.get("offset-schedule").state is WorkerMissionState.QUEUED
+    assert queue.get("offset-schedule").state is WorkerMissionState.SCHEDULED
+    assert queue.claim_next(now="2026-01-01T00:30:00+00:00", worker_id="worker") is None
 
 
 def test_scheduler_migrates_legacy_offset_due_times(tmp_path):
@@ -389,7 +392,9 @@ def test_scheduler_migrates_legacy_offset_due_times(tmp_path):
     scheduler = MissionScheduler(schedule_path, queue)
     assert scheduler.get("legacy-offset").next_run_at == "2026-01-01T00:00:00.000000+00:00"
 
-    dispatched = scheduler.dispatch_due(now="2026-01-01T00:30:00+00:00")
+    queue.enqueue("legacy-scheduled-mission", available_at="2026-01-01T00:00:00+00:00", state=WorkerMissionState.SCHEDULED)
+    with pytest.raises(ExecutionFenceError, match="authoritative MissionStore"):
+        scheduler.dispatch_due(now="2026-01-01T00:30:00+00:00")
 
-    assert [item.schedule_id for item in dispatched] == ["legacy-offset"]
-    assert queue.get("legacy-scheduled-mission").state is WorkerMissionState.QUEUED
+    assert queue.get("legacy-scheduled-mission").state is WorkerMissionState.SCHEDULED
+    assert queue.claim_next(now="2026-01-01T00:30:00+00:00", worker_id="worker") is None

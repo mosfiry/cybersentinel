@@ -2,46 +2,34 @@
 
 ## Previous checkpoint
 
-V8 is complete at code commit `0ce8730ca7a0a49d2e51ece94fadfb0139890b4f`. The full suite passed 892 tests with 1 skipped; focused Owner control-plane/bridge/recovery tests passed 27. See `docs/M3_STATE.md` for the detailed V8 evidence and remote-state reconciliation.
+V8 is complete at code commit `0ce8730ca7a0a49d2e51ece94fadfb0139890b4f`. The full suite passed 892 tests with 1 skipped; focused Owner control-plane/bridge/recovery tests passed 27. See `docs/M3_STATE.md` for V8 evidence and remote-state reconciliation.
 
 ## V9 objective
 
-A scheduled or delayed mission must never inherit authority merely because it was created by, queued for, or once belonged to an Owner. Schedule creation requires fresh authenticated Owner reauthorization. Each durable schedule is bound to the exact mission, stable Owner identity, authorization snapshot digest/version, and expiry. At due time the runtime must validate those bindings and the mission's current status before making the queue item claimable. Expired, changed, mismatched, or corrupt authorization is quarantined; it is not silently refreshed or resurrected.
+Cover delayed/scheduled missions and queued/resumed work with verifiable Owner authority. A schedule must not derive authority from `created_by`, `owner_id`, or an old session alone. At restart or expiry, work must be reauthorized or blocked; it must never resurrect authority.
 
 ## Source findings
 
-- `MissionScheduler.mission_schedules` currently stores only schedule ID, mission ID, due time, interval, retry counters, and state. It stores no Owner or authorization-snapshot binding.
-- `MissionService.schedule_mission()` checks the current Owner-to-mission identity and active lease, but does not run the fresh reauthorization path used by start/resume.
-- `MissionScheduler.dispatch_due()` blindly calls `MissionQueue.enqueue()` and then updates the schedule row. It does not validate mission status, snapshot identity, snapshot expiry, or the current Owner binding.
-- `MissionScheduler` uses its own database path in the bridge; queue and MissionStore also have separate database paths. The current schedule enqueue/state update is not one crash-safe transaction. All strict databases must retain rollback-journal mode if an attached-database transaction is used.
-- The source search found no production invocation of `dispatch_due()` from `MissionWorker`, `RuntimeSupervisor`, or bridge startup. The existing API persists schedules but does not establish a supervised due-dispatch loop. Do not call a dormant interface production-ready; wire a bounded, observable due-dispatch path only if it can be integrated into the existing supervisor without hidden threads or invented infrastructure.
+- The original scheduler schema lacked Owner identity, snapshot digest/version, and expiry.
+- The original service did not reauthorize Owner authority before scheduling; the original due-dispatch path did not validate mission or snapshot state.
+- Scheduler, queue, MissionStore, and Owner-authentication data are held in existing SQLite stores. Production scheduling can use the existing supervised `MissionWorker` poll without adding a thread.
+- The production call path was wired so the worker performs bounded due-dispatch before claim. A scheduled queue row is never directly claimable.
+- The Owner evidence already persisted in the authoritative MissionStore includes an evidence record and session reference. Its HMAC uses a process-local key, so an independent worker cannot re-verify that HMAC. The bridge authenticates and creates the snapshot; the scheduler does not duplicate a session token and due dispatch validates the durable evidence-to-snapshot bindings plus current Owner session/account status inside the attached transaction. `AuthorizationContext` uses the same active-session fallback only when its local HMAC does not verify.
 
 ## Architecture decisions
 
-1. Reuse the existing authenticated Owner session and `owner_revalidator`; schedule creation is a fresh Owner action. Validate the renewed `MissionAuthorizationSnapshot` against mission ID, stable `owner:<id>`, integrity hash, provenance version, and active time range.
-2. Persist only non-secret binding metadata with the schedule: stable Owner identity, authorization hash/version, and snapshot expiry. Do not persist a session token or attempt to refresh the stored authorization at dispatch time.
-3. Before due dispatch, reload the authoritative MissionStore record and compare the schedule binding to the current, hash-valid authorization snapshot and provenance version. Require an allowed nonterminal mission status and no active lease. If any check fails or the snapshot expired, place the mission/schedule into a durable non-claimable Owner-reauthorization state.
-4. Make schedule state transition and queue insertion idempotent under crash/retry. Prefer one attached rollback-journal transaction over best-effort sequential writes; otherwise use an explicit durable dispatch saga that can only fail closed. Validate all participating database journal modes.
-5. Bind recurring schedules to one snapshot. Once that snapshot expires or changes, stop the schedule and quarantine it. Renewal requires a new explicit Owner action; never update a schedule's authorization from a background worker.
-6. Use the existing supervisor polling/lifecycle rather than adding a hidden daemon. Any due dispatcher must be bounded, recoverable, observable, and run before a scheduled queue item is claimed.
+1. Schedule creation goes through the existing active Owner session and `owner_revalidator`. Only the exact durable `owner:<id>` matching the mission may schedule it. The renewed `MissionAuthorizationSnapshot` must match mission ID, stable Owner identity, current provenance version, and live expiry.
+2. Persist only non-secret binding metadata in `mission_schedules`: stable Owner identity, authorization hash/version, and snapshot expiry. Do not store a session token in a schedule row. Schedule creation flows through the existing authenticated Owner revalidator; due-time verification is portable across worker processes by checking exact durable evidence/snapshot fields and the current active Owner session/account rather than trusting a process-local HMAC.
+3. At due time, reload the authoritative MissionStore record and check schedule/mission/Owner/snapshot bindings, evidence request/proof/expiry fields, active session, current account status, expiry, queue state, lease, and mission readiness. Invalid or revoked authority is quarantined; terminal/cancelled missions are retired; no path refreshes authorization in the background. Owner start/resume retires pending due rows after reauthorization and reloads status before queueing; cancellation immediately retires pending due rows after the queue state change.
+4. Schedule and queue writes are one attached SQLite transaction spanning scheduler, queue, MissionStore, and Owner-authentication stores. Every participant must use rollback-journal mode. A missing store, unsupported journal mode, malformed row, or transaction failure does not promote work. Startup migration also catches malformed legacy queue/schedule states and timestamps, moving them to non-claimable recovery states instead of aborting before the supervisor can recover.
+5. Strict startup recovery still runs before polling. It quarantines previously scheduled work after restart, requiring a fresh Owner action before any future schedule; the old schedule cannot revive it.
+6. Production supports one-shot delayed schedules only. Recurring/cron execution and automatic retries are explicitly blocked because the existing model has no safe per-occurrence mission identity plus explicit Owner authorization contract; reopening a completed mission or silently reusing one snapshot would broaden authority. The bridge/service returns a validation error instead of emulating recurring work. `MissionScheduler.schedule()` and `dispatch_due()` also fail closed without an authoritative MissionStore; legacy unbound schedule rows may be inspected/migrated but never dispatched.
+7. Integrate due polling into the existing `MissionWorker.run_once()` and supervisor lifecycle only; add no daemon/thread or external service.
 
-## Task list
+## Verification
 
-### Phase 1: Snapshot-bound schedule persistence
-- Add strict schedule input validation and Owner reauthorization before schedule insertion.
-- Migrate the schedule table additively for Owner identity, authorization hash/version, and expiry.
-- Reject schedules for unbound, terminal, recovery-required, leased, malformed, or already-expired mission authority.
-
-### Phase 2: Fail-closed due dispatch and lifecycle integration
-- Verify exact current mission/Owner/snapshot bindings and expiry at due time.
-- Atomically or saga-safely transition schedule and queue; quarantine invalid or expired records without dispatch.
-- Inspect runtime-supervisor wiring; if an existing lifecycle can support scheduled dispatch, integrate a bounded pre-claim poll. Do not create a new hidden thread or external service.
-
-### Phase 3: Adversarial verification
-- Test stale/expired/foreign/unbound/tampered snapshot rejection; mission/version/Owner mismatch; duplicate due dispatch; crash between schedule/queue writes; recurring schedule expiry; and stale session/replay.
-- Prove invalid schedules never reach the executor and no background path renews authority.
-- Run full suite, compileall, diff hygiene, static dispatch/scheduler call-graph scans, and secret scanning.
+`tests/test_v9_scheduled_authorization.py` contains 39 adversarial cases for fresh/foreign/revoked sessions, active and expired snapshots, tampered hashes/versions, malformed persisted provenance/version/mission/queue/schedule data, corrupted and NULL startup timestamps, legacy unbound rows, active leases, duplicate polls, crash boundaries in schedule and queue writes, Owner start versus due-poll races, cancellation, restart quarantine, WAL rejection, normalized offset times, one-shot worker dispatch, explicit recurring/retry rejection, and bridge/worker key-rotation portability with revocation rejection. Separate legacy-API tests prove missing-MissionStore scheduling/dispatch/cancellation fail closed and SCHEDULED queue rows remain unclaimable. Bridge-level HTTP and production worker-factory tests cover the public route and supervisor wiring.
 
 ## Checkpoint gate
 
-V9 is complete only when schedule creation and due dispatch are both demonstrably Owner- and snapshot-bound, restart/expiry fail closed, the production scheduling path is either actually integrated or explicitly remains unavailable without being advertised as active, all negative tests pass, and the local code/evidence checkpoint is committed. Preserve `main` and M2D. Do not push while the V6 Cloudflare production-build check remains unresolved.
+V9 gates passed: the full suite reports 931 passed and 1 skipped; the dedicated V9 suite reports 39 passed; compilation, diff hygiene, static dispatch/call-graph review, secret scan, protected-ref checks, and final independent review are clean. V9 is complete after the new code and state evidence are committed locally on `task/m3-production-runtime-20261003`; `main`/M2D remain unchanged. Recurring/cron remains a separately recorded BLOCKED sub-capability pending an explicit per-occurrence authority model. Do not push while the exact-SHA V6 Cloudflare production-build check remains unresolved.

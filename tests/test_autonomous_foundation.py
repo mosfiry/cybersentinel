@@ -9,7 +9,7 @@ import pytest
 from agent.mission import MissionStatus
 from agent.mission_runtime import MissionRuntime
 from agent.mission_context import ContextRecord, MissionContext
-from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, WorkerMissionState
+from agent.mission_worker import ExecutionFenceError, MissionQueue, MissionScheduler, MissionWorker, WorkerMissionState
 from agent.self_repair import BoundedSelfRepair
 from agent.verification import FindingClaim, VerificationEngine, VerificationPlan, VerificationResult
 from security.mission_authorization import MissionAuthorizationSnapshot
@@ -271,16 +271,18 @@ def test_worker_preserves_recovery_required_for_reconciliation(tmp_path):
     assert result.last_error == "in-flight tool outcome is unknown"
 
 
-def test_scheduler_supports_one_time_and_recurring_dispatch(tmp_path):
+def test_scheduler_without_mission_store_fails_closed(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     scheduler = MissionScheduler(Path(tmp_path) / "scheduler.sqlite3", queue)
-    one = scheduler.schedule("mission-one", run_at="2026-01-01T00:00:00+00:00", schedule_id="one")
-    recurring = scheduler.schedule("mission-recurring", run_at="2026-01-01T00:00:00+00:00", interval_seconds=60, schedule_id="recurring")
-    dispatched = scheduler.dispatch_due(now="2026-01-01T00:01:00+00:00")
-    assert {item.schedule_id for item in dispatched} == {"one", "recurring"}
-    assert scheduler.get("one").state is WorkerMissionState.COMPLETED
-    assert scheduler.get("recurring").state is WorkerMissionState.SCHEDULED
-    assert datetime.fromisoformat(scheduler.get("recurring").next_run_at) == datetime.fromisoformat("2026-01-01T00:02:00+00:00")
+    with pytest.raises(ExecutionFenceError, match="authoritative MissionStore"):
+        scheduler.schedule("mission-one", run_at="2026-01-01T00:00:00+00:00", schedule_id="one")
+    with pytest.raises(ExecutionFenceError, match="authoritative MissionStore"):
+        scheduler.cancel_scheduled("legacy-scheduled-mission")
+    queue.enqueue("legacy-scheduled-mission", available_at="2026-01-01T00:00:00+00:00", state=WorkerMissionState.SCHEDULED)
+    with pytest.raises(ExecutionFenceError, match="authoritative MissionStore"):
+        scheduler.dispatch_due(now="2026-01-01T00:01:00+00:00")
+    assert queue.get("legacy-scheduled-mission").state is WorkerMissionState.SCHEDULED
+    assert queue.claim_next(now="2026-01-01T00:01:00+00:00", worker_id="worker") is None
 
 
 def test_context_separation_and_independent_verification():
@@ -314,12 +316,26 @@ def test_self_repair_records_bounded_cycle():
 
 
 def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path, monkeypatch):
+    import core.db as core_db
     from agent.mission import MissionStore
     from agent.agent_core import AgentCore
     from agent.model_router import ModelRouter
     from owner_session_testutils import allow_owner_sessions
 
     allow_owner_sessions(monkeypatch, "service-owner")
+    monkeypatch.setattr(core_db, "DB_PATH", Path(tmp_path) / "owner_auth.sqlite3")
+    now = datetime.now(timezone.utc).isoformat()
+    with core_db.connect() as auth_db:
+        auth_db.execute(
+            "INSERT INTO owner_accounts(username,password_hash,kdf_algorithm,kdf_params_json,status) "
+            "VALUES(?,?,?,?,?)",
+            ("owner-one", "test-verifier", "scrypt", "{}", "active"),
+        )
+        auth_db.execute(
+            "INSERT INTO owner_sessions(session_id,owner_id,created_at,authenticated_at,expires_at,status,auth_method) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("service-owner", 1, now, now, "2999-01-01T00:00:00+00:00", "active", "username_password"),
+        )
     store = MissionStore(Path(tmp_path) / "missions.sqlite3")
     runtime = MissionRuntime(store, executor=lambda _mission, _step, _action: {"success": True, "criterion_id": "done", "source": "test"}, authorization_snapshot_factory=make_test_snapshot)
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")

@@ -5,13 +5,13 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 import sqlite3
 import uuid
 
 from .execution_fence import ExecutionFence, ExecutionFenceError
-from .mission import MissionClaimBinding, MissionStatus
+from .mission import Mission, MissionClaimBinding, MissionStatus
 
 
 class WorkerMissionState(str, Enum):
@@ -106,12 +106,27 @@ class MissionQueue:
                 if column not in columns:
                     db.execute(f"ALTER TABLE mission_queue ADD COLUMN {column} {definition}")
                     columns.add(column)
-            for mission_id, available_at, claimed_at, lease_expires_at in db.execute(
-                "SELECT mission_id,available_at,claimed_at,lease_expires_at FROM mission_queue"
+            for mission_id, state_value, available_at, claimed_at, lease_expires_at, lease_owner in db.execute(
+                "SELECT mission_id,state,available_at,claimed_at,lease_expires_at,lease_owner FROM mission_queue"
             ).fetchall():
-                normalized_available = _utc_text(_utc_datetime(available_at, field_name="available_at"))
-                normalized_claimed = _utc_text(_utc_datetime(claimed_at, field_name="claimed_at")) if claimed_at is not None else None
-                normalized_expiry = _utc_text(_utc_datetime(lease_expires_at, field_name="lease_expires_at")) if lease_expires_at is not None else None
+                try:
+                    WorkerMissionState(state_value)
+                    if available_at is None:
+                        raise ValueError("available_at is missing")
+                    normalized_available = _utc_text(_utc_datetime(available_at, field_name="available_at"))
+                    normalized_claimed = _utc_text(_utc_datetime(claimed_at, field_name="claimed_at")) if claimed_at is not None else None
+                    normalized_expiry = _utc_text(_utc_datetime(lease_expires_at, field_name="lease_expires_at")) if lease_expires_at is not None else None
+                except (TypeError, ValueError):
+                    db.execute(
+                        "UPDATE mission_queue SET state=?,available_at=?,claimed_at=NULL,last_error=?,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_id=?",
+                        (
+                            WorkerMissionState.WAITING_FOR_TOOL.value,
+                            _utc_text(datetime.now(timezone.utc)),
+                            "malformed persisted queue state/timestamp; manual recovery required",
+                            mission_id,
+                        ),
+                    )
+                    continue
                 if (available_at, claimed_at, lease_expires_at) != (normalized_available, normalized_claimed, normalized_expiry):
                     db.execute(
                         "UPDATE mission_queue SET available_at=?,claimed_at=?,lease_expires_at=? WHERE mission_id=?",
@@ -306,13 +321,21 @@ class MissionQueue:
                 generation = execution_fence.runtime_generation
             else:
                 generation = self._assert_worker_generation(db, instance_id, runtime_generation)
-            row = db.execute("SELECT mission_id FROM mission_queue WHERE state IN (?, ?, ?) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?) ORDER BY available_at,mission_id LIMIT 1", (WorkerMissionState.QUEUED.value, WorkerMissionState.SCHEDULED.value, WorkerMissionState.SLEEPING.value, moment, moment)).fetchone()
+            # SCHEDULED rows are never directly claimable. Only the Owner-bound
+            # scheduler may validate their snapshot and atomically promote them
+            # to QUEUED; otherwise a direct queue poll would bypass V9.
+            claimable_states = (WorkerMissionState.QUEUED.value, WorkerMissionState.SLEEPING.value)
+            placeholders = ",".join("?" for _ in claimable_states)
+            row = db.execute(
+                f"SELECT mission_id FROM mission_queue WHERE state IN ({placeholders}) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?) ORDER BY available_at,mission_id LIMIT 1",
+                (*claimable_states, moment, moment),
+            ).fetchone()
             if row is None:
                 return None
             mission_id = row[0]
             updated = db.execute(
                 "UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=?, worker_instance_id=?, runtime_generation=?, lease_epoch=lease_epoch+1,claim_phase='CLAIMED',claim_fence_id='' "
-                "WHERE mission_id=? AND state IN (?, ?, ?) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+                f"WHERE mission_id=? AND state IN ({placeholders}) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
                 (
                     WorkerMissionState.EXECUTING.value,
                     moment,
@@ -321,9 +344,7 @@ class MissionQueue:
                     instance_id,
                     generation,
                     mission_id,
-                    WorkerMissionState.QUEUED.value,
-                    WorkerMissionState.SCHEDULED.value,
-                    WorkerMissionState.SLEEPING.value,
+                    *claimable_states,
                     moment,
                     moment,
                 ),
@@ -856,11 +877,20 @@ class MissionQueue:
 class MissionWorker:
     """Single-step worker adapter; a supervisor may call run_once repeatedly."""
 
-    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker", lease_seconds: int = DEFAULT_WORKER_LEASE_SECONDS):
+    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker", lease_seconds: int = DEFAULT_WORKER_LEASE_SECONDS, scheduler: Any | None = None):
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.queue = queue
         self.runtime_factory = runtime_factory
+        if scheduler is not None and getattr(scheduler, "queue", None) is not queue:
+            raise ValueError("worker scheduler must use the same MissionQueue")
+        if (
+            queue.require_execution_fence
+            and scheduler is not None
+            and getattr(scheduler, "mission_store", None) is not queue.mission_store
+        ):
+            raise ExecutionFenceError("strict worker scheduler must use the authoritative MissionStore")
+        self.scheduler = scheduler
         self.identity = queue.register_worker(worker_id)
         self.identity_fence = ExecutionFence.for_worker(queue, self.identity)
         self.logical_worker_id = self.identity.worker_id
@@ -888,6 +918,9 @@ class MissionWorker:
             # Expired claims can become recoverable after startup; quarantine
             # them before any subsequent claim instead of returning them to QUEUED.
             self.queue.recover_expired(now=now, execution_fence=self.identity_fence)
+        if self.scheduler is not None:
+            schedule_now = _utc_text(_utc_datetime(now, field_name="now"))
+            self.scheduler.dispatch_due(now=schedule_now)
         # `now` is a claim-time override only. Renewals and writes use live UTC
         # time so a frozen caller timestamp cannot keep an expired lease alive.
         item = self.queue.claim_next(now=now, worker_id=self.worker_id, lease_seconds=self.lease_seconds, worker_instance_id=self.worker_instance_id, runtime_generation=self.runtime_generation, execution_fence=self.identity_fence)
@@ -1035,23 +1068,372 @@ class MissionSchedule:
 class MissionScheduler:
     """Persistent schedule records that enqueue missions; no hidden execution thread."""
 
-    def __init__(self, db_path: str | Path, queue: MissionQueue):
+    def __init__(
+        self,
+        db_path: str | Path,
+        queue: MissionQueue,
+        *,
+        mission_store: Any | None = None,
+        fault_injector: Callable[[str], None] | None = None,
+    ):
         self.db_path = str(db_path)
         self.queue = queue
+        self.mission_store = mission_store or queue.mission_store
+        self.fault_injector = fault_injector
         with sqlite3.connect(self.db_path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS mission_schedules (schedule_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, next_run_at TEXT NOT NULL, interval_seconds INTEGER, retry_limit INTEGER NOT NULL, retries INTEGER NOT NULL, state TEXT NOT NULL)")
-            for schedule_id, next_run_at in db.execute("SELECT schedule_id,next_run_at FROM mission_schedules").fetchall():
-                normalized = _utc_text(_utc_datetime(next_run_at, field_name="next_run_at"))
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS mission_schedules ("
+                "schedule_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, next_run_at TEXT NOT NULL, "
+                "interval_seconds INTEGER, retry_limit INTEGER NOT NULL, retries INTEGER NOT NULL, state TEXT NOT NULL, "
+                "owner_identity_ref TEXT NOT NULL DEFAULT '', authorization_hash TEXT NOT NULL DEFAULT '', "
+                "authorization_version INTEGER NOT NULL DEFAULT 0, authorization_expires_at TEXT NOT NULL DEFAULT '')"
+            )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(mission_schedules)")}
+            for column, definition in (
+                ("owner_identity_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("authorization_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("authorization_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("authorization_expires_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE mission_schedules ADD COLUMN {column} {definition}")
+            for schedule_id, next_run_at, state_value in db.execute(
+                "SELECT schedule_id,next_run_at,state FROM mission_schedules"
+            ).fetchall():
+                try:
+                    schedule_state = WorkerMissionState(state_value)
+                except (TypeError, ValueError):
+                    db.execute(
+                        "UPDATE mission_schedules SET state=? WHERE schedule_id=?",
+                        (WorkerMissionState.NEEDS_INPUT.value, schedule_id),
+                    )
+                    continue
+                if schedule_state is not WorkerMissionState.SCHEDULED:
+                    continue
+                try:
+                    if next_run_at is None:
+                        raise ValueError("next_run_at is missing")
+                    normalized = _utc_text(_utc_datetime(next_run_at, field_name="next_run_at"))
+                except (TypeError, ValueError):
+                    db.execute(
+                        "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                        (WorkerMissionState.NEEDS_INPUT.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+                    )
+                    continue
                 if next_run_at != normalized:
                     db.execute("UPDATE mission_schedules SET next_run_at=? WHERE schedule_id=?", (normalized, schedule_id))
 
-    def schedule(self, mission_id: str, *, run_at: str, interval_seconds: int | None = None, retry_limit: int = 0, schedule_id: str | None = None) -> MissionSchedule:
-        if interval_seconds is not None and interval_seconds <= 0:
+    @staticmethod
+    def _quoted_schema(name: str) -> str:
+        return '"' + str(name).replace('"', '""') + '"'
+
+    @classmethod
+    def _attach_database(cls, db: sqlite3.Connection, path: str | Path, alias: str) -> str:
+        resolved = str(Path(path).resolve())
+        for _sequence, name, existing_path in db.execute("PRAGMA database_list"):
+            if existing_path and str(Path(existing_path).resolve()) == resolved:
+                return cls._quoted_schema(str(name))
+        db.execute(f"ATTACH DATABASE ? AS {alias}", (resolved,))
+        return cls._quoted_schema(alias)
+
+    @contextmanager
+    def _attached_transaction(self):
+        if self.mission_store is None:
+            raise ExecutionFenceError("Owner-bound scheduling requires its authoritative MissionStore")
+        import core.db as core_db
+
+        owner_auth_path = Path(core_db.DB_PATH)
+        if not owner_auth_path.exists():
+            raise ExecutionFenceError("Owner authentication store is unavailable for scheduled dispatch")
+        db = sqlite3.connect(self.db_path, timeout=30)
+        try:
+            queue_schema = self._attach_database(db, self.queue.db_path, "schedule_queue")
+            mission_schema = self._attach_database(db, self.mission_store.db_path, "schedule_missions")
+            owner_schema = self._attach_database(db, owner_auth_path, "schedule_owner_auth")
+            schemas = {"main", queue_schema, mission_schema, owner_schema}
+            for schema in schemas:
+                mode = str(db.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
+                if mode not in {"delete", "truncate", "persist"}:
+                    raise ExecutionFenceError("scheduled mission handoff requires rollback-journal mode for every participating store")
+            db.execute("BEGIN IMMEDIATE")
+            yield db, queue_schema, mission_schema, owner_schema
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _load_mission(db: sqlite3.Connection, mission_schema: str, mission_id: str) -> tuple[Mission, str]:
+        import json
+
+        row = db.execute(
+            f"SELECT payload FROM {mission_schema}.missions WHERE mission_id=?", (mission_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError("scheduled mission is missing from MissionStore")
+        encoded = str(row[0])
+        try:
+            mission = Mission.from_dict(json.loads(encoded))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ExecutionFenceError("scheduled MissionStore record is invalid") from exc
+        if mission.mission_id != mission_id:
+            raise ExecutionFenceError("scheduled MissionStore identity mismatch")
+        return mission, encoded
+
+    @staticmethod
+    def _validate_snapshot(
+        mission: Mission,
+        *,
+        db: sqlite3.Connection,
+        owner_schema: str,
+        owner_identity_ref: str,
+        authorization_hash: str,
+        authorization_version: int,
+        authorization_expires_at: str,
+        at: str,
+    ):
+        from security.mission_authorization import MissionAuthorizationSnapshot
+
+        if not mission.owner_identity_ref or mission.owner_identity_ref != owner_identity_ref:
+            raise PermissionError("scheduled mission Owner binding changed")
+        if not isinstance(mission.authorization_snapshot, dict):
+            raise PermissionError("scheduled mission authorization snapshot is missing")
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PermissionError("scheduled mission authorization snapshot is invalid") from exc
+        if not isinstance(mission.provenance, dict) or not isinstance(mission.progress, dict):
+            raise PermissionError("scheduled mission authorization provenance is invalid")
+        if mission.checkpoint is not None and not isinstance(mission.checkpoint, dict):
+            raise PermissionError("scheduled mission checkpoint is invalid")
+        provenance_version = mission.provenance.get("authorization_snapshot_version", 0)
+        if (
+            snapshot.authorization_hash != authorization_hash
+            or type(authorization_version) is not int
+            or type(snapshot.version) is not int
+            or type(provenance_version) is not int
+            or snapshot.version != authorization_version
+            or snapshot.expires_at != authorization_expires_at
+            or provenance_version != snapshot.version
+        ):
+            raise PermissionError("scheduled mission authorization snapshot changed")
+        valid, reason = snapshot.validate_for_mission(
+            mission_id=mission.mission_id,
+            owner_identity=owner_identity_ref,
+            target_identity=snapshot.target_identity,
+            version=authorization_version,
+            at=at,
+        )
+        if not valid:
+            raise PermissionError(reason)
+
+        policy = mission.policy_snapshot if isinstance(mission.policy_snapshot, dict) else {}
+        raw_evidence = policy.get("authentication")
+        if not isinstance(raw_evidence, dict):
+            raise PermissionError("scheduled mission Owner authentication evidence is missing")
+        session_id = raw_evidence.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise PermissionError("scheduled mission Owner session binding is missing")
+        try:
+            evidence_method = str(raw_evidence["method"])
+            evidence_authenticated_at = datetime.fromisoformat(str(raw_evidence["authenticated_at"]))
+            evidence_expires_at = datetime.fromisoformat(str(raw_evidence["expires_at"]))
+            evidence_proof = str(raw_evidence["proof_fingerprint"])
+            evidence_request_id = str(raw_evidence["request_id"])
+            evidence_nonce = str(raw_evidence["nonce"])
+            evidence_signature = str(raw_evidence["signature"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PermissionError("scheduled mission Owner authentication evidence is invalid") from exc
+        current_time = _utc_datetime(at, field_name="at")
+        if evidence_authenticated_at.tzinfo is None:
+            evidence_authenticated_at = evidence_authenticated_at.replace(tzinfo=timezone.utc)
+        if evidence_expires_at.tzinfo is None:
+            evidence_expires_at = evidence_expires_at.replace(tzinfo=timezone.utc)
+        # OwnerAuthenticationEvidence's HMAC key is process-local. The bridge
+        # authorizes and snapshots the request; the independent worker verifies
+        # the immutable evidence bindings against the live Owner session store.
+        if (
+            evidence_proof != snapshot.owner_approval
+            or evidence_request_id != mission.request_id
+            or str(raw_evidence["expires_at"]) != snapshot.expires_at
+            or len(evidence_nonce) < 24
+            or len(evidence_signature) != 64
+            or any(char not in "0123456789abcdef" for char in evidence_signature.lower())
+            or evidence_authenticated_at > current_time
+            or evidence_expires_at <= current_time
+        ):
+            raise PermissionError("scheduled mission Owner authentication evidence is stale or mismatched")
+        try:
+            session_row = db.execute(
+                f"SELECT s.owner_id,s.status,s.expires_at,s.auth_method,a.status "
+                f"FROM {owner_schema}.owner_sessions s "
+                f"JOIN {owner_schema}.owner_accounts a ON a.owner_id=s.owner_id "
+                "WHERE s.session_id=?",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise PermissionError("scheduled mission Owner session store is unavailable") from exc
+        if session_row is None or session_row[1] != "active" or session_row[4] != "active":
+            raise PermissionError("scheduled mission Owner session is revoked or unavailable")
+        try:
+            session_expiry = datetime.fromisoformat(str(session_row[2]))
+        except (TypeError, ValueError) as exc:
+            raise PermissionError("scheduled mission Owner session expiry is invalid") from exc
+        if session_expiry.tzinfo is None:
+            session_expiry = session_expiry.replace(tzinfo=timezone.utc)
+        if (
+            session_expiry <= current_time
+            or str(session_row[3]) != evidence_method
+            or f"owner:{int(session_row[0])}" != owner_identity_ref
+        ):
+            raise PermissionError("scheduled mission Owner session is expired or mismatched")
+        return snapshot
+
+    def _call_fault_injector(self, boundary: str) -> None:
+        if self.fault_injector is not None:
+            self.fault_injector(boundary)
+
+    def cancel_scheduled(self, mission_id: str) -> int:
+        """Retire pending due rows before an authenticated Owner starts/resumes a mission."""
+        if self.mission_store is None:
+            raise ExecutionFenceError("Owner-bound schedule cancellation requires its authoritative MissionStore")
+        if not isinstance(mission_id, str) or not mission_id.strip():
+            raise ValueError("mission_id required")
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE mission_schedules SET state=? WHERE mission_id=? AND state=?",
+                (
+                    WorkerMissionState.CANCELLED.value,
+                    mission_id,
+                    WorkerMissionState.SCHEDULED.value,
+                ),
+            )
+            db.commit()
+            return changed.rowcount
+
+    def schedule(
+        self,
+        mission_id: str,
+        *,
+        run_at: str,
+        interval_seconds: int | None = None,
+        retry_limit: int = 0,
+        schedule_id: str | None = None,
+        owner_identity_ref: str | None = None,
+        authorization_snapshot: Any | None = None,
+    ) -> MissionSchedule:
+        if not isinstance(mission_id, str) or not mission_id.strip():
+            raise ValueError("mission_id required")
+        if interval_seconds is not None and (not isinstance(interval_seconds, int) or interval_seconds <= 0):
             raise ValueError("interval_seconds must be positive")
+        if not isinstance(retry_limit, int) or retry_limit < 0:
+            raise ValueError("retry_limit must be a non-negative integer")
         normalized_run_at = _utc_text(_utc_datetime(run_at, field_name="run_at"))
-        item = MissionSchedule(schedule_id or uuid.uuid4().hex, mission_id, normalized_run_at, interval_seconds, retry_limit)
-        with sqlite3.connect(self.db_path) as db:
-            db.execute("INSERT INTO mission_schedules VALUES(?,?,?,?,?,?,?)", (item.schedule_id, item.mission_id, item.next_run_at, item.interval_seconds, item.retry_limit, item.retries, item.state.value))
+        new_schedule_id = schedule_id or uuid.uuid4().hex
+        if not isinstance(new_schedule_id, str) or not new_schedule_id.strip() or len(new_schedule_id) > 128:
+            raise ValueError("schedule_id must be a non-empty string of at most 128 characters")
+        item = MissionSchedule(new_schedule_id, mission_id, normalized_run_at, interval_seconds, retry_limit)
+        if self.mission_store is None:
+            raise ExecutionFenceError("Owner-bound scheduling requires its authoritative MissionStore")
+
+        from security.mission_authorization import MissionAuthorizationSnapshot
+
+        if interval_seconds is not None:
+            raise ValueError("recurring missions require a new Owner-authorized mission identity per occurrence")
+        if retry_limit != 0:
+            raise ValueError("scheduled mission retries are not supported")
+        if not isinstance(owner_identity_ref, str) or not owner_identity_ref.strip():
+            raise PermissionError("Owner identity is required for a mission-bound schedule")
+        try:
+            supplied_snapshot = (
+                authorization_snapshot
+                if isinstance(authorization_snapshot, MissionAuthorizationSnapshot)
+                else MissionAuthorizationSnapshot.from_dict(dict(authorization_snapshot))
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PermissionError("Owner authorization snapshot is required for a mission-bound schedule") from exc
+
+        current = _utc_text(datetime.now(timezone.utc))
+        with self._attached_transaction() as (db, queue_schema, mission_schema, owner_schema):
+            mission, _encoded = self._load_mission(db, mission_schema, mission_id)
+            persisted = self._validate_snapshot(
+                mission,
+                db=db,
+                owner_schema=owner_schema,
+                owner_identity_ref=owner_identity_ref,
+                authorization_hash=supplied_snapshot.authorization_hash,
+                authorization_version=supplied_snapshot.version,
+                authorization_expires_at=supplied_snapshot.expires_at,
+                at=current,
+            )
+            if persisted.to_dict() != supplied_snapshot.to_dict():
+                raise PermissionError("scheduled authorization differs from the persisted mission snapshot")
+            if _utc_datetime(normalized_run_at, field_name="run_at") >= _utc_datetime(persisted.expires_at, field_name="authorization_expires_at"):
+                raise PermissionError("schedule due time is outside the Owner authorization window")
+            if (
+                mission.status is not MissionStatus.READY
+                or mission.progress.get("pause_requested")
+                or mission.progress.get("owner_cancel_requested")
+                or mission.progress.get("active_execution_claim")
+                or str((mission.checkpoint or {}).get("status", "")) in {"in_flight", "in_flight_parallel"}
+            ):
+                raise ValueError("mission is not in a schedulable READY state")
+
+            queue_row = db.execute(
+                f"SELECT state,lease_owner,lease_expires_at FROM {queue_schema}.mission_queue WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if queue_row is not None:
+                if queue_row[1] is not None or WorkerMissionState(queue_row[0]) is WorkerMissionState.EXECUTING:
+                    raise PermissionError("active worker lease blocks scheduling")
+                if WorkerMissionState(queue_row[0]) not in {
+                    WorkerMissionState.QUEUED,
+                    WorkerMissionState.NEEDS_INPUT,
+                    WorkerMissionState.SCHEDULED,
+                }:
+                    raise ValueError("queue state is not eligible for a scheduled handoff")
+            active = db.execute(
+                "SELECT 1 FROM mission_schedules WHERE mission_id=? AND state=? LIMIT 1",
+                (mission_id, WorkerMissionState.SCHEDULED.value),
+            ).fetchone()
+            if active is not None:
+                db.execute(
+                    "UPDATE mission_schedules SET state=? WHERE mission_id=? AND state=?",
+                    (WorkerMissionState.CANCELLED.value, mission_id, WorkerMissionState.SCHEDULED.value),
+                )
+            db.execute(
+                "INSERT INTO mission_schedules(schedule_id,mission_id,next_run_at,interval_seconds,retry_limit,retries,state,owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at) VALUES(?,?,?,?,?,?,?, ?,?,?,?)",
+                (
+                    item.schedule_id,
+                    item.mission_id,
+                    item.next_run_at,
+                    None,
+                    item.retry_limit,
+                    item.retries,
+                    item.state.value,
+                    owner_identity_ref,
+                    persisted.authorization_hash,
+                    persisted.version,
+                    persisted.expires_at,
+                ),
+            )
+            self._call_fault_injector("after_schedule_insert")
+            if queue_row is None:
+                db.execute(
+                    f"INSERT INTO {queue_schema}.mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id) VALUES(?,?,?,?,NULL,'',NULL,NULL,0,NULL,0,'NONE','')",
+                    (mission_id, WorkerMissionState.SCHEDULED.value, 0, normalized_run_at),
+                )
+            else:
+                changed = db.execute(
+                    f"UPDATE {queue_schema}.mission_queue SET state=?,available_at=?,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_id=? AND state=? AND lease_owner IS NULL",
+                    (WorkerMissionState.SCHEDULED.value, normalized_run_at, mission_id, str(queue_row[0])),
+                )
+                if changed.rowcount != 1:
+                    raise LeaseLostError("queue state changed during scheduled handoff")
+            self._call_fault_injector("after_queue_scheduled")
         return item
 
     def get(self, schedule_id: str) -> MissionSchedule:
@@ -1061,24 +1443,271 @@ class MissionScheduler:
             raise KeyError("unknown schedule")
         return MissionSchedule(row[0], row[1], row[2], row[3], row[4], row[5], WorkerMissionState(row[6]))
 
-    def dispatch_due(self, *, now: str) -> list[MissionSchedule]:
+    def dispatch_due(self, *, now: str, limit: int = 100) -> list[MissionSchedule]:
+        if self.mission_store is None:
+            raise ExecutionFenceError("Owner-bound dispatch requires its authoritative MissionStore")
+        if not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("schedule dispatch limit must be between 1 and 1000")
         current = _utc_datetime(now, field_name="now")
         current_text = _utc_text(current)
         with sqlite3.connect(self.db_path) as db:
-            rows = db.execute("SELECT schedule_id FROM mission_schedules WHERE state=? AND next_run_at<=? ORDER BY next_run_at,schedule_id", (WorkerMissionState.SCHEDULED.value, current_text)).fetchall()
+            rows = db.execute(
+                "SELECT schedule_id FROM mission_schedules WHERE state=? AND (next_run_at<=? OR typeof(next_run_at)!='text' OR julianday(next_run_at) IS NULL) ORDER BY next_run_at,schedule_id LIMIT ?",
+                (WorkerMissionState.SCHEDULED.value, current_text, limit),
+            ).fetchall()
         dispatched = []
         for (schedule_id,) in rows:
-            item = self.get(schedule_id)
-            self.queue.enqueue(item.mission_id, available_at=now, state=WorkerMissionState.QUEUED)
-            if item.interval_seconds:
-                next_run = _utc_text(current + timedelta(seconds=item.interval_seconds))
-                with sqlite3.connect(self.db_path) as db:
-                    db.execute("UPDATE mission_schedules SET next_run_at=?,retries=0 WHERE schedule_id=?", (next_run, schedule_id))
-            else:
-                with sqlite3.connect(self.db_path) as db:
-                    db.execute("UPDATE mission_schedules SET state=? WHERE schedule_id=?", (WorkerMissionState.COMPLETED.value, schedule_id))
-            dispatched.append(self.get(schedule_id))
+            if self._dispatch_due_bound(schedule_id, now=current_text):
+                dispatched.append(self.get(schedule_id))
         return dispatched
+
+    @staticmethod
+    def _quarantine_queue_row(db, queue_schema: str, mission_id: str, queue_row, *, now: str, reason: str) -> None:
+        if queue_row is None:
+            db.execute(
+                f"INSERT INTO {queue_schema}.mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id) VALUES(?,?,?,?,NULL,?,NULL,NULL,0,NULL,0,'NONE','')",
+                (mission_id, WorkerMissionState.NEEDS_INPUT.value, 0, now, reason),
+            )
+            return
+        changed = db.execute(
+            f"UPDATE {queue_schema}.mission_queue SET state=?,claimed_at=NULL,last_error=?,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_id=? AND state IS ? AND lease_owner IS NULL",
+            (WorkerMissionState.NEEDS_INPUT.value, reason, mission_id, queue_row[0]),
+        )
+        if changed.rowcount != 1:
+            raise LeaseLostError("queue changed during scheduled authorization quarantine")
+
+    def _quarantine_due_record(
+        self, db, queue_schema: str, schedule_id: str, mission_id: str, *, now: str, reason: str
+    ) -> None:
+        queue_row = db.execute(
+            f"SELECT state,lease_owner,lease_epoch FROM {queue_schema}.mission_queue WHERE mission_id=?",
+            (mission_id,),
+        ).fetchone()
+        if queue_row is None or queue_row[1] is None:
+            self._quarantine_queue_row(db, queue_schema, mission_id, queue_row, now=now, reason=reason)
+        db.execute(
+            "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+            (WorkerMissionState.NEEDS_INPUT.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+        )
+
+    def _dispatch_due_bound(self, schedule_id: str, *, now: str) -> bool:
+        with self._attached_transaction() as (db, queue_schema, mission_schema, owner_schema):
+            row = db.execute(
+                "SELECT schedule_id,mission_id,next_run_at,state,owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at "
+                "FROM mission_schedules WHERE schedule_id=?",
+                (schedule_id,),
+            ).fetchone()
+            if row is None or row[3] != WorkerMissionState.SCHEDULED.value:
+                return False
+            mission_id = str(row[1])
+            try:
+                if row[2] is None:
+                    raise ValueError("scheduled next_run_at is missing")
+                due_at = _utc_datetime(row[2], field_name="scheduled next_run_at")
+            except (TypeError, ValueError):
+                self._quarantine_due_record(
+                    db,
+                    queue_schema,
+                    schedule_id,
+                    mission_id,
+                    now=now,
+                    reason="scheduled due time is malformed; Owner review required",
+                )
+                return True
+            if due_at > _utc_datetime(now, field_name="now"):
+                return False
+            schedule_owner, snapshot_hash = str(row[4]), str(row[5])
+            snapshot_version = row[6] if type(row[6]) is int else -1
+            snapshot_expiry = str(row[7])
+            try:
+                mission, encoded_before = self._load_mission(db, mission_schema, mission_id)
+            except (KeyError, ExecutionFenceError, TypeError, ValueError, AttributeError):
+                self._quarantine_due_record(
+                    db,
+                    queue_schema,
+                    schedule_id,
+                    mission_id,
+                    now=now,
+                    reason="scheduled mission payload is unavailable or malformed; manual recovery required",
+                )
+                return True
+
+            queue_row = db.execute(
+                f"SELECT state,lease_owner,lease_epoch FROM {queue_schema}.mission_queue WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if mission.is_terminal and mission.status is not MissionStatus.OWNER_REAUTH_REQUIRED:
+                db.execute(
+                    "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                    (WorkerMissionState.CANCELLED.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+                )
+                return True
+            if queue_row is not None and queue_row[1] is not None:
+                db.execute(
+                    "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                    (WorkerMissionState.CANCELLED.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+                )
+                return True
+            queue_state_invalid = False
+            if queue_row is None:
+                queue_state = None
+            else:
+                try:
+                    queue_state = WorkerMissionState(queue_row[0])
+                except (TypeError, ValueError):
+                    queue_state = None
+                    queue_state_invalid = True
+            if not queue_state_invalid and queue_state in {
+                WorkerMissionState.NEEDS_INPUT,
+                WorkerMissionState.WAITING_FOR_TOOL,
+            }:
+                db.execute(
+                    "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                    (WorkerMissionState.NEEDS_INPUT.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+                )
+                return True
+            if not queue_state_invalid and queue_state is not None and queue_state is not WorkerMissionState.SCHEDULED:
+                db.execute(
+                    "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                    (WorkerMissionState.CANCELLED.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+                )
+                return True
+
+            try:
+                if (
+                    not isinstance(mission.progress, dict)
+                    or (mission.checkpoint is not None and not isinstance(mission.checkpoint, dict))
+                    or not isinstance(mission.transitions, list)
+                    or not isinstance(mission.recovery_events, list)
+                ):
+                    raise PermissionError("scheduled mission runtime state is malformed")
+                if queue_state_invalid:
+                    raise PermissionError("scheduled queue state is malformed")
+                self._validate_snapshot(
+                    mission,
+                    db=db,
+                    owner_schema=owner_schema,
+                    owner_identity_ref=schedule_owner,
+                    authorization_hash=snapshot_hash,
+                    authorization_version=snapshot_version,
+                    authorization_expires_at=snapshot_expiry,
+                    at=now,
+                )
+                if (
+                    mission.status is not MissionStatus.READY
+                    or mission.progress.get("pause_requested")
+                    or mission.progress.get("owner_cancel_requested")
+                    or mission.progress.get("active_execution_claim")
+                    or str((mission.checkpoint or {}).get("status", "")) in {"in_flight", "in_flight_parallel"}
+                ):
+                    raise PermissionError("mission is not eligible for scheduled execution")
+            except (PermissionError, TypeError, ValueError, AttributeError, KeyError):
+                runtime_state_malformed = (
+                    not isinstance(mission.progress, dict)
+                    or (mission.checkpoint is not None and not isinstance(mission.checkpoint, dict))
+                    or not isinstance(mission.transitions, list)
+                    or not isinstance(mission.recovery_events, list)
+                )
+                if runtime_state_malformed:
+                    recovery_reason = "scheduled mission runtime state is malformed; manual recovery required"
+                    if not mission.is_terminal and mission.status is not MissionStatus.RECOVERY_REQUIRED:
+                        prior_status = mission.status.value
+                        mission.status = MissionStatus.RECOVERY_REQUIRED
+                        mission.error = recovery_reason
+                        if isinstance(mission.transitions, list):
+                            mission.transitions.append(
+                                {
+                                    "from": prior_status,
+                                    "to": MissionStatus.RECOVERY_REQUIRED.value,
+                                    "reason": recovery_reason,
+                                    "data": {"schedule_id": schedule_id},
+                                    "iteration": mission.iteration_count,
+                                }
+                            )
+                        if isinstance(mission.recovery_events, list):
+                            mission.recovery_events.append(
+                                {"event": "scheduled_runtime_state_malformed", "schedule_id": schedule_id}
+                            )
+                        encoded_after = json.dumps(mission.to_dict(), ensure_ascii=False)
+                        changed = db.execute(
+                            f"UPDATE {mission_schema}.missions SET payload=? WHERE mission_id=? AND payload=?",
+                            (encoded_after, mission_id, encoded_before),
+                        )
+                        if changed.rowcount != 1:
+                            raise LeaseLostError("mission changed during malformed-state quarantine")
+                    if queue_row is None or queue_row[1] is None:
+                        self._quarantine_queue_row(
+                            db,
+                            queue_schema,
+                            mission_id,
+                            queue_row,
+                            now=now,
+                            reason=recovery_reason,
+                        )
+                    db.execute(
+                        "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                        (WorkerMissionState.NEEDS_INPUT.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+                    )
+                    return True
+
+                progress = mission.progress if isinstance(mission.progress, dict) else {}
+                checkpoint = mission.checkpoint if isinstance(mission.checkpoint, dict) else {}
+                in_flight = (
+                    mission.status is MissionStatus.RECOVERY_REQUIRED
+                    or str(checkpoint.get("status", "")) in {"in_flight", "in_flight_parallel"}
+                    or bool(progress.get("active_execution_claim"))
+                )
+                if not in_flight and not mission.is_terminal:
+                    mission.error = "scheduled Owner authorization is stale, expired, or mismatched"
+                    mission.transition(
+                        MissionStatus.OWNER_REAUTH_REQUIRED,
+                        mission.error,
+                        schedule_id=schedule_id,
+                    )
+                    mission.recovery_events.append(
+                        {"event": "scheduled_authorization_blocked", "schedule_id": schedule_id}
+                    )
+                    payload = mission.to_dict()
+                    encoded_after = json.dumps(payload, ensure_ascii=False)
+                    changed = db.execute(
+                        f"UPDATE {mission_schema}.missions SET payload=? WHERE mission_id=? AND payload=?",
+                        (encoded_after, mission_id, encoded_before),
+                    )
+                    if changed.rowcount != 1:
+                        raise LeaseLostError("mission changed during scheduled authorization quarantine")
+                if not in_flight:
+                    self._quarantine_queue_row(
+                        db,
+                        queue_schema,
+                        mission_id,
+                        queue_row,
+                        now=now,
+                        reason="Owner reauthorization required for scheduled mission",
+                    )
+                db.execute(
+                    "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                    (WorkerMissionState.NEEDS_INPUT.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+                )
+                return True
+
+            if queue_row is None:
+                db.execute(
+                    f"INSERT INTO {queue_schema}.mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id) VALUES(?,?,?,?,NULL,'',NULL,NULL,0,NULL,0,'NONE','')",
+                    (mission_id, WorkerMissionState.QUEUED.value, 0, now),
+                )
+            else:
+                changed = db.execute(
+                    f"UPDATE {queue_schema}.mission_queue SET state=?,available_at=?,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_id=? AND state=? AND lease_owner IS NULL",
+                    (WorkerMissionState.QUEUED.value, now, mission_id, str(queue_row[0])),
+                )
+                if changed.rowcount != 1:
+                    raise LeaseLostError("queue changed during scheduled dispatch")
+            self._call_fault_injector("after_queue_promotion")
+            db.execute(
+                "UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?",
+                (WorkerMissionState.COMPLETED.value, schedule_id, WorkerMissionState.SCHEDULED.value),
+            )
+            return True
 
     def mark_missed(self, schedule_id: str, *, now: str) -> MissionSchedule:
         item = self.get(schedule_id)

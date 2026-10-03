@@ -42,7 +42,10 @@ class AuthorizationContext:
             raise TypeError("authorization context requires typed OwnerPolicySnapshot")
         if self.owner_evidence.request_id != self.request_id or self.policy_snapshot.request_id != self.request_id:
             raise ValueError("authorization context request binding mismatch")
-        if not self.owner_evidence.is_valid(self.request_id, self.session_id):
+        if not self.owner_evidence.is_valid(self.request_id, self.session_id) and not self.owner_evidence.is_valid_for_active_session(
+            self.request_id,
+            self.session_id,
+        ):
             raise PermissionError("authorization context contains stale or invalid Owner evidence")
         if self.scope_snapshot is not None:
             if not isinstance(self.scope_snapshot, ScopeSnapshot):

@@ -13,6 +13,7 @@ from agent.mission import Mission, MissionStatus
 from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue, MissionScheduler, WorkerMissionState
 from agent.planning import Plan
+from security.mission_authorization import MissionAuthorizationSnapshot
 from security.owner_policy import OwnerAuthenticationEvidence
 
 
@@ -33,6 +34,13 @@ class MissionService:
         self.scheduler = scheduler
         self.owner_revalidator = owner_revalidator
         self.reconciliation_engine = reconciliation_engine
+        if self.scheduler is not None:
+            if self.scheduler.queue is not queue:
+                raise ValueError("MissionScheduler must use the MissionService queue")
+            if self.scheduler.mission_store is None:
+                self.scheduler.mission_store = runtime.store
+            elif self.scheduler.mission_store is not runtime.store:
+                raise ValueError("MissionScheduler must use the authoritative MissionStore")
 
     def create_mission(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> dict[str, Any]:
         if not str(kwargs.get("request_id") or "").strip():
@@ -380,6 +388,11 @@ class MissionService:
 
     def start_mission(self, mission_id: str, *, owner_session_token: str | None = None) -> dict[str, Any]:
         self._reauthorize_before_enqueue(mission_id, owner_session_token)
+        if self.scheduler is not None:
+            self.scheduler.cancel_scheduled(mission_id)
+            current = self._load(mission_id)
+            if current.status is not MissionStatus.READY:
+                raise PermissionError("mission was quarantined during Owner reauthorization")
         return self.queue.enqueue(mission_id).__dict__.copy()
 
     def pause_mission(
@@ -399,6 +412,11 @@ class MissionService:
         mission = self._reauthorize_before_enqueue(mission_id, owner_session_token)
         mission.progress.pop("pause_requested", None)
         mission = self.runtime.store.save(mission)
+        if self.scheduler is not None:
+            self.scheduler.cancel_scheduled(mission_id)
+            mission = self._load(mission_id)
+            if mission.status is not MissionStatus.READY:
+                raise PermissionError("mission was quarantined during Owner reauthorization")
         self.queue.enqueue(mission_id)
         return mission.to_dict()
 
@@ -415,6 +433,8 @@ class MissionService:
         queued = self.queue.enqueue(mission_id, state=WorkerMissionState.CANCELLED)
         if queued.state is WorkerMissionState.EXECUTING:
             raise PermissionError("active worker lease blocks Owner control")
+        if self.scheduler is not None:
+            self.scheduler.cancel_scheduled(mission_id)
         if mission.status is MissionStatus.RECOVERY_REQUIRED:
             # Keep the recovery status and checkpoint available to V7 reconciliation.
             # Cancellation prevents dispatch; it does not assert an effect outcome.
@@ -442,14 +462,41 @@ class MissionService:
         if self.scheduler is None:
             raise RuntimeError("scheduler is not configured")
         if mission.is_terminal or mission.status is MissionStatus.RECOVERY_REQUIRED:
-            raise ValueError("mission cannot be scheduled in its current state")
+            if mission.status not in {MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.OWNER_REAUTH_REQUIRED}:
+                raise ValueError("mission cannot be scheduled in its current state")
+        if interval_seconds is not None:
+            raise ValueError("recurring missions require a new Owner-authorized mission identity per occurrence")
+        if retry_limit != 0:
+            raise ValueError("scheduled mission retries are not supported")
         self._assert_unleased(mission_id)
+        mission = self._reauthorize_before_enqueue(mission_id, owner_session_token)
+        owner_ref = self._owner_identity_ref(owner_session_token)
+        try:
+            if not isinstance(mission.authorization_snapshot, dict):
+                raise ValueError("snapshot missing")
+            authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PermissionError("mission authorization snapshot is unavailable") from exc
+        if not isinstance(mission.provenance, dict):
+            raise PermissionError("mission authorization provenance is invalid")
+        snapshot_version = mission.provenance.get("authorization_snapshot_version", 0)
+        if type(snapshot_version) is not int:
+            raise PermissionError("mission authorization provenance version is invalid")
+        valid, reason = authorization.validate_for_mission(
+            mission_id=mission.mission_id,
+            owner_identity=owner_ref,
+            target_identity=authorization.target_identity,
+            version=snapshot_version,
+        )
+        if not valid:
+            raise PermissionError(f"mission authorization snapshot is invalid: {reason}")
         return self.scheduler.schedule(
             mission_id,
             run_at=run_at,
-            interval_seconds=interval_seconds,
             retry_limit=retry_limit,
             schedule_id=schedule_id,
+            owner_identity_ref=owner_ref,
+            authorization_snapshot=authorization,
         ).__dict__.copy()
 
     def _owner_context(self, owner_session_token: str):

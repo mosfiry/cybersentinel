@@ -90,12 +90,74 @@ class OwnerAuthenticationEvidence:
             expires = datetime.fromisoformat(self.expires_at)
         except ValueError:
             return False
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
         expected = hmac.new(_EVIDENCE_SECRET, self._signed_payload().encode("utf-8"), hashlib.sha256).hexdigest()
         return (
             hmac.compare_digest(expected, self.signature)
             and self.request_id == str(request_id)
             and (session_id is None or self.session_id == session_id)
             and expires > now
+        )
+
+    def is_valid_for_active_session(
+        self,
+        request_id: str,
+        session_id: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Validate a serialized grant in another process using the durable Owner session.
+
+        The HMAC key is intentionally process-local. A worker cannot validate
+        the bridge's HMAC after deserialization, so this fallback binds the
+        exact request, evidence fingerprint, and expiry to the still-active
+        server-side Owner session. It never accepts a missing/revoked session.
+        """
+        if not self.session_id or (session_id is not None and self.session_id != session_id):
+            return False
+        if self.request_id != str(request_id) or self.method != OwnerInstructionSource.USERNAME_PASSWORD.value:
+            return False
+        if len(self.signature) != 64 or any(char not in "0123456789abcdef" for char in self.signature.lower()):
+            return False
+        if len(self.nonce) < 24:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        try:
+            authenticated_at = datetime.fromisoformat(self.authenticated_at)
+            expires_at = datetime.fromisoformat(self.expires_at)
+        except (TypeError, ValueError):
+            return False
+        if authenticated_at.tzinfo is None:
+            authenticated_at = authenticated_at.replace(tzinfo=timezone.utc)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        expected_proof = hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()
+        if (
+            authenticated_at > moment
+            or expires_at <= moment
+            or not hmac.compare_digest(expected_proof, self.proof_fingerprint)
+        ):
+            return False
+        try:
+            from security.owner_password import resolve_session
+
+            active_session = resolve_session(self.session_id)
+        except Exception:
+            return False
+        if not isinstance(active_session, dict):
+            return False
+        try:
+            owner_id = int(active_session.get("owner_id", 0))
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            active_session.get("session_id") == self.session_id
+            and active_session.get("auth_method") == self.method
+            and owner_id > 0
         )
 
     def to_dict(self) -> dict[str, Any]:

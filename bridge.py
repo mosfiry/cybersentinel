@@ -42,11 +42,12 @@ def build_mission_worker() -> MissionWorker:
     """Construct the standalone worker over the bridge's existing durable stores."""
     core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
+    scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
 
     def runtime_factory() -> MissionRuntime:
         return MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True, require_execution_fence=True)
 
-    return MissionWorker(queue, runtime_factory)
+    return MissionWorker(queue, runtime_factory, scheduler=scheduler)
 
 
 class Handler(BaseHTTPRequestHandler):

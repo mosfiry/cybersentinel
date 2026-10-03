@@ -2,32 +2,33 @@
 
 ## Task 1: Fresh Owner authority when scheduling
 
-- [ ] Require current authenticated Owner session and exact durable mission Owner identity.
-- [ ] Run existing Owner revalidation before persisting a schedule; do not use `created_by`, `owner_id`, or a stored session as authority.
-- [ ] Validate snapshot integrity, mission/Owner binding, provenance version, and active expiry.
-- [ ] Reject active leases, recovery-required missions, terminal missions, unbound legacy missions, and malformed schedule inputs.
+- [x] Require a current authenticated Owner session and exact durable mission Owner identity.
+- [x] Run existing Owner revalidation before persisting a schedule; do not use `created_by`, `owner_id`, or a stored session alone as authority.
+- [x] Authenticate fresh Owner evidence through the bridge revalidator; verify snapshot integrity, mission/Owner binding, provenance version, active expiry, and current session/account status.
+- [x] Reject active leases, recovery-required missions, terminal missions, unbound legacy missions, and invalid schedule inputs.
 
 ## Task 2: Durable schedule snapshot binding
 
-- [ ] Add an additive, idempotent schema migration for stable Owner identity, snapshot digest/version, and expiry.
-- [ ] Persist no session token, raw secret, raw Owner evidence, or mutable authorization object.
-- [ ] Ensure legacy schedules lacking an explicit binding cannot dispatch and are quarantined rather than adopted.
-- [ ] Validate positive intervals/retry bounds and normalize due times consistently.
+- [x] Add an additive, idempotent schema migration for stable Owner identity, snapshot digest/version, and expiry.
+- [x] Persist no session token or raw Owner evidence in a schedule row; validate durable evidence-to-snapshot bindings through MissionStore and the Owner auth store.
+- [x] Ensure legacy schedules lacking an explicit binding cannot dispatch and are quarantined rather than adopted.
+- [x] Normalize due times consistently; Owner-bound recurring intervals and retries are rejected, and low-level schedule/dispatch mutations fail closed without an authoritative MissionStore.
 
 ## Task 3: Due-time validation and crash-safe queue handoff
 
-- [ ] Reload authoritative MissionStore data and validate schedule, mission, Owner, exact snapshot hash/version, and active expiry immediately before dispatch.
-- [ ] Prevent terminal, recovery-required, cancelled, already-claimed, or mismatched queue states from being reopened by `enqueue`.
-- [ ] Make schedule state and queue insertion atomic using existing rollback-journal attached SQLite transactions, or implement a durable fail-closed saga with restart recovery markers.
-- [ ] On stale/expired/tampered bindings, set a non-claimable Owner-reauthorization/quarantine state and never queue execution.
-- [ ] Bind recurring schedules to the original snapshot and stop/quarantine them on expiry; require a separate Owner action to create a newly authorized schedule.
-- [ ] Integrate due dispatch into the existing supervised lifecycle only if an existing production path supports it without hidden threads or new infrastructure; otherwise keep the feature explicitly non-active and fail closed.
+- [x] Reload authoritative MissionStore data and validate schedule, mission, Owner, exact snapshot hash/version, evidence request/proof/expiry fields, active Owner session/account, and expiry immediately before dispatch.
+- [x] Prevent terminal, recovery-required, cancelled, active-lease, already-claimed, or mismatched queue states from being reopened by `enqueue`.
+- [x] Atomically transition schedule and queue with the existing rollback-journal attached SQLite transaction spanning scheduler, queue, MissionStore, and Owner-authentication stores.
+- [x] Quarantine stale, expired, revoked, tampered, mismatched, legacy-unbound, or structurally malformed authority/data; never queue execution.
+- [x] Wire bounded due dispatch into existing supervised `MissionWorker.run_once()` before claim; no hidden thread or new infrastructure.
+- [!] BLOCKED SUB-CAPABILITY: recurring/cron execution and auto-retries remain rejected until the Owner-approved per-occurrence mission-identity/authorization contract exists. Do not reopen a terminal mission or reuse one snapshot for repeat executions.
 
 ## Task 4: Adversarial negative tests and checkpoint
 
-- [ ] Cover no/expired/revoked Owner session, foreign Owner, forged/unbound mission, old/tampered snapshot hash, wrong mission/version/identity, and expired snapshot.
-- [ ] Cover crash between scheduler-state and queue-state writes, duplicate due polling, recurring expiry, stale schedule replay, terminal/cancelled missions, and active-worker races.
-- [ ] Prove failed cases never call the executor or produce a claimable queue item.
-- [ ] Run full pytest, compileall, `git diff --check`, static direct-dispatch and scheduler call-graph scans, and changed-source secret scan.
+- [x] Cover stale/revoked/foreign Owner sessions, unbound legacy rows, tampered hash/version, identity mismatch, expired snapshot, and expiry-window rejection.
+- [x] Cover schedule-insert/queue-write/queue-promotion crash boundaries, duplicate due polling, restart quarantine, terminal/cancelled missions, active-worker races, and revoked Owner-session status at due time.
+- [x] Prove invalid cases never reach executor or a claimable queue state; direct `SCHEDULED` rows remain unclaimable.
+- [x] Cover independent-review fixes: no unbound scheduler mutation, malformed mission/service provenance/queue/schedule state and timestamps, strict Owner-bound offset normalization, due-poll/start race, and immediate start/resume/cancel schedule retirement.
+- [x] Rerun final full repository suite and checkpoint hygiene after the independent-review fixes (931 passed, 1 skipped; V9 suite 39 passed; compileall, py_compile, diff hygiene, dispatch/call-graph, secret-pattern, and protected-ref checks passed).
 - [ ] Commit V9 code and evidence locally on `task/m3-production-runtime-20261003`; preserve `main` and M2D.
-- [ ] Keep remote push withheld while exact-SHA V6 Cloudflare build outcome remains unresolved and potentially production-associated.
+- [x] Keep remote push withheld while exact-SHA V6 Cloudflare build outcome remains unresolved and potentially production-associated.

@@ -275,10 +275,23 @@ def test_worker_heartbeat_during_execution_and_stale_update_rejected(tmp_path):
 
 def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, monkeypatch):
     import bridge
-    import security.owner_policy as owner_policy
+    import core.db as core_db
     monkeypatch.setattr(bridge, "BRIDGE_TOKEN", "bridge-test")
     allow_owner_sessions(monkeypatch, "owner-test")
     monkeypatch.setattr(bridge, "DB_PATH", tmp_path / "api.sqlite3")
+    monkeypatch.setattr(core_db, "DB_PATH", tmp_path / "owner_auth.sqlite3")
+    now = datetime.now(timezone.utc).isoformat()
+    with core_db.connect() as auth_db:
+        auth_db.execute(
+            "INSERT INTO owner_accounts(username,password_hash,kdf_algorithm,kdf_params_json,status) "
+            "VALUES(?,?,?,?,?)",
+            ("owner-test-user", "test-verifier", "scrypt", "{}", "active"),
+        )
+        auth_db.execute(
+            "INSERT INTO owner_sessions(session_id,owner_id,created_at,authenticated_at,expires_at,status,auth_method) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("owner-test", 1, now, now, "2999-01-01T00:00:00+00:00", "active", "username_password"),
+        )
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -310,7 +323,11 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
         assert code == 200
         code, _ = request("POST", f"/api/missions/{mission_id}/resume")
         assert code == 200
-        code, _ = request("POST", f"/api/missions/{mission_id}/schedule", {"run_at": "2099-01-01T00:00:00+00:00"})
+        code, _ = request(
+            "POST",
+            f"/api/missions/{mission_id}/schedule",
+            {"run_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()},
+        )
         assert code == 201
         code, _ = request("POST", f"/api/missions/{mission_id}/cancel")
         assert code == 200

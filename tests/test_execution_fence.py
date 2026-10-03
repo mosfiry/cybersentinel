@@ -575,4 +575,8 @@ def test_bridge_worker_factory_requires_fenced_queue_and_runtime(tmp_path, monke
 
     assert worker.queue.require_execution_fence is True
     assert runtime.require_execution_fence is True
+    assert worker.scheduler is not None
+    assert worker.scheduler.queue is worker.queue
+    assert worker.scheduler.mission_store is worker.queue.mission_store
+    assert worker.scheduler.db_path == str((tmp_path / "mission_scheduler.sqlite3"))
     worker.stop()
