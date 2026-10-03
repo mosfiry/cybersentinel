@@ -23,6 +23,7 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 
 from .mission import Mission, MissionStatus, MissionStore
 from .mission_runtime import MissionRuntime
+from .mission_worker import MissionQueue, MissionWorker
 from .planning import Plan, PlanStep, RecoveryPolicy, TaskProfile, select_reasoning_profile
 from .provider_api import ToolCall
 from .provider_api import CapabilityUnsupported
@@ -194,8 +195,11 @@ class AgentCore:
         snapshot = capture_policy_snapshot(request_id, evidence)
         return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=evidence.session_id), policy_context_from_snapshot(snapshot)
 
-    @staticmethod
-    def _executor(mission: Mission, step: PlanStep, action_id: str) -> dict[str, Any]:
+    def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None) -> dict[str, Any]:
+        from .execution_fence import ExecutionFenceError
+        if execution_fence is None:
+            raise ExecutionFenceError("AgentCore tool dispatch requires an execution fence")
+        execution_fence.assert_current(mission=mission, task_id=step.step_id, task_version=mission.plan.version, execution_id=action_id)
         if step.action == "__planning_failure__":
             return {"success": False, "failure_class": dict(step.retry_policy).get("failure_class", "LOGIC"), "error": "malformed, empty, or unknown tool proposal"}
         arguments = dict(step.retry_policy).get("arguments", {})
@@ -220,12 +224,58 @@ class AgentCore:
             if not workspace_root:
                 raise PermissionError("mission workspace boundary required")
             workspace = Workspace(workspace_root)
-            evidence_store = EvidenceChainStore(DB_PATH.with_name("evidence_chain.db"))
+            evidence_store = EvidenceChainStore(Path(self.store.db_path).with_name("evidence_chain.db"), execution_fence=execution_fence, require_execution_fence=True)
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity)
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
+        except ExecutionFenceError:
+            raise
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
+
+    def _run_via_fenced_worker(self, runtime: MissionRuntime, mission_id: str, *, max_slices: int, native_model: Any = None, tools: list[dict[str, Any]] | None = None, postprocess: Any = None) -> Mission:
+        """Run a synchronous facade call through the durable production fence."""
+        class RuntimeAdapter:
+            def set_execution_fence(self, fence):
+                runtime.set_execution_fence(fence)
+
+            def run_to_completion(self, requested_mission_id, *, max_slices=None, heartbeat=None):
+                if native_model is not None:
+                    result = runtime.run_model_loop(
+                        requested_mission_id,
+                        native_model,
+                        tools=tools or [],
+                        max_turns=max_slices or self_max_slices,
+                        heartbeat=heartbeat,
+                    )
+                else:
+                    result = runtime.run_to_completion(
+                        requested_mission_id,
+                        max_slices=max_slices,
+                        heartbeat=heartbeat,
+                    )
+                if postprocess is not None:
+                    postprocess(result)
+                    runtime.persist_execution_state(result)
+                return result
+
+        self_max_slices = max_slices
+        queue_path = Path(self.store.db_path).with_name("mission_queue.sqlite3")
+        queue = MissionQueue(queue_path, require_execution_fence=True)
+        worker = MissionWorker(
+            queue,
+            RuntimeAdapter,
+            worker_id=f"agent-core-{uuid.uuid4().hex}",
+        )
+        worker.enqueue(mission_id)
+        try:
+            worker.run_once(max_slices=max_slices)
+        finally:
+            worker.stop()
+        result = self.store.load(mission_id)
+        if result is None:
+            raise KeyError("unknown_mission")
+        return result
 
     def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True) -> Mission:
         request_id = request_id or uuid.uuid4().hex
@@ -250,6 +300,7 @@ class AgentCore:
             recovery_policy=RecoveryPolicy(),
             interpreter=ObservationInterpreter(proposer=self._observation_proposal),
             require_authorization_snapshot=True,
+            require_execution_fence=True,
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
@@ -306,29 +357,36 @@ class AgentCore:
         # planner; this is a compatibility mode inside the same engine, not a
         # second AgentTaskRuntime/core-engine execution path.
         capabilities = [getattr(provider, "capabilities", None) for provider in getattr(self.router, "providers", ())]
+        native_model = None
         if any(getattr(item, "native_chat", False) and getattr(item, "tool_calling", False) for item in capabilities):
             from .model_protocol import RouterNativeModel
-            return runtime.run_model_loop(mission.mission_id, RouterNativeModel(self.router), tools=self._schemas(), max_turns=self.max_iterations)
-        result = runtime.run_to_completion(mission.mission_id, max_slices=self.max_iterations)
-        last_response = getattr(self, "_last_model_response", None)
-        if isinstance(last_response, dict) and last_response.get("content"):
-            result.progress["last_model_content"] = str(last_response["content"])
-            result.progress["last_model_response"] = dict(last_response)
-            self.store.save(result)
-        # Text-only compatibility providers do not expose a native continuation
-        # channel. A final interpretation is presentation-only: deterministic
-        # verification has already decided the mission status.
-        initial = result.progress.get("initial_model_response", {})
-        if initial.get("tool_calls") and not result.progress.get("last_model_content"):
-            try:
-                final_response = self._ask(result.objective, result.observations[-1] if result.observations else None, policy_context=policy_context, request_id=result.request_id, conversation_id=result.mission_id)
-                if final_response.get("content"):
-                    result.progress["last_model_content"] = str(final_response["content"])
-                    result.progress["last_model_response"] = dict(final_response)
-                    self.store.save(result)
-            except Exception:
-                pass
-        return result
+            native_model = RouterNativeModel(self.router)
+
+        def postprocess(result: Mission) -> None:
+            # Text-only compatibility providers keep their former presentation
+            # metadata, persisted while the worker still holds its live fence.
+            last_response = getattr(self, "_last_model_response", None)
+            if isinstance(last_response, dict) and last_response.get("content"):
+                result.progress["last_model_content"] = str(last_response["content"])
+                result.progress["last_model_response"] = dict(last_response)
+            initial = result.progress.get("initial_model_response", {})
+            if initial.get("tool_calls") and not result.progress.get("last_model_content"):
+                try:
+                    final_response = self._ask(result.objective, result.observations[-1] if result.observations else None, policy_context=policy_context, request_id=result.request_id, conversation_id=result.mission_id)
+                    if final_response.get("content"):
+                        result.progress["last_model_content"] = str(final_response["content"])
+                        result.progress["last_model_response"] = dict(final_response)
+                except Exception:
+                    pass
+
+        return self._run_via_fenced_worker(
+            runtime,
+            mission.mission_id,
+            max_slices=self.max_iterations,
+            native_model=native_model,
+            tools=self._schemas() if native_model is not None else None,
+            postprocess=postprocess if native_model is None else None,
+        )
 
     def _reauthorize_mission(
         self, mission_id: str, *, owner_session_token: str
@@ -387,8 +445,8 @@ class AgentCore:
     def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
         mission, _, fresh_snapshot = self._reauthorize_mission(mission_id, owner_session_token=owner_session_token)
         policy_context = policy_context_from_snapshot(fresh_snapshot)
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True)
-        return runtime.run_to_completion(mission_id, max_slices=max_slices or self.max_iterations)
+        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True)
+        return self._run_via_fenced_worker(runtime, mission_id, max_slices=max_slices or self.max_iterations)
 
 
 __all__ = ["AgentCore"]

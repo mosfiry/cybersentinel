@@ -13,8 +13,10 @@ import time
 import pytest
 
 from agent.evidence import EvidenceChainStore
+from agent.execution_fence import ExecutionFence
 from agent.mission_worker import MissionQueue, WorkerMissionState
-from agent.mission import MissionStatus, MissionStore
+from agent.mission import Mission, MissionStatus, MissionStore
+from agent.planning import Plan, PlanStep
 from agent.mission_runtime import MissionRuntime
 from agent.planning import Plan, PlanStep
 from agent.self_repair import BoundedSelfRepair
@@ -52,7 +54,6 @@ def auth(root: str, *, mission_id: str = "m1", owner: str = "owner-proof", actio
 
 def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkeypatch):
     (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert 2 + 2 == 4\n")
-    store = EvidenceChainStore(tmp_path / "evidence.sqlite3")
     snapshot = auth(str(tmp_path))
     workspace = Workspace(tmp_path)
     import security.owner_policy as owner_policy
@@ -61,7 +62,41 @@ def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkey
     context = AuthorizationContext(request_id="req-1", owner_evidence=evidence, policy_snapshot=owner_policy.capture_policy_snapshot("req-1", evidence))
     decision = authorize_tool(["run_project_tests", "."], context=context)
     assert decision.allowed and decision.decision is not None
-    result = execute("run_project_tests", ".", authorization_decision=decision.decision, request_id="req-1", mission_authorization=snapshot, workspace=workspace, evidence_store=store, mission_id="m1")
+
+    queue = MissionQueue(tmp_path / "mission-queue.sqlite3", require_execution_fence=True)
+    queue.enqueue("m1")
+    identity = queue.register_worker("governed-test-worker")
+    identity_fence = ExecutionFence.for_worker(queue, identity)
+    now = datetime.now(timezone.utc).isoformat()
+    claim = queue.claim_next(
+        now=now,
+        worker_id=identity.worker_id,
+        worker_instance_id=identity.worker_instance_id,
+        runtime_generation=identity.runtime_generation,
+        execution_fence=identity_fence,
+    )
+    assert claim is not None
+    mission_record = Mission.create(
+        "workspace test",
+        "workspace test",
+        Plan(version=1, objective="workspace test", steps=(PlanStep("workspace-step", "run tests", action="run_project_tests"),)),
+        mission_id="m1",
+        request_id="req-1",
+        owner_identity_ref=snapshot.owner_identity,
+        authorization_snapshot=snapshot.to_dict(),
+    )
+    fence = identity_fence.with_lease(claim).for_mission(
+        mission_record, task_id="workspace-step", execution_id="workspace-execution-1"
+    )
+    store = EvidenceChainStore(
+        tmp_path / "evidence.sqlite3", execution_fence=fence, require_execution_fence=True
+    )
+    result = execute(
+        "run_project_tests", ".", authorization_decision=decision.decision,
+        request_id="req-1", mission_authorization=snapshot, workspace=workspace,
+        evidence_store=store, mission_id="m1", execution_fence=fence,
+        execution_id="workspace-execution-1",
+    )
     assert result["ok"] is True
     assert result["returncode"] == 0
     records = store.list(request_id="req-1")

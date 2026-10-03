@@ -273,10 +273,13 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None):
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None):
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+    if (mission_id is not None or mission_authorization is not None) and execution_fence is None:
+        from agent.execution_fence import ExecutionFenceError
+        raise ExecutionFenceError("mission-bound tool dispatch requires an execution fence")
     decision_valid = False
     if authorization_decision is not None:
         from security.authorization_context import AuthorizationDecision
@@ -316,6 +319,13 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
     valid, reason = spec.validate(argument)
     if not valid:
         raise ValueError(reason)
+    if execution_fence is not None:
+        execution_fence.assert_dispatch(
+            mission_id=str(mission_id or ""),
+            request_id=str(request_id or ""),
+            execution_id=str(execution_id or ""),
+            authorization_snapshot=mission_authorization,
+        )
     limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
@@ -330,9 +340,17 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             workspace = Workspace(root, authorization_snapshot=compatibility_snapshot)
             workspace_authorization = compatibility_snapshot
         workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
-        future = executor.submit(spec.handler, argument, workspace=workspace)
+        def dispatch_workspace():
+            if execution_fence is not None:
+                execution_fence.assert_dispatch(mission_id=str(mission_id or ""), request_id=str(request_id or ""), execution_id=str(execution_id or ""), authorization_snapshot=mission_authorization)
+            return spec.handler(argument, workspace=workspace)
+        future = executor.submit(dispatch_workspace)
     else:
-        future = executor.submit(spec.handler, argument)
+        def dispatch_tool():
+            if execution_fence is not None:
+                execution_fence.assert_dispatch(mission_id=str(mission_id or ""), request_id=str(request_id or ""), execution_id=str(execution_id or ""), authorization_snapshot=mission_authorization)
+            return spec.handler(argument)
+        future = executor.submit(dispatch_tool)
     try:
         return future.result(timeout=limit)
     except FutureTimeout as exc:

@@ -9,6 +9,7 @@ import json
 
 from .planning import Plan, GoalVerification
 from .trajectory import EventType, TrajectoryEvent, verify_trajectory
+from .execution_fence import ExecutionFence
 
 
 class MissionStatus(str, Enum):
@@ -164,9 +165,14 @@ class MissionStore:
         with sqlite3.connect(self.db_path) as db:
             db.execute("CREATE TABLE IF NOT EXISTS missions (mission_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
 
-    def save(self, mission: Mission) -> Mission:
+    def save(self, mission: Mission, *, execution_fence: ExecutionFence | None = None) -> Mission:
         import json, sqlite3
+        if execution_fence is not None:
+            execution_fence.assert_current(mission=mission)
         with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if execution_fence is not None:
+                execution_fence.assert_current(mission=mission)
             payload = mission.to_dict()
             encoded = json.dumps(payload, ensure_ascii=False)
             existing = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()

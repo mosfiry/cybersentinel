@@ -4,9 +4,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 import hashlib
+import inspect
 import json
 
 from .mission import Mission, MissionStatus, MissionStore
+from .execution_fence import ExecutionFence, ExecutionFenceError
 from .planning import FailureClass, GoalVerification, Plan, PlanStep, RecoveryAction, RecoveryPolicy, VerificationCriterion, evidence_for
 from .trajectory import EventType
 from .observation import Observation
@@ -21,7 +23,7 @@ from .model_intelligence.tool_calls import execute_bounded_parallel, validate_pr
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -31,6 +33,43 @@ class MissionRuntime:
         self.interpreter = interpreter or ObservationInterpreter()
         self.require_authorization_snapshot = require_authorization_snapshot
         self.authorization_snapshot_factory = authorization_snapshot_factory
+        self.execution_fence = execution_fence
+        self.require_execution_fence = bool(require_execution_fence)
+
+    def set_execution_fence(self, execution_fence: ExecutionFence) -> None:
+        if not isinstance(execution_fence, ExecutionFence) or execution_fence.lease_epoch is None:
+            raise ExecutionFenceError("runtime requires a leased execution fence")
+        self.execution_fence = execution_fence
+
+    def _fence_for(self, mission: Mission, *, task_id: str | None = None, execution_id: str | None = None) -> ExecutionFence | None:
+        if self.execution_fence is None:
+            if self.require_execution_fence:
+                raise ExecutionFenceError("mission runtime execution fence is required")
+            return None
+        return self.execution_fence.for_mission(mission, task_id=task_id, execution_id=execution_id)
+
+    def _save(self, mission: Mission, *, execution_fence: ExecutionFence | None = None) -> Mission:
+        fence = execution_fence or self._fence_for(mission)
+        if fence is None:
+            if self.require_execution_fence:
+                raise ExecutionFenceError("mission state mutation requires an execution fence")
+            return self.store.save(mission)
+        return self.store.save(mission, execution_fence=fence)
+
+    @staticmethod
+    def _executor_accepts_fence(executor: Callable[..., Any]) -> bool:
+        try:
+            parameters = inspect.signature(executor).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == "execution_fence" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    def persist_execution_state(self, mission: Mission) -> Mission:
+        """Persist execution-owned metadata before the worker releases its lease."""
+        return self._save(mission)
 
     def _mission_authorization(self, mission: Mission) -> tuple[bool, str]:
         if not self.require_authorization_snapshot:
@@ -121,7 +160,9 @@ class MissionRuntime:
             authorization_snapshot_factory=authorization_snapshot_factory,
         )
 
-    def provide_owner_decision(self, mission_id: str, *, allow: bool, authorization_context: dict[str, Any] | None = None) -> Mission:
+    def provide_owner_decision(self, mission_id: str, *, allow: bool, authorization_context: dict[str, Any] | None = None, execution_fence: ExecutionFence | None = None) -> Mission:
+        if self.require_execution_fence and execution_fence is None:
+            raise ExecutionFenceError("Owner decision requires its authorized control-plane workflow")
         mission = self._load(mission_id)
         if mission.status is not MissionStatus.OWNER_INPUT_REQUIRED:
             raise ValueError("mission is not waiting for owner input")
@@ -131,7 +172,7 @@ class MissionRuntime:
         else:
             mission.authorization_context = authorization_context or {"owner_decision": "allow"}
             mission.transition(MissionStatus.READY, "owner allowed action")
-        return self.store.save(mission)
+        return self._save(mission, execution_fence=execution_fence)
 
     def _load(self, mission_id: str) -> Mission:
         mission = self.store.load(mission_id)
@@ -189,13 +230,15 @@ class MissionRuntime:
         mission.emit(EventType.STRATEGY_DECIDED, step_id=step.step_id, data=decision.to_dict())
         return decision
 
-    def reconcile_in_flight(self, mission_id: str, *, executed: bool, observation: dict[str, Any] | None = None) -> Mission:
+    def reconcile_in_flight(self, mission_id: str, *, executed: bool, observation: dict[str, Any] | None = None, execution_fence: ExecutionFence | None = None) -> Mission:
         """Resolve an ambiguous external side effect without silently replaying it.
 
         ``executed=True`` records the external receipt as completed.  ``False``
         records that reconciliation found no side effect and permits one safe
         retry.  The runtime never infers either outcome from a process crash.
         """
+        if self.require_execution_fence and execution_fence is None:
+            raise ExecutionFenceError("in-flight reconciliation requires its authorized control-plane workflow")
         mission = self._load(mission_id)
         checkpoint = dict(mission.checkpoint or {})
         checkpoint_status = checkpoint.get("status")
@@ -219,7 +262,7 @@ class MissionRuntime:
             else:
                 mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
                 mission.transition(MissionStatus.READY, "parallel in-flight actions reconciled as not executed", tool_call_ids=ambiguous_ids)
-            return self.store.save(mission)
+            return self._save(mission, execution_fence=execution_fence)
         action_id = str(checkpoint.get("action_id", ""))
         step_id = str(checkpoint.get("step_id", ""))
         if executed:
@@ -235,9 +278,9 @@ class MissionRuntime:
         else:
             mission.checkpoint = {**checkpoint, "status": "reconciled_not_executed", "reconciled": True}
             mission.transition(MissionStatus.READY, "in-flight action reconciled as not executed", action_id=action_id)
-        return self.store.save(mission)
+        return self._save(mission, execution_fence=execution_fence)
 
-    def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20) -> Mission:
+    def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20, heartbeat: Callable[[], None] | None = None) -> Mission:
         """Run a real model/tool/observation loop for a durable mission."""
         from security.authorization import authorize_tool
         from security.authorization_context import AuthorizationContext
@@ -249,7 +292,7 @@ class MissionRuntime:
         if (mission.checkpoint or {}).get("status") in {"in_flight", "in_flight_parallel"}:
             mission.error = "in-flight native tool outcome is unknown; reconciliation required"
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
-            return self.store.save(mission)
+            return self._save(mission)
         run_id = run_id or str(mission.progress.get("model_run_id") or hashlib.sha256((mission.mission_id + mission.request_id).encode()).hexdigest()[:20])
         mission.progress["model_run_id"] = run_id
         progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
@@ -262,6 +305,8 @@ class MissionRuntime:
                 auth_context = None
 
         for _ in range(max_turns):
+            if heartbeat is not None:
+                heartbeat()
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
             current_step = mission.current_plan_step
             assembled = ContextAssembler().build(mission, tool_results=progress.get("tool_results", ()), tools=tools)
@@ -309,7 +354,7 @@ class MissionRuntime:
                     mission.transition(MissionStatus.REPLANNING, "provider failure; replan selected")
                 else:
                     mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
-                self.store.save(mission)
+                self._save(mission)
                 if mission.is_terminal:
                     return mission
                 continue
@@ -338,10 +383,10 @@ class MissionRuntime:
                 else:
                     mission.error = "model final lacked deterministic goal evidence"
                     mission.transition(MissionStatus.READY, mission.error)
-                return self.store.save(mission)
+                return self._save(mission)
             if len(turn.tool_calls) > 1:
                 self._run_parallel_model_calls(mission, turn.tool_calls, auth_context=auth_context, run_id=run_id, current_step=current_step, progress=progress, seen=seen)
-                self.store.save(mission)
+                self._save(mission)
                 if mission.is_terminal:
                     return mission
                 continue
@@ -364,8 +409,15 @@ class MissionRuntime:
                     else:
                         try:
                             mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
-                            self.store.save(mission)
-                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id)
+                            task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
+                            execution_id = proposal.action_id or proposal.tool_call_id
+                            dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
+                            if dispatch_fence is not None:
+                                dispatch_fence.assert_current(mission=mission, task_id=task_id, execution_id=execution_id)
+                            self._save(mission)
+                            if heartbeat is not None:
+                                heartbeat()
+                            raw = execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, mission_authorization=mission.authorization_snapshot, execution_fence=dispatch_fence, execution_id=execution_id)
                             observation = dict(raw or {})
                             observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
                             mission.record_observation(observation)
@@ -380,12 +432,12 @@ class MissionRuntime:
                         except Exception as exc:
                             mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
                             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
-                            return self.store.save(mission)
+                            return self._save(mission)
                 progress["tool_results"].append(result.to_dict())
-            self.store.save(mission)
+            self._save(mission)
         mission.error = "model turn budget exhausted"
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
-        return self.store.save(mission)
+        return self._save(mission)
 
     def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str]) -> None:
         """Authorize and execute independent proposals concurrently, then fold results deterministically."""
@@ -409,11 +461,16 @@ class MissionRuntime:
             else:
                 results.append(ToolCallResult(proposal, False, error=decision.reason))
         mission.checkpoint = {"status": "in_flight_parallel", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
-        self.store.save(mission)
+        self._save(mission)
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
             proposal, argument, decision = item
             try:
-                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id) or {})
+                task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
+                execution_id = proposal.action_id or proposal.tool_call_id
+                dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
+                if dispatch_fence is not None:
+                    dispatch_fence.assert_current(mission=mission, task_id=task_id, execution_id=execution_id)
+                return dict(execute_tool(proposal.name, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_id=mission.mission_id, mission_authorization=mission.authorization_snapshot, execution_fence=dispatch_fence, execution_id=execution_id) or {})
             except Exception as exc:
                 # An exception after dispatch cannot prove that the external side effect did not happen.
                 # Preserve ambiguity so recovery cannot blindly replay this proposal.
@@ -461,7 +518,7 @@ class MissionRuntime:
             mission.error = authorization_reason
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason": authorization_reason})
             mission.transition(MissionStatus.AUTHORIZATION_BLOCKED, authorization_reason)
-            return self.store.save(mission)
+            return self._save(mission)
         checkpoint = dict(mission.checkpoint or {})
         checkpoint_status = checkpoint.get("status")
         if checkpoint_status in {"in_flight", "in_flight_parallel"}:
@@ -490,12 +547,12 @@ class MissionRuntime:
                     data={**failure, "recovery": "reconciliation_required"},
                 )
                 mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
-            return self.store.save(mission)
+            return self._save(mission)
         if mission.iteration_count >= mission.max_iterations:
             mission.error = "iteration budget exhausted"
             mission.emit(EventType.FAILURE_DETECTED, data={"class": FailureClass.RESOURCE.value, "reason": mission.error})
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
-            return self.store.save(mission)
+            return self._save(mission)
         mission.iteration_count += 1
         if mission.current_step >= len(mission.plan.steps):
             mission.transition(MissionStatus.VERIFYING, "all plan steps observed")
@@ -508,7 +565,7 @@ class MissionRuntime:
                 mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state})
             else:
                 mission.transition(MissionStatus.RUNNING, "required verification evidence missing")
-            return self.store.save(mission)
+            return self._save(mission)
 
         step = mission.current_plan_step
         action_id = f"{mission.mission_id}:{mission.plan.version}:{step.step_id}:{mission.current_step}"
@@ -520,11 +577,11 @@ class MissionRuntime:
             mission.error = "dead loop detected: repeated plan and action"
             mission.emit(EventType.FAILURE_DIAGNOSED, step_id=step.step_id, data={"class": FailureClass.LOGIC.value, "reason": mission.error})
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
-            return self.store.save(mission)
+            return self._save(mission)
         if any(item.get("action_id") == action_id and item.get("status") == "completed" for item in mission.action_history):
             mission.current_step += 1
             mission.transition(MissionStatus.READY, "idempotent action already completed")
-            return self.store.save(mission)
+            return self._save(mission)
 
         allowed, reason = self.authorizer(mission, step)
         mission.emit(EventType.AUTHORIZATION_CHECKED, step_id=step.step_id, data={"allowed": allowed, "reason": reason})
@@ -533,18 +590,33 @@ class MissionRuntime:
             mission.failures.append({"class": FailureClass.AUTHORIZATION.value if "authorization" in reason else FailureClass.SCOPE.value, "reason": reason, "step_id": step.step_id})
             mission.emit(EventType.OWNER_INPUT_REQUIRED if "authorization" in reason else EventType.FAILURE_DETECTED, step_id=step.step_id, data={"reason": reason})
             mission.transition(MissionStatus.OWNER_INPUT_REQUIRED if "authorization" in reason else MissionStatus.SCOPE_BLOCKED, reason)
-            return self.store.save(mission)
+            return self._save(mission)
+
+        if self.require_execution_fence and not self._executor_accepts_fence(self.executor):
+            raise ExecutionFenceError("strict runtime executor does not accept execution fences")
 
         mission.transition(MissionStatus.RUNNING, "step started", step_id=step.step_id)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "in_flight", "plan_version": mission.plan.version}
-        self.store.save(mission)
+        self._save(mission)
+        dispatch_fence = self._fence_for(mission, task_id=step.step_id, execution_id=action_id)
+        if dispatch_fence is not None:
+            dispatch_fence.assert_current(mission=mission, task_id=step.step_id, execution_id=action_id)
         try:
-            result = self.executor(mission, step, action_id)
+            if dispatch_fence is None:
+                result = self.executor(mission, step, action_id)
+            elif self._executor_accepts_fence(self.executor):
+                result = self.executor(mission, step, action_id, execution_fence=dispatch_fence)
+            elif self.require_execution_fence:
+                raise ExecutionFenceError("strict runtime executor does not accept execution fences")
+            else:
+                result = self.executor(mission, step, action_id)
+        except ExecutionFenceError:
+            raise
         except Exception as exc:
             # Keep the in-flight checkpoint durable. A new runtime can safely resume it.
             mission.error = type(exc).__name__
             mission.record_observation({"type": "execution_exception", "success": False, "error": str(exc), "action_id": action_id})
-            return self.store.save(mission)
+            return self._save(mission)
 
         observation = dict(result or {})
         observation.setdefault("type", "tool_observation")
@@ -564,14 +636,14 @@ class MissionRuntime:
             mission.error = f"observation interpretation rejected: {type(exc).__name__}"
             mission.recovery_events.append({"event": "interpretation_rejected", "reason": str(exc), "action_id": action_id})
             mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
-            return self.store.save(mission)
+            return self._save(mission)
         allowed_targets = (mission.scope_snapshot or {}).get("allowed_targets") if isinstance(mission.scope_snapshot, dict) else None
         scope_blocked = bool(observation.get("target") and isinstance(allowed_targets, (list, tuple, set)) and str(observation.get("target")) not in {str(item) for item in allowed_targets})
         if scope_blocked:
             mission.error = "observation proposed a target outside deterministic scope"
             mission.failures.append({"class": FailureClass.SCOPE.value, "reason": mission.error, "target": observation.get("target")})
             mission.transition(MissionStatus.SCOPE_BLOCKED, mission.error)
-            return self.store.save(mission)
+            return self._save(mission)
         if success:
             mission.evidence.append({"criterion_id": observation.get("criterion_id", step.step_id), "passed": True, "source": observation.get("source", step.action), "result": observation, "provenance": {"mission_id": mission.mission_id, "step_id": step.step_id, "action_id": action_id}})
             mission.emit(EventType.EVIDENCE_ADDED, step_id=step.step_id, data={"criterion_id": observation.get("criterion_id", step.step_id)})
@@ -582,7 +654,7 @@ class MissionRuntime:
                 if new_plan.objective != mission.objective:
                     mission.error = "replanner attempted to change Owner objective"
                     mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
-                    return self.store.save(mission)
+                    return self._save(mission)
                 mission.replan_history.append({"from_version": mission.plan.version, "to_version": new_plan.version, "reason": strategy_decision.reason, "trigger": strategy_decision.to_dict()})
                 mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": strategy_decision.reason})
                 mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": strategy_decision.reason})
@@ -590,11 +662,11 @@ class MissionRuntime:
                 mission.current_step = 0
                 mission.retry_count = 0
                 mission.transition(MissionStatus.READY, "informative observation caused replan", plan_version=new_plan.version)
-                return self.store.save(mission)
+                return self._save(mission)
             mission.current_step += 1
             mission.retry_count = 0
             mission.transition(MissionStatus.READY, "observation accepted")
-            return self.store.save(mission)
+            return self._save(mission)
 
         failure = FailureClass(str(observation.get("failure_class", FailureClass.UNKNOWN.value))) if str(observation.get("failure_class", FailureClass.UNKNOWN.value)) in {item.value for item in FailureClass} else FailureClass.UNKNOWN
         mission.failures.append({"class": failure.value, "reason": observation.get("error", "action failed"), "step_id": step.step_id, "action_id": action_id})
@@ -615,7 +687,7 @@ class MissionRuntime:
             if new_plan.objective != mission.objective:
                 mission.error = "replanner attempted to change Owner objective"
                 mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
-                return self.store.save(mission)
+                return self._save(mission)
             mission.plan_history.append({"version": new_plan.version, "fingerprint": new_plan.fingerprint, "reason": "failure observation"})
             mission.emit(EventType.PLAN_REVISED, data={"version": new_plan.version, "fingerprint": new_plan.fingerprint})
             mission.plan = new_plan
@@ -626,7 +698,7 @@ class MissionRuntime:
             mission.transition(MissionStatus.READY, "bounded retry selected")
         else:
             mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, "recovery budget exhausted")
-        return self.store.save(mission)
+        return self._save(mission)
 
     def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:
         limit = max_slices or self._load(mission_id).max_iterations
