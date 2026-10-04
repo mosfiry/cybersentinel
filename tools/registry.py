@@ -503,11 +503,12 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 raise PermissionError("scope denied: " + decision.reason)
     snapshot = None
     if mission_authorization is not None:
-        from security.mission_authorization import MissionAuthorizationSnapshot
+        from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
         snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
         allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
         if not allowed:
-            raise PermissionError("mission authorization blocked: " + reason)
+            code = "authorization_expired" if reason == "authorization snapshot expired or not active" else "authorization_denied"
+            raise MissionAuthorizationError("mission authorization blocked: " + reason, code=code)
     if execution_fence is not None:
         execution_fence.assert_dispatch(
             mission_id=str(mission_id or ""),

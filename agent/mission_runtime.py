@@ -22,6 +22,7 @@ from .model_protocol import ConversationTurn, NativeModel, RouterNativeModel, To
 from .provider_api import InvalidModelResponse, MAX_PROVIDER_LABEL_CHARS, ProviderError
 from .model_intelligence.context import ContextAssembler
 from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
+from security.mission_authorization import MissionAuthorizationError
 
 MAX_TOOL_ERROR_CHARS = 128
 MAX_TOOL_ERROR_OUTPUT_CHARS = MAX_TOOL_ERROR_CHARS + 2
@@ -1228,9 +1229,105 @@ class MissionRuntime:
                         mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
                         mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
                         result = ToolCallResult(proposal, True, result=observation)
+                    except MissionAuthorizationError as exc:
+                        authorization_expired = getattr(exc, "code", "authorization_denied") == "authorization_expired"
+                        target_status = MissionStatus.OWNER_REAUTH_REQUIRED if authorization_expired else MissionStatus.AUTHORIZATION_BLOCKED
+                        reason = str(exc)[:256] or "mission authorization rejected before tool dispatch"
+                        reason_code = "authorization_expired" if authorization_expired else "authorization_denied"
+                        mission.checkpoint = {
+                            "status": "not_dispatched",
+                            "tool_call_id": proposal.tool_call_id,
+                            "action_id": execution_id,
+                            "step_id": task_id,
+                            "run_id": run_id,
+                            "turn_id": turn_id,
+                            "plan_version": mission.plan.version,
+                            "reason_code": reason_code,
+                        }
+                        failure = {
+                            "mission_id": mission.mission_id,
+                            "request_id": mission.request_id,
+                            "run_id": run_id,
+                            "turn_id": turn_id,
+                            "tool_call_id": proposal.tool_call_id,
+                            "action_id": execution_id,
+                            "step_id": task_id,
+                            "class": FailureClass.AUTHORIZATION.value,
+                            "kind": "OWNER_REAUTH_REQUIRED" if authorization_expired else "MISSION_AUTHORIZATION_REJECTED",
+                            "error_type": type(exc).__name__,
+                            "reason": reason,
+                            "retry_policy": {
+                                "action": target_status.value,
+                                "retryable": False,
+                                "attempts": 0,
+                                "requires_owner_reauth": authorization_expired,
+                            },
+                        }
+                        mission.error = reason
+                        mission.failures.append(failure)
+                        mission.progress.setdefault("authorization_failures", []).append(failure)
+                        mission.emit(EventType.FAILURE_DETECTED, step_id=task_id, data=failure)
+                        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=task_id, data={
+                            "class": FailureClass.AUTHORIZATION.value,
+                            "kind": failure["kind"],
+                            "recovery": target_status.value,
+                            "run_id": run_id,
+                            "turn_id": turn_id,
+                            "tool_call_id": proposal.tool_call_id,
+                        })
+                        mission.transition(
+                            target_status,
+                            reason,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_call_id=proposal.tool_call_id,
+                            checkpoint_status="not_dispatched",
+                        )
+                        return self._save(mission)
                     except Exception as exc:
-                        mission.error = f"native tool outcome is ambiguous: {type(exc).__name__}"
-                        mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
+                        error_detail = self._bounded_tool_error(str(exc)) or "no exception detail"
+                        reason = f"native tool outcome is ambiguous: {type(exc).__name__}"
+                        failure = {
+                            "mission_id": mission.mission_id,
+                            "request_id": mission.request_id,
+                            "run_id": run_id,
+                            "turn_id": turn_id,
+                            "tool_call_id": proposal.tool_call_id,
+                            "action_id": execution_id,
+                            "step_id": task_id,
+                            "class": FailureClass.UNKNOWN.value,
+                            "kind": "NATIVE_TOOL_OUTCOME_UNKNOWN",
+                            "error_type": type(exc).__name__,
+                            "error": error_detail,
+                            "reason": reason,
+                            "retry_policy": {
+                                "action": "RECONCILIATION_REQUIRED",
+                                "retryable": False,
+                                "attempts": 0,
+                            },
+                        }
+                        mission.error = reason
+                        mission.failures.append(failure)
+                        mission.progress.setdefault("native_tool_failures", []).append(failure)
+                        mission.emit(EventType.FAILURE_DETECTED, step_id=task_id, data=failure)
+                        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=task_id, data={
+                            "class": FailureClass.UNKNOWN.value,
+                            "kind": failure["kind"],
+                            "recovery": "reconciliation_required",
+                            "run_id": run_id,
+                            "turn_id": turn_id,
+                            "tool_call_id": proposal.tool_call_id,
+                            "action_id": execution_id,
+                        })
+                        mission.transition(
+                            MissionStatus.RECOVERY_REQUIRED,
+                            reason,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_call_id=proposal.tool_call_id,
+                            action_id=execution_id,
+                            checkpoint_status="in_flight",
+                        )
                         return self._save(mission)
                 progress["tool_results"].append(result.to_dict())
             self._save(mission)

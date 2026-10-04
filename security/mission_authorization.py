@@ -9,7 +9,9 @@ from pathlib import Path
 
 
 class MissionAuthorizationError(PermissionError):
-    pass
+    def __init__(self, message: str, *, code: str = "authorization_denied") -> None:
+        super().__init__(message)
+        self.code = str(code)
 
 
 def _now() -> str:
