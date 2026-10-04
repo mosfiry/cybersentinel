@@ -1,5 +1,7 @@
 {
   "version": "2.0",
+  "require_owner_token": true,
+  "owner_phrase": "Owner",
   "evidence_required": true,
   "sandbox_by_default": true,
   "external_targets_require_scope": true,

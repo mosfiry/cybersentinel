@@ -38,6 +38,8 @@ class RuntimeLimitsConfig:
 @dataclass(frozen=True)
 class OwnerPolicy:
     version: str
+    require_owner_token: bool
+    owner_phrase: str
     evidence_required: bool
     sandbox_by_default: bool
     external_targets_require_scope: bool
