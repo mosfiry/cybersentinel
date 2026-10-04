@@ -43,6 +43,7 @@ jobs:
               docker compose logs --no-color || true
             fi
             docker compose down --volumes --remove-orphans || true
+            sudo rm -rf -- "$CYBERSENTINEL_SECRETS_DIR" || true
           }
           trap cleanup EXIT
 
@@ -63,10 +64,10 @@ jobs:
           for name, value in values.items():
               (directory / name).write_text(value, encoding="utf-8")
           PY
-          sudo chown root:root "$CYBERSENTINEL_SECRETS_DIR"
-          sudo chmod 0711 "$CYBERSENTINEL_SECRETS_DIR"
           sudo chown 10001:10001 "$CYBERSENTINEL_SECRETS_DIR"/*
           sudo chmod 0440 "$CYBERSENTINEL_SECRETS_DIR"/*
+          sudo chown root:root "$CYBERSENTINEL_SECRETS_DIR"
+          sudo chmod 0711 "$CYBERSENTINEL_SECRETS_DIR"
 
           wait_bridge() {
             for attempt in $(seq 1 60); do

@@ -94,3 +94,15 @@ def test_m3_overlay_does_not_create_conflicting_inline_provider_secrets() -> Non
         "HF_LLM_API_KEY",
     ):
         assert re.search(rf"(?m)^\s+{variable}\s*:", overlay) is None
+
+
+def test_container_ci_secrets_are_permissioned_then_removed() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    write_files = workflow.index('(directory / name).write_text')
+    files_owner = workflow.index('sudo chown 10001:10001 "$CYBERSENTINEL_SECRETS_DIR"/*')
+    files_mode = workflow.index('sudo chmod 0440 "$CYBERSENTINEL_SECRETS_DIR"/*')
+    directory_owner = workflow.index('sudo chown root:root "$CYBERSENTINEL_SECRETS_DIR"')
+    directory_mode = workflow.index('sudo chmod 0711 "$CYBERSENTINEL_SECRETS_DIR"')
+    cleanup = workflow.index('sudo rm -rf -- "$CYBERSENTINEL_SECRETS_DIR"')
+    assert write_files < files_owner < files_mode < directory_owner < directory_mode
+    assert cleanup < workflow.index("trap cleanup EXIT") < write_files
