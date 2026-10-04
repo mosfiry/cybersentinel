@@ -288,6 +288,11 @@ function renderModelCards(target) {
 async function refreshDesktopSetup() {
   const data = await api("/api/public/desktop/setup");
   state.desktopSetup = data;
+  const canonicalUsername = String(data.owner_username || "").trim();
+  const setupUsername = $("#setupOwnerUsername");
+  if (setupUsername) setupUsername.textContent = canonicalUsername || "غير متاح";
+  const loginUsername = $("#loginUsername");
+  if (loginUsername && !loginUsername.value && canonicalUsername) loginUsername.value = canonicalUsername;
   state.modelManager = data.model_manager || null;
   renderModelCards($("#setupModelList"));
   const overlay = $("#firstRunOverlay");
@@ -347,11 +352,13 @@ $("#ownerSetupForm").onsubmit = async (event) => {
   button.disabled = true;
   message.textContent = "جارٍ إنشاء حساب المالك محليًا...";
   try {
+    const canonicalUsername = String(state.desktopSetup?.owner_username || "").trim();
+    if (!canonicalUsername) throw new Error("desktop_owner_username_unavailable");
     if (!window.cybersentinelDesktop?.createOwner) throw new Error("desktop_first_run_unavailable");
     await window.cybersentinelDesktop.createOwner(password);
     const data = await api("/api/public/auth/login", {
       method: "POST",
-      body: JSON.stringify({ username: "owner", password }),
+      body: JSON.stringify({ username: canonicalUsername, password }),
     });
     $("#ownerSetupPassword").value = "";
     $("#ownerSetupConfirm").value = "";

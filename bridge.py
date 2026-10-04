@@ -387,6 +387,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "ok": True,
                 "desktop_mode": DESKTOP_MODE,
+                "owner_username": owner_password.OWNER_USERNAME,
                 "owner_configured": owner_password.owner_account_exists(),
                 "model_manager": model_state,
             })

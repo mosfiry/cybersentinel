@@ -6,6 +6,7 @@ The real Owner password must never appear here.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -90,6 +91,27 @@ def test_login_success(tmp_db, monkeypatch):
     assert session["session_id"]
     assert "password" not in session
     assert "password_hash" not in session
+
+
+def test_first_run_bootstrap_to_login_uses_canonical_username(tmp_db, monkeypatch):
+    assert _bootstrap(monkeypatch) == 0
+
+    app = Path("web/app.js").read_text(encoding="utf-8")
+    bridge = Path("bridge.py").read_text(encoding="utf-8")
+    html = Path("web/index.html").read_text(encoding="utf-8")
+    assert '"owner_username": owner_password.OWNER_USERNAME' in bridge
+    assert 'const canonicalUsername = String(state.desktopSetup?.owner_username || "").trim();' in app
+    assert "setupUsername.textContent = canonicalUsername" in app
+    assert "loginUsername.value = canonicalUsername" in app
+    assert 'id="setupOwnerUsername"' in html
+    assert "username: canonicalUsername" in app
+    assert 'username: "owner"' not in app
+
+    with pytest.raises(PermissionError):
+        op.login("owner", TEST_PASSWORD)
+    session = op.login(op.OWNER_USERNAME, TEST_PASSWORD)
+    assert session["auth_method"] == "username_password"
+    assert session["session_id"]
 
 
 def test_owner_session_bearer_token_is_not_persisted(tmp_db, monkeypatch):
