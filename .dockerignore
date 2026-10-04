@@ -41,7 +41,12 @@ security/*_state.json
 tests/
 scripts/verify_container_contract.py
 scripts/prepare_compose_secrets.py
+scripts/install_compose.sh
+scripts/backup_state.sh
+scripts/restore_state.sh
+scripts/package_release.py
 docs/
+RELEASE_NOTES.md
 tasks/
 diagnostics/
 .github/

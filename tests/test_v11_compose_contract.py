@@ -119,3 +119,53 @@ def test_v12_archive_is_runtime_code_and_legacy_fixture_is_ci_only_readonly() ->
     assert "- ./tests/m3_rehearsal:/m3-rehearsal:ro" in initializer
     assert "/m3-rehearsal" not in COMPOSE
     assert fixture.is_file()
+
+
+def test_versioned_runtime_image_and_release_bundle_share_the_version_source() -> None:
+    version = (ROOT / "VERSION").read_text(encoding="ascii").strip()
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    from core.version import VERSION
+
+    assert version == VERSION
+    assert f"CYBERSENTINEL_VERSION={version}" in env_example
+    assert f"CYBERSENTINEL_IMAGE=cybersentinel-runtime:{version}" in env_example
+    assert "${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.0.0}" in COMPOSE
+    assert 'org.opencontainers.image.version="${CYBERSENTINEL_VERSION}"' in DOCKERFILE
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+    for host_only in (
+        "scripts/install_compose.sh",
+        "scripts/backup_state.sh",
+        "scripts/restore_state.sh",
+        "scripts/package_release.py",
+    ):
+        assert host_only in dockerignore
+
+
+def test_release_artifact_job_is_gated_on_tests_and_rehearsal_and_does_not_publish() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    release_job = workflow.split("  release-artifacts:\n", 1)[1]
+
+    assert "needs: [test, m3-nonproduction-rehearsal]" in release_job
+    assert "refs/heads/release/cybersentinel-final-20261003" in release_job
+    assert "docker save --output" in release_job
+    assert "scripts/package_release.py build" in release_job
+    assert "scripts/package_release.py verify" in release_job
+    assert "actions/upload-artifact@v4" in release_job
+    assert "github-release" not in release_job.lower()
+    assert "gh release create" not in release_job.lower()
+    assert "git tag" not in release_job.lower()
+
+
+def test_release_operator_scripts_are_scoped_and_do_not_add_cloud_host_dependencies() -> None:
+    for name in (
+        "install_compose.sh",
+        "backup_state.sh",
+        "restore_state.sh",
+        "package_release.py",
+    ):
+        source = (ROOT / "scripts" / name).read_text(encoding="utf-8").lower()
+        assert "cloudflare" not in source
+        assert "wrangler" not in source
+    notes = (ROOT / "RELEASE_NOTES.md").read_text(encoding="utf-8")
+    assert "unpublished" in notes.lower()
+    assert "final tag" in notes.lower()

@@ -72,3 +72,14 @@ Owner identity and policy proof are rebound to a fresh server-side session befor
 Recurring execution and scheduled retries are intentionally rejected by both the service and scheduler, with regression tests. The Owner policy does not authorize unattended recurring delegation; the user-provided scheduler requirements say that when unattended execution is not permitted, the mission must stop in an Owner-input/reauthorization state rather than execute. Therefore no recurring grant or automatic high-risk approval is inferred here. A previously valid scheduled mission is not resurrected after restart; fresh Owner reauthorization is required. This is a documented fail-closed boundary, not an unverified capability.
 
 **No final release tag is to be created by this plan.** V14 will stop for a separate confirmation containing the exact proposed tag and artifacts if and only if all release gates are evidenced.
+
+
+## V13 — Packaging and distribution
+
+Implemented a versioned `5.0.0` candidate bundle containing the Docker save archive, reproducible source/Compose package, `.env.example`, install/backup/restore scripts, release notes, version metadata, and inner/outer SHA-256 manifests. The release job is restricted to pushes on `release/cybersentinel-final-20261003` and depends on the full test and M3 rehearsal jobs; it validates the Docker image label, saves and reloads the image, verifies every packaged file/checksum, and uploads an expiring workflow artifact only. It does not create a Registry publish, GitHub Release, public deployment, or final tag.
+
+Local gates passed: `compileall`; **1,162 passed, 1 skipped** in the full suite; **18 focused packaging/Compose contract tests**; shell syntax, Compose/overlay/workflow YAML, secret-like-value scan, and `git diff --check`. The skipped test is the configured live-provider long-horizon harness; no live provider was contacted. Docker is unavailable on this computer, so the actual image/archive generation and artifact verification remain pending the exact-SHA hosted release job.
+
+## V14 — Final release gate
+
+Not started. Begin only after the V13 checkpoint's exact-SHA tests, M3 rehearsal, Owner Charter audit, and release-artifact job have completed and the uploaded bundle has been independently re-verified. The final tag/publication remains blocked until the separate Owner confirmation presents the exact proposed tag and artifact hashes; no final tag is authorized by this plan.

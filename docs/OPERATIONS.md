@@ -121,6 +121,25 @@ docker compose -p "$restore_project" ps
 
 The restored project uses the current `.env` and separate host secret files, so validate those before starting it. Log in as the Owner on `http://127.0.0.1:18789/` and confirm the expected mission/state before any cutover. `restore` does not promote the recovered project or change the original project's volume; choose and execute any production cutover separately. To upgrade in place, stop services, create and verify a backup first, then rebuild and start the same Compose project so it reuses the named volume. SQLite stores apply their component-specific additive/idempotent schema migrations at startup. Do not roll back an image against a database already migrated by a newer image; recover into a separate project from the pre-upgrade backup instead.
 
+### Unpublished release bundle
+
+A successful push to the dedicated release branch runs a separate CI packaging job only after the full tests, container smoke checks, and M3 rehearsal pass. It uploads an unpublished workflow artifact named `cybersentinel-release-candidate-<commit-sha>` containing the versioned Docker image tar, Compose bundle, `.env.example`, installation/backup/restore scripts, version metadata, release notes, and SHA-256 manifests. This workflow does not create a GitHub Release, publish to a registry, deploy to a public host, or create a Git tag.
+
+After downloading the workflow artifact, verify and extract the archive before use:
+
+```bash
+sha256sum --check --strict cybersentinel-5.0.0-release.tar.gz.sha256
+tar -xzf cybersentinel-5.0.0-release.tar.gz
+cd cybersentinel-5.0.0
+sha256sum --check --strict SHA256SUMS
+python3 scripts/package_release.py verify ../cybersentinel-5.0.0-release.tar.gz
+./scripts/install_compose.sh
+```
+
+The installer requires Linux, Docker Engine 28+, Docker Compose, `sudo` for secret-file preparation, and an interactive terminal for one-time Owner account initialization. It loads the included image, preserves existing `.env` files (or creates one from the template), validates the archive hashes, creates/preserves file-backed secrets without printing their values, and starts the bridge only on loopback. Review `.env` and configure any provider endpoints before relying on provider-backed missions.
+
+Use `./scripts/backup_state.sh /secure/backup/cybersentinel` to stop stateful services, create and internally verify a whole-volume archive, write a SHA-256 sidecar, then restore only services that were running. Store backups access-controlled and encrypted off-host. Restore with `./scripts/restore_state.sh /secure/backup/<archive>.tar.gz <new-unique-project-name>`; it verifies the sidecar and archive, refuses the current project or an existing restore volume, restores to a separate empty volume, and deliberately leaves the restored services stopped. Review `.env`/secrets, select an unused loopback port, verify the restored Owner and mission state, and start that project only when ready.
+
 ### Deployment boundary
 
 `firebase.json` remains the existing static-hosting configuration; it has no backend rewrite. The bridge, durable worker, and SQLite storage are not deployed to a public platform. This Compose configuration has no Cloudflare dependency and does not select a public backend host, domain, TLS ingress, production credentials, or production database. Keep production deployment blocked until the exact target and authority are known and the later M3 cutover gates pass.

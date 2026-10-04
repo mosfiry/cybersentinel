@@ -183,3 +183,56 @@ jobs:
           path: ${{ runner.temp }}/v12-clean-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}.json
           if-no-files-found: warn
           retention-days: 14
+
+
+  release-artifacts:
+    name: Build and verify unpublished release candidate artifacts
+    if: github.event_name == 'push' && github.ref == 'refs/heads/release/cybersentinel-final-20261003'
+    runs-on: ubuntu-latest
+    needs: [test, m3-nonproduction-rehearsal]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build, save, package, and verify the exact-version image
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid VERSION file" >&2
+            exit 2
+          fi
+          image_ref="cybersentinel-runtime:${version}"
+          docker build --pull --tag "$image_ref" --build-arg "CYBERSENTINEL_VERSION=$version" .
+          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image_ref")"
+          test "$image_version" = "$version"
+
+          image_tar="$RUNNER_TEMP/cybersentinel-runtime-${version}.tar"
+          docker save --output "$image_tar" "$image_ref"
+          docker load --input "$image_tar"
+          loaded_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image_ref")"
+          test "$loaded_version" = "$version"
+
+          output_dir="$RUNNER_TEMP/cybersentinel-release"
+          mkdir -p "$output_dir"
+          python3 scripts/package_release.py build \
+            --image-tar "$image_tar" \
+            --output-dir "$output_dir" \
+            --commit "$SOURCE_COMMIT"
+          archive="$output_dir/cybersentinel-${version}-release.tar.gz"
+          python3 scripts/package_release.py verify "$archive"
+          (cd "$output_dir" && sha256sum --check --strict "$(basename "$archive").sha256")
+      - name: Upload unpublished candidate bundle (no GitHub Release or tag)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cybersentinel-release-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/cybersentinel-release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90

@@ -1,7 +1,10 @@
 FROM python:3.12-slim-bookworm
 
+ARG CYBERSENTINEL_VERSION=5.0.0
+
 LABEL org.opencontainers.image.title="CyberSentinel" \
-      org.opencontainers.image.description="Self-hosted single-host runtime"
+      org.opencontainers.image.description="Self-hosted single-host runtime" \
+      org.opencontainers.image.version="${CYBERSENTINEL_VERSION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

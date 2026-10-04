@@ -47,3 +47,10 @@
 - Session-reference migrations are security-sensitive. Backups, exports, and new structured fields must be checked so a legacy/raw bearer token is not reintroduced.
 - The state archive is a versioned manifest plus per-file SHA-256 checksums. Backup rejects symlinks and non-regular files; verification checks every member before restore, and restore rejects traversal/link entries and requires an empty target directory rather than overwriting live state. The archive is not encrypted and can contain sensitive mission/workspace data; protect it accordingly. Compose credentials are stored separately and are intentionally outside the state volume/archive.
 - Review `security/session_reference.py`, `security/owner_password.py`, `security/pinned_http.py`, `workspace/environment.py`, and the scheduled-worker authorization path when changing these boundaries.
+
+
+## Release artifact provenance and limits
+
+- The release builder binds `release-metadata.json` to the full source commit, versioned image tag, and image-archive SHA-256. The inner `SHA256SUMS` covers every payload file and the Docker image archive; the adjacent `.sha256` sidecar covers the outer bundle. CI also loads the saved Docker image and checks its OCI version label before uploading the candidate artifact.
+- These checks detect accidental corruption and mismatched contents; SHA-256 files are not digital signatures and do not, by themselves, authenticate who produced an artifact. Obtain candidate artifacts from the expected exact-commit workflow run and review its checks before use.
+- The workflow uploads an unpublished, expiring CI artifact only after tests and the isolated deployment rehearsal succeed. It does not publish to a registry, create a GitHub Release, deploy publicly, or create a final Git tag. Final release publication remains behind explicit Owner confirmation.
