@@ -367,5 +367,25 @@ class MissionStore:
             row = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission_id,)).fetchone()
         return Mission.from_dict(json.loads(row[0])) if row else None
 
+    def list_for_owner(self, owner_identity_ref: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return newest inserted missions for one authenticated Owner only."""
+        import sqlite3
+
+        if not isinstance(owner_identity_ref, str) or not owner_identity_ref.startswith("owner:"):
+            raise PermissionError("owner identity is required")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("mission listing limit must be between 1 and 100")
+        values: list[dict[str, Any]] = []
+        with sqlite3.connect(self.db_path) as db:
+            cursor = db.execute("SELECT payload FROM missions ORDER BY rowid DESC")
+            for (encoded,) in cursor:
+                mission = Mission.from_dict(json.loads(encoded))
+                if mission.owner_identity_ref != owner_identity_ref:
+                    continue
+                values.append(mission.to_dict())
+                if len(values) >= limit:
+                    break
+        return values
+
 
 __all__ = ["Mission", "MissionStatus", "MissionClaimBinding", "MissionStore", "TERMINAL_MISSION_STATUSES"]

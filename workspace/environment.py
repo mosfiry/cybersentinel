@@ -6,6 +6,7 @@ from shutil import move as shutil_move
 from subprocess import PIPE, DEVNULL, Popen
 from threading import Lock, Thread
 from typing import Any, Callable, Iterable, Sequence
+import heapq
 import errno
 import hashlib
 import os
@@ -296,6 +297,48 @@ class Workspace:
         self._record("list", path=path, output_value=result)
         return result
 
+    def list_entries(self, relative: str | Path = ".", *, limit: int = 500) -> list[dict[str, Any]]:
+        """List only regular files/directories without following symbolic links."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ValueError("directory listing limit must be between 1 and 1000")
+        self._authorize("read", path=str(relative))
+        fd = self._open_dir_fd(relative)
+
+        def candidates(iterator):
+            for item in iterator:
+                try:
+                    item_stat = item.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                is_directory = stat.S_ISDIR(item_stat.st_mode)
+                if not is_directory and not stat.S_ISREG(item_stat.st_mode):
+                    continue
+                yield {
+                    "name": item.name,
+                    "directory": is_directory,
+                    "size": None if is_directory else item_stat.st_size,
+                }
+
+        def sort_key(item: dict[str, Any]):
+            return (not item["directory"], item["name"].casefold(), item["name"])
+
+        if fd is None:
+            path = self.resolve(relative)
+            if not path.is_dir():
+                raise NotADirectoryError(str(relative))
+            with os.scandir(path) as iterator:
+                entries = heapq.nsmallest(limit, candidates(iterator), key=sort_key)
+        else:
+            try:
+                with os.scandir(fd) as iterator:
+                    entries = heapq.nsmallest(limit, candidates(iterator), key=sort_key)
+            finally:
+                os.close(fd)
+            path = self._logical_path(relative)
+        entries.sort(key=sort_key)
+        self._record("list", path=path, output_value=entries)
+        return entries
+
     def read(self, relative: str | Path, *, encoding: str = "utf-8") -> str:
         self._authorize("read", path=str(relative))
         opened = self._open_file_fd(relative, os.O_RDONLY)
@@ -312,6 +355,51 @@ class Workspace:
             finally:
                 os.close(parent_fd)
             path = self._logical_path(relative)
+        self._record("read", path=path, output_value=value)
+        return value
+
+    def read_bounded(
+        self, relative: str | Path, *, max_bytes: int = 262_144, encoding: str = "utf-8"
+    ) -> str:
+        """Read a regular file through a no-follow descriptor with a hard byte cap."""
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        self._authorize("read", path=str(relative))
+        opened = self._open_file_fd(relative, os.O_RDONLY)
+        if opened is None:
+            path = self.resolve(relative)
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+                raise ValueError("workspace_file_not_regular_or_too_large")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            try:
+                opened_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    raise WorkspaceBoundaryError("workspace file operation requires a regular file")
+                with os.fdopen(descriptor, "rb") as stream:
+                    descriptor = -1
+                    raw = stream.read(max_bytes + 1)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        else:
+            parent_fd, descriptor = opened
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+                    raise ValueError("workspace_file_not_regular_or_too_large")
+                with os.fdopen(descriptor, "rb") as stream:
+                    descriptor = -1
+                    raw = stream.read(max_bytes + 1)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                os.close(parent_fd)
+            path = self._logical_path(relative)
+        if len(raw) > max_bytes:
+            raise ValueError("workspace_file_not_regular_or_too_large")
+        value = raw.decode(encoding)
         self._record("read", path=path, output_value=value)
         return value
 
@@ -472,6 +560,11 @@ class Workspace:
             raise ValueError("process command must not be empty")
         self._authorize("process", path=str(cwd), command=command, network="network" if network else None, credential="credential" if credentials else None)
         self.policy.authorize("process", command=command, network=network, credentials=credentials)
+        return self._run_process_authorized(command, timeout=timeout, cwd=cwd)
+
+    def _run_process_authorized(
+        self, command: tuple[str, ...], *, timeout: float | None, cwd: str | Path
+    ) -> "ProcessResult":
         workdir = self._logical_path(cwd)
         cwd_fd = self._open_dir_fd(cwd)
         popen_options: dict[str, Any] = {
@@ -524,6 +617,34 @@ class Workspace:
             raise WorkspacePolicyError("unsupported git operation")
         self._authorize("git", command=("git", operation, *arguments))
         return self.run_process(("git", operation, *arguments), timeout=timeout, cwd=".")
+
+    def git_readonly(self, operation: str, *, timeout: float | None = None) -> "ProcessResult":
+        """Expose fixed, read-only Git queries for the authenticated Owner UI."""
+        commands = {
+            "status": ("status", "--short", "--branch"),
+            "branch": ("branch", "--show-current"),
+            "log": ("log", "-8", "--oneline", "--decorate"),
+            "diff": ("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--", "."),
+            "repository": ("rev-parse", "--show-toplevel"),
+            "head": ("rev-parse", "HEAD"),
+            "remote": ("remote", "get-url", "origin"),
+        }
+        arguments = commands.get(operation)
+        if arguments is None:
+            raise WorkspacePolicyError("unsupported read-only git operation")
+        command = (
+            "git",
+            "--no-pager",
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            *arguments,
+        )
+        self._authorize("git", command=command)
+        self.policy.authorize("process", command=command)
+        return self._run_process_authorized(command, timeout=timeout, cwd=".")
 
     def develop(self, command: Sequence[str], *, timeout: float | None = None, cwd: str | Path = ".") -> "ProcessResult":
         self._authorize("development", path=str(cwd), command=command)

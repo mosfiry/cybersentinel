@@ -140,6 +140,12 @@ The installer requires Linux, Docker Engine 28+, Docker Compose, `sudo` for secr
 
 Use `./scripts/backup_state.sh /secure/backup/cybersentinel` to stop stateful services, create and internally verify a whole-volume archive, write a SHA-256 sidecar, then restore only services that were running. Store backups access-controlled and encrypted off-host. Restore with `./scripts/restore_state.sh /secure/backup/<archive>.tar.gz <new-unique-project-name>`; it verifies the sidecar and archive, refuses the current project or an existing restore volume, restores to a separate empty volume, and deliberately leaves the restored services stopped. Review `.env`/secrets, select an unused loopback port, verify the restored Owner and mission state, and start that project only when ready.
 
+### Desktop shell
+
+The optional Windows x64 Electron shell starts the checked-in Python bridge on loopback and serves the same Web UI/API. It requires Python 3.12+, installed repository requirements, the source repository, a private `.env` (including a strong `BRIDGE_TOKEN` or supported file-backed equivalent), and a bootstrapped Owner account. Electron does not read `.env`, forward credential values, or bundle the Python backend/repository. Use [`desktop/README.md`](../desktop/README.md) for development and packaging commands and [`docs/DESKTOP_BACKEND_CONTRACT.md`](DESKTOP_BACKEND_CONTRACT.md) for the exact UI/API capability boundary. The Desktop's provider panel is configuration metadata only, not a live provider test; chat is request/response, not public streaming.
+
+The release-only Windows workflow builds installer and portable `.exe` files and uploads a non-release CI artifact. CI builds but does not execute the Windows program; native Windows runtime behavior is not claimed as tested. No macOS/Linux graphical package is configured. Final tagging or publication requires explicit Owner confirmation after the exact candidate artifacts and hashes are independently verified.
+
 ### Deployment boundary
 
 `firebase.json` remains the existing static-hosting configuration; it has no backend rewrite. The bridge, durable worker, and SQLite storage are not deployed to a public platform. This Compose configuration has no Cloudflare dependency and does not select a public backend host, domain, TLS ingress, production credentials, or production database. Keep production deployment blocked until the exact target and authority are known and the later M3 cutover gates pass.

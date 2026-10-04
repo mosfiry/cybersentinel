@@ -22,6 +22,7 @@ BRIDGE_ALLOW_NON_LOOPBACK_BIND = env(
 ).lower() in {"1", "true", "yes"}
 PUBLIC_WEB_ENABLED = env("PUBLIC_WEB_ENABLED", "false").lower() in {"1", "true", "yes"}
 PUBLIC_SESSION_COOKIE = env("PUBLIC_SESSION_COOKIE", "cs_public_session")
+PUBLIC_OWNER_SESSION_COOKIE = env("PUBLIC_OWNER_SESSION_COOKIE", "cs_owner_session")
 PUBLIC_SESSION_TTL_SECONDS = int(env("PUBLIC_SESSION_TTL_SECONDS", "1800"))
 PUBLIC_WEB_ORIGIN = env("PUBLIC_WEB_ORIGIN")
 DB_PATH = Path(env("DB_PATH", "~/.cybersentinel-x/intel.db")).expanduser()

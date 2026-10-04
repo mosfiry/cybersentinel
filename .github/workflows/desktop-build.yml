@@ -1,0 +1,62 @@
+name: desktop-build
+
+on:
+  push:
+    branches: [release/cybersentinel-final-20261003]
+    paths:
+      - "desktop/**"
+      - "web/**"
+      - "bridge.py"
+      - "api/**"
+      - "agent/**"
+      - "core/**"
+      - "security/**"
+      - "workspace/**"
+      - "docs/DESKTOP_*.md"
+      - ".github/workflows/desktop-build.yml"
+      - "tests/test_desktop_client.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Syntax check desktop JavaScript sources
+        run: |
+          node --check desktop/main.js
+          node --check desktop/preload.js
+          node --check desktop/tools/make-icon.js
+      - name: Generate application icon
+        run: node desktop/tools/make-icon.js
+      - name: Install desktop toolchain
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+      - name: Audit locked desktop build dependencies
+        working-directory: desktop
+        run: npm audit --audit-level=high
+      - name: Build Windows executables
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --win nsis portable --publish never
+      - name: Upload Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: cybersentinel-desktop-windows
+          path: |
+            desktop/dist/*.exe
+          if-no-files-found: error

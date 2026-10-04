@@ -1,15 +1,130 @@
-<!doctype html><html lang="ar" dir="rtl"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#080c12"><title>CyberSentinel X Agent</title>
-<link rel="stylesheet" href="/style.css"></head><body>
-<div class="layout"><aside id="side"><div class="brand"><div class="logo">CS</div><div><b>CyberSentinel X</b><small>V5 Agent Platform</small></div></div>
-<div class="state"><i></i><span>جلسة عامة؛ صلاحيات المالك منفصلة</span></div>
-<button class="nav active" data-action="chat">◉ المحادثة</button><button class="nav" data-action="intel">◈ استخبارات التهديد</button><button class="nav" data-action="local">⌁ فحص محلي</button><button class="nav" data-action="status">◌ حالة النظام</button>
-<div class="security"><b>Trust Boundary</b><small>المصادر الخارجية أدلة فقط؛ كل Tool Call يمر عبر السياسة والتفويض وسجل الأدلة.</small></div></aside>
-<main><header><button id="menu">☰</button><div><b>CyberSentinel X Agent</b><small id="conn">اتصال...</small></div><button id="reload">↻</button></header>
-<section id="chat" class="page"><div id="messages"><div class="welcome"><div class="hero">CS</div><h1>CyberSentinel X</h1><p>محادثة أمنية طبيعية: أفهم السؤال، أطلب الأدلة، أستدعي الأدوات المصرح بها، ثم أوضح الفرضيات والثقة.</p><div class="cards"><button data-p="افحص آخر الأحداث وابحث عن نشاط مشبوه">تحليل الأحداث</button><button data-p="حدّث استخبارات التهديدات ثم اعرض الملخص">تحديث الاستخبارات</button><button data-p="افحص الجهاز محليًا">فحص محلي</button><button data-p="ما حالة النظام؟">حالة النظام</button></div></div></div>
-<form id="form"><textarea id="input" rows="1" placeholder="اكتب سؤالك الأمني بلغة طبيعية..."></textarea><button>➤</button></form><div class="hint">Conversation → Reasoning → Tool Call → Authorization → Evidence → Natural Response</div></section>
-<section id="intel" class="page hidden"><div class="panel"><h2>استخبارات التهديد</h2><button id="intelBtn">تحديث المصادر الآن</button><div id="intelOut"></div></div></section>
-<section id="local" class="page hidden"><div class="panel"><h2>الفحص المحلي</h2><button id="localBtn">فحص TCP على هذا الجهاز</button><div id="localOut"></div></div></section>
-<section id="status" class="page hidden"><div class="panel"><h2>حالة النظام</h2><div id="statusOut"></div></div></section>
-</main></div><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#080c12">
+  <title>CyberSentinel X — مساحة عمل الوكيل الأمني</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app" class="workspace-shell">
+  <header id="topbar">
+    <button id="sidebarToggle" type="button" aria-label="إظهار/إخفاء الشريط الجانبي">☰</button>
+    <div class="brand"><div class="logo">CS</div><div class="brand-text"><b>CYBERSENTINEL X</b><small>Agent Workspace</small></div></div>
+    <small id="runtimeState" role="status">جارٍ التحقق من الخدمة…</small>
+    <div class="topbar-actions">
+      <span id="authState" role="status">غير مسجل الدخول</span>
+      <button id="activityToggle" type="button" aria-label="إظهار/إخفاء لوحة النشاط" aria-expanded="true">النشاط</button>
+      <button id="reload" type="button" aria-label="تحديث الحالة">↻</button>
+    </div>
+  </header>
+
+  <div class="workspace-body" id="workspaceBody">
+    <aside id="sidebar" aria-label="الشريط الجانبي">
+      <section class="auth-card" aria-labelledby="authTitle">
+        <b id="authTitle">جلسة المالك</b>
+        <small id="authStateSide" role="status">جارٍ التحقق من الجلسة…</small>
+        <form id="loginForm">
+          <label for="loginUsername">اسم المستخدم</label>
+          <input id="loginUsername" name="username" autocomplete="username" required maxlength="128">
+          <label for="loginPassword">كلمة المرور</label>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required maxlength="4096">
+          <button id="loginButton" type="submit">تسجيل الدخول</button>
+        </form>
+        <button id="logoutButton" class="hidden" type="button">تسجيل الخروج</button>
+        <small id="authMessage" role="status" aria-live="polite"></small>
+      </section>
+
+      <section class="side-section" aria-labelledby="composeTitle">
+        <h2 id="composeTitle">مهمة جديدة</h2>
+        <form id="missionForm">
+          <label for="missionObjective">ماذا تريد أن تنجز؟</label>
+          <textarea id="missionObjective" rows="3" maxlength="12000" required placeholder="صف هدف المهمة بلغة طبيعية…"></textarea>
+          <button id="createMission" type="submit">إنشاء المهمة</button>
+        </form>
+        <div id="workspaceNotice" class="notice" role="status" aria-live="polite">سجّل الدخول بحساب المالك لعرض المهام وإنشائها.</div>
+      </section>
+
+      <nav class="side-section" aria-label="المهام">
+        <h2>المهام</h2>
+        <div id="missionList" class="mission-list"><p class="muted">لم تُحمّل المهام بعد.</p></div>
+      </nav>
+
+      <nav class="side-section" aria-label="المشروع">
+        <h2>المشروع</h2>
+        <div class="side-links">
+          <button type="button" data-side-view="files" disabled>الملفات</button>
+          <button type="button" data-side-view="git" disabled>Git</button>
+          <button type="button" data-side-view="evidence" disabled>الأدلة</button>
+          <button type="button" data-side-view="findings" disabled>النتائج المرتبطة بالأدلة</button>
+          <button type="button" data-side-view="artifacts" disabled>المخرجات</button>
+          <button type="button" data-side-view="timeline" disabled>السجل</button>
+        </div>
+      </nav>
+
+      <nav class="side-section" aria-label="الأدوات والإعدادات">
+        <h2>الأدوات والإعدادات</h2>
+        <div class="side-links">
+          <button type="button" id="toolsLink">الأدوات</button>
+          <button type="button" id="settingsLink">حالة الخدمة</button>
+        </div>
+      </nav>
+
+      <div class="security-note"><small>الواجهة ليست حدود ثقة. كل حالة معروضة تأتي من الخادم فقط، ولا تُخزَّن الجلسات أو الرموز في المتصفح.</small></div>
+    </aside>
+
+    <main id="mainArea">
+      <section id="missionHeader" class="mission-header hidden">
+        <div id="missionDetail"></div>
+        <div id="missionTools" class="mission-tools hidden">
+          <div class="action-row">
+            <button data-mission-action="start" type="button">بدء</button>
+            <button data-mission-action="resume" type="button">استئناف / إعادة التفويض</button>
+            <button data-mission-action="pause" type="button">إيقاف مؤقت</button>
+            <button data-mission-action="cancel" class="danger" type="button">إلغاء</button>
+          </div>
+        </div>
+      </section>
+      <div class="tabs" role="tablist" id="missionTabs">
+        <button class="tab active" data-view="overview" type="button">المهمة</button>
+        <button class="tab" data-view="conversation" type="button">المحادثة</button>
+        <button class="tab" data-view="evidence" type="button">الأدلة</button>
+        <button class="tab" data-view="findings" type="button">النتائج المرتبطة بالأدلة</button>
+        <button class="tab" data-view="timeline" type="button">السجل</button>
+        <button class="tab" data-view="logs" type="button">السجلات</button>
+        <button class="tab" data-view="artifacts" type="button">المخرجات</button>
+        <button class="tab" data-view="files" type="button">الملفات</button>
+        <button class="tab" data-view="git" type="button">Git</button>
+      </div>
+      <section id="missionView" class="mission-view">
+        <div class="welcome">
+          <div class="hero">CS</div>
+          <h1>CyberSentinel X</h1>
+          <p>ماذا تعمل عليه؟ صف هدفك أو سؤالك أو خطوتك التالية في الحقل أسفل الشاشة. تنشئ CyberSentinel مهمة أو تستأنفها وفق تفويض المالك، وتعرض الحالة والأدلة من الخادم فقط.</p>
+        </div>
+      </section>
+      <section id="transcript" class="transcript hidden">
+        <div id="messages"></div>
+      </section>
+      <section id="infoPanel" class="info-panel hidden"></section>
+    </main>
+
+    <aside id="activityPanel" aria-label="نشاط الوكيل">
+      <h2>نشاط الوكيل</h2>
+      <div id="activityList" class="activity-list"><p class="muted">لا يوجد نشاط حالي من الخادم.</p></div>
+    </aside>
+  </div>
+
+  <footer id="composer">
+    <form id="composerForm">
+      <label for="composerInput" class="visually-hidden">وصف الهدف أو السؤال أو الخطوة التالية</label>
+      <textarea id="composerInput" rows="1" maxlength="12000" placeholder="صف هدفك أو سؤالك أو خطوتك التالية…"></textarea>
+      <button type="submit" aria-label="إرسال">➤</button>
+    </form>
+    <div class="hint">إدخال بلغة طبيعية فقط · طلب ← تفويض ← تنفيذ ← رصد ← دليل موثّق ← رد صريح</div>
+  </footer>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

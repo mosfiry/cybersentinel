@@ -75,6 +75,12 @@ def test_release_bundle_contains_versioned_image_and_verified_payload(tmp_path: 
         "scripts/backup_state.sh",
         "scripts/restore_state.sh",
         "scripts/state_archive.py",
+        "desktop/README.md",
+        "desktop/main.js",
+        "desktop/package.json",
+        "desktop/package-lock.json",
+        "docs/DESKTOP_ARCHITECTURE.md",
+        "docs/DESKTOP_BACKEND_CONTRACT.md",
     ):
         assert f"{root_name}{relative}" in names
     assert not any("/diagnostics/" in name or "/tests/" in name for name in names)

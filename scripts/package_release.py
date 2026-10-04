@@ -29,6 +29,8 @@ PAYLOAD_FILES = (
     "requirements-runtime.txt",
     "docs/OPERATIONS.md",
     "docs/SECURITY_MODEL.md",
+    "docs/DESKTOP_ARCHITECTURE.md",
+    "docs/DESKTOP_BACKEND_CONTRACT.md",
     "scripts/backup_state.sh",
     "scripts/install_compose.sh",
     "scripts/package_release.py",

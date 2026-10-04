@@ -322,7 +322,11 @@ class AgentCore:
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
-        allowed_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
+        planned_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
+        # These are control-plane capabilities for the authenticated Owner UI,
+        # not registered model tools and not execution steps.
+        ui_read_capabilities = ("workspace_read", "git_read")
+        allowed_tools = tuple(dict.fromkeys((*planned_tools, *ui_read_capabilities)))
 
         def authorization_snapshot_factory(created_mission: Mission) -> MissionAuthorizationSnapshot:
             return MissionAuthorizationSnapshot.create(
@@ -335,7 +339,11 @@ class AgentCore:
                 allowed_tools=allowed_tools,
                 time_window={"timezone": "UTC"},
                 max_duration=max(60, created_mission.max_iterations * 60),
-                rate_limits={tool: 1 for tool in allowed_tools},
+                rate_limits={
+                    **{tool: 1 for tool in planned_tools},
+                    "workspace_read": 100,
+                    "git_read": 40,
+                },
                 network_boundary={"allowed": tuple((scope_context or {}).get("allowed_networks", ()))},
                 data_boundary={"allowed": (target_identity,)},
                 credential_boundary={"allowed": tuple((scope_context or {}).get("allowed_credentials", ()))},

@@ -3,16 +3,20 @@ from __future__ import annotations
 import json
 import hmac
 import signal
+import re
+import sys
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from http.cookies import SimpleCookie
 import threading
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from core.config import (
     BRIDGE_HOST,
     BRIDGE_PORT,
     BRIDGE_TOKEN,
     PUBLIC_SESSION_COOKIE,
+    PUBLIC_OWNER_SESSION_COOKIE,
     PUBLIC_SESSION_TTL_SECONDS,
     PUBLIC_WEB_ENABLED,
     PUBLIC_WEB_ORIGIN,
@@ -28,7 +32,6 @@ from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 from core.health import readiness_snapshot
-from security.public_session import DEFAULT_PUBLIC_SESSIONS
 from api.missions import MissionService
 from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker
 from agent.mission_runtime import MissionRuntime
@@ -36,10 +39,26 @@ from agent.mission import MissionStore
 from agent.agent_core import AgentCore
 from agent.planning import Plan, PlanStep
 from security.mission_authorization import MissionAuthorizationSnapshot
+from security.public_session import PublicSessionManager
+from agent.runtime_supervisor import RuntimeSupervisor
+from workspace.environment import Workspace, WorkspaceBoundaryError, WorkspacePolicyError
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
+PUBLIC_SESSIONS = PublicSessionManager(ttl_seconds=PUBLIC_SESSION_TTL_SECONDS)
+PUBLIC_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PUBLIC_MISSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+MAX_PUBLIC_WORKSPACE_FILE_BYTES = 262_144
+PUBLIC_WORKSPACE_BLOCKED_DIRS = {".git", ".ssh", ".gnupg", "secrets", "credentials"}
+PUBLIC_WORKSPACE_BLOCKED_NAMES = {".env", "id_rsa", "id_ed25519", "authorized_keys", "known_hosts"}
+PUBLIC_WORKSPACE_SAFE_ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
+
+
+def _redact_git_remote(value: str) -> str:
+    value = re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@", r"\1[REDACTED]@", str(value))
+    sensitive_key = r"(?:access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|oauth[_-]?token|api[_-]?key|private[_-]?key|client[_-]?secret|consumer[_-]?secret|token|key|password|passwd|pwd|secret|credential|auth(?:orization)?|signature|sig)"
+    return re.sub(rf"(?i)([?&]{sensitive_key}=)[^&\s]+", r"\1[REDACTED]", value)
 
 
 class BridgeHTTPServer(ThreadingHTTPServer):
@@ -79,7 +98,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         for name, value in (headers or {}).items():
-            self.send_header(name, value)
+            values = value if isinstance(value, (list, tuple)) else (value,)
+            for item in values:
+                self.send_header(name, item)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -94,10 +115,21 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, p.read_bytes(), MIME[p.suffix])
 
     def _read_json(self):
-        n = int(self.headers.get("Content-Length", "0"))
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) > 1:
+            raise ValueError("invalid_content_length")
+        raw_length = lengths[0] if lengths else "0"
+        if not raw_length.isdecimal():
+            raise ValueError("invalid_content_length")
+        n = int(raw_length)
         if n > 32768:
             raise ValueError("request_too_large")
-        return json.loads(self.rfile.read(n) or b"{}")
+        if n and "application/json" not in self.headers.get("Content-Type", "").lower():
+            raise ValueError("application_json_required")
+        body = self.rfile.read(n)
+        if len(body) != n:
+            raise ValueError("truncated_request_body")
+        return json.loads(body or b"{}")
 
     def _chat_auth(self):
         return self.headers.get("X-CyberSentinel-Owner-Session", "")
@@ -136,16 +168,34 @@ class Handler(BaseHTTPRequestHandler):
         return factory
 
     def _public_enabled(self):
-        return PUBLIC_WEB_ENABLED
+        local_bind = BRIDGE_HOST.casefold() in {"127.0.0.1", "localhost", "::1", "[::1]"}
+        return bool(PUBLIC_WEB_ENABLED and (local_bind or PUBLIC_WEB_ORIGIN))
 
     def _public_origin_allowed(self):
         origin = self.headers.get("Origin", "").strip()
-        return not origin or (PUBLIC_WEB_ORIGIN and origin == PUBLIC_WEB_ORIGIN)
+        if not origin:
+            return True
+        if PUBLIC_WEB_ORIGIN:
+            return origin.rstrip("/") == PUBLIC_WEB_ORIGIN.rstrip("/")
+        host = self.headers.get("Host", "").strip()
+        return bool(host and origin == f"http://{host}")
 
     def _public_cookie(self):
         cookie = SimpleCookie()
-        cookie.load(self.headers.get("Cookie", ""))
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
         morsel = cookie.get(PUBLIC_SESSION_COOKIE)
+        return morsel.value if morsel else ""
+
+    def _public_owner_cookie(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
+        morsel = cookie.get(PUBLIC_OWNER_SESSION_COOKIE)
         return morsel.value if morsel else ""
 
     def _public_guard(self, *, csrf=True):
@@ -157,8 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
         try:
             if csrf:
-                return DEFAULT_PUBLIC_SESSIONS.validate(self._public_cookie(), self.headers.get("X-CSRF-Token"))
-            session = DEFAULT_PUBLIC_SESSIONS.get(self._public_cookie())
+                return PUBLIC_SESSIONS.validate(self._public_cookie(), self.headers.get("X-CSRF-Token"))
+            session = PUBLIC_SESSIONS.get(self._public_cookie())
             if session is None:
                 raise PermissionError("public session required")
             return session
@@ -167,7 +217,91 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def _public_cookie_header(self, session_id, max_age):
-        return f"{PUBLIC_SESSION_COOKIE}={session_id}; Max-Age={max_age}; Path=/; HttpOnly; Secure; SameSite=Lax"
+        if not PUBLIC_COOKIE_NAME_RE.fullmatch(PUBLIC_SESSION_COOKIE):
+            raise RuntimeError("invalid public session cookie name")
+        return f"{PUBLIC_SESSION_COOKIE}={session_id}; Max-Age={max_age}; Path=/api/public; HttpOnly; Secure; SameSite=Lax"
+
+    def _public_owner_cookie_header(self, session_token: str, max_age: int) -> str:
+        if not PUBLIC_COOKIE_NAME_RE.fullmatch(PUBLIC_OWNER_SESSION_COOKIE):
+            raise RuntimeError("invalid Owner session cookie name")
+        return f"{PUBLIC_OWNER_SESSION_COOKIE}={session_token}; Max-Age={max_age}; Path=/api/public; HttpOnly; Secure; SameSite=Lax"
+
+    def _public_owner_session(self):
+        token = self._public_owner_cookie()
+        session = owner_password.resolve_session(token) if token else None
+        if session is None or session.get("auth_method") != "username_password":
+            return None
+        return {**session, "session_token": token}
+
+    def _public_mission_owner(self, *, csrf: bool = False):
+        if self._public_guard(csrf=csrf) is None:
+            return None
+        owner = self._public_owner_session()
+        if owner is None:
+            self._send(403, {"ok": False, "error": "owner_authorization_required"})
+            return None
+        return owner
+
+    def _public_scope_context(self) -> dict[str, object]:
+        return {
+            "target_id": "local-cybersentinel-repository",
+            "workspace_root": str(ROOT.resolve()),
+            "scope": ["workspace"],
+            "allowed_networks": [],
+            "allowed_credentials": [],
+        }
+
+    def _workspace_for_mission(self, mission_id: str, owner: dict, capability: str):
+        service = self._mission_service()
+        mission, owner_ref = service._authorized_mission(
+            mission_id, owner["session_token"], allow_unbound_read=False
+        )
+        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        if capability not in snapshot.allowed_actions or capability not in snapshot.allowed_tools:
+            raise PermissionError("read-only workspace capability is not in this mission snapshot")
+        valid, reason = snapshot.validate_for_mission(
+            mission_id=mission.mission_id,
+            owner_identity=owner_ref,
+            target_identity=snapshot.target_identity,
+            version=int(mission.provenance.get("authorization_snapshot_version", 1)),
+        )
+        if not valid:
+            raise PermissionError(reason)
+        root = str(snapshot.workspace_boundary.get("root", ""))
+        if not root:
+            raise PermissionError("mission has no authorized workspace root")
+        root_path = Path(root).expanduser().resolve(strict=True)
+        if not root_path.is_dir():
+            raise PermissionError("mission workspace is unavailable")
+        workspace = Workspace(
+            root_path,
+            mission_id=mission.mission_id,
+            request_id=mission.request_id,
+            tool_id=capability,
+            authorization_snapshot=snapshot,
+        )
+        return mission, snapshot, workspace
+
+    @staticmethod
+    def _sensitive_workspace_path(path: Path, root: Path) -> bool:
+        try:
+            parts = tuple(part.casefold() for part in path.relative_to(root).parts)
+        except ValueError:
+            return True
+        for part in parts:
+            if part in PUBLIC_WORKSPACE_BLOCKED_DIRS or part in PUBLIC_WORKSPACE_BLOCKED_NAMES:
+                return True
+            if part.startswith(".env.") and part not in PUBLIC_WORKSPACE_SAFE_ENV_TEMPLATES:
+                return True
+        return False
+
+    @staticmethod
+    def _public_mission_summary(mission: dict) -> dict:
+        fields = (
+            "mission_id", "objective", "owner_request", "status", "request_id",
+            "retry_count", "verification_state", "completion_proof", "queue",
+        )
+        return {key: mission[key] for key in fields if key in mission}
 
     def _send_sse(self, events):
         self.send_response(200)
@@ -179,7 +313,390 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(sse(event))
             self.wfile.flush()
 
+    def _public_get(self, parsed):
+        if not self._public_enabled():
+            return self._send(404, {"ok": False, "error": "public_boundary_disabled"})
+        if not self._public_origin_allowed():
+            return self._send(403, {"ok": False, "error": "origin_not_allowed"})
+        if parsed.path == "/api/public/health":
+            worker_health = None
+            supervisor = getattr(self.server, "mission_worker_supervisor", None)
+            if supervisor is not None:
+                worker_health = supervisor.health()
+            ready = worker_health is None or worker_health.get("state") == "RUNNING"
+            return self._send(200 if ready else 503, {
+                "ok": ready,
+                "service": PRODUCT_NAME,
+                "version": VERSION,
+                **({"mission_worker": worker_health} if worker_health is not None else {}),
+            })
+        if parsed.path == "/api/public/auth/session":
+            if self._public_guard(csrf=False) is None:
+                return
+            owner = self._public_owner_session()
+            return self._send(200, {
+                "ok": True,
+                "authenticated": owner is not None,
+                "username": str(owner.get("username", "")) if owner else "",
+                "expires_at": str(owner.get("expires_at", "")) if owner else "",
+            })
+        if parsed.path == "/api/public/providers":
+            if self._public_mission_owner() is None:
+                return
+            router = getattr(RUNTIME, "router", None)
+            providers = getattr(router, "providers", ()) or ()
+            capability_names = (
+                "generate", "stream", "tool_calling", "structured_output",
+                "chat", "native_chat", "parallel_tool_calls", "reasoning",
+                "reasoning_budget", "long_context", "vision",
+            )
+            safe_providers = []
+            known_names = {"local", "colab", "hf", "default"}
+            for provider in providers[:32]:
+                name = str(getattr(provider, "name", ""))
+                capabilities = getattr(provider, "capabilities", None)
+                try:
+                    failure_count = min(
+                        max(int(getattr(provider, "failure_count", 0)), 0),
+                        1_000_000,
+                    )
+                except (TypeError, ValueError):
+                    failure_count = 0
+                safe_providers.append({
+                    "name": name if name in known_names else "configured_provider",
+                    "configured": bool(
+                        getattr(provider, "base_url", "")
+                        and getattr(provider, "model", "")
+                    ),
+                    "failure_count": failure_count,
+                    "capabilities": {
+                        key: bool(getattr(capabilities, key, False))
+                        for key in capability_names
+                    },
+                })
+            return self._send(200, {"ok": True, "providers": safe_providers})
+        if parsed.path == "/api/public/missions":
+            owner = self._public_mission_owner()
+            if owner is None:
+                return
+            try:
+                raw_limit = parse_qs(parsed.query).get("limit", ["100"])[0]
+                limit = int(raw_limit)
+                if not 1 <= limit <= 100:
+                    raise ValueError("mission listing limit must be between 1 and 100")
+                missions = self._mission_service().list_missions(
+                    owner_session_token=owner["session_token"], limit=limit
+                )
+                return self._send(200, {
+                    "ok": True,
+                    "missions": [self._public_mission_summary(item) for item in missions],
+                })
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, TypeError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if parsed.path.startswith("/api/public/missions/"):
+            owner = self._public_mission_owner()
+            if owner is None:
+                return
+            parts = [unquote(item) for item in parsed.path[len("/api/public/missions/"):].split("/")]
+            mission_id = parts[0] if parts else ""
+            if not PUBLIC_MISSION_ID_RE.fullmatch(mission_id):
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            action = parts[1] if len(parts) > 1 else "status"
+            try:
+                service = self._mission_service()
+                service._authorized_mission(
+                    mission_id,
+                    owner["session_token"],
+                    allow_unbound_read=False,
+                )
+                if action == "effects" and len(parts) == 2:
+                    effects = service.effects(mission_id, owner_session_token=owner["session_token"])
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "effects": effects})
+                if action == "effects" and len(parts) == 3:
+                    effect = service.inspect_effect(
+                        mission_id, parts[2], owner_session_token=owner["session_token"]
+                    )
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "effect": effect})
+                values = {
+                    "status": service.status,
+                    "timeline": service.timeline,
+                    "evidence": service.evidence,
+                    "artifacts": service.artifacts,
+                    "logs": service.logs,
+                    "report": service.report,
+                }
+                if len(parts) != 2 or action not in values:
+                    return self._send(404, {"ok": False, "error": "unknown_mission_action"})
+                value = values[action](mission_id, owner_session_token=owner["session_token"])
+                return self._send(200, {"ok": True, "mission_id": mission_id, action: value})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if parsed.path.startswith("/api/public/workspace/"):
+            owner = self._public_mission_owner()
+            if owner is None:
+                return
+            parts = [unquote(item) for item in parsed.path[len("/api/public/workspace/"):].split("/")]
+            if len(parts) != 2 or not PUBLIC_MISSION_ID_RE.fullmatch(parts[0]):
+                return self._send(404, {"ok": False, "error": "not_found"})
+            mission_id, action = parts
+            query = parse_qs(parsed.query)
+            relative = query.get("path", [""])[0] if action == "file" else query.get("path", ["."])[0]
+            if len(relative) > 1024:
+                return self._send(400, {"ok": False, "error": "path_too_long"})
+            capability = "git_read" if action == "git" else "workspace_read"
+            try:
+                mission, _snapshot, workspace = self._workspace_for_mission(mission_id, owner, capability)
+                root = workspace.root
+                if action == "files":
+                    directory = workspace.resolve(relative)
+                    if self._sensitive_workspace_path(directory, root):
+                        return self._send(404, {"ok": False, "error": "not_found"})
+                    entries = workspace.list_entries(relative, limit=500)
+                    files = []
+                    for item in entries:
+                        try:
+                            candidate = workspace.resolve(str(Path(relative) / item["name"]))
+                        except WorkspaceBoundaryError:
+                            continue
+                        if not self._sensitive_workspace_path(candidate, root):
+                            files.append(item)
+                    return self._send(200, {
+                        "ok": True,
+                        "mission_id": mission_id,
+                        "path": relative,
+                        "files": files,
+                        "truncated": len(entries) >= 500,
+                    })
+                if action == "file":
+                    if not relative:
+                        return self._send(400, {"ok": False, "error": "path_required"})
+                    resolved = workspace.resolve(relative)
+                    if self._sensitive_workspace_path(resolved, root):
+                        return self._send(404, {"ok": False, "error": "not_found"})
+                    content = workspace.read_bounded(relative, max_bytes=MAX_PUBLIC_WORKSPACE_FILE_BYTES)
+                    return self._send(200, {
+                        "ok": True,
+                        "mission_id": mission_id,
+                        "path": relative,
+                        "content": content,
+                    })
+                if action == "git":
+                    operation = query.get("operation", ["status"])[0]
+                    result = workspace.git_readonly(operation, timeout=15.0)
+                    output = result.stdout
+                    error_output = result.stderr
+                    if operation == "remote":
+                        output = _redact_git_remote(output)
+                        error_output = _redact_git_remote(error_output)
+                    return self._send(200, {
+                        "ok": result.ok,
+                        "mission_id": mission_id,
+                        "operation": operation,
+                        "output": output,
+                        "error_output": error_output,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.timed_out,
+                    })
+                return self._send(404, {"ok": False, "error": "unknown_workspace_action"})
+            except (WorkspaceBoundaryError, FileNotFoundError, NotADirectoryError):
+                return self._send(404, {"ok": False, "error": "not_found"})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, UnicodeDecodeError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+            except OSError:
+                return self._send(404, {"ok": False, "error": "not_found"})
+            finally:
+                if "workspace" in locals():
+                    workspace.close()
+        return self._send(404, {"ok": False, "error": "not_found"})
+
+    def _public_post(self, parsed):
+        path = parsed.path
+        if not self._public_enabled():
+            return self._send(404, {"ok": False, "error": "public_boundary_disabled"})
+        if not self._public_origin_allowed():
+            return self._send(403, {"ok": False, "error": "origin_not_allowed"})
+        if path == "/api/public/session":
+            session = PUBLIC_SESSIONS.create()
+            return self._send(
+                201,
+                {"ok": True, "session": session.public()},
+                headers={"Set-Cookie": self._public_cookie_header(session.session_id, PUBLIC_SESSION_TTL_SECONDS)},
+            )
+        if path == "/api/public/logout":
+            session = self._public_guard(csrf=True)
+            if session is None:
+                return
+            PUBLIC_SESSIONS.revoke(session.session_id)
+            owner_token = self._public_owner_cookie()
+            if owner_token:
+                owner_password_logout(owner_token)
+            return self._send(200, {"ok": True}, headers={
+                "Set-Cookie": [
+                    self._public_cookie_header("", 0),
+                    self._public_owner_cookie_header("", 0),
+                ]
+            })
+        if path == "/api/public/auth/login":
+            if self._public_guard(csrf=True) is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_request")
+                session = owner_password_login(
+                    str(payload.get("username", "")),
+                    str(payload.get("password", "")),
+                )
+                token = str(session.get("session_id", ""))
+                if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token):
+                    raise PermissionError("invalid_credentials")
+            except Exception:
+                return self._send(403, {"ok": False, "error": "invalid_credentials"})
+            return self._send(200, {
+                "ok": True,
+                "authenticated": True,
+                "username": str(session.get("username", "")),
+                "expires_at": str(session.get("expires_at", "")),
+            }, headers={
+                "Set-Cookie": self._public_owner_cookie_header(token, owner_password.SESSION_TTL_SECONDS)
+            })
+        if path == "/api/public/auth/logout":
+            if self._public_guard(csrf=True) is None:
+                return
+            token = self._public_owner_cookie()
+            if token:
+                owner_password_logout(token)
+            return self._send(200, {"ok": True, "authenticated": False}, headers={
+                "Set-Cookie": self._public_owner_cookie_header("", 0)
+            })
+        if path == "/api/public/chat":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_request")
+                safe_payload = dict(payload)
+                safe_payload.pop("scope_context", None)
+                safe_payload.pop("completion_criteria", None)
+                safe_payload["scope_context"] = self._public_scope_context()
+                result = chat(safe_payload, owner_session_token=owner["session_token"])
+                return self._send(200, {"ok": True, **result})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except ValueError as exc:
+                status = 413 if str(exc) == "request_too_large" else 400
+                return self._send(status, {"ok": False, "error": str(exc)})
+            except Exception:
+                return self._send(502, {"ok": False, "error": "mission_request_failed"})
+        if path == "/api/public/missions":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_request")
+                objective = str(payload.get("objective", "")).strip()
+                if not objective:
+                    raise ValueError("objective_required")
+                if len(objective) > 12_000:
+                    raise ValueError("objective_too_long")
+                scope_context = self._public_scope_context()
+                core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
+                mission = core.run_owner_mission(
+                    objective,
+                    owner_session_token=owner["session_token"],
+                    request_id=uuid.uuid4().hex,
+                    scope_context=scope_context,
+                    run=False,
+                )
+                service = self._mission_service()
+                service.start_mission(mission.mission_id, owner_session_token=owner["session_token"])
+                current = service.status(mission.mission_id, owner_session_token=owner["session_token"])
+                return self._send(201, {
+                    "ok": True,
+                    "mission_id": mission.mission_id,
+                    "mission": self._public_mission_summary(current),
+                    "queue": current.get("queue", {}),
+                })
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            except ValueError as exc:
+                status = 413 if str(exc) == "request_too_large" else 400
+                return self._send(status, {"ok": False, "error": str(exc)})
+            except RuntimeError as exc:
+                return self._send(409, {"ok": False, "error": str(exc)})
+            except Exception:
+                return self._send(502, {"ok": False, "error": "mission_creation_failed"})
+        if path.startswith("/api/public/missions/"):
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            parts = [unquote(item) for item in path[len("/api/public/missions/"):].split("/")]
+            mission_id = parts[0] if parts else ""
+            if not PUBLIC_MISSION_ID_RE.fullmatch(mission_id):
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            try:
+                service = self._mission_service()
+                if len(parts) == 4 and parts[1] == "effects" and parts[3] == "reconcile":
+                    payload = self._read_json()
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid_request")
+                    outcome = str(payload.get("outcome", ""))
+                    evidence_reference = str(payload.get("evidence_reference", "")).strip()
+                    if len(evidence_reference) > 512:
+                        raise ValueError("evidence_reference_too_long")
+                    result = service.reconcile_effect(
+                        mission_id,
+                        parts[2],
+                        owner_session_token=owner["session_token"],
+                        outcome=outcome,
+                        evidence_reference=evidence_reference,
+                    )
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "reconciliation": result})
+                if len(parts) == 2 and parts[1] == "reconcile":
+                    return self._send(400, {"ok": False, "error": "effect_id_and_evidence_reference_required"})
+                action = parts[1] if len(parts) > 1 else "start"
+                if len(parts) != 2:
+                    return self._send(404, {"ok": False, "error": "unknown_mission_action"})
+                if action == "start":
+                    result = service.start_mission(mission_id, owner_session_token=owner["session_token"])
+                elif action == "resume":
+                    result = service.resume_mission(mission_id, owner_session_token=owner["session_token"])
+                elif action == "pause":
+                    result = service.pause_mission(mission_id, owner_session_token=owner["session_token"])
+                elif action == "cancel":
+                    result = service.cancel_mission(mission_id, owner_session_token=owner["session_token"])
+                else:
+                    return self._send(404, {"ok": False, "error": "unknown_mission_action"})
+                return self._send(200, {"ok": True, "mission": result})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            except ValueError as exc:
+                status = 413 if str(exc) == "request_too_large" else 400
+                return self._send(status, {"ok": False, "error": str(exc)})
+            except RuntimeError as exc:
+                return self._send(409, {"ok": False, "error": str(exc)})
+        return self._send(404, {"ok": False, "error": "not_found"})
+
     def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/public/"):
+            return self._public_get(parsed)
         if self.path == "/api/health":
             return self._send(200, {"ok": True, "service": PRODUCT_NAME, "version": VERSION})
         if self.path == "/api/health/live":
@@ -309,6 +826,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/public/"):
+            return self._public_post(parsed)
         if self.path == "/api/missions":
             auth = self._mission_owner()
             if auth is None:
@@ -372,25 +892,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, {"ok": False, "error": str(exc)})
             except (ValueError, KeyError) as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
-        if self.path == "/api/public/session":
-            if not self._public_enabled() or not self._public_origin_allowed():
-                return self._send(404, {"ok": False, "error": "public_boundary_disabled"})
-            session = DEFAULT_PUBLIC_SESSIONS.create()
-            return self._send(201, {"ok": True, "session": session.public()}, headers={"Set-Cookie": self._public_cookie_header(session.session_id, PUBLIC_SESSION_TTL_SECONDS)})
-        if self.path == "/api/public/logout":
-            session = self._public_guard(csrf=False)
-            if session is None:
-                return
-            DEFAULT_PUBLIC_SESSIONS.revoke(session.session_id)
-            return self._send(200, {"ok": True}, headers={"Set-Cookie": self._public_cookie_header("", 0)})
-        if self.path == "/api/public/chat":
-            session = self._public_guard(csrf=True)
-            if session is None:
-                return
-            # Public session identity is deliberately not Owner authority.
-            # Do not call the internal chat path until an Owner-approved
-            # identity-to-Owner mapping exists.
-            return self._send(403, {"ok": False, "error": "owner_authorization_required"})
         if not self._bridge_auth():
             return self._send(401, {"ok": False, "error": "bridge authentication required"})
         if self.path == "/api/auth/login":
@@ -515,6 +1016,22 @@ def main():
     if not BRIDGE_TOKEN:
         raise SystemExit("BRIDGE_TOKEN is required in .env")
     server = BridgeHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
+    worker_stop = threading.Event()
+    worker_thread: threading.Thread | None = None
+    loopback_host = BRIDGE_HOST.casefold() in {"127.0.0.1", "localhost", "::1", "[::1]"}
+    if PUBLIC_WEB_ENABLED and loopback_host:
+        supervisor = RuntimeSupervisor(
+            build_mission_worker(worker_id="desktop-bridge"),
+            poll_interval_seconds=0.5,
+        )
+        server.mission_worker_supervisor = supervisor
+        worker_thread = threading.Thread(
+            target=supervisor.serve_forever,
+            kwargs={"stop_event": worker_stop},
+            name="desktop-mission-worker",
+            daemon=False,
+        )
+        worker_thread.start()
     print(f"{PRODUCT_NAME} {VERSION}: http://{BRIDGE_HOST}:{server.server_address[1]}", flush=True)
     print("Local-only defensive engine, threat intelligence, planner and audit enabled.", flush=True)
     shutdown_started = threading.Event()
@@ -527,12 +1044,28 @@ def main():
         if shutdown_started.is_set():
             return
         shutdown_started.set()
+        worker_stop.set()
         shutdown_thread = threading.Thread(
             target=server.shutdown,
             name="bridge-http-shutdown",
             daemon=True,
         )
         shutdown_thread.start()
+
+    control_thread: threading.Thread | None = None
+    if sys.argv[1:] == ["--desktop-stdio-control"]:
+        def read_desktop_control() -> None:
+            for line in sys.stdin:
+                if line.rstrip("\r\n") == "CYBERSENTINEL_DESKTOP_SHUTDOWN":
+                    request_shutdown(None, None)
+                    return
+
+        control_thread = threading.Thread(
+            target=read_desktop_control,
+            name="desktop-shutdown-control",
+            daemon=True,
+        )
+        control_thread.start()
 
     try:
         for signum in stop_signals:
@@ -541,6 +1074,9 @@ def main():
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+        worker_stop.set()
+        if worker_thread is not None:
+            worker_thread.join()
         server.server_close()
         if shutdown_thread is not None:
             shutdown_thread.join()

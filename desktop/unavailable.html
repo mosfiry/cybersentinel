@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'">
+<title>CyberSentinel X — الخادم غير متاح</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; color: #d7e0ea; font-family: "Segoe UI", Tahoma, sans-serif; }
+  .panel { max-width: 640px; margin: 0 auto; padding: 48px 24px; }
+  h1 { font-size: 20px; color: #7dd3fc; margin: 0 0 12px; }
+  p { line-height: 1.9; font-size: 14px; color: #b9c4cf; }
+  code { color: #9ae6b4; background: #111827; padding: 2px 6px; border-radius: 4px; }
+  .hint { color: #8b98a5; font-size: 12px; }
+  button { margin-top: 20px; padding: 10px 22px; font-size: 14px; color: #04121d; background: #22d3ee; border: 0; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #67e8f9; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>تعذّر الوصول إلى خادم CyberSentinel</h1>
+  <p id="reason">لم يستجب خادم الجسر المحلي (bridge.py) خلال المهلة المتوقعة. لم يتم توليد أي بيانات بديلة؛ هذه حالة عدم توفر حقيقية.</p>
+  <p>تحقّق من أن مستودع CyberSentinel موجود بجوار التطبيق (أو حدّد المسار عبر المتغير <code>CYBERSENTINEL_REPO</code>)، ومن أن Python مثبت مع اعتماديات <code>requirements.txt</code>، ومن وجود <code>BRIDGE_TOKEN</code> في ملف <code>.env</code> لأن الخادم يرفض الإقلاع بدونه.</p>
+  <p class="hint">الرمز: <span id="detail"></span></p>
+  <button id="retry">إعادة المحاولة</button>
+</div>
+<script>
+  var params = new URLSearchParams(window.location.search);
+  var reason = params.get("reason") || "backend-unavailable";
+  var detail = params.get("detail") || "";
+  var messages = {
+    "backend-unavailable": "لم يستجب خادم الجسر المحلي (bridge.py) خلال المهلة المتوقعة.",
+    "backend-exited": "توقف خادم الجسر المحلي أثناء التشغيل.",
+    "python-missing": "لم يتم العثور على مترجم Python قابل للتشغيل لتشغيل bridge.py.",
+    "missing-repository": "لم يتم العثور على مستودع CyberSentinel (bridge.py) بجوار التطبيق."
+  };
+  document.getElementById("reason").textContent = messages[reason] || messages["backend-unavailable"];
+  document.getElementById("detail").textContent = reason + (detail ? " / " + detail : "");
+  document.getElementById("retry").addEventListener("click", function () {
+    if (window.cybersentinelDesktop && typeof window.cybersentinelDesktop.retry === "function") {
+      window.cybersentinelDesktop.retry();
+    }
+  });
+</script>
+</body>
+</html>

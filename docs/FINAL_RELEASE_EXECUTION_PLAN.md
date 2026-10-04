@@ -84,4 +84,15 @@ Hosted exact-SHA [tests/build/M3/release-artifact run 37167533724](https://githu
 
 ## V14 — Final release gate
 
-Ready to start: all V13 prerequisites passed on exact SHA `2ff33d55609f18a95c9aae2dbe2b649a7d46915d`, including independent verification of the uploaded candidate archive. V14 final-gate reviews and checks remain outstanding. The final tag/publication remains blocked until the separate Owner confirmation presents the exact proposed tag and artifact hashes; no final tag is authorized by this plan.
+The V13 prerequisites passed on exact SHA `2ff33d55609f18a95c9aae2dbe2b649a7d46915d`, including independent verification of the uploaded candidate archive. V14 implementation and local tests are now recorded below; exact-SHA hosted results and the final gate audit remain pending. The final tag/publication remains blocked until the separate Owner confirmation presents the exact proposed tag and artifact hashes; no final tag is authorized by this plan.
+
+
+### V14 checkpoint — local implementation (hosted exact-SHA verification pending)
+
+The Desktop compatibility implementation now uses the hardened bridge and backend. It includes a server-managed Owner cookie/CSRF flow, minimized provider status, bounded read-only workspace listing/file reads, fixed read-only Git summaries, and Electron environment/navigation/shutdown hardening. The Git display route also disables fsmonitor, pager, external diff/textconv, and optional index writes; Git remote user-info and recognized secret query values are redacted. Packaging payload tests require the Desktop sources and contract documents to be included.
+
+Local evidence on the staged release-branch tree: `pytest -q` passed **1,181 tests, 1 skipped** (the live-provider long-horizon test; no provider credentials/factory are configured and no live provider was contacted); `npm ci` completed; `npm audit --audit-level=high` found **0 vulnerabilities**; Node syntax and lock consistency checks passed; Linux `electron-builder --dir --publish never` produced `dist/linux-unpacked/resources/app.asar`, whose main, preload, unavailable, and package files were independently enumerated. `git diff --cached --check` and the CI-equivalent sensitive-file/secret-pattern scans passed.
+
+The exact-SHA hosted test workflow, 16-stage M3 clean-volume/migration/backup/restore rehearsal, release-candidate build/verification, independent Owner Charter audit, and Windows x64 installer/portable build have not yet run on this checkpoint. Docker is unavailable on this development computer, and no native Windows executable/runtime rehearsal is claimed. The working tree is not yet clean until the checkpoint is committed and pushed.
+
+The original task labels the gate section **46. RELEASE GATE**; it contains **34 checkbox conditions** (46 is the section number). Those conditions remain pending exact-SHA hosted results and the final tree audit. No release tag, public release, registry publish, or deployment has been created; a separate owner confirmation remains required after the gate passes.

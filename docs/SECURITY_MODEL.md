@@ -14,6 +14,15 @@
 - Session references are non-bearer identifiers, not substitutes for authentication. Resolution checks the backing session and account state, status, and expiry; logout/revocation invalidates the stored session row.
 - The reference conversion is idempotent for already-hashed references. Database migration code converts legacy persisted bearer-token fields to references. New persistence paths and migrations must preserve this invariant: **never write a raw session bearer to SQLite, audit records, mission state, or logs**.
 
+## Public UI and Desktop boundary
+
+- The browser-facing `/api/public/` boundary is disabled unless explicitly enabled and a loopback or explicit-origin deployment satisfies the runtime guard. `BRIDGE_TOKEN` is not used as Owner identity; public sessions provide CSRF state, while the Owner cookie is resolved against the backend's current username/password session on every authenticated request.
+- Public cookies are server-managed, `HttpOnly`, `Secure`, `SameSite=Lax`, and scoped to `/api/public`. State-changing public requests require CSRF validation; requests carrying an `Origin` must match the configured origin or the loopback request host. Public Owner routes apply mission ownership/snapshot checks in addition to cookie authentication.
+- `/api/public/providers` returns only bounded provider labels, a configured flag, bounded failure counts, and Boolean capabilities. It never serializes base URLs, model identifiers, credential values, or error text; configuration is not represented as live connectivity.
+- The Electron renderer has `contextIsolation`, Chromium sandboxing, and `nodeIntegration: false`; its preload exposes only retry. Navigation remains on the exact loopback app origin or the packaged `unavailable.html`, and external web links are opened outside the renderer. The shell launches the existing bridge with a restricted non-secret environment allowlist and does not parse `.env`; Python loads backend configuration and secrets. Child output pipes are drained but not forwarded to shell/installer logs.
+- Public Git inspection accepts only fixed read-only subcommands. It disables Git's optional index writes, pager, repository fsmonitor, external diff, and text-conversion helpers; remote URL user-info and recognized secret query parameters are redacted before display.
+- Desktop is a client of the same public API, not a second authority. Its supported Windows x64 executable does not bundle Python, the repository, state, or secrets. A built workflow artifact is not a public release, and the Windows executable has not been executed by the Linux test run.
+
 ## Authorization and mission completion
 
 - Owner authorization is bound to an immutable mission snapshot, request identity, target, allowed actions/tools, boundaries, and expiry. Queue workers revalidate the snapshot and the live Owner session before dispatch.

@@ -635,8 +635,36 @@ class MissionService:
         result = engine.apply_owner_decision(effect_id, authorization=authorization)
         return asdict(result)
 
+    def list_missions(
+        self, *, owner_session_token: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        owner_ref = self._owner_identity_ref(owner_session_token)
+        missions = self.runtime.store.list_for_owner(owner_ref, limit=limit)
+        for mission in missions:
+            try:
+                item = self.queue.get(str(mission["mission_id"]))
+            except KeyError:
+                continue
+            mission["queue"] = {
+                "state": item.state.value,
+                "attempts": item.attempts,
+                "lease_owner": item.lease_owner,
+            }
+        return missions
+
     def status(self, mission_id: str, *, owner_session_token: str | None = None) -> dict[str, Any]:
-        return self._authorized_mission(mission_id, owner_session_token, allow_unbound_read=True)[0].to_dict()
+        mission = self._authorized_mission(mission_id, owner_session_token, allow_unbound_read=True)[0]
+        value = mission.to_dict()
+        try:
+            item = self.queue.get(mission_id)
+        except KeyError:
+            return value
+        value["queue"] = {
+            "state": item.state.value,
+            "attempts": item.attempts,
+            "lease_owner": item.lease_owner,
+        }
+        return value
 
     def timeline(self, mission_id: str, *, owner_session_token: str | None = None) -> list[dict[str, Any]]:
         return list(self._authorized_mission(mission_id, owner_session_token, allow_unbound_read=True)[0].trajectory)
