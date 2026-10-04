@@ -13,7 +13,7 @@ from cyber.case_engine import CyberCase, EvidenceStatus, Provenance
 from cyber.hunting import HuntHypothesis, ThreatHunter
 from cyber.incident_response import IRPlaybook
 from cyber.knowledge_model import CyberKnowledgeGraph, SourceClass
-from cyber.malware import triage_sample, record_triage_in_graph
+from cyber.malware import CapabilityClaim, MalwareTriage, triage_sample, record_triage_in_graph
 
 
 def _malicious_sample():
@@ -40,11 +40,27 @@ class TestMalwareTriage:
         assert ("ipv4", "203.0.113.7") in iocs
         assert all(i["field"] for i in t.iocs)
 
+    def test_hash_iocs_are_normalized_and_keep_field_provenance(self):
+        t = triage_sample({
+            "sample_id": "hash-sample",
+            "strings": ["A" * 32, "B" * 64],
+        })
+        iocs = {(item["type"], item["value"], item["field"]) for item in t.iocs}
+        assert ("md5", "a" * 32, "strings") in iocs
+        assert ("sha256", "b" * 64, "strings") in iocs
+
     def test_benign_sample_is_un_determined_or_benign_never_malicious(self):
         t = triage_sample({"sample_id": "synth-benign", "strings": ["hello world"]})
         assert t.verdict in ("UNDETERMINED", "BENIGN")
         assert t.verdict != "MALICIOUS"
         assert any("UNDETERMINED" in u for u in t.unknowns)
+
+        trusted = triage_sample({
+            "sample_id": "trusted-benign",
+            "classification": "benign-lab-utility",
+            "strings": ["hello world"],
+        })
+        assert trusted.verdict == "BENIGN"
 
     def test_family_attribution_below_threshold_is_tentative_not_supported(self):
         t = triage_sample(
@@ -99,6 +115,20 @@ class TestMalwareTriage:
         t = triage_sample(_malicious_sample())
         with pytest.raises(ValueError, match="provenance source"):
             record_triage_in_graph(g, t, source="  ", source_class=SourceClass.REAL)
+
+    def test_record_refuses_undetermined_capabilities_as_graph_claims(self):
+        g = CyberKnowledgeGraph()
+        t = MalwareTriage(sample_id="uncertain-sample")
+        t.capabilities.append(CapabilityClaim(
+            capability="unknown_behavior",
+            evidence_fields=("strings",),
+            status="UNDETERMINED",
+        ))
+
+        record_triage_in_graph(g, t, source="static-triage", source_class=SourceClass.REAL)
+
+        assert g.entity("uncertain-sample") is not None
+        assert g.to_dict()["edges"] == []
 
 
 class TestIRPlaybook:
