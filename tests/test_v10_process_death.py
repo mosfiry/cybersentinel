@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import queue as thread_queue
@@ -19,11 +20,11 @@ import uuid
 import pytest
 
 from agent.agent_core import AgentCore
-from agent.evidence import EvidenceChainStore
+from agent.evidence import EvidenceChainStore, observed
 from agent.external_effects import EffectState, ExternalEffectLedger
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
-from agent.mission_worker import MissionQueue, MissionScheduler, WorkerMissionState
+from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, WorkerMissionState
 from agent.planning import Plan, PlanStep
 from api.missions import MissionService
 from core import db as core_db
@@ -981,3 +982,158 @@ def test_restart_requires_new_owner_session_before_requeue(tmp_path, v10_env, ch
 
 def _one_poll_after_ready(child: WorkerProcess) -> dict:
     return _one_poll(child)
+
+
+
+def _append_fenced_evidence_process(evidence_db, mission, execution_fence, index, gate, results):
+    try:
+        gate.wait(timeout=15)
+        chain = EvidenceChainStore(
+            evidence_db,
+            execution_fence=execution_fence,
+            mission_store=execution_fence.queue.mission_store,
+            mission=mission,
+            require_execution_fence=True,
+        )
+        record = chain.append(
+            observed(
+                f"concurrent evidence candidate {index}",
+                "v10-concurrent-worker",
+                {"candidate": index},
+                request_id=mission.request_id,
+            ),
+            execution_fence=execution_fence,
+        )
+        results.put({"outcome": "appended", "evidence_id": record["evidence_id"]})
+    except BaseException as exc:
+        results.put({"outcome": "rejected", "error_type": type(exc).__name__})
+
+
+def test_sqlite_mission_store_interruption_after_claim_recovers_without_duplicate_dispatch(
+    monkeypatch, v10_env
+):
+    mission, keyword = v10_env.create_mission()
+    original_load = v10_env.core.store.load
+    interrupted = False
+
+    def fail_one_store_read(mission_id):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise sqlite3.OperationalError("injected MissionStore database interruption")
+        return original_load(mission_id)
+
+    def runtime_factory():
+        return MissionRuntime(
+            v10_env.core.store,
+            executor=v10_env.core._executor,
+            require_authorization_snapshot=True,
+            require_execution_fence=True,
+        )
+
+    worker = MissionWorker(
+        v10_env.queue,
+        runtime_factory,
+        worker_id="v10-db-interruption",
+        lease_seconds=60,
+    )
+    worker.recover_after_restart()
+    v10_env.enqueue(mission)
+    monkeypatch.setattr(v10_env.core.store, "load", fail_one_store_read)
+
+    worker.run_once(max_slices=3)
+
+    assert interrupted
+    assert _watch_count(v10_env, keyword) == 0
+    parked = v10_env.queue.get(mission.mission_id)
+    assert parked.state is WorkerMissionState.WAITING_FOR_TOOL
+    assert parked.claim_phase == "NONE"
+
+    monkeypatch.setattr(v10_env.core.store, "load", original_load)
+    replacement = MissionWorker(
+        v10_env.queue,
+        runtime_factory,
+        worker_id="v10-db-recovery",
+        lease_seconds=60,
+    )
+    replacement.recover_after_restart()
+    recovered = v10_env.queue.get(mission.mission_id)
+    assert recovered.state is WorkerMissionState.NEEDS_INPUT
+    assert recovered.claim_phase == "NONE"
+    assert v10_env.core.store.load(mission.mission_id).status is MissionStatus.OWNER_REAUTH_REQUIRED
+    assert replacement.run_once(max_slices=3) is None
+    assert _watch_count(v10_env, keyword) == 0
+
+
+def test_concurrent_fenced_evidence_append_rejects_stale_writer_without_chain_corruption(
+    tmp_path, v10_env
+):
+    mission, _keyword = v10_env.create_mission(action="status")
+    race_results: list[dict] = []
+
+    def executor(live_mission, _step, _action_id, *, execution_fence):
+        context = multiprocessing.get_context("fork")
+        gate = context.Barrier(3)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_append_fenced_evidence_process,
+                args=(
+                    str(v10_env.evidence_db),
+                    live_mission,
+                    execution_fence,
+                    index,
+                    gate,
+                    results,
+                ),
+            )
+            for index in (1, 2)
+        ]
+        for process in processes:
+            process.start()
+        gate.wait(timeout=15)
+        race_results.extend(results.get(timeout=20) for _ in processes)
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+        persisted = v10_env.core.store.load(live_mission.mission_id)
+        live_mission.progress["execution_evidence_refs"] = persisted.progress[
+            "execution_evidence_refs"
+        ]
+        live_mission.integrity_hash = persisted.integrity_hash
+        return {"success": True, "source": "status", "result": {"status": "observed"}}
+
+    def runtime_factory():
+        return MissionRuntime(
+            v10_env.core.store,
+            executor=executor,
+            require_authorization_snapshot=True,
+            require_execution_fence=True,
+        )
+
+    worker = MissionWorker(
+        v10_env.queue,
+        runtime_factory,
+        worker_id="v10-evidence-race",
+        lease_seconds=60,
+    )
+    worker.recover_after_restart()
+    v10_env.enqueue(mission)
+    worker.run_once(max_slices=3)
+
+    assert sorted(item["outcome"] for item in race_results) == ["appended", "rejected"]
+    assert "ExecutionFenceError" in {item.get("error_type") for item in race_results}
+    persisted = v10_env.core.store.load(mission.mission_id)
+    chain = EvidenceChainStore(
+        v10_env.evidence_db,
+        mission_store=v10_env.core.store,
+        mission=persisted,
+        require_execution_fence=True,
+    )
+    records = chain.list()
+    assert len(records) == 1
+    assert chain.verify()
+    references = persisted.progress["execution_evidence_refs"]
+    assert len(references) == 1
+    assert references[0]["evidence_id"] == records[0]["evidence_id"]

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -893,3 +895,33 @@ def test_null_legacy_schedule_time_is_quarantined_at_scheduler_startup(tmp_path)
     scheduler = MissionScheduler(scheduler_path, queue)
 
     assert scheduler.get("null-run-time").state is WorkerMissionState.NEEDS_INPUT
+
+
+
+def test_concurrent_due_polls_promote_one_schedule_across_scheduler_instances(tmp_path, monkeypatch):
+    store, _runtime, queue, scheduler, service, mission, worker, executions = _fixture(tmp_path, monkeypatch)
+    worker.recover_after_restart()
+    _schedule(service, mission.mission_id)
+    competing_scheduler = MissionScheduler(
+        scheduler.db_path,
+        queue,
+        mission_store=store,
+    )
+    due = datetime.now(timezone.utc).isoformat()
+    barrier = Barrier(3)
+
+    def poll(instance):
+        barrier.wait(timeout=10)
+        return instance.dispatch_due(now=due, limit=1)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(poll, instance) for instance in (scheduler, competing_scheduler)]
+        barrier.wait(timeout=10)
+        outcomes = [future.result(timeout=20) for future in futures]
+
+    promoted = [item for outcome in outcomes for item in outcome]
+    assert len(promoted) == 1
+    assert promoted[0].state is WorkerMissionState.COMPLETED
+    assert scheduler.get("v9-once").state is WorkerMissionState.COMPLETED
+    assert queue.get(mission.mission_id).state is WorkerMissionState.QUEUED
+    assert executions == []

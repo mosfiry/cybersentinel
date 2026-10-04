@@ -867,6 +867,7 @@ class MissionRuntime:
             except (KeyError, TypeError, ValueError, PermissionError):
                 auth_context = None
 
+        retryable_provider_failure = False
         for _ in range(turn_budget):
             if len(progress["turns"]) >= max_execution_steps:
                 return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
@@ -959,6 +960,11 @@ class MissionRuntime:
                 mission.retry_count += 1
                 action = self.recovery_policy.action_for(FailureClass.PROVIDER, mission.retry_count - 1)
                 mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.PROVIDER.value, "kind": str(kind), "recovery": action.value})
+                kind_value = getattr(kind, "value", kind)
+                retryable_provider_failure = (
+                    action in {RecoveryAction.RETRY, RecoveryAction.REPLAN}
+                    and str(kind_value) in {"PROVIDER_FAILURE", "TIMEOUT"}
+                )
                 if action is RecoveryAction.RETRY:
                     mission.transition(MissionStatus.READY, "provider failure; bounded retry selected")
                 elif action is RecoveryAction.REPLAN:
@@ -969,6 +975,7 @@ class MissionRuntime:
                 if mission.is_terminal:
                     return mission
                 continue
+            retryable_provider_failure = False
             progress["turns"].append(turn.to_dict())
             mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
             if not turn.tool_calls:
@@ -1070,6 +1077,8 @@ class MissionRuntime:
             return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
         if self._remaining_seconds(deadline) <= 0 and not mission.is_terminal:
             return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
+        if retryable_provider_failure and mission.status in {MissionStatus.READY, MissionStatus.REPLANNING}:
+            return mission
         mission.error = "model turn budget exhausted"
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self._save(mission)
