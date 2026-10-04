@@ -307,6 +307,71 @@ def test_concurrent_runtimes_reject_stale_writer_before_duplicate_dispatch(tmp_p
     assert len(persisted.progress["model_loop"]["tool_results"]) == 1
 
 
+def test_concurrent_runtime_during_partial_parallel_fold_cannot_replay_or_erase_checkpoint(tmp_path, monkeypatch):
+    import threading
+    import tools.registry
+
+    db = _db(tmp_path)
+    first_fold_saved = threading.Event()
+    release_first = threading.Event()
+    executed = []
+    execute_lock = threading.Lock()
+
+    def execute(name, argument, **kwargs):
+        with execute_lock:
+            executed.append(name)
+        return {"ok": True, "criterion_id": "goal", "source": name}
+
+    monkeypatch.setattr(tools.registry, "execute", execute)
+
+    class PausingStore(MissionStore):
+        def save(self, mission):
+            result = super().save(mission)
+            if (mission.checkpoint or {}).get("completed_tool_call_ids") == ["call_001"]:
+                first_fold_saved.set()
+                assert release_first.wait(3)
+            return result
+
+    store = PausingStore(db)
+    first = MissionRuntime(store, executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    mission = _mission(first)
+    second = _runtime(db)
+
+    class ParallelModel:
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            return ModelTurn(turn_id, tool_calls=(
+                _call(mission_id, run_id, turn_id, plan_version, 1),
+                _call(mission_id, run_id, turn_id, plan_version, 2),
+            ))
+
+    first_result = {}
+    second_result = {}
+
+    def run_first():
+        try:
+            first_result["value"] = first.run_model_loop(mission.mission_id, ParallelModel(), tools=[{"name": "status"}], max_turns=1)
+        except Exception as exc:
+            first_result["error"] = exc
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert first_fold_saved.wait(3)
+    second_result["value"] = second.run_model_loop(mission.mission_id, ParallelModel(), tools=[{"name": "status"}], max_turns=1)
+    release_first.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(executed) == 2
+    assert second_result["value"].status.name == "RECOVERY_REQUIRED"
+    assert isinstance(first_result.get("error"), ValueError)
+    assert "stale mission write rejected" in str(first_result["error"])
+    persisted = MissionStore(db).load(mission.mission_id)
+    assert persisted is not None
+    assert persisted.status.name == "RECOVERY_REQUIRED"
+    assert persisted.checkpoint.get("status") in {"in_flight_parallel", "completed"}
+    assert len(persisted.progress["model_loop"]["tool_results"]) == 1
+
+
 def test_owner_authority_is_not_silently_restored_after_restart(tmp_path, monkeypatch):
     import tools.registry
 
