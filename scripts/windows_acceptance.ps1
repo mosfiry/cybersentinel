@@ -25,6 +25,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Desktop syntax check failed ($LASTEXITCODE)." }
         node --check (Join-Path $repoRoot "web/app.js")
         if ($LASTEXITCODE -ne 0) { throw "Browser renderer syntax check failed ($LASTEXITCODE)." }
+        npm run icon
+        if ($LASTEXITCODE -ne 0) { throw "Desktop icon fixture generation failed ($LASTEXITCODE)." }
         npm run test:desktop
         if ($LASTEXITCODE -ne 0) { throw "Desktop contract tests failed ($LASTEXITCODE)." }
     }

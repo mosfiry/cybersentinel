@@ -45,6 +45,9 @@ jobs:
         run: npm run check
       - name: Check browser renderer syntax
         run: node --check web/app.js
+      - name: Generate local icon fixture for Desktop contracts
+        working-directory: desktop
+        run: npm run icon
       - name: Run Desktop contracts
         working-directory: desktop
         run: npm run test:desktop
