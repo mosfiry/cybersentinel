@@ -32,25 +32,35 @@ docs/CHECKPOINT_OWNER_AUTH_MIGRATION_SESSION10.md
    any modification.
 5. Second-pass attacker review documented in
    docs/OWNER_AUTH_AUDIT_2026-10-04.md section 3.
+6. CI VERDICTS (confirmed): diagnostics/ci-03aa7265f6ac.md = SUCCESS
+   (read at commit 6b9b41544fbb; full pytest suite + compileall +
+   secret-scan + git diff --check) and diagnostics/ci-037559222109.md =
+   SUCCESS at the docs head (covers 5132aec9bda5's policy schema removal and
+   guard test, since those changes are ancestors of 037559222109). Some
+   intermediate pytest-diagnostics marker publishes raced and were dropped
+   from later diagnostics commits; the SUCCESS verdicts above are the
+   preserved evidence. Cloudflare Workers Builds remains the documented
+   pre-existing unrelated failing check.
 
 ## CHECKPOINT FIELDS
 
 - CURRENT_PHASE: Mission 1 (owner password auth migration) — ENGINEERING
-  COMPLETE + SESSION-11 FINAL IN-SCOPE HARDENING
-- CURRENT_UNIT: X-K (legacy policy keys removal + atomic throttle)
-- CURRENT_STEP: units X-K.1 and X-K.2 complete; CI verification in progress
-  on 03aa7265 / 5132aec9 at session close
-- LAST_COMPLETED_STEP: commits 03aa7265f6ac (atomic throttle + battery) and
-  5132aec9bda5 (legacy keys removal + guard test)
-- NEXT_STEP: confirm CI green on 5132aec9bda5 (write the diagnostics marker
-  if the workflow did not run), then Owner-only steps
-- LAST_VERIFIED_COMMIT: 00edf2acfd65 (CI SUCCESS, marker
-  diagnostics/ci-00edf2acfd65.md); session-11 commits pending CI verdict
-- TEST_STATUS: session-10 full suite GREEN at 5b1f13e1a818; session-11 adds
+  COMPLETE + SESSION-11 FINAL IN-SCOPE HARDENING, CI GREEN
+- CURRENT_UNIT: X-K (legacy policy keys removal + atomic throttle) — COMPLETE
+- CURRENT_STEP: unit complete, CI green on all session-11 commits
+- LAST_COMPLETED_STEP: commits 03aa7265f6ac (atomic throttle + battery, CI
+  SUCCESS) and 5132aec9bda5 (legacy keys removal + guard test, CI SUCCESS via
+  037559222109); docs commits 037559222109 (audit + checkpoint) and this
+  update
+- NEXT_STEP: Owner-only steps (bootstrap, merge decision)
+- LAST_VERIFIED_COMMIT: 037559222109 (full-suite SUCCESS,
+  diagnostics/ci-037559222109.md); code verdicts: 03aa7265f6ac SUCCESS,
+  5132aec9bda5 covered by 037559222109 SUCCESS
+- TEST_STATUS: full suite GREEN (including
   tests/test_owner_throttle_atomicity.py and
-  tests/test_owner_policy_legacy_keys_removed.py (CI verdict pending at
-  session close)
-- CI_STATUS: GREEN through 00edf2acfd65; 03aa7265 / 5132aec9 pending
+  tests/test_owner_policy_legacy_keys_removed.py)
+- CI_STATUS: GREEN (Cloudflare Workers Builds failure is the documented
+  pre-existing unrelated check, as on every branch)
 - OPEN_ISSUES: (1) OWNER-LOCAL STEP NOT YET RUN:
   python -m security.owner_password_bootstrap (username mosfiry);
   (2) merge of the session-6..11 commits into main is an Owner decision;
@@ -74,15 +84,13 @@ docs/CHECKPOINT_OWNER_AUTH_MIGRATION_SESSION10.md
 - FILES_CHANGED (session 11): 03aa7265f6ac (security/owner_password.py,
   tests/test_owner_throttle_atomicity.py), 5132aec9bda5
   (security/owner_policy.py, security/owner_policy.json,
-  tests/test_owner_policy_legacy_keys_removed.py), this commit
+  tests/test_owner_policy_legacy_keys_removed.py), 037559222109
   (docs/OWNER_AUTH_AUDIT_2026-10-04.md,
   docs/CHECKPOINT_OWNER_AUTH_MIGRATION_SESSION11.md)
-- NEXT_SESSION_FIRST_ACTION: verify CI green on 5132aec9bda5 (and
-  03aa7265f6ac) — read the commit checks; if a failure exists, diagnose and
-  fix it (never hide it). If green, Mission 1 has NO remaining engineering
-  work: direct the Owner to (1) run python -m security.owner_password_bootstrap
+- NEXT_SESSION_FIRST_ACTION: Mission 1 has NO remaining engineering work.
+  Direct the Owner to (1) run python -m security.owner_password_bootstrap
   locally (username mosfiry) and confirm owner_account_created, and
-  (2) decide on merging the session-6..11 commits into main (ordinary
-  merge, no force/squash). Only after that merge does Mission 2 (B3-C5)
-  resume on security/b3-four-layer-intent. Do NOT start B3-C6, Phase A, or
-  R2.
+  (2) decide on merging the session-6..11 commits into main (ordinary merge,
+  no force/squash). Only after that merge does Mission 2 (B3-C5) resume on
+  security/b3-four-layer-intent (open item: the Owner decision on the Case
+  15 single-use-proof proposal). Do NOT start B3-C6, Phase A, or R2.
