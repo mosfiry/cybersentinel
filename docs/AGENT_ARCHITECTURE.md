@@ -87,8 +87,9 @@ OWNER_INSTRUCTION (800)
 Semantics that remove a historical ambiguity:
 
 - `SYSTEM_PLATFORM` names the **internal CyberSentinel platform layer** — the
-  process boundary, credential separation (bridge token vs Owner token),
-  lifecycle persistence, audit-chain integrity, and deterministic enforcement.
+  process boundary, separation between bridge transport authentication and
+  server-managed Owner sessions, lifecycle persistence, audit-chain integrity,
+  and deterministic enforcement. There is no runtime `OWNER_TOKEN` credential.
   It is an application-internal tier, **not** the external hosting or runtime
   constraints of the machine/network the service happens to run on.
 - External platform constraints that CyberSentinel does not control (OS
