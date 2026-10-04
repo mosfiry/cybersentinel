@@ -5,6 +5,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from security.runtime_secrets import secret_env
+
 load_dotenv()
 
 
@@ -14,7 +16,7 @@ def env(name: str, default: str = "") -> str:
 
 BRIDGE_HOST = env("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(env("BRIDGE_PORT", "8787"))
-BRIDGE_TOKEN = env("BRIDGE_TOKEN")
+BRIDGE_TOKEN = secret_env("BRIDGE_TOKEN")
 BRIDGE_ALLOW_NON_LOOPBACK_BIND = env(
     "BRIDGE_ALLOW_NON_LOOPBACK_BIND", "false"
 ).lower() in {"1", "true", "yes"}
@@ -25,7 +27,7 @@ PUBLIC_WEB_ORIGIN = env("PUBLIC_WEB_ORIGIN")
 DB_PATH = Path(env("DB_PATH", "~/.cybersentinel-x/intel.db")).expanduser()
 
 LLM_BASE_URL = env("LLM_BASE_URL").rstrip("/")
-LLM_API_KEY = env("LLM_API_KEY")
+LLM_API_KEY = secret_env("LLM_API_KEY")
 LLM_MODEL = env("LLM_MODEL")
 
 CISA_KEV_URL = (

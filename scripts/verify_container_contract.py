@@ -17,6 +17,20 @@ STATE_PATH_VARIABLES = (
     "SCOPE_DB_PATH",
     "OWNER_POLICY_STATE_PATH",
 )
+SECRET_FILE_ENV = {
+    "bridge_token": "BRIDGE_TOKEN_FILE",
+    "llm_api_key": "LLM_API_KEY_FILE",
+    "local_llm_api_key": "LOCAL_LLM_API_KEY_FILE",
+    "colab_llm_api_key": "COLAB_LLM_API_KEY_FILE",
+    "hf_llm_api_key": "HF_LLM_API_KEY_FILE",
+}
+DIRECT_SECRET_ENV_NAMES = (
+    "BRIDGE_TOKEN",
+    "LLM_API_KEY",
+    "LOCAL_LLM_API_KEY",
+    "COLAB_LLM_API_KEY",
+    "HF_LLM_API_KEY",
+)
 
 
 def _run(*args: str) -> str:
@@ -72,6 +86,26 @@ def _assert_hardened(container: dict[str, Any], service: str) -> dict[str, dict[
     return mounts
 
 
+def _assert_runtime_secrets(
+    container: dict[str, Any], service: str, required: tuple[str, ...]
+) -> None:
+    config = container["Config"]
+    environment = {
+        entry.split("=", 1)[0]: entry.split("=", 1)[1]
+        for entry in config.get("Env", [])
+        if "=" in entry
+    }
+    mounts = {mount["Destination"]: mount for mount in container["Mounts"]}
+    for name in DIRECT_SECRET_ENV_NAMES:
+        assert name not in environment, (service, "inline secret leaked into container environment", name)
+    for secret_name in required:
+        env_name = SECRET_FILE_ENV[secret_name]
+        target = f"/run/secrets/{secret_name}"
+        assert environment.get(env_name) == target, (service, env_name, environment.get(env_name))
+        mount = mounts.get(target)
+        assert mount is not None and mount["RW"] is False, (service, target, mount)
+
+
 def _exec_python(service: str, program: str) -> str:
     return _run(
         "docker",
@@ -95,7 +129,18 @@ def main() -> int:
     bridge_mounts = _assert_hardened(bridge, "bridge")
     worker_mounts = _assert_hardened(worker, "mission-worker")
     init_mounts = _assert_hardened(initializer, "workspace-init")
+    _assert_runtime_secrets(
+        bridge,
+        "bridge",
+        ("bridge_token", "llm_api_key", "local_llm_api_key", "colab_llm_api_key", "hf_llm_api_key"),
+    )
+    _assert_runtime_secrets(
+        worker,
+        "mission-worker",
+        ("llm_api_key", "local_llm_api_key", "colab_llm_api_key", "hf_llm_api_key"),
+    )
     assert initializer["State"]["ExitCode"] == 0, initializer["State"]
+    assert initializer["HostConfig"].get("NetworkMode") == "none", initializer["HostConfig"].get("NetworkMode")
 
     bridge_state = bridge_mounts[str(STATE_ROOT)]
     worker_state = worker_mounts[str(STATE_ROOT)]
@@ -107,6 +152,11 @@ def main() -> int:
     mappings = published.get("8787/tcp") or []
     assert mappings and all(mapping["HostIp"] == "127.0.0.1" for mapping in mappings), published
     assert not (worker["HostConfig"].get("PortBindings") or {}), "worker must not publish ports"
+    bridge_networks = bridge.get("NetworkSettings", {}).get("Networks", {})
+    worker_networks = worker.get("NetworkSettings", {}).get("Networks", {})
+    assert len(bridge_networks) == len(worker_networks) == 1
+    assert set(bridge_networks) == set(worker_networks)
+    assert next(iter(bridge_networks)).endswith("_cybersentinel")
 
     bridge_probe = f"""
 import os
@@ -144,7 +194,7 @@ assert (state / '.m3-v12-state-probe').read_text(encoding='utf-8') == 'state-vol
 """
     _exec_python("bridge", bridge_probe)
     _exec_python("mission-worker", worker_probe)
-    print("container health, mount, UID, read-only root, loopback publish, and shared state/workspace contract: PASS")
+    print("container health, mounts, UID, read-only root, loopback publish, private network, read-only secret files, and shared state/workspace contract: PASS")
     return 0
 
 

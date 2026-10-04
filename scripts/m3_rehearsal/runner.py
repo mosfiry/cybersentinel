@@ -52,13 +52,12 @@ class RehearsalRunner:
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.output_path = output_path
         self.env = _safe_environment(
-            image=self.image, bridge_token=self.bridge_token, published_port=self.port
+            image=self.image, published_port=self.port
         )
         self.host = DockerHost(
             project=self.project,
             image=self.image,
             port=self.port,
-            bridge_token=self.bridge_token,
             env=self.env,
         )
         self.owner_session = ""
@@ -71,6 +70,36 @@ class RehearsalRunner:
         self.stages: list[dict[str, Any]] = []
         self.started = time.monotonic()
         self.temp_path: Path | None = None
+
+    def _prepare_compose_secrets(self) -> None:
+        """Materialize only synthetic credentials in the disposable run directory."""
+        if self.temp_path is None:
+            raise RehearsalFailure("temporary_directory_missing")
+        secret_directory = self.temp_path / "compose-secrets"
+        secret_directory.mkdir(mode=0o700)
+        values = {
+            "bridge_token": (self.bridge_token + "\n").encode("utf-8"),
+            "llm_api_key": b"",
+            "local_llm_api_key": b"",
+            "colab_llm_api_key": b"",
+            "hf_llm_api_key": b"",
+        }
+        for name, payload in values.items():
+            path = secret_directory / name
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            try:
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(fd, view) :]
+                os.fchmod(fd, 0o444)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        self.env["CYBERSENTINEL_SECRETS_DIR"] = str(secret_directory)
 
     def _compose_build(self) -> dict[str, Any]:
         self.host.compose("version", timeout=15)
@@ -714,6 +743,7 @@ class RehearsalRunner:
         }
         try:
             self.temp_path = Path(tempfile.mkdtemp(prefix=f"{self.project}-"))
+            self._prepare_compose_secrets()
             docker_config = self.temp_path / "docker-config"
             docker_config.mkdir(mode=0o700)
             self.env["DOCKER_CONFIG"] = str(docker_config)

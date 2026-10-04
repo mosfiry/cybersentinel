@@ -32,8 +32,8 @@ jobs:
       - name: Build and smoke-test container runtime (no publish)
         shell: bash
         env:
-          BRIDGE_TOKEN: "ci-only-test-token-not-a-credential-1234567890"
           BRIDGE_PUBLISHED_PORT: "18787"
+          CYBERSENTINEL_SECRETS_DIR: "${{ runner.temp }}/cybersentinel-compose-secrets"
           COMPOSE_PROJECT_NAME: "cybersentinel-ci-${{ github.run_id }}-${{ github.run_attempt }}"
         run: |
           set -euo pipefail
@@ -45,6 +45,28 @@ jobs:
             docker compose down --volumes --remove-orphans || true
           }
           trap cleanup EXIT
+
+          python - <<'PY'
+          import os
+          import secrets
+          from pathlib import Path
+
+          directory = Path(os.environ["CYBERSENTINEL_SECRETS_DIR"])
+          directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+          values = {
+              "bridge_token": secrets.token_urlsafe(48) + "\n",
+              "llm_api_key": "",
+              "local_llm_api_key": "",
+              "colab_llm_api_key": "",
+              "hf_llm_api_key": "",
+          }
+          for name, value in values.items():
+              (directory / name).write_text(value, encoding="utf-8")
+          PY
+          sudo chown root:root "$CYBERSENTINEL_SECRETS_DIR"
+          sudo chmod 0711 "$CYBERSENTINEL_SECRETS_DIR"
+          sudo chown 10001:10001 "$CYBERSENTINEL_SECRETS_DIR"/*
+          sudo chmod 0440 "$CYBERSENTINEL_SECRETS_DIR"/*
 
           wait_bridge() {
             for attempt in $(seq 1 60); do

@@ -136,11 +136,10 @@ def test_safe_environment_removes_ambient_provider_and_runtime_credentials(
 
     result = rehearsal._safe_environment(
         image="cybersentinel-m3-v16:abcdef012345",
-        bridge_token="synthetic-bridge-token",
         published_port=32991,
     )
 
-    assert result["BRIDGE_TOKEN"] == "synthetic-bridge-token"
+    assert "BRIDGE_TOKEN" not in result
     assert result["DOCKER_HOST"] == "unix:///var/run/docker.sock"
     assert "DOCKER_CONTEXT" not in result
     assert result["DB_PATH"] == "/var/lib/cybersentinel/intel.db"
@@ -220,17 +219,15 @@ def test_compose_adapter_uses_fixed_files_argv_and_synthetic_environment(
         return subprocess.CompletedProcess(argv, 0, stdout="validated\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    token = "synthetic-bridge-token-never-on-argv"
     env = rehearsal._safe_environment(
         image="cybersentinel-m3-v16:abcdef012345",
-        bridge_token=token,
         published_port=32991,
     )
+    env["CYBERSENTINEL_SECRETS_DIR"] = "/tmp/m3v16-synthetic-secrets"
     host = rehearsal.DockerHost(
         project="m3v16-abcdef012345",
         image="cybersentinel-m3-v16:abcdef012345",
         port=32991,
-        bridge_token=token,
         env=env,
     )
 
@@ -244,9 +241,9 @@ def test_compose_adapter_uses_fixed_files_argv_and_synthetic_environment(
     assert str(BASE_COMPOSE) in argv
     assert str(OVERLAY_COMPOSE) in argv
     assert "m3v16-abcdef012345" in argv
-    assert token not in argv
+    assert kwargs["env"]["CYBERSENTINEL_SECRETS_DIR"] == "/tmp/m3v16-synthetic-secrets"
+    assert "BRIDGE_TOKEN" not in kwargs["env"]
     assert "shell" not in kwargs
-    assert kwargs["env"]["BRIDGE_TOKEN"] == token
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["capture_output"] is True
 
@@ -270,7 +267,6 @@ def test_one_off_worker_command_is_named_and_never_contains_credentials(
     password = "synthetic-owner-password"
     env = rehearsal._safe_environment(
         image="cybersentinel-m3-v16:abcdef012345",
-        bridge_token=token,
         published_port=32991,
     )
     env["SYNTHETIC_OWNER_PASSWORD"] = password
@@ -278,7 +274,6 @@ def test_one_off_worker_command_is_named_and_never_contains_credentials(
         project="m3v16-abcdef012345",
         image="cybersentinel-m3-v16:abcdef012345",
         port=32991,
-        bridge_token=token,
         env=env,
     )
 
@@ -405,7 +400,6 @@ def test_cleanup_uses_only_the_unique_project_and_image(
         project="m3v16-abcdef012345",
         image="cybersentinel-m3-v16:abcdef012345",
         port=32991,
-        bridge_token="synthetic-token",
         env={},
     )
     host.image_built = True
@@ -437,3 +431,21 @@ def test_cleanup_uses_only_the_unique_project_and_image(
         and args == ("image", "rm", "cybersentinel-m3-v16:abcdef012345")
         for kind, args in calls
     )
+
+
+def test_compose_secrets_are_synthetic_files_inside_rehearsal_temp_directory(
+    tmp_path: Path,
+) -> None:
+    runner = rehearsal.RehearsalRunner(port_picker=lambda: 32991)
+    runner.temp_path = tmp_path
+
+    runner._prepare_compose_secrets()
+
+    directory = Path(runner.env["CYBERSENTINEL_SECRETS_DIR"])
+    assert directory == tmp_path / "compose-secrets"
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert (directory / "bridge_token").read_text(encoding="utf-8").strip() == runner.bridge_token
+    assert "BRIDGE_TOKEN" not in runner.env
+    for name in ("llm_api_key", "local_llm_api_key", "colab_llm_api_key", "hf_llm_api_key"):
+        assert (directory / name).read_bytes() == b""
+        assert (directory / name).stat().st_mode & 0o777 == 0o444

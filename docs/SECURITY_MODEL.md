@@ -29,6 +29,12 @@
 - Redirects are not followed, URL user-info is rejected, permitted schemes/ports are checked, and response/time limits are enforced. URL preflight alone is not the security boundary; the transport repeats validation at connection time.
 - The process does not expose an arbitrary remote scanner or exploit runner. Any additional provider or URL-fetching code must use the same validated transport rather than a raw HTTP client.
 
+## Container secrets and deployment boundary
+
+- The Linux Compose target mounts its bridge token and provider API keys as read-only files under `/run/secrets/`; credential values are not passed as container environment variables or baked into the image. Runtime `*_FILE` reads reject a final-component symlink, require a regular file, and enforce a bounded UTF-8 read.
+- The host setup helper creates secret files owned by root and group `10001`, mode `0440`; the application runs as UID/GID `10001:10001`. The mission worker receives provider keys but not the bridge transport token. Rootless Docker and user-namespace remapping are not validated for this release target.
+- The one-shot workspace initializer has no network. The bridge and worker share a dedicated Compose bridge network, while only the bridge publishes a host-loopback port. Provider egress remains available. This is a single-host self-hosted target, not a public ingress or high-availability deployment, and it has no Cloudflare dependency.
+
 ## Workspace and process boundaries
 
 - Workspace paths are first checked against the mission authorization snapshot. On POSIX, file operations then traverse directory descriptors relative to the opened workspace root, reject symlinks (`O_NOFOLLOW`), and use descriptor-relative rename/unlink operations. This closes the check-then-use path substitution window for the protected operations.

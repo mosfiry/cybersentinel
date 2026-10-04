@@ -28,7 +28,7 @@ def test_docker_context_keeps_workspace_application_package() -> None:
     assert "workspace/" not in ignored
     assert (ROOT / "workspace" / "__init__.py").is_file()
     dockerfile = (ROOT / "Dockerfile").read_text()
-    assert "COPY . /app" in dockerfile
+    assert "COPY --chown=0:0 . /app" in dockerfile
     assert 'RUN python -c "from workspace import Workspace"' in dockerfile
 
 

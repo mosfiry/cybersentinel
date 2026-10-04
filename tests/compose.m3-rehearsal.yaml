@@ -11,16 +11,12 @@ services:
       CYBERSENTINEL_M3_LEASE_SECONDS: "5"
       CYBERSENTINEL_M3_CRASH_WAIT_SECONDS: "45"
       LLM_BASE_URL: ""
-      LLM_API_KEY: ""
       LLM_MODEL: ""
       LOCAL_LLM_BASE_URL: ""
-      LOCAL_LLM_API_KEY: ""
       LOCAL_LLM_MODEL: ""
       COLAB_LLM_BASE_URL: ""
-      COLAB_LLM_API_KEY: ""
       COLAB_LLM_MODEL: ""
       HF_LLM_BASE_URL: ""
-      HF_LLM_API_KEY: ""
       HF_LLM_MODEL: ""
     volumes:
       - ./tests/m3_rehearsal:/m3-rehearsal:ro
@@ -35,16 +31,12 @@ services:
       CYBERSENTINEL_M3_LEASE_SECONDS: "5"
       CYBERSENTINEL_M3_CRASH_WAIT_SECONDS: "45"
       LLM_BASE_URL: ""
-      LLM_API_KEY: ""
       LLM_MODEL: ""
       LOCAL_LLM_BASE_URL: ""
-      LOCAL_LLM_API_KEY: ""
       LOCAL_LLM_MODEL: ""
       COLAB_LLM_BASE_URL: ""
-      COLAB_LLM_API_KEY: ""
       COLAB_LLM_MODEL: ""
       HF_LLM_BASE_URL: ""
-      HF_LLM_API_KEY: ""
       HF_LLM_MODEL: ""
     volumes:
       - ./tests/m3_rehearsal:/m3-rehearsal:ro

@@ -188,7 +188,7 @@ def _free_loopback_port() -> int:
 
 
 def _safe_environment(
-    *, image: str, bridge_token: str, published_port: int
+    *, image: str, published_port: int
 ) -> dict[str, str]:
     """Pass only a minimal environment to the disposable local Docker engine."""
     allowed_host_keys = {
@@ -207,7 +207,6 @@ def _safe_environment(
     env.update(
         {
             "M3_REHEARSAL_IMAGE": image,
-            "BRIDGE_TOKEN": bridge_token,
             "BRIDGE_PUBLISHED_PORT": str(published_port),
             "BRIDGE_HOST": "0.0.0.0",
             "PUBLIC_WEB_ENABLED": "0",
@@ -227,7 +226,6 @@ class DockerHost:
         project: str,
         image: str,
         port: int,
-        bridge_token: str,
         env: dict[str, str],
     ) -> None:
         self.project = project

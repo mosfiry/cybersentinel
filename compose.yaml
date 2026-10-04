@@ -9,6 +9,7 @@ services:
     working_dir: /var/lib/cybersentinel
     entrypoint: ["/bin/sh", "/app/scripts/container_workspace_init.sh"]
     command: ["--once"]
+    network_mode: none
     restart: "no"
     read_only: true
     cap_drop: ["ALL"]
@@ -31,6 +32,8 @@ services:
     depends_on:
       workspace-init:
         condition: service_completed_successfully
+    networks:
+      - cybersentinel
     restart: unless-stopped
     stop_grace_period: 330s
     read_only: true
@@ -50,7 +53,7 @@ services:
       BRIDGE_HOST: "0.0.0.0"
       BRIDGE_PORT: "8787"
       BRIDGE_ALLOW_NON_LOOPBACK_BIND: "true"
-      BRIDGE_TOKEN: "${BRIDGE_TOKEN:?BRIDGE_TOKEN_required}"
+      BRIDGE_TOKEN_FILE: "/run/secrets/bridge_token"
       PUBLIC_WEB_ENABLED: "false"
       PYTHON_DOTENV_DISABLED: "true"
       PYTHONPATH: "/app"
@@ -63,17 +66,23 @@ services:
       OWNER_POLICY_STATE_PATH: "/var/lib/cybersentinel/owner_policy_state.json"
       CYBERSENTINEL_OWNER_PHRASE: "${CYBERSENTINEL_OWNER_PHRASE:-Owner}"
       LLM_BASE_URL: "${LLM_BASE_URL:-}"
-      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_API_KEY_FILE: "/run/secrets/llm_api_key"
       LLM_MODEL: "${LLM_MODEL:-}"
       LOCAL_LLM_BASE_URL: "${LOCAL_LLM_BASE_URL:-}"
-      LOCAL_LLM_API_KEY: "${LOCAL_LLM_API_KEY:-}"
+      LOCAL_LLM_API_KEY_FILE: "/run/secrets/local_llm_api_key"
       LOCAL_LLM_MODEL: "${LOCAL_LLM_MODEL:-}"
       COLAB_LLM_BASE_URL: "${COLAB_LLM_BASE_URL:-}"
-      COLAB_LLM_API_KEY: "${COLAB_LLM_API_KEY:-}"
+      COLAB_LLM_API_KEY_FILE: "/run/secrets/colab_llm_api_key"
       COLAB_LLM_MODEL: "${COLAB_LLM_MODEL:-}"
       HF_LLM_BASE_URL: "${HF_LLM_BASE_URL:-}"
-      HF_LLM_API_KEY: "${HF_LLM_API_KEY:-}"
+      HF_LLM_API_KEY_FILE: "/run/secrets/hf_llm_api_key"
       HF_LLM_MODEL: "${HF_LLM_MODEL:-}"
+    secrets:
+      - bridge_token
+      - llm_api_key
+      - local_llm_api_key
+      - colab_llm_api_key
+      - hf_llm_api_key
     volumes:
       - cybersentinel-state:/var/lib/cybersentinel
     healthcheck:
@@ -100,6 +109,8 @@ services:
     depends_on:
       workspace-init:
         condition: service_completed_successfully
+    networks:
+      - cybersentinel
     restart: unless-stopped
     stop_grace_period: 330s
     read_only: true
@@ -114,10 +125,6 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m
     environment:
       CYBERSENTINEL_STATE_DIR: "/var/lib/cybersentinel"
-      BRIDGE_HOST: "0.0.0.0"
-      BRIDGE_PORT: "8787"
-      BRIDGE_ALLOW_NON_LOOPBACK_BIND: "true"
-      BRIDGE_TOKEN: "${BRIDGE_TOKEN:?BRIDGE_TOKEN_required}"
       PUBLIC_WEB_ENABLED: "false"
       PYTHON_DOTENV_DISABLED: "true"
       PYTHONPATH: "/app"
@@ -130,17 +137,22 @@ services:
       OWNER_POLICY_STATE_PATH: "/var/lib/cybersentinel/owner_policy_state.json"
       CYBERSENTINEL_OWNER_PHRASE: "${CYBERSENTINEL_OWNER_PHRASE:-Owner}"
       LLM_BASE_URL: "${LLM_BASE_URL:-}"
-      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_API_KEY_FILE: "/run/secrets/llm_api_key"
       LLM_MODEL: "${LLM_MODEL:-}"
       LOCAL_LLM_BASE_URL: "${LOCAL_LLM_BASE_URL:-}"
-      LOCAL_LLM_API_KEY: "${LOCAL_LLM_API_KEY:-}"
+      LOCAL_LLM_API_KEY_FILE: "/run/secrets/local_llm_api_key"
       LOCAL_LLM_MODEL: "${LOCAL_LLM_MODEL:-}"
       COLAB_LLM_BASE_URL: "${COLAB_LLM_BASE_URL:-}"
-      COLAB_LLM_API_KEY: "${COLAB_LLM_API_KEY:-}"
+      COLAB_LLM_API_KEY_FILE: "/run/secrets/colab_llm_api_key"
       COLAB_LLM_MODEL: "${COLAB_LLM_MODEL:-}"
       HF_LLM_BASE_URL: "${HF_LLM_BASE_URL:-}"
-      HF_LLM_API_KEY: "${HF_LLM_API_KEY:-}"
+      HF_LLM_API_KEY_FILE: "/run/secrets/hf_llm_api_key"
       HF_LLM_MODEL: "${HF_LLM_MODEL:-}"
+    secrets:
+      - llm_api_key
+      - local_llm_api_key
+      - colab_llm_api_key
+      - hf_llm_api_key
     volumes:
       - cybersentinel-state:/var/lib/cybersentinel
     healthcheck:
@@ -156,5 +168,21 @@ services:
       retries: 3
       start_period: 15s
 
+networks:
+  cybersentinel:
+    driver: bridge
+
 volumes:
   cybersentinel-state:
+
+secrets:
+  bridge_token:
+    file: "${CYBERSENTINEL_SECRETS_DIR:-./secrets}/bridge_token"
+  llm_api_key:
+    file: "${CYBERSENTINEL_SECRETS_DIR:-./secrets}/llm_api_key"
+  local_llm_api_key:
+    file: "${CYBERSENTINEL_SECRETS_DIR:-./secrets}/local_llm_api_key"
+  colab_llm_api_key:
+    file: "${CYBERSENTINEL_SECRETS_DIR:-./secrets}/colab_llm_api_key"
+  hf_llm_api_key:
+    file: "${CYBERSENTINEL_SECRETS_DIR:-./secrets}/hf_llm_api_key"

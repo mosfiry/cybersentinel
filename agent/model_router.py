@@ -11,6 +11,7 @@ from typing import Any
 from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, response_from_legacy, validate_provider_response
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
+from security.runtime_secrets import secret_env
 
 
 @dataclass
@@ -28,7 +29,7 @@ class ModelRouter:
             base = os.getenv(f"{name}_LLM_BASE_URL", "").strip()
             default_model = "Qwen/Qwen3-Coder-Next" if name == "LOCAL" else ""
             model = os.getenv(f"{name}_LLM_MODEL", default_model).strip()
-            key = os.getenv(f"{name}_LLM_API_KEY", "").strip()
+            key = secret_env(f"{name}_LLM_API_KEY")
             if base and model:
                 native = os.getenv(f"{name}_LLM_TOOL_CALLING", "false").lower() == "true"
                 streaming = os.getenv(f"{name}_LLM_STREAMING", "false").lower() == "true"
@@ -37,7 +38,7 @@ class ModelRouter:
                 providers.append(OpenAICompatibleProvider(name.lower(), base, model, key, tool_calling=native, streaming=streaming, structured_output=structured, priority=priority))
         base = os.getenv("LLM_BASE_URL", "").strip()
         model = os.getenv("LLM_MODEL", "").strip()
-        key = os.getenv("LLM_API_KEY", "").strip()
+        key = secret_env("LLM_API_KEY")
         if base and model and not providers:
             native = os.getenv("LLM_TOOL_CALLING", "false").lower() == "true"
             streaming = os.getenv("LLM_STREAMING", "false").lower() == "true"
