@@ -859,6 +859,70 @@ class MissionRuntime:
         mission.transition(MissionStatus.RESOURCE_BLOCKED, mission.error)
         return self._save(mission)
 
+    def _complete_from_verified_evidence_after_budget(self, mission: Mission, *, budget: str, limit: int, run_id: str, turn_id: str) -> Mission | None:
+        """Complete only when required deterministic evidence already proves the goal."""
+        verification = self.verifier(mission)
+        if not verification.verified:
+            return None
+        mission.verification_state = {
+            "verified": True,
+            "missing_criteria": list(verification.missing_criteria),
+            "evidence_count": len(verification.evidence),
+        }
+        reason = f"final model turn was not generated because {budget} exceeded its configured budget after required evidence was verified"
+        failure = {
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "class": FailureClass.RESOURCE.value,
+            "kind": "FINAL_MODEL_TURN_BUDGET",
+            "reason": reason,
+            "budget": budget,
+            "limit": limit,
+            "blocking": False,
+            "retry_policy": {
+                "configured_recovery": RecoveryAction.RESOURCE_BLOCKED.value,
+                "action": "complete_from_verified_evidence",
+                "retryable": False,
+                "attempts": 0,
+            },
+        }
+        mission.failures.append(failure)
+        mission.progress.setdefault("nonblocking_finalization_failures", []).append(failure)
+        mission.progress["final_model_turn"] = {
+            "status": "not_generated_resource_limited",
+            "reason": reason,
+            "budget": budget,
+            "limit": limit,
+            "run_id": run_id,
+            "turn_id": turn_id,
+        }
+        mission.emit(EventType.FAILURE_DETECTED, data=failure)
+        mission.emit(EventType.FAILURE_DIAGNOSED, data={
+            "class": FailureClass.RESOURCE.value,
+            "kind": failure["kind"],
+            "recovery": "complete_from_verified_evidence",
+            "run_id": run_id,
+            "turn_id": turn_id,
+        })
+        mission.transition(
+            MissionStatus.GOAL_COMPLETED,
+            "required deterministic evidence verified; final model turn was budget-blocked",
+            run_id=run_id,
+            turn_id=turn_id,
+            budget=budget,
+            limit=limit,
+            final_model_generated=False,
+        )
+        mission.emit(EventType.GOAL_VERIFIED, data=mission.verification_state)
+        mission.emit(EventType.MISSION_COMPLETED, data={
+            "verification": mission.verification_state,
+            "completion_source": "deterministic_evidence",
+            "final_model_generated": False,
+        })
+        return self._save(mission)
+
     def run_model_loop(self, mission_id: str, model: NativeModel, *, tools: list[dict[str, Any]], run_id: str = "", max_turns: int = 20, heartbeat: Callable[[], None] | None = None) -> Mission:
         """Run a real model/tool/observation loop for a durable mission."""
         from security.authorization import authorize_tool
@@ -942,8 +1006,14 @@ class MissionRuntime:
                 max_chars=context_char_limit,
             )
             if assembled.context_chars > context_char_limit:
+                completed = self._complete_from_verified_evidence_after_budget(mission, budget="max_context_chars", limit=context_char_limit, run_id=run_id, turn_id=f"{run_id}:turn:{len(progress['turns']) + 1}")
+                if completed is not None:
+                    return completed
                 return self._block_on_budget(mission, "max_context_chars", context_char_limit)
             if len(assembled.messages) > context_message_limit:
+                completed = self._complete_from_verified_evidence_after_budget(mission, budget="max_context_messages", limit=context_message_limit, run_id=run_id, turn_id=f"{run_id}:turn:{len(progress['turns']) + 1}")
+                if completed is not None:
+                    return completed
                 return self._block_on_budget(mission, "max_context_messages", context_message_limit)
             progress["last_context_hash"] = assembled.context_hash
             progress["context_compaction"] = {
@@ -987,6 +1057,9 @@ class MissionRuntime:
                 output_remaining = self._remaining_output_chars(progress) - len(turn.content)
                 result_caps = self._allocate_result_caps(len(turn.tool_calls), output_remaining)
             except _MissionBudgetExceeded as exc:
+                completed = self._complete_from_verified_evidence_after_budget(mission, budget=exc.budget, limit=exc.limit, run_id=run_id, turn_id=turn_id)
+                if completed is not None:
+                    return completed
                 return self._block_on_budget(mission, exc.budget, exc.limit)
             except ProviderError as exc:
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")

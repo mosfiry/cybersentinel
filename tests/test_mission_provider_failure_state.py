@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from agent.context import RuntimeLimits
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.planning import Plan, RecoveryPolicy
@@ -225,3 +226,62 @@ def test_model_input_context_budget_uses_provider_limit(tmp_path):
         context_length = 4096
 
     assert runtime._context_limits(LocalModel()) == (8192, 50)
+
+
+def test_verified_evidence_completes_when_final_model_context_is_over_budget(tmp_path):
+    store = MissionStore(tmp_path / "verified-context-budget.sqlite3")
+    runtime = MissionRuntime(
+        store,
+        executor=lambda *_args: {},
+        recovery_policy=RecoveryPolicy(max_retries=2),
+        authorization_snapshot_factory=make_test_snapshot,
+        runtime_limits=RuntimeLimits(max_context_chars=1),
+    )
+    mission = runtime.create(
+        "check status",
+        "check status",
+        Plan.initial("check status"),
+        request_id="verified-context-budget-request",
+        completion_criteria=[{"criterion_id": "status-snapshot", "check": "status_snapshot"}],
+    )
+    mission.evidence.append({
+        "criterion_id": "status-snapshot",
+        "passed": True,
+        "source": "status",
+        "result": {"online": True},
+        "provenance": {"mission_id": mission.mission_id, "tool_call_id": "verified-status-call"},
+    })
+    store.save(mission)
+    model = AlwaysFailingModel(lambda: AssertionError("budget must prevent provider dispatch"))
+
+    result = runtime.run_model_loop(
+        mission.mission_id,
+        model,
+        tools=[],
+        run_id="verified-context-budget-run",
+    )
+
+    assert model.calls == []
+    assert result.status is MissionStatus.GOAL_COMPLETED
+    assert result.verification_state == {"verified": True, "missing_criteria": [], "evidence_count": 1}
+    assert result.retry_count == 0
+    assert result.evidence[0]["provenance"]["tool_call_id"] == "verified-status-call"
+    failure = result.failures[0]
+    assert failure["class"] == "RESOURCE"
+    assert failure["kind"] == "FINAL_MODEL_TURN_BUDGET"
+    assert failure["blocking"] is False
+    assert failure["run_id"] == "verified-context-budget-run"
+    assert failure["turn_id"] == "verified-context-budget-run:turn:1"
+    assert failure["retry_policy"] == {
+        "configured_recovery": "RESOURCE_BLOCKED",
+        "action": "complete_from_verified_evidence",
+        "retryable": False,
+        "attempts": 0,
+    }
+    assert result.progress["final_model_turn"]["status"] == "not_generated_resource_limited"
+    assert any(item.get("event") == "GoalVerified" for item in result.trajectory)
+    assert any(item.get("event") == "MissionCompleted" for item in result.trajectory)
+    persisted = MissionStore(tmp_path / "verified-context-budget.sqlite3").load(mission.mission_id)
+    assert persisted is not None and persisted.status is MissionStatus.GOAL_COMPLETED
+    assert persisted.failures == result.failures
+    assert persisted.evidence == result.evidence
