@@ -16,7 +16,7 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check -r /tmp/req
     && python -m pip check \
     && groupadd --system --gid 10001 cybersentinel \
     && useradd --system --uid 10001 --gid 10001 --home-dir /var/lib/cybersentinel --no-create-home cybersentinel \
-    && mkdir -p /var/lib/cybersentinel/workspace \
+    && mkdir -p /var/lib/cybersentinel \
     && chown -R 10001:10001 /var/lib/cybersentinel
 
 COPY --chown=0:0 . /app

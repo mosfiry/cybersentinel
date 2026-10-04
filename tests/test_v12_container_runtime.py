@@ -19,6 +19,16 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_fresh_state_volume_image_copy_up_is_empty_for_restore() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    initializer = (ROOT / "scripts" / "container_workspace_init.sh").read_text()
+
+    assert "mkdir -p /var/lib/cybersentinel \\" in dockerfile
+    assert "chown -R 10001:10001 /var/lib/cybersentinel" in dockerfile
+    assert "/var/lib/cybersentinel/workspace" not in dockerfile
+    assert 'mkdir -p "$workspace_dir"' in initializer
+
+
 def test_docker_context_keeps_workspace_application_package() -> None:
     ignored = {
         line.strip()
