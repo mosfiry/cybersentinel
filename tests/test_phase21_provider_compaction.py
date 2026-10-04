@@ -9,7 +9,7 @@ from agent.model_intelligence.context import COMPACTED_TOOL_METADATA, ContextAss
 from agent.model_protocol import RouterNativeModel
 from agent.model_router import ModelRouter
 from agent.planning import Plan
-from agent.provider_api import CapabilityUnsupported, ProviderCapabilities, ProviderFailure, ProviderResponse, ToolCall
+from agent.provider_api import CapabilityUnsupported, ProviderCapabilities, ProviderResponse, ProviderTimeout, ToolCall
 
 
 class UnsupportedProvider:
@@ -78,9 +78,9 @@ def test_router_native_model_uses_configured_provider_identity_not_response_clai
 def test_native_provider_failure_does_not_fallback_to_generate():
     provider = BrokenNativeProvider()
     router = ModelRouter([provider])
-    with pytest.raises(ProviderFailure) as error:
+    with pytest.raises(ProviderTimeout) as error:
         RouterNativeModel(router).complete([], [], mission_id="m", run_id="r", turn_id="t", plan_version=1)
-    assert "TIMEOUT" in str(error.value)
+    assert error.value.kind.value == "TIMEOUT"
     assert provider.generate_calls == 0
     assert router.last_trace[0]["failure_kind"] == "TIMEOUT"
 

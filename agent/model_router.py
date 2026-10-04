@@ -8,7 +8,7 @@ import urllib.error
 from dataclasses import dataclass
 from typing import Any
 
-from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderResponse, ProviderTimeout, response_from_legacy, validate_provider_response
+from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderRequestRejected, ProviderResponse, ProviderTimeout, response_from_legacy, validate_provider_response
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
 from security.runtime_secrets import secret_env
@@ -21,6 +21,15 @@ class ModelRouter:
 
     def __post_init__(self):
         self.last_trace = []
+
+    @property
+    def context_length(self) -> int | None:
+        lengths = [
+            value for provider in self.providers
+            if isinstance((value := getattr(provider, "context_length", None)), int)
+            and not isinstance(value, bool) and value > 0
+        ]
+        return min(lengths) if lengths else None
 
     @classmethod
     def from_env(cls):
@@ -100,8 +109,14 @@ class ModelRouter:
             return exc
         if isinstance(exc, urllib.error.HTTPError):
             if exc.code in {401, 403}:
-                return ProviderAuthenticationFailure(f"HTTP {exc.code}", **details)
-            return ProviderFailure(f"HTTP {exc.code}", **details)
+                return ProviderAuthenticationFailure(f"HTTP {exc.code}", status_code=exc.code, **details)
+            if exc.code == 408:
+                return ProviderTimeout(f"HTTP {exc.code}", status_code=exc.code, **details)
+            if exc.code == 429:
+                return ProviderFailure(f"HTTP {exc.code}", status_code=exc.code, **details)
+            if 400 <= exc.code < 500:
+                return ProviderRequestRejected(f"HTTP {exc.code}", status_code=exc.code, **details)
+            return ProviderFailure(f"HTTP {exc.code}", status_code=exc.code, **details)
         if isinstance(exc, urllib.error.URLError):
             reason = getattr(exc, "reason", None)
             if isinstance(reason, TimeoutError) or (isinstance(reason, OSError) and reason.errno == errno.ETIMEDOUT):
@@ -116,6 +131,29 @@ class ModelRouter:
         if isinstance(exc, (TypeError, ValueError, UnicodeError)):
             return InvalidModelResponse("invalid provider response", **details)
         return ProviderFailure(type(exc).__name__, **details)
+
+    @staticmethod
+    def _aggregate_failure(message: str, attempts: list[dict[str, str]]) -> ProviderError:
+        kinds = {str(item.get("kind", "")) for item in attempts}
+        status_codes = [str(item.get("http_status", "")) for item in attempts]
+        status_code = None
+        if attempts and all(code.isdigit() for code in status_codes) and len(set(status_codes)) == 1:
+            status_code = int(status_codes[0])
+        kwargs: dict[str, Any] = {"attempts": attempts}
+        if status_code is not None:
+            kwargs["status_code"] = status_code
+        if kinds == {"TIMEOUT"}:
+            return ProviderTimeout(message, **kwargs)
+        if kinds == {"PROVIDER_FAILURE"} or kinds.intersection({"PROVIDER_FAILURE", "TIMEOUT"}):
+            return ProviderFailure(message, **kwargs)
+        if kinds == {"AUTHENTICATION_FAILURE"}:
+            return ProviderAuthenticationFailure(message, **kwargs)
+        if kinds == {"REQUEST_REJECTED"}:
+            rejected_message = f"provider request rejected (HTTP {status_code})" if status_code is not None else message
+            return ProviderRequestRejected(rejected_message, **kwargs)
+        if kinds == {"INVALID_MODEL_RESPONSE"}:
+            return InvalidModelResponse(message, **kwargs)
+        return InvalidModelResponse("provider attempts failed without a retryable error", attempts=attempts)
 
     def generate(self, messages: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
@@ -148,12 +186,19 @@ class ModelRouter:
             except Exception as exc:
                 failure = self._classify(exc, provider)
                 attempt = {"provider": failure.provider or "unknown", "model": failure.model or "unknown", "kind": failure.kind.value}
+                if failure.status_code is not None:
+                    attempt["http_status"] = str(failure.status_code)
                 attempts.append(attempt)
                 errors.append(f"{attempt['provider']}: {failure.kind.value}")
-                self.last_trace.append({"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
+                trace = {"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()}
+                if failure.status_code is not None:
+                    trace["http_status"] = failure.status_code
+                self.last_trace.append(trace)
         if deadline is not None and time.monotonic() >= deadline:
             raise ProviderTimeout("provider call deadline expired", attempts=attempts)
-        raise ProviderFailure("all model providers failed: " + "; ".join(errors) if errors else "no model provider configured", attempts=attempts)
+        if errors:
+            raise self._aggregate_failure("all model providers failed", attempts)
+        raise ProviderFailure("no model provider configured")
 
     def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
@@ -186,13 +231,18 @@ class ModelRouter:
             except Exception as exc:
                 failure = self._classify(exc, provider)
                 attempt = {"provider": failure.provider or "unknown", "model": failure.model or "unknown", "kind": failure.kind.value}
+                if failure.status_code is not None:
+                    attempt["http_status"] = str(failure.status_code)
                 attempts.append(attempt)
                 errors.append(f"{attempt['provider']}: {failure.kind.value}")
-                self.last_trace.append({"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()})
+                trace = {"provider": attempt["provider"], "model": attempt["model"], "status": "failure", "failure_kind": failure.kind.value, "error_type": type(exc).__name__, "capabilities": self._caps(provider).__dict__.copy()}
+                if failure.status_code is not None:
+                    trace["http_status"] = failure.status_code
+                self.last_trace.append(trace)
         if deadline is not None and time.monotonic() >= deadline:
             raise ProviderTimeout("provider call deadline expired", attempts=attempts)
         if errors:
-            raise ProviderFailure("native tool providers failed: " + "; ".join(errors), attempts=attempts)
+            raise self._aggregate_failure("native tool providers failed", attempts)
         raise CapabilityUnsupported("no provider supports native tool calling")
 
     def chat(self, messages: list[dict], temperature: float | None = None, *, tools: list[dict] | None = None, reasoning_profile: ReasoningProfile | None = None) -> dict:

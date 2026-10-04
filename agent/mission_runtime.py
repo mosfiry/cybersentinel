@@ -82,11 +82,15 @@ class MissionRuntime:
             self._save(mission)
         return effective_limit
 
-    def _context_limits(self) -> tuple[int, int]:
+    def _context_limits(self, model: Any = None) -> tuple[int, int]:
         # This is the model-input budget. MAX_PROVIDER_TEXT_CHARS separately
         # limits model-returned text and must not be applied to the request.
-        # The assembler's default is only a compaction target.
+        # The provider's token cap is translated conservatively into a character
+        # ceiling so durable state is compacted before dispatch, not after a 4xx.
         max_chars = self._limit_value(self.runtime_limits.max_context_chars)
+        context_length = getattr(model, "context_length", None)
+        if isinstance(context_length, int) and not isinstance(context_length, bool) and context_length > 0:
+            max_chars = min(max_chars, context_length * 2)
         max_messages = self._limit_value(self.runtime_limits.max_context_messages)
         return max_chars, max_messages
 
@@ -600,6 +604,8 @@ class MissionRuntime:
 
     def create(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> Mission:
         snapshot_factory = kwargs.pop("authorization_snapshot_factory", None) or self.authorization_snapshot_factory
+        planning_failures = kwargs.pop("planning_failures", None)
+        planning_exhausted = bool(kwargs.pop("planning_exhausted", False))
         mission = Mission.create(owner_request, objective, plan, **kwargs)
         if mission.authorization_snapshot is None and snapshot_factory is not None:
             snapshot = snapshot_factory(mission)
@@ -610,10 +616,45 @@ class MissionRuntime:
         mission.provenance["owner_runtime_limits"] = {
             "max_execution_steps": self._limit_value(self.runtime_limits.max_execution_steps),
         }
-        mission.transition(MissionStatus.READY, "plan persisted")
+        if planning_failures:
+            for item in planning_failures:
+                if not isinstance(item, dict):
+                    continue
+                failure = dict(item)
+                failure.setdefault("mission_id", mission.mission_id)
+                failure.setdefault("request_id", mission.request_id)
+                mission.failures.append(failure)
+                mission.progress.setdefault("model_failures", []).append(failure)
+                attempt_number = failure.get("provider_attempt")
+                if isinstance(attempt_number, int) and not isinstance(attempt_number, bool):
+                    mission.retry_count = max(mission.retry_count, attempt_number)
+                mission.emit(EventType.FAILURE_DETECTED, data=failure)
+                mission.emit(EventType.FAILURE_DIAGNOSED, data={
+                    "class": failure.get("class", "PROVIDER"),
+                    "kind": failure.get("kind", "PROVIDER_FAILURE"),
+                    "recovery": failure.get("retry_policy", {}).get("action", "FAIL"),
+                })
+            if planning_exhausted:
+                final_failure = next((item for item in reversed(mission.failures) if item.get("run_id")), mission.failures[-1])
+                kind = str(final_failure.get("kind", "PROVIDER_FAILURE"))
+                status_code = final_failure.get("http_status")
+                error_prefix = "model planning failure" if final_failure.get("class") == "LOGIC" else "model provider failure"
+                mission.error = f"{error_prefix}: {kind}" + (f" (HTTP {status_code})" if status_code is not None else "")
+                mission.transition(
+                    MissionStatus.FAILED_RETRY_EXHAUSTED,
+                    "initial planning failed under bounded recovery policy",
+                    failure_class=final_failure.get("class", "PROVIDER"),
+                    kind=kind,
+                    retry_count=mission.retry_count,
+                    max_retries=final_failure.get("retry_policy", {}).get("max_retries", 0),
+                )
+            else:
+                mission.transition(MissionStatus.READY, "plan persisted after bounded planning recovery", prior_provider_failures=len(planning_failures))
+        else:
+            mission.transition(MissionStatus.READY, "plan persisted")
         return self.store.save(mission)
 
-    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None) -> Mission:
+    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, planning_failures: list[dict[str, Any]] | None = None, planning_exhausted: bool = False) -> Mission:
         """Create a Mission without allowing model understanding to rewrite the Owner objective."""
         from security.authorization_context import AuthorizationContext
         if not isinstance(authorization_context, AuthorizationContext):
@@ -645,6 +686,8 @@ class MissionRuntime:
             completion_criteria=completion_criteria,
             provenance={"source": "owner_instruction", **(provenance or {})},
             authorization_snapshot_factory=authorization_snapshot_factory,
+            planning_failures=planning_failures,
+            planning_exhausted=planning_exhausted,
         )
 
     def provide_owner_decision(self, mission_id: str, *, allow: bool, authorization_context: dict[str, Any] | None = None, execution_fence: ExecutionFence | None = None) -> Mission:
@@ -853,7 +896,7 @@ class MissionRuntime:
             return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
         turn_budget = min(max_turns, max_execution_steps - len(progress["turns"]))
         seen = set(progress["seen_call_ids"])
-        context_char_limit, context_message_limit = self._context_limits()
+        context_char_limit, context_message_limit = self._context_limits(model)
         if context_char_limit < 1:
             return self._block_on_budget(mission, "max_context_chars", context_char_limit)
         execution_time_limit = self._limit_value(self.runtime_limits.max_execution_time_seconds)
@@ -948,11 +991,14 @@ class MissionRuntime:
             except ProviderError as exc:
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")
                 kind_value = getattr(kind, "value", kind)
-                attempts = [
-                    {key: str(item.get(key, "")) for key in ("provider", "model", "kind")}
-                    for item in getattr(exc, "attempts", ())
-                    if isinstance(item, dict)
-                ]
+                attempts = []
+                for item in getattr(exc, "attempts", ()):
+                    if not isinstance(item, dict):
+                        continue
+                    attempt = {key: str(item.get(key, "")) for key in ("provider", "model", "kind")}
+                    if item.get("http_status") is not None:
+                        attempt["http_status"] = str(item["http_status"])
+                    attempts.append(attempt)
                 provider_name = str(
                     getattr(exc, "provider", "")
                     or (attempts[0].get("provider", "") if attempts else "")
@@ -961,6 +1007,11 @@ class MissionRuntime:
                     getattr(exc, "model", "")
                     or (attempts[0].get("model", "") if attempts else "")
                 )
+                status_code = getattr(exc, "status_code", None)
+                if status_code is None and len(attempts) == 1 and attempts[0].get("http_status", "").isdigit():
+                    status_code = int(attempts[0]["http_status"])
+                if isinstance(status_code, bool) or not isinstance(status_code, int) or not 100 <= status_code <= 599:
+                    status_code = None
                 mission.retry_count += 1
                 failure = {
                     "mission_id": mission.mission_id,
@@ -971,14 +1022,22 @@ class MissionRuntime:
                     "model": model_name,
                     "provider_attempt": mission.retry_count,
                     "attempts": attempts,
-                    "reason": "provider/model call failed",
+                    "reason": (
+                        f"provider request rejected (HTTP {status_code})"
+                        if str(kind_value) == "REQUEST_REJECTED" and status_code is not None
+                        else f"provider/model call failed (HTTP {status_code})"
+                        if status_code is not None
+                        else "provider/model call failed"
+                    ),
                     "turn_id": turn_id,
                     "run_id": run_id,
                 }
+                if status_code is not None:
+                    failure["http_status"] = status_code
                 mission.failures.append(failure)
                 mission.progress.setdefault("model_failures", []).append(failure)
                 mission.emit(EventType.FAILURE_DETECTED, data=failure)
-                mission.error = f"model provider failure: {kind_value}"
+                mission.error = f"model provider failure: {kind_value}" + (f" (HTTP {status_code})" if status_code is not None else "")
                 action = self.recovery_policy.action_for(FailureClass.PROVIDER, mission.retry_count - 1)
                 kind_is_retryable = str(kind_value) in {"PROVIDER_FAILURE", "TIMEOUT"}
                 retryable_provider_failure = (

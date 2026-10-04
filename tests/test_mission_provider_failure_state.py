@@ -6,7 +6,7 @@ from pathlib import Path
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.planning import Plan, RecoveryPolicy
-from agent.provider_api import ProviderAuthenticationFailure, ProviderFailure
+from agent.provider_api import ProviderAuthenticationFailure, ProviderFailure, ProviderRequestRejected
 from runtime_authorization import make_test_snapshot
 
 
@@ -163,3 +163,65 @@ def test_nonretryable_provider_authentication_failure_is_not_retried(tmp_path):
         item["reason"] == "provider failure; bounded retry selected"
         for item in result.transitions
     )
+
+
+def test_nonretryable_http_request_rejection_preserves_status_and_mission_evidence(tmp_path):
+    runtime = _runtime(tmp_path, max_retries=5)
+    mission = _ready_mission(runtime)
+    rejected = ProviderRequestRejected(
+        "provider request rejected (HTTP 400)",
+        provider="local_llama_cpp",
+        model="qwen3-4b-q4-k-m",
+        status_code=400,
+        attempts=[{
+            "provider": "local_llama_cpp",
+            "model": "qwen3-4b-q4-k-m",
+            "kind": "REQUEST_REJECTED",
+            "http_status": "400",
+        }],
+    )
+    model = AlwaysFailingModel(lambda: rejected)
+
+    result = runtime.run_model_loop(
+        mission.mission_id,
+        model,
+        tools=[],
+        run_id="provider-http400-regression-run",
+        max_turns=8,
+    )
+
+    assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert result.retry_count == 1
+    assert len(model.calls) == 1
+    failure = result.failures[0]
+    assert failure["kind"] == "REQUEST_REJECTED"
+    assert failure["http_status"] == 400
+    assert failure["reason"] == "provider request rejected (HTTP 400)"
+    assert failure["request_id"] == "request-provider-failure-regression"
+    assert failure["run_id"] == "provider-http400-regression-run"
+    assert failure["turn_id"] == "provider-http400-regression-run:turn:1"
+    assert failure["attempts"] == [{
+        "provider": "local_llama_cpp",
+        "model": "qwen3-4b-q4-k-m",
+        "kind": "REQUEST_REJECTED",
+        "http_status": "400",
+    }]
+    assert result.error == "model provider failure: REQUEST_REJECTED (HTTP 400)"
+    assert result.evidence == mission.evidence
+    assert not any(item["reason"] == "provider failure; bounded retry selected" for item in result.transitions)
+
+    persisted = MissionStore(tmp_path / "missions.sqlite3").load(mission.mission_id)
+    assert persisted is not None
+    assert persisted.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert persisted.failures == result.failures
+    assert persisted.evidence == mission.evidence
+    assert persisted.retry_count == 1
+
+
+def test_model_input_context_budget_uses_provider_limit(tmp_path):
+    runtime = _runtime(tmp_path)
+
+    class LocalModel:
+        context_length = 4096
+
+    assert runtime._context_limits(LocalModel()) == (8192, 50)

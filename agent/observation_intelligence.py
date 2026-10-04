@@ -168,8 +168,15 @@ class ObservationInterpreter:
                 "conversation_context": list(conversation_context),
             }) or {})
         except Exception as exc:
+            provenance = {**base.provenance, "model_status": "unavailable_or_malformed", "model_error": type(exc).__name__}
+            error_kind = getattr(getattr(exc, "kind", None), "value", getattr(exc, "kind", None))
+            status_code = getattr(exc, "status_code", None)
+            if error_kind:
+                provenance["model_error_kind"] = str(error_kind)
+            if isinstance(status_code, int) and not isinstance(status_code, bool) and 100 <= status_code <= 599:
+                provenance["model_http_status"] = status_code
             return ObservationInterpretationProposal(
-                **{**base.__dict__, "provenance": {**base.provenance, "model_status": "unavailable_or_malformed", "model_error": type(exc).__name__}}
+                **{**base.__dict__, "provenance": provenance}
             )
         # The model can enrich the proposal, but deterministic authority fields are discarded.
         proposal.pop("owner_instruction", None)

@@ -23,7 +23,7 @@ from .provider_api import (
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, structured_output: bool = False, priority: int = 100, parallel_tool_calls: bool = False, reasoning: bool = False, reasoning_budget: bool = False, long_context: bool = False, vision: bool = False):
+    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, structured_output: bool = False, priority: int = 100, parallel_tool_calls: bool = False, reasoning: bool = False, reasoning_budget: bool = False, long_context: bool = False, vision: bool = False, context_length: int | None = None):
         self.name = name
         self.base_url = base_url.rstrip("/")
         parsed_base = urlsplit(self.base_url)
@@ -31,6 +31,9 @@ class OpenAICompatibleProvider:
             raise ValueError("provider base_url must not contain credentials, query parameters, or a fragment")
         self.model = model
         self.api_key = api_key
+        if context_length is not None and (isinstance(context_length, bool) or not isinstance(context_length, int) or context_length < 1):
+            raise ValueError("context_length must be a positive integer")
+        self.context_length = context_length
         self.failure_count = 0
         self.last_error = ""
         self.priority = priority

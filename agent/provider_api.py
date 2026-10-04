@@ -20,6 +20,7 @@ MAX_PROVIDER_LABEL_CHARS = 128
 class ProviderFailureKind(StrEnum):
     CAPABILITY_UNSUPPORTED = "CAPABILITY_UNSUPPORTED"
     PROVIDER_FAILURE = "PROVIDER_FAILURE"
+    REQUEST_REJECTED = "REQUEST_REJECTED"
     INVALID_MODEL_RESPONSE = "INVALID_MODEL_RESPONSE"
     TIMEOUT = "TIMEOUT"
     AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
@@ -28,13 +29,17 @@ class ProviderFailureKind(StrEnum):
 class ProviderError(RuntimeError):
     """Typed provider boundary error; never silently changes execution mode."""
 
-    def __init__(self, kind: ProviderFailureKind, message: str, *, provider: str = "", model: str = "", attempts: list[dict[str, str]] | tuple[dict[str, str], ...] = ()) -> None:
+    def __init__(self, kind: ProviderFailureKind, message: str, *, provider: str = "", model: str = "", attempts: list[dict[str, str]] | tuple[dict[str, str], ...] = (), status_code: int | None = None) -> None:
         super().__init__(message)
         self.kind = kind
         self.provider = provider
         self.model = model
+        self.status_code = status_code if isinstance(status_code, int) and not isinstance(status_code, bool) and 100 <= status_code <= 599 else None
         self.attempts = tuple(
-            {key: str(item.get(key, "")) for key in ("provider", "model", "kind")}
+            {
+                **{key: str(item.get(key, "")) for key in ("provider", "model", "kind")},
+                **({"http_status": str(item["http_status"])} if item.get("http_status") is not None else {}),
+            }
             for item in attempts
             if isinstance(item, dict)
         )
@@ -63,6 +68,11 @@ class ProviderTimeout(ProviderError):
 class ProviderAuthenticationFailure(ProviderError):
     def __init__(self, message: str, **kwargs: Any) -> None:
         super().__init__(ProviderFailureKind.AUTHENTICATION_FAILURE, message, **kwargs)
+
+
+class ProviderRequestRejected(ProviderError):
+    def __init__(self, message: str, *, status_code: int | None = None, **kwargs: Any) -> None:
+        super().__init__(ProviderFailureKind.REQUEST_REJECTED, message, status_code=status_code, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -286,7 +296,7 @@ def response_from_legacy(value: dict[str, Any], *, provider: str, model: str, ca
 
 
 __all__ = [
-    "CapabilityUnsupported", "InvalidModelResponse", "ProviderAuthenticationFailure", "ProviderError",
+    "CapabilityUnsupported", "InvalidModelResponse", "ProviderAuthenticationFailure", "ProviderError", "ProviderRequestRejected",
     "ProviderFailure", "ProviderFailureKind", "ProviderResponse", "ProviderTimeout", "ProviderCapabilities", "ToolCall",
     "MAX_PROVIDER_RESPONSE_BYTES", "MAX_PROVIDER_TEXT_CHARS", "MAX_PROVIDER_TOOL_CALLS",
     "MAX_PROVIDER_TOOL_NAME_CHARS", "MAX_PROVIDER_CALL_ID_CHARS", "MAX_PROVIDER_ARGUMENT_BYTES",

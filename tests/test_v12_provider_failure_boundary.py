@@ -26,6 +26,7 @@ from agent.provider_api import (
     ProviderAuthenticationFailure,
     ProviderCapabilities,
     ProviderFailure,
+    ProviderRequestRejected,
     ProviderResponse,
     ProviderTimeout,
     ToolCall,
@@ -171,7 +172,7 @@ def test_model_router_shares_hard_text_limit_for_typed_and_legacy_responses(lega
     assert len(router.generate([])["content"]) == MAX_PROVIDER_TEXT_CHARS
 
     provider.content = "x" * (MAX_PROVIDER_TEXT_CHARS + 1) + "RESPONSE_SENTINEL"
-    with pytest.raises(ProviderFailure) as caught:
+    with pytest.raises(InvalidModelResponse) as caught:
         router.generate([])
 
     assert caught.value.attempts[0]["kind"] == "INVALID_MODEL_RESPONSE"
@@ -384,7 +385,7 @@ def test_router_classifies_failover_attempts_and_redacts_error_bodies():
         router.generate([])
 
     assert caught.value.attempts == (
-        {"provider": "auth-provider", "model": "model-a", "kind": "AUTHENTICATION_FAILURE"},
+        {"provider": "auth-provider", "model": "model-a", "kind": "AUTHENTICATION_FAILURE", "http_status": "401"},
         {"provider": "timeout-provider", "model": "model-b", "kind": "TIMEOUT"},
     )
     assert isinstance(ModelRouter._classify(unauthorized, first), ProviderAuthenticationFailure)
@@ -394,6 +395,28 @@ def test_router_classifies_failover_attempts_and_redacts_error_bodies():
     assert all("failure_reason" not in row for row in router.last_trace)
     assert [row["failure_kind"] for row in router.last_trace] == ["AUTHENTICATION_FAILURE", "TIMEOUT"]
     assert all("PRIVATE_PROVIDER_BODY_DO_NOT_PERSIST" not in repr(row) for row in router.last_trace)
+
+
+def test_router_preserves_http400_request_rejection_without_retrying_or_persisting_body():
+    raw_private_body = b"PRIVATE_PROVIDER_BODY_DO_NOT_PERSIST"
+    rejected = urllib.error.HTTPError("https://provider.invalid", 400, "bad request", None, io.BytesIO(raw_private_body))
+    provider = _FailingProvider("local_llama_cpp", "qwen3-4b-q4-k-m", rejected)
+    router = ModelRouter([provider])
+
+    with pytest.raises(ProviderRequestRejected) as caught:
+        router.generate([], timeout=2)
+
+    assert caught.value.status_code == 400
+    assert caught.value.attempts == (
+        {"provider": "local_llama_cpp", "model": "qwen3-4b-q4-k-m", "kind": "REQUEST_REJECTED", "http_status": "400"},
+    )
+    assert "HTTP 400" in str(caught.value)
+    assert "PRIVATE_PROVIDER_BODY_DO_NOT_PERSIST" not in str(caught.value)
+    assert router.last_trace[0]["failure_kind"] == "REQUEST_REJECTED"
+    assert router.last_trace[0]["http_status"] == 400
+    assert isinstance(ModelRouter._classify(rejected, provider), ProviderRequestRejected)
+    server_error = urllib.error.HTTPError("https://provider.invalid", 503, "unavailable", None, io.BytesIO(b"private"))
+    assert isinstance(ModelRouter._classify(server_error, provider), ProviderFailure)
 
 
 def test_router_fails_over_once_per_provider_with_shared_deadline_and_trusted_identity():

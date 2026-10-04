@@ -278,6 +278,11 @@ class RouterNativeModel:
         self.trusted_model = ""
         self.trusted_capability = ""
 
+    @property
+    def context_length(self) -> int | None:
+        value = getattr(self.router, "context_length", None)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
     def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int, timeout_seconds: float | None = None) -> ModelTurn:
         payload = [item.to_dict() for item in messages]
         timeout_kwargs: dict[str, Any] = {}

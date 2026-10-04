@@ -111,6 +111,7 @@ class LlamaCppRuntime:
             streaming=False,
             structured_output=False,
             priority=0,
+            context_length=spec.context_length,
         )
         self.provider.capabilities = ProviderCapabilities(
             generate=True,
