@@ -31,6 +31,7 @@ PAYLOAD_FILES = (
     "docs/SECURITY_MODEL.md",
     "docs/DESKTOP_ARCHITECTURE.md",
     "docs/DESKTOP_BACKEND_CONTRACT.md",
+    "docs/LOCAL_MODEL_ARTIFACTS.md",
     "scripts/backup_state.sh",
     "scripts/install_compose.sh",
     "scripts/package_release.py",
@@ -39,6 +40,7 @@ PAYLOAD_FILES = (
     "scripts/state_archive.py",
 )
 EXCLUDED_TOP_LEVEL = {".github", "diagnostics", "docs", "evaluation", "tests"}
+EXCLUDED_ANY_LEVEL = {"diagnostics", "tests"}
 EXCLUDED_FILES = {
     ".env.agent.example",
     "firebase.json",
@@ -152,7 +154,7 @@ def _source_files(root: Path) -> list[Path]:
             continue
         relative = raw.decode("utf-8")
         path = PurePosixPath(relative)
-        if not path.parts or path.parts[0] in EXCLUDED_TOP_LEVEL:
+        if not path.parts or path.parts[0] in EXCLUDED_TOP_LEVEL or EXCLUDED_ANY_LEVEL.intersection(path.parts):
             continue
         if relative in EXCLUDED_FILES or relative.startswith(".git/"):
             continue

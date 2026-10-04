@@ -55,8 +55,9 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - name: Install Python test and bundling dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-desktop-build.txt
-      - name: Unit, integration, security, and regression tests
-        run: python -m pytest -q
+      # The full suite (including POSIX process/signal and /proc tests) runs in tests.yml on Ubuntu.
+      - name: Windows-portable API, project, model, and security tests
+        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py
       - name: Install locked Electron toolchain
         working-directory: desktop
         run: npm ci --no-audit --no-fund

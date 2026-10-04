@@ -81,6 +81,7 @@ def test_release_bundle_contains_versioned_image_and_verified_payload(tmp_path: 
         "desktop/package-lock.json",
         "docs/DESKTOP_ARCHITECTURE.md",
         "docs/DESKTOP_BACKEND_CONTRACT.md",
+        "docs/LOCAL_MODEL_ARTIFACTS.md",
     ):
         assert f"{root_name}{relative}" in names
     assert not any("/diagnostics/" in name or "/tests/" in name for name in names)
