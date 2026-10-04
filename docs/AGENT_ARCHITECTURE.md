@@ -14,7 +14,7 @@ Bridge authentication
   -> evidence and audit response
 ```
 
-The bridge accepts `X-CyberSentinel-Token` only for the local HTTP channel. Owner authority requires `X-CyberSentinel-Owner-Token`, which is checked against `OWNER_TOKEN`. There is no fallback between the two credentials.
+`X-CyberSentinel-Token` authenticates only the local bridge transport. Owner identity is established through the username/password bootstrap and login flow and a server-managed session. Protected internal mission routes revalidate that session through `X-CyberSentinel-Owner-Session`; the Desktop/public API uses HttpOnly session cookies and CSRF protection for writes. There is no runtime `OWNER_TOKEN` credential, and bridge transport authentication never grants Owner authority.
 
 `AgentRuntime.plan()` is the only planner entry point. It supplies the authenticated Owner policy context to an optional OpenAI-compatible model. A model can propose a plan, but it cannot execute tools or authorize itself. `tools/registry.py` is the single source of tool metadata, handlers, risk classes, and argument schemas; `security/authorization.py` applies the registry policy, maximum argument length, and maximum plan size before execution.
 

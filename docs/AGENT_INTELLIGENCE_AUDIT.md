@@ -4,6 +4,8 @@ Generated at: `2026-09-21T16:54:18.542109+00:00`
 Commit: `de5c2c513648de7f552225681e39364717d1549f`
 Baseline: `25307b88960d7e9a04cb9ce14c3b00b8fbcee41e` with 276 tests before this upgrade.
 
+> **Historical report; not 5.0.0 release-gate evidence.** All provider status, real-provider probes, and mission results below apply only to the dated run and commit shown above. They do not establish provider configuration or live-provider behavior for the current release branch. Current-release provider verification is reported only when the opt-in live-provider harness is run on that exact candidate with explicitly authorized credentials and a compatible router factory; the V14 candidate's long-horizon case was skipped because those inputs were unavailable, and no live provider was contacted.
+
 ## Scope
 
 This report records the adaptive-loop audit. It does not claim production readiness, full autonomy, or super-intelligence. External knowledge, model output, memory, and tool results remain untrusted data or proposals; Owner Instruction and deterministic enforcement remain authoritative.

@@ -4,6 +4,8 @@
 **Baseline commit:** `f1ed9ae21fe5ff9e806daebc76db8be549ccbe74`
 **Scope:** Secure browser boundary and reviewable deployment artifacts only. No Firebase project creation, Firebase login, Cloud Run deployment, billing change, production secret, or provider credential is included.
 
+> **Historical design baseline — superseded for the 5.0.0 release branch.** This file describes an earlier Firebase/public-cloud proposal and its unresolved decisions; it is not the implementation contract or deployment guide for the current local/Desktop public gateway. Its `OWNER_TOKEN` and Firebase assumptions are historical and do not describe current runtime behavior. For the implemented 5.0.0 boundary, see [Desktop/backend contract](DESKTOP_BACKEND_CONTRACT.md), [Desktop architecture](DESKTOP_ARCHITECTURE.md), and [operations](OPERATIONS.md). The 5.0.0 candidate does not deploy Firebase, Cloud Run, or a public website.
+
 ## 1. Request flow
 
 The target request path is:
