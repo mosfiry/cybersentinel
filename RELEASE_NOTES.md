@@ -21,4 +21,6 @@ The release candidate is generated from an exact source commit and its Docker im
 
 The Windows x64 Desktop installer and portable executable are built by a separate branch-scoped workflow. The local Linux smoke package validates the Electron archive contents, but it is not a native Windows runtime rehearsal; no Windows GUI execution is claimed.
 
-The final V14 release gate remains outstanding. Do not treat these files as a public release or create a final tag until the owner separately confirms the exact proposed tag and artifact hashes.
+The workflow disables signing-identity auto-discovery and supplies no code-signing identity; the Windows executables are unsigned candidates. Windows may show publisher or SmartScreen warnings.
+
+The V14 gate assessment records 33 of 34 conditions passing; `provider works` remains **PARTIAL** because no live-provider key/router factory is configured in this session. Gate evidence is SHA-bound, so verify the hosted checks for the exact artifact source commit. No final tag (`v5.0.0`), public release, registry publication, or production deployment has been created. Do not treat these files as a public release or as publication approval.

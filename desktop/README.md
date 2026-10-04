@@ -52,6 +52,10 @@ workflow builds both x64 targets on `windows-latest`, uses
 workflow artifact subject to the repository's access controls. This is not a
 public release or a final tag.
 
+The workflow disables signing-identity auto-discovery and does not provide a
+code-signing identity, so both executables are unsigned. Windows may show
+publisher or SmartScreen warnings; do not treat these files as code-signed.
+
 The executable contains the Electron shell only. The Python runtime, repository,
 requirements, private configuration, and state must be installed/provisioned
 separately. Current packaging support is Windows x64 only; no macOS or Linux
