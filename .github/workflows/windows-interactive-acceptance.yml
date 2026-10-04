@@ -28,10 +28,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $repo = 'mosfiry/cybersentinel'
-          $sourceSha = 'aa2e3aa811df7fa1551b2d13e92ff50c542d53da'
-          $artifactId = 11307277832
-          $buildRunId = 37213148361
-          $artifactName = 'cybersentinel-windows-installer-aa2e3aa811df7fa1551b2d13e92ff50c542d53da'
+          $sourceSha = '26739d9b01b3b1ff492854e7e21789be20b1be0e'
+          $artifactId = 11313817188
+          $buildRunId = 37231291821
+          $artifactName = 'cybersentinel-windows-installer-26739d9b01b3b1ff492854e7e21789be20b1be0e'
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
             Accept = 'application/vnd.github+json'
@@ -67,18 +67,18 @@ jobs:
       - name: Download exact existing artifact (no rebuild)
         uses: actions/download-artifact@v4
         with:
-          name: cybersentinel-windows-installer-aa2e3aa811df7fa1551b2d13e92ff50c542d53da
+          name: cybersentinel-windows-installer-26739d9b01b3b1ff492854e7e21789be20b1be0e
           path: acceptance-evidence\downloaded-artifact
           repository: mosfiry/cybersentinel
-          run-id: 37213148361
+          run-id: 37231291821
           github-token: ${{ github.token }}
 
       - name: Verify downloaded executable, sidecar, and source manifest
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $expectedSha = '0f902af535df717cc7dc3777f01410cf35f7ed573fe73cfcecbd69d946fc4f75'
-          $expectedSource = 'aa2e3aa811df7fa1551b2d13e92ff50c542d53da'
+          $expectedSha = '36e4149afa27b996fa487d874476ea3064d82827ce6e8c94ef820bd951eaf36e'
+          $expectedSource = '26739d9b01b3b1ff492854e7e21789be20b1be0e'
           $exe = Resolve-Path 'acceptance-evidence\downloaded-artifact\CyberSentinel-Setup-5.1.0.exe'
           $actualSha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           $sidecar = (Get-Content -Raw -LiteralPath ($exe.Path + '.sha256')).Trim().Split(' ')[0].ToLowerInvariant()
@@ -93,7 +93,7 @@ jobs:
         run: |
           .\acceptance\Invoke-CyberSentinelWindowsAcceptance.ps1 `
             -InstallerPath (Resolve-Path 'acceptance-evidence\downloaded-artifact\CyberSentinel-Setup-5.1.0.exe').Path `
-            -ExpectedSha256 '0f902af535df717cc7dc3777f01410cf35f7ed573fe73cfcecbd69d946fc4f75' `
+            -ExpectedSha256 '36e4149afa27b996fa487d874476ea3064d82827ce6e8c94ef820bd951eaf36e' `
             -EvidenceDirectory (Join-Path $PWD 'acceptance-evidence\windows-ui')
 
       - name: Upload logs, screenshots, and machine-readable evidence only

@@ -1,15 +1,15 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
 
-    [string]$ExpectedSha256 = "0f902af535df717cc7dc3777f01410cf35f7ed573fe73cfcecbd69d946fc4f75",
+    [string]$ExpectedSha256 = "36e4149afa27b996fa487d874476ea3064d82827ce6e8c94ef820bd951eaf36e",
 
     [string]$EvidenceDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
-$ExpectedSourceCommit = "aa2e3aa811df7fa1551b2d13e92ff50c542d53da"
+$ExpectedSourceCommit = "26739d9b01b3b1ff492854e7e21789be20b1be0e"
 $ExpectedInstallerName = "CyberSentinel-Setup-5.1.0.exe"
 $script:Checks = [System.Collections.Generic.List[object]]::new()
 $script:CdpSocket = $null
@@ -19,6 +19,7 @@ $script:Evidence = $null
 $script:InstallRoot = $null
 $script:ProfileRoot = $null
 $script:ProjectName = $null
+$script:CanonicalUsername = $null
 $script:Password = $null
 $script:Port = $null
 $script:TranscriptStarted = $false
@@ -71,6 +72,8 @@ JSON.stringify((() => {
     runtimeText: document.querySelector('#runtimeState')?.textContent?.trim() || '',
     authText: document.querySelector('#authState')?.textContent?.trim() || '',
     authMessage: document.querySelector('#authMessage')?.textContent?.trim() || '',
+    ownerUsername: document.querySelector('#setupOwnerUsername')?.textContent?.trim() || '',
+    loginUsername: document.querySelector('#loginUsername')?.value?.trim() || '',
     ownerMessage: document.querySelector('#ownerSetupMessage')?.textContent?.trim() || '',
     projectText: document.querySelector('#projectList')?.textContent?.trim() || '',
     projectMessage: document.querySelector('#projectMessage')?.textContent?.trim() || '',
@@ -395,10 +398,15 @@ public static class CyberSentinelAcceptanceNative {
     $ownerFormDiagnostics = [string](Invoke-CdpEvaluation -Expression $ownerSetupExpression) | ConvertFrom-Json
     Write-Event -Event "owner_form_pre_submit" -Data @{ password_length = $ownerFormDiagnostics.passwordLength; confirmation_matches = $ownerFormDiagnostics.confirmationMatches; form_valid = $ownerFormDiagnostics.formValid }
     if (-not $ownerFormDiagnostics.formReady -or -not $ownerFormDiagnostics.confirmationMatches -or -not $ownerFormDiagnostics.formValid) { throw "First Run owner form was unavailable or invalid before submission." }
-    $ownerReady = Wait-ForUi -TimeoutSeconds 60 -Description "local Owner creation from the First Run form" -Condition {
-        param($s) (-not $s.firstRunVisible) -and $s.authText -match 'owner'
+    $script:CanonicalUsername = [string]$firstRun.ownerUsername
+    if ([string]::IsNullOrWhiteSpace($script:CanonicalUsername) -or $firstRun.loginUsername -ne $script:CanonicalUsername) {
+        throw "The visible canonical Owner username and login field do not match: visible='$($firstRun.ownerUsername)' login='$($firstRun.loginUsername)'."
     }
-    Add-Check -Name "First Run Owner setup" -Status "PASS" -Details "Owner was created through the visible First Run form; credentials are temporary and are not written to logs."
+    Write-Event -Event "canonical_owner_username_verified" -Data @{ username = $script:CanonicalUsername }
+    $ownerReady = Wait-ForUi -TimeoutSeconds 60 -Description "local Owner creation from the First Run form" -Condition {
+        param($s) (-not $s.firstRunVisible) -and $s.authText -like "*$($script:CanonicalUsername)*"
+    }
+    Add-Check -Name "First Run Owner setup and canonical login" -Status "PASS" -Details "Owner '$($script:CanonicalUsername)' was created and authenticated through the visible First Run form; credentials are temporary and are not written to logs."
 
     $projectJson = ConvertTo-Json -InputObject $script:ProjectName -Compress
     $createProjectExpression = "(() => { const n = document.querySelector('#newProjectToggle'); if (!n) return false; n.click(); const name = document.querySelector('#projectName'); if (!name) return false; name.value = $projectJson; name.dispatchEvent(new Event('input',{bubbles:true})); const form = document.querySelector('#projectForm'); form.requestSubmit(); return true; })()"
@@ -430,13 +438,17 @@ public static class CyberSentinelAcceptanceNative {
     Start-InstalledApp
     $reopened = Connect-AppUi
     $persisted = Wait-ForUi -TimeoutSeconds 90 -Description "First Run remaining completed after reopen" -Condition {
-        param($s) (-not $s.firstRunVisible) -and $s.runtimeText -match '●'
+        param($s) (-not $s.firstRunVisible) -and $s.runtimeText -match '●' -and $s.ownerUsername -eq $script:CanonicalUsername -and $s.loginUsername -eq $script:CanonicalUsername
     }
-    if ($persisted.authText -notmatch 'owner') {
-        $loginExpression = "(() => { const u = document.querySelector('#loginUsername'); const p = document.querySelector('#loginPassword'); const f = document.querySelector('#loginForm'); if (!u || !p || !f) return false; u.value = 'owner'; p.value = $passwordJson; u.dispatchEvent(new Event('input',{bubbles:true})); p.dispatchEvent(new Event('input',{bubbles:true})); f.requestSubmit(); return true; })()"
+    if ($persisted.authText -notlike "*$($script:CanonicalUsername)*") {
+        if ($persisted.loginUsername -ne $script:CanonicalUsername) {
+            throw "The reopened login field does not contain the canonical Owner username."
+        }
+        $usernameJson = ConvertTo-Json -InputObject $script:CanonicalUsername -Compress
+        $loginExpression = "(() => { const u = document.querySelector('#loginUsername'); const p = document.querySelector('#loginPassword'); const f = document.querySelector('#loginForm'); if (!u || !p || !f) return false; u.value = $usernameJson; p.value = $passwordJson; u.dispatchEvent(new Event('input',{bubbles:true})); p.dispatchEvent(new Event('input',{bubbles:true})); f.requestSubmit(); return true; })()"
         if (-not (Invoke-CdpEvaluation -Expression $loginExpression)) { throw "Reopened app login form was unavailable." }
         $persisted = Wait-ForUi -TimeoutSeconds 45 -Description "Owner re-login after restart" -Condition {
-            param($s) $s.authText -match 'owner'
+            param($s) $s.authText -like "*$($script:CanonicalUsername)*"
         }
     }
     if ($persisted.projectText -notlike "*$($script:ProjectName)*") {

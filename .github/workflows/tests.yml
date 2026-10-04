@@ -2,6 +2,8 @@ name: tests
 
 on:
   push:
+    branches-ignore:
+      - acceptance/windows-interactive-20261004
   pull_request:
 
 concurrency:
