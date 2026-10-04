@@ -96,11 +96,19 @@ jobs:
             -ExpectedSha256 '0f902af535df717cc7dc3777f01410cf35f7ed573fe73cfcecbd69d946fc4f75' `
             -EvidenceDirectory (Join-Path $PWD 'acceptance-evidence\windows-ui')
 
-      - name: Upload logs, screenshots, and machine-readable evidence
+      - name: Upload logs, screenshots, and machine-readable evidence only
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-interactive-acceptance-evidence-${{ github.run_id }}
-          path: acceptance-evidence\
+          path: |
+            acceptance-evidence/github-provenance.json
+            acceptance-evidence/artifact-verification.json
+            acceptance-evidence/windows-ui/acceptance-result.json
+            acceptance-evidence/windows-ui/acceptance.jsonl
+            acceptance-evidence/windows-ui/machine.json
+            acceptance-evidence/windows-ui/powershell-transcript.txt
+            acceptance-evidence/windows-ui/persisted-profile-files.json
+            acceptance-evidence/windows-ui/*.png
           if-no-files-found: warn
           retention-days: 30

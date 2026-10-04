@@ -70,6 +70,7 @@ JSON.stringify((() => {
     modelCards: cards,
     runtimeText: document.querySelector('#runtimeState')?.textContent?.trim() || '',
     authText: document.querySelector('#authState')?.textContent?.trim() || '',
+    authMessage: document.querySelector('#authMessage')?.textContent?.trim() || '',
     ownerMessage: document.querySelector('#ownerSetupMessage')?.textContent?.trim() || '',
     projectText: document.querySelector('#projectList')?.textContent?.trim() || '',
     projectMessage: document.querySelector('#projectMessage')?.textContent?.trim() || '',
@@ -351,7 +352,7 @@ public static class CyberSentinelAcceptanceNative {
     $randomGenerator = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
     $randomGenerator.GetBytes($random)
     $randomGenerator.Dispose()
-    $script:Password = [Convert]::ToBase64String($random)
+    $script:Password = "CSWinAccept" + [BitConverter]::ToString($random).Replace("-", "")
     [Array]::Clear($random, 0, $random.Length)
 
     Start-InstalledApp
@@ -390,8 +391,10 @@ public static class CyberSentinelAcceptanceNative {
     }
 
     $passwordJson = ConvertTo-Json -InputObject $script:Password -Compress
-    $ownerSetupExpression = "(() => { const p = $passwordJson; const a = document.querySelector('#ownerSetupPassword'); const b = document.querySelector('#ownerSetupConfirm'); if (!a || !b) return false; a.value = p; b.value = p; a.dispatchEvent(new Event('input',{bubbles:true})); b.dispatchEvent(new Event('input',{bubbles:true})); document.querySelector('#ownerSetupForm').requestSubmit(); return true; })()"
-    if (-not (Invoke-CdpEvaluation -Expression $ownerSetupExpression)) { throw "First Run owner form was unavailable." }
+    $ownerSetupExpression = "(() => { const p = $passwordJson; const a = document.querySelector('#ownerSetupPassword'); const b = document.querySelector('#ownerSetupConfirm'); const f = document.querySelector('#ownerSetupForm'); if (!a || !b || !f) return JSON.stringify({formReady:false}); a.value = p; b.value = p; a.dispatchEvent(new Event('input',{bubbles:true})); b.dispatchEvent(new Event('input',{bubbles:true})); const d = {formReady:true,passwordLength:a.value.length,confirmationMatches:a.value === b.value,formValid:f.checkValidity()}; f.requestSubmit(); return JSON.stringify(d); })()"
+    $ownerFormDiagnostics = [string](Invoke-CdpEvaluation -Expression $ownerSetupExpression) | ConvertFrom-Json
+    Write-Event -Event "owner_form_pre_submit" -Data @{ password_length = $ownerFormDiagnostics.passwordLength; confirmation_matches = $ownerFormDiagnostics.confirmationMatches; form_valid = $ownerFormDiagnostics.formValid }
+    if (-not $ownerFormDiagnostics.formReady -or -not $ownerFormDiagnostics.confirmationMatches -or -not $ownerFormDiagnostics.formValid) { throw "First Run owner form was unavailable or invalid before submission." }
     $ownerReady = Wait-ForUi -TimeoutSeconds 60 -Description "local Owner creation from the First Run form" -Condition {
         param($s) (-not $s.firstRunVisible) -and $s.authText -match 'owner'
     }
