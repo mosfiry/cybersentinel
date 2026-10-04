@@ -6,8 +6,9 @@
 - Python 3.12 or newer with repository dependencies installed:
   `python -m pip install -r requirements.txt` from the repository root.
 - The CyberSentinel repository. For packaged installs, set `CYBERSENTINEL_REPO`
-  to its location or launch the shell with the repository root as its working
-  directory; an installed shell does not bundle the backend.
+  to its location; the packaged shell refuses to discover a backend from an
+  arbitrary working directory. Development builds may use the repository-root
+  working directory. The installed shell does not bundle the backend.
 - A private repository `.env` containing `BRIDGE_TOKEN` (at least 32 random
   characters) or the supported file-backed bridge-token configuration. Python
   loads private settings itself; Electron does not parse `.env` or forward
@@ -56,3 +57,8 @@ requirements, private configuration, and state must be installed/provisioned
 separately. Current packaging support is Windows x64 only; no macOS or Linux
 graphical package is claimed. CI builds the artifacts but does not execute the
 `.exe` or perform an interactive Windows runtime rehearsal.
+
+The public workspace file-list, file-view, and Git-summary endpoints fail closed
+with an unsupported response on Windows until equivalent handle-relative
+no-follow path access is available. Mission operations and other supported
+Owner APIs remain separate.

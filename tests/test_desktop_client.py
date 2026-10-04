@@ -37,6 +37,13 @@ def test_desktop_shell_runs_the_existing_bridge_and_loads_the_served_ui():
     assert "/api/health" in MAIN
 
 
+def test_packaged_desktop_requires_an_explicit_repository_path():
+    repo_root = MAIN.split("function repoRoot()", 1)[1].split("\n}", 1)[0]
+    assert "process.env[REPO_ENV_KEY]" in repo_root
+    assert "if (!app.isPackaged)" in repo_root
+    assert repo_root.index("if (!app.isPackaged)") < repo_root.index("process.cwd()")
+
+
 def test_desktop_does_not_invent_or_weaken_credentials():
     # No token/credential values are read from .env, passed by Electron, or
     # exposed to the renderer. Python loads its own private configuration.

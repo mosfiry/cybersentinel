@@ -400,3 +400,43 @@ def test_public_provider_summary_is_sanitized_and_bounded(public_server, monkeyp
 )
 def test_git_remote_redaction_covers_userinfo_and_secret_query_parameters(remote, expected):
     assert bridge._redact_git_remote(remote) == expected
+
+
+@pytest.mark.parametrize(
+    ("action", "suffix", "capability"),
+    (
+        ("files", "/files?path=.", "workspace_read"),
+        ("file", "/file?path=secret.txt", "workspace_read"),
+        ("git", "/git?operation=diff", "git_read"),
+    ),
+)
+def test_public_workspace_views_fail_closed_without_secure_descriptor_support(
+    public_server, monkeypatch, action, suffix, capability
+):
+    cookie, _csrf = _owner_session(public_server)
+    workspace = SimpleNamespace(
+        supports_secure_public_workspace_access=action == "git",
+        supports_secure_public_git_access=False,
+        close=lambda: None,
+    )
+
+    def workspace_for_mission(_handler, mission_id, _owner, requested_capability):
+        assert mission_id == "mission-1"
+        assert requested_capability == capability
+        return SimpleNamespace(mission_id=mission_id), object(), workspace
+
+    monkeypatch.setattr(bridge.Handler, "_workspace_for_mission", workspace_for_mission)
+    status, payload, _headers = _request(
+        public_server,
+        "GET",
+        f"/api/public/workspace/mission-1{suffix}",
+        headers={"Cookie": cookie},
+    )
+    assert status == 501
+    assert payload == {"ok": False, "error": "secure_workspace_access_unavailable"}
+
+
+def test_ui_explains_secure_workspace_views_unavailable():
+    source = Path("web/app.js").read_text(encoding="utf-8")
+    assert "secure_workspace_access_unavailable:" in source
+    assert "عرض مساحة العمل غير متاح على هذا النظام" in source

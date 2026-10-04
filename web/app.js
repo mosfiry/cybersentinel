@@ -89,6 +89,7 @@ function errorText(error) {
     public_boundary_disabled: "واجهة المتصفح معطلة في إعدادات الخدمة.",
     unknown_mission: "المهمة غير موجودة أو غير متاحة لهذا الحساب.",
     not_found: "المورد غير موجود أو محجوب بسياسة مساحة العمل.",
+    secure_workspace_access_unavailable: "عرض مساحة العمل غير متاح على هذا النظام لأن الوصول الآمن للمجلدات غير مدعوم.",
   };
   return messages[error.message] || `تعذر إكمال الطلب: ${error.message || "خطأ غير معروف"}`;
 }

@@ -9,7 +9,7 @@ This contract describes the Desktop shell and the hardened backend integration o
 - Electron passes a reviewed allowlist of non-secret environment settings. It does not parse `.env` or forward credential values. Python loads the private `.env` and file-backed secrets itself; the Desktop deployment requires a private `.env` containing `BRIDGE_TOKEN` (or the supported secret-file configuration).
 - Electron and the renderer do not receive Owner session tokens. The renderer uses same-origin cookies, `HttpOnly`, `Secure`, `SameSite=Lax`, and CSRF protection.
 - On Desktop shutdown, Electron sends a private command over the child process's stdin pipe. The bridge stops the worker and HTTP service; Electron waits for process exit and force-terminates only after a 10-second grace period.
-- The packaged `.exe` contains the Electron shell, not the Python backend, repository, or virtual environment. Python 3.12+ and a separately provisioned CyberSentinel repository/dependencies are required. This workflow builds Windows x64 installer and portable artifacts; it does not certify macOS or Linux GUI packaging.
+- The packaged `.exe` contains the Electron shell, not the Python backend, repository, or virtual environment. Python 3.12+ and a separately provisioned CyberSentinel repository/dependencies are required; packaged launches must set `CYBERSENTINEL_REPO`. This workflow builds Windows x64 installer and portable artifacts; it does not certify macOS or Linux GUI packaging.
 
 ## Public API
 
@@ -28,9 +28,9 @@ This contract describes the Desktop shell and the hardened backend integration o
 | `/api/public/missions/<id>/<status\|timeline\|evidence\|artifacts\|logs\|report\|effects>` | GET | Owner session; rejects unbound legacy missions; returns server records only. |
 | `/api/public/missions/<id>/<start\|resume\|pause\|cancel>` | POST | Owner session + CSRF; delegates to MissionService owner authorization/revalidation. |
 | `/api/public/missions/<id>/effects/<effect-id>/reconcile` | POST | Owner session + CSRF; requires a specific ledger effect, an allowed reconciliation outcome, and a non-empty evidence reference of at most 512 characters. Owner statements are not independent proof of goal completion. |
-| `/api/public/workspace/<id>/files?path=...` | GET | Owner session; read-only descriptor-relative listing, at most 500 entries; symlinks and sensitive paths are excluded. |
-| `/api/public/workspace/<id>/file?path=...` | GET | Owner session; read-only bounded UTF-8 file view, maximum 256 KiB; symlinks, escapes, and sensitive paths are rejected. |
-| `/api/public/workspace/<id>/git?operation=...` | GET | Owner session; fixed read-only operations only: `status`, `branch`, `log`, `diff`, `repository`, `head`, `remote`. No arbitrary arguments or mutations; optional index writes, fsmonitor, pager, external diff, and textconv are disabled; remote URL user-info and recognized secret query values are redacted. |
+| `/api/public/workspace/<id>/files?path=...` | GET | Owner session; read-only descriptor-relative listing, at most 500 entries; symlinks and sensitive paths are excluded. Returns `501 secure_workspace_access_unavailable` unless secure descriptor-relative no-follow support is available. |
+| `/api/public/workspace/<id>/file?path=...` | GET | Owner session; read-only bounded UTF-8 file view, maximum 256 KiB; symlinks, escapes, and sensitive paths are rejected. Returns `501 secure_workspace_access_unavailable` unless secure descriptor-relative no-follow support is available. |
+| `/api/public/workspace/<id>/git?operation=...` | GET | Owner session; fixed read-only operations only: `status`, `branch`, `log`, `diff`, `repository`, `head`, `remote`. No arbitrary arguments or mutations; optional index writes, fsmonitor, pager, external diff, and textconv are disabled; remote URL user-info and recognized secret query values are redacted. Returns `501 secure_workspace_access_unavailable` unless secure descriptor-relative workspace/cwd support is available. |
 
 All write routes validate same-origin/Origin and CSRF, and require server-side Owner authorization. Public health is informational; it does not authenticate a user. Responses use stable, explicit error codes and do not expose stack traces.
 

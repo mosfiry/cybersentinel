@@ -452,6 +452,16 @@ class Handler(BaseHTTPRequestHandler):
             capability = "git_read" if action == "git" else "workspace_read"
             try:
                 mission, _snapshot, workspace = self._workspace_for_mission(mission_id, owner, capability)
+                secure_access = (
+                    workspace.supports_secure_public_git_access
+                    if action == "git"
+                    else workspace.supports_secure_public_workspace_access
+                )
+                if action in {"files", "file", "git"} and not secure_access:
+                    return self._send(501, {
+                        "ok": False,
+                        "error": "secure_workspace_access_unavailable",
+                    })
                 root = workspace.root
                 if action == "files":
                     directory = workspace.resolve(relative)

@@ -123,3 +123,27 @@ def test_git_readonly_disables_repository_fsmonitor_and_optional_writes(tmp_path
         assert "core.untrackedCache=false" in result.command
     finally:
         workspace.close()
+
+
+def test_secure_public_workspace_capability_fails_closed_without_dir_fd(tmp_path: Path) -> None:
+    workspace = _authorized_workspace(tmp_path)
+    try:
+        workspace._supports_dir_fd = False
+        assert workspace.supports_secure_public_workspace_access is False
+    finally:
+        workspace.close()
+
+
+def test_secure_public_git_capability_requires_proc_fd(tmp_path: Path, monkeypatch) -> None:
+    workspace = _authorized_workspace(tmp_path)
+    original_isdir = os.path.isdir
+    try:
+        assert workspace.supports_secure_public_workspace_access
+        monkeypatch.setattr(
+            os.path,
+            "isdir",
+            lambda path: False if str(path) == "/proc/self/fd" else original_isdir(path),
+        )
+        assert workspace.supports_secure_public_git_access is False
+    finally:
+        workspace.close()

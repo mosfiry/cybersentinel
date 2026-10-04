@@ -13,7 +13,7 @@ The supported deployment target is a single-host Linux Docker Compose installati
 - SHA-256 session references, descriptor-relative filesystem/process protections, and DNS-pinned outbound provider requests.
 - Non-root container execution, read-only application filesystem, bounded logs, file-backed Compose secrets, isolated workspace initialization, and loopback-only host publishing.
 - Versioned SHA-256 state backup/verification/restore that rejects symlinks and path traversal and refuses non-empty restore targets; the clean-environment rehearsal also checks representative legacy schema migrations.
-- Optional Electron Desktop shell for Windows x64, using the same loopback Python bridge and Owner-authenticated API. The renderer gets no bearer token; the UI is limited to supported mission operations and bounded read-only workspace/Git views. The executable does not bundle Python, the repository, state, or backend secrets.
+- Optional Electron Desktop shell for Windows x64, using the same loopback Python bridge and Owner-authenticated API. The renderer gets no bearer token; packaged launches require a separately provisioned backend repository via `CYBERSENTINEL_REPO`. The executable does not bundle Python, the repository, state, or backend secrets. Workspace file/Git views fail closed on Windows until secure handle-relative path access is implemented.
 
 ## Verification and limits
 

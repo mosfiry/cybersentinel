@@ -2,9 +2,11 @@
 
 // CyberSentinel Desktop — Electron shell.
 //
-// Contract: the desktop application is a thin client over the existing
-// CyberSentinel backend. It starts the checked-in bridge server
-// (python bridge.py, loopback-only) and loads the served web client from
+// Contract: the desktop application is a thin client over a configured
+// CyberSentinel backend repository. Packaged builds require CYBERSENTINEL_REPO;
+// development builds can use the checked-out repository and working directory.
+// It starts that repository's bridge server (python bridge.py, loopback-only)
+// and loads the served web client from
 // http://127.0.0.1:<BRIDGE_PORT>/ so that the browser security contract
 // (same-origin, server-side Owner sessions, CSRF, HttpOnly cookies) is
 // preserved exactly. The desktop process never handles Owner credentials,
@@ -37,8 +39,10 @@ let shutdownComplete = false;
 function repoRoot() {
   const candidates = [];
   if (process.env[REPO_ENV_KEY]) candidates.push(process.env[REPO_ENV_KEY]);
-  candidates.push(path.resolve(app.getAppPath(), ".."));
-  candidates.push(process.cwd());
+  if (!app.isPackaged) {
+    candidates.push(path.resolve(app.getAppPath(), ".."));
+    candidates.push(process.cwd());
+  }
   for (const candidate of candidates) {
     try {
       if (fs.existsSync(path.join(candidate, "bridge.py"))) return candidate;

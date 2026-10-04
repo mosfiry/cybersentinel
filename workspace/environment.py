@@ -146,6 +146,22 @@ class Workspace:
         self.authorization_snapshot = authorization_snapshot
         self.evidence_store = evidence_store
 
+    @property
+    def supports_secure_public_workspace_access(self) -> bool:
+        """Whether public workspace listing and file reads avoid path races."""
+        return bool(
+            self._supports_dir_fd
+            and self._root_fd is not None
+            and getattr(os, "O_DIRECTORY", 0)
+            and getattr(os, "O_NOFOLLOW", 0)
+            and os.scandir in getattr(os, "supports_fd", set())
+        )
+
+    @property
+    def supports_secure_public_git_access(self) -> bool:
+        """Whether Git can use the already-open cwd without a path fallback."""
+        return self.supports_secure_public_workspace_access and os.path.isdir("/proc/self/fd")
+
     def resolve(self, relative: str | Path = ".") -> Path:
         candidate = Path(relative)
         if candidate.is_absolute():
