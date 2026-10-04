@@ -104,6 +104,34 @@ CREATE TABLE IF NOT EXISTS owner_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner ON owner_sessions(owner_id);
 CREATE INDEX IF NOT EXISTS idx_owner_sessions_status ON owner_sessions(status);
+
+CREATE TABLE IF NOT EXISTS workspace_projects (
+    project_id TEXT PRIMARY KEY,
+    owner_id INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE,
+    description TEXT NOT NULL DEFAULT '',
+    root_path TEXT NOT NULL,
+    location_kind TEXT NOT NULL DEFAULT 'managed',
+    is_default INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(owner_id, name),
+    FOREIGN KEY(owner_id) REFERENCES owner_accounts(owner_id)
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_projects_owner ON workspace_projects(owner_id, archived, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_projects_default ON workspace_projects(owner_id) WHERE is_default=1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_projects_owner_root ON workspace_projects(owner_id, root_path);
+
+CREATE TABLE IF NOT EXISTS mission_projects (
+    mission_id TEXT PRIMARY KEY,
+    owner_id INTEGER NOT NULL,
+    project_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(owner_id) REFERENCES owner_accounts(owner_id),
+    FOREIGN KEY(project_id) REFERENCES workspace_projects(project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mission_projects_owner ON mission_projects(owner_id, project_id);
 """
 
 def _migrate_legacy_owner_session_references(con: sqlite3.Connection) -> None:

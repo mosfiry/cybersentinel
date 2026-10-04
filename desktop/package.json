@@ -1,8 +1,8 @@
 {
   "name": "cybersentinel-desktop",
   "productName": "CyberSentinel",
-  "version": "5.0.0",
-  "description": "CyberSentinel X desktop shell over the existing loopback bridge and web client",
+  "version": "5.1.0",
+  "description": "CyberSentinel X Windows Desktop with bundled backend and offline-capable local inference",
   "author": "Mohammed Sfiry",
   "license": "UNLICENSED",
   "private": true,
@@ -10,7 +10,9 @@
   "scripts": {
     "icon": "node tools/make-icon.js",
     "start": "electron .",
-    "dist": "electron-builder --win nsis portable"
+    "check": "node --check main.js && node --check preload.js && node --check tools/make-icon.js",
+    "test:desktop": "node --test tests/*.test.js",
+    "dist": "electron-builder --win nsis --publish never"
   },
   "devDependencies": {
     "electron": "44.5.1",
@@ -30,22 +32,32 @@
       "main.js",
       "preload.js",
       "unavailable.html",
-      "build/icon.png"
+      "build/icon.png",
+      "build/icon.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "build/backend/cybersentinel-backend",
+        "to": "backend",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "build/llama",
+        "to": "llama",
+        "filter": ["**/*"]
+      }
     ],
     "win": {
-      "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "portable", "arch": ["x64"] }
-      ],
-      "icon": "build/icon.png"
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
       "artifactName": "CyberSentinel-Setup-${version}.exe"
-    },
-    "portable": {
-      "artifactName": "CyberSentinel-Portable-${version}.exe"
     }
   }
 }

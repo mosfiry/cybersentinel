@@ -1,6 +1,6 @@
 "use strict";
 
-// Generates desktop/build/icon.png (256x256) with no external dependencies.
+// Generates desktop/build/icon.png and a Windows-compatible PNG-backed ICO.
 // The icon is a dark engineering palette with a cyan sentinel diamond.
 // Run: node tools/make-icon.js   (from the desktop/ directory)
 
@@ -120,6 +120,22 @@ function makeIcon() {
   const outPath = path.join(outDir, "icon.png");
   fs.writeFileSync(outPath, png);
   process.stdout.write(`wrote ${outPath} (${png.length} bytes)\n`);
+
+  // ICO directory (6 bytes) + one 16-byte entry + the PNG payload. A zero
+  // width/height entry denotes 256x256; Windows supports PNG-compressed ICOs.
+  const directory = Buffer.alloc(6);
+  directory.writeUInt16LE(1, 2); // image type: icon
+  directory.writeUInt16LE(1, 4); // one image
+  const entry = Buffer.alloc(16);
+  entry[0] = 0; // 256 px
+  entry[1] = 0; // 256 px
+  entry.writeUInt16LE(1, 4); // planes
+  entry.writeUInt16LE(32, 6); // bits per pixel
+  entry.writeUInt32LE(png.length, 8);
+  entry.writeUInt32LE(directory.length + entry.length, 12);
+  const icoPath = path.join(outDir, "icon.ico");
+  fs.writeFileSync(icoPath, Buffer.concat([directory, entry, png]));
+  process.stdout.write(`wrote ${icoPath} (${png.length + directory.length + entry.length} bytes)\n`);
 }
 
 makeIcon();

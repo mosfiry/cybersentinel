@@ -36,9 +36,42 @@
         <small id="authMessage" role="status" aria-live="polite"></small>
       </section>
 
+      <section class="side-section" aria-labelledby="projectsTitle">
+        <h2 id="projectsTitle">المشاريع</h2>
+        <div id="projectList" class="project-list"><p class="muted">سجّل الدخول لتحميل المشاريع.</p></div>
+        <div class="project-actions">
+          <button id="newProjectToggle" type="button">مشروع جديد</button>
+          <button id="renameProject" type="button" disabled>إعادة تسمية</button>
+          <button id="archiveProject" type="button" disabled>أرشفة</button>
+        </div>
+        <form id="projectForm" class="project-form hidden">
+          <label for="projectName">اسم المشروع</label>
+          <input id="projectName" maxlength="80" required>
+          <label for="projectDescription">الوصف (اختياري)</label>
+          <textarea id="projectDescription" rows="2" maxlength="1000"></textarea>
+          <div class="project-actions">
+            <button type="submit">إنشاء مساحة مُدارة</button>
+            <button id="importProjectFolder" type="button">اختيار مجلد موجود…</button>
+            <button id="cancelProjectForm" type="button">إلغاء</button>
+          </div>
+          <small>اختيار مجلد موجود يفتح نافذة Windows الأصلية؛ يُحصر نطاق المهمة في ذلك المجلد.</small>
+        </form>
+        <form id="renameProjectForm" class="project-form hidden">
+          <label for="renameProjectName">الاسم الجديد</label>
+          <input id="renameProjectName" maxlength="80" required>
+          <div class="project-actions">
+            <button type="submit">حفظ الاسم</button>
+            <button id="cancelRenameProject" type="button">إلغاء</button>
+          </div>
+        </form>
+        <small id="projectMessage" role="status" aria-live="polite"></small>
+      </section>
+
       <section class="side-section" aria-labelledby="composeTitle">
         <h2 id="composeTitle">مهمة جديدة</h2>
         <form id="missionForm">
+          <label for="missionProject">المشروع</label>
+          <select id="missionProject" required></select>
           <label for="missionObjective">ماذا تريد أن تنجز؟</label>
           <textarea id="missionObjective" rows="3" maxlength="12000" required placeholder="صف هدف المهمة بلغة طبيعية…"></textarea>
           <button id="createMission" type="submit">إنشاء المهمة</button>
@@ -56,8 +89,10 @@
         <div class="side-links">
           <button type="button" data-side-view="files" disabled>الملفات</button>
           <button type="button" data-side-view="git" disabled>Git</button>
+          <button type="button" data-side-view="agents" disabled>تنفيذ المهمة</button>
           <button type="button" data-side-view="evidence" disabled>الأدلة</button>
-          <button type="button" data-side-view="findings" disabled>النتائج المرتبطة بالأدلة</button>
+          <button type="button" data-side-view="findings" disabled>النتائج</button>
+          <button type="button" data-side-view="report" disabled>التقرير</button>
           <button type="button" data-side-view="artifacts" disabled>المخرجات</button>
           <button type="button" data-side-view="timeline" disabled>السجل</button>
         </div>
@@ -67,7 +102,7 @@
         <h2>الأدوات والإعدادات</h2>
         <div class="side-links">
           <button type="button" id="toolsLink">الأدوات</button>
-          <button type="button" id="settingsLink">حالة الخدمة</button>
+          <button type="button" id="settingsLink">النماذج والإعدادات</button>
         </div>
       </nav>
 
@@ -89,8 +124,10 @@
       <div class="tabs" role="tablist" id="missionTabs">
         <button class="tab active" data-view="overview" type="button">المهمة</button>
         <button class="tab" data-view="conversation" type="button">المحادثة</button>
+        <button class="tab" data-view="agents" type="button">خطة التنفيذ والطابور</button>
         <button class="tab" data-view="evidence" type="button">الأدلة</button>
-        <button class="tab" data-view="findings" type="button">النتائج المرتبطة بالأدلة</button>
+        <button class="tab" data-view="findings" type="button">النتائج</button>
+        <button class="tab" data-view="report" type="button">التقرير</button>
         <button class="tab" data-view="timeline" type="button">السجل</button>
         <button class="tab" data-view="logs" type="button">السجلات</button>
         <button class="tab" data-view="artifacts" type="button">المخرجات</button>
@@ -101,7 +138,7 @@
         <div class="welcome">
           <div class="hero">CS</div>
           <h1>CyberSentinel X</h1>
-          <p>ماذا تعمل عليه؟ صف هدفك أو سؤالك أو خطوتك التالية في الحقل أسفل الشاشة. تنشئ CyberSentinel مهمة أو تستأنفها وفق تفويض المالك، وتعرض الحالة والأدلة من الخادم فقط.</p>
+          <p>اختر مشروعًا وصف هدفًا بلغة طبيعية. تُحفظ المهمة على الخادم مع التفويض والنطاق والأدلة، ويمكن متابعة حالتها أو إيقافها واستئنافها من مساحة العمل.</p>
         </div>
       </section>
       <section id="transcript" class="transcript hidden">
@@ -117,6 +154,7 @@
   </div>
 
   <footer id="composer">
+    <div id="activeProjectHint" class="hint">المحادثة والمهمة ستُسجلان ضمن المشروع الحالي.</div>
     <form id="composerForm">
       <label for="composerInput" class="visually-hidden">وصف الهدف أو السؤال أو الخطوة التالية</label>
       <textarea id="composerInput" rows="1" maxlength="12000" placeholder="صف هدفك أو سؤالك أو خطوتك التالية…"></textarea>
@@ -125,6 +163,31 @@
     <div class="hint">إدخال بلغة طبيعية فقط · طلب ← تفويض ← تنفيذ ← رصد ← دليل موثّق ← رد صريح</div>
   </footer>
 </div>
+
+<section id="firstRunOverlay" class="setup-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="firstRunTitle">
+  <div class="setup-card">
+    <div class="setup-brand"><div class="hero">CS</div><div><h1 id="firstRunTitle">إعداد CyberSentinel لأول مرة</h1><p>تُحفظ البيانات والنماذج محليًا على هذا الجهاز. لا تحتاج إلى تثبيت Python أو تشغيل طرفية.</p></div></div>
+    <section class="setup-section">
+      <h2>1. تحقق من ملاءمة الجهاز واختر نموذجًا</h2>
+      <p id="setupHardware" class="muted">جارٍ فحص الذاكرة والمعالج والمساحة…</p>
+      <div id="setupModelList" class="model-list"></div>
+      <div id="setupModelMessage" class="notice" role="status" aria-live="polite"></div>
+    </section>
+    <section class="setup-section">
+      <h2>2. أنشئ حساب المالك المحلي</h2>
+      <p class="muted">اسم الدخول ثابت: <bdi>owner</bdi>. اختر كلمة مرور لا تقل عن 12 محرفًا.</p>
+      <form id="ownerSetupForm" class="owner-setup-form">
+        <label for="ownerSetupPassword">كلمة مرور المالك</label>
+        <input id="ownerSetupPassword" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+        <label for="ownerSetupConfirm">تأكيد كلمة المرور</label>
+        <input id="ownerSetupConfirm" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+        <button id="ownerSetupSubmit" type="submit">إنشاء الحساب وفتح مساحة العمل</button>
+      </form>
+      <p id="ownerSetupMessage" role="status" aria-live="polite"></p>
+    </section>
+    <small class="security-note-text">يُنشأ الحساب مرة واحدة؛ بيانات الاعتماد تبقى على هذا الجهاز، والجلسات محمية بـHttpOnly cookies.</small>
+  </div>
+</section>
 <script src="/app.js"></script>
 </body>
 </html>

@@ -226,9 +226,30 @@ def test_mission_list_is_owner_scoped_and_summary_is_minimized(public_server, mo
     assert "authorization_snapshot" not in payload["missions"][0]
 
 
-def test_public_mission_create_uses_server_scope_and_queues_owner_mission(public_server, monkeypatch):
+def test_public_mission_create_uses_server_project_scope_and_queues_owner_mission(public_server, monkeypatch, tmp_path):
     cookie, csrf = _owner_session(public_server)
     captured = {}
+    project_id = "a" * 32
+    project_root = tmp_path / "owner-project"
+    project_root.mkdir()
+
+    class FakeProject:
+        def __init__(self):
+            self.project_id = project_id
+            self.root_path = project_root
+
+    class FakeProjects:
+        def get(self, owner_id, selected_id, *, include_archived):
+            assert owner_id == 7
+            assert selected_id == project_id
+            assert include_archived is False
+            return FakeProject()
+
+        def ensure_default(self, _owner_id):
+            pytest.fail("a client-selected project must not fall back to General")
+
+        def assign_mission(self, owner_id, mission_id, selected_id):
+            captured["project_assignment"] = (owner_id, mission_id, selected_id)
 
     class FakeCore:
         def __init__(self, router, *, db_path):
@@ -255,19 +276,26 @@ def test_public_mission_create_uses_server_scope_and_queues_owner_mission(public
 
     monkeypatch.setattr(bridge, "AgentCore", FakeCore)
     monkeypatch.setattr(bridge.Handler, "_mission_service", lambda self: FakeService())
+    monkeypatch.setattr(bridge, "_project_store", lambda: FakeProjects())
     status, payload, _headers = _request(
         public_server,
         "POST",
         "/api/public/missions",
-        body={"objective": "Review the service", "scope_context": {"workspace_root": "/", "allowed_networks": ["*"]}},
+        body={
+            "objective": "Review the service",
+            "project_id": project_id,
+            "scope_context": {"workspace_root": "/", "allowed_networks": ["*"]},
+        },
         headers={"Cookie": cookie, "X-CSRF-Token": csrf},
     )
     assert status == 201
     assert payload["mission_id"] == "mission-abc"
     assert captured["started"] == ("mission-abc", OWNER_TOKEN)
     assert captured["run"] is False
-    assert captured["scope_context"]["workspace_root"] == str(bridge.ROOT.resolve())
+    assert captured["scope_context"]["workspace_root"] == str(project_root.resolve())
+    assert captured["scope_context"]["target_id"] == f"local-project:{project_id}"
     assert captured["scope_context"]["allowed_networks"] == []
+    assert captured["project_assignment"] == (7, "mission-abc", project_id)
     assert "authorization_snapshot" not in payload["mission"]
 
 
@@ -440,3 +468,146 @@ def test_ui_explains_secure_workspace_views_unavailable():
     source = Path("web/app.js").read_text(encoding="utf-8")
     assert "secure_workspace_access_unavailable:" in source
     assert "عرض مساحة العمل غير متاح على هذا النظام" in source
+
+
+def test_desktop_owner_first_run_is_capability_gated_and_one_time(public_server, monkeypatch):
+    monkeypatch.setattr(bridge, "DESKTOP_MODE", True)
+    monkeypatch.setattr(bridge, "DESKTOP_SETUP_TOKEN", "one-time-desktop-capability")
+    account_exists = {"value": False}
+    created = []
+    defaults = []
+
+    class FakeProjects:
+        def ensure_default(self, owner_id):
+            defaults.append(owner_id)
+
+    def create_owner(username, password):
+        created.append((username, password))
+        account_exists["value"] = True
+        return 7
+
+    monkeypatch.setattr(bridge.owner_password, "owner_account_exists", lambda: account_exists["value"])
+    monkeypatch.setattr(bridge.owner_password, "create_owner_account", create_owner)
+    monkeypatch.setattr(bridge, "_project_store", lambda: FakeProjects())
+    origin = f"http://{public_server.server_address[0]}:{public_server.server_address[1]}"
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/desktop/bootstrap-owner",
+        body={"password": "a-long-owner-password"},
+        headers={"Origin": origin},
+    )
+    assert status == 403
+    assert payload["error"] == "desktop_setup_authorization_required"
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/desktop/bootstrap-owner",
+        body={"password": "a-long-owner-password"},
+        headers={
+            "Origin": "http://attacker.invalid",
+            "X-CyberSentinel-Setup-Key": "one-time-desktop-capability",
+        },
+    )
+    assert status == 403
+    assert payload["error"] == "origin_not_allowed"
+
+    valid_headers = {
+        "Origin": origin,
+        "X-CyberSentinel-Setup-Key": "one-time-desktop-capability",
+    }
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/desktop/bootstrap-owner",
+        body={"password": "short"},
+        headers=valid_headers,
+    )
+    assert status == 400
+    assert payload["error"] == "password_must_be_12_to_256_characters"
+    assert created == []
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/desktop/bootstrap-owner",
+        body={"password": "a-long-owner-password"},
+        headers=valid_headers,
+    )
+    assert status == 201
+    assert payload == {"ok": True, "owner_created": True}
+    assert created == [(bridge.owner_password.OWNER_USERNAME, "a-long-owner-password")]
+    assert defaults == [7]
+    assert "a-long-owner-password" not in json.dumps(payload)
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/desktop/bootstrap-owner",
+        body={"password": "a-second-long-password"},
+        headers=valid_headers,
+    )
+    assert status == 409
+    assert payload["error"] == "owner_account_already_exists"
+    assert len(created) == 1
+
+
+def test_project_import_requires_main_process_capability_owner_and_csrf(public_server, monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "DESKTOP_MODE", True)
+    monkeypatch.setattr(bridge, "DESKTOP_SETUP_TOKEN", "native-folder-capability")
+    cookie, csrf = _owner_session(public_server)
+    selected_root = tmp_path / "chosen-folder"
+    selected_root.mkdir()
+    captured = {}
+
+    class FakeProject:
+        def public(self, *, mission_count=None):
+            return {"project_id": "project-1", "name": "Imported", "mission_count": mission_count}
+
+    class FakeProjects:
+        def create(self, owner_id, name, description, *, selected_root):
+            captured.update(owner_id=owner_id, name=name, description=description, selected_root=selected_root)
+            return FakeProject()
+
+    monkeypatch.setattr(bridge, "_project_store", lambda: FakeProjects())
+    origin = f"http://{public_server.server_address[0]}:{public_server.server_address[1]}"
+    body = {"name": "Imported", "description": "from native picker", "selected_root": str(selected_root)}
+    headers = {"Cookie": cookie, "Origin": origin, "X-CSRF-Token": csrf}
+
+    status, payload, _headers = _request(
+        public_server, "POST", "/api/public/projects/import", body=body, headers=headers
+    )
+    assert status == 403
+    assert payload["error"] == "native_folder_selection_required"
+
+    capability_headers = {
+        **headers,
+        "X-CyberSentinel-Desktop-Capability": "native-folder-capability",
+    }
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/projects/import",
+        body=body,
+        headers={**capability_headers, "X-CSRF-Token": "invalid"},
+    )
+    assert status == 401
+    assert payload["error"] == "invalid csrf token"
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/projects/import",
+        body=body,
+        headers=capability_headers,
+    )
+    assert status == 201
+    assert payload["project"]["project_id"] == "project-1"
+    assert captured == {
+        "owner_id": 7,
+        "name": "Imported",
+        "description": "from native picker",
+        "selected_root": str(selected_root),
+    }

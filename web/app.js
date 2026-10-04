@@ -23,7 +23,13 @@ const state = {
   missions: [],
   selectedMissionId: "",
   selectedMission: null,
-  missionViews: { timeline: [], evidence: [], artifacts: [], logs: [], effects: [] },
+  projects: [],
+  projectsLoaded: false,
+  activeProjectId: "",
+  desktopSetup: null,
+  modelManager: null,
+  onboardingVisible: false,
+  missionViews: { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null },
   filePath: ".",
   activeView: "overview",
 };
@@ -82,6 +88,8 @@ async function api(path, options = {}) {
 }
 
 function errorText(error) {
+  const raw = String(error?.message || "");
+  if (raw.startsWith("model_not_compatible:")) return "هذا النموذج لا يلائم الذاكرة أو المساحة المتاحة على الجهاز.";
   const messages = {
     invalid_credentials: "بيانات الدخول غير صحيحة.",
     owner_authorization_required: "يلزم تسجيل الدخول بحساب المالك.",
@@ -90,8 +98,17 @@ function errorText(error) {
     unknown_mission: "المهمة غير موجودة أو غير متاحة لهذا الحساب.",
     not_found: "المورد غير موجود أو محجوب بسياسة مساحة العمل.",
     secure_workspace_access_unavailable: "عرض مساحة العمل غير متاح على هذا النظام لأن الوصول الآمن للمجلدات غير مدعوم.",
+    model_manager_busy: "هناك عملية تنزيل أو تشغيل نموذج قيد التنفيذ؛ انتظر اكتمالها.",
+    model_not_installed: "نزّل النموذج وتحقق منه قبل تفعيله.",
+    model_switch_blocked_by_active_mission: "أوقف المهمة أو انتظر انتهاءها قبل تبديل النموذج.",
+    owner_account_already_exists: "حساب المالك موجود بالفعل؛ سجّل الدخول بدل إنشاء حساب آخر.",
+    project_folder_must_be_a_specific_directory: "اختر مجلد مشروع محددًا وليس جذر القرص.",
+    project_folder_overlaps_application_data: "لا يمكن استخدام مجلد بيانات التطبيق كمجلد مشروع.",
+    project_folder_already_registered: "هذا المجلد مرتبط بمشروع آخر بالفعل.",
+    network_project_folder_not_supported: "اختر مجلدًا محليًا على هذا الجهاز؛ المجلدات الشبكية غير مدعومة حاليًا.",
+    native_folder_selection_required: "يجب اختيار مجلد المشروع من نافذة النظام الأصلية.",
   };
-  return messages[error.message] || `تعذر إكمال الطلب: ${error.message || "خطأ غير معروف"}`;
+  return messages[raw] || `تعذر إكمال الطلب: ${raw || "خطأ غير معروف"}`;
 }
 
 function esc(value) {
@@ -128,6 +145,10 @@ async function status() {
     runtime.textContent = health.ok === true
       ? `● ${health.service || "الخدمة"} · ${health.version || "الإصدار غير متاح"}`
       : "? حالة الخدمة غير مؤكدة";
+    if (window.cybersentinelDesktop?.isDesktop) {
+      try { await refreshDesktopSetup(); } catch (error) { setModelNotice(errorText(error), "error"); }
+    }
+    if (state.ownerAuthenticated && !state.projectsLoaded) await loadProjects();
   } catch (error) {
     const runtime = $("#runtimeState");
     runtime.classList.add("offline");
@@ -158,8 +179,11 @@ function resetWorkspaceState() {
   state.conversationId = "";
   state.selectedMissionId = "";
   state.selectedMission = null;
-  state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [], effects: [] };
+  state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null };
   state.missions = [];
+  state.projects = [];
+  state.projectsLoaded = false;
+  state.activeProjectId = "";
   $("#messages").replaceChildren();
   $("#missionHeader").classList.add("hidden");
   $("#missionTools").classList.add("hidden");
@@ -168,7 +192,386 @@ function resetWorkspaceState() {
   $("#missionTabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === "overview"));
   state.activeView = "overview";
   updateSideLinks();
+  renderProjects();
 }
+
+function setModelNotice(message, kind = "") {
+  [$("#setupModelMessage"), $("#modelManagerNotice")].filter(Boolean).forEach((element) => {
+    element.textContent = message || "";
+    element.className = `notice${kind ? ` ${kind}` : ""}`;
+  });
+}
+
+function formatBytes(value) {
+  let size = Math.max(0, Number(value) || 0);
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
+  return `${size.toFixed(unit >= 2 ? 1 : 0)} ${units[unit]}`;
+}
+
+function modelOperationLabel(operation) {
+  const labels = {
+    downloading: "جارٍ التنزيل",
+    verifying: "جارٍ التحقق من SHA-256",
+    activating: "جارٍ تشغيل النموذج",
+    complete: "اكتمل",
+    failed: `فشل: ${operation.error || "خطأ غير محدد"}`,
+    interrupted: "توقف عند إغلاق التطبيق؛ يمكن إعادة المحاولة",
+  };
+  return labels[operation.status] || "لا توجد عملية جارية";
+}
+
+function renderModelCards(target) {
+  if (!target) return;
+  target.replaceChildren();
+  const manager = state.modelManager;
+  if (!manager || !Array.isArray(manager.models)) {
+    target.textContent = "كتالوج النماذج غير متاح حاليًا.";
+    return;
+  }
+  const hardware = manager.hardware || {};
+  const ram = hardware.ram_gib == null ? "غير متاح" : `${hardware.ram_gib} GiB RAM`;
+  const disk = hardware.free_disk_gib == null ? "مساحة القرص غير متاحة" : `${hardware.free_disk_gib} GiB متاح على القرص`;
+  const hardwareLine = `الجهاز: ${hardware.os || "غير معروف"} · ${hardware.architecture || "بنية غير معروفة"} · ${ram} · ${hardware.cpu_count || "?"} نواة · ${disk} · ${hardware.gpu_acceleration_available ? "تسريع GPU متاح" : "CPU فقط"}`;
+  if ($("#setupHardware")) $("#setupHardware").textContent = hardwareLine;
+  const operation = manager.manager?.operation || { status: "idle", model_id: "" };
+  const runtime = manager.manager?.runtime || {};
+  manager.models.forEach((model) => {
+    const article = document.createElement("article");
+    article.className = "model-card";
+    const title = document.createElement("h3");
+    title.textContent = `${model.display_name || model.family} · ${model.parameter_size || ""}`;
+    const description = document.createElement("p");
+    description.textContent = `${model.family} · ${model.quantization} · ${model.license} · سياق ${model.context_length || 4096}`;
+    const meta = document.createElement("p");
+    meta.className = "model-meta";
+    meta.textContent = `GGUF ${formatBytes(model.size_bytes)} · RAM حد أدنى ${model.min_ram_gib} GiB · موصى به ${model.recommended_ram_gib} GiB`;
+    const recommendation = document.createElement("p");
+    recommendation.className = model.compatible ? "model-recommendation" : "model-warning";
+    recommendation.textContent = model.compatible
+      ? (model.warnings?.length ? `متوافق مع تحذير: ${model.warnings.join(", ")}` : "ملائم وفق فحص الذاكرة والمساحة")
+      : `غير ملائم حاليًا: ${(model.compatibility_reasons || []).join(", ") || "سبب غير محدد"}`;
+    const button = document.createElement("button");
+    button.type = "button";
+    const busy = ["downloading", "verifying", "activating"].includes(operation.status);
+    if (model.active && runtime.status === "ready") {
+      button.textContent = "النموذج المفعّل";
+      button.disabled = true;
+    } else if (model.installed) {
+      button.textContent = model.active ? "إعادة تشغيل النموذج" : "تشغيل / تبديل إلى هذا النموذج";
+      button.dataset.modelAction = "activate";
+      button.dataset.modelId = model.model_id;
+      button.disabled = busy || !model.compatible;
+    } else {
+      button.textContent = "تنزيل وتثبيت";
+      button.dataset.modelAction = "install";
+      button.dataset.modelId = model.model_id;
+      button.disabled = busy || !model.compatible;
+    }
+    const progress = document.createElement("div");
+    progress.className = "model-progress";
+    if (operation.model_id === model.model_id && ["downloading", "verifying", "activating", "failed", "interrupted"].includes(operation.status)) {
+      const amount = operation.total_bytes ? `${formatBytes(operation.bytes_downloaded)} / ${formatBytes(operation.total_bytes)} (${operation.progress || 0}%)` : "";
+      progress.textContent = `${modelOperationLabel(operation)}${amount ? ` · ${amount}` : ""}`;
+    } else if (model.active) {
+      progress.textContent = `Runtime: ${runtime.status || "غير معروف"}${runtime.error ? ` · ${runtime.error}` : ""}`;
+    }
+    article.append(title, description, meta, recommendation, button, progress);
+    target.appendChild(article);
+  });
+  target.querySelectorAll("[data-model-action]").forEach((button) => {
+    button.addEventListener("click", () => runModelAction(button.dataset.modelId, button.dataset.modelAction));
+  });
+}
+
+async function refreshDesktopSetup() {
+  const data = await api("/api/public/desktop/setup");
+  state.desktopSetup = data;
+  state.modelManager = data.model_manager || null;
+  renderModelCards($("#setupModelList"));
+  const overlay = $("#firstRunOverlay");
+  const show = Boolean(window.cybersentinelDesktop?.isDesktop && data.owner_configured === false);
+  state.onboardingVisible = show;
+  overlay?.classList.toggle("hidden", !show);
+  const operation = state.modelManager?.manager?.operation || {};
+  if (["downloading", "verifying", "activating"].includes(operation.status)) scheduleModelPoll();
+}
+
+let modelPollTimer = null;
+function scheduleModelPoll() {
+  if (modelPollTimer) return;
+  modelPollTimer = setTimeout(async () => {
+    modelPollTimer = null;
+    try {
+      const data = await api("/api/public/desktop/models");
+      state.modelManager = data;
+      renderModelCards($("#setupModelList"));
+      renderModelCards($("#settingsModelList"));
+      const operation = data.manager?.operation || {};
+      if (operation.status === "failed") setModelNotice(modelOperationLabel(operation), "error");
+      else if (["downloading", "verifying", "activating"].includes(operation.status)) {
+        setModelNotice(modelOperationLabel(operation), "warn");
+        scheduleModelPoll();
+      } else if (operation.status === "complete") {
+        setModelNotice("اكتملت العملية وتحقق الخادم من الملف المحلي.", "ok");
+      }
+    } catch (error) {
+      setModelNotice(errorText(error), "error");
+    }
+  }, 1200);
+}
+
+async function runModelAction(modelId, action) {
+  if (!modelId || !["install", "activate"].includes(action)) return;
+  setModelNotice(action === "install" ? "بدأ التنزيل؛ سيُستأنف من الملف الجزئي ويتحقق SHA-256 قبل التثبيت." : "جارٍ إيقاف runtime السابق والتحقق من النموذج قبل التبديل.", "warn");
+  try {
+    const data = await api(`/api/public/desktop/models/${encodeURIComponent(modelId)}/${action}`, { method: "POST", body: "{}" });
+    state.modelManager = data;
+    renderModelCards($("#setupModelList"));
+    renderModelCards($("#settingsModelList"));
+    scheduleModelPoll();
+  } catch (error) {
+    setModelNotice(errorText(error), "error");
+  }
+}
+
+$("#ownerSetupForm").onsubmit = async (event) => {
+  event.preventDefault();
+  const password = $("#ownerSetupPassword").value;
+  const confirmPassword = $("#ownerSetupConfirm").value;
+  const message = $("#ownerSetupMessage");
+  if (password.length < 12 || password.length > 256) { message.textContent = "استخدم كلمة مرور بين 12 و256 محرفًا."; return; }
+  if (password !== confirmPassword) { message.textContent = "كلمتا المرور غير متطابقتين."; return; }
+  const button = $("#ownerSetupSubmit");
+  button.disabled = true;
+  message.textContent = "جارٍ إنشاء حساب المالك محليًا...";
+  try {
+    if (!window.cybersentinelDesktop?.createOwner) throw new Error("desktop_first_run_unavailable");
+    await window.cybersentinelDesktop.createOwner(password);
+    const data = await api("/api/public/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: "owner", password }),
+    });
+    $("#ownerSetupPassword").value = "";
+    $("#ownerSetupConfirm").value = "";
+    updateAuthUI(data);
+    await refreshDesktopSetup();
+    await loadProjects();
+    await loadMissions();
+    setNotice("اكتمل الإعداد المحلي. يمكنك إنشاء مشروع ومهمة؛ نزّل نموذجًا متوافقًا من الإعدادات لاستخدام الاستدلال المحلي.", "ok");
+  } catch (error) {
+    message.textContent = errorText(error);
+  } finally {
+    button.disabled = false;
+  }
+};
+
+function currentProject() {
+  return state.projects.find((item) => item.project_id === state.activeProjectId && !item.archived) || null;
+}
+
+function renderProjects() {
+  const list = $("#projectList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!state.ownerAuthenticated) {
+    list.innerHTML = '<p class="muted">سجّل الدخول لعرض المشاريع.</p>';
+  } else if (!state.projects.length) {
+    list.innerHTML = '<p class="muted">لا توجد مشاريع بعد.</p>';
+  } else {
+    state.projects.forEach((project) => {
+      const row = document.createElement("div");
+      row.className = "project-item";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `project-item${project.project_id === state.activeProjectId ? " selected" : ""}`;
+      button.disabled = Boolean(project.archived);
+      const name = document.createElement("span");
+      name.textContent = project.name;
+      const details = document.createElement("small");
+      details.textContent = `${project.mission_count || 0} مهمة${project.location_kind === "selected-folder" ? " · مجلد محلي" : " · مُدار"}${project.archived ? " · مؤرشف" : ""}`;
+      button.append(name, details);
+      if (!project.archived) {
+        button.addEventListener("click", () => selectProject(project.project_id));
+        row.appendChild(button);
+      } else {
+        row.appendChild(button);
+        const restore = document.createElement("button");
+        restore.type = "button";
+        restore.textContent = "استعادة";
+        restore.title = `استعادة ${project.name}`;
+        restore.addEventListener("click", () => updateProject(project.project_id, { action: "unarchive" }));
+        row.appendChild(restore);
+      }
+      list.appendChild(row);
+    });
+  }
+  const available = state.projects.filter((project) => !project.archived);
+  const selector = $("#missionProject");
+  if (selector) {
+    const previous = state.activeProjectId;
+    selector.replaceChildren();
+    available.forEach((project) => {
+      const option = document.createElement("option");
+      option.value = project.project_id;
+      option.textContent = project.name;
+      selector.appendChild(option);
+    });
+    selector.disabled = !available.length || !state.ownerAuthenticated;
+    if (available.some((project) => project.project_id === previous)) selector.value = previous;
+  }
+  const project = currentProject();
+  $("#renameProject").disabled = !project || !state.ownerAuthenticated;
+  $("#archiveProject").disabled = !project || project.is_default || !state.ownerAuthenticated;
+  $("#activeProjectHint").textContent = project
+    ? `السياق الحالي: ${project.name} · تُحفظ المحادثة والمهمة ضمن هذا المشروع.`
+    : "اختر أو أنشئ مشروعًا قبل تسجيل المهام.";
+  $("#archiveProject").textContent = "أرشفة";
+}
+
+async function loadProjects() {
+  if (!state.ownerAuthenticated) {
+    state.projects = [];
+    state.projectsLoaded = false;
+    renderProjects();
+    return;
+  }
+  try {
+    const data = await api("/api/public/projects");
+    state.projects = Array.isArray(data.projects) ? data.projects : [];
+    const available = state.projects.filter((project) => !project.archived);
+    if (!available.some((project) => project.project_id === state.activeProjectId)) {
+      state.activeProjectId = available[0]?.project_id || "";
+    }
+    state.projectsLoaded = true;
+    renderProjects();
+  } catch (error) {
+    $("#projectList").textContent = errorText(error);
+    $("#projectMessage").textContent = errorText(error);
+  }
+}
+
+async function selectProject(projectId) {
+  const project = state.projects.find((item) => item.project_id === projectId && !item.archived);
+  if (!project) return;
+  state.activeProjectId = projectId;
+  state.selectedMissionId = "";
+  state.selectedMission = null;
+  $("#missionHeader").classList.add("hidden");
+  $("#missionTools").classList.add("hidden");
+  renderProjects();
+  renderMissions();
+  await loadMissions();
+}
+
+async function updateProject(projectId, payload) {
+  try {
+    await api(`/api/public/projects/${encodeURIComponent(projectId)}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    $("#projectMessage").textContent = payload.action === "unarchive" ? "استُعيد المشروع." : "حُفظت تغييرات المشروع.";
+    await loadProjects();
+    await loadMissions();
+    return true;
+  } catch (error) {
+    $("#projectMessage").textContent = errorText(error);
+    return false;
+  }
+}
+
+$("#newProjectToggle").onclick = () => {
+  if (!state.ownerAuthenticated) { $("#projectMessage").textContent = "سجّل الدخول بحساب المالك أولًا."; return; }
+  $("#projectForm").classList.toggle("hidden");
+  $("#projectName").focus();
+};
+$("#cancelProjectForm").onclick = () => {
+  $("#projectForm").classList.add("hidden");
+  $("#projectForm").reset();
+};
+$("#projectForm").onsubmit = async (event) => {
+  event.preventDefault();
+  if (!state.ownerAuthenticated) return;
+  try {
+    const data = await api("/api/public/projects", {
+      method: "POST",
+      body: JSON.stringify({ name: $("#projectName").value.trim(), description: $("#projectDescription").value.trim() }),
+    });
+    $("#projectForm").reset();
+    $("#projectForm").classList.add("hidden");
+    state.activeProjectId = data.project?.project_id || "";
+    $("#projectMessage").textContent = "أُنشئ المشروع وحُفظ مجلده المحلي.";
+    await loadProjects();
+    await loadMissions();
+  } catch (error) {
+    $("#projectMessage").textContent = errorText(error);
+  }
+};
+$("#importProjectFolder").onclick = async () => {
+  if (!state.ownerAuthenticated) { $("#projectMessage").textContent = "سجّل الدخول بحساب المالك أولًا."; return; }
+  if (!window.cybersentinelDesktop?.selectProjectFolder) { $("#projectMessage").textContent = "استيراد مجلد يتطلب تطبيق Desktop."; return; }
+  const name = $("#projectName").value.trim();
+  if (!name) { $("#projectMessage").textContent = "أدخل اسم المشروع قبل اختيار مجلده."; $("#projectName").focus(); return; }
+  const button = $("#importProjectFolder");
+  button.disabled = true;
+  $("#projectMessage").textContent = "اختر مجلدًا من نافذة النظام؛ سيُحفظ المسار على الجهاز فقط.";
+  try {
+    const csrfToken = await ensureSession();
+    const result = await window.cybersentinelDesktop.selectProjectFolder({
+      name,
+      description: $("#projectDescription").value.trim(),
+      csrfToken,
+    });
+    if (result.cancelled) {
+      $("#projectMessage").textContent = "أُلغي اختيار المجلد.";
+      return;
+    }
+    state.activeProjectId = result.project?.project_id || "";
+    $("#projectForm").reset();
+    $("#projectForm").classList.add("hidden");
+    $("#projectMessage").textContent = "رُبط المجلد بالمشروع؛ نطاق المهمة سيبقى داخله.";
+    await loadProjects();
+    await loadMissions();
+  } catch (error) {
+    $("#projectMessage").textContent = errorText(error);
+  } finally {
+    button.disabled = false;
+  }
+};
+$("#renameProject").onclick = () => {
+  const project = currentProject();
+  if (!project) return;
+  $("#renameProjectName").value = project.name;
+  $("#renameProjectForm").classList.remove("hidden");
+  $("#renameProjectName").focus();
+};
+$("#cancelRenameProject").onclick = () => {
+  $("#renameProjectForm").classList.add("hidden");
+  $("#renameProjectForm").reset();
+};
+$("#renameProjectForm").onsubmit = async (event) => {
+  event.preventDefault();
+  const project = currentProject();
+  const name = $("#renameProjectName").value.trim();
+  if (!project || !name || name === project.name) {
+    $("#renameProjectForm").classList.add("hidden");
+    return;
+  }
+  if (await updateProject(project.project_id, { name })) {
+    $("#renameProjectForm").classList.add("hidden");
+    $("#renameProjectForm").reset();
+  }
+};
+$("#archiveProject").onclick = async () => {
+  const project = currentProject();
+  if (!project || project.is_default) return;
+  if (!window.confirm(`أرشفة المشروع «${project.name}»؟ ستبقى مهامه محفوظة ولن يُستخدم لمهام جديدة.`)) return;
+  await updateProject(project.project_id, { action: "archive" });
+};
+$("#missionProject").onchange = () => {
+  if ($("#missionProject").value) selectProject($("#missionProject").value);
+};
 
 /* ── Activity panel (real server events only) ───────────── */
 
@@ -245,6 +648,10 @@ async function send(text) {
     bubble("bot", "سجّل الدخول بحساب المالك لاستخدام المحادثة.");
     return;
   }
+  if (!state.activeProjectId) {
+    bubble("bot", "أنشئ مشروعًا أو اختر مشروعًا نشطًا قبل إرسال المهمة.");
+    return;
+  }
   bubble("user", text);
   $("#composerInput").value = "";
   const button = $("#composerForm button[type=submit]");
@@ -253,7 +660,7 @@ async function send(text) {
   try {
     const data = await api("/api/public/chat", {
       method: "POST",
-      body: JSON.stringify({ text, conversation_id: state.conversationId || undefined }),
+      body: JSON.stringify({ text, conversation_id: state.conversationId || undefined, project_id: state.activeProjectId || undefined }),
     });
     loading.remove();
     state.conversationId = String(data.conversation_id || "");
@@ -292,8 +699,13 @@ function renderMissions() {
     target.innerHTML = '<p class="muted">سجّل الدخول لعرض المهام.</p>';
     return;
   }
-  if (!state.missions.length) {
-    target.innerHTML = '<p class="muted">لا توجد مهام محفوظة لهذا الحساب.</p>';
+  const projectMissions = state.missions.filter((mission) => mission.project_id === state.activeProjectId);
+  if (!state.activeProjectId) {
+    target.innerHTML = '<p class="muted">أنشئ مشروعًا أو اختر مجلدًا محليًا أولًا.</p>';
+    return;
+  }
+  if (!projectMissions.length) {
+    target.innerHTML = '<p class="muted">لا توجد مهام محفوظة لهذا المشروع.</p>';
     return;
   }
   const groups = [
@@ -303,7 +715,7 @@ function renderMissions() {
   ];
   const seen = new Set();
   groups.forEach((group) => {
-    const items = state.missions.filter((m) => !seen.has(m.mission_id) && group.match(m));
+    const items = projectMissions.filter((m) => !seen.has(m.mission_id) && group.match(m));
     items.forEach((m) => seen.add(m.mission_id));
     if (!items.length) return;
     const heading = document.createElement("div");
@@ -331,10 +743,16 @@ async function loadMissions() {
     const data = await api("/api/public/missions?limit=100");
     state.missions = Array.isArray(data.missions) ? data.missions : [];
     renderMissions();
-    if (state.selectedMissionId && state.missions.some((item) => item.mission_id === state.selectedMissionId)) {
+    const visible = state.missions.filter((item) => item.project_id === state.activeProjectId);
+    if (state.selectedMissionId && visible.some((item) => item.mission_id === state.selectedMissionId)) {
       await loadMission(state.selectedMissionId);
-    } else if (state.missions.length && !state.selectedMissionId) {
-      await selectMission(state.missions[0].mission_id);
+    } else if (visible.length) {
+      await selectMission(visible[0].mission_id);
+    } else {
+      state.selectedMissionId = "";
+      state.selectedMission = null;
+      $("#missionHeader").classList.add("hidden");
+      renderMissionView("overview");
     }
   } catch (error) {
     $("#missionList").textContent = errorText(error);
@@ -357,13 +775,14 @@ async function loadMission(missionId = state.selectedMissionId) {
   if (!missionId || !state.ownerAuthenticated) return;
   state.selectedMissionId = String(missionId);
   try {
-    const [statusData, timelineData, evidenceData, artifactsData, logsData, effectsData] = await Promise.all([
+    const [statusData, timelineData, evidenceData, artifactsData, logsData, effectsData, reportData] = await Promise.all([
       api(missionEndpoint("status")),
       api(missionEndpoint("timeline")),
       api(missionEndpoint("evidence")),
       api(missionEndpoint("artifacts")),
       api(missionEndpoint("logs")),
       api(missionEndpoint("effects")).catch((error) => ({ effects: [], error: error.message })),
+      api(missionEndpoint("report")).catch((error) => ({ report: null, error: error.message })),
     ]);
     state.selectedMission = statusData.status || null;
     state.missionViews = {
@@ -373,6 +792,8 @@ async function loadMission(missionId = state.selectedMissionId) {
       logs: logsData.logs ?? [],
       effects: effectsData.effects ?? [],
       effectsError: effectsData.error || "",
+      report: reportData.report || null,
+      reportError: reportData.error || "",
     };
     renderMissionHeader();
     renderActivityFromTimeline(state.missionViews.timeline);
@@ -479,6 +900,10 @@ function renderMissionView(view) {
     }
     return;
   }
+  if (view === "agents") {
+    renderAgentSubtasks(mission, target);
+    return;
+  }
   const values = view === "evidence" ? state.missionViews.evidence
     : view === "timeline" ? state.missionViews.timeline
       : view === "artifacts" ? state.missionViews.artifacts
@@ -500,6 +925,7 @@ function renderMissionView(view) {
     return;
   }
   if (view === "findings") {
+    renderReportFindings(target);
     const records = state.missionViews.evidence.filter((item) => item && typeof item === "object" && item.system_evidence);
     const heading = document.createElement("p");
     heading.className = "muted";
@@ -525,6 +951,10 @@ function renderMissionView(view) {
     });
     return;
   }
+  if (view === "report") {
+    renderMissionReport(target);
+    return;
+  }
   if (view === "files") {
     renderFiles();
     return;
@@ -532,6 +962,104 @@ function renderMissionView(view) {
   if (view === "git") {
     renderGit();
   }
+}
+
+function renderAgentSubtasks(mission, target) {
+  const plan = Array.isArray(mission.plan?.steps) ? mission.plan.steps : [];
+  const queue = mission.queue || {};
+  const heading = document.createElement("div");
+  heading.className = "result";
+  heading.textContent = `حالة mission: ${mission.status || "غير معروفة"}\nحالة العامل/الطابور: ${queue.state || "غير متاحة"}\nمعرّف العامل: ${queue.lease_owner || "لا يوجد عامل مالك للـlease حاليًا"}\nموضع مؤشر الخطة: ${Number.isInteger(mission.current_step) ? mission.current_step : "غير متاح"}\nعناصر الخطة: ${plan.length}`;
+  target.appendChild(heading);
+  if (!plan.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "لم يسجل الخادم خطوات/مهام فرعية لهذه المهمة.";
+    target.appendChild(empty);
+  } else {
+    const current = Number.isInteger(mission.current_step) ? mission.current_step : -1;
+    plan.forEach((step, index) => {
+      const card = document.createElement("article");
+      card.className = "subtask-card";
+      const title = document.createElement("h3");
+      title.textContent = `${step.step_id || `خطة-${index + 1}`} · ${step.action || "خطوة بلا أداة محددة"}`;
+      const detail = document.createElement("p");
+      detail.textContent = step.objective || "لا يوجد وصف محفوظ لهذه الخطوة.";
+      const status = document.createElement("small");
+      status.className = "subtask-status";
+      status.textContent = index === current ? "موضع مؤشر المهمة الحالي" : index < current ? "قبل مؤشر الخطة الحالي؛ راجع الأحداث والأدلة" : "لاحق في الخطة؛ لم يصل إليه المؤشر الحالي";
+      const checks = document.createElement("p");
+      checks.textContent = `المتطلبات السابقة: ${(step.prerequisites || []).join(", ") || "لا توجد"} · التحقق المخطط: ${(step.verification || []).join("، ") || "غير محدد"}`;
+      card.append(title, detail, status, checks);
+      target.appendChild(card);
+    });
+  }
+  const progress = mission.progress && typeof mission.progress === "object" ? mission.progress : {};
+  const agentRuns = Array.isArray(progress.agent_runs) ? progress.agent_runs : (Array.isArray(progress.agents) ? progress.agents : []);
+  const agentTitle = document.createElement("h2");
+  agentTitle.textContent = "سجلات التنفيذ والوكلاء الفرعيين إن وُجدت";
+  target.appendChild(agentTitle);
+  if (agentRuns.length) {
+    agentRuns.forEach((record) => target.appendChild(showJson(record)));
+  } else {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = "لا يسجل هذا المسار الحالي هويات مستقلة لوكلاء فرعيين لكل mission؛ تعرض الواجهة بدلًا من ذلك plan steps والطابور وسجل الأدوات الفعلي من الخادم، دون اختلاق agent runs.";
+    target.appendChild(note);
+  }
+  const calls = Array.isArray(progress.model_loop?.tool_results) ? progress.model_loop.tool_results : [];
+  const callsTitle = document.createElement("h2");
+  callsTitle.textContent = `نتائج استدعاءات الأدوات المحفوظة (${calls.length})`;
+  target.appendChild(callsTitle);
+  calls.slice(-40).forEach((call) => target.appendChild(showJson(call)));
+}
+
+function renderReportFindings(target) {
+  const report = state.missionViews.report;
+  if (!report) return;
+  const summary = report.mission_summary || {};
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  const evidence = report.evidence || {};
+  const card = document.createElement("div");
+  card.className = "result";
+  card.textContent = `نتيجة التقرير: ${summary.outcome || "UNKNOWN"}\nحالة المهمة: ${summary.mission_status || "غير متاحة"}\nسلسلة Evidence: ${evidence.execution_chain_integrity || "غير معروفة"}\nFinding rows: ${findings.length}\n\nهذه النتائج مأخوذة من report builder الخادمي. الادعاءات غير الحاملة لـprovenance حتمي تظهر كـUNVERIFIED ولا تمنح نتيجة VERIFIED.`;
+  target.appendChild(card);
+  findings.forEach((finding) => {
+    const item = document.createElement("article");
+    item.className = "subtask-card";
+    const title = document.createElement("h3");
+    title.textContent = `${finding.criterion_id || "معيار غير محدد"} · ${finding.status || "UNKNOWN"}`;
+    const detail = document.createElement("p");
+    detail.textContent = `المصدر: ${finding.source || "غير معروف"} · نتيجة الادعاء: ${finding.claimed_result || "لا يوجد"} · الثقة: ${finding.confidence ?? "غير مسجلة"} · hash: ${finding.evidence_hash || "غير متاح"}`;
+    item.append(title, detail);
+    target.appendChild(item);
+  });
+}
+
+function renderMissionReport(target) {
+  const report = state.missionViews.report;
+  if (!report) {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = state.missionViews.reportError ? `تعذر تحميل التقرير: ${state.missionViews.reportError}` : "لا يوجد تقرير محفوظ لهذه المهمة.";
+    target.appendChild(note);
+    return;
+  }
+  const summary = report.mission_summary || {};
+  const verification = summary.verification || {};
+  const evidence = report.evidence || {};
+  const card = document.createElement("div");
+  card.className = "result";
+  card.textContent = `Outcome: ${summary.outcome || "UNKNOWN"}\nMission: ${summary.mission_id || "غير متاح"}\nRequest: ${summary.request_id || "غير متاح"}\nStatus: ${summary.mission_status || "UNKNOWN"}\nVerified: ${verification.verified === true ? "نعم — وفق شروط التقرير" : verification.verified === false ? "لا" : "غير محدد"}\nEvidence chain: ${evidence.execution_chain_integrity || "غير معروفة"}\nEvidence digest SHA-256: ${evidence.digest_sha256 || "غير متاح"}\nTrusted evidence: ${verification.trusted_evidence_count ?? 0} · غير موثق: ${verification.unverified_evidence_count ?? 0}\nمعايير التحقق الناقصة: ${(verification.missing_criteria || []).join(", ") || "لا توجد/غير محددة"}\n\nالمالك: ${(report.owner_approval_status || {}).status || "غير معروف"} · الثقة الكلية لا تُستنتج: ${(report.confidence || {}).aggregate ?? "لا يوجد"}`;
+  target.appendChild(card);
+  ["limitations", "unknown_states", "tool_failures", "provenance"].forEach((key) => {
+    const section = document.createElement("article");
+    section.className = "result record-card";
+    const title = document.createElement("h3");
+    title.textContent = key;
+    section.append(title, showJson(report[key] ?? []));
+    target.appendChild(section);
+  });
 }
 
 async function runMissionAction(action) {
@@ -663,31 +1191,55 @@ function toolsPanel() {
 }
 
 async function settingsPanel() {
-  const box = document.createElement("div");
-  box.className = "result";
-  let healthText = "تعذر قراءة حالة الخدمة.";
+  const panel = document.createElement("div");
+  panel.className = "settings-layout";
+  const summary = document.createElement("div");
+  summary.className = "result";
   try {
     const health = await api("/api/public/health");
-    healthText = `استجابة HTTP: ${health.ok === true ? "OK" : "غير مؤكدة"}\nالخدمة: ${health.service || "غير متاح"}\nالإصدار: ${health.version || "غير متاح"}`;
+    const runtime = state.modelManager?.manager?.runtime || {};
+    summary.textContent = `CyberSentinel Desktop\nBackend: ${health.ok === true ? "جاهز" : "غير جاهز"} · ${health.version || "version n/a"}\nLocal runtime: ${runtime.status || "لم يُفعّل نموذج"}${runtime.model_id ? ` · ${runtime.model_id}` : ""}\nInference backend: llama.cpp CPU · بعد تنزيل النموذج يدعم العمل دون إنترنت.`;
   } catch (error) {
-    healthText = `تعذر قراءة حالة الخدمة: ${errorText(error)}`;
+    summary.textContent = `تعذر قراءة حالة الخدمة: ${errorText(error)}`;
   }
-  let providerText = "حالة المزودين متاحة بعد تسجيل دخول المالك.";
+  const managerTitle = document.createElement("h2");
+  managerTitle.textContent = "إدارة النماذج المحلية";
+  const helper = document.createElement("p");
+  helper.className = "muted";
+  helper.textContent = "اختر عائلة/حجم/quantization من الكتالوج المثبت. يفحص التطبيق RAM والمساحة قبل التنزيل، ويتحقق من SHA-256 قبل التثبيت. لا يتم التبديل أثناء وجود mission فعالة.";
+  const notice = document.createElement("div");
+  notice.id = "modelManagerNotice";
+  notice.className = "notice";
+  notice.setAttribute("role", "status");
+  const list = document.createElement("div");
+  list.id = "settingsModelList";
+  list.className = "model-list";
+  const providerNote = document.createElement("p");
+  providerNote.className = "muted";
+  let providersText = "";
+  if (state.ownerAuthenticated) {
+    try {
+      const result = await api("/api/public/providers");
+      providersText = (result.providers || []).map((provider) => {
+        const caps = Object.entries(provider.capabilities || {}).filter(([, enabled]) => enabled).map(([name]) => name);
+        return `${provider.name}: ${provider.configured ? "مهيأ" : "غير مهيأ"} · قدرات: ${caps.join(", ") || "غير معلنة"}`;
+      }).join("\n") || "لا يوجد مزود خارجي مهيأ.";
+    } catch (error) { providersText = errorText(error); }
+  } else providersText = "سجّل الدخول لعرض حالة المزودين.";
+  providerNote.textContent = `مزودو النموذج المهيّؤون (قراءة فقط؛ لا تُعرض مفاتيح أو عناوين):\n${providersText}`;
+  const note = document.createElement("p");
+  note.className = "muted";
+  note.textContent = "كتالوج هذه النسخة يدعم Qwen3 4B/8B وDeepSeek R1 Distill Qwen 7B بملفات GGUF Q4_K_M. حزم المحرك والنماذج تُجلب من المصادر المثبتة وتُحفظ تحت بيانات المستخدم.";
+  panel.append(summary, managerTitle, helper, notice, list, providerNote, note);
+  showInfoPanel(panel);
   try {
-    const data = await api("/api/public/providers");
-    const providers = Array.isArray(data.providers) ? data.providers : [];
-    providerText = providers.length
-      ? providers.map((provider) => {
-        const caps = provider.capabilities || {};
-        const enabled = Object.entries(caps).filter(([, active]) => active === true).map(([name]) => name);
-        return `${provider.name || "مزود"}: ${provider.configured ? "مهيأ" : "غير مهيأ"} · إخفاقات مرصودة: ${provider.failure_count || 0} · قدرات: ${enabled.length ? enabled.join(", ") : "غير معلنة"}`;
-      }).join("\n")
-      : "لا يوجد مزود نموذج مهيأ.";
+    state.modelManager = await api("/api/public/desktop/models");
+    renderModelCards(list);
+    const operation = state.modelManager.manager?.operation || {};
+    if (["downloading", "verifying", "activating"].includes(operation.status)) scheduleModelPoll();
   } catch (error) {
-    providerText = `تعذر قراءة حالة المزود: ${errorText(error)}`;
+    list.textContent = errorText(error);
   }
-  box.textContent = `حالة الخدمة\n${healthText}\n\nحالة مزود النموذج\n${providerText}\n\nحالة الإعداد تعكس التهيئة فقط ولا تثبت أن المزود متصل أو أن طلبًا نجح. لا تُعرض عناوين المزودين أو المفاتيح أو نصوص الأخطاء.\n\nلا توجد إعدادات تُدار من المتصفح. الإعدادات والتشريعات تُدار من الخادم وفق تعليمات المالك، ولا يملك العميل أي سلطة تعديل.`;
-  showInfoPanel(box);
 }
 
 /* ── View switching ──────────────────────────────────────── */
@@ -736,13 +1288,14 @@ $("#refreshMissions")?.addEventListener("click", loadMissions);
 $("#missionForm").onsubmit = async (event) => {
   event.preventDefault();
   if (!state.ownerAuthenticated) { setNotice("سجّل الدخول بحساب المالك أولاً.", "warn"); return; }
+  if (!state.activeProjectId) { setNotice("أنشئ مشروعًا أو اختر مشروعًا نشطًا أولاً.", "warn"); return; }
   const button = $("#createMission");
   button.disabled = true;
   setNotice("جارٍ إنشاء المهمة وتسجيلها في طابور التنفيذ...", "warn");
   try {
     const data = await api("/api/public/missions", {
       method: "POST",
-      body: JSON.stringify({ objective: $("#missionObjective").value.trim() }),
+      body: JSON.stringify({ objective: $("#missionObjective").value.trim(), project_id: state.activeProjectId }),
     });
     $("#missionObjective").value = "";
     state.selectedMissionId = data.mission_id || data.mission?.mission_id || "";

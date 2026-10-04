@@ -1,68 +1,46 @@
-# CyberSentinel Desktop — build and run
+# CyberSentinel Windows Desktop
 
-## Prerequisites
+## استخدام Installer
 
-- Windows 10 or later (x64) for the packaged target; Node.js 22.12 or newer for building the shell.
-- Python 3.12 or newer with repository dependencies installed:
-  `python -m pip install -r requirements.txt` from the repository root.
-- The CyberSentinel repository. For packaged installs, set `CYBERSENTINEL_REPO`
-  to its location; the packaged shell refuses to discover a backend from an
-  arbitrary working directory. Development builds may use the repository-root
-  working directory. The installed shell does not bundle the backend.
-- A private repository `.env` containing `BRIDGE_TOKEN` (at least 32 random
-  characters) or the supported file-backed bridge-token configuration. Python
-  loads private settings itself; Electron does not parse `.env` or forward
-  credential values. Keep `.env` private (`chmod 600` on POSIX).
-- An Owner account bootstrapped through
-  `python -m security.owner_password_bootstrap`.
+حزمة Windows x64 المثبتة من هذا الفرع تحتوي على Electron وPython backend المجمّع وruntime CPU لـ`llama.cpp`. على المستخدم تشغيل ملف `CyberSentinel-Setup-5.1.0.exe` واتباع معالج التثبيت، ثم إنشاء كلمة مرور Owner عند أول تشغيل. لا يحتاج الاستخدام المثبت إلى Python أو Node.js أو Docker أو WSL أو Termux أو Terminal أو إعداد `.env` أو تشغيل bridge يدويًا.
 
-## Development run
+من **الإعدادات** اختر نموذجًا ملائمًا للجهاز، ثم نزّله وفعّله. يتطلب تنزيل النموذج اتصال إنترنت ومساحة قرص بحسب الحجم المعروض؛ بعد اكتمال التنزيل والتحقق من SHA-256 يمكن تشغيل الاستدلال المحلي دون الإنترنت. النماذج المتاحة في كتالوج هذا البناء: Qwen3 4B، Qwen3 8B، وDeepSeek-R1-Distill-Qwen 7B، جميعها GGUF Q4_K_M. التطبيق يعرض حدود الذاكرة والمساحة، ولا يسمح بالتفعيل إن كان الجهاز غير ملائم.
 
-```sh
+تظهر المشاريع في Workspace، ويمكن إنشاء مشروع مُدار أو استيراد مجلد باستخدام نافذة Windows الأصلية. تُحفظ قاعدة البيانات والحالة والنماذج تحت مجلد `userData` الخاص بالتطبيق؛ مسار المجلد المختار لا يُعرض للواجهة. تبقى المهام والأدلة وسجل التشغيل على الجهاز بين جلسات التطبيق.
+
+## حالة النشر والتوقيع
+
+هذا بناء تطويري لفرع `work/windows-native-local-llm` وإصدار Desktop المرشح `5.1.0` فوق Core `5.0.0`. يُرفع Installer كـGitHub Actions artifact مرتبط بالـworkflow وcommit SHA لمدة 90 يومًا، مع SHA-256 وmanifest. المستودع عام؛ تعامل مع الفرع وسجل التشغيل والـartifact على أنها مرئية/قابلة للتنزيل وفق أذونات GitHub للمستودع. لا ينشئ هذا المسار tag أو GitHub Release أو نشرًا في registry/خدمة إنتاجية. الـInstaller غير موقّع رقميًا؛ قد يعرض Windows SmartScreen تحذير ناشر غير معروف. تحقق من SHA-256 للملف الذي استلمته قبل التثبيت.
+
+## بناء Installer من المصدر
+
+يتطلب البناء على Windows x64: Python 3.12، Node.js 22، والاتصال لتنزيل اعتماديات build وruntime المثبّت. ينفذ workflow الموثق الاختبارات أولًا ثم:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-desktop-build.txt
+python scripts/download_llama_runtime.py
+python scripts/build_desktop_backend.py
 cd desktop
-npm install
+npm ci --no-audit --no-fund
 npm run icon
+npm run dist
+cd ..
+python scripts/write_installer_manifest.py desktop/dist --version 5.1.0
+```
+
+الناتج: `desktop/dist/CyberSentinel-Setup-5.1.0.exe` وملف `.sha256` و`installer-manifest.json`. يفشل سكربت runtime إذا لم يطابق ملف llama.cpp الحجم والـSHA المثبتين؛ ويفحص build سكربت backend تشغيل `--desktop-self-test` والـweb assets. سجل المصدر والإصدارات والحجوم وSHA-256 للنماذج وruntime في [`docs/LOCAL_MODEL_ARTIFACTS.md`](../docs/LOCAL_MODEL_ARTIFACTS.md).
+
+## تطوير التطبيق من المصدر
+
+تشغيل Electron التطويري فقط يحتاج Python ومصدر المستودع واعتمادياته وNode.js:
+
+```powershell
+python -m pip install -r requirements.txt
+cd desktop
+npm ci
 npm start
 ```
 
-The shell starts `python bridge.py --desktop-stdio-control` on loopback, waits
-for `/api/health`, then opens the served client at
-`http://127.0.0.1:8787/` (or the `BRIDGE_PORT` provided in the process
-environment). The bridge starts its durable mission worker for this loopback
-Desktop mode. The client uses Owner-only cookies and CSRF, displays provider
-configuration without secrets, and calls the same mission/evidence APIs as the
-backend. Chat uses request/response; public streaming is not exposed.
+هذا المسار مخصص للمطورين. لا يغير متطلبات Installer النهائي. دعم حزم واجهة الاستخدام يقتصر على Windows x64؛ لا ندّعي حزم macOS/Linux. Workflow يبني على `windows-latest` ويختبر bundle دون نافذة تفاعلية، لذلك يلزم rehearsal يدوي على Windows للتحقق من تجربة SmartScreen والتثبيت الفعلية.
 
-When the app exits it asks the child bridge to shut down over a private stdin
-pipe, waits for the worker/service to drain, and force-terminates only after a
-ten-second grace period. The backend's crash-recovery/fencing remains the
-fallback if the process cannot exit cleanly.
-
-## Windows packaging
-
-```sh
-cd desktop
-npm run dist
-```
-
-The outputs are `desktop/dist/CyberSentinel-Setup-5.0.0.exe` and
-`desktop/dist/CyberSentinel-Portable-5.0.0.exe`. The release-branch GitHub
-workflow builds both x64 targets on `windows-latest`, uses
-`electron-builder --publish never`, and uploads the executables as an expiring
-workflow artifact subject to the repository's access controls. This is not a
-public release or a final tag.
-
-The workflow disables signing-identity auto-discovery and does not provide a
-code-signing identity, so both executables are unsigned. Windows may show
-publisher or SmartScreen warnings; do not treat these files as code-signed.
-
-The executable contains the Electron shell only. The Python runtime, repository,
-requirements, private configuration, and state must be installed/provisioned
-separately. Current packaging support is Windows x64 only; no macOS or Linux
-graphical package is claimed. CI builds the artifacts but does not execute the
-`.exe` or perform an interactive Windows runtime rehearsal.
-
-The public workspace file-list, file-view, and Git-summary endpoints fail closed
-with an unsupported response on Windows until equivalent handle-relative
-no-follow path access is available. Mission operations and other supported
-Owner APIs remain separate.
+**حد واجهة Workspace على Windows:** واجهات المهام والمشاريع والتقارير مدعومة؛ file browser وGit viewer يستمران في الرفض الآمن إذا لم تتوفر آليات handle-relative/no-follow المطلوبة على المنصة.

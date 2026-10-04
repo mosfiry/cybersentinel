@@ -1,46 +1,54 @@
-# CyberSentinel Desktop/backend contract
+# CyberSentinel Desktop/backend contract — 5.1.0 work branch
 
-This contract describes the Desktop shell and the hardened backend integration on the release branch. The UI, Electron shell, bridge, and backend are tested together; this is not a claim that the earlier Desktop source branch already matched the backend.
+This contract applies to `work/windows-native-local-llm`, derived from the published `v5.0.0` source. The Electron renderer is an untrusted client. No API in this document widens Owner authority, mission scope, evidence trust, or Tool Registry capabilities.
 
-## Runtime and transport
+## Runtime and persistence
 
-- The Windows x64 Electron shell starts the checked-in Python bridge at `127.0.0.1` and opens the same-origin UI at `http://127.0.0.1:<BRIDGE_PORT>/` (default port `8787`).
-- Desktop starts the durable mission worker through the bridge's runtime supervisor. The bridge does not start that worker for non-loopback deployments; Compose runs its own worker service.
-- Electron passes a reviewed allowlist of non-secret environment settings. It does not parse `.env` or forward credential values. Python loads the private `.env` and file-backed secrets itself; the Desktop deployment requires a private `.env` containing `BRIDGE_TOKEN` (or the supported secret-file configuration).
-- Electron and the renderer do not receive Owner session tokens. The renderer uses same-origin cookies, `HttpOnly`, `Secure`, `SameSite=Lax`, and CSRF protection.
-- On Desktop shutdown, Electron sends a private command over the child process's stdin pipe. The bridge stops the worker and HTTP service; Electron waits for process exit and force-terminates only after a 10-second grace period.
-- The packaged `.exe` contains the Electron shell, not the Python backend, repository, or virtual environment. Python 3.12+ and a separately provisioned CyberSentinel repository/dependencies are required; packaged launches must set `CYBERSENTINEL_REPO`. This workflow builds Windows x64 installer and portable artifacts; it does not certify macOS or Linux GUI packaging.
+- The Windows x64 installer contains the Electron shell, PyInstaller backend, and pinned llama.cpp CPU runtime. Packaged launch uses `process.resourcesPath/backend/cybersentinel-backend.exe`; user devices do not need a Python executable or repository checkout.
+- Electron chooses an ephemeral `127.0.0.1` port, generates process-scoped bridge and desktop-setup tokens, and sends a fixed shutdown message through the child stdin pipe. The backend starts the durable `RuntimeSupervisor` only in loopback Desktop mode.
+- DBs, Owner policy, model manager state, verified models, managed project folders, and local secrets live below Electron `userData`, separate from installed binaries. Mission checkpoints and application DB state are durable across restarts.
+- Development `npm start` may use a developer Python interpreter and checked-out source; that path is not used by packaged launch.
+- Renderer has `contextIsolation`, `sandbox`, and `nodeIntegration: false`. Preload exposes a small set of IPC methods for retry, one-time Owner creation, and the native project-folder picker. It does not expose filesystem/child-process access or bridge/setup secrets.
 
-## Public API
+## API routes
 
 | Endpoint | Method | Requirement and behavior |
 | --- | --- | --- |
-| `/api/public/session` | POST | Issues the short-lived public CSRF session cookie. |
-| `/api/public/auth/login` | POST | Public session + CSRF; verifies Owner credentials and sets a server-managed HttpOnly Owner cookie. |
-| `/api/public/auth/session` | GET | Returns only authenticated state, username, and expiry; never returns a session identifier. |
-| `/api/public/auth/logout` | POST | Public session + CSRF; revokes the Owner session and clears its cookie. |
-| `/api/public/logout` | POST | Public session + CSRF; revokes both public and Owner sessions and clears both cookies. |
-| `/api/public/health` | GET | Reports service/version and worker readiness without provider URLs or credentials. |
-| `/api/public/providers` | GET | Owner session; exposes only known provider label, configured flag, failure count, and Boolean capabilities. Does not expose model, base URL, key, or error text. `configured` is not a live connectivity check. |
-| `/api/public/chat` | POST | Owner session + CSRF; request/response JSON, fixed server-side scope, no public SSE stream. |
-| `/api/public/missions` | GET | Owner session; bounded, minimized list of missions bound to that Owner. |
-| `/api/public/missions` | POST | Owner session + CSRF; accepts an objective, constructs scope server-side, creates a mission and queues it. Client-provided scope/completion criteria are ignored. |
-| `/api/public/missions/<id>/<status\|timeline\|evidence\|artifacts\|logs\|report\|effects>` | GET | Owner session; rejects unbound legacy missions; returns server records only. |
-| `/api/public/missions/<id>/<start\|resume\|pause\|cancel>` | POST | Owner session + CSRF; delegates to MissionService owner authorization/revalidation. |
-| `/api/public/missions/<id>/effects/<effect-id>/reconcile` | POST | Owner session + CSRF; requires a specific ledger effect, an allowed reconciliation outcome, and a non-empty evidence reference of at most 512 characters. Owner statements are not independent proof of goal completion. |
-| `/api/public/workspace/<id>/files?path=...` | GET | Owner session; read-only descriptor-relative listing, at most 500 entries; symlinks and sensitive paths are excluded. Returns `501 secure_workspace_access_unavailable` unless secure descriptor-relative no-follow support is available. |
-| `/api/public/workspace/<id>/file?path=...` | GET | Owner session; read-only bounded UTF-8 file view, maximum 256 KiB; symlinks, escapes, and sensitive paths are rejected. Returns `501 secure_workspace_access_unavailable` unless secure descriptor-relative no-follow support is available. |
-| `/api/public/workspace/<id>/git?operation=...` | GET | Owner session; fixed read-only operations only: `status`, `branch`, `log`, `diff`, `repository`, `head`, `remote`. No arbitrary arguments or mutations; optional index writes, fsmonitor, pager, external diff, and textconv are disabled; remote URL user-info and recognized secret query values are redacted. Returns `501 secure_workspace_access_unavailable` unless secure descriptor-relative workspace/cwd support is available. |
+| `/api/desktop/bootstrap-owner` | POST | Desktop-only loopback route; process setup capability and expected Origin required; creates the local `owner` account only if none exists. It is not a public renderer route. |
+| `/api/public/session` | POST | Issues a short-lived public CSRF session cookie. |
+| `/api/public/auth/login` | POST | Public session + CSRF; validates Owner credentials and sets a server-managed HttpOnly Owner cookie. |
+| `/api/public/auth/session` | GET | Returns only authenticated state, username, and expiry; no session identifier. |
+| `/api/public/auth/logout` or `/api/public/logout` | POST | Public session + CSRF; revokes Owner and/or public session and clears cookies. |
+| `/api/public/desktop/setup` | GET | Public session; returns Desktop mode, whether Owner setup is complete, and sanitized model-manager state. |
+| `/api/public/desktop/models` | GET | Public session; returns the fixed bundled catalog, hardware compatibility, installed/active state, and bounded manager status. |
+| `/api/public/desktop/models/<id>/install` | POST | Public session + CSRF; before an Owner exists this permits only the fixed pinned catalog; after setup, Owner auth is required. Checks hardware and downloads only the pinned file. |
+| `/api/public/desktop/models/<id>/activate` | POST | Public session + CSRF and Owner auth after setup; refuses an incompatible or unverified model and blocks switching while nonterminal missions are active. |
+| `/api/public/projects` | GET | Owner session; creates/returns a default General project and an Owner-scoped project list without absolute root paths. |
+| `/api/public/projects` | POST | Owner session + CSRF; creates an app-managed project and local root. |
+| `/api/public/projects/import` | POST | Owner session + CSRF, expected Origin, and main-process native-picker capability; imports the selected directory only after backend path validation. |
+| `/api/public/projects/<id>` | POST | Owner session + CSRF; rename, description update, archive, or restore for that Owner's project. |
+| `/api/public/health` | GET | Reports service/version/worker readiness without provider secrets. |
+| `/api/public/providers` | GET | Owner session; exposes only known provider labels, configured flags, failure count, and Boolean capabilities—not URLs, model names, keys, or error text. |
+| `/api/public/chat` | POST | Owner session + CSRF; accepts `project_id`; server resolves Owner/project mapping and constructs scope. |
+| `/api/public/missions` | GET | Owner session; bounded, minimized mission list with server-derived `project_id`. Legacy unassigned missions are deterministically moved to General on listing. |
+| `/api/public/missions` | POST | Owner session + CSRF; accepts objective and project ID, ignores client-supplied scope/completion criteria, creates and queues a mission with server-derived project root. |
+| `/api/public/missions/<id>/<status\|timeline\|evidence\|artifacts\|logs\|report\|effects>` | GET | Owner session; rejects missions unbound to this Owner; returns persisted backend records only. |
+| `/api/public/missions/<id>/<start\|resume\|pause\|cancel>` | POST | Owner session + CSRF; delegates to MissionService authorization and revalidation. |
+| `/api/public/missions/<id>/effects/<effect-id>/reconcile` | POST | Owner session + CSRF; requires a specific effect ledger record, allowed outcome, and evidence reference; owner statement alone is not proof of goal completion. |
+| `/api/public/workspace/<id>/files?path=...` | GET | Owner session; bounded read-only listing; symlinks and sensitive paths excluded. Fails closed when secure descriptor-relative no-follow support is unavailable. |
+| `/api/public/workspace/<id>/file?path=...` | GET | Owner session; read-only UTF-8 view bounded to 256 KiB; escapes/symlinks/sensitive paths rejected; fails closed without secure handle-relative access. |
+| `/api/public/workspace/<id>/git?operation=...` | GET | Owner session; fixed read-only operations only; no arbitrary arguments/mutations; fails closed when secure workspace cwd support is unavailable. |
 
-All write routes validate same-origin/Origin and CSRF, and require server-side Owner authorization. Public health is informational; it does not authenticate a user. Responses use stable, explicit error codes and do not expose stack traces.
+Public write routes validate same-origin/Origin and CSRF and require Owner authorization, except the one-time bootstrap route, which has its own main-process capability and no-existing-account condition. Health/status APIs do not grant authority. Errors do not include stack traces or credentials.
 
-## Evidence, lifecycle, and unavailable capabilities
+## Mission, model, evidence, and agent visibility
 
-- The Desktop renders mission completion only when the backend reports `GOAL_COMPLETED`, independent verification is true, and a completion proof is present. Model text, tool output, provider status, and an Owner reconciliation decision are not accepted as independent completion proof.
-- Reconciliation is effect-specific and preserves the backend's recovery state machine; the client cannot submit a free-standing `{executed: true}` result.
-- The public client does not claim a general approve/reject API, public tools listing, transcript retrieval, or streaming chat. The chat UI is request/response; conversation text held only in the renderer is not represented as a server transcript.
-- The provider panel is a sanitized configuration summary, not a provider health probe. A successful provider call remains the only evidence of a successful request.
+- The ModelRouter remains Core's provider abstraction. The local manager owns pinned model acquisition, integrity verification, activation, status persistence, and `RuntimeAdapter` lifecycle. `llama.cpp` binds loopback only with a random API key; CPU is the supported backend in this installer.
+- Switching models cannot happen while a mission is active. A model download is resumable from a partial file and installation requires exact size and SHA-256.
+- Mission status controls, checkpoint/recovery, evidence chain, provenance, deterministic validation, findings, reports, scope firewall, target identity, tool registry, and bounded execution remain backend-owned.
+- The inspected source stores mission plan steps, queue/worker data, and tool results, but does not define a persistent independent sub-agent identity/run schema. The UI does not invent one; per-agent tracking requires a future Core data model with authorization, budget, checkpoint, and evidence lineage.
+- Filesystem and Git viewer routes keep their platform-specific fail-closed boundary; the app does not replace it with insecure path-based reads to make the UI appear more capable.
 
-## Build validation boundary
+## Build and verification
 
-The Windows workflow runs on `windows-latest` only for `release/cybersentinel-final-20261003`, builds NSIS and portable x64 executables, and uploads them as a non-release workflow artifact (`electron-builder --publish never`). CI and the Python suite validate the API and contracts, but the `.exe` is not executed on the Linux development computer; interactive Windows runtime behavior remains unverified unless a Windows runtime rehearsal is separately performed.
+`.github/workflows/desktop-build.yml` runs on `windows-latest` for `work/windows-native-local-llm`. It tests Python, npm lock/audit, renderer/Electron syntax, Desktop contracts, backend PyInstaller smoke, pinned llama.cpp digest, and NSIS output; the artifact includes installer SHA-256 and manifest. The job has `contents: read`, `--publish never`, and no release/tag step. No signing identity is configured, so the installer is unsigned. The current computer is Linux without Wine/native Windows GUI; hosted CI does not prove interactive Windows installation, SmartScreen, or first-run window behavior.

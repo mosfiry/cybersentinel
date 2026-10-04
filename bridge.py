@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hmac
+import os
 import signal
 import re
 import sys
@@ -42,6 +43,9 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 from security.public_session import PublicSessionManager
 from agent.runtime_supervisor import RuntimeSupervisor
 from workspace.environment import Workspace, WorkspaceBoundaryError, WorkspacePolicyError
+from workspace.projects import WorkspaceProjectStore
+from agent.local_runtime.manager import LocalModelManager
+from agent.local_runtime.runtime import LlamaCppRuntime
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -53,6 +57,40 @@ MAX_PUBLIC_WORKSPACE_FILE_BYTES = 262_144
 PUBLIC_WORKSPACE_BLOCKED_DIRS = {".git", ".ssh", ".gnupg", "secrets", "credentials"}
 PUBLIC_WORKSPACE_BLOCKED_NAMES = {".env", "id_rsa", "id_ed25519", "authorized_keys", "known_hosts"}
 PUBLIC_WORKSPACE_SAFE_ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
+DESKTOP_MODE = os.environ.get("CYBERSENTINEL_DESKTOP_MODE", "").casefold() == "true"
+DESKTOP_SETUP_TOKEN = os.environ.get("CYBERSENTINEL_DESKTOP_SETUP_TOKEN", "")
+_DESKTOP_MODEL_MANAGER: LocalModelManager | None = None
+_DESKTOP_MANAGER_LOCK = threading.Lock()
+
+
+def _project_store() -> WorkspaceProjectStore:
+    return WorkspaceProjectStore(root_base=DB_PATH.parent / "workspaces")
+
+
+def _desktop_model_manager() -> LocalModelManager:
+    global _DESKTOP_MODEL_MANAGER
+    with _DESKTOP_MANAGER_LOCK:
+        if _DESKTOP_MODEL_MANAGER is None:
+            storage_root = Path(
+                os.environ.get("CYBERSENTINEL_MODEL_ROOT", str(DB_PATH.parent / "local-models"))
+            ).expanduser().resolve()
+            runtime_dir = Path(
+                os.environ.get("CYBERSENTINEL_LLM_RUNTIME_DIR", str(ROOT / "runtime" / "llama"))
+            ).expanduser().resolve()
+            manager = LocalModelManager(
+                storage_root,
+                runtime=LlamaCppRuntime(runtime_dir),
+                router=RUNTIME.router,
+            )
+            _DESKTOP_MODEL_MANAGER = manager
+            manager.restore_active()
+        return _DESKTOP_MODEL_MANAGER
+
+
+def _shutdown_desktop_services() -> None:
+    manager = _DESKTOP_MODEL_MANAGER
+    if manager is not None:
+        manager.shutdown()
 
 
 def _redact_git_remote(value: str) -> str:
@@ -242,10 +280,10 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return owner
 
-    def _public_scope_context(self) -> dict[str, object]:
+    def _public_scope_context(self, project) -> dict[str, object]:
         return {
-            "target_id": "local-cybersentinel-repository",
-            "workspace_root": str(ROOT.resolve()),
+            "target_id": f"local-project:{project.project_id}",
+            "workspace_root": str(project.root_path.resolve()),
             "scope": ["workspace"],
             "allowed_networks": [],
             "allowed_credentials": [],
@@ -296,12 +334,14 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     @staticmethod
-    def _public_mission_summary(mission: dict) -> dict:
+    def _public_mission_summary(mission: dict, project_id: str = "") -> dict:
         fields = (
             "mission_id", "objective", "owner_request", "status", "request_id",
             "retry_count", "verification_state", "completion_proof", "queue",
         )
-        return {key: mission[key] for key in fields if key in mission}
+        result = {key: mission[key] for key in fields if key in mission}
+        result["project_id"] = str(project_id or "")
+        return result
 
     def _send_sse(self, events):
         self.send_response(200)
@@ -340,6 +380,33 @@ class Handler(BaseHTTPRequestHandler):
                 "username": str(owner.get("username", "")) if owner else "",
                 "expires_at": str(owner.get("expires_at", "")) if owner else "",
             })
+        if parsed.path == "/api/public/desktop/setup":
+            if self._public_guard(csrf=False) is None:
+                return
+            model_state = _desktop_model_manager().public_state()
+            return self._send(200, {
+                "ok": True,
+                "desktop_mode": DESKTOP_MODE,
+                "owner_configured": owner_password.owner_account_exists(),
+                "model_manager": model_state,
+            })
+        if parsed.path == "/api/public/desktop/models":
+            if self._public_guard(csrf=False) is None:
+                return
+            return self._send(200, _desktop_model_manager().public_state())
+        if parsed.path == "/api/public/projects":
+            owner = self._public_mission_owner()
+            if owner is None:
+                return
+            try:
+                store = _project_store()
+                store.ensure_default(int(owner["owner_id"]))
+                return self._send(200, {
+                    "ok": True,
+                    "projects": store.list(int(owner["owner_id"])),
+                })
+            except (ValueError, KeyError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
         if parsed.path == "/api/public/providers":
             if self._public_mission_owner() is None:
                 return
@@ -387,9 +454,20 @@ class Handler(BaseHTTPRequestHandler):
                 missions = self._mission_service().list_missions(
                     owner_session_token=owner["session_token"], limit=limit
                 )
+                store = _project_store()
+                default_project = store.ensure_default(int(owner["owner_id"]))
+                mission_ids = [str(item.get("mission_id", "")) for item in missions]
+                project_map = store.map_missions(int(owner["owner_id"]), mission_ids)
+                for mission_id in mission_ids:
+                    if mission_id and mission_id not in project_map:
+                        store.assign_mission(int(owner["owner_id"]), mission_id, default_project.project_id)
+                        project_map[mission_id] = default_project.project_id
                 return self._send(200, {
                     "ok": True,
-                    "missions": [self._public_mission_summary(item) for item in missions],
+                    "missions": [
+                        self._public_mission_summary(item, project_map.get(str(item.get("mission_id", "")), ""))
+                        for item in missions
+                    ],
                 })
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -578,6 +656,118 @@ class Handler(BaseHTTPRequestHandler):
             }, headers={
                 "Set-Cookie": self._public_owner_cookie_header(token, owner_password.SESSION_TTL_SECONDS)
             })
+        if path == "/api/public/projects":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_request")
+                project = _project_store().create(
+                    int(owner["owner_id"]), payload.get("name"), payload.get("description", "")
+                )
+                return self._send(201, {"ok": True, "project": project.public(mission_count=0)})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if path == "/api/public/projects/import":
+            if not DESKTOP_MODE or not DESKTOP_SETUP_TOKEN:
+                return self._send(404, {"ok": False, "error": "not_found"})
+            origin = self.headers.get("Origin", "").strip()
+            selection_key = self.headers.get("X-CyberSentinel-Desktop-Capability", "")
+            if not origin or not hmac.compare_digest(selection_key, DESKTOP_SETUP_TOKEN):
+                return self._send(403, {"ok": False, "error": "native_folder_selection_required"})
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_request")
+                project = _project_store().create(
+                    int(owner["owner_id"]),
+                    payload.get("name"),
+                    payload.get("description", ""),
+                    selected_root=payload.get("selected_root"),
+                )
+                return self._send(201, {"ok": True, "project": project.public(mission_count=0)})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if path.startswith("/api/public/projects/"):
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            project_id = unquote(path[len("/api/public/projects/"):])
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_request")
+                action = str(payload.get("action", "update"))
+                if action == "archive":
+                    project = _project_store().update(int(owner["owner_id"]), project_id, archived=True)
+                elif action == "unarchive":
+                    project = _project_store().update(int(owner["owner_id"]), project_id, archived=False)
+                elif action == "update":
+                    project = _project_store().update(
+                        int(owner["owner_id"]), project_id,
+                        name=payload.get("name") if "name" in payload else None,
+                        description=payload.get("description") if "description" in payload else None,
+                    )
+                else:
+                    return self._send(400, {"ok": False, "error": "unknown_project_action"})
+                return self._send(200, {"ok": True, "project": project.public()})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_project"})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if path.startswith("/api/public/desktop/models/"):
+            session = self._public_guard(csrf=True)
+            if session is None:
+                return
+            parts = [unquote(item) for item in path[len("/api/public/desktop/models/"):].split("/")]
+            if len(parts) != 2 or parts[1] not in {"install", "activate"}:
+                return self._send(404, {"ok": False, "error": "not_found"})
+            owner = self._public_owner_session()
+            if owner_password.owner_account_exists() and owner is None:
+                return self._send(403, {"ok": False, "error": "owner_authorization_required"})
+            try:
+                if parts[1] == "install":
+                    result = _desktop_model_manager().install(parts[0])
+                else:
+                    if owner is not None:
+                        missions = self._mission_service().list_missions(
+                            owner_session_token=owner["session_token"], limit=100
+                        )
+                        terminal = {
+                            "GOAL_COMPLETED", "COMPLETED", "CANCELLED", "FAILED",
+                            "FAILED_RETRY_EXHAUSTED", "OWNER_INPUT_REQUIRED",
+                            "OWNER_REAUTH_REQUIRED", "RECOVERY_REQUIRED", "PAUSED",
+                            "SCOPE_BLOCKED", "SAFETY_BLOCKED", "TERMINAL_FAILURE",
+                        }
+                        busy = any(
+                            str(item.get("status", "")).upper() not in terminal
+                            or str((item.get("queue") or {}).get("state", "")).lower()
+                            in {"ready", "queued", "leased", "running", "retry", "waiting"}
+                            for item in missions
+                        )
+                        if busy:
+                            return self._send(409, {"ok": False, "error": "model_switch_blocked_by_active_mission"})
+                    result = _desktop_model_manager().activate(parts[0])
+                return self._send(202, result)
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_model"})
+            except FileNotFoundError as exc:
+                return self._send(409, {"ok": False, "error": str(exc)})
+            except RuntimeError as exc:
+                return self._send(409, {"ok": False, "error": str(exc)})
+            except ValueError as exc:
+                return self._send(409 if str(exc).startswith("model_not_compatible") else 400, {"ok": False, "error": str(exc)})
         if path == "/api/public/auth/logout":
             if self._public_guard(csrf=True) is None:
                 return
@@ -598,11 +788,25 @@ class Handler(BaseHTTPRequestHandler):
                 safe_payload = dict(payload)
                 safe_payload.pop("scope_context", None)
                 safe_payload.pop("completion_criteria", None)
-                safe_payload["scope_context"] = self._public_scope_context()
+                requested_project_id = str(safe_payload.pop("project_id", "") or "")
+                store = _project_store()
+                project = (
+                    store.get(int(owner["owner_id"]), requested_project_id, include_archived=False)
+                    if requested_project_id
+                    else store.ensure_default(int(owner["owner_id"]))
+                )
+                safe_payload["scope_context"] = self._public_scope_context(project)
                 result = chat(safe_payload, owner_session_token=owner["session_token"])
+                mission_id = str(result.get("mission_id", ""))
+                if not mission_id and isinstance(result.get("mission"), dict):
+                    mission_id = str(result["mission"].get("mission_id", ""))
+                if mission_id:
+                    store.assign_mission(int(owner["owner_id"]), mission_id, project.project_id)
                 return self._send(200, {"ok": True, **result})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_project"})
             except ValueError as exc:
                 status = 413 if str(exc) == "request_too_large" else 400
                 return self._send(status, {"ok": False, "error": str(exc)})
@@ -621,7 +825,14 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("objective_required")
                 if len(objective) > 12_000:
                     raise ValueError("objective_too_long")
-                scope_context = self._public_scope_context()
+                store = _project_store()
+                requested_project_id = str(payload.get("project_id", "") or "")
+                project = (
+                    store.get(int(owner["owner_id"]), requested_project_id, include_archived=False)
+                    if requested_project_id
+                    else store.ensure_default(int(owner["owner_id"]))
+                )
+                scope_context = self._public_scope_context(project)
                 core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
                 mission = core.run_owner_mission(
                     objective,
@@ -630,19 +841,22 @@ class Handler(BaseHTTPRequestHandler):
                     scope_context=scope_context,
                     run=False,
                 )
+                store.assign_mission(int(owner["owner_id"]), mission.mission_id, project.project_id)
                 service = self._mission_service()
                 service.start_mission(mission.mission_id, owner_session_token=owner["session_token"])
                 current = service.status(mission.mission_id, owner_session_token=owner["session_token"])
                 return self._send(201, {
                     "ok": True,
                     "mission_id": mission.mission_id,
-                    "mission": self._public_mission_summary(current),
+                    "mission": self._public_mission_summary(current, project.project_id),
+                    "project_id": project.project_id,
                     "queue": current.get("queue", {}),
                 })
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
-            except KeyError:
-                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            except KeyError as exc:
+                error = "unknown_project" if "unknown_project" in str(exc) else "unknown_mission"
+                return self._send(404, {"ok": False, "error": error})
             except ValueError as exc:
                 status = 413 if str(exc) == "request_too_large" else 400
                 return self._send(status, {"ok": False, "error": str(exc)})
@@ -708,6 +922,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/public/"):
             return self._public_get(parsed)
         if self.path == "/api/health":
+            if DESKTOP_MODE and not self._bridge_auth():
+                return self._send(401, {"ok": False, "error": "bridge authentication required"})
             return self._send(200, {"ok": True, "service": PRODUCT_NAME, "version": VERSION})
         if self.path == "/api/health/live":
             return self._send(
@@ -835,8 +1051,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "request_id": request_id, "memory": memory})
         return self._send(404, {"ok": False, "error": "not_found"})
 
+    def _desktop_bootstrap_owner(self):
+        if not DESKTOP_MODE or not DESKTOP_SETUP_TOKEN or not self._public_enabled():
+            return self._send(404, {"ok": False, "error": "not_found"})
+        origin = self.headers.get("Origin", "").strip()
+        supplied = self.headers.get("X-CyberSentinel-Setup-Key", "")
+        if not origin or not self._public_origin_allowed():
+            return self._send(403, {"ok": False, "error": "origin_not_allowed"})
+        if not hmac.compare_digest(supplied, DESKTOP_SETUP_TOKEN):
+            return self._send(403, {"ok": False, "error": "desktop_setup_authorization_required"})
+        if owner_password.owner_account_exists():
+            return self._send(409, {"ok": False, "error": "owner_account_already_exists"})
+        try:
+            payload = self._read_json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid_request")
+            password = payload.get("password")
+            if not isinstance(password, str) or not 12 <= len(password) <= 256:
+                raise ValueError("password_must_be_12_to_256_characters")
+            owner_id = owner_password.create_owner_account(owner_password.OWNER_USERNAME, password)
+            _project_store().ensure_default(owner_id)
+            return self._send(201, {"ok": True, "owner_created": True})
+        except PermissionError as exc:
+            return self._send(409, {"ok": False, "error": str(exc)})
+        except ValueError as exc:
+            return self._send(400, {"ok": False, "error": str(exc)})
+
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/desktop/bootstrap-owner":
+            return self._desktop_bootstrap_owner()
         if parsed.path.startswith("/api/public/"):
             return self._public_post(parsed)
         if self.path == "/api/missions":
@@ -1023,8 +1267,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if "--desktop-self-test" in sys.argv[1:]:
+        required = (WEB / "index.html", WEB / "app.js", WEB / "style.css")
+        missing = [path.name for path in required if not path.is_file()]
+        if missing:
+            raise SystemExit("desktop_bundle_missing:" + ",".join(missing))
+        print(json.dumps({"ok": True, "version": VERSION, "web_assets": len(required)}), flush=True)
+        return
     if not BRIDGE_TOKEN:
         raise SystemExit("BRIDGE_TOKEN is required in .env")
+    if DESKTOP_MODE:
+        _desktop_model_manager()
     server = BridgeHTTPServer((BRIDGE_HOST, BRIDGE_PORT), Handler)
     worker_stop = threading.Event()
     worker_thread: threading.Thread | None = None
@@ -1090,6 +1343,7 @@ def main():
         server.server_close()
         if shutdown_thread is not None:
             shutdown_thread.join()
+        _shutdown_desktop_services()
 
 
 if __name__ == "__main__":

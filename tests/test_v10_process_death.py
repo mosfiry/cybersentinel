@@ -217,17 +217,35 @@ class WorkerProcess:
         ):
             raise AssertionError("refusing to signal a process that is not the V10 child harness")
         proc_dir = Path("/proc") / str(self.process.pid)
-        try:
-            live_args = [os.fsdecode(item) for item in (proc_dir / "cmdline").read_bytes().split(b"\0") if item]
-            raw_env = (proc_dir / "environ").read_bytes().split(b"\0")
-        except OSError as exc:
-            raise AssertionError("unable to verify the live V10 child process identity") from exc
-        if (
-            len(live_args) < 2
-            or Path(live_args[1]).resolve() != self.child_script
-            or Path(live_args[0]).resolve() != Path(args[0]).resolve()
-        ):
-            raise AssertionError("live PID does not belong to the expected V10 child harness")
+        deadline = time.monotonic() + 2.0
+        live_args: list[str] = []
+        raw_env: list[bytes] = []
+        while True:
+            if self.process.poll() is not None:
+                raise AssertionError("V10 child exited before its PID could be verified")
+            try:
+                live_args = [
+                    os.fsdecode(item)
+                    for item in (proc_dir / "cmdline").read_bytes().split(b"\0")
+                    if item
+                ]
+                raw_env = (proc_dir / "environ").read_bytes().split(b"\0")
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("unable to verify the live V10 child process identity") from exc
+            else:
+                if (
+                    len(live_args) >= 2
+                    and Path(live_args[1]).resolve() == self.child_script
+                    and Path(live_args[0]).resolve() == Path(args[0]).resolve()
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError("live PID does not belong to the expected V10 child harness")
+            # Popen returns before exec() is guaranteed to be visible in /proc.
+            # Wait briefly, still failing closed, rather than mistaking that
+            # startup window for a different process and making the suite flaky.
+            time.sleep(0.01)
         live_env = {}
         for item in raw_env:
             key, separator, value = item.partition(b"=")

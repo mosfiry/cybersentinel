@@ -1,0 +1,3 @@
+# Build-only dependencies used by the Windows installer workflow.
+-r requirements-runtime.txt
+PyInstaller==6.22.3

@@ -1,8 +1,8 @@
-name: desktop-build
+name: cybersentinel-windows-installer
 
 on:
   push:
-    branches: [release/cybersentinel-final-20261003]
+    branches: [work/windows-native-local-llm]
     paths:
       - "desktop/**"
       - "web/**"
@@ -12,51 +12,95 @@ on:
       - "core/**"
       - "security/**"
       - "workspace/**"
-      - "docs/DESKTOP_*.md"
+      - "scripts/build_desktop_backend.py"
+      - "scripts/download_llama_runtime.py"
+      - "scripts/write_installer_manifest.py"
+      - "requirements*.txt"
+      - "tests/**"
       - ".github/workflows/desktop-build.yml"
-      - "tests/test_desktop_client.py"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: pwsh
+
 concurrency:
-  group: desktop-build-${{ github.ref }}
+  group: cybersentinel-windows-installer-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  windows:
+  windows-installer:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-desktop-build.txt
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-      - name: Syntax check desktop JavaScript sources
-        run: |
-          node --check desktop/main.js
-          node --check desktop/preload.js
-          node --check desktop/tools/make-icon.js
-      - name: Generate application icon
-        run: node desktop/tools/make-icon.js
-      - name: Install desktop toolchain
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install Python test and bundling dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-desktop-build.txt
+      - name: Unit, integration, security, and regression tests
+        run: python -m pytest -q
+      - name: Install locked Electron toolchain
         working-directory: desktop
         run: npm ci --no-audit --no-fund
-      - name: Audit locked desktop build dependencies
+      - name: Audit locked Electron build dependencies
         working-directory: desktop
         run: npm audit --audit-level=high
-      - name: Build Windows executables
+      - name: Check Electron and renderer JavaScript syntax
+        working-directory: desktop
+        run: |
+          npm run check
+          node --check ../web/app.js
+      - name: Generate Desktop icon resources
+        working-directory: desktop
+        run: npm run icon
+      - name: Run Desktop contract tests
+        working-directory: desktop
+        run: npm run test:desktop
+      - name: Download and verify pinned llama.cpp CPU runtime
+        run: python scripts/download_llama_runtime.py
+      - name: Smoke-test pinned Windows runtime CLI
+        run: |
+          $runtime = Join-Path $env:GITHUB_WORKSPACE "desktop/build/llama/llama-server.exe"
+          $output = & $runtime --help 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "llama-server --help failed with exit code $LASTEXITCODE" }
+          $helpText = $output -join "`n"
+          foreach ($required in @("--api-key", "--no-webui", "--ctx-size", "--alias")) {
+            if (-not $helpText.Contains($required)) { throw "llama-server is missing required option: $required" }
+          }
+      - name: Build and smoke-test bundled backend
+        run: python scripts/build_desktop_backend.py
+      - name: Build unsigned Windows x64 NSIS installer
         working-directory: desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npx electron-builder --win nsis portable --publish never
-      - name: Upload Windows executables
+        run: npm run dist
+      - name: Hash and describe installer
+        run: python scripts/write_installer_manifest.py desktop/dist --version 5.1.0
+      - name: Upload installer and SHA-256 manifest for this commit
         uses: actions/upload-artifact@v4
         with:
-          name: cybersentinel-desktop-windows
+          name: cybersentinel-windows-installer-${{ github.sha }}
           path: |
-            desktop/dist/*.exe
+            desktop/dist/CyberSentinel-Setup-5.1.0.exe
+            desktop/dist/CyberSentinel-Setup-5.1.0.exe.sha256
+            desktop/dist/installer-manifest.json
           if-no-files-found: error
+          retention-days: 90

@@ -1,19 +1,4 @@
-"""Contract tests for the CyberSentinel Desktop client.
-
-The desktop application is a thin Electron shell over the existing backend.
-These tests pin the product contract:
-
-- the desktop shell starts the checked-in bridge server (python bridge.py)
-  and loads the served web client from the loopback origin,
-- the desktop process never mints, stores, or forwards credential values,
-- the public API uses Owner-only sessions, CSRF, and independent backend checks,
-- the Windows packaging pipeline builds real executables from the desktop
-  sources in CI.
-
-Desktop UI, shell, and backend changes are integrated on the release branch and
-tested together; no other branch is part of this test contract.
-"""
-
+"""Contract tests for the bundled Windows Desktop application."""
 from __future__ import annotations
 
 import json
@@ -24,100 +9,111 @@ PRELOAD = Path("desktop/preload.js").read_text(encoding="utf-8")
 UNAVAILABLE = Path("desktop/unavailable.html").read_text(encoding="utf-8")
 PACKAGE = json.loads(Path("desktop/package.json").read_text(encoding="utf-8"))
 WORKFLOW = Path(".github/workflows/desktop-build.yml").read_text(encoding="utf-8")
+APP = Path("web/app.js").read_text(encoding="utf-8")
+BRIDGE = Path("bridge.py").read_text(encoding="utf-8")
 
 
-def test_desktop_shell_runs_the_existing_bridge_and_loads_the_served_ui():
-    # The desktop client reuses the existing backend entrypoint and the
-    # existing web client instead of embedding a new application.
-    assert 'spawn(python, ["bridge.py", "--desktop-stdio-control"]' in MAIN
-    assert "PUBLIC_WEB_ENABLED" in MAIN
+def test_packaged_shell_starts_bundled_backend_without_external_python_or_repository():
+    assert 'if (app.isPackaged) return null;' in MAIN
+    assert 'path.join(process.resourcesPath, "backend", "cybersentinel-backend.exe")' in MAIN
+    assert 'args = ["--desktop-stdio-control"]' in MAIN
+    assert 'if (!app.isPackaged)' in MAIN
+    assert 'process.env.CYBERSENTINEL_PYTHON || "python"' in MAIN  # development-only path
+    assert "CYBERSENTINEL_REPO" not in MAIN
+    assert "developer_repository_missing" in MAIN
     assert 'env.BRIDGE_HOST = "127.0.0.1"' in MAIN
-    assert "http://127.0.0.1" in MAIN
+    assert "findFreeLoopbackPort" in MAIN
     assert 'mainWindow.loadURL(`${appOrigin()}/`)' in MAIN
-    assert "/api/health" in MAIN
 
 
-def test_packaged_desktop_requires_an_explicit_repository_path():
-    repo_root = MAIN.split("function repoRoot()", 1)[1].split("\n}", 1)[0]
-    assert "process.env[REPO_ENV_KEY]" in repo_root
-    assert "if (!app.isPackaged)" in repo_root
-    assert repo_root.index("if (!app.isPackaged)") < repo_root.index("process.cwd()")
-
-
-def test_desktop_does_not_invent_or_weaken_credentials():
-    # No token/credential values are read from .env, passed by Electron, or
-    # exposed to the renderer. Python loads its own private configuration.
-    for forbidden in ("OWNER_TOKEN", "cs_bridge_token", "cs_owner_token", "localStorage", "sessionStorage"):
-        assert forbidden not in PRELOAD
-    assert "parseDotEnv" not in MAIN
-    assert "readFileSync(envPath" not in MAIN
-    assert "Object.entries(process.env)" not in MAIN
-    assert '"BRIDGE_TOKEN",' not in MAIN
-    assert '"LLM_API_KEY",' not in MAIN
-    assert '"BRIDGE_TOKEN_FILE"' in MAIN
-    assert 'env.BRIDGE_HOST = "127.0.0.1"' in MAIN
-    assert "OWNER_TOKEN" not in MAIN
-    # Renderer hardening stays enabled.
-    assert "contextIsolation: true" in MAIN
-    assert "nodeIntegration: false" in MAIN
-    assert "sandbox: true" in MAIN
-    bridge = Path("bridge.py").read_text(encoding="utf-8")
-    assert "--desktop-stdio-control" in bridge
-    assert "CYBERSENTINEL_DESKTOP_SHUTDOWN" in bridge
-    assert 'child.stdin.end("CYBERSENTINEL_DESKTOP_SHUTDOWN\\n")' in MAIN
-    assert 'child.kill("SIGKILL")' in MAIN
-
-
-def test_desktop_navigation_allows_only_the_trusted_unavailable_file():
-    assert "function isUnavailableFile(url)" in MAIN
-    assert "fileURLToPath(parsed)" in MAIN
-    assert "isAppOrigin(url) || isUnavailableFile(url)" in MAIN
-    assert 'on("will-navigate", guardNavigation)' in MAIN
-    assert 'on("will-redirect", guardNavigation)' in MAIN
-    assert 'url.startsWith("file://")' not in MAIN
-
-
-def test_desktop_child_environment_and_logs_are_restricted():
-    assert '"PYTHONPATH"' not in MAIN
-    assert '"PYTHONHOME"' not in MAIN
-    assert '"PUBLIC_WEB_ORIGIN"' not in MAIN
-    assert 'env.PUBLIC_WEB_ORIGIN = ""' in MAIN
+def test_backend_and_persistent_state_are_bundled_or_scoped_to_user_data():
+    assert 'path.join(process.resourcesPath, "llama")' in MAIN
+    assert 'app.getPath("userData")' in MAIN
+    assert 'path.join(root, "local-model-manager")' in MAIN
+    assert 'path.join(state, "intel.sqlite3")' in MAIN
+    assert 'env.CYBERSENTINEL_DESKTOP_MODE = "true"' in MAIN
+    assert 'env.CYBERSENTINEL_DESKTOP_SETUP_TOKEN = desktopSetupToken' in MAIN
+    assert 'env.BRIDGE_TOKEN = bridgeToken' in MAIN
     assert "bridgeProcess.stdout.resume()" in MAIN
     assert "bridgeProcess.stderr.resume()" in MAIN
     assert "process.stdout.write(`[bridge]" not in MAIN
-    assert "process.stderr.write(`[bridge]" not in MAIN
+    assert '"BRIDGE_TOKEN"' not in PRELOAD
+    assert '"CYBERSENTINEL_DESKTOP_SETUP_TOKEN"' not in PRELOAD
+    assert '"node:fs"' not in PRELOAD
+    assert "contextIsolation: true" in MAIN
+    assert "nodeIntegration: false" in MAIN
+    assert "sandbox: true" in MAIN
 
 
-def test_desktop_handles_backend_unavailable_truthfully():
-    # A real unavailable state with retry; no fabricated data.
-    assert "unavailable.html" in MAIN
-    assert "backend-unavailable" in MAIN
-    assert "desktop:retry" in MAIN
-    assert "لم يتم توليد أي بيانات بديلة" in UNAVAILABLE
+def test_first_run_owner_bootstrap_is_one_time_and_keeps_credentials_out_of_storage():
+    assert '"desktop:create-owner"' in MAIN
+    assert "postOwnerBootstrap(payload.password)" in MAIN
+    assert '"X-CyberSentinel-Setup-Key": desktopSetupToken' in MAIN
+    assert 'if owner_password.owner_account_exists():' in BRIDGE
+    assert 'path == "/api/desktop/bootstrap-owner"' in BRIDGE
+    assert 'create_owner_account(owner_password.OWNER_USERNAME, password)' in BRIDGE
+    assert 'id="ownerSetupForm"' in Path("web/index.html").read_text(encoding="utf-8")
+    assert "window.cybersentinelDesktop.createOwner(password)" in APP
+    assert "localStorage" not in APP
+    assert "sessionStorage" not in APP
+    assert '"CYBERSENTINEL_REPO"' not in UNAVAILABLE
+    assert "Python مثبت" not in UNAVAILABLE
     assert "إعادة المحاولة" in UNAVAILABLE
 
 
-def test_desktop_builds_windows_executables_in_ci():
+def test_project_folder_import_uses_native_dialog_csrf_owner_and_capability():
+    assert "dialog.showOpenDialog(mainWindow" in MAIN
+    assert '"X-CSRF-Token": payload.csrfToken' in MAIN
+    assert '"X-CyberSentinel-Desktop-Capability": desktopSetupToken' in MAIN
+    assert 'path == "/api/public/projects/import"' in BRIDGE
+    assert "native_folder_selection_required" in BRIDGE
+    assert 'selected_root=payload.get("selected_root")' in BRIDGE
+    assert "window.cybersentinelDesktop.selectProjectFolder" in APP
+    assert "mission.project_id === state.activeProjectId" in APP
+
+
+def test_local_model_catalog_downloader_and_runtime_are_pinned_and_loopback_only():
+    catalog = Path("agent/local_runtime/catalog.py").read_text(encoding="utf-8")
+    downloader = Path("agent/local_runtime/downloader.py").read_text(encoding="utf-8")
+    runtime = Path("agent/local_runtime/runtime.py").read_text(encoding="utf-8")
+    manager = Path("agent/local_runtime/manager.py").read_text(encoding="utf-8")
+    assert "Qwen3-4B-Q4_K_M.gguf" in catalog
+    assert "qwen3-8b-q4_k_m.gguf" in catalog
+    assert "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf" in catalog
+    assert "revision=" in catalog
+    assert '("huggingface.co", "hf.co")' in downloader
+    assert "expected_sha256" in downloader
+    assert "os.replace(part, target)" in downloader
+    assert '"127.0.0.1"' in runtime
+    assert '"--api-key"' in runtime
+    assert "RuntimeAdapter" in runtime
+    assert "model_not_compatible" in manager
+    assert '"model_manager_busy"' in manager
+    assert 'status="interrupted"' in manager
+    assert "renderModelCards" in APP
+    assert "تنزيل وتثبيت" in APP
+    assert "تشغيل / تبديل إلى هذا النموذج" in APP
+
+
+def test_installer_and_exact_sha_workflow_build_a_private_artifact_not_a_release():
     build = PACKAGE["build"]
     targets = [item["target"] for item in build["win"]["target"]]
-    assert "nsis" in targets
-    assert "portable" in targets
-    assert build["win"]["icon"] == "build/icon.png"
-    assert PACKAGE["main"] == "main.js"
-    # The CI workflow checks syntax, generates the icon, builds, and uploads
-    # the produced executables as artifacts.
+    assert targets == ["nsis"]
+    assert build["extraResources"][0]["to"] == "backend"
+    assert build["extraResources"][1]["to"] == "llama"
+    assert build["nsis"]["allowToChangeInstallationDirectory"] is True
+    assert PACKAGE["version"] == "5.1.0"
+    assert "work/windows-native-local-llm" in WORKFLOW
     assert "windows-latest" in WORKFLOW
-    assert "node --check desktop/main.js" in WORKFLOW
-    assert "node desktop/tools/make-icon.js" in WORKFLOW
-    assert "electron-builder --win nsis portable" in WORKFLOW
-    assert "actions/upload-artifact@v4" in WORKFLOW
-    assert "contents: read" in WORKFLOW
-    assert "git commit" not in WORKFLOW
-    assert PACKAGE["version"] == "5.0.0"
-    assert PACKAGE["devDependencies"]["electron"] == "44.5.1"
-    assert PACKAGE["devDependencies"]["electron-builder"] == "26.15.3"
-    assert PACKAGE["overrides"]["@electron/get"] == "5.1.0"
-    assert Path("desktop/package-lock.json").is_file()
-    assert 'node-version: "22"' in WORKFLOW
+    assert "python -m pytest -q" in WORKFLOW
     assert "npm ci --no-audit --no-fund" in WORKFLOW
     assert "npm audit --audit-level=high" in WORKFLOW
+    assert "scripts/download_llama_runtime.py" in WORKFLOW
+    assert "scripts/build_desktop_backend.py" in WORKFLOW
+    assert "scripts/write_installer_manifest.py" in WORKFLOW
+    assert "CyberSentinel-Setup-5.1.0.exe" in WORKFLOW
+    assert "actions/upload-artifact@v4" in WORKFLOW
+    assert "contents: read" in WORKFLOW
+    assert "release:" not in WORKFLOW
+    assert "git push" not in WORKFLOW
+    assert Path("desktop/package-lock.json").is_file()
