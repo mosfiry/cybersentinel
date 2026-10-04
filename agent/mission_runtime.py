@@ -882,6 +882,15 @@ class MissionRuntime:
             if heartbeat is not None:
                 heartbeat()
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
+            if mission.status is not MissionStatus.RUNNING:
+                mission.transition(
+                    MissionStatus.RUNNING,
+                    "provider attempt started",
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    attempt_number=mission.retry_count + 1,
+                )
+                self._save(mission)
             current_step = mission.current_plan_step
             assembled = ContextAssembler().build(
                 mission,
@@ -938,16 +947,29 @@ class MissionRuntime:
                 return self._block_on_budget(mission, exc.budget, exc.limit)
             except ProviderError as exc:
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")
+                kind_value = getattr(kind, "value", kind)
                 attempts = [
                     {key: str(item.get(key, "")) for key in ("provider", "model", "kind")}
                     for item in getattr(exc, "attempts", ())
                     if isinstance(item, dict)
                 ]
+                provider_name = str(
+                    getattr(exc, "provider", "")
+                    or (attempts[0].get("provider", "") if attempts else "")
+                )
+                model_name = str(
+                    getattr(exc, "model", "")
+                    or (attempts[0].get("model", "") if attempts else "")
+                )
+                mission.retry_count += 1
                 failure = {
+                    "mission_id": mission.mission_id,
+                    "request_id": mission.request_id,
                     "class": FailureClass.PROVIDER.value,
-                    "kind": str(kind),
-                    "provider": str(getattr(exc, "provider", "") or ""),
-                    "model": str(getattr(exc, "model", "") or ""),
+                    "kind": str(kind_value),
+                    "provider": provider_name,
+                    "model": model_name,
+                    "provider_attempt": mission.retry_count,
                     "attempts": attempts,
                     "reason": "provider/model call failed",
                     "turn_id": turn_id,
@@ -956,19 +978,26 @@ class MissionRuntime:
                 mission.failures.append(failure)
                 mission.progress.setdefault("model_failures", []).append(failure)
                 mission.emit(EventType.FAILURE_DETECTED, data=failure)
-                mission.error = f"model provider failure: {kind}"
-                mission.retry_count += 1
+                mission.error = f"model provider failure: {kind_value}"
                 action = self.recovery_policy.action_for(FailureClass.PROVIDER, mission.retry_count - 1)
-                mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.PROVIDER.value, "kind": str(kind), "recovery": action.value})
-                kind_value = getattr(kind, "value", kind)
+                kind_is_retryable = str(kind_value) in {"PROVIDER_FAILURE", "TIMEOUT"}
                 retryable_provider_failure = (
                     action in {RecoveryAction.RETRY, RecoveryAction.REPLAN}
-                    and str(kind_value) in {"PROVIDER_FAILURE", "TIMEOUT"}
+                    and kind_is_retryable
                 )
+                if action in {RecoveryAction.RETRY, RecoveryAction.REPLAN} and not kind_is_retryable:
+                    action = RecoveryAction.FAIL
+                mission.emit(EventType.FAILURE_DIAGNOSED, data={"class": FailureClass.PROVIDER.value, "kind": str(kind_value), "recovery": action.value})
+                retry_data = {
+                    "run_id": run_id,
+                    "turn_id": turn_id,
+                    "attempt_number": mission.retry_count,
+                    "max_retries": self.recovery_policy.max_retries,
+                }
                 if action is RecoveryAction.RETRY:
-                    mission.transition(MissionStatus.READY, "provider failure; bounded retry selected")
+                    mission.transition(MissionStatus.READY, "provider failure; bounded retry selected", **retry_data)
                 elif action is RecoveryAction.REPLAN:
-                    mission.transition(MissionStatus.REPLANNING, "provider failure; replan selected")
+                    mission.transition(MissionStatus.REPLANNING, "provider failure; replan selected", **retry_data)
                 else:
                     mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
                 self._save(mission)
