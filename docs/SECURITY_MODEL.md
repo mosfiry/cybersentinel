@@ -45,4 +45,5 @@
 
 - SQLite records mission, request, authorization, execution, evidence, and lifecycle state needed for traceability. Sensitive bearer session values are represented by their SHA-256 references; passwords remain verifiers, and command arguments are not copied into workspace audit events.
 - Session-reference migrations are security-sensitive. Backups, exports, and new structured fields must be checked so a legacy/raw bearer token is not reintroduced.
+- The state archive is a versioned manifest plus per-file SHA-256 checksums. Backup rejects symlinks and non-regular files; verification checks every member before restore, and restore rejects traversal/link entries and requires an empty target directory rather than overwriting live state. The archive is not encrypted and can contain sensitive mission/workspace data; protect it accordingly. Compose credentials are stored separately and are intentionally outside the state volume/archive.
 - Review `security/session_reference.py`, `security/owner_password.py`, `security/pinned_http.py`, `workspace/environment.py`, and the scheduled-worker authorization path when changing these boundaries.

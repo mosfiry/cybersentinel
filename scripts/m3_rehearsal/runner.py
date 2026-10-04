@@ -1,8 +1,9 @@
-"""Twelve-stage non-production M3 lifecycle rehearsal orchestration."""
+"""M3 lifecycle and V12 clean-environment rehearsal orchestration."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -70,6 +71,8 @@ class RehearsalRunner:
         self.stages: list[dict[str, Any]] = []
         self.started = time.monotonic()
         self.temp_path: Path | None = None
+        self.backup_archive: Path | None = None
+        self.restore_host: DockerHost | None = None
 
     def _prepare_compose_secrets(self) -> None:
         """Materialize only synthetic credentials in the disposable run directory."""
@@ -111,6 +114,12 @@ class RehearsalRunner:
             "image": self.image,
             "compose_config_valid": True,
         }
+
+    def _legacy_state_seed(self) -> dict[str, Any]:
+        return self.host.seed_legacy_state()
+
+    def _schema_upgrade(self) -> dict[str, Any]:
+        return self.host.legacy_migration_probe()
 
     def _startup(self) -> dict[str, Any]:
         self.host.compose("up", "--detach", "--no-build", "bridge", timeout=90)
@@ -663,6 +672,128 @@ class RehearsalRunner:
             "bridge_exit_code": int(bridge_exit),
         }
 
+    def _backup(self) -> dict[str, Any]:
+        if self.temp_path is None:
+            raise RehearsalFailure("temporary_directory_missing")
+        archive_path = self.temp_path / "state-backup.tar.gz"
+        self.host.state_archive("backup", output_path=archive_path)
+        verification = self.host.state_archive("verify", input_path=archive_path)
+        try:
+            details = json.loads(verification)
+        except json.JSONDecodeError as exc:
+            raise RehearsalFailure("backup_verification_result_invalid") from exc
+        if details.get("valid") is not True or details.get("files", 0) < 1:
+            raise RehearsalFailure("backup_archive_not_verified")
+        digest = hashlib.sha256()
+        size = 0
+        with archive_path.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+        if size <= 0:
+            raise RehearsalFailure("backup_archive_empty")
+        self.backup_archive = archive_path
+        return {
+            "archive_verified": True,
+            "files": details["files"],
+            "entries": details["entries"],
+            "total_state_bytes": details["total_bytes"],
+            "archive_bytes": size,
+            "archive_sha256": digest.hexdigest(),
+        }
+
+    def _restore(self) -> dict[str, Any]:
+        if self.backup_archive is None or not self.backup_archive.is_file():
+            raise RehearsalFailure("verified_backup_missing")
+        restore_project = f"{self.project}-restore"
+        restore_port = int(_free_loopback_port())
+        restore_env = dict(self.env)
+        restore_env["BRIDGE_PUBLISHED_PORT"] = str(restore_port)
+        restore_host = DockerHost(
+            project=restore_project,
+            image=self.image,
+            port=restore_port,
+            env=restore_env,
+        )
+        restore_host.image_built = True
+        restore_host.remove_image = False
+        self.restore_host = restore_host
+        restore_host.compose("config", "--quiet", timeout=30)
+        restored = restore_host.state_archive(
+            "restore", input_path=self.backup_archive
+        )
+        try:
+            restore_details = json.loads(restored)
+        except json.JSONDecodeError as exc:
+            raise RehearsalFailure("restore_result_invalid") from exc
+        if restore_details.get("valid") is not True:
+            raise RehearsalFailure("restored_state_not_verified")
+        restore_host.compose(
+            "up", "--detach", "--no-build", "bridge", timeout=90
+        )
+        previous_host = self.host
+        previous_base_url = self.base_url
+        previous_session = self.owner_session
+        try:
+            self.host = restore_host
+            self.base_url = f"http://127.0.0.1:{restore_port}"
+            self.owner_session = ""
+            self._health()
+            login = self._http_json(
+                "POST",
+                "/api/auth/login",
+                {"username": OWNER_USERNAME, "password": self.owner_password},
+                expected=(200,),
+            ).get("session", {})
+            restored_session = str(login.get("session_id", ""))
+            restored_owner_id = int(login.get("owner_id", -1))
+            if (
+                not restored_session
+                or restored_owner_id != self.owner_id
+                or restored_session == previous_session
+            ):
+                raise RehearsalFailure("restored_owner_reauthentication_failed")
+            self.owner_session = restored_session
+            mission = self._status()
+            probe = self.host.state_probe(self.mission_id, self.keyword)
+            queue = probe.get("queue") or {}
+            effect = next(
+                (
+                    item
+                    for item in probe.get("effects", [])
+                    if item.get("effect_id") == self.effect_id
+                ),
+                {},
+            )
+            events = effect.get("events", [])
+            if (
+                mission.get("status") != "GOAL_COMPLETED"
+                or queue.get("state") != QUEUE_STATE_COMPLETED
+                or probe.get("watch_count") != 1
+                or effect.get("state") != "SUCCEEDED"
+                or events.count("DISPATCHED") != 1
+                or events.count("OWNER_CONFIRMED_APPLIED") != 1
+                or (probe.get("generation") or {}).get("runtime_generation") != 2
+                or probe.get("db_under_state") is not True
+            ):
+                raise RehearsalFailure("restored_mission_state_mismatch")
+        finally:
+            self.host = previous_host
+            self.base_url = previous_base_url
+            self.owner_session = previous_session
+        return {
+            "restored_volume_is_separate": True,
+            "owner_reauthenticated": True,
+            "owner_identity_preserved": True,
+            "completed_mission_preserved": True,
+            "queue_effect_evidence_and_worker_generation_preserved": True,
+            "archive_entries_restored": restore_details["entries"],
+            "restore_target_was_empty": True,
+        }
+
     def _run_stage(self, name: str, operation) -> None:
         started = time.monotonic()
         try:
@@ -704,7 +835,7 @@ class RehearsalRunner:
         summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
         if summary_path:
             rows = [
-                "## M3 V16 non-production rehearsal",
+                "## M3 V16 and V12 clean-environment rehearsal",
                 "",
                 (
                     f"**Result:** `{result['status']}` — production remains "
@@ -749,17 +880,21 @@ class RehearsalRunner:
             self.env["DOCKER_CONFIG"] = str(docker_config)
             operations = (
                 ("deploy_build", self._compose_build),
+                ("legacy_state_seed", self._legacy_state_seed),
                 ("startup", self._startup),
                 ("health", self._health),
                 ("owner_login", self._owner_login),
                 ("mission_creation", self._create_mission),
                 ("worker_execution", self._worker_execution),
+                ("schema_upgrade", self._schema_upgrade),
                 ("queue_state", self._queue_state),
                 ("evidence", self._evidence),
                 ("controlled_crash", self._controlled_crash),
                 ("same_identity_restart", self._restart),
                 ("recovery_owner_reauthorization", self._recovery),
                 ("graceful_shutdown", self._graceful_shutdown),
+                ("backup", self._backup),
+                ("restore", self._restore),
             )
             for name, operation in operations:
                 self._run_stage(name, operation)
@@ -773,14 +908,38 @@ class RehearsalRunner:
             for name in STAGE_ORDER:
                 if name not in completed_names:
                     self.stages.append({"name": name, "status": "NOT_RUN"})
-            try:
-                cleanup_result = self.host.cleanup()
-            except Exception as exc:
-                cleanup_result = {
-                    "status": "FAIL",
-                    "leftovers": {},
-                    "errors": [f"cleanup_{type(exc).__name__}"],
-                }
+            cleanup_hosts = []
+            if self.restore_host is not None:
+                cleanup_hosts.append(("restore", self.restore_host))
+            cleanup_hosts.append(("primary", self.host))
+            project_results: dict[str, dict[str, Any]] = {}
+            for label, host in cleanup_hosts:
+                try:
+                    project_results[label] = host.cleanup()
+                except Exception as exc:
+                    project_results[label] = {
+                        "status": "FAIL",
+                        "leftovers": {},
+                        "errors": [f"cleanup_{type(exc).__name__}"],
+                    }
+            leftover_keys = {key for item in project_results.values() for key in item.get("leftovers", {})}
+            leftovers = {
+                key: sum(int(item.get("leftovers", {}).get(key, 0)) for item in project_results.values())
+                for key in leftover_keys
+            }
+            cleanup_errors = [
+                f"{label}:{error}"
+                for label, item in project_results.items()
+                for error in item.get("errors", [])
+            ]
+            cleanup_result = {
+                "status": "PASS"
+                if all(item.get("status") == "PASS" for item in project_results.values())
+                else "FAIL",
+                "leftovers": leftovers,
+                "errors": cleanup_errors,
+                "projects": project_results,
+            }
             if self.temp_path is not None:
                 try:
                     shutil.rmtree(self.temp_path)

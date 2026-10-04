@@ -106,3 +106,16 @@ def test_container_ci_secrets_are_permissioned_then_removed() -> None:
     cleanup = workflow.index('sudo rm -rf -- "$CYBERSENTINEL_SECRETS_DIR"')
     assert write_files < files_owner < files_mode < directory_owner < directory_mode
     assert cleanup < workflow.index("trap cleanup EXIT") < write_files
+
+
+def test_v12_archive_is_runtime_code_and_legacy_fixture_is_ci_only_readonly() -> None:
+    overlay = (ROOT / "tests" / "compose.m3-rehearsal.yaml").read_text(encoding="utf-8")
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+    fixture = ROOT / "tests" / "m3_rehearsal" / "prepare_legacy_state.py"
+    initializer = overlay.split("  workspace-init:\n", 1)[1].split("\n  bridge:", 1)[0]
+
+    assert (ROOT / "scripts" / "state_archive.py").is_file()
+    assert "tests/" in dockerignore
+    assert "- ./tests/m3_rehearsal:/m3-rehearsal:ro" in initializer
+    assert "/m3-rehearsal" not in COMPOSE
+    assert fixture.is_file()

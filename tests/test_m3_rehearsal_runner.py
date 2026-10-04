@@ -37,17 +37,21 @@ def _stub_stages(
 ) -> None:
     names = (
         "_compose_build",
+        "_legacy_state_seed",
         "_startup",
         "_health",
         "_owner_login",
         "_create_mission",
         "_worker_execution",
+        "_schema_upgrade",
         "_queue_state",
         "_evidence",
         "_controlled_crash",
         "_restart",
         "_recovery",
         "_graceful_shutdown",
+        "_backup",
+        "_restore",
     )
     for name in names:
         monkeypatch.setattr(runner, name, lambda name=name: {"completed": name})
@@ -204,6 +208,7 @@ def test_embedded_container_probe_programs_compile() -> None:
         host_module._MARKER_PROBE,
         host_module._MARKER_CREATE,
         host_module._STATE_PROBE,
+        host_module._LEGACY_MIGRATION_PROBE,
     )
     for index, program in enumerate(programs):
         compile(program, f"m3-v16-probe-{index}", "exec")
@@ -314,7 +319,7 @@ def test_http_failure_reason_does_not_include_response_body(
     assert body.closed
 
 
-def test_success_records_all_twelve_stages_and_cleans_temporary_directory(
+def test_success_records_all_v12_stages_and_cleans_temporary_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -368,17 +373,19 @@ def test_stage_failure_marks_later_stages_not_run_and_still_cleans(
 
     assert result["status"] == "FAIL"
     assert result["failure_reason"] == "health_failed"
-    assert [stage["name"] for stage in result["stages"][:3]] == [
+    assert [stage["name"] for stage in result["stages"][:4]] == [
         "deploy_build",
+        "legacy_state_seed",
         "startup",
         "health",
     ]
-    assert [stage["status"] for stage in result["stages"][:3]] == [
+    assert [stage["status"] for stage in result["stages"][:4]] == [
+        "PASS",
         "PASS",
         "PASS",
         "FAIL",
     ]
-    assert all(stage["status"] == "NOT_RUN" for stage in result["stages"][3:])
+    assert all(stage["status"] == "NOT_RUN" for stage in result["stages"][4:])
     assert result["cleanup"]["temporary_directory_removed"] is True
     assert runner.host.cleanup_calls == 1
     rendered = output.read_text(encoding="utf-8")
@@ -449,3 +456,59 @@ def test_compose_secrets_are_synthetic_files_inside_rehearsal_temp_directory(
     for name in ("llm_api_key", "local_llm_api_key", "colab_llm_api_key", "hf_llm_api_key"):
         assert (directory / name).read_bytes() == b""
         assert (directory / name).stat().st_mode & 0o777 == 0o444
+
+
+def test_state_archive_adapter_streams_binary_output_to_private_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        kwargs["stdout"].write(b"synthetic-gzip-archive")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    archive = tmp_path / "state.tar.gz"
+    host = rehearsal.DockerHost(
+        project="m3v16-abcdef012345",
+        image="cybersentinel-m3-v16:abcdef012345",
+        port=32991,
+        env={},
+    )
+
+    assert host.state_archive("backup", output_path=archive) == ""
+    assert archive.read_bytes() == b"synthetic-gzip-archive"
+    assert archive.stat().st_mode & 0o777 == 0o600
+    assert captured["argv"][-3:] == [
+        "workspace-init",
+        "/app/scripts/state_archive.py",
+        "backup",
+    ]
+    assert "--no-TTY" in captured["argv"] and "--no-deps" in captured["argv"]
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+
+
+def test_failed_state_archive_command_removes_partial_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        kwargs["stdout"].write(b"partial")
+        return subprocess.CompletedProcess(argv, 2, stdout="", stderr="hidden")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    archive = tmp_path / "partial.tar.gz"
+    host = rehearsal.DockerHost(
+        project="m3v16-abcdef012345",
+        image="cybersentinel-m3-v16:abcdef012345",
+        port=32991,
+        env={},
+    )
+
+    with pytest.raises(rehearsal.RehearsalFailure, match="state_archive_command_failed"):
+        host.state_archive("backup", output_path=archive)
+
+    assert not archive.exists()

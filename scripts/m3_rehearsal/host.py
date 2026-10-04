@@ -25,17 +25,21 @@ LEASE_SECONDS = 5
 HOST_RELEASE_SECONDS = 45
 STAGE_ORDER = (
     "deploy_build",
+    "legacy_state_seed",
     "startup",
     "health",
     "owner_login",
     "mission_creation",
     "worker_execution",
+    "schema_upgrade",
     "queue_state",
     "evidence",
     "controlled_crash",
     "same_identity_restart",
     "recovery_owner_reauthorization",
     "graceful_shutdown",
+    "backup",
+    "restore",
 )
 PROVIDER_ENV_KEYS = (
     "LLM_BASE_URL",
@@ -171,6 +175,45 @@ for effect in ledger.list_effects(mission_id=mission_id, limit=20):
 print(json.dumps(result, sort_keys=True))
 """
 
+_LEGACY_MIGRATION_PROBE = """\
+import json
+import sqlite3
+from pathlib import Path
+
+root = Path('/var/lib/cybersentinel')
+
+with sqlite3.connect(root / 'intel.db') as db:
+    db.row_factory = sqlite3.Row
+    core_columns = {row[1] for row in db.execute('PRAGMA table_info(executions)')}
+    core_row = db.execute(
+        "SELECT source,status,error,cancel_requested,owner_session_id "
+        "FROM executions WHERE request_id='v12-legacy-execution'"
+    ).fetchone()
+with sqlite3.connect(root / 'tasks.sqlite3') as db:
+    db.row_factory = sqlite3.Row
+    task_columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+    task_row = db.execute(
+        "SELECT task_id,objective,task_version FROM tasks WHERE task_id='v12-legacy-task'"
+    ).fetchone()
+with sqlite3.connect(root / 'mission_queue.sqlite3') as db:
+    db.row_factory = sqlite3.Row
+    queue_columns = {row[1] for row in db.execute('PRAGMA table_info(mission_queue)')}
+    queue_row = db.execute(
+        "SELECT mission_id,attempts,last_error,lease_epoch,claim_fence_id "
+        "FROM mission_queue WHERE mission_id='v12-legacy-queue'"
+    ).fetchone()
+
+checks = {
+    'execution_columns_added': {'cancel_requested', 'owner_session_id'} <= core_columns,
+    'execution_row_preserved': bool(core_row and core_row['source'] == 'v12-legacy-fixture' and core_row['status'] == 'completed' and core_row['error'] == 'preserve-me'),
+    'task_version_column_added': 'task_version' in task_columns,
+    'task_row_preserved': bool(task_row and task_row['objective'] == 'preserve legacy task' and task_row['task_version'] == 0),
+    'queue_fence_columns_added': {'lease_epoch', 'runtime_generation', 'claim_phase', 'claim_fence_id', 'worker_instance_id'} <= queue_columns,
+    'queue_row_preserved': bool(queue_row and queue_row['attempts'] == 4 and queue_row['last_error'] == 'preserve legacy queue row' and queue_row['lease_epoch'] == 0),
+}
+print(json.dumps({'checks': checks, 'all_passed': all(checks.values())}, sort_keys=True))
+"""
+
 
 class RehearsalFailure(RuntimeError):
     """A failure with a deliberately sanitized, non-secret reason code."""
@@ -248,6 +291,7 @@ class DockerHost:
         self.worker_names: list[str] = []
         self.worker_processes: list[subprocess.Popen[bytes]] = []
         self.image_built = False
+        self.remove_image = True
 
     @staticmethod
     def _run(
@@ -422,6 +466,120 @@ class DockerHost:
         except json.JSONDecodeError as exc:
             raise RehearsalFailure("state_probe_invalid") from exc
 
+    def seed_legacy_state(self) -> dict[str, Any]:
+        output = self.compose(
+            "run",
+            "--rm",
+            "--no-deps",
+            "--no-TTY",
+            "--entrypoint",
+            "python",
+            "workspace-init",
+            "/m3-rehearsal/prepare_legacy_state.py",
+            timeout=30,
+        )
+        try:
+            result = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RehearsalFailure("legacy_fixture_result_invalid") from exc
+        if result.get("legacy_rows_seeded") != 3:
+            raise RehearsalFailure("legacy_fixture_seed_failed")
+        return result
+
+    def legacy_migration_probe(self) -> dict[str, Any]:
+        output = self.compose(
+            "exec", "--no-TTY", "bridge", "python", "-c", _LEGACY_MIGRATION_PROBE
+        )
+        try:
+            result = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RehearsalFailure("legacy_migration_probe_invalid") from exc
+        if result.get("all_passed") is not True:
+            raise RehearsalFailure("legacy_schema_upgrade_invariants_failed")
+        return result
+
+    def state_archive(
+        self,
+        command: str,
+        *,
+        input_path: Path | None = None,
+        output_path: Path | None = None,
+        timeout: int = 180,
+    ) -> str:
+        if command not in {"backup", "verify", "restore"}:
+            raise RehearsalFailure("unsafe_state_archive_command")
+        argv = [
+            *self.compose_base,
+            "run",
+            "--rm",
+            "--no-deps",
+            "--no-TTY",
+            "--entrypoint",
+            "python",
+            "workspace-init",
+            "/app/scripts/state_archive.py",
+            command,
+        ]
+        source = None
+        destination = None
+        created_path = False
+        succeeded = False
+        try:
+            if input_path is not None:
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                source = os.fdopen(os.open(input_path, flags), "rb")
+            if output_path is not None:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                destination = os.fdopen(os.open(output_path, flags, 0o600), "wb")
+                created_path = True
+            completed = subprocess.run(
+                argv,
+                cwd=REPO_ROOT,
+                env=self.env,
+                stdin=source if source is not None else subprocess.DEVNULL,
+                stdout=destination if destination is not None else subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if destination is not None:
+                destination.flush()
+                os.fsync(destination.fileno())
+            if completed.returncode != 0:
+                raise RehearsalFailure("state_archive_command_failed")
+            succeeded = True
+            return completed.stdout.strip() if destination is None else ""
+        except FileNotFoundError as exc:
+            raise RehearsalFailure("state_archive_file_unavailable") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RehearsalFailure("state_archive_command_timeout") from exc
+        except OSError as exc:
+            raise RehearsalFailure("state_archive_host_io_failed") from exc
+        finally:
+            if source is not None:
+                source.close()
+            if destination is not None:
+                destination.close()
+            if created_path and output_path is not None:
+                if succeeded:
+                    os.chmod(output_path, 0o600, follow_symlinks=False)
+                else:
+                    try:
+                        output_path.unlink()
+                    except FileNotFoundError:
+                        pass
+
     def cleanup(self) -> dict[str, Any]:
         errors: list[str] = []
         if self.worker_names:
@@ -437,7 +595,8 @@ class DockerHost:
                 timeout=30,
                 check=False,
             )
-            self.docker("image", "rm", self.image, check=False)
+            if self.remove_image:
+                self.docker("image", "rm", self.image, check=False)
             for process in self.worker_processes:
                 if process.poll() is None:
                     process.terminate()
@@ -480,10 +639,15 @@ class DockerHost:
                         f"label=com.docker.compose.project={self.project}",
                     ],
                 ),
-                ("image_tags", ["image", "ls", "--quiet", self.image]),
+                ("image_tags", ["image", "ls", "--quiet", self.image])
+                if self.remove_image
+                else ("image_tags", []),
             )
             leftovers: dict[str, int] = {}
             for label, args in checks:
+                if not args:
+                    leftovers[label] = 0
+                    continue
                 try:
                     output = self.docker(*args, check=False)
                     count = len([line for line in output.splitlines() if line.strip()])

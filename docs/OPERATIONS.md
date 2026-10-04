@@ -60,6 +60,67 @@ The image uses the Python 3.12 slim Bookworm base, installs only runtime depende
 
 The named state volume stores all SQLite databases, mutable Owner policy state, and scoped workspace files at `/var/lib/cybersentinel/workspace`. Use the same Compose project name so Compose reattaches the existing volume; stop services before upgrading and back up the whole volume first. `docker compose down` preserves it. **Do not run `docker compose down --volumes` unless permanent deletion is explicitly intended and a verified backup exists.** Use approved host backup tooling for the stopped volume and rehearse restoration. Do not copy a single live SQLite file or place the state volume on an unverified network filesystem. No ignored local database is copied into the image or automatically migrated into this volume. The M3 cutover rehearsal's explicit test cleanup may remove only its isolated CI volume.
 
+### State backup, restore, and upgrade
+
+The image includes `/app/scripts/state_archive.py`. It writes a gzip tar archive with a versioned manifest and per-file SHA-256 hashes. It refuses symlinks and non-regular files, verifies the full archive before restore, and restores only into an empty state directory; it never overwrites an existing volume. Restored files are owned by the process performing restore (UID/GID `10001:10001` in the production container), and basic POSIX mode bits are preserved; ownership, ACLs, extended attributes, and timestamps are not. The archive covers the complete state volume (SQLite files and workspace), but **does not include `.env`, Compose secret files, provider credentials, or bridge-token files**. State archives can still contain sensitive Owner, mission, and workspace data: store them access-controlled and encrypted outside the host, and manage the separate deployment secrets securely.
+
+Create and verify a consistent backup while both stateful services are stopped:
+
+```bash
+set -euo pipefail
+umask 077
+backup_dir=/secure/backup/cybersentinel
+install -d -m 700 "$backup_dir"
+backup="$backup_dir/state-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
+temporary="$backup.tmp"
+if [[ -e "$backup" || -e "$backup.sha256" || -e "$temporary" ]]; then
+  echo "Refusing to overwrite an existing backup path" >&2
+  exit 1
+fi
+running_services="$(docker compose ps --status running --services)"
+resume_services=()
+for service in bridge mission-worker; do
+  if grep -Fxq "$service" <<<"$running_services"; then
+    resume_services+=("$service")
+  fi
+done
+resume_services_now() {
+  rm -f -- "$temporary"
+  if ((${#resume_services[@]})); then
+    docker compose start "${resume_services[@]}" >/dev/null
+  fi
+}
+trap resume_services_now EXIT
+docker compose stop bridge mission-worker
+docker compose run --rm --no-deps -T --entrypoint python workspace-init \
+  /app/scripts/state_archive.py backup > "$temporary"
+docker compose run --rm --no-deps -T --entrypoint python workspace-init \
+  /app/scripts/state_archive.py verify < "$temporary"
+chmod 600 "$temporary"
+mv "$temporary" "$backup"
+sha256sum "$backup" > "$backup.sha256"
+chmod 600 "$backup.sha256"
+if ((${#resume_services[@]})); then
+  docker compose start "${resume_services[@]}"
+fi
+trap - EXIT
+```
+
+Before restore, check the outer checksum with `sha256sum -c "$backup.sha256"`. Use a **new Compose project name** so the restore mounts a new empty named volume; do not point the restore at the live project or an existing state directory. The example uses loopback port `18789`, leaving the current project and its data untouched:
+
+```bash
+restore_project=cybersentinel-restore
+export BRIDGE_PUBLISHED_PORT=18789
+docker compose -p "$restore_project" run --rm --no-deps -T --entrypoint python workspace-init \
+  /app/scripts/state_archive.py verify < "$backup"
+docker compose -p "$restore_project" run --rm --no-deps -T --entrypoint python workspace-init \
+  /app/scripts/state_archive.py restore < "$backup"
+docker compose -p "$restore_project" up -d bridge
+docker compose -p "$restore_project" ps
+```
+
+The restored project uses the current `.env` and separate host secret files, so validate those before starting it. Log in as the Owner on `http://127.0.0.1:18789/` and confirm the expected mission/state before any cutover. `restore` does not promote the recovered project or change the original project's volume; choose and execute any production cutover separately. To upgrade in place, stop services, create and verify a backup first, then rebuild and start the same Compose project so it reuses the named volume. SQLite stores apply their component-specific additive/idempotent schema migrations at startup. Do not roll back an image against a database already migrated by a newer image; recover into a separate project from the pre-upgrade backup instead.
+
 ### Deployment boundary
 
 `firebase.json` remains the existing static-hosting configuration; it has no backend rewrite. The bridge, durable worker, and SQLite storage are not deployed to a public platform. This Compose configuration has no Cloudflare dependency and does not select a public backend host, domain, TLS ingress, production credentials, or production database. Keep production deployment blocked until the exact target and authority are known and the later M3 cutover gates pass.

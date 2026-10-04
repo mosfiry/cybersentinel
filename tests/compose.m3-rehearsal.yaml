@@ -1,6 +1,8 @@
 services:
   workspace-init:
     image: ${M3_REHEARSAL_IMAGE:?M3_REHEARSAL_IMAGE_required}
+    volumes:
+      - ./tests/m3_rehearsal:/m3-rehearsal:ro
 
   bridge:
     image: ${M3_REHEARSAL_IMAGE:?M3_REHEARSAL_IMAGE_required}

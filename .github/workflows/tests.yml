@@ -169,17 +169,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Run isolated M3 V16 lifecycle and cleanup
+      - name: Run isolated M3 V16 and V12 clean-install, migration, backup, and restore rehearsal
         env:
-          REHEARSAL_OUTPUT: ${{ runner.temp }}/m3-v16-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}.json
+          REHEARSAL_OUTPUT: ${{ runner.temp }}/v12-clean-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}.json
         run: |
           set -euo pipefail
           python scripts/rehearse_nonproduction_cutover.py --output "$REHEARSAL_OUTPUT"
-      - name: Upload sanitized V16 stage evidence
+      - name: Upload sanitized V12 stage evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: m3-v16-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/m3-v16-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}.json
+          name: v12-clean-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/v12-clean-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}.json
           if-no-files-found: warn
           retention-days: 14
