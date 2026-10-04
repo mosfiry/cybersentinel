@@ -1,0 +1,106 @@
+name: windows-interactive-acceptance
+
+on:
+  push:
+    branches:
+      - acceptance/windows-interactive-20261004
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: cybersentinel-windows-interactive-acceptance
+  cancel-in-progress: false
+
+jobs:
+  windows-interactive-acceptance:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout acceptance-only branch
+        uses: actions/checkout@v4
+
+      - name: Verify source branch, build run, and immutable artifact metadata
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = 'mosfiry/cybersentinel'
+          $sourceSha = 'aa2e3aa811df7fa1551b2d13e92ff50c542d53da'
+          $artifactId = 11307277832
+          $buildRunId = 37213148361
+          $artifactName = 'cybersentinel-windows-installer-aa2e3aa811df7fa1551b2d13e92ff50c542d53da'
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+
+          $branch = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repo/branches/work/windows-native-local-llm"
+          if ($branch.commit.sha -ne $sourceSha) { throw "Expected source branch SHA $sourceSha; found $($branch.commit.sha)." }
+
+          $run = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repo/actions/runs/$buildRunId"
+          if ($run.head_sha -ne $sourceSha -or $run.conclusion -ne 'success') { throw 'Pinned Windows build run is not successful on the expected source SHA.' }
+
+          $artifact = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repo/actions/artifacts/$artifactId"
+          if ($artifact.id -ne $artifactId -or $artifact.name -ne $artifactName -or $artifact.expired) { throw 'Pinned artifact is missing, expired, or has an unexpected name.' }
+          if ($artifact.workflow_run.id -ne $buildRunId -or $artifact.workflow_run.head_sha -ne $sourceSha -or $artifact.workflow_run.head_branch -ne 'work/windows-native-local-llm') { throw 'Artifact provenance does not match the expected source run.' }
+
+          New-Item -ItemType Directory -Path acceptance-evidence -Force | Out-Null
+          [ordered]@{
+            checked_utc = [DateTime]::UtcNow.ToString('o')
+            source_branch = $branch.name
+            source_sha = $branch.commit.sha
+            build_run_id = $run.id
+            build_conclusion = $run.conclusion
+            build_run_url = $run.html_url
+            artifact_id = $artifact.id
+            artifact_name = $artifact.name
+            artifact_size_bytes = $artifact.size_in_bytes
+            artifact_expired = $artifact.expired
+            artifact_run_id = $artifact.workflow_run.id
+            artifact_sha = $artifact.workflow_run.head_sha
+          } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath acceptance-evidence\github-provenance.json -Encoding utf8
+
+      - name: Download exact existing artifact (no rebuild)
+        uses: actions/download-artifact@v4
+        with:
+          name: cybersentinel-windows-installer-aa2e3aa811df7fa1551b2d13e92ff50c542d53da
+          path: acceptance-evidence\downloaded-artifact
+          repository: mosfiry/cybersentinel
+          run-id: 37213148361
+          github-token: ${{ github.token }}
+
+      - name: Verify downloaded executable, sidecar, and source manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedSha = '0f902af535df717cc7dc3777f01410cf35f7ed573fe73cfcecbd69d946fc4f75'
+          $expectedSource = 'aa2e3aa811df7fa1551b2d13e92ff50c542d53da'
+          $exe = Resolve-Path 'acceptance-evidence\downloaded-artifact\CyberSentinel-Setup-5.1.0.exe'
+          $actualSha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sidecar = (Get-Content -Raw -LiteralPath ($exe.Path + '.sha256')).Trim().Split(' ')[0].ToLowerInvariant()
+          $manifest = Get-Content -Raw -LiteralPath 'acceptance-evidence\downloaded-artifact\installer-manifest.json' | ConvertFrom-Json
+          if ($actualSha -ne $expectedSha) { throw "Executable hash mismatch: $actualSha" }
+          if ($sidecar -ne $expectedSha) { throw "Sidecar hash mismatch: $sidecar" }
+          if ($manifest.sha256 -ne $expectedSha -or $manifest.source_commit -ne $expectedSource -or $manifest.size_bytes -ne (Get-Item -LiteralPath $exe).Length) { throw 'Manifest provenance/hash/size mismatch.' }
+          [ordered]@{ verified_utc = [DateTime]::UtcNow.ToString('o'); executable = [IO.Path]::GetFileName($exe.Path); sha256 = $actualSha; size_bytes = (Get-Item -LiteralPath $exe).Length; source_commit = $manifest.source_commit } | ConvertTo-Json | Set-Content -LiteralPath acceptance-evidence\artifact-verification.json -Encoding utf8
+
+      - name: Fresh install and installed-app Windows UI acceptance
+        shell: pwsh
+        run: |
+          .\acceptance\Invoke-CyberSentinelWindowsAcceptance.ps1 `
+            -InstallerPath (Resolve-Path 'acceptance-evidence\downloaded-artifact\CyberSentinel-Setup-5.1.0.exe').Path `
+            -ExpectedSha256 '0f902af535df717cc7dc3777f01410cf35f7ed573fe73cfcecbd69d946fc4f75' `
+            -EvidenceDirectory (Join-Path $PWD 'acceptance-evidence\windows-ui')
+
+      - name: Upload logs, screenshots, and machine-readable evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-interactive-acceptance-evidence-${{ github.run_id }}
+          path: acceptance-evidence\
+          if-no-files-found: warn
+          retention-days: 30
