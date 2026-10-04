@@ -10,7 +10,7 @@
 
 ## حالة النشر والتوقيع
 
-هذا بناء تطويري لفرع `work/windows-native-local-llm` وإصدار Desktop المرشح `5.1.0` فوق Core `5.0.0`. يُرفع Installer كـGitHub Actions artifact مرتبط بالـworkflow وcommit SHA لمدة 90 يومًا، مع SHA-256 وmanifest. المستودع عام؛ تعامل مع الفرع وسجل التشغيل والـartifact على أنها مرئية/قابلة للتنزيل وفق أذونات GitHub للمستودع. لا ينشئ هذا المسار tag أو GitHub Release أو نشرًا في registry/خدمة إنتاجية. الـInstaller غير موقّع رقميًا؛ قد يعرض Windows SmartScreen تحذير ناشر غير معروف. تحقق من SHA-256 للملف الذي استلمته قبل التثبيت.
+هذا بناء تطويري لفرع `work/windows-native-local-llm` وإصدار Desktop المرشح `5.1.0` فوق Core `5.0.0`. يُرفع Installer كـGitHub Actions artifact مرتبط بالـworkflow وcommit SHA لمدة 90 يومًا؛ اسم artifact و`source_commit` داخل manifest يحددان commit البناء، إلى جانب SHA-256 للملف. المستودع عام؛ تعامل مع الفرع وسجل التشغيل والـartifact على أنها مرئية/قابلة للتنزيل وفق أذونات GitHub للمستودع. لا ينشئ هذا المسار tag أو GitHub Release أو نشرًا في registry/خدمة إنتاجية. الـInstaller غير موقّع رقميًا؛ قد يعرض Windows SmartScreen تحذير ناشر غير معروف. تحقق من SHA-256 للملف الذي استلمته قبل التثبيت.
 
 ## بناء Installer من المصدر
 
@@ -25,7 +25,8 @@ npm ci --no-audit --no-fund
 npm run icon
 npm run dist
 cd ..
-python scripts/write_installer_manifest.py desktop/dist --version 5.1.0
+$sourceCommit = git rev-parse HEAD
+python scripts/write_installer_manifest.py desktop/dist --version 5.1.0 --source-commit $sourceCommit
 ```
 
 الناتج: `desktop/dist/CyberSentinel-Setup-5.1.0.exe` وملف `.sha256` و`installer-manifest.json`. يفشل سكربت runtime إذا لم يطابق ملف llama.cpp الحجم والـSHA المثبتين؛ ويفحص build سكربت backend تشغيل `--desktop-self-test` والـweb assets. سجل المصدر والإصدارات والحجوم وSHA-256 للنماذج وruntime في [`docs/LOCAL_MODEL_ARTIFACTS.md`](../docs/LOCAL_MODEL_ARTIFACTS.md).
