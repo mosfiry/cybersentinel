@@ -73,14 +73,18 @@ def test_project_folder_import_uses_native_dialog_csrf_owner_and_capability():
 
 
 def test_local_model_catalog_downloader_and_runtime_are_pinned_and_loopback_only():
-    catalog = Path("agent/local_runtime/catalog.py").read_text(encoding="utf-8")
+    catalog = json.loads(Path("agent/local_runtime/catalog.json").read_text(encoding="utf-8"))
+    catalog_module = Path("agent/local_runtime/catalog.py").read_text(encoding="utf-8")
     downloader = Path("agent/local_runtime/downloader.py").read_text(encoding="utf-8")
     runtime = Path("agent/local_runtime/runtime.py").read_text(encoding="utf-8")
     manager = Path("agent/local_runtime/manager.py").read_text(encoding="utf-8")
-    assert "Qwen3-4B-Q4_K_M.gguf" in catalog
-    assert "qwen3-8b-q4_k_m.gguf" in catalog
-    assert "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf" in catalog
-    assert "revision=" in catalog
+    models = {item["model_id"]: item for item in catalog["models"]}
+    assert "Qwen3-4B-Q4_K_M.gguf" == models["qwen3-4b-q4-k-m"]["filename"]
+    assert "qwen3-8b-q4_k_m.gguf" == models["qwen3-8b-q4-k-m"]["filename"]
+    assert "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf" == models["deepseek-r1-distill-qwen-7b-q4-k-m"]["filename"]
+    assert all(item["revision"] and len(item["sha256"]) == 64 for item in models.values())
+    assert all(item["backend_compatibility"] and item["license_url"].startswith("https://") for item in models.values())
+    assert "load_catalog" in catalog_module
     assert '("huggingface.co", "hf.co")' in downloader
     assert "expected_sha256" in downloader
     assert "os.replace(part, target)" in downloader
@@ -90,9 +94,23 @@ def test_local_model_catalog_downloader_and_runtime_are_pinned_and_loopback_only
     assert "model_not_compatible" in manager
     assert '"model_manager_busy"' in manager
     assert 'status="interrupted"' in manager
+    assert "local_llama_cpp" in manager
+    assert "def test_inference" in manager
+    assert "def deactivate" in manager
+    assert 'parts[1] not in {"install", "activate", "test", "stop"}' in BRIDGE
+    assert 'self._public_guard(csrf=True)' in BRIDGE
+    assert 'owner_password.owner_account_exists() and owner is None' in BRIDGE
+    assert 'action != "install" and owner is not None' in BRIDGE
+    assert 'model_switch_blocked_by_active_mission' in BRIDGE
+    assert '_desktop_model_manager().test_inference()' in BRIDGE
+    assert '_desktop_model_manager().deactivate()' in BRIDGE
     assert "renderModelCards" in APP
     assert "تنزيل وتثبيت" in APP
     assert "تشغيل / تبديل إلى هذا النموذج" in APP
+    assert "النماذج الموصى بها لهذا الجهاز" in APP
+    assert "قد تكون أكبر من ذاكرة هذا الجهاز" in APP
+    assert "اختبار الاستدلال المحلي الحقيقي" in APP
+    assert 'f"{ROOT / \'agent\' / \'local_runtime\' / \'catalog.json\'}{separator}agent/local_runtime"' in Path("scripts/build_desktop_backend.py").read_text(encoding="utf-8")
 
 
 def test_installer_and_exact_sha_workflow_build_a_private_artifact_not_a_release():

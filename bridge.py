@@ -732,41 +732,50 @@ class Handler(BaseHTTPRequestHandler):
             if session is None:
                 return
             parts = [unquote(item) for item in path[len("/api/public/desktop/models/"):].split("/")]
-            if len(parts) != 2 or parts[1] not in {"install", "activate"}:
+            if len(parts) != 2 or parts[1] not in {"install", "activate", "test", "stop"}:
+                return self._send(404, {"ok": False, "error": "not_found"})
+            action = parts[1]
+            if action == "stop" and parts[0] != "active":
                 return self._send(404, {"ok": False, "error": "not_found"})
             owner = self._public_owner_session()
             if owner_password.owner_account_exists() and owner is None:
                 return self._send(403, {"ok": False, "error": "owner_authorization_required"})
             try:
-                if parts[1] == "install":
+                if action != "install" and owner is not None:
+                    missions = self._mission_service().list_missions(
+                        owner_session_token=owner["session_token"], limit=100
+                    )
+                    terminal = {
+                        "GOAL_COMPLETED", "COMPLETED", "CANCELLED", "FAILED",
+                        "FAILED_RETRY_EXHAUSTED", "OWNER_INPUT_REQUIRED",
+                        "OWNER_REAUTH_REQUIRED", "RECOVERY_REQUIRED", "PAUSED",
+                        "SCOPE_BLOCKED", "SAFETY_BLOCKED", "TERMINAL_FAILURE",
+                    }
+                    busy = any(
+                        str(item.get("status", "")).upper() not in terminal
+                        or str((item.get("queue") or {}).get("state", "")).lower()
+                        in {"ready", "queued", "leased", "running", "retry", "waiting"}
+                        for item in missions
+                    )
+                    if busy:
+                        return self._send(409, {"ok": False, "error": "model_switch_blocked_by_active_mission"})
+                if action == "install":
                     result = _desktop_model_manager().install(parts[0])
-                else:
-                    if owner is not None:
-                        missions = self._mission_service().list_missions(
-                            owner_session_token=owner["session_token"], limit=100
-                        )
-                        terminal = {
-                            "GOAL_COMPLETED", "COMPLETED", "CANCELLED", "FAILED",
-                            "FAILED_RETRY_EXHAUSTED", "OWNER_INPUT_REQUIRED",
-                            "OWNER_REAUTH_REQUIRED", "RECOVERY_REQUIRED", "PAUSED",
-                            "SCOPE_BLOCKED", "SAFETY_BLOCKED", "TERMINAL_FAILURE",
-                        }
-                        busy = any(
-                            str(item.get("status", "")).upper() not in terminal
-                            or str((item.get("queue") or {}).get("state", "")).lower()
-                            in {"ready", "queued", "leased", "running", "retry", "waiting"}
-                            for item in missions
-                        )
-                        if busy:
-                            return self._send(409, {"ok": False, "error": "model_switch_blocked_by_active_mission"})
+                elif action == "activate":
                     result = _desktop_model_manager().activate(parts[0])
+                elif action == "test":
+                    result = _desktop_model_manager().test_inference()
+                    return self._send(200, result)
+                else:
+                    result = _desktop_model_manager().deactivate()
                 return self._send(202, result)
             except KeyError:
                 return self._send(404, {"ok": False, "error": "unknown_model"})
             except FileNotFoundError as exc:
                 return self._send(409, {"ok": False, "error": str(exc)})
             except RuntimeError as exc:
-                return self._send(409, {"ok": False, "error": str(exc)})
+                code = str(exc)
+                return self._send(502 if code.startswith("local_inference_failed:") else 409, {"ok": False, "error": code})
             except ValueError as exc:
                 return self._send(409 if str(exc).startswith("model_not_compatible") else 400, {"ok": False, "error": str(exc)})
         if path == "/api/public/auth/logout":

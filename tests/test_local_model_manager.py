@@ -185,3 +185,111 @@ def test_activation_rechecks_file_hash_and_removes_invalid_manifest(tmp_path):
     state = wait_operation(manager, "failed")
     assert state["runtime"]["status"] == "error"
     assert not (manager.models_root / spec.model_id / "manifest.json").exists()
+
+
+class FakeLocalInferenceProvider:
+    name = "local_llama_cpp"
+
+    def __init__(self, *, failure: str = ""):
+        self.model = ""
+        self.failure = failure
+        self.calls = 0
+
+    def generate(self, messages, **_kwargs):
+        self.calls += 1
+        assert messages[-1]["content"] == "Reply with the single word CYBERSENTINEL_LOCAL_OK."
+        if self.failure:
+            raise RuntimeError(self.failure)
+        return SimpleNamespace(
+            text="CYBERSENTINEL_LOCAL_OK",
+            provider=self.name,
+            model=self.model,
+        )
+
+
+class FakeLocalInferenceRuntime(FakeRuntime):
+    def __init__(self, provider):
+        super().__init__()
+        self.provider = provider
+
+    def start(self, spec, model_path: Path):
+        super().start(spec, model_path)
+        self.provider.model = spec.model_id
+        return self.provider
+
+
+class FakeExternalProvider:
+    name = "remote-provider"
+    model = "remote-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def generate(self, *_args, **_kwargs):
+        self.calls += 1
+        raise AssertionError("local inference tests must not fall back to an external provider")
+
+
+def test_local_inference_uses_active_provider_and_stop_restores_external_router(tmp_path):
+    payload = b"model-bits"
+    spec = make_spec("local", payload)
+    local_provider = FakeLocalInferenceProvider()
+    runtime = FakeLocalInferenceRuntime(local_provider)
+    external_provider = FakeExternalProvider()
+    manager, runtime, router = make_manager(
+        tmp_path,
+        [spec],
+        {spec.filename: payload},
+        runtime=runtime,
+        router=ModelRouter([external_provider]),
+    )
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+    manager.activate(spec.model_id)
+    wait_operation(manager, "complete")
+
+    result = manager.test_inference()
+    assert result == {
+        "ok": True,
+        "real_inference": True,
+        "provider": "local_llama_cpp",
+        "model": spec.model_id,
+        "response": "CYBERSENTINEL_LOCAL_OK",
+    }
+    assert local_provider.calls == 1
+    assert external_provider.calls == 0
+    assert manager.public_state()["manager"]["operation"]["result"] == "CYBERSENTINEL_LOCAL_OK"
+
+    manager.deactivate()
+    state = wait_operation(manager, "complete")
+    assert state["active_model_id"] == ""
+    assert state["runtime"]["status"] == "stopped"
+    assert runtime.active == ""
+    assert router.providers == [external_provider]
+    with pytest.raises(RuntimeError, match="local_runtime_not_ready"):
+        manager.test_inference()
+
+
+def test_local_inference_failure_is_visible_and_never_falls_back(tmp_path):
+    payload = b"model-bits"
+    spec = make_spec("local", payload)
+    local_provider = FakeLocalInferenceProvider(failure="local_model_timeout")
+    runtime = FakeLocalInferenceRuntime(local_provider)
+    external_provider = FakeExternalProvider()
+    manager, _runtime, _router = make_manager(
+        tmp_path,
+        [spec],
+        {spec.filename: payload},
+        runtime=runtime,
+        router=ModelRouter([external_provider]),
+    )
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+    manager.activate(spec.model_id)
+    wait_operation(manager, "complete")
+
+    with pytest.raises(RuntimeError, match="local_inference_failed:local_model_timeout"):
+        manager.test_inference()
+    assert manager.public_state()["manager"]["operation"]["status"] == "failed"
+    assert local_provider.calls == 1
+    assert external_provider.calls == 0

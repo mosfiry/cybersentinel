@@ -163,13 +163,16 @@ button{font:inherit;cursor:pointer}
 .setup-section{margin-top:18px;padding-top:4px}
 .setup-section h2{font-size:14px;color:#dbe4f2}
 .model-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}
+.model-group-title{grid-column:1/-1;margin:8px 0 0;color:#c8d6eb;font-size:13px}
 .model-card{border:1px solid #26364e;border-radius:8px;background:#0c131e;padding:12px;display:grid;gap:7px;align-content:start}
 .model-card h3{margin:0;font-size:14px;color:#e8eef8}
 .model-card p{margin:0;color:#8795aa;font-size:11px;line-height:1.55}
 .model-card .model-meta{font-size:10px;color:#92a2b8;direction:ltr;text-align:right}
 .model-card .model-recommendation{color:#8ee0af}
 .model-card .model-warning{color:#ffbd83}
+.model-actions{display:flex;flex-wrap:wrap;gap:7px}
 .model-card button,.owner-setup-form button{border:1px solid #2c3b52;border-radius:6px;background:#16233a;color:#e6ecff;padding:8px;font-weight:600}
+.model-actions button{flex:1;min-width:140px}
 .model-card button:disabled,.owner-setup-form button:disabled{opacity:.55;cursor:wait}
 .model-progress{font-size:11px;color:#aebbd0;direction:ltr;text-align:left;white-space:pre-wrap;min-height:1em}
 .owner-setup-form{max-width:460px;display:grid;gap:8px}

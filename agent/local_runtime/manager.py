@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent.model_router import ModelRouter
+from agent.provider_api import ProviderError
 
 from .catalog import CATALOG_VERSION, MODEL_CATALOG, ModelSpec, get_model
 from .downloader import DownloadError, _hash_file, download_verified_file
 from .hardware import assess_compatibility, detect_hardware
 from .runtime import RuntimeAdapter
+
+_BUSY_OPERATION_STATUSES = frozenset({"downloading", "verifying", "activating", "testing", "stopping"})
 
 
 def _utc_now() -> str:
@@ -47,14 +50,15 @@ class LocalModelManager:
         self._downloader = downloader
         self._lock = threading.RLock()
         self._operation_thread: threading.Thread | None = None
+        self._active_provider: Any | None = None
         self._state: dict[str, Any] = {
             "active_model_id": "",
             "runtime": {"status": "stopped", "model_id": "", "error": ""},
-            "operation": {"kind": "", "model_id": "", "status": "idle", "bytes_downloaded": 0, "total_bytes": 0, "progress": 0, "error": ""},
+            "operation": {"kind": "", "model_id": "", "status": "idle", "bytes_downloaded": 0, "total_bytes": 0, "progress": 0, "error": "", "result": ""},
             "updated_at": _utc_now(),
         }
         self._load_state()
-        if self._state["operation"].get("status") in {"downloading", "verifying", "activating"}:
+        if self._state["operation"].get("status") in _BUSY_OPERATION_STATUSES:
             self._state["operation"].update(status="interrupted", error="application_restarted")
             self._save_locked()
 
@@ -81,6 +85,7 @@ class LocalModelManager:
                 "total_bytes": max(0, int(operation.get("total_bytes", 0) or 0)),
                 "progress": max(0, min(100, int(operation.get("progress", 0) or 0))),
                 "error": str(operation.get("error", "")),
+                "result": str(operation.get("result", ""))[:1000],
             },
             updated_at=str(loaded.get("updated_at", _utc_now())),
         )
@@ -154,6 +159,8 @@ class LocalModelManager:
             rows.append({
                 **spec.public(),
                 "compatible": compatibility["compatible"],
+                "recommended": compatibility["recommended"],
+                "too_large": compatibility["too_large"],
                 "compatibility_reasons": compatibility["reasons"],
                 "warnings": compatibility["warnings"],
                 "required_disk_bytes": compatibility["required_disk_bytes"],
@@ -179,7 +186,7 @@ class LocalModelManager:
             current = self._state["operation"]
             if self._operation_thread is not None and self._operation_thread.is_alive():
                 raise RuntimeError("model_manager_busy")
-            if current.get("status") in {"downloading", "verifying", "activating"}:
+            if current.get("status") in _BUSY_OPERATION_STATUSES:
                 raise RuntimeError("model_manager_busy")
             self._state["operation"] = {
                 "kind": kind,
@@ -189,6 +196,7 @@ class LocalModelManager:
                 "total_bytes": total,
                 "progress": 0,
                 "error": "",
+                "result": "",
             }
             self._save_locked()
 
@@ -290,9 +298,11 @@ class LocalModelManager:
         try:
             model_path = self._verify_installed(spec)
             self._runtime.stop()
+            self._active_provider = None
             self._router.providers = list(self._external_providers)
             provider = self._runtime.start(spec, model_path)
             self._router.providers = [provider]
+            self._active_provider = provider
             with self._lock:
                 self._state["active_model_id"] = spec.model_id
                 self._state["runtime"] = {"status": "ready", "model_id": spec.model_id, "error": ""}
@@ -304,17 +314,19 @@ class LocalModelManager:
             except Exception:
                 pass
             restored = False
+            restored_provider = None
             if previous_id and previous_id != spec.model_id and previous_id in self._by_id:
                 try:
                     previous_spec = self._by_id[previous_id]
                     previous_path = self._verify_installed(previous_spec)
-                    provider = self._runtime.start(previous_spec, previous_path)
-                    self._router.providers = [provider]
+                    restored_provider = self._runtime.start(previous_spec, previous_path)
+                    self._router.providers = [restored_provider]
                     restored = True
                 except Exception:
                     restored = False
             if not restored:
                 self._router.providers = list(self._external_providers)
+            self._active_provider = restored_provider if restored else None
             code = str(exc) if isinstance(exc, (DownloadError, FileNotFoundError, ValueError)) else type(exc).__name__
             with self._lock:
                 if not restored:
@@ -326,6 +338,93 @@ class LocalModelManager:
                 }
                 self._state["operation"].update(status="failed", error=code[:160])
                 self._save_locked()
+
+    def test_inference(self) -> dict[str, Any]:
+        """Call only the activated local provider; never route to a fallback."""
+        with self._lock:
+            model_id = str(self._state.get("active_model_id", ""))
+            provider = self._active_provider
+            if (
+                not model_id
+                or self._state.get("runtime", {}).get("status") != "ready"
+                or provider is None
+            ):
+                raise RuntimeError("local_runtime_not_ready")
+            spec = self._spec(model_id)
+            if getattr(provider, "name", "") != "local_llama_cpp" or getattr(provider, "model", "") != model_id:
+                raise RuntimeError("local_runtime_provider_identity_mismatch")
+            self._begin_operation("inference_test", spec, "testing")
+
+        try:
+            response = provider.generate(
+                [
+                    {"role": "system", "content": "Follow the user request exactly and answer briefly."},
+                    {"role": "user", "content": "Reply with the single word CYBERSENTINEL_LOCAL_OK."},
+                ],
+                temperature=0,
+                timeout=90,
+                max_tokens=24,
+            )
+            text = str(getattr(response, "text", "") or "").strip()
+            if not text:
+                raise RuntimeError("local_inference_empty_response")
+            response_provider = str(getattr(response, "provider", "") or provider.name)
+            response_model = str(getattr(response, "model", "") or provider.model)
+            if response_provider != "local_llama_cpp" or response_model != model_id:
+                raise RuntimeError("local_inference_identity_mismatch")
+        except Exception as exc:
+            kind = getattr(exc.kind, "value", "") if isinstance(exc, ProviderError) else ""
+            code = str(kind or (str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__))[:160]
+            with self._lock:
+                self._state["operation"].update(status="failed", error=code, result="")
+                self._save_locked()
+            raise RuntimeError("local_inference_failed:" + code) from exc
+
+        with self._lock:
+            self._state["operation"].update(status="complete", progress=100, error="", result=text[:1000])
+            self._save_locked()
+        return {
+            "ok": True,
+            "real_inference": True,
+            "provider": response_provider,
+            "model": response_model,
+            "response": text[:1000],
+        }
+
+    def deactivate(self) -> dict[str, Any]:
+        with self._lock:
+            model_id = str(self._state.get("active_model_id", ""))
+            if not model_id:
+                return self.public_state()
+            spec = self._spec(model_id)
+        self._begin_operation("stop", spec, "stopping")
+        thread = threading.Thread(
+            target=self._deactivate_worker,
+            args=(model_id,),
+            name="model-stop",
+            daemon=True,
+        )
+        self._operation_thread = thread
+        thread.start()
+        return self.public_state()
+
+    def _deactivate_worker(self, model_id: str) -> None:
+        try:
+            self._runtime.stop()
+        except Exception as exc:
+            code = str(exc)[:160] if isinstance(exc, RuntimeError) else type(exc).__name__
+            with self._lock:
+                self._state["runtime"] = {"status": "error", "model_id": model_id, "error": code}
+                self._state["operation"].update(status="failed", error=code)
+                self._save_locked()
+            return
+        self._router.providers = list(self._external_providers)
+        with self._lock:
+            self._active_provider = None
+            self._state["active_model_id"] = ""
+            self._state["runtime"] = {"status": "stopped", "model_id": "", "error": ""}
+            self._state["operation"].update(status="complete", progress=100, error="", result="")
+            self._save_locked()
 
     def restore_active(self) -> None:
         with self._lock:
@@ -341,7 +440,7 @@ class LocalModelManager:
             self._state["runtime"] = {"status": "starting", "model_id": model_id, "error": ""}
             self._state["operation"] = {
                 "kind": "activate", "model_id": model_id, "status": "activating",
-                "bytes_downloaded": 0, "total_bytes": 0, "progress": 0, "error": "",
+                "bytes_downloaded": 0, "total_bytes": 0, "progress": 0, "error": "", "result": "",
             }
             self._save_locked()
         thread = threading.Thread(target=self._activate_worker, args=(spec,), name="model-restore", daemon=True)
@@ -354,7 +453,8 @@ class LocalModelManager:
         finally:
             self._router.providers = list(self._external_providers)
             with self._lock:
-                if self._state["operation"].get("status") in {"downloading", "verifying", "activating"}:
+                self._active_provider = None
+                if self._state["operation"].get("status") in _BUSY_OPERATION_STATUSES:
                     self._state["operation"].update(status="interrupted", error="application_stopped")
                 self._state["runtime"] = {
                     "status": "stopped",

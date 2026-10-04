@@ -1,0 +1,50 @@
+name: Windows Model Manager Regressions
+
+on:
+  push:
+    branches: [work/v5.2-production-completion]
+    paths:
+      - "agent/local_runtime/**"
+      - "bridge.py"
+      - "web/**"
+      - "desktop/**"
+      - "scripts/build_desktop_backend.py"
+      - "scripts/windows_*"
+      - "web/app.js"
+      - "tests/test_local_model_*.py"
+      - "tests/test_desktop_client.py"
+      - ".github/workflows/windows-model-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-regressions:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install Python test/runtime dependencies
+        run: python -m pip install -r requirements.txt -r requirements-runtime.txt
+      - name: Run model catalog, manager, downloader, and desktop API contracts
+        run: python -m pytest -q tests/test_local_model_catalog.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_desktop_client.py
+      - name: Install Desktop dependencies
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+      - name: Check Desktop JavaScript syntax
+        working-directory: desktop
+        run: npm run check
+      - name: Check browser renderer syntax
+        run: node --check web/app.js
+      - name: Run Desktop contracts
+        working-directory: desktop
+        run: npm run test:desktop

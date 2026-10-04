@@ -90,6 +90,7 @@ async function api(path, options = {}) {
 function errorText(error) {
   const raw = String(error?.message || "");
   if (raw.startsWith("model_not_compatible:")) return "هذا النموذج لا يلائم الذاكرة أو المساحة المتاحة على الجهاز.";
+  if (raw.startsWith("local_inference_failed:")) return `فشل الاستدلال المحلي عبر llama.cpp (${raw.slice("local_inference_failed:".length)}). تحقّق من حالة runtime وسجل التطبيق.`;
   const messages = {
     invalid_credentials: "بيانات الدخول غير صحيحة.",
     owner_authorization_required: "يلزم تسجيل الدخول بحساب المالك.",
@@ -100,6 +101,10 @@ function errorText(error) {
     secure_workspace_access_unavailable: "عرض مساحة العمل غير متاح على هذا النظام لأن الوصول الآمن للمجلدات غير مدعوم.",
     model_manager_busy: "هناك عملية تنزيل أو تشغيل نموذج قيد التنفيذ؛ انتظر اكتمالها.",
     model_not_installed: "نزّل النموذج وتحقق منه قبل تفعيله.",
+    local_runtime_not_ready: "فعّل نموذجًا محليًا أولًا قبل اختبار الاستدلال.",
+    local_runtime_provider_identity_mismatch: "توقّف الاختبار لأن هوية مزود النموذج المحلي لم تطابق النموذج المفعّل.",
+    local_inference_empty_response: "لم يُرجع النموذج المحلي استجابة نصية.",
+    local_inference_identity_mismatch: "توقّف الاختبار لأن هوية الاستجابة لم تطابق runtime المحلي.",
     model_switch_blocked_by_active_mission: "أوقف المهمة أو انتظر انتهاءها قبل تبديل النموذج.",
     owner_account_already_exists: "حساب المالك موجود بالفعل؛ سجّل الدخول بدل إنشاء حساب آخر.",
     project_folder_must_be_a_specific_directory: "اختر مجلد مشروع محددًا وليس جذر القرص.",
@@ -215,6 +220,8 @@ function modelOperationLabel(operation) {
     downloading: "جارٍ التنزيل",
     verifying: "جارٍ التحقق من SHA-256",
     activating: "جارٍ تشغيل النموذج",
+    testing: "جارٍ التحقق باستدلال محلي حقيقي",
+    stopping: "جارٍ إيقاف runtime وتحرير الموارد",
     complete: "اكتمل",
     failed: `فشل: ${operation.error || "خطأ غير محدد"}`,
     interrupted: "توقف عند إغلاق التطبيق؛ يمكن إعادة المحاولة",
@@ -233,52 +240,95 @@ function renderModelCards(target) {
   const hardware = manager.hardware || {};
   const ram = hardware.ram_gib == null ? "غير متاح" : `${hardware.ram_gib} GiB RAM`;
   const disk = hardware.free_disk_gib == null ? "مساحة القرص غير متاحة" : `${hardware.free_disk_gib} GiB متاح على القرص`;
-  const hardwareLine = `الجهاز: ${hardware.os || "غير معروف"} · ${hardware.architecture || "بنية غير معروفة"} · ${ram} · ${hardware.cpu_count || "?"} نواة · ${disk} · ${hardware.gpu_acceleration_available ? "تسريع GPU متاح" : "CPU فقط"}`;
+  const gpuNames = Array.isArray(hardware.gpu_devices) ? hardware.gpu_devices.map((device) => device.name).filter(Boolean).join(", ") : "";
+  const vram = hardware.vram_gib == null ? "VRAM غير مكتشفة" : `${hardware.vram_gib} GiB VRAM`;
+  const hardwareLine = `الجهاز: ${hardware.os || "غير معروف"} · ${hardware.architecture || "بنية غير معروفة"} · ${hardware.cpu_model || "CPU غير معروف"} (${hardware.cpu_count || "?"} نواة) · ${ram} · ${gpuNames || "GPU غير مكتشف"} · ${vram} · ${disk} · ${hardware.gpu_acceleration_available ? "تسريع GPU متاح" : "استدلال CPU"}`;
   if ($("#setupHardware")) $("#setupHardware").textContent = hardwareLine;
+  if ($("#settingsHardware")) $("#settingsHardware").textContent = hardwareLine;
   const operation = manager.manager?.operation || { status: "idle", model_id: "" };
   const runtime = manager.manager?.runtime || {};
-  manager.models.forEach((model) => {
+
+  const groups = [
+    { title: "النماذج الموصى بها لهذا الجهاز", items: manager.models.filter((model) => model.recommended) },
+    { title: "متوافقة لكن دون توصية كاملة", items: manager.models.filter((model) => model.compatible && !model.recommended) },
+    { title: "قد تكون أكبر من ذاكرة هذا الجهاز", items: manager.models.filter((model) => model.too_large) },
+    { title: "غير متاحة بسبب النظام أو مساحة القرص", items: manager.models.filter((model) => !model.compatible && !model.too_large) },
+  ].filter((group) => group.items.length);
+
+  const reasonLabels = {
+    insufficient_system_memory: "ذاكرة RAM أقل من الحد الأدنى",
+    insufficient_free_disk: "مساحة القرص غير كافية",
+    insufficient_vram: "ذاكرة VRAM أقل من الحد الأدنى",
+    unsupported_windows_architecture: "بنية Windows غير مدعومة",
+    unsupported_runtime_platform: "نظام التشغيل غير مدعوم",
+  };
+  const busy = ["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status);
+
+  const renderModel = (model) => {
     const article = document.createElement("article");
     article.className = "model-card";
     const title = document.createElement("h3");
     title.textContent = `${model.display_name || model.family} · ${model.parameter_size || ""}`;
     const description = document.createElement("p");
-    description.textContent = `${model.family} · ${model.quantization} · ${model.license} · سياق ${model.context_length || 4096}`;
+    description.textContent = `${model.family} ${model.model_version || ""} · ${model.quantization} · ${model.license} · سياق ${model.context_length || 4096}`;
     const meta = document.createElement("p");
     meta.className = "model-meta";
-    meta.textContent = `GGUF ${formatBytes(model.size_bytes)} · RAM حد أدنى ${model.min_ram_gib} GiB · موصى به ${model.recommended_ram_gib} GiB`;
+    meta.textContent = `GGUF ${formatBytes(model.size_bytes)} · RAM ${model.min_ram_gib}–${model.recommended_ram_gib} GiB · VRAM ${model.min_vram_gib || 0} GiB+ · backend ${(model.backend_compatibility || []).join(", ") || "غير محدد"}`;
     const recommendation = document.createElement("p");
     recommendation.className = model.compatible ? "model-recommendation" : "model-warning";
-    recommendation.textContent = model.compatible
-      ? (model.warnings?.length ? `متوافق مع تحذير: ${model.warnings.join(", ")}` : "ملائم وفق فحص الذاكرة والمساحة")
-      : `غير ملائم حاليًا: ${(model.compatibility_reasons || []).join(", ") || "سبب غير محدد"}`;
+    if (model.recommended) recommendation.textContent = "موصى به لهذا الجهاز وفق فحص RAM/CPU/VRAM والمساحة.";
+    else if (model.compatible) recommendation.textContent = `متوافق، لكن ليس ضمن التوصية الكاملة: ${(model.warnings || []).join(", ") || "المتطلبات الموصى بها أعلى من موارد الجهاز"}.`;
+    else recommendation.textContent = `غير ملائم حاليًا: ${(model.compatibility_reasons || []).map((reason) => reasonLabels[reason] || reason).join("، ") || "سبب غير محدد"}`;
+
+    const actions = document.createElement("div");
+    actions.className = "model-actions";
     const button = document.createElement("button");
     button.type = "button";
-    const busy = ["downloading", "verifying", "activating"].includes(operation.status);
     if (model.active && runtime.status === "ready") {
-      button.textContent = "النموذج المفعّل";
-      button.disabled = true;
+      button.textContent = "اختبار الاستدلال المحلي الحقيقي";
+      button.dataset.modelAction = "test";
+      button.dataset.modelId = model.model_id;
+      button.disabled = busy;
+      const stopButton = document.createElement("button");
+      stopButton.type = "button";
+      stopButton.textContent = "إيقاف runtime";
+      stopButton.dataset.modelAction = "stop";
+      stopButton.dataset.modelId = "active";
+      stopButton.disabled = busy;
+      actions.append(button, stopButton);
     } else if (model.installed) {
       button.textContent = model.active ? "إعادة تشغيل النموذج" : "تشغيل / تبديل إلى هذا النموذج";
       button.dataset.modelAction = "activate";
       button.dataset.modelId = model.model_id;
       button.disabled = busy || !model.compatible;
+      actions.append(button);
     } else {
       button.textContent = "تنزيل وتثبيت";
       button.dataset.modelAction = "install";
       button.dataset.modelId = model.model_id;
       button.disabled = busy || !model.compatible;
+      actions.append(button);
     }
     const progress = document.createElement("div");
     progress.className = "model-progress";
-    if (operation.model_id === model.model_id && ["downloading", "verifying", "activating", "failed", "interrupted"].includes(operation.status)) {
+    if (operation.model_id === model.model_id && ["downloading", "verifying", "activating", "testing", "stopping", "failed", "interrupted"].includes(operation.status)) {
       const amount = operation.total_bytes ? `${formatBytes(operation.bytes_downloaded)} / ${formatBytes(operation.total_bytes)} (${operation.progress || 0}%)` : "";
       progress.textContent = `${modelOperationLabel(operation)}${amount ? ` · ${amount}` : ""}`;
+    } else if (operation.kind === "inference_test" && operation.model_id === model.model_id && operation.result) {
+      progress.textContent = `نتيجة الاستدلال المحلي: ${operation.result}`;
     } else if (model.active) {
       progress.textContent = `Runtime: ${runtime.status || "غير معروف"}${runtime.error ? ` · ${runtime.error}` : ""}`;
     }
-    article.append(title, description, meta, recommendation, button, progress);
-    target.appendChild(article);
+    article.append(title, description, meta, recommendation, actions, progress);
+    return article;
+  };
+
+  groups.forEach((group) => {
+    const heading = document.createElement("h4");
+    heading.className = "model-group-title";
+    heading.textContent = group.title;
+    target.appendChild(heading);
+    group.items.forEach((model) => target.appendChild(renderModel(model)));
   });
   target.querySelectorAll("[data-model-action]").forEach((button) => {
     button.addEventListener("click", () => runModelAction(button.dataset.modelId, button.dataset.modelAction));
@@ -300,7 +350,7 @@ async function refreshDesktopSetup() {
   state.onboardingVisible = show;
   overlay?.classList.toggle("hidden", !show);
   const operation = state.modelManager?.manager?.operation || {};
-  if (["downloading", "verifying", "activating"].includes(operation.status)) scheduleModelPoll();
+  if (["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status)) scheduleModelPoll();
 }
 
 let modelPollTimer = null;
@@ -315,11 +365,17 @@ function scheduleModelPoll() {
       renderModelCards($("#settingsModelList"));
       const operation = data.manager?.operation || {};
       if (operation.status === "failed") setModelNotice(modelOperationLabel(operation), "error");
-      else if (["downloading", "verifying", "activating"].includes(operation.status)) {
+      else if (["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status)) {
         setModelNotice(modelOperationLabel(operation), "warn");
         scheduleModelPoll();
       } else if (operation.status === "complete") {
-        setModelNotice("اكتملت العملية وتحقق الخادم من الملف المحلي.", "ok");
+        if (operation.kind === "inference_test" && operation.result) {
+          setModelNotice(`نجح الاستدلال المحلي الحقيقي عبر llama.cpp: ${operation.result}`, "ok");
+        } else if (operation.kind === "stop") {
+          setModelNotice("أُوقف runtime المحلي وتحررت موارد النموذج.", "ok");
+        } else {
+          setModelNotice("اكتملت العملية وتحقق الخادم من الملف المحلي.", "ok");
+        }
       }
     } catch (error) {
       setModelNotice(errorText(error), "error");
@@ -328,10 +384,21 @@ function scheduleModelPoll() {
 }
 
 async function runModelAction(modelId, action) {
-  if (!modelId || !["install", "activate"].includes(action)) return;
-  setModelNotice(action === "install" ? "بدأ التنزيل؛ سيُستأنف من الملف الجزئي ويتحقق SHA-256 قبل التثبيت." : "جارٍ إيقاف runtime السابق والتحقق من النموذج قبل التبديل.", "warn");
+  if (!modelId || !["install", "activate", "test", "stop"].includes(action)) return;
+  const pathModelId = action === "stop" ? "active" : modelId;
+  if (action === "install") setModelNotice("بدأ التنزيل؛ سيُستأنف من الملف الجزئي ويتحقق SHA-256 قبل التثبيت.", "warn");
+  else if (action === "activate") setModelNotice("جارٍ إيقاف runtime السابق والتحقق من النموذج قبل التبديل.", "warn");
+  else if (action === "test") setModelNotice("يرسل التطبيق طلبًا مباشرًا إلى النموذج المحلي المفعّل؛ لا يوجد تحويل إلى مزود خارجي.", "warn");
+  else setModelNotice("جارٍ إيقاف runtime المحلي وتحرير موارده.", "warn");
   try {
-    const data = await api(`/api/public/desktop/models/${encodeURIComponent(modelId)}/${action}`, { method: "POST", body: "{}" });
+    const data = await api(`/api/public/desktop/models/${encodeURIComponent(pathModelId)}/${action}`, { method: "POST", body: "{}" });
+    if (action === "test") {
+      setModelNotice(`نجح الاستدلال المحلي الحقيقي عبر ${data.provider} (${data.model}): ${data.response}`, "ok");
+      state.modelManager = await api("/api/public/desktop/models");
+      renderModelCards($("#setupModelList"));
+      renderModelCards($("#settingsModelList"));
+      return;
+    }
     state.modelManager = data;
     renderModelCards($("#setupModelList"));
     renderModelCards($("#settingsModelList"));
@@ -1214,6 +1281,9 @@ async function settingsPanel() {
   const helper = document.createElement("p");
   helper.className = "muted";
   helper.textContent = "اختر عائلة/حجم/quantization من الكتالوج المثبت. يفحص التطبيق RAM والمساحة قبل التنزيل، ويتحقق من SHA-256 قبل التثبيت. لا يتم التبديل أثناء وجود mission فعالة.";
+  const hardwareSummary = document.createElement("p");
+  hardwareSummary.id = "settingsHardware";
+  hardwareSummary.className = "muted";
   const notice = document.createElement("div");
   notice.id = "modelManagerNotice";
   notice.className = "notice";
@@ -1237,13 +1307,13 @@ async function settingsPanel() {
   const note = document.createElement("p");
   note.className = "muted";
   note.textContent = "كتالوج هذه النسخة يدعم Qwen3 4B/8B وDeepSeek R1 Distill Qwen 7B بملفات GGUF Q4_K_M. حزم المحرك والنماذج تُجلب من المصادر المثبتة وتُحفظ تحت بيانات المستخدم.";
-  panel.append(summary, managerTitle, helper, notice, list, providerNote, note);
+  panel.append(summary, managerTitle, helper, hardwareSummary, notice, list, providerNote, note);
   showInfoPanel(panel);
   try {
     state.modelManager = await api("/api/public/desktop/models");
     renderModelCards(list);
     const operation = state.modelManager.manager?.operation || {};
-    if (["downloading", "verifying", "activating"].includes(operation.status)) scheduleModelPoll();
+    if (["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status)) scheduleModelPoll();
   } catch (error) {
     list.textContent = errorText(error);
   }

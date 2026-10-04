@@ -84,15 +84,22 @@ def detect_hardware(storage_root: str | Path | None = None) -> dict[str, Any]:
     except OSError:
         free_disk = 0
     total_memory = _physical_memory_bytes()
+    gpu_devices = _nvidia_devices()
+    total_vram = sum(max(0, int(item.get("vram_bytes", 0))) for item in gpu_devices)
+    cpu_model = (platform.processor() or platform.machine() or "unknown").strip()[:160]
     return {
         "os": platform.system().lower(),
         "architecture": platform.machine().lower(),
+        "cpu_model": cpu_model,
         "cpu_count": max(1, int(os.cpu_count() or 1)),
         "ram_bytes": total_memory,
         "ram_gib": round(total_memory / GIB, 1) if total_memory else None,
         "free_disk_bytes": free_disk,
         "free_disk_gib": round(free_disk / GIB, 1),
-        "gpu_devices": _nvidia_devices(),
+        "gpu_devices": gpu_devices,
+        "vram_bytes": total_vram,
+        "vram_gib": round(total_vram / GIB, 1),
+        "vram_detection": "nvidia-smi" if gpu_devices else "not_detected",
         "inference_backend": "llama.cpp CPU runtime",
         "gpu_acceleration_available": False,
     }
@@ -114,8 +121,27 @@ def assess_compatibility(spec: ModelSpec, hardware: dict[str, Any]) -> dict[str,
         reasons.append("unsupported_windows_architecture")
     if hardware.get("os") not in {"windows", "linux"}:
         reasons.append("unsupported_runtime_platform")
+    cpu_count = hardware.get("cpu_count")
+    if isinstance(cpu_count, int) and not isinstance(cpu_count, bool) and cpu_count < spec.min_cpu_cores:
+        warnings.append("cpu_below_recommended")
+    vram_bytes = hardware.get("vram_bytes")
+    if spec.min_vram_gib and (
+        not isinstance(vram_bytes, int) or vram_bytes < spec.min_vram_gib * GIB
+    ):
+        reasons.append("insufficient_vram")
+    if spec.recommended_vram_gib and isinstance(vram_bytes, int) and vram_bytes < spec.recommended_vram_gib * GIB:
+        warnings.append("vram_below_recommended")
+    compatible = not reasons
+    ram_recommended = isinstance(ram_bytes, int) and ram_bytes >= spec.recommended_ram_gib * GIB
+    vram_recommended = (
+        not spec.recommended_vram_gib
+        or isinstance(vram_bytes, int) and vram_bytes >= spec.recommended_vram_gib * GIB
+    )
+    recommended = compatible and ram_recommended and vram_recommended and not warnings
     return {
-        "compatible": not reasons,
+        "compatible": compatible,
+        "recommended": recommended,
+        "too_large": "insufficient_system_memory" in reasons or "insufficient_vram" in reasons,
         "reasons": reasons,
         "warnings": warnings,
         "required_disk_bytes": required_disk,

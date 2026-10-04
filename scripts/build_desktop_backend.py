@@ -47,6 +47,8 @@ def main() -> int:
         str(ROOT),
         "--add-data",
         f"{ROOT / 'web'}{separator}web",
+        "--add-data",
+        f"{ROOT / 'agent' / 'local_runtime' / 'catalog.json'}{separator}agent/local_runtime",
         "--collect-submodules",
         "tools",
         str(ROOT / "bridge.py"),
