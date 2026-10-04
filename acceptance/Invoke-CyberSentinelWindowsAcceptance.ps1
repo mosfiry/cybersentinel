@@ -248,6 +248,7 @@ using System.Runtime.InteropServices;
 public static class CyberSentinelAcceptanceNative {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern uint GetShortPathName(string longPath, System.Text.StringBuilder shortPath, uint bufferLength);
 }
 "@
 
@@ -286,8 +287,26 @@ public static class CyberSentinelAcceptanceNative {
     $script:ProfileRoot = Join-Path $script:Evidence "isolated-user-data"
     New-Item -ItemType Directory -Path $script:InstallRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $script:ProfileRoot -Force | Out-Null
-    $installerProcess = Start-Process -FilePath $resolvedInstaller -ArgumentList "/S /D=`"$($script:InstallRoot)`"" -PassThru -Wait
-    Write-Event -Event "installer_exit" -Data @{ exit_code = $installerProcess.ExitCode; install_directory = $script:InstallRoot }
+    $possibleInstallRoots = @(
+        $script:InstallRoot,
+        (Join-Path $env:LOCALAPPDATA "Programs\CyberSentinel"),
+        (Join-Path $env:LOCALAPPDATA "CyberSentinel"),
+        (Join-Path $env:ProgramFiles "CyberSentinel"),
+        (Join-Path ${env:ProgramFiles(x86)} "CyberSentinel")
+    ) | Where-Object { $_ } | Select-Object -Unique
+    $preexisting = @($possibleInstallRoots | ForEach-Object { Join-Path $_ "CyberSentinel.exe" } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    if ($preexisting.Count -gt 0) { throw "An existing CyberSentinel installation was found; no install was attempted: $($preexisting -join ', ')" }
+    $shortPathBuffer = [System.Text.StringBuilder]::new(1024)
+    $shortPathLength = [CyberSentinelAcceptanceNative]::GetShortPathName($script:InstallRoot, $shortPathBuffer, [uint32]$shortPathBuffer.Capacity)
+    $installArgumentPath = $script:InstallRoot
+    if ($script:InstallRoot.Contains(" ")) {
+        if ($shortPathLength -eq 0 -or $shortPathLength -ge $shortPathBuffer.Capacity) { throw "Cannot form a no-space NSIS install path for: $($script:InstallRoot)" }
+        $installArgumentPath = $shortPathBuffer.ToString()
+    }
+    $installerArguments = "/S /D=$installArgumentPath"
+    Write-Event -Event "installer_start" -Data @{ install_directory = $script:InstallRoot; argument_shape = "/S /D=<unquoted path>" }
+    $installerProcess = Start-Process -FilePath $resolvedInstaller -ArgumentList $installerArguments -PassThru -Wait
+    Write-Event -Event "installer_exit" -Data @{ exit_code = $installerProcess.ExitCode; requested_directory = $script:InstallRoot }
     if ($installerProcess.ExitCode -ne 0) { throw "NSIS installer returned exit code $($installerProcess.ExitCode)." }
     $appCandidates = @(
         (Join-Path $script:InstallRoot "CyberSentinel.exe"),
@@ -295,10 +314,33 @@ public static class CyberSentinelAcceptanceNative {
     )
     $script:AppExe = $appCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
     if (-not $script:AppExe) {
-        $script:AppExe = Get-ChildItem -LiteralPath $script:InstallRoot -Filter "CyberSentinel.exe" -File -Recurse | Select-Object -First 1 -ExpandProperty FullName
+        $discovered = @($possibleInstallRoots | ForEach-Object {
+            if (Test-Path -LiteralPath $_ -PathType Container) {
+                Get-ChildItem -LiteralPath $_ -Filter "CyberSentinel.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+        } | Where-Object { $_ })
+        $script:AppExe = $discovered | Select-Object -First 1 -ExpandProperty FullName
     }
-    if (-not $script:AppExe) { throw "Installer exited successfully but installed CyberSentinel.exe was not found." }
-    Add-Check -Name "Fresh install" -Status "PASS" -Details "Installer exit code 0; installed executable found at $script:AppExe in a new isolated directory."
+    if (-not $script:AppExe) {
+        $inventory = @($possibleInstallRoots | ForEach-Object {
+            if (Test-Path -LiteralPath $_ -PathType Container) {
+                [ordered]@{ root = $_; entries = @(Get-ChildItem -LiteralPath $_ -Force -ErrorAction SilentlyContinue | Select-Object -First 20 -ExpandProperty Name) }
+            } else { [ordered]@{ root = $_; missing = $true } }
+        })
+        $uninstallKeys = @(
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+        $uninstallEntries = @($uninstallKeys | ForEach-Object { Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue }
+        | Where-Object { $_.DisplayName -like "*CyberSentinel*" }
+        | Select-Object DisplayName, InstallLocation, DisplayVersion)
+        Write-Event -Event "installer_path_diagnostic" -Data @{ requested_directory = $script:InstallRoot; candidate_roots = $inventory; uninstall_registry = $uninstallEntries }
+        throw "Installer exited successfully but installed CyberSentinel.exe was not found in requested or standard install paths."
+    }
+    $actualInstallRoot = Split-Path -Parent $script:AppExe
+    Add-Check -Name "Fresh install" -Status "PASS" -Details "Installer exit code 0; installed executable found at $script:AppExe. Requested target honored=$($actualInstallRoot -eq $script:InstallRoot)."
+    $script:InstallRoot = $actualInstallRoot
 
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
