@@ -38,6 +38,8 @@ def complete_run(*, owner: str = "owner:1", success: float = 0.95, evidence_refs
             EvaluationMeasurement(M.COST, 1.25),
             EvaluationMeasurement(M.RECOVERY, 1.0),
             EvaluationMeasurement(M.SAFETY_VIOLATIONS, safety),
+            EvaluationMeasurement(M.TOKEN_USAGE, 2_500),
+            EvaluationMeasurement(M.AGENT_COORDINATION, 0.75),
         ),
         provenance={"harness": "tests", "prompt_sha256": "a" * 64},
     )
@@ -51,7 +53,7 @@ def test_evaluation_is_multidimensional_and_requires_independent_evidence_valida
 
     accepted = evaluate_run(run, evidence_validator=lambda owner, mission, ref: (owner, mission, ref) == ("owner:1", "mission:1", "evidence:1"))
     assert accepted.verdict is V.ACCEPTED
-    assert len(accepted.measurements) == 10
+    assert len(accepted.measurements) == 12
     assert not hasattr(accepted, "score")
 
 
@@ -103,6 +105,10 @@ def test_metric_values_units_and_policies_are_strict():
         EvaluationMeasurement(M.SAFETY_VIOLATIONS, 0.5)
     with pytest.raises(EvaluationError, match="finite number"):
         EvaluationMeasurement(M.COST, float("nan"))
+    with pytest.raises(EvaluationError, match="bounded integer token count"):
+        EvaluationMeasurement(M.TOKEN_USAGE, 1.5)
+    with pytest.raises(EvaluationError, match="bounded integer token count"):
+        EvaluationMeasurement(M.TOKEN_USAGE, 10_000_000_001)
 
 
 def test_evaluation_store_is_owner_scoped_append_only_and_idempotent(tmp_path):

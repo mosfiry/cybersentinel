@@ -9,6 +9,7 @@ from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import sqlite3
+import threading
 import uuid
 
 from .execution_fence import ExecutionFence, ExecutionFenceError
@@ -878,7 +879,7 @@ class MissionQueue:
 class MissionWorker:
     """Single-step worker adapter; a supervisor may call run_once repeatedly."""
 
-    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker", lease_seconds: int = DEFAULT_WORKER_LEASE_SECONDS, scheduler: Any | None = None):
+    def __init__(self, queue: MissionQueue, runtime_factory: Callable[[], Any], *, worker_id: str = "worker", lease_seconds: int = DEFAULT_WORKER_LEASE_SECONDS, scheduler: Any | None = None, outcome_recorder: Callable[[str], Any] | None = None):
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.queue = queue
@@ -892,6 +893,10 @@ class MissionWorker:
         ):
             raise ExecutionFenceError("strict worker scheduler must use the authoritative MissionStore")
         self.scheduler = scheduler
+        if outcome_recorder is not None and not callable(outcome_recorder):
+            raise TypeError("outcome_recorder must be callable")
+        self.outcome_recorder = outcome_recorder
+        self.outcome_recording_failures = 0
         self.identity = queue.register_worker(worker_id)
         self.identity_fence = ExecutionFence.for_worker(queue, self.identity)
         self.logical_worker_id = self.identity.worker_id
@@ -903,6 +908,16 @@ class MissionWorker:
 
     def enqueue(self, mission_id: str) -> QueueItem:
         return self.queue.enqueue(mission_id)
+
+    def _record_terminal_outcome(self, mission_id: str) -> None:
+        if self.outcome_recorder is None:
+            return
+        try:
+            self.outcome_recorder(mission_id)
+        except Exception:
+            # Evaluation is observational only; never turn a committed Mission
+            # result or ambiguous effect into an execution retry.
+            self.outcome_recording_failures += 1
 
     def recover_after_restart(self, *, now: str | None = None) -> list[QueueItem]:
         recovered = self.queue.recover_after_restart(now=now, execution_fence=self.identity_fence)
@@ -929,18 +944,46 @@ class MissionWorker:
             return None
         execution_fence = self.identity_fence.with_lease(item)
         claim_bound = False
+        heartbeat_lock = threading.Lock()
+        heartbeat_stop = threading.Event()
+        heartbeat_lost = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
 
         def heartbeat(*, allow_claimed: bool = False) -> None:
-            self.queue.heartbeat(
-                item.mission_id,
-                worker_id=self.worker_id,
-                lease_epoch=item.lease_epoch,
-                runtime_generation=self.runtime_generation,
-                worker_instance_id=self.worker_instance_id,
-                execution_fence=execution_fence,
-                lease_seconds=self.lease_seconds,
-                allow_claimed=allow_claimed,
-            )
+            if heartbeat_lost.is_set():
+                raise LeaseLostError("worker lease heartbeat was lost")
+            with heartbeat_lock:
+                if heartbeat_lost.is_set():
+                    raise LeaseLostError("worker lease heartbeat was lost")
+                try:
+                    self.queue.heartbeat(
+                        item.mission_id,
+                        worker_id=self.worker_id,
+                        lease_epoch=item.lease_epoch,
+                        runtime_generation=self.runtime_generation,
+                        worker_instance_id=self.worker_instance_id,
+                        execution_fence=execution_fence,
+                        lease_seconds=self.lease_seconds,
+                        allow_claimed=allow_claimed,
+                    )
+                except Exception:
+                    heartbeat_lost.set()
+                    raise
+
+        def keep_lease_alive() -> None:
+            interval = min(30.0, max(0.1, self.lease_seconds / 3.0))
+            while not heartbeat_stop.wait(interval):
+                try:
+                    heartbeat()
+                except Exception:
+                    # The runtime-facing heartbeat observes this flag and
+                    # fails closed before the next protected dispatch/write.
+                    return
+
+        def stop_lease_keepalive() -> None:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
+                heartbeat_thread.join(timeout=min(10.0, max(1.0, self.lease_seconds / 3.0 + 1.0)))
 
         try:
             # The initial renewal verifies a live CLAIMED lease before runtime
@@ -968,6 +1011,7 @@ class MissionWorker:
                         MissionStatus.SAFETY_BLOCKED: WorkerMissionState.FAILED,
                         MissionStatus.RESOURCE_BLOCKED: WorkerMissionState.FAILED,
                     }.get(binding.terminal_status, WorkerMissionState.FAILED)
+                    self._record_terminal_outcome(item.mission_id)
                     return self.queue.finalize_unstarted_claim(
                         execution_fence,
                         terminal_queue_state,
@@ -985,8 +1029,15 @@ class MissionWorker:
                 self.queue.mark_claim_bound(execution_fence)
             claim_bound = True
             heartbeat()
+            heartbeat_thread = threading.Thread(
+                target=keep_lease_alive,
+                name="mission-lease-keepalive",
+                daemon=True,
+            )
+            heartbeat_thread.start()
             mission = runtime.run_to_completion(item.mission_id, max_slices=max_slices, heartbeat=heartbeat)
         except (LeaseLostError, ExecutionFenceError):
+            stop_lease_keepalive()
             # Before BOUND, no runtime slice or handler has run; quarantine this
             # lease if it is still current. After BOUND, stale ownership must not
             # modify the replacement worker's outcome.
@@ -1000,6 +1051,7 @@ class MissionWorker:
                     pass
             return self.queue.get(item.mission_id)
         except Exception:
+            stop_lease_keepalive()
             if not claim_bound:
                 try:
                     return self.queue.abort_unstarted_claim(
@@ -1023,6 +1075,8 @@ class MissionWorker:
                 )
             except (LeaseLostError, ExecutionFenceError):
                 return self.queue.get(item.mission_id)
+        if getattr(mission, "is_terminal", False):
+            self._record_terminal_outcome(item.mission_id)
         state = {
             MissionStatus.GOAL_COMPLETED: WorkerMissionState.COMPLETED,
             MissionStatus.OWNER_INPUT_REQUIRED: WorkerMissionState.NEEDS_INPUT,
@@ -1053,6 +1107,8 @@ class MissionWorker:
             # A long-running handler may finish after another worker reclaimed
             # the lease; never let the stale result overwrite that worker.
             return self.queue.get(item.mission_id)
+        finally:
+            stop_lease_keepalive()
 
 
 @dataclass(frozen=True)

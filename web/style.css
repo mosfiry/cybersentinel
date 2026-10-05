@@ -196,6 +196,11 @@ button{font:inherit;cursor:pointer}
 .observability-error{color:#ff9b9b!important}
 .observability-active-agent{color:#8ee3ac!important}
 .observability-refresh,.observability-more{justify-self:start;border:1px solid #2c3b52;border-radius:6px;background:#0f1726;color:#cdd7e6;padding:6px 10px}
+.evaluation-dashboard-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px;margin-top:10px}
+.evaluation-dashboard-metric{display:grid;gap:6px;align-content:start}
+.evaluation-dashboard-metric h2,.evaluation-dashboard-metric p{margin:0}
+.evaluation-dashboard-value{font-size:18px;color:#8ee3ac;direction:ltr;text-align:right;overflow-wrap:anywhere}
+.evaluation-dashboard-metric small{color:#8b97ab}
 @media (max-width: 640px){
   .setup-overlay{padding:8px;align-items:start}
   .setup-card{max-height:calc(100vh - 16px);padding:14px}

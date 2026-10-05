@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+import api.evaluation_observability as evaluation_observability
 from agent.evidence import Evidence, EvidenceChainStore
 from agent.mission import Mission, MissionStore
 from agent.planning import Plan, PlanStep
@@ -92,7 +93,12 @@ def _run(owner, mission_id, *, evidence_id=None, marker="PRIVATE"):
     measurements = []
     for metric in EvaluationMetric:
         refs = (evidence_id,) if metric is EvaluationMetric.EVIDENCE_QUALITY and evidence_id else ()
-        measurements.append(EvaluationMeasurement(metric, 0 if metric is EvaluationMetric.SAFETY_VIOLATIONS else 0.75, refs))
+        value = (
+            0 if metric is EvaluationMetric.SAFETY_VIOLATIONS
+            else 2_500 if metric is EvaluationMetric.TOKEN_USAGE
+            else 0.75
+        )
+        measurements.append(EvaluationMeasurement(metric, value, refs))
     return EvaluationRun(
         owner_identity_ref=owner,
         mission_id=mission_id,
@@ -120,6 +126,46 @@ def _service(mission, store, evidence_path):
     )
 
 
+class _DashboardMissionService:
+    def __init__(self, mission_store):
+        self.mission_store = mission_store
+
+    @staticmethod
+    def _owner(token):
+        owners = {"owner-session-token": "owner:7", "foreign-session-token": "owner:8"}
+        if token not in owners:
+            raise PermissionError("owner authentication required")
+        return owners[token]
+
+    def list_missions(self, *, owner_session_token, limit):
+        return self.mission_store.list_for_owner(self._owner(owner_session_token), limit=limit)
+
+    def load_authorized_mission(self, mission_id, owner_session_token):
+        owner = self._owner(owner_session_token)
+        mission = self.mission_store.load(mission_id)
+        if mission is None or mission.owner_identity_ref != owner:
+            raise KeyError("unknown_mission")
+        return mission, owner
+
+
+def _add_mission(store, *, owner, mission_id):
+    plan = Plan(version=1, objective="Private mission objective", steps=(
+        PlanStep(step_id="step-1", objective="Private task prompt", action="search"),
+    ))
+    mission = Mission.create(
+        "Private mission objective",
+        "Private mission objective",
+        plan,
+        mission_id=mission_id,
+        request_id=f"request-{mission_id}",
+        owner_identity_ref=owner,
+    )
+    mission.provenance["authorization_snapshot_version"] = 1
+    mission.authorization_snapshot = make_test_snapshot(mission).to_dict()
+    store.save(mission)
+    return store.load(mission_id)
+
+
 def test_no_run_returns_ten_explicitly_unavailable_metrics_without_creating_data(tmp_path):
     mission, _mission_store, evidence_path, _evidence_id = _stored_mission(tmp_path)
     missing_path = tmp_path / "missing-evaluation.sqlite3"
@@ -133,7 +179,7 @@ def test_no_run_returns_ten_explicitly_unavailable_metrics_without_creating_data
     assert result["status"] == "no_run"
     assert result["run_count"] == 0
     assert result["verdict"] == "not_persisted"
-    assert len(result["metrics"]) == len(EvaluationMetric) == 10
+    assert len(result["metrics"]) == len(EvaluationMetric) == 12
     assert all(item["status"] == "unavailable" and item["value"] is None for item in result["metrics"])
 
     empty_store_path = tmp_path / "empty-evaluations.sqlite3"
@@ -145,7 +191,92 @@ def test_no_run_returns_ten_explicitly_unavailable_metrics_without_creating_data
     ).get(mission.mission_id, owner_session_token="owner-session-token")
     assert empty_store_result["status"] == "no_run"
     assert empty_store_result["run_count"] == 0
-    assert len(empty_store_result["metrics"]) == 10
+    assert len(empty_store_result["metrics"]) == 12
+
+
+def test_owner_dashboard_aggregates_latest_owner_missions_without_foreign_or_raw_fields(tmp_path):
+    mission, mission_store, evidence_path, evidence_id = _stored_mission(
+        tmp_path / "dashboard", with_evidence=True
+    )
+    second = _add_mission(mission_store, owner="owner:7", mission_id="mission-eval-2")
+    foreign = _add_mission(mission_store, owner="owner:8", mission_id="mission-eval-foreign")
+    evaluation_path = tmp_path / "dashboard-evaluations.sqlite3"
+    writer = EvaluationStore(evaluation_path)
+    writer.append(_run("owner:7", mission.mission_id, evidence_id=evidence_id), idempotency_key="owner-one")
+    writer.append(_run("owner:7", second.mission_id), idempotency_key="owner-two")
+    writer.append(_run("owner:8", foreign.mission_id, marker="FOREIGN_OWNER"), idempotency_key="foreign")
+    service = MissionEvaluationSummaryService(
+        _DashboardMissionService(mission_store),
+        EvaluationStore(evaluation_path, read_only=True),
+        evidence_db_path=evidence_path,
+    )
+
+    result = service.get_owner_dashboard(owner_session_token="owner-session-token")
+
+    assert result["status"] == "available"
+    assert result["mission_count"] == 2
+    assert result["mission_count_capped"] is False
+    assert result["evaluated_mission_count"] == 2
+    success = next(item for item in result["metrics"] if item["metric"] == "task_success")
+    assert success["value"] == 0.75
+    assert success["sample_mission_count"] == 2
+    evidence_quality = next(item for item in result["metrics"] if item["metric"] == "evidence_quality")
+    assert evidence_quality["value"] == 0.75
+    assert evidence_quality["sample_mission_count"] == 1
+    encoded = json.dumps(result)
+    for forbidden in (
+        mission.mission_id,
+        second.mission_id,
+        foreign.mission_id,
+        evidence_id,
+        "FOREIGN_OWNER",
+        "PRIVATE_RAW_PROMPT",
+        "PRIVATE_RAW_PROVIDER_RESPONSE",
+        "PRIVATE_EVIDENCE_PAYLOAD",
+    ):
+        assert forbidden not in encoded
+    assert len(encoded.encode("utf-8")) <= evaluation_observability.MAX_OWNER_DASHBOARD_BYTES
+
+
+def test_owner_dashboard_no_run_is_explicit_and_foreign_owner_is_denied(tmp_path):
+    mission, mission_store, evidence_path, _evidence_id = _stored_mission(tmp_path / "dashboard-empty")
+    service = MissionEvaluationSummaryService(
+        _DashboardMissionService(mission_store), None, evidence_db_path=evidence_path
+    )
+    result = service.get_owner_dashboard(owner_session_token="owner-session-token")
+    assert result["status"] == "no_run"
+    assert result["evaluated_mission_count"] == 0
+    assert all(item["status"] == "unavailable" and item["value"] is None for item in result["metrics"])
+    with pytest.raises(KeyError, match="owner_session_required"):
+        service.get_owner_dashboard(owner_session_token="unknown-session")
+
+
+def test_owner_dashboard_mission_cap_and_tamper_fail_closed(tmp_path, monkeypatch):
+    mission, mission_store, evidence_path, _evidence_id = _stored_mission(tmp_path / "dashboard-cap")
+    _add_mission(mission_store, owner="owner:7", mission_id="mission-eval-cap-2")
+    monkeypatch.setattr(evaluation_observability, "MAX_OWNER_DASHBOARD_MISSIONS", 1)
+    service = MissionEvaluationSummaryService(
+        _DashboardMissionService(mission_store), None, evidence_db_path=evidence_path
+    )
+    result = service.get_owner_dashboard(owner_session_token="owner-session-token", limit=1)
+    assert result["mission_count"] == 1
+    assert result["mission_count_capped"] is True
+
+    class TamperedMissionService(_DashboardMissionService):
+        def load_authorized_mission(self, mission_id, owner_session_token):
+            value, owner = super().load_authorized_mission(mission_id, owner_session_token)
+            value.objective += "-tampered"
+            return value, owner
+
+    tampered = MissionEvaluationSummaryService(
+        TamperedMissionService(mission_store), None, evidence_db_path=evidence_path
+    )
+    with pytest.raises(MissionEvaluationSummaryError, match="mission_integrity_invalid"):
+        tampered.get_owner_dashboard(owner_session_token="owner-session-token", limit=1)
+
+    monkeypatch.setattr(evaluation_observability, "MAX_OWNER_DASHBOARD_BYTES", 1)
+    with pytest.raises(MissionEvaluationSummaryTooLarge, match="response bound"):
+        service.get_owner_dashboard(owner_session_token="owner-session-token", limit=1)
 
 
 def test_bridge_does_not_create_an_evaluation_database_for_a_read_request(tmp_path, monkeypatch):
@@ -184,7 +315,7 @@ def test_summary_is_exact_owner_mission_scoped_and_only_exposes_opaque_verified_
     assert result["run_count"] == 1
     assert result["run_count_capped"] is False
     assert result["verdict"] == "not_persisted"
-    assert len(result["metrics"]) == 10
+    assert len(result["metrics"]) == 12
     assert [item["metric"] for item in result["metrics"]] == [metric.value for metric in EvaluationMetric]
     assert all(item["status"] == "recorded" and isinstance(item["value"], (int, float)) for item in result["metrics"])
     evidence_metric = next(item for item in result["metrics"] if item["metric"] == "evidence_quality")

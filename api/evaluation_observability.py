@@ -30,6 +30,8 @@ MAX_EVIDENCE_CHAIN_RECORDS = 10_000
 MAX_EVIDENCE_CHAIN_BYTES = 16 * 1024 * 1024
 MAX_EVIDENCE_REFS_PER_METRIC = 4
 MAX_SUMMARY_BYTES = 16 * 1024
+MAX_OWNER_DASHBOARD_MISSIONS = 10
+MAX_OWNER_DASHBOARD_BYTES = 16 * 1024
 _METRIC_UNITS = {
     EvaluationMetric.TASK_SUCCESS: "ratio",
     EvaluationMetric.EVIDENCE_QUALITY: "ratio",
@@ -41,6 +43,8 @@ _METRIC_UNITS = {
     EvaluationMetric.COST: "units",
     EvaluationMetric.RECOVERY: "ratio",
     EvaluationMetric.SAFETY_VIOLATIONS: "count",
+    EvaluationMetric.TOKEN_USAGE: "tokens",
+    EvaluationMetric.AGENT_COORDINATION: "ratio",
 }
 
 
@@ -254,12 +258,107 @@ class MissionEvaluationSummaryService:
             raise MissionEvaluationSummaryTooLarge("evaluation summary exceeds the response bound")
         return result
 
+    def get_owner_dashboard(
+        self,
+        *,
+        owner_session_token: str,
+        limit: int = MAX_OWNER_DASHBOARD_MISSIONS,
+    ) -> dict[str, Any]:
+        """Aggregate latest persisted metrics for a small Owner-only Mission window.
+
+        The response omits Mission identifiers, prompts, providers, and evidence
+        references. It is a display-only mean, not a policy verdict.
+        """
+        if (
+            not isinstance(owner_session_token, str)
+            or not owner_session_token
+            or len(owner_session_token) > 256
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_OWNER_DASHBOARD_MISSIONS
+        ):
+            raise ValueError("invalid_evaluation_dashboard_request")
+        try:
+            listed = self.mission_service.list_missions(
+                owner_session_token=owner_session_token,
+                limit=limit + 1,
+            )
+        except (KeyError, PermissionError):
+            raise KeyError("owner_session_required") from None
+        if not isinstance(listed, list) or len(listed) > limit + 1:
+            raise MissionEvaluationSummaryError("mission_listing_invalid")
+        capped = len(listed) > limit
+        rows = listed[:limit]
+        mission_ids: list[str] = []
+        for row in rows:
+            mission_id = row.get("mission_id") if isinstance(row, dict) else None
+            if not isinstance(mission_id, str) or not mission_id or len(mission_id) > 128:
+                raise MissionEvaluationSummaryError("mission_listing_invalid")
+            if mission_id in mission_ids:
+                raise MissionEvaluationSummaryError("mission_listing_invalid")
+            mission_ids.append(mission_id)
+
+        samples: dict[EvaluationMetric, list[float]] = {metric: [] for metric in EvaluationMetric}
+        evaluated_missions = 0
+        for mission_id in mission_ids:
+            summary = self.get(mission_id, owner_session_token=owner_session_token)
+            if summary.get("status") != "run_recorded":
+                continue
+            evaluated_missions += 1
+            metrics = summary.get("metrics")
+            if not isinstance(metrics, list) or len(metrics) != len(EvaluationMetric):
+                raise MissionEvaluationSummaryError("evaluation_projection_invalid")
+            for item in metrics:
+                if not isinstance(item, dict):
+                    raise MissionEvaluationSummaryError("evaluation_projection_invalid")
+                try:
+                    metric = EvaluationMetric(item.get("metric"))
+                except (TypeError, ValueError):
+                    raise MissionEvaluationSummaryError("evaluation_projection_invalid") from None
+                value = item.get("value")
+                if item.get("status") != "recorded":
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise MissionEvaluationSummaryError("evaluation_projection_invalid")
+                if metric is EvaluationMetric.EVIDENCE_QUALITY and (
+                    summary.get("evidence_status") != "verified"
+                    or item.get("verified_evidence_ref_count", 0) < 1
+                ):
+                    continue
+                samples[metric].append(float(value))
+
+        metrics_output = []
+        for metric in EvaluationMetric:
+            values = samples[metric]
+            metrics_output.append({
+                "metric": metric.value,
+                "status": "recorded" if values else "unavailable",
+                "value": round(sum(values) / len(values), 6) if values else None,
+                "unit": _METRIC_UNITS[metric],
+                "aggregation": "mean_of_latest_recorded_per_mission",
+                "sample_mission_count": len(values),
+            })
+        result = {
+            "status": "available" if evaluated_missions else "no_run",
+            "mission_count": len(mission_ids),
+            "mission_count_capped": capped,
+            "evaluated_mission_count": evaluated_missions,
+            "metrics": metrics_output,
+            "verdict": "not_computed",
+        }
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(encoded) > MAX_OWNER_DASHBOARD_BYTES:
+            raise MissionEvaluationSummaryTooLarge("evaluation dashboard exceeds the response bound")
+        return result
+
 
 __all__ = [
     "MAX_EVIDENCE_CHAIN_BYTES",
     "MAX_EVIDENCE_CHAIN_RECORDS",
     "MAX_EVIDENCE_REFS_PER_METRIC",
     "MAX_EVALUATION_RUNS",
+    "MAX_OWNER_DASHBOARD_BYTES",
+    "MAX_OWNER_DASHBOARD_MISSIONS",
     "MAX_SUMMARY_BYTES",
     "MissionEvaluationSummaryError",
     "MissionEvaluationSummaryService",

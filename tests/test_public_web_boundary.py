@@ -237,6 +237,179 @@ def test_mission_evaluation_summary_requires_owner_csrf_and_exact_mission_scope(
     assert query_error == {"ok": False, "error": "invalid_evaluation_query"}
 
 
+def test_owner_evaluation_dashboard_requires_owner_csrf_and_rejects_client_identity(public_server, monkeypatch):
+    calls = []
+
+    class FakeEvaluationDashboard:
+        def get_owner_dashboard(self, *, owner_session_token, limit):
+            calls.append((owner_session_token, limit))
+            if limit > 10:
+                raise ValueError("invalid_evaluation_dashboard_request")
+            return {
+                "status": "no_run",
+                "mission_count": 0,
+                "mission_count_capped": False,
+                "evaluated_mission_count": 0,
+                "metrics": [],
+                "verdict": "not_computed",
+            }
+
+    monkeypatch.setattr(
+        bridge.Handler,
+        "_mission_evaluation_service",
+        lambda self: FakeEvaluationDashboard(),
+    )
+    public_cookie, public_csrf, _ = _public_session(public_server)
+    public_status, public_error, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/evaluation-dashboard",
+        headers={"Cookie": public_cookie, "X-CSRF-Token": public_csrf},
+    )
+    assert public_status == 403
+    assert public_error == {"ok": False, "error": "owner_authorization_required"}
+
+    owner_cookie, csrf = _owner_session(public_server)
+    missing_csrf_status, missing_csrf, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/evaluation-dashboard",
+        headers={"Cookie": owner_cookie},
+    )
+    assert missing_csrf_status == 401
+    assert missing_csrf["ok"] is False
+
+    status, result, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/evaluation-dashboard?limit=5",
+        headers={"Cookie": owner_cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert result["dashboard"]["status"] == "no_run"
+    assert calls[-1] == (OWNER_TOKEN, 5)
+    assert OWNER_TOKEN not in json.dumps(result)
+
+    for query in ("limit=11", "owner=owner%3A8", "limit=" + "1" * 300):
+        denied_status, denied_body, _ = _request(
+            public_server,
+            "GET",
+            "/api/public/evaluation-dashboard?" + query,
+            headers={"Cookie": owner_cookie, "X-CSRF-Token": csrf},
+        )
+        assert denied_status == 400
+        assert denied_body == {"ok": False, "error": "invalid_evaluation_dashboard_request"}
+
+
+def test_public_schedule_api_is_owner_csrf_protected_and_only_accepts_one_shot_payloads(public_server, monkeypatch):
+    calls = []
+
+    class FakeMissionService:
+        def schedule_mission(self, mission_id, *, owner_session_token, run_at):
+            if mission_id != "mission-safe":
+                raise KeyError("unknown_mission")
+            calls.append((mission_id, owner_session_token, run_at))
+            return {
+                "schedule_id": "schedule-safe",
+                "mission_id": mission_id,
+                "next_run_at": run_at,
+                "interval_seconds": None,
+                "retry_limit": 0,
+                "state": "SCHEDULED",
+            }
+
+    monkeypatch.setattr(bridge.Handler, "_mission_service", lambda self: FakeMissionService())
+    public_cookie, public_csrf, _ = _public_session(public_server)
+    public_status, public_body, _ = _request(
+        public_server,
+        "POST",
+        "/api/public/missions/mission-safe/schedule",
+        body={"run_at": "2030-01-01T00:00:00Z"},
+        headers={"Cookie": public_cookie, "X-CSRF-Token": public_csrf},
+    )
+    assert public_status == 403
+    assert public_body == {"ok": False, "error": "owner_authorization_required"}
+
+    owner_cookie, csrf = _owner_session(public_server)
+    no_csrf_status, _, _ = _request(
+        public_server,
+        "POST",
+        "/api/public/missions/mission-safe/schedule",
+        body={"run_at": "2030-01-01T00:00:00Z"},
+        headers={"Cookie": owner_cookie},
+    )
+    assert no_csrf_status == 401
+
+    status, response, _ = _request(
+        public_server,
+        "POST",
+        "/api/public/missions/mission-safe/schedule",
+        body={"run_at": "2030-01-01T00:00:00Z"},
+        headers={"Cookie": owner_cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 201
+    assert response["schedule"]["retry_limit"] == 0
+    assert calls == [("mission-safe", OWNER_TOKEN, "2030-01-01T00:00:00Z")]
+    assert OWNER_TOKEN not in json.dumps(response)
+
+    for mission_id in ("foreign", "missing"):
+        denied_status, denied_body, _ = _request(
+            public_server,
+            "POST",
+            f"/api/public/missions/{mission_id}/schedule",
+            body={"run_at": "2030-01-01T00:00:00Z"},
+            headers={"Cookie": owner_cookie, "X-CSRF-Token": csrf},
+        )
+        assert denied_status == 404
+        assert denied_body == {"ok": False, "error": "unknown_mission"}
+
+    invalid_payloads = (
+        {"run_at": "2030-01-01T00:00:00Z", "interval_seconds": 60},
+        {"run_at": "2030-01-01T00:00:00Z", "cron": "* * * * *"},
+        {"run_at": "2030-01-01T00:00:00Z", "retry_limit": 1},
+        {"run_at": 2030},
+        ["2030-01-01T00:00:00Z"],
+    )
+    for payload in invalid_payloads:
+        denied_status, denied_body, _ = _request(
+            public_server,
+            "POST",
+            "/api/public/missions/mission-safe/schedule",
+            body=payload,
+            headers={"Cookie": owner_cookie, "X-CSRF-Token": csrf},
+        )
+        assert denied_status == 400
+        assert denied_body == {"ok": False, "error": "invalid_schedule_request"}
+    assert len(calls) == 1, "invalid and foreign requests never reach the scheduling service"
+
+    monkeypatch.setattr(bridge, "BRIDGE_TOKEN", "bridge-test-token")
+    legacy_headers = {
+        "X-CyberSentinel-Token": "bridge-test-token",
+        "X-CyberSentinel-Owner-Session": OWNER_TOKEN,
+    }
+    legacy_status, legacy_response, _ = _request(
+        public_server,
+        "POST",
+        "/api/missions/mission-safe/schedule",
+        body={"run_at": "2030-01-02T00:00:00Z"},
+        headers=legacy_headers,
+    )
+    assert legacy_status == 201
+    assert legacy_response["schedule"]["retry_limit"] == 0
+    assert calls[-1] == ("mission-safe", OWNER_TOKEN, "2030-01-02T00:00:00Z")
+    for payload in invalid_payloads:
+        denied_status, denied_body, _ = _request(
+            public_server,
+            "POST",
+            "/api/missions/mission-safe/schedule",
+            body=payload,
+            headers=legacy_headers,
+        )
+        assert denied_status == 400
+        assert denied_body == {"ok": False, "error": "invalid_schedule_request"}
+    assert len(calls) == 2, "unsupported legacy action payloads never reach scheduling"
+
+
 def test_public_session_rejects_missing_or_invalid_csrf(manager):
     session = manager.create()
     with pytest.raises(PermissionError, match="csrf"):

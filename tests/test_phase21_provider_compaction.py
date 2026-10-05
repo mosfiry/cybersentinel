@@ -96,6 +96,8 @@ def test_compacted_metadata_is_not_replayed_as_tool_result():
     assert assembled.sections["owner"]["instruction"] == "owner objective"
     assert any(item.get("record_type") == COMPACTED_TOOL_METADATA for item in assembled.sections["tool"])
     assert all(message.role != "tool" or message.tool_call_id not in {f"call-{i}" for i in range(12) if i < assembled.compacted_items} for message in assembled.messages)
-    assert all(item.get("record_type") == "LIVE_TOOL_RESULT" for item in assembled.sections["tool"] if item.get("record_type") != COMPACTED_TOOL_METADATA)
+    assert all(item.get("record_type") == COMPACTED_TOOL_METADATA for item in assembled.sections["tool"])
+    tool_messages = [message for message in assembled.messages if message.role == "tool"]
+    assert [(message.tool_call_id, message.name) for message in tool_messages] == [("call-11", "status")]
     assert assembled.sections["compaction"]["metadata_is_untrusted"] is True
     assert assembled.context_chars <= 3000

@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+const { hideWindowOnClose, keepProcessAfterWindowClosure } = require("../background-lifecycle");
 
 const root = path.resolve(__dirname, "../..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
@@ -22,6 +23,30 @@ test("packaged launch uses bundled executables and durable userData, not Python 
   assert.match(main, /findFreeLoopbackPort/);
   assert.match(main, /env\.BRIDGE_HOST = "127\.0\.0\.1"/);
   assert.doesNotMatch(main, /CYBERSENTINEL_REPO/);
+  assert.ok(pkg.build.files.includes("background-lifecycle.js"));
+});
+
+test("closing the window hides to tray while authorized background Missions keep running", () => {
+  assert.match(main, /new Tray\(path\.join\(__dirname, "build", "icon\.png"\)\)/);
+  assert.match(main, /hideWindowOnClose\(event/);
+  assert.match(main, /Quit and stop background Missions/);
+  let prevented = false;
+  let hidden = false;
+  const event = { preventDefault() { prevented = true; } };
+  assert.equal(hideWindowOnClose(event, { quitting: false, trayAvailable: true, hide: () => { hidden = true; } }), true);
+  assert.equal(prevented, true);
+  assert.equal(hidden, true);
+  assert.equal(keepProcessAfterWindowClosure({ trayAvailable: true, quitting: false }), true);
+
+  prevented = false;
+  hidden = false;
+  assert.equal(hideWindowOnClose(event, { quitting: true, trayAvailable: true, hide: () => { hidden = true; } }), false);
+  assert.equal(prevented, false);
+  assert.equal(hidden, false);
+  assert.equal(keepProcessAfterWindowClosure({ trayAvailable: true, quitting: true }), false);
+
+  assert.equal(hideWindowOnClose(event, { quitting: false, trayAvailable: false, hide: () => { hidden = true; } }), false);
+  assert.equal(keepProcessAfterWindowClosure({ trayAvailable: false, quitting: false }), false);
 });
 
 test("packaged Browser includes pinned Chromium and verifies the bundled runtime", () => {
@@ -185,6 +210,70 @@ test("Mission evaluation summary renders only whitelisted numbers and opaque evi
   assert.ok(renderedText.includes("task_success: غير مسجّل"));
   assert.ok(renderedText.includes("evref_" + "b".repeat(64)));
   assert.ok(!renderedText.includes(attack), "arbitrary evaluation strings and raw evidence IDs are omitted");
+});
+
+test("aggregate evaluation dashboard is navigable and renders hostile fields only as fixed text", () => {
+  assert.ok(index.includes('id="evaluationDashboardLink"'));
+  assert.ok(app.includes("/api/public/evaluation-dashboard?limit=10"));
+  const start = app.indexOf("const EVALUATION_DASHBOARD_METRICS =");
+  const end = app.indexOf("\nasync function evaluationDashboardPanel", start);
+  assert.ok(start >= 0 && end > start, "aggregate evaluation dashboard renderer is present");
+  const renderer = app.slice(start, end);
+  assert.match(renderer, /\.textContent\s*=/);
+  assert.match(renderer, /Object\.hasOwn\(EVALUATION_DASHBOARD_METRICS/);
+  assert.doesNotMatch(renderer, /\.innerHTML|insertAdjacentHTML|DOMParser|eval\s*\(/);
+
+  const elements = [];
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.textContent = "";
+      this.className = "";
+      elements.push(this);
+    }
+    set innerHTML(_value) { throw new Error("HTML parsing is forbidden in this renderer"); }
+    append(...children) { this.children.push(...children); }
+    appendChild(child) { this.children.push(child); return child; }
+    replaceChildren(...children) { this.children = [...children]; }
+  }
+  const context = { document: { createElement: (tag) => new Element(tag) } };
+  vm.runInNewContext(`${renderer}; globalThis.render = renderEvaluationDashboard;`, context);
+  const root = new Element("root");
+  const attack = `<img src=x onerror=alert(1)>`;
+  context.render(root, {
+    status: "available",
+    mission_count: 2,
+    mission_count_capped: false,
+    evaluated_mission_count: 2,
+    private_mission_id: "PRIVATE_MISSION_ID",
+    metrics: [
+      { metric: attack, status: "recorded", value: 1, unit: attack, sample_mission_count: 2 },
+      { metric: "task_success", status: attack, value: 0.99, unit: "ratio", sample_mission_count: 999 },
+      { metric: "evidence_quality", status: "recorded", value: 0.62, unit: "ratio", sample_mission_count: 1, evidence_refs: ["PRIVATE_EVIDENCE_ID"] },
+    ],
+  });
+  const renderedText = elements.map((element) => element.textContent).join("\n");
+  assert.ok(renderedText.includes("0.62 ratio"));
+  assert.ok(renderedText.includes("غير متاح"));
+  assert.ok(!renderedText.includes(attack), "hostile metric keys/status/value/unit fields never render");
+  assert.ok(!renderedText.includes("PRIVATE_MISSION_ID"));
+  assert.ok(!renderedText.includes("PRIVATE_EVIDENCE_ID"));
+
+  const emptyRoot = new Element("root");
+  context.render(emptyRoot, {
+    status: "no_run",
+    mission_count: 1,
+    mission_count_capped: false,
+    evaluated_mission_count: 0,
+    metrics: [
+      { metric: "task_success", status: "unavailable", value: null, unit: "ratio", sample_mission_count: 0 },
+    ],
+  });
+  const emptyText = elements.map((element) => element.textContent).join("\n");
+  assert.ok(emptyText.includes("لا توجد سجلات تقييم متاحة"));
+  assert.ok(emptyText.includes("غير متاح"));
+  assert.ok(!emptyText.includes("0 ratio"), "an absent run does not become a zero score");
 });
 
 test("NSIS installer packages backend and local runtime and has a stable artifact name", () => {

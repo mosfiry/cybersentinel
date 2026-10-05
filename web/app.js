@@ -1146,8 +1146,9 @@ function renderMissionObservability(data, target) {
       task_success: "ratio", evidence_quality: "ratio", hallucination: "ratio",
       tool_correctness: "ratio", skill_usefulness: "ratio", memory_usefulness: "ratio",
       latency: "ms", cost: "units", recovery: "ratio", safety_violations: "count",
+      token_usage: "tokens", agent_coordination: "ratio",
     };
-    const metrics = Array.isArray(evaluation.metrics) ? evaluation.metrics.slice(0, 10) : [];
+    const metrics = Array.isArray(evaluation.metrics) ? evaluation.metrics.slice(0, 12) : [];
     metrics.forEach((metric) => {
       if (!metric || !Object.hasOwn(metricUnits, metric.metric)) return;
       const value = typeof metric.value === "number" && Number.isFinite(metric.value)
@@ -1504,6 +1505,96 @@ function showInfoPanel(nodes) {
   (Array.isArray(nodes) ? nodes : [nodes]).forEach((node) => panel.appendChild(node));
 }
 
+const EVALUATION_DASHBOARD_METRICS = Object.freeze({
+  task_success: { label: "نجاح المهمة", unit: "ratio" },
+  evidence_quality: { label: "جودة الأدلة الموثّقة", unit: "ratio" },
+  hallucination: { label: "معدل الادعاءات غير المدعومة", unit: "ratio" },
+  tool_correctness: { label: "صحة استخدام الأدوات", unit: "ratio" },
+  skill_usefulness: { label: "فائدة المهارات", unit: "ratio" },
+  memory_usefulness: { label: "فائدة الذاكرة", unit: "ratio" },
+  latency: { label: "زمن الاستجابة", unit: "ms" },
+  cost: { label: "التكلفة المسجّلة", unit: "units" },
+  recovery: { label: "التعافي", unit: "ratio" },
+  safety_violations: { label: "مخالفات السلامة", unit: "count" },
+  token_usage: { label: "استخدام الرموز", unit: "tokens" },
+  agent_coordination: { label: "تنسيق مهام الوكلاء", unit: "ratio" },
+});
+
+function renderEvaluationDashboard(panel, data) {
+  panel.replaceChildren();
+  const title = document.createElement("h1");
+  title.textContent = "لوحة تقييم المهام";
+  const note = document.createElement("p");
+  note.className = "muted";
+  note.textContent = "يعرض متوسط أحدث القياس المسجّل لكل مهمة ضمن نافذة محدودة. هذه ملخصات رصد وليست حكم قبول أو قياسًا محسوبًا الآن؛ الأدلة غير الموثّقة لا تدخل في جودة الأدلة.";
+  const status = document.createElement("p");
+  status.className = data?.status === "available" ? "notice ok" : "notice warn";
+  const missionCount = Number.isInteger(data?.mission_count) && data.mission_count >= 0 && data.mission_count <= 10
+    ? String(data.mission_count)
+    : "—";
+  const evaluatedCount = Number.isInteger(data?.evaluated_mission_count) && data.evaluated_mission_count >= 0 && data.evaluated_mission_count <= 10
+    ? String(data.evaluated_mission_count)
+    : "—";
+  status.textContent = data?.status === "available"
+    ? `مهمات ضمن النافذة: ${missionCount} · لها سجلات تقييم: ${evaluatedCount}${data.mission_count_capped === true ? " · عُرضت أحدث 10 فقط" : ""}`
+    : "لا توجد سجلات تقييم متاحة ضمن أحدث المهام؛ لا تُعرض نتائج مفترضة.";
+  panel.append(title, note, status);
+
+  const metrics = Array.isArray(data?.metrics) ? data.metrics.slice(0, 12) : [];
+  const list = document.createElement("div");
+  list.className = "evaluation-dashboard-list";
+  metrics.forEach((item) => {
+    const metricKey = typeof item?.metric === "string" ? item.metric : "";
+    if (!Object.hasOwn(EVALUATION_DASHBOARD_METRICS, metricKey)) return;
+    const definition = EVALUATION_DASHBOARD_METRICS[metricKey];
+    const card = document.createElement("article");
+    card.className = "result evaluation-dashboard-metric";
+    const name = document.createElement("h2");
+    name.textContent = definition.label;
+    const value = document.createElement("p");
+    value.className = "evaluation-dashboard-value";
+    const recorded = item?.status === "recorded" && typeof item.value === "number" && Number.isFinite(item.value) && item.unit === definition.unit;
+    value.textContent = recorded ? `${String(item.value)} ${definition.unit}` : "غير متاح";
+    const samples = document.createElement("small");
+    const count = Number.isInteger(item?.sample_mission_count) && item.sample_mission_count >= 0 && item.sample_mission_count <= 10
+      ? String(item.sample_mission_count)
+      : "0";
+    samples.textContent = `عدد المهمات ذات القياس: ${count}`;
+    card.append(name, value, samples);
+    list.appendChild(card);
+  });
+  panel.appendChild(list);
+}
+
+async function evaluationDashboardPanel() {
+  const panel = document.createElement("section");
+  panel.id = "evaluationDashboardPanel";
+  panel.className = "settings-layout";
+  showInfoPanel(panel);
+  state.activeInfoPanel = "evaluation-dashboard";
+  if (!state.ownerAuthenticated) {
+    const message = document.createElement("p");
+    message.className = "notice warn";
+    message.textContent = "سجّل الدخول بحساب المالك لعرض ملخص التقييم.";
+    panel.appendChild(message);
+    return;
+  }
+  const loading = document.createElement("p");
+  loading.className = "muted";
+  loading.textContent = "جارٍ تحميل ملخصات التقييم المحفوظة…";
+  panel.appendChild(loading);
+  try {
+    const data = await api("/api/public/evaluation-dashboard?limit=10");
+    if (state.activeInfoPanel === "evaluation-dashboard") renderEvaluationDashboard(panel, data.dashboard);
+  } catch (error) {
+    if (state.activeInfoPanel !== "evaluation-dashboard") return;
+    const message = document.createElement("p");
+    message.className = "notice error";
+    message.textContent = errorText(error);
+    panel.replaceChildren(message);
+  }
+}
+
 function toolsPanel() {
   const box = document.createElement("div");
   box.className = "result";
@@ -1809,6 +1900,7 @@ $("#activityToggle").onclick = () => {
 };
 $("#toolsLink").onclick = toolsPanel;
 $("#skillsLink").onclick = skillsPanel;
+$("#evaluationDashboardLink")?.addEventListener("click", evaluationDashboardPanel);
 $("#settingsLink").onclick = settingsPanel;
 $("#refreshMissions")?.addEventListener("click", loadMissions);
 

@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -177,6 +179,29 @@ def test_worker_heartbeat_uses_live_clock_not_claim_timestamp(tmp_path):
     assert result.lease_owner == "worker-a"
     assert datetime.fromisoformat(result.lease_expires_at) == datetime.fromisoformat(expected_expiry)
     assert runtime_created == []
+
+
+def test_worker_renews_fenced_claim_during_long_provider_call(tmp_path):
+    queue = MissionQueue(tmp_path / "long-provider-call.sqlite3")
+    queue.enqueue("long-provider-call", available_at=datetime.now(timezone.utc).isoformat())
+    completed = SimpleNamespace(status=MissionStatus.GOAL_COMPLETED, evidence=[{"criterion_id": "verified"}], error="")
+
+    class SlowRuntime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            assert mission_id == "long-provider-call"
+            time.sleep(2.5)
+            heartbeat()
+            return completed
+
+    worker = MissionWorker(queue, lambda: SlowRuntime(), worker_id="slow-provider", lease_seconds=2)
+    result = worker.run_once(max_slices=1)
+
+    assert result is not None
+    assert result.state is WorkerMissionState.COMPLETED
+    assert result.lease_owner is None
+    assert result.lease_expires_at is None
+    assert result.lease_epoch == 1
+    assert not any(thread.name == "mission-lease-keepalive" and thread.is_alive() for thread in threading.enumerate())
 
 
 def test_worker_stale_completion_cannot_ack_reclaimed_same_worker_lease(tmp_path):

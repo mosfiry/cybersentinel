@@ -448,6 +448,29 @@ def test_stale_or_foreign_owner_cannot_create_schedule_and_recurrence_is_rejecte
     assert executions == []
 
 
+def test_owner_cancel_retires_scheduled_mission_across_restart_without_dispatch(tmp_path, monkeypatch):
+    store, _runtime, queue, scheduler, service, mission, _worker, executions = _fixture(tmp_path, monkeypatch)
+    _schedule(service, mission.mission_id)
+
+    cancelled = service.cancel_mission(mission.mission_id, owner_session_token="current-owner-session")
+
+    assert cancelled["status"] == MissionStatus.CANCELLED.value
+    assert scheduler.get("v9-once").state is WorkerMissionState.CANCELLED
+    assert queue.get(mission.mission_id).state is WorkerMissionState.CANCELLED
+    replacement_queue = MissionQueue(
+        queue.db_path,
+        require_execution_fence=True,
+        mission_store=store,
+    )
+    replacement_scheduler = MissionScheduler(
+        scheduler.db_path,
+        replacement_queue,
+        mission_store=store,
+    )
+    assert replacement_scheduler.dispatch_due(now=datetime.now(timezone.utc).isoformat()) == []
+    assert executions == []
+
+
 def test_wal_mode_fails_closed_before_creating_bound_schedule(tmp_path, monkeypatch):
     store, _runtime, queue, scheduler, service, mission, worker, executions = _fixture(tmp_path, monkeypatch)
     worker.recover_after_restart()

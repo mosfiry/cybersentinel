@@ -4,7 +4,8 @@
 // local llama.cpp CPU runtime as signed-by-hash build resources. End users do
 // not need Python, Node, Docker, WSL, or a terminal.
 
-const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require("electron");
+const { app, BrowserWindow, Menu, Tray, ipcMain, shell, dialog } = require("electron");
+const { hideWindowOnClose, keepProcessAfterWindowClosure } = require("./background-lifecycle");
 const { spawn } = require("child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -20,6 +21,7 @@ const REQUEST_TIMEOUT_MS = 1500;
 const OWNER_SETUP_TIMEOUT_MS = 30000;
 
 let mainWindow = null;
+let backgroundTray = null;
 let bridgeProcess = null;
 let bridgePort = DEFAULT_PORT;
 let bridgeToken = "";
@@ -296,6 +298,11 @@ function createWindow() {
     if (url.startsWith("http://") || url.startsWith("https://")) shell.openExternal(url);
     return { action: "deny" };
   });
+  mainWindow.on("close", (event) => hideWindowOnClose(event, {
+    quitting,
+    trayAvailable: Boolean(backgroundTray),
+    hide: () => mainWindow?.hide(),
+  }));
   mainWindow.on("closed", () => { mainWindow = null; });
 }
 
@@ -306,9 +313,33 @@ function buildMenu() {
       { role: "reload", label: "Reload UI" },
       { role: "togglefullscreen" },
       { type: "separator" },
-      { role: "quit", label: "Quit" },
+      { role: "quit", label: "Quit and stop background missions" },
     ],
   }]));
+}
+
+function restoreMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function buildBackgroundTray() {
+  try {
+    backgroundTray = new Tray(path.join(__dirname, "build", "icon.png"));
+    backgroundTray.setToolTip("CyberSentinel continues authorized background Missions while this window is closed.");
+    backgroundTray.setContextMenu(Menu.buildFromTemplate([
+      { label: "Open CyberSentinel", click: restoreMainWindow },
+      { type: "separator" },
+      { label: "Quit and stop background Missions", click: () => app.quit() },
+    ]));
+    backgroundTray.on("double-click", restoreMainWindow);
+  } catch (_error) {
+    // Without a tray, retain the previous close-to-quit behavior so the app
+    // cannot disappear with no user-visible way to reopen or stop it.
+    backgroundTray = null;
+  }
 }
 
 function postOwnerBootstrap(password) {
@@ -452,11 +483,13 @@ async function startup() {
 
 app.whenReady().then(() => {
   buildMenu();
+  buildBackgroundTray();
   createWindow();
   startup();
 });
 
 app.on("window-all-closed", () => {
+  if (keepProcessAfterWindowClosure({ trayAvailable: Boolean(backgroundTray), quitting })) return;
   quitting = true;
   app.quit();
 });

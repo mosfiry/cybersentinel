@@ -45,6 +45,8 @@ class EvaluationMetric(str, Enum):
     COST = "cost"
     RECOVERY = "recovery"
     SAFETY_VIOLATIONS = "safety_violations"
+    TOKEN_USAGE = "token_usage"
+    AGENT_COORDINATION = "agent_coordination"
 
 
 class EvaluationVerdict(str, Enum):
@@ -64,8 +66,11 @@ _UNITS = {
     EvaluationMetric.COST: "units",
     EvaluationMetric.RECOVERY: "ratio",
     EvaluationMetric.SAFETY_VIOLATIONS: "count",
+    EvaluationMetric.TOKEN_USAGE: "tokens",
+    EvaluationMetric.AGENT_COORDINATION: "ratio",
 }
 _RATIO_METRICS = {metric for metric, unit in _UNITS.items() if unit == "ratio"}
+MAX_RECORDED_TOKEN_USAGE = 10_000_000_000
 
 
 def _identity(value: str, label: str) -> str:
@@ -119,6 +124,10 @@ class EvaluationMeasurement:
             raise EvaluationError(f"{self.metric.value} cannot be negative")
         if self.metric is EvaluationMetric.SAFETY_VIOLATIONS and (isinstance(self.value, bool) or int(self.value) != self.value):
             raise EvaluationError("safety_violations must be an integer count")
+        if self.metric is EvaluationMetric.TOKEN_USAGE and (
+            type(self.value) is not int or self.value > MAX_RECORDED_TOKEN_USAGE
+        ):
+            raise EvaluationError("token_usage must be a bounded integer token count")
         if not isinstance(self.evidence_refs, (tuple, list)) or len(self.evidence_refs) > 128:
             raise EvaluationError("evidence references must be a bounded sequence")
         refs = tuple(_identity(ref, "evidence reference") for ref in self.evidence_refs)

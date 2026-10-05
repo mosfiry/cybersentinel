@@ -38,6 +38,8 @@ SAFE_ERROR_CODES = {
     "mission_model_turn_missing",
     "mission_provider_identity_mismatch",
     "mission_tool_scope_mismatch",
+    "mission_final_response_missing",
+    "mission_final_turn_not_text_only",
     "status_tool_not_successful",
     "status_evidence_not_verified",
     "mission_trajectory_integrity_invalid",
@@ -97,6 +99,17 @@ def _resolve_artifact_root(requested: Path | None) -> tuple[Path, bool]:
     ):
         raise ValueError("resume_artifacts_dir_must_be_a_cybersentinel_temp_directory")
     return root, False
+
+
+def _new_mission_store_path(artifact_root: Path) -> Path:
+    """Allocate a unique attempt directory; AgentCore derives its queue beside this DB."""
+    if artifact_root.is_symlink() or not artifact_root.is_dir():
+        raise ValueError("acceptance_artifact_root_invalid")
+    root = artifact_root.resolve(strict=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="mission-run-", dir=root))
+    if run_dir.is_symlink() or run_dir.resolve(strict=True).parent != root:
+        raise ValueError("acceptance_mission_store_path_invalid")
+    return run_dir / "missions.sqlite3"
 
 
 def _safe_error_code(exc: Exception) -> str:
@@ -161,6 +174,17 @@ def validate_acceptance_mission(mission, expected_model_id: str) -> dict[str, ob
         for turn in turns
     ):
         raise RuntimeError("mission_provider_identity_mismatch")
+    final_turn = turns[-1]
+    final_content = final_turn.get("content")
+    final_calls = final_turn.get("tool_calls")
+    if (
+        not isinstance(final_content, str)
+        or not final_content.strip()
+        or len(final_content.encode("utf-8")) > 32_000
+    ):
+        raise RuntimeError("mission_final_response_missing")
+    if not isinstance(final_calls, list) or final_calls:
+        raise RuntimeError("mission_final_turn_not_text_only")
     if not isinstance(tool_results, list) or any(
         not isinstance(result, dict) or result.get("name") != "status"
         for result in tool_results
@@ -194,11 +218,22 @@ def validate_acceptance_mission(mission, expected_model_id: str) -> dict[str, ob
     event_names = [str(item.get("event", "")) for item in events]
     if not {"ToolExecuted", "GoalVerified", "MissionCompleted"}.issubset(event_names):
         raise RuntimeError("mission_tool_evidence_trajectory_incomplete")
+    try:
+        final_model_index = max(index for index, name in enumerate(event_names) if name == "ModelTurn")
+        tool_executed_index = max(index for index, name in enumerate(event_names) if name == "ToolExecuted")
+        goal_verified_index = event_names.index("GoalVerified")
+    except ValueError as exc:
+        raise RuntimeError("mission_tool_evidence_trajectory_incomplete") from exc
+    if not tool_executed_index < final_model_index < goal_verified_index:
+        raise RuntimeError("mission_tool_evidence_trajectory_incomplete")
 
     return {
         "mission_id": mission.mission_id,
         "status": mission.status.value,
         "provider_bound_turns": len(turns),
+        "final_response_present": True,
+        "final_response_bytes": len(final_content.encode("utf-8")),
+        "final_turn_tool_calls": 0,
         "successful_status_tool_calls": len(successful),
         "evidence_references": [
             {
@@ -338,7 +373,7 @@ def main() -> int:
             raise RuntimeError("remote_or_ambiguous_provider_configured")
 
         stage = "mission_execution"
-        mission_store_path = root / ("missions-" + uuid.uuid4().hex + ".sqlite3")
+        mission_store_path = _new_mission_store_path(root)
         mission_store = MissionStore(mission_store_path)
         core = AgentCore(router, store=mission_store, max_iterations=10)
         print("Running an Owner-authenticated status-tool mission through AgentCore.", file=sys.stderr, flush=True)

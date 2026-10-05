@@ -155,6 +155,13 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
     )
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
     scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
+    from evaluation.agent_evaluation import EvaluationStore
+    from evaluation.mission_outcomes import MissionOutcomeRecorder
+    evaluation_recorder = MissionOutcomeRecorder(
+        core.store,
+        EvaluationStore(DB_PATH.with_name("agent_evaluations.sqlite3")),
+        evidence_db_path=Path(core.store.db_path).with_name("evidence_chain.db"),
+    )
 
     def runtime_factory() -> MissionRuntime:
         return MissionRuntime(
@@ -169,7 +176,13 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
             mission_memory_writer=core.mission_memory_writer,
         )
 
-    return MissionWorker(queue, runtime_factory, worker_id=worker_id, scheduler=scheduler)
+    return MissionWorker(
+        queue,
+        runtime_factory,
+        worker_id=worker_id,
+        scheduler=scheduler,
+        outcome_recorder=evaluation_recorder.record,
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -618,6 +631,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"ok": False, "error": "unknown_skill_revision"})
             except (ValueError, TypeError) as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
+        if parsed.path == "/api/public/evaluation-dashboard":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            from api.evaluation_observability import (
+                MissionEvaluationSummaryError,
+                MissionEvaluationSummaryTooLarge,
+            )
+            from evaluation.agent_evaluation import EvaluationError
+
+            try:
+                if len(parsed.query) > 256:
+                    raise ValueError("invalid_evaluation_dashboard_request")
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if set(query) - {"limit"} or any(len(values) != 1 for values in query.values()):
+                    raise ValueError("invalid_evaluation_dashboard_request")
+                raw_limit = query.get("limit", ["10"])[0]
+                if not re.fullmatch(r"[0-9]{1,2}", raw_limit):
+                    raise ValueError("invalid_evaluation_dashboard_request")
+                value = self._mission_evaluation_service().get_owner_dashboard(
+                    owner_session_token=owner["session_token"],
+                    limit=int(raw_limit),
+                )
+                return self._send(200, {"ok": True, "dashboard": value})
+            except KeyError:
+                return self._send(403, {"ok": False, "error": "owner_authorization_required"})
+            except MissionEvaluationSummaryTooLarge:
+                return self._send(413, {"ok": False, "error": "evaluation_dashboard_too_large"})
+            except MissionEvaluationSummaryError as exc:
+                return self._send(409, {"ok": False, "error": str(exc)})
+            except EvaluationError:
+                return self._send(409, {"ok": False, "error": "evaluation_store_unavailable"})
+            except ValueError:
+                return self._send(400, {"ok": False, "error": "invalid_evaluation_dashboard_request"})
         if parsed.path == "/api/public/missions":
             owner = self._public_mission_owner()
             if owner is None:
@@ -1321,6 +1368,22 @@ class Handler(BaseHTTPRequestHandler):
                     result = service.pause_mission(mission_id, owner_session_token=owner["session_token"])
                 elif action == "cancel":
                     result = service.cancel_mission(mission_id, owner_session_token=owner["session_token"])
+                elif action == "schedule":
+                    payload = self._read_json()
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {"run_at"}
+                        or not isinstance(payload.get("run_at"), str)
+                        or not payload["run_at"].strip()
+                        or len(payload["run_at"]) > 128
+                    ):
+                        raise ValueError("invalid_schedule_request")
+                    schedule = service.schedule_mission(
+                        mission_id,
+                        owner_session_token=owner["session_token"],
+                        run_at=payload["run_at"],
+                    )
+                    return self._send(201, {"ok": True, "schedule": schedule})
                 else:
                     return self._send(404, {"ok": False, "error": "unknown_mission_action"})
                 return self._send(200, {"ok": True, "mission": result})
@@ -1558,7 +1621,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": True, "mission": service.cancel_mission(mission_id, owner_session_token=auth["session_token"])})
                 if action == "schedule":
                     payload = self._read_json()
-                    return self._send(201, {"ok": True, "schedule": service.schedule_mission(mission_id, owner_session_token=auth["session_token"], run_at=str(payload["run_at"]), interval_seconds=payload.get("interval_seconds"), retry_limit=int(payload.get("retry_limit", 0)))})
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {"run_at"}
+                        or not isinstance(payload.get("run_at"), str)
+                        or not payload["run_at"].strip()
+                        or len(payload["run_at"]) > 128
+                    ):
+                        raise ValueError("invalid_schedule_request")
+                    schedule = service.schedule_mission(
+                        mission_id,
+                        owner_session_token=auth["session_token"],
+                        run_at=payload["run_at"],
+                    )
+                    return self._send(201, {"ok": True, "schedule": schedule})
                 return self._send(404, {"ok": False, "error": "unknown_mission_action"})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})

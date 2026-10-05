@@ -30,6 +30,7 @@
     },
     "files": [
       "main.js",
+      "background-lifecycle.js",
       "preload.js",
       "unavailable.html",
       "build/icon.png",

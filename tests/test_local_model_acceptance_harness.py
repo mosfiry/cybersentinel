@@ -19,7 +19,7 @@ from scripts.download_llama_runtime import (
     _extract_zip,
     _safe_member_path,
 )
-from scripts.local_model_acceptance import _resolve_artifact_root, _safe_error_code, validate_acceptance_mission
+from scripts.local_model_acceptance import _new_mission_store_path, _resolve_artifact_root, _safe_error_code, validate_acceptance_mission
 
 
 def _mission():
@@ -29,7 +29,9 @@ def _mission():
     previous = ""
     for event_type in (
         EventType.MISSION_STARTED,
+        EventType.MODEL_TURN,
         EventType.TOOL_EXECUTED,
+        EventType.MODEL_TURN,
         EventType.GOAL_VERIFIED,
         EventType.MISSION_COMPLETED,
     ):
@@ -49,7 +51,10 @@ def _mission():
         status=SimpleNamespace(value="GOAL_COMPLETED"),
         progress={
             "model_loop": {
-                "turns": [{"provider": "local_llama_cpp", "model": "qwen3-4b-q4-k-m"}],
+                "turns": [
+                    {"provider": "local_llama_cpp", "model": "qwen3-4b-q4-k-m", "content": "", "tool_calls": [{"id": tool_call_id}]},
+                    {"provider": "local_llama_cpp", "model": "qwen3-4b-q4-k-m", "content": "bounded final response", "tool_calls": []},
+                ],
                 "tool_results": [{"name": "status", "ok": True, "tool_call_id": tool_call_id, "result": {"private": "not projected"}}],
             }
         },
@@ -71,7 +76,10 @@ def _mission():
 def test_local_model_acceptance_requires_provider_bound_status_tool_and_verified_evidence():
     summary = validate_acceptance_mission(_mission(), "qwen3-4b-q4-k-m")
     assert summary["status"] == "GOAL_COMPLETED"
-    assert summary["provider_bound_turns"] == 1
+    assert summary["provider_bound_turns"] == 2
+    assert summary["final_response_present"] is True
+    assert summary["final_response_bytes"] == len("bounded final response".encode())
+    assert summary["final_turn_tool_calls"] == 0
     assert summary["successful_status_tool_calls"] == 1
     assert summary["trajectory_integrity_verified"] is True
     assert "private" not in repr(summary)
@@ -93,6 +101,18 @@ def test_local_model_acceptance_rejects_non_status_tool_and_missing_verified_evi
     mission = _mission()
     mission.evidence[0]["provenance"]["verification_authority"] = "model_claim"
     with pytest.raises(RuntimeError, match="status_evidence_not_verified"):
+        validate_acceptance_mission(mission, "qwen3-4b-q4-k-m")
+
+
+def test_local_model_acceptance_rejects_missing_or_tool_call_final_response():
+    mission = _mission()
+    mission.progress["model_loop"]["turns"][-1]["content"] = ""
+    with pytest.raises(RuntimeError, match="mission_final_response_missing"):
+        validate_acceptance_mission(mission, "qwen3-4b-q4-k-m")
+
+    mission = _mission()
+    mission.progress["model_loop"]["turns"][-1]["tool_calls"] = [{"name": "status"}]
+    with pytest.raises(RuntimeError, match="mission_final_turn_not_text_only"):
         validate_acceptance_mission(mission, "qwen3-4b-q4-k-m")
 
 
@@ -126,6 +146,21 @@ def test_acceptance_resume_only_uses_existing_named_temp_directory(tmp_path: Pat
     link.symlink_to(accepted, target_is_directory=True)
     with pytest.raises(ValueError, match="existing_real_directory"):
         _resolve_artifact_root(link)
+
+
+def test_acceptance_retries_get_distinct_private_mission_and_queue_stores(tmp_path: Path):
+    artifacts = tmp_path / "cybersentinel-local-model-acceptance-retry"
+    artifacts.mkdir()
+    first = _new_mission_store_path(artifacts)
+    second = _new_mission_store_path(artifacts)
+
+    assert first != second
+    assert first.parent.parent == artifacts.resolve()
+    assert second.parent.parent == artifacts.resolve()
+    assert first.parent.stat().st_mode & 0o777 == 0o700
+    assert second.parent.stat().st_mode & 0o777 == 0o700
+    assert first.parent / "mission_queue.sqlite3" != second.parent / "mission_queue.sqlite3"
+    assert not first.exists() and not second.exists()
 
 
 def test_acceptance_report_never_reflects_arbitrary_exception_text():
