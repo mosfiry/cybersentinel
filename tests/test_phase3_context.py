@@ -18,6 +18,7 @@ from agent.context import (
     ContextSource,
     ContextItem,
     ContextBudget,
+    ContextBudgetExceeded,
     ExecutionState,
     RuntimeLimits,
     AgentContext,
@@ -399,7 +400,7 @@ class TestDeterministicTruncation:
         """Test that truncation records metadata."""
         runtime_limits = RuntimeLimits(
             max_context_messages=100,
-            max_context_chars=10,
+            max_context_chars=100,
         )
         builder = ContextBuilder(
             owner_policy_context="test",
@@ -408,20 +409,21 @@ class TestDeterministicTruncation:
         )
         
         builder.add_system_instructions("sys")
-        builder.add_user_message("user message that is too long")
+        builder.add_user_message("u" * 200)
         
         context = builder.build()
         
         # Check truncation was recorded
         assert context.truncated or context.budget.truncated
         assert context.budget.messages_removed >= 0
-        assert context.budget.chars_removed >= 0
+        assert context.budget.chars_removed > 0
+        assert "[TRUNCATED sha256=" in context.messages[-1]["content"]
     
     def test_truncation_preserves_system_and_owner(self, runtime_limits, execution_state):
         """Test that truncation always preserves system and owner policy."""
         runtime_limits = RuntimeLimits(
             max_context_messages=100,
-            max_context_chars=10,
+            max_context_chars=128,
         )
         builder = ContextBuilder(
             owner_policy_context="Owner policy",
@@ -437,7 +439,9 @@ class TestDeterministicTruncation:
         
         # System and owner policy should be preserved
         messages_content = " ".join(m["content"] for m in context.messages)
-        assert "System: be defensive" in messages_content or context.truncated
+        assert "System: be defensive" in messages_content
+        assert "Owner policy" in messages_content
+        assert "[TRUNCATED sha256=" in messages_content
 
 
 # =============================================================================
@@ -700,6 +704,36 @@ class TestContextHash:
         )
         
         assert context1.context_hash != context2.context_hash
+
+    def test_context_hash_changes_with_tool_schema(self, runtime_limits, execution_state, monkeypatch):
+        """Tool schema and authorization metadata are part of context identity."""
+        import tools.registry as registry
+
+        definition = {
+            "name": "search",
+            "description": "Search",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            "risk_class": "read",
+        }
+        monkeypatch.setattr(registry, "tool_definitions", lambda: [definition.copy()])
+        first = ContextEngine.build(
+            user_text="same",
+            conversation_id="conv-1",
+            owner_policy_context="policy",
+            execution_state=execution_state,
+            runtime_limits=runtime_limits,
+        )
+
+        definition["parameters"]["properties"]["query"]["maxLength"] = 128
+        second = ContextEngine.build(
+            user_text="same",
+            conversation_id="conv-1",
+            owner_policy_context="policy",
+            execution_state=execution_state,
+            runtime_limits=runtime_limits,
+        )
+
+        assert first.context_hash != second.context_hash
     
     def test_context_hash_excludes_secrets(self, runtime_limits, execution_state):
         """Test that context hash does not include secrets."""
@@ -1139,8 +1173,8 @@ class TestRuntimeLimitPreservation:
     def test_context_engine_respects_runtime_limits(self, runtime_limits, execution_state):
         """Test that ContextEngine respects RuntimeLimits."""
         custom_limits = RuntimeLimits(
-            max_context_messages=10,
-            max_context_chars=50,
+            max_context_messages=4,
+            max_context_chars=10000,
         )
         
         context = ContextEngine.build(
@@ -1152,8 +1186,9 @@ class TestRuntimeLimitPreservation:
         )
         
         # Check budget has the limits
-        assert context.budget.limits.max_context_messages == 10
-        assert context.budget.limits.max_context_chars == 50
+        assert context.budget.limits.max_context_messages == 4
+        assert context.budget.limits.max_context_chars == 10000
+        assert len(context.messages) <= 4
 
 
 # =============================================================================
@@ -1414,3 +1449,42 @@ class TestRegression:
         # Test invalid
         result = _parse_response("not json")
         assert result is None
+
+
+class TestRequiredContextBudget:
+    def test_required_security_context_overflow_fails_instead_of_sending_partial_policy(self, execution_state):
+        builder = ContextBuilder(
+            owner_policy_context="p" * 20,
+            execution_state=execution_state,
+            runtime_limits=RuntimeLimits(max_context_messages=10, max_context_chars=24),
+        )
+        builder.add_system_instructions("s" * 10).add_owner_policy().add_security_context("x" * 10)
+        with pytest.raises(ContextBudgetExceeded) as error:
+            builder.build()
+        assert error.value.required_chars == 40
+        assert error.value.required_messages == 3
+
+    def test_required_context_message_cap_fails_closed(self, execution_state):
+        builder = ContextBuilder(
+            owner_policy_context="policy",
+            execution_state=execution_state,
+            runtime_limits=RuntimeLimits(max_context_messages=1, max_context_chars=1000),
+        )
+        builder.add_system_instructions("system").add_user_message("current request")
+        with pytest.raises(ContextBudgetExceeded) as error:
+            builder.build()
+        assert error.value.required_messages == 2
+
+    def test_optional_history_is_deterministically_removed_before_current_user_message(self, execution_state):
+        builder = ContextBuilder(
+            owner_policy_context="policy",
+            execution_state=execution_state,
+            runtime_limits=RuntimeLimits(max_context_messages=2, max_context_chars=1000),
+        )
+        builder.add_system_instructions("system")
+        builder.add_conversation_history([{"role": "user", "content": "prior conversation"}])
+        builder.add_user_message("current request")
+        context = builder.build()
+        assert [message["content"] for message in context.messages] == ["system", "current request"]
+        assert context.truncated is True
+        assert any(item["source"] == "truncation" and item["messages_removed"] == 1 for item in context.provenance)

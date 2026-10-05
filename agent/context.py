@@ -75,6 +75,7 @@ class RuntimeLimits:
     max_pending_tasks: int = 10
     max_retries: int = 3
     max_total_output_chars: int = 8000
+    max_tool_schema_chars: int = 16000
     
     @classmethod
     def from_owner_policy(cls) -> RuntimeLimits:
@@ -161,29 +162,71 @@ class ContextBudget:
     limits: RuntimeLimits
     current_chars: int = 0
     current_messages: int = 0
+    fixed_chars: int = 0
     truncated: bool = False
     messages_removed: int = 0
     chars_removed: int = 0
+    required_overflow: bool = False
+    truncation_reported: bool = False
     
     def can_add(self, chars: int, is_required: bool = False) -> bool:
         """Check if we can add more content."""
         if is_required:
             return True  # Required items are always added
-        return self.current_chars + chars <= self.limits.max_context_chars
+        return (
+            self.current_chars + chars <= self.limits.max_context_chars
+            and self.current_messages + 1 <= self.limits.max_context_messages
+        )
     
     def add_item(self, chars: int, is_required: bool = False) -> bool:
         """Add item to budget. Returns True if added."""
         if self.can_add(chars, is_required):
             self.current_chars += chars
             self.current_messages += 1
+            if is_required and (
+                self.current_chars > self.limits.max_context_chars
+                or self.current_messages > self.limits.max_context_messages
+            ):
+                self.required_overflow = True
             return True
+        self.record_truncation(1, chars)
         return False
+
+    def add_fixed(self, chars: int) -> None:
+        """Count non-message payloads such as canonical tool schemas as required."""
+        if chars < 0:
+            raise ValueError("context fixed payload size cannot be negative")
+        self.fixed_chars += chars
+        if self.fixed_chars > self.limits.max_tool_schema_chars:
+            raise ToolSchemaBudgetExceeded(self.fixed_chars, self.limits.max_tool_schema_chars)
     
     def record_truncation(self, messages: int, chars: int) -> None:
         """Record truncation that occurred."""
         self.truncated = True
         self.messages_removed += messages
         self.chars_removed += chars
+
+
+class ContextBudgetExceeded(ValueError):
+    """Protected system, Owner policy, or security context cannot fit the configured budget."""
+
+    def __init__(self, *, required_messages: int, required_chars: int, limits: RuntimeLimits):
+        self.required_messages = required_messages
+        self.required_chars = required_chars
+        self.limits = limits
+        super().__init__(
+            f"required context exceeds limits: messages={required_messages}/{limits.max_context_messages}, "
+            f"chars={required_chars}/{limits.max_context_chars}"
+        )
+
+
+class ToolSchemaBudgetExceeded(ValueError):
+    """Canonical tool schemas exceed their independently configured size limit."""
+
+    def __init__(self, required_chars: int, limit_chars: int):
+        self.required_chars = required_chars
+        self.limit_chars = limit_chars
+        super().__init__(f"tool schemas exceed size limit: chars={required_chars}/{limit_chars}")
 
 
 # =============================================================================
@@ -267,14 +310,57 @@ class ConversationMemoryProvider(MemoryProvider):
 class DurableMemoryProvider(MemoryProvider):
     """Adapter from the persistent structured memory database to ContextEngine."""
 
-    def __init__(self, conversation_id: str):
+    def __init__(
+        self,
+        conversation_id: str,
+        *,
+        request_id: str | None = None,
+        domain=None,
+        owner_identity_ref: str | None = None,
+        mission_id: str | None = None,
+        agent_id: str | None = None,
+        minimum_confidence: float | None = None,
+    ):
         self.conversation_id = conversation_id
+        self.request_id = request_id
+        self.domain = domain
+        self.owner_identity_ref = owner_identity_ref
+        self.mission_id = mission_id
+        self.agent_id = agent_id
+        self.minimum_confidence = minimum_confidence
 
     def retrieve_relevant(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         from agent.memory import MemoryProvider as DurableProvider
         return [
-            {"id": item.memory_id, "content": item.content, "memory_type": item.memory_type.value, "trust_classification": item.trust_classification.value, "provenance": item.provenance}
-            for item in DurableProvider.get_relevant_memory(self.conversation_id, query=query, limit=limit)
+            {
+                "id": item.memory_id,
+                "content": item.content,
+                "memory_type": item.memory_type.value,
+                "trust_classification": item.trust_classification.value,
+                "provenance": item.provenance,
+                "content_hash": item.content_hash,
+                "domain": item.domain.value,
+                "request_id": item.request_id,
+                "source": item.source,
+                "owner_identity_ref": item.owner_identity_ref,
+                "mission_id": item.mission_id,
+                "agent_id": item.agent_id,
+                "scope": list(item.scope),
+                "confidence": item.confidence,
+                "sensitivity": item.sensitivity.value,
+                "validation_state": item.validation_state.value,
+            }
+            for item in DurableProvider.get_relevant_memory(
+                self.conversation_id,
+                query=query,
+                limit=limit,
+                request_id=self.request_id,
+                domain=self.domain,
+                owner_identity_ref=self.owner_identity_ref,
+                mission_id=self.mission_id,
+                agent_id=self.agent_id,
+                minimum_confidence=self.minimum_confidence,
+            )
         ]
 
     def available(self) -> bool:
@@ -405,6 +491,8 @@ class ContextBuilder:
         """Add tool definitions from registry."""
         from tools.registry import tool_definitions
         self.tool_definitions = tool_definitions()
+        tool_schema_chars = len(json.dumps(self.tool_definitions, ensure_ascii=False, separators=(",", ":")))
+        self.budget.add_fixed(tool_schema_chars)
         
         # Create a compact tool summary
         tool_list = []
@@ -420,15 +508,16 @@ class ContextBuilder:
             trust_level=TrustLevel.VALIDATED,
             metadata={"tool_count": len(tool_list), "priority": "medium"},
         )
-        self.items.append(item)
+        if self.budget.add_item(item.char_count()):
+            self.items.append(item)
         self.provenance.append({
             "source": "tools",
             "type": "registry",
             "trust": "validated",
             "count": len(tool_list),
             "chars": len(tools_content) + len("Available tools:\n"),
+            "schema_chars": tool_schema_chars,
         })
-        self.budget.add_item(len(tools_content) + 20, is_required=True)
         return self
     
     def add_conversation_history(
@@ -617,7 +706,103 @@ class ContextBuilder:
     
     def apply_deterministic_truncation(self) -> ContextBuilder:
         """Apply deterministic truncation when limits exceeded."""
-        if not self.budget.truncated and self.budget.current_chars <= self.runtime_limits.max_context_chars:
+        protected_sources = {
+            ContextSource.SYSTEM,
+            ContextSource.OWNER_POLICY,
+            ContextSource.SECURITY_CONTEXT,
+        }
+
+        def is_protected(item: ContextItem) -> bool:
+            return item.source in protected_sources or (
+                item.metadata.get("priority") == "highest" and item.source is not ContextSource.USER
+            )
+
+        def is_user_request(item: ContextItem) -> bool:
+            return item.source is ContextSource.USER or item.metadata.get("priority") == "highest_user"
+
+        protected_items = [item for item in self.items if is_protected(item)]
+        user_items = [item for item in self.items if is_user_request(item)]
+        protected_chars = sum(item.char_count() for item in protected_items)
+        required_messages = len(protected_items) + len(user_items)
+        required_original_chars = protected_chars + sum(item.char_count() for item in user_items)
+        if (
+            protected_chars > self.runtime_limits.max_context_chars
+            or required_messages > self.runtime_limits.max_context_messages
+        ):
+            self.budget.required_overflow = True
+            raise ContextBudgetExceeded(
+                required_messages=required_messages,
+                required_chars=required_original_chars,
+                limits=self.runtime_limits,
+            )
+
+        # Preserve the current request's prefix and a digest marker if it cannot fit;
+        # never silently drop it or pretend a partial request is the complete one.
+        remaining_chars = self.runtime_limits.max_context_chars - protected_chars
+        for index, item in enumerate(self.items):
+            if not is_user_request(item):
+                continue
+            if item.metadata.get("truncated"):
+                remaining_chars -= item.char_count()
+                continue
+            if item.char_count() <= remaining_chars:
+                remaining_chars -= item.char_count()
+                continue
+            digest = hashlib.sha256(item.content.encode("utf-8")).hexdigest()
+            marker = f"...[TRUNCATED sha256={digest}]"
+            if remaining_chars < len(marker):
+                self.budget.required_overflow = True
+                raise ContextBudgetExceeded(
+                    required_messages=required_messages,
+                    required_chars=required_original_chars,
+                    limits=self.runtime_limits,
+                )
+            content = item.content[: remaining_chars - len(marker)] + marker
+            self.items[index] = ContextItem(
+                role=item.role,
+                content=content,
+                source=item.source,
+                trust_level=item.trust_level,
+                metadata={**item.metadata, "truncated": True, "original_content_sha256": digest},
+            )
+            self.budget.record_truncation(0, item.char_count() - len(content))
+            self.provenance.append({
+                "source": "user",
+                "type": "request_truncated",
+                "original_content_sha256": digest,
+                "original_chars": item.char_count(),
+                "retained_chars": len(content),
+            })
+            remaining_chars = 0
+
+        required_sources = protected_sources | {ContextSource.USER}
+
+        def is_required(item: ContextItem) -> bool:
+            return item.metadata.get("priority") in {"highest", "highest_user"} or item.source in required_sources
+
+        required_items = [item for item in self.items if is_required(item)]
+        required_chars = sum(item.char_count() for item in required_items)
+        required_messages = len(required_items)
+        self.budget.required_overflow = (
+            required_chars > self.runtime_limits.max_context_chars
+            or required_messages > self.runtime_limits.max_context_messages
+        )
+        if self.budget.required_overflow:
+            raise ContextBudgetExceeded(
+                required_messages=required_messages,
+                required_chars=required_chars,
+                limits=self.runtime_limits,
+            )
+
+        actual_chars = sum(item.char_count() for item in self.items)
+        actual_messages = len(self.items)
+        self.budget.current_chars = actual_chars
+        self.budget.current_messages = actual_messages
+        if (
+            not self.budget.truncated
+            and actual_chars <= self.runtime_limits.max_context_chars
+            and actual_messages <= self.runtime_limits.max_context_messages
+        ):
             return self
         
         # Sort items by priority (highest first)
@@ -633,20 +818,8 @@ class ContextBuilder:
             ContextSource.KNOWLEDGE: 5,
         }
         
-        # Separate required and optional items
-        required_items = []
-        optional_items = []
-        
-        for item in self.items:
-            metadata = item.metadata
-            if metadata.get("priority") == "highest" or item.source in {
-                ContextSource.SYSTEM,
-                ContextSource.OWNER_POLICY,
-                ContextSource.SECURITY_CONTEXT,
-            }:
-                required_items.append(item)
-            else:
-                optional_items.append(item)
+        # Separate required and optional items; the live user request is never discarded.
+        optional_items = [item for item in self.items if not is_required(item)]
         
         # Sort optional items by priority (keep higher priority first)
         optional_items.sort(
@@ -659,29 +832,38 @@ class ContextBuilder:
         # Build new items list
         new_items = list(required_items)
         current_chars = sum(item.char_count() for item in required_items)
+        current_messages = len(required_items)
         chars_removed = 0
         messages_removed = 0
         
         # Add optional items until we hit the limit
         for item in optional_items:
             item_chars = item.char_count()
-            if current_chars + item_chars <= self.runtime_limits.max_context_chars:
+            if (
+                current_chars + item_chars <= self.runtime_limits.max_context_chars
+                and current_messages + 1 <= self.runtime_limits.max_context_messages
+            ):
                 new_items.append(item)
                 current_chars += item_chars
+                current_messages += 1
             else:
                 chars_removed += item_chars
                 messages_removed += 1
-        
+
+        self.items = new_items
+        self.budget.current_chars = current_chars
+        self.budget.current_messages = current_messages
         if messages_removed > 0 or chars_removed > 0:
             self.budget.record_truncation(messages_removed, chars_removed)
-            self.items = new_items
+        if self.budget.truncated and not self.budget.truncation_reported:
             self.provenance.append({
                 "source": "truncation",
                 "type": "deterministic",
-                "messages_removed": messages_removed,
-                "chars_removed": chars_removed,
+                "messages_removed": self.budget.messages_removed,
+                "chars_removed": self.budget.chars_removed,
             })
-        
+            self.budget.truncation_reported = True
+
         return self
     
     def deduplicate(self) -> ContextBuilder:
@@ -727,7 +909,12 @@ class ContextBuilder:
                     for m in messages
                 ],
                 "tools": [
-                    {"name": t["name"], "description_hash": hashlib.sha256(t["description"].encode()).hexdigest()}
+                    {
+                        "name": t["name"],
+                        "definition_sha256": hashlib.sha256(
+                            json.dumps(t, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest(),
+                    }
                     for t in self.tool_definitions
                 ],
                 "execution_state": {

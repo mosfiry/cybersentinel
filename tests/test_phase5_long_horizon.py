@@ -508,7 +508,7 @@ class TestPhase5C_ConversationMemory:
         assert item.source == "user"
         assert item.provenance == "user_message"
         assert item.content_hash is not None
-        assert len(item.content_hash) == 16
+        assert len(item.content_hash) == 64
     
     def test_memory_item_serialization(self):
         """Test MemoryItem serialization."""
@@ -820,9 +820,11 @@ class TestPhase5D_MemoryConsolidation:
         summary_items = [m for m in memory if m.memory_type == MemoryType.SUMMARY]
         assert len(summary_items) > 0
         
-        # Check that some messages were deleted
+        # Sources remain available for audit but are excluded from active context.
         recent_items = [m for m in memory if m.memory_type == MemoryType.RECENT]
-        assert len(recent_items) <= 50
+        assert len(recent_items) == 60
+        assert len(MemoryProvider.get_memory_by_conversation("conv-1", active_only=True)) <= 51
+        assert all(item.superseded_by for item in recent_items if item.memory_id in summary_items[0].metadata["source_ids"])
 
 
 # =============================================================================

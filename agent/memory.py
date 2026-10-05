@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from typing import Any
 # Database setup
 ROOT = Path(__file__).resolve().parents[1]
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", str(ROOT / "memory.sqlite3"))).expanduser()
+MEMORY_SCHEMA_VERSION = 4
 
 # Ensure database directory exists
 MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +61,19 @@ class MemoryDomain(Enum):
     TASK_STATE = "task_state"
 
 
+class MemorySensitivity(str, Enum):
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    SENSITIVE = "sensitive"
+
+
+class MemoryValidationState(str, Enum):
+    UNVERIFIED = "unverified"
+    PENDING_VALIDATION = "pending_validation"
+    VALIDATED = "validated"
+    REJECTED = "rejected"
+
+
 @dataclass(frozen=True)
 class MemoryItem:
     """Individual memory item with provenance."""
@@ -75,10 +90,18 @@ class MemoryItem:
     metadata: dict[str, Any] = field(default_factory=dict)
     domain: MemoryDomain = MemoryDomain.CONVERSATION
     request_id: str = ""
+    superseded_by: str | None = None
+    owner_identity_ref: str = ""
+    mission_id: str = ""
+    agent_id: str = ""
+    scope: tuple[str, ...] = ()
+    confidence: float = 0.0
+    sensitivity: MemorySensitivity = MemorySensitivity.INTERNAL
+    validation_state: MemoryValidationState = MemoryValidationState.UNVERIFIED
 
     def __post_init__(self) -> None:
         expected_hash = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
-        if not self.content_hash or not expected_hash.startswith(str(self.content_hash)):
+        if len(str(self.content_hash)) not in {16, 64} or not expected_hash.startswith(str(self.content_hash)):
             raise ValueError("memory_content_hash_mismatch")
         if self.trust_classification is TrustClassification.AUTHORITATIVE:
             raise ValueError("memory cannot be authoritative; Owner Policy is not memory")
@@ -86,6 +109,16 @@ class MemoryItem:
             raise ValueError("policy, authorization, scope, and evidence are separate stores")
         if str(self.metadata.get("classification", "")).casefold() in {"owner_policy", "authorization", "scope", "evidence"}:
             raise ValueError("memory metadata cannot claim policy, authorization, scope, or evidence authority")
+        if isinstance(self.confidence, bool) or not isinstance(self.confidence, (float, int)) or not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("memory confidence must be between 0 and 1")
+        object.__setattr__(self, "confidence", float(self.confidence))
+        object.__setattr__(self, "scope", tuple(str(value).strip() for value in self.scope))
+        if any(not value for value in self.scope) or len(set(self.scope)) != len(self.scope):
+            raise ValueError("memory scope values must be non-empty and unique")
+        if not isinstance(self.sensitivity, MemorySensitivity):
+            object.__setattr__(self, "sensitivity", MemorySensitivity(self.sensitivity))
+        if not isinstance(self.validation_state, MemoryValidationState):
+            object.__setattr__(self, "validation_state", MemoryValidationState(self.validation_state))
     
     @classmethod
     def create(
@@ -99,11 +132,18 @@ class MemoryItem:
         metadata: dict[str, Any] | None = None,
         domain: MemoryDomain = MemoryDomain.CONVERSATION,
         request_id: str = "",
+        owner_identity_ref: str = "",
+        mission_id: str = "",
+        agent_id: str = "",
+        scope: tuple[str, ...] | list[str] = (),
+        confidence: float = 0.0,
+        sensitivity: MemorySensitivity = MemorySensitivity.INTERNAL,
+        validation_state: MemoryValidationState = MemoryValidationState.UNVERIFIED,
     ) -> MemoryItem:
         """Create a new memory item."""
         import uuid
         now = datetime.now(timezone.utc).isoformat()
-        content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return cls(
             memory_id=uuid.uuid4().hex,
             conversation_id=conversation_id,
@@ -118,6 +158,13 @@ class MemoryItem:
             metadata=metadata or {},
             domain=domain,
             request_id=request_id,
+            owner_identity_ref=owner_identity_ref,
+            mission_id=mission_id,
+            agent_id=agent_id,
+            scope=tuple(scope),
+            confidence=confidence,
+            sensitivity=sensitivity,
+            validation_state=validation_state,
         )
     
     def to_dict(self) -> dict[str, Any]:
@@ -136,6 +183,14 @@ class MemoryItem:
             "metadata": self.metadata,
             "domain": self.domain.value,
             "request_id": self.request_id,
+            "superseded_by": self.superseded_by,
+            "owner_identity_ref": self.owner_identity_ref,
+            "mission_id": self.mission_id,
+            "agent_id": self.agent_id,
+            "scope": list(self.scope),
+            "confidence": self.confidence,
+            "sensitivity": self.sensitivity.value,
+            "validation_state": self.validation_state.value,
         }
     
     @classmethod
@@ -145,6 +200,15 @@ class MemoryItem:
         data["memory_type"] = MemoryType(data["memory_type"])
         data["trust_classification"] = TrustClassification(data["trust_classification"])
         data["domain"] = MemoryDomain(data.get("domain", MemoryDomain.CONVERSATION.value))
+        data.setdefault("request_id", "")
+        data.setdefault("superseded_by", None)
+        data.setdefault("owner_identity_ref", "")
+        data.setdefault("mission_id", "")
+        data.setdefault("agent_id", "")
+        data["scope"] = tuple(data.get("scope", ()))
+        data.setdefault("confidence", 0.0)
+        data["sensitivity"] = MemorySensitivity(data.get("sensitivity", MemorySensitivity.INTERNAL.value))
+        data["validation_state"] = MemoryValidationState(data.get("validation_state", MemoryValidationState.UNVERIFIED.value))
         return cls(**data)
 
 
@@ -164,43 +228,86 @@ def _get_memory_db():
 
 
 def _init_memory_db():
-    """Initialize memory database."""
-    with _get_memory_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memory_items (
-                memory_id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                memory_type TEXT NOT NULL,
-                trust_classification TEXT NOT NULL,
-                source TEXT NOT NULL,
-                provenance TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                metadata TEXT DEFAULT '{}'
-            )
-        """)
-        
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memory_conversation 
-            ON memory_items(conversation_id)
-        """)
-        
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memory_type 
-            ON memory_items(memory_type)
-        """)
-        
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memory_trust 
-            ON memory_items(trust_classification)
-        """)
-        
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memory_content_hash 
-            ON memory_items(content_hash)
-        """)
+    """Initialize and transactionally upgrade the memory database to v4."""
+    with _memory_lock:
+        with _get_memory_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memory_items (
+                    memory_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    memory_type TEXT NOT NULL,
+                    trust_classification TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    provenance TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    metadata TEXT DEFAULT '{}'
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memory_schema_versions (
+                    component TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL
+                )
+            """)
+            version_row = conn.execute(
+                "SELECT version FROM memory_schema_versions WHERE component='memory_items'"
+            ).fetchone()
+            if version_row is None:
+                # Databases without the registry predate v2; retain every row and
+                # treat their existing columns as the v1 baseline.
+                conn.execute(
+                    "INSERT INTO memory_schema_versions(component, version) VALUES('memory_items', 1)"
+                )
+                version = 1
+            else:
+                version = int(version_row[0])
+            if version > MEMORY_SCHEMA_VERSION:
+                raise RuntimeError(f"memory schema version {version} is newer than supported {MEMORY_SCHEMA_VERSION}")
+
+            while version < MEMORY_SCHEMA_VERSION:
+                columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_items)").fetchall()}
+                if version == 1:
+                    if "domain" not in columns:
+                        conn.execute("ALTER TABLE memory_items ADD COLUMN domain TEXT NOT NULL DEFAULT 'conversation'")
+                    if "request_id" not in columns:
+                        conn.execute("ALTER TABLE memory_items ADD COLUMN request_id TEXT NOT NULL DEFAULT ''")
+                    version = 2
+                elif version == 2:
+                    if "superseded_by" not in columns:
+                        conn.execute("ALTER TABLE memory_items ADD COLUMN superseded_by TEXT")
+                    version = 3
+                elif version == 3:
+                    additions = {
+                        "owner_identity_ref": "TEXT NOT NULL DEFAULT ''",
+                        "mission_id": "TEXT NOT NULL DEFAULT ''",
+                        "agent_id": "TEXT NOT NULL DEFAULT ''",
+                        "scope": "TEXT NOT NULL DEFAULT '[]'",
+                        "confidence": "REAL NOT NULL DEFAULT 0.0",
+                        "sensitivity": "TEXT NOT NULL DEFAULT 'internal'",
+                        "validation_state": "TEXT NOT NULL DEFAULT 'unverified'",
+                    }
+                    for name, declaration in additions.items():
+                        if name not in columns:
+                            conn.execute(f"ALTER TABLE memory_items ADD COLUMN {name} {declaration}")
+                    version = 4
+                else:
+                    raise RuntimeError(f"no memory migration registered from schema version {version}")
+                conn.execute(
+                    "UPDATE memory_schema_versions SET version=? WHERE component='memory_items'",
+                    (version,),
+                )
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_conversation ON memory_items(conversation_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_items(memory_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_trust ON memory_items(trust_classification)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_content_hash ON memory_items(content_hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_domain_request ON memory_items(domain, request_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_active ON memory_items(conversation_id, superseded_by)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_mission_agent ON memory_items(owner_identity_ref, mission_id, agent_id)")
 
 
 # Initialize database on module load
@@ -209,31 +316,57 @@ _init_memory_db()
 
 class MemoryProvider:
     """Provides hierarchical memory access for conversations."""
+
+    @staticmethod
+    def _insert_memory(conn: sqlite3.Connection, item: MemoryItem) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_items ("
+            "memory_id, conversation_id, content, memory_type, trust_classification, "
+            "source, provenance, content_hash, created_at, updated_at, metadata, "
+            "domain, request_id, superseded_by, owner_identity_ref, mission_id, agent_id, "
+            "scope, confidence, sensitivity, validation_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                item.memory_id, item.conversation_id, item.content, item.memory_type.value,
+                item.trust_classification.value, item.source, item.provenance, item.content_hash,
+                item.created_at, item.updated_at, json.dumps(item.metadata, ensure_ascii=False, sort_keys=True),
+                item.domain.value, item.request_id, item.superseded_by,
+                item.owner_identity_ref, item.mission_id, item.agent_id, json.dumps(list(item.scope)),
+                item.confidence, item.sensitivity.value, item.validation_state.value,
+            ),
+        )
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> MemoryItem:
+        return MemoryItem(
+            memory_id=row["memory_id"],
+            conversation_id=row["conversation_id"],
+            content=row["content"],
+            memory_type=MemoryType(row["memory_type"]),
+            trust_classification=TrustClassification(row["trust_classification"]),
+            source=row["source"],
+            provenance=row["provenance"],
+            content_hash=row["content_hash"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            metadata=json.loads(row["metadata"] or "{}"),
+            domain=MemoryDomain(row["domain"]),
+            request_id=str(row["request_id"] or ""),
+            superseded_by=row["superseded_by"],
+            owner_identity_ref=str(row["owner_identity_ref"] or ""),
+            mission_id=str(row["mission_id"] or ""),
+            agent_id=str(row["agent_id"] or ""),
+            scope=tuple(json.loads(row["scope"] or "[]")),
+            confidence=float(row["confidence"] or 0.0),
+            sensitivity=MemorySensitivity(row["sensitivity"]),
+            validation_state=MemoryValidationState(row["validation_state"]),
+        )
     
     @staticmethod
     def store_memory(item: MemoryItem) -> None:
         """Store a memory item."""
         with _memory_lock:
             with _get_memory_db() as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO memory_items (
-                        memory_id, conversation_id, content, memory_type,
-                        trust_classification, source, provenance, content_hash,
-                        created_at, updated_at, metadata
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    item.memory_id,
-                    item.conversation_id,
-                    item.content,
-                    item.memory_type.value,
-                    item.trust_classification.value,
-                    item.source,
-                    item.provenance,
-                    item.content_hash,
-                    item.created_at,
-                    item.updated_at,
-                    json.dumps(item.metadata),
-                ))
+                MemoryProvider._insert_memory(conn, item)
     
     @staticmethod
     def get_memory_item(memory_id: str) -> MemoryItem | None:
@@ -246,93 +379,103 @@ class MemoryProvider:
             if row is None:
                 return None
             
-            return MemoryItem(
-                memory_id=row["memory_id"],
-                conversation_id=row["conversation_id"],
-                content=row["content"],
-                memory_type=MemoryType(row["memory_type"]),
-                trust_classification=TrustClassification(row["trust_classification"]),
-                source=row["source"],
-                provenance=row["provenance"],
-                content_hash=row["content_hash"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-                metadata=json.loads(row["metadata"]),
-            )
+            return MemoryProvider._from_row(row)
     
     @staticmethod
-    def get_memory_by_conversation(conversation_id: str) -> list[MemoryItem]:
+    def get_memory_by_conversation(
+        conversation_id: str,
+        *,
+        active_only: bool = False,
+        domain: MemoryDomain | str | None = None,
+        request_id: str | None = None,
+        trust_classification: TrustClassification | str | None = None,
+        owner_identity_ref: str | None = None,
+        mission_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> list[MemoryItem]:
         """Get all memory items for a conversation."""
         with _get_memory_db() as conn:
+            clauses = ["conversation_id = ?"]
+            values: list[Any] = [conversation_id]
+            if active_only:
+                clauses.append("superseded_by IS NULL")
+            if domain is not None:
+                clauses.append("domain = ?")
+                values.append(domain.value if isinstance(domain, MemoryDomain) else str(domain))
+            if request_id is not None:
+                clauses.append("request_id = ?")
+                values.append(str(request_id))
+            if trust_classification is not None:
+                clauses.append("trust_classification = ?")
+                values.append(trust_classification.value if isinstance(trust_classification, TrustClassification) else str(trust_classification))
+            for name, value in (("owner_identity_ref", owner_identity_ref), ("mission_id", mission_id), ("agent_id", agent_id)):
+                if value is not None:
+                    clauses.append(name + " = ?")
+                    values.append(str(value))
             rows = conn.execute(
-                "SELECT * FROM memory_items WHERE conversation_id = ? ORDER BY created_at DESC",
-                (conversation_id,)
+                "SELECT * FROM memory_items WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC",
+                values,
             ).fetchall()
-            
-            return [
-                MemoryItem(
-                    memory_id=row["memory_id"],
-                    conversation_id=row["conversation_id"],
-                    content=row["content"],
-                    memory_type=MemoryType(row["memory_type"]),
-                    trust_classification=TrustClassification(row["trust_classification"]),
-                    source=row["source"],
-                    provenance=row["provenance"],
-                    content_hash=row["content_hash"],
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
-                    metadata=json.loads(row["metadata"]),
-                )
-                for row in rows
-            ]
+            return [MemoryProvider._from_row(row) for row in rows]
     
     @staticmethod
     def get_memory_by_type(
-        conversation_id: str, 
-        memory_type: MemoryType
+        conversation_id: str,
+        memory_type: MemoryType,
+        *,
+        active_only: bool = False,
+        domain: MemoryDomain | str | None = None,
+        request_id: str | None = None,
+        owner_identity_ref: str | None = None,
+        mission_id: str | None = None,
+        agent_id: str | None = None,
     ) -> list[MemoryItem]:
         """Get memory items by type for a conversation."""
         with _get_memory_db() as conn:
+            clauses = ["conversation_id = ?", "memory_type = ?"]
+            values: list[Any] = [conversation_id, memory_type.value]
+            if active_only:
+                clauses.append("superseded_by IS NULL")
+            if domain is not None:
+                clauses.append("domain = ?")
+                values.append(domain.value if isinstance(domain, MemoryDomain) else str(domain))
+            if request_id is not None:
+                clauses.append("request_id = ?")
+                values.append(str(request_id))
+            for name, value in (("owner_identity_ref", owner_identity_ref), ("mission_id", mission_id), ("agent_id", agent_id)):
+                if value is not None:
+                    clauses.append(name + " = ?")
+                    values.append(str(value))
             rows = conn.execute(
-                "SELECT * FROM memory_items WHERE conversation_id = ? AND memory_type = ? "
-                "ORDER BY created_at DESC",
-                (conversation_id, memory_type.value)
+                "SELECT * FROM memory_items WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC",
+                values,
             ).fetchall()
-            
-            return [
-                MemoryItem(
-                    memory_id=row["memory_id"],
-                    conversation_id=row["conversation_id"],
-                    content=row["content"],
-                    memory_type=MemoryType(row["memory_type"]),
-                    trust_classification=TrustClassification(row["trust_classification"]),
-                    source=row["source"],
-                    provenance=row["provenance"],
-                    content_hash=row["content_hash"],
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
-                    metadata=json.loads(row["metadata"]),
-                )
-                for row in rows
-            ]
+            return [MemoryProvider._from_row(row) for row in rows]
     
     @staticmethod
     def get_relevant_memory(
         conversation_id: str,
         query: str | None = None,
         limit: int = 20,
+        *,
+        domain: MemoryDomain | str | None = None,
+        request_id: str | None = None,
+        trust_classification: TrustClassification | str | None = None,
+        owner_identity_ref: str | None = None,
+        mission_id: str | None = None,
+        agent_id: str | None = None,
+        minimum_confidence: float | None = None,
     ) -> list[MemoryItem]:
-        """Get relevant memory items for context building.
-        
-        Priority order:
-        1. Active objectives
-        2. Unresolved questions
-        3. Recent messages
-        4. Decisions
-        5. Facts
-        6. Tool results
-        7. Investigations
-        """
+        """Retrieve active, conversation-scoped memory using lexical relevance and priority."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 1000:
+            raise ValueError("limit must be between 0 and 1000")
+        if limit == 0:
+            return []
+        if minimum_confidence is not None and (
+            isinstance(minimum_confidence, bool) or not isinstance(minimum_confidence, (int, float))
+            or not 0.0 <= float(minimum_confidence) <= 1.0
+        ):
+            raise ValueError("minimum_confidence must be between 0 and 1")
         # Define priority order for memory types
         priority_order = [
             MemoryType.ACTIVE_OBJECTIVE,
@@ -348,20 +491,36 @@ class MemoryProvider:
             MemoryType.REASONING_CASE,
         ]
         
-        # Get all memory for conversation
-        all_memory = MemoryProvider.get_memory_by_conversation(conversation_id)
-        
-        # Sort by priority, then by recency
-        def sort_key(item: MemoryItem) -> tuple[int, str]:
+        all_memory = MemoryProvider.get_memory_by_conversation(
+            conversation_id,
+            active_only=True,
+            domain=domain,
+            request_id=request_id,
+            trust_classification=trust_classification,
+            owner_identity_ref=owner_identity_ref,
+            mission_id=mission_id,
+            agent_id=agent_id,
+        )
+        if minimum_confidence is not None:
+            all_memory = [item for item in all_memory if item.confidence >= float(minimum_confidence)]
+        query_terms = set(re.findall(r"\w+", str(query or "").casefold()))
+
+        def sort_key(item: MemoryItem) -> tuple[float, float, int, float]:
             try:
                 priority = priority_order.index(item.memory_type)
             except ValueError:
                 priority = len(priority_order)
-            return (priority, item.updated_at)
-        
+            item_terms = set(re.findall(r"\w+", item.content.casefold()))
+            relevance = len(query_terms & item_terms) / len(query_terms) if query_terms else 0.0
+            try:
+                recency = datetime.fromisoformat(item.updated_at.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                recency = 0.0
+            if query_terms:
+                return (-relevance, -item.confidence, priority, -recency)
+            return (0.0, float(priority), -int(item.confidence * 1000), -recency)
+
         sorted_memory = sorted(all_memory, key=sort_key)
-        
-        # Return top N items
         return sorted_memory[:limit]
     
     @staticmethod
@@ -414,6 +573,15 @@ class ConversationMemory:
         provenance: str = "user_message",
         trust_classification: TrustClassification = TrustClassification.UNTRUSTED_DATA,
         metadata: dict[str, Any] | None = None,
+        domain: MemoryDomain = MemoryDomain.CONVERSATION,
+        request_id: str = "",
+        owner_identity_ref: str = "",
+        mission_id: str = "",
+        agent_id: str = "",
+        scope: tuple[str, ...] | list[str] = (),
+        confidence: float = 0.0,
+        sensitivity: MemorySensitivity = MemorySensitivity.INTERNAL,
+        validation_state: MemoryValidationState = MemoryValidationState.UNVERIFIED,
     ) -> MemoryItem:
         """Store conversation memory with proper classification."""
         item = MemoryItem.create(
@@ -424,6 +592,15 @@ class ConversationMemory:
             source=source,
             provenance=provenance,
             metadata=metadata,
+            domain=domain,
+            request_id=request_id,
+            owner_identity_ref=owner_identity_ref,
+            mission_id=mission_id,
+            agent_id=agent_id,
+            scope=tuple(scope),
+            confidence=confidence,
+            sensitivity=sensitivity,
+            validation_state=validation_state,
         )
         MemoryProvider.store_memory(item)
         return item
@@ -433,6 +610,13 @@ class ConversationMemory:
         conversation_id: str,
         current_user_message: str,
         limit: int = 50,
+        *,
+        domain: MemoryDomain | str | None = None,
+        request_id: str | None = None,
+        owner_identity_ref: str | None = None,
+        mission_id: str | None = None,
+        agent_id: str | None = None,
+        minimum_confidence: float | None = None,
     ) -> list[dict[str, Any]]:
         """Build hierarchical context from memory.
         
@@ -448,7 +632,17 @@ class ConversationMemory:
         recent_messages = conversation_messages(conversation_id)
         
         # Get relevant memory
-        relevant_memory = MemoryProvider.get_relevant_memory(conversation_id, limit=limit)
+        relevant_memory = MemoryProvider.get_relevant_memory(
+            conversation_id,
+            query=current_user_message,
+            limit=limit,
+            domain=domain,
+            request_id=request_id,
+            owner_identity_ref=owner_identity_ref,
+            mission_id=mission_id,
+            agent_id=agent_id,
+            minimum_confidence=minimum_confidence,
+        )
         
         # Build context items
         context_items = []
@@ -493,6 +687,16 @@ class ConversationMemory:
                 "trust_level": memory_item.trust_classification.value,
                 "memory_id": memory_item.memory_id,
                 "provenance": memory_item.provenance,
+                "content_hash": memory_item.content_hash,
+                "domain": memory_item.domain.value,
+                "request_id": memory_item.request_id,
+                "owner_identity_ref": memory_item.owner_identity_ref,
+                "mission_id": memory_item.mission_id,
+                "agent_id": memory_item.agent_id,
+                "scope": list(memory_item.scope),
+                "confidence": memory_item.confidence,
+                "sensitivity": memory_item.sensitivity.value,
+                "validation_state": memory_item.validation_state.value,
             })
         
         return context_items
@@ -502,59 +706,89 @@ class ConversationMemory:
         conversation_id: str,
         max_items: int = 100,
     ) -> dict[str, Any]:
-        """Consolidate memory when context pressure is detected.
-        
-        This method:
-        1. Detects if conversation has too many items
-        2. Summarizes old conversation deterministically
-        3. Preserves important facts, decisions, unresolved objectives
-        4. Preserves evidence references
-        5. Hashes and provenance tracks all memory artifacts
-        """
-        # Get all memory for conversation
-        all_memory = MemoryProvider.get_memory_by_conversation(conversation_id)
-        
-        if len(all_memory) <= max_items:
-            return {"consolidated": False, "actions_taken": []}
-        
-        # Separate by type
-        recent_messages = [m for m in all_memory if m.memory_type == MemoryType.RECENT]
-        summaries = [m for m in all_memory if m.memory_type == MemoryType.SUMMARY]
-        facts = [m for m in all_memory if m.memory_type == MemoryType.FACT]
-        decisions = [m for m in all_memory if m.memory_type == MemoryType.DECISION]
-        objectives = [m for m in all_memory if m.memory_type == MemoryType.ACTIVE_OBJECTIVE]
-        questions = [m for m in all_memory if m.memory_type == MemoryType.UNRESOLVED_QUESTION]
-        tool_results = [m for m in all_memory if m.memory_type == MemoryType.TOOL_RESULT]
-        investigations = [m for m in all_memory if m.memory_type == MemoryType.INVESTIGATION]
-        
-        actions_taken = []
-        
-        # If we have too many recent messages, create a summary
-        if len(recent_messages) > 50:
-            # Combine older recent messages into a summary
-            older_messages = recent_messages[50:]
-            summary_content = "\n".join([m.content for m in older_messages])
-            summary_hash = hashlib.sha256(summary_content.encode('utf-8')).hexdigest()[:16]
-            
-            summary_item = MemoryItem.create(
+        """Compact old conversation excerpts atomically without deleting sources."""
+        if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items < 0:
+            raise ValueError("max_items must be a non-negative integer")
+        active = MemoryProvider.get_memory_by_conversation(conversation_id, active_only=True)
+        if len(active) <= max_items:
+            return {"consolidated": False, "actions_taken": [], "remaining_memory_count": len(active)}
+
+        groups: dict[tuple[str, str, str, MemoryDomain, str, tuple[str, ...], MemorySensitivity], list[MemoryItem]] = {}
+        for item in active:
+            if item.memory_type is MemoryType.RECENT:
+                key = (
+                    item.owner_identity_ref, item.mission_id, item.agent_id, item.domain,
+                    item.request_id, item.scope, item.sensitivity,
+                )
+                groups.setdefault(key, []).append(item)
+
+        summaries: list[MemoryItem] = []
+        summary_sources: list[tuple[MemoryItem, list[str]]] = []
+        for (owner_identity_ref, mission_id, agent_id, domain, request_id, scope, sensitivity), messages in groups.items():
+            if len(messages) <= 50:
+                continue
+            older_messages = messages[50:]  # source query is newest-first
+            source_ids = [item.memory_id for item in older_messages]
+            source_hashes = [item.content_hash for item in older_messages]
+            manifest = [{"memory_id": item.memory_id, "content_hash": item.content_hash} for item in older_messages]
+            source_digest = hashlib.sha256(
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            lines = ["[DETERMINISTIC EXTRACTIVE SUMMARY — UNTRUSTED DATA]"]
+            used = len(lines[0])
+            for item in reversed(older_messages):
+                excerpt = " ".join(item.content.split())
+                line = f"- {excerpt[:320]}"
+                if used + len(line) + 1 > 4096:
+                    lines.append("- [remaining source content retained in superseded memory records]")
+                    break
+                lines.append(line)
+                used += len(line) + 1
+            summary = MemoryItem.create(
                 conversation_id=conversation_id,
-                content=f"[SUMMARY {summary_hash}] Previous conversation summary",
+                content="\n".join(lines),
                 memory_type=MemoryType.SUMMARY,
                 trust_classification=TrustClassification.UNTRUSTED_DATA,
                 source="memory_consolidation",
-                provenance=f"consolidated_from_{len(older_messages)}_messages",
-                metadata={"original_hashes": [m.content_hash for m in older_messages]},
+                provenance=f"extractive_compaction_v1:{source_digest}",
+                metadata={
+                    "summary_algorithm": "extractive_compaction_v1",
+                    "source_count": len(older_messages),
+                    "source_ids": source_ids,
+                    "source_hashes": source_hashes,
+                    "source_manifest_sha256": source_digest,
+                },
+                domain=domain,
+                request_id=request_id,
+                owner_identity_ref=owner_identity_ref,
+                mission_id=mission_id,
+                agent_id=agent_id,
+                scope=scope,
+                confidence=min((item.confidence for item in older_messages), default=0.0),
+                sensitivity=sensitivity,
+                validation_state=MemoryValidationState.UNVERIFIED,
             )
-            MemoryProvider.store_memory(summary_item)
-            actions_taken.append(f"created_summary_from_{len(older_messages)}_messages")
-            
-            # Delete the consolidated messages
-            for msg in older_messages:
-                MemoryProvider.delete_memory(msg.memory_id)
-                actions_taken.append(f"deleted_message_{msg.memory_id}")
-        
+            summaries.append(summary)
+            summary_sources.append((summary, source_ids))
+
+        if summaries:
+            with _memory_lock:
+                with _get_memory_db() as conn:
+                    for summary, source_ids in summary_sources:
+                        MemoryProvider._insert_memory(conn, summary)
+                        before = conn.total_changes
+                        conn.executemany(
+                            "UPDATE memory_items SET superseded_by=? WHERE conversation_id=? AND memory_id=? AND superseded_by IS NULL",
+                            [(summary.memory_id, conversation_id, memory_id) for memory_id in source_ids],
+                        )
+                        changed = conn.total_changes - before
+                        if changed != len(source_ids):
+                            raise RuntimeError("memory consolidation source set changed; transaction rolled back")
+
+        actions = [f"created_summary:{item.memory_id}:sources={item.metadata['source_count']}" for item in summaries]
         return {
-            "consolidated": True,
-            "actions_taken": actions_taken,
-            "remaining_memory_count": len(MemoryProvider.get_memory_by_conversation(conversation_id)),
+            "consolidated": bool(summaries),
+            "actions_taken": actions,
+            "summary_ids": [item.memory_id for item in summaries],
+            "remaining_memory_count": len(MemoryProvider.get_memory_by_conversation(conversation_id, active_only=True)),
         }
