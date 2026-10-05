@@ -16,6 +16,10 @@ Planning retrieval is limited to the exact canonical Owner and exact hashed Owne
 
 Every retrieved record remains in a separate user-data message prefixed `[UNTRUSTED_MEMORY][NO_AUTHORITY]`; internal provenance and score parts remain metadata. The MemoryLayer view maps existing v4 types to working, episodic, or semantic layers without a schema migration. Procedural Skills remain in the distinct Owner-approved declarative SkillRegistry and are never executed from memory. This is a narrow episodic retrieval slice: automatic semantic fact extraction/consolidation, vector search, live MissionContext restart hydration, provider-token accounting, and Windows acceptance remain open.
 
+## Memory-poisoning boundary
+
+`MemoryProvider.store_untrusted_candidate` rejects external webpage and document bodies; those remain bounded, untrusted evidence, not durable memory. Its only supported candidate source is agent output, stored with `UNTRUSTED_DATA`, `PENDING_VALIDATION`, zero confidence, an 8 KiB body cap, obvious credential redaction, and deterministic idempotency. Both strict scoped retrieval and legacy conversation retrieval exclude pending or rejected records, so an unreviewed fabricated fact is not prompt context. No candidate validation/promotion workflow is implemented. If hostile content exists in older/unverified records, `ContextEngine` still exposes it only as `[UNTRUSTED_MEMORY][NO_AUTHORITY]` user data; this is an authority boundary, not a guarantee that a model cannot be influenced by text. Adversarial P8 tests cover malicious web/document attempts, fabricated agent output, redaction, size limits, quarantine, and inert role projection.
+
 ## Context limits
 
 `ContextBudget` separately bounds messages and canonical tool-schema JSON. It retains system, Owner-policy, security, and the current user request as required content. If those protected instructions cannot fit, `ContextBudgetExceeded` fails closed. Oversized user text is shortened only with a visible marker containing the SHA-256 of the full original text; optional history, memory, tool summaries, and other context are dropped deterministically under the remaining budget.

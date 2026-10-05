@@ -14,7 +14,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -81,6 +81,12 @@ class MemoryLayer(str, Enum):
     EPISODIC = "episodic"
     SEMANTIC = "semantic"
     PROCEDURAL = "procedural"
+
+
+class MemoryCandidateSource(str, Enum):
+    EXTERNAL_WEBPAGE = "external_webpage"
+    EXTERNAL_DOCUMENT = "external_document"
+    AGENT_OUTPUT = "agent_output"
 
 
 @dataclass(frozen=True)
@@ -431,6 +437,78 @@ class MemoryProvider:
                 return existing
 
     @staticmethod
+    def store_untrusted_candidate(
+        *,
+        content: str,
+        source_kind: MemoryCandidateSource | str,
+        source_digest: str,
+        owner_identity_ref: str,
+        mission_id: str,
+        scope: tuple[str, ...] | list[str],
+        agent_id: str = "mission-coordinator",
+        request_id: str = "",
+    ) -> MemoryItem:
+        """Store an agent output only as a pending, non-retrievable candidate.
+
+        External webpage/document bodies stay in fenced evidence and cannot be
+        promoted into durable memory through this ingestion path.
+        """
+        try:
+            source = source_kind if isinstance(source_kind, MemoryCandidateSource) else MemoryCandidateSource(str(source_kind))
+        except ValueError as exc:
+            raise ValueError("memory_candidate_source_invalid") from exc
+        if source is not MemoryCandidateSource.AGENT_OUTPUT:
+            raise ValueError("external_material_remains_fenced_evidence")
+        owner = str(owner_identity_ref).strip()
+        mission = str(mission_id).strip()
+        agent = str(agent_id).strip()
+        request = str(request_id).strip()
+        scope_values = tuple(str(value).strip() for value in scope)
+        digest = str(source_digest).strip().lower()
+        if digest.startswith("sha256:"):
+            digest = digest[7:]
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("memory_candidate_provenance_required")
+        if not re.fullmatch(r"owner:[1-9][0-9]*", owner) or not mission or len(mission) > 256:
+            raise ValueError("memory_candidate_owner_mission_required")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent) or len(request) > 128:
+            raise ValueError("memory_candidate_identity_invalid")
+        if len(scope_values) != 1 or not re.fullmatch(r"owner_scope_sha256:[0-9a-f]{64}", scope_values[0]):
+            raise ValueError("memory_candidate_scope_required")
+        if not isinstance(content, str) or not content.strip() or "\x00" in content:
+            raise ValueError("memory_candidate_content_invalid")
+        # Strip obvious credential forms before persistence; prompt-like prose
+        # remains untrusted and pending rather than being silently rewritten as truth.
+        safe_content = re.sub(r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]", content)
+        safe_content = re.sub(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}", r"\1[REDACTED]", safe_content)
+        safe_content = re.sub(r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]{4,}", r"\1=[REDACTED]", safe_content)
+        if len(safe_content.encode("utf-8")) > 8192:
+            raise ValueError("memory_candidate_content_too_large")
+
+        item = MemoryItem.create(
+            conversation_id="memory-candidate:" + hashlib.sha256(f"{owner}\0{mission}".encode("utf-8")).hexdigest(),
+            content=safe_content,
+            memory_type=MemoryType.REASONING_CASE,
+            trust_classification=TrustClassification.UNTRUSTED_DATA,
+            source=source.value,
+            provenance=f"sha256:{digest}",
+            metadata={"record_type": "UNTRUSTED_MEMORY_CANDIDATE", "candidate_source": source.value, "source_digest": digest},
+            domain=MemoryDomain.LEARNING,
+            request_id=request,
+            owner_identity_ref=owner,
+            mission_id=mission,
+            agent_id=agent,
+            scope=scope_values,
+            confidence=0.0,
+            sensitivity=MemorySensitivity.INTERNAL,
+            validation_state=MemoryValidationState.PENDING_VALIDATION,
+        )
+        memory_id = hashlib.sha256(
+            f"memory-candidate-v1\0{owner}\0{mission}\0{agent}\0{scope_values[0]}\0{digest}\0{item.content_hash}".encode("utf-8")
+        ).hexdigest()
+        return MemoryProvider.store_idempotent_memory(replace(item, memory_id=memory_id))
+
+    @staticmethod
     def get_specialist_memory_item(
         *,
         memory_id: str,
@@ -650,6 +728,10 @@ class MemoryProvider:
             mission_id=mission_id,
             agent_id=agent_id,
         )
+        all_memory = [
+            item for item in all_memory
+            if item.validation_state not in {MemoryValidationState.PENDING_VALIDATION, MemoryValidationState.REJECTED}
+        ]
         if minimum_confidence is not None:
             all_memory = [item for item in all_memory if item.confidence >= float(minimum_confidence)]
         query_terms = set(re.findall(r"\w+", str(query or "").casefold()))
@@ -715,10 +797,10 @@ class MemoryProvider:
         scope_json = json.dumps(list(canonical_scope), ensure_ascii=False)
         clauses = [
             "owner_identity_ref = ?", "scope = ?", "superseded_by IS NULL",
-            "sensitivity != ?", "validation_state != ?",
+            "sensitivity != ?", "validation_state NOT IN (?, ?)",
             "length(CAST(content AS BLOB)) <= 8192", "length(metadata) <= 8192",
         ]
-        values: list[Any] = [owner, scope_json, MemorySensitivity.SENSITIVE.value, MemoryValidationState.REJECTED.value]
+        values: list[Any] = [owner, scope_json, MemorySensitivity.SENSITIVE.value, MemoryValidationState.REJECTED.value, MemoryValidationState.PENDING_VALIDATION.value]
         if domain_value is not None:
             clauses.append("domain = ?")
             values.append(domain_value)
