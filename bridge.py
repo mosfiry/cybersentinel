@@ -1124,6 +1124,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "authenticated": False}, headers={
                 "Set-Cookie": self._public_owner_cookie_header("", 0)
             })
+        if path == "/api/public/skills/mission-analysis":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict) or set(payload) != {"mission_id"}:
+                    raise ValueError("invalid_mission_analysis_request")
+                analysis = self._skill_service().analyze_mission(
+                    owner["session_token"],
+                    payload["mission_id"],
+                )
+                return self._send(200, {"ok": True, "analysis": analysis})
+            except (PermissionError, KeyError):
+                # Do not distinguish a foreign Mission from an unknown ID.
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
         if path == "/api/public/skills/candidates":
             owner = self._public_mission_owner(csrf=True)
             if owner is None:

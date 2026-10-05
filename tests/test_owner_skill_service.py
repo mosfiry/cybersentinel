@@ -8,11 +8,12 @@ from api.missions import MissionService
 from api.skills import OwnerSkillService
 from agent.agent_core import AgentCore
 from agent.intelligence_layer.skills import SkillAuthorizationError, SkillCondition, SkillDefinition, SkillError, SkillStep, SkillTestCase
-from agent.mission import MissionStore
+from agent.mission import Mission, MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue
 from agent.model_router import ModelRouter
 from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
+from agent.trajectory import EventType
 from owner_session_testutils import allow_owner_sessions, persist_canonical_scope, workspace_scope_context
 
 
@@ -101,6 +102,170 @@ def _completed_mission(tmp_path: Path, monkeypatch):
     return service, mission, store
 
 
+def test_owner_skill_outcome_analysis_exposes_only_verified_safe_summary(tmp_path, monkeypatch):
+    service, mission, _store = _completed_mission(tmp_path, monkeypatch)
+    analysis = service.analyze_mission("valid-owner", mission.mission_id)
+
+    assert analysis["analysis_version"] == 1
+    assert analysis["status"] == "GOAL_COMPLETED"
+    assert analysis["outcome_class"] == "verified_success"
+    assert analysis["verified"] is True
+    assert analysis["completed_tool_sequence"] == ["run_project_tests"]
+    assert analysis["evidence_count"] >= 1
+    assert analysis["candidate_seed_eligible"] is True
+    assert analysis["reason_code"] == "ready_for_owner_authored_candidate"
+    assert len(analysis["analysis_digest"]) == 64
+    assert set(analysis) == {
+        "analysis_version", "status", "outcome_class", "verified", "completed_tool_sequence",
+        "failure_classes", "evidence_count", "candidate_seed_eligible", "reason_code", "analysis_digest",
+    }
+    assert mission.owner_request not in str(analysis)
+    assert "owner-project" not in str(analysis)
+    assert service.registry.list_owner_revisions("owner:1") == []
+
+
+def test_owner_skill_outcome_analysis_requires_verified_completion_trajectory(tmp_path, monkeypatch):
+    service, mission, _store = _completed_mission(tmp_path, monkeypatch)
+    mission.trajectory = []
+    mission.emit(EventType.MISSION_STARTED)
+    mission.emit(EventType.PLAN_CREATED)
+    mission.integrity_hash = mission.to_dict()["integrity_hash"]
+
+    def authorized(mission_id, owner_session_token):
+        assert mission_id == mission.mission_id
+        assert owner_session_token == "valid-owner"
+        return mission, "owner:1"
+
+    monkeypatch.setattr(service.mission_service, "load_authorized_mission", authorized)
+    analysis = service.analyze_mission("valid-owner", mission.mission_id)
+    assert analysis["outcome_class"] == "verified_success"
+    assert analysis["verified"] is True
+    assert analysis["candidate_seed_eligible"] is False
+    assert analysis["reason_code"] == "completion_trajectory_not_qualified"
+    assert analysis["evidence_count"] == 0
+
+
+def test_owner_skill_outcome_analysis_rejects_out_of_order_completion_trajectory(tmp_path, monkeypatch):
+    service, mission, _store = _completed_mission(tmp_path, monkeypatch)
+    mission.trajectory = []
+    mission.emit(EventType.GOAL_VERIFIED)
+    mission.emit(EventType.MISSION_STARTED)
+    mission.emit(EventType.MISSION_COMPLETED)
+    mission.integrity_hash = mission.to_dict()["integrity_hash"]
+
+    def authorized(mission_id, owner_session_token):
+        assert mission_id == mission.mission_id
+        assert owner_session_token == "valid-owner"
+        return mission, "owner:1"
+
+    monkeypatch.setattr(service.mission_service, "load_authorized_mission", authorized)
+    analysis = service.analyze_mission("valid-owner", mission.mission_id)
+    assert analysis["verified"] is True
+    assert analysis["candidate_seed_eligible"] is False
+    assert analysis["reason_code"] == "completion_trajectory_not_qualified"
+    assert analysis["evidence_count"] == 0
+
+
+def test_owner_skill_outcome_analysis_classifies_failure_without_candidate_eligibility(tmp_path, monkeypatch):
+    service, mission, _store = _completed_mission(tmp_path, monkeypatch)
+    failed = Mission.create(
+        mission.owner_request,
+        mission.objective,
+        mission.plan,
+        mission_id=mission.mission_id,
+        request_id=mission.request_id,
+        owner_identity_ref=mission.owner_identity_ref,
+        authorization_snapshot=mission.authorization_snapshot,
+        scope_snapshot=mission.scope_snapshot,
+        provenance=mission.provenance,
+    )
+    failed.transition(MissionStatus.RUNNING, "test worker started")
+    failed.failures = [{"class": "TIMEOUT"}, {"class": "<script>"}]
+    failed.emit(EventType.FAILURE_DETECTED, data={"failure_class": "TIMEOUT"})
+    failed.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, "retry limit reached")
+    failed.integrity_hash = failed.to_dict()["integrity_hash"]
+
+    def authorized(mission_id, owner_session_token):
+        assert mission_id == failed.mission_id
+        assert owner_session_token == "valid-owner"
+        return failed, "owner:1"
+
+    monkeypatch.setattr(service.mission_service, "load_authorized_mission", authorized)
+    analysis = service.analyze_mission("valid-owner", failed.mission_id)
+    assert analysis["status"] == "FAILED_RETRY_EXHAUSTED"
+    assert analysis["outcome_class"] == "failed"
+    assert analysis["verified"] is False
+    assert analysis["candidate_seed_eligible"] is False
+    assert analysis["reason_code"] == "mission_failed"
+    assert analysis["failure_classes"] == ["TIMEOUT"]
+    assert analysis["completed_tool_sequence"] == []
+    assert "<script>" not in str(analysis)
+    assert service.registry.list_owner_revisions("owner:1") == []
+
+
+def test_owner_skill_outcome_analysis_rejects_mission_integrity_tampering(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    service, mission, store = _completed_mission(tmp_path, monkeypatch)
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute("SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()
+        payload = json.loads(row[0])
+        payload["objective"] = "tampered objective"
+        conn.execute(
+            "UPDATE missions SET payload=? WHERE mission_id=?",
+            (json.dumps(payload, ensure_ascii=False), mission.mission_id),
+        )
+    with pytest.raises(ValueError, match="mission_integrity_invalid"):
+        service.analyze_mission("valid-owner", mission.mission_id)
+
+
+def test_owner_skill_outcome_analysis_obeys_bounded_mission_payload_load(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+    import api.missions as missions_api
+
+    service, mission, store = _completed_mission(tmp_path, monkeypatch)
+    monkeypatch.setattr(missions_api, "MAX_OBSERVABILITY_MISSION_BYTES", 512)
+    oversized = {
+        "mission_id": mission.mission_id,
+        "owner_identity_ref": "owner:1",
+        "padding": "x" * 1024,
+    }
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE missions SET payload=? WHERE mission_id=?",
+            (json.dumps(oversized), mission.mission_id),
+        )
+    with pytest.raises(ValueError, match="mission_observability_too_large"):
+        service.analyze_mission("valid-owner", mission.mission_id)
+
+
+def test_owner_skill_outcome_analysis_rejects_tampered_evidence_for_seed_eligibility(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    service, mission, store = _completed_mission(tmp_path, monkeypatch)
+    assert service.analyze_mission("valid-owner", mission.mission_id)["candidate_seed_eligible"] is True
+    evidence_db = Path(store.db_path).with_name("evidence_chain.db")
+    with sqlite3.connect(evidence_db) as db:
+        row = db.execute("SELECT payload FROM evidence_chain ORDER BY sequence LIMIT 1").fetchone()
+        assert row is not None
+        record = json.loads(row[0])
+        record["claim"] = "attacker-controlled replacement claim"
+        db.execute(
+            "UPDATE evidence_chain SET payload=? WHERE sequence=?",
+            (json.dumps(record, sort_keys=True), record["sequence"]),
+        )
+
+    analysis = service.analyze_mission("valid-owner", mission.mission_id)
+    assert analysis["outcome_class"] == "verified_success"
+    assert analysis["candidate_seed_eligible"] is False
+    assert analysis["reason_code"] == "completed_tool_sequence_not_fully_evidenced"
+    assert analysis["evidence_count"] == 0
+    assert "attacker-controlled" not in str(analysis)
+
+
 def test_owner_skill_service_qualifies_only_real_fenced_mission_evidence(tmp_path, monkeypatch):
     service, mission, _store = _completed_mission(tmp_path, monkeypatch)
     malicious_description = '<img src=x onerror="alert(1)">'
@@ -165,6 +330,8 @@ def test_owner_skill_service_rejects_foreign_owner_mission_and_revision_access(t
 
     with pytest.raises(PermissionError, match="mission access denied"):
         service.submit_candidate("foreign-owner-token", mission.mission_id, definition.to_dict())
+    with pytest.raises(PermissionError, match="mission access denied"):
+        service.analyze_mission("foreign-owner-token", mission.mission_id)
     assert service.list_revisions("foreign-owner-token") == []
     with pytest.raises(KeyError, match="unknown_skill_revision"):
         service.detail("foreign-owner-token", candidate["skill_id"], 1)

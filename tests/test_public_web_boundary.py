@@ -575,6 +575,92 @@ def test_public_skill_routes_require_owner_and_csrf_and_forward_narrow_requests(
     assert payload["error"] == "unknown_skill_revision"
 
 
+def test_public_skill_mission_analysis_requires_owner_csrf_and_fixed_payload(public_server, monkeypatch):
+    cookie, csrf = _owner_session(public_server)
+    captured = []
+    safe_analysis = {
+        "analysis_version": 1,
+        "outcome_class": "verified_success",
+        "candidate_seed_eligible": True,
+        "reason_code": "ready_for_owner_authored_candidate",
+        "analysis_digest": "b" * 64,
+    }
+
+    class FakeSkills:
+        def analyze_mission(self, owner_session_token, mission_id):
+            assert owner_session_token == OWNER_TOKEN
+            captured.append(mission_id)
+            if mission_id == "foreign-mission":
+                raise PermissionError("mission access denied")
+            return safe_analysis
+
+    monkeypatch.setattr(bridge.Handler, "_skill_service", lambda self: FakeSkills())
+
+    status, _payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/mission-analysis",
+        body={"mission_id": "owned-mission"},
+        headers={"Cookie": cookie},
+    )
+    assert status == 401
+
+    status, _payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/mission-analysis",
+        body={"mission_id": "owned-mission"},
+        headers={"Cookie": cookie, "X-CSRF-Token": "incorrect-token"},
+    )
+    assert status == 401
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/mission-analysis",
+        body={"mission_id": "owned-mission", "objective": "forged"},
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 400
+    assert payload["error"] == "invalid_mission_analysis_request"
+    assert captured == []
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/mission-analysis",
+        body={"mission_id": "owned-mission"},
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert payload == {"ok": True, "analysis": safe_analysis}
+    assert captured == ["owned-mission"]
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/mission-analysis",
+        body={"mission_id": "foreign-mission"},
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 404
+    assert payload["error"] == "unknown_mission"
+    assert captured == ["owned-mission", "foreign-mission"]
+
+
+def test_public_skill_mission_analysis_requires_owner_not_only_public_session(public_server, monkeypatch):
+    public_cookie, public_csrf, _ = _public_session(public_server)
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/mission-analysis",
+        body={"mission_id": "mission-owned"},
+        headers={"Cookie": public_cookie, "X-CSRF-Token": public_csrf},
+    )
+    assert status == 403
+    assert payload["error"] == "owner_authorization_required"
+
+
 def test_public_mission_read_rejects_legacy_unbound_mission(public_server, monkeypatch):
     cookie, _csrf = _owner_session(public_server)
 

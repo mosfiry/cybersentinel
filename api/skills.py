@@ -150,22 +150,34 @@ class OwnerSkillService:
             raise KeyError("unknown_skill_revision")
         return revision
 
-    def _authorized_mission(self, owner_session_token: str, mission_id: str) -> tuple[Mission, str, MissionAuthorizationSnapshot]:
+    def _authorized_mission(
+        self,
+        owner_session_token: str,
+        mission_id: str,
+        *,
+        require_verified_completion: bool = True,
+    ) -> tuple[Mission, str, MissionAuthorizationSnapshot]:
         if not isinstance(mission_id, str) or not mission_id or len(mission_id) > 128:
             raise ValueError("invalid_mission_id")
-        mission, owner_ref = self.mission_service._authorized_mission(
-            mission_id,
-            owner_session_token,
-            allow_unbound_read=False,
-        )
+        bounded_loader = getattr(self.mission_service, "load_authorized_mission", None)
+        if not callable(bounded_loader):
+            raise SkillAuthorizationError("bounded Owner-filtered Mission loading is unavailable")
+        try:
+            mission, owner_ref = bounded_loader(mission_id, owner_session_token)
+        except KeyError as exc:
+            # The bounded loader uses the same result for absent and foreign rows.
+            raise PermissionError("mission access denied") from exc
         canonical_owner = self._owner_ref(owner_session_token)
         if owner_ref != canonical_owner or mission.owner_identity_ref != canonical_owner:
             raise SkillAuthorizationError("Mission does not belong to the current canonical Owner")
         if not mission.verify_integrity():
             raise SkillAuthorizationError("Mission integrity verification failed")
-        if mission.status is not MissionStatus.GOAL_COMPLETED:
+        if require_verified_completion and mission.status is not MissionStatus.GOAL_COMPLETED:
             raise SkillError("Skill candidates require a successfully completed Mission")
-        if not isinstance(mission.verification_state, dict) or mission.verification_state.get("verified") is not True:
+        if require_verified_completion and (
+            not isinstance(mission.verification_state, dict)
+            or mission.verification_state.get("verified") is not True
+        ):
             raise SkillError("Skill candidates require server-verified Mission completion")
         try:
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
@@ -184,6 +196,141 @@ class OwnerSkillService:
         if not verify_trajectory(mission.trajectory):
             raise SkillAuthorizationError("Mission trajectory integrity verification failed")
         return mission, canonical_owner, snapshot
+
+    def analyze_mission(self, owner_session_token: str, mission_id: str) -> dict[str, Any]:
+        """Return bounded learning eligibility signals; never synthesize or approve a Skill."""
+        mission, owner_ref, snapshot = self._authorized_mission(
+            owner_session_token,
+            mission_id,
+            require_verified_completion=False,
+        )
+        status = mission.status
+        verification = mission.verification_state
+        verified = (
+            status is MissionStatus.GOAL_COMPLETED
+            and isinstance(verification, dict)
+            and verification.get("verified") is True
+        )
+        trajectory_types = [
+            item.get("event") for item in mission.trajectory
+            if isinstance(item, dict) and isinstance(item.get("event"), str)
+        ] if isinstance(mission.trajectory, (list, tuple)) else []
+        trajectory_qualified = (
+            "MissionStarted" in trajectory_types
+            and "GoalVerified" in trajectory_types
+            and bool(trajectory_types)
+            and trajectory_types[-1] == "MissionCompleted"
+            and trajectory_types.index("MissionStarted") <= trajectory_types.index("GoalVerified")
+            and trajectory_types.index("GoalVerified") <= trajectory_types.index("MissionCompleted")
+        )
+
+        if not mission.is_terminal:
+            outcome_class, reason_code = "in_progress", "mission_not_terminal"
+        elif status is MissionStatus.GOAL_COMPLETED and not verified:
+            outcome_class, reason_code = "unverified_completion", "mission_not_verified"
+        elif status is MissionStatus.GOAL_COMPLETED:
+            outcome_class, reason_code = "verified_success", "no_completed_tool_steps"
+        elif status is MissionStatus.CANCELLED:
+            outcome_class, reason_code = "cancelled", "mission_cancelled"
+        elif status in {MissionStatus.FAILED_RETRY_EXHAUSTED}:
+            outcome_class, reason_code = "failed", "mission_failed"
+        elif status in {MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.OWNER_REAUTH_REQUIRED}:
+            outcome_class, reason_code = "owner_intervention", "owner_intervention_required"
+        else:
+            outcome_class, reason_code = "blocked", "mission_not_successfully_verified"
+
+        completed_ids = {
+            str(item.get("step_id", ""))
+            for item in mission.action_history
+            if isinstance(item, dict) and item.get("status") == "completed"
+        } if isinstance(mission.action_history, (list, tuple)) else set()
+        tool_sequence: list[str] = []
+        tool_step_ids: list[str] = []
+        sequence_overflow = False
+        for step in getattr(mission.plan, "steps", ()):
+            tool_name = getattr(step, "action", "")
+            step_id = getattr(step, "step_id", "")
+            if not isinstance(tool_name, str) or not isinstance(step_id, str):
+                continue
+            if step_id not in completed_ids or tool_name not in self.registry.tool_specs:
+                continue
+            if len(tool_sequence) >= 32:
+                sequence_overflow = True
+                break
+            tool_sequence.append(tool_name)
+            tool_step_ids.append(step_id)
+
+        evidence_count = 0
+        evidence_digest = ""
+        candidate_seed_eligible = False
+        if outcome_class == "verified_success":
+            if not trajectory_qualified:
+                reason_code = "completion_trajectory_not_qualified"
+            elif sequence_overflow:
+                reason_code = "completed_tool_sequence_exceeds_limit"
+            elif not tool_step_ids:
+                reason_code = "no_completed_tool_steps"
+            else:
+                try:
+                    evidence_records = self._trusted_mission_evidence(
+                        mission,
+                        owner_ref,
+                        snapshot,
+                        set(tool_step_ids),
+                    )
+                except (SkillError, SkillAuthorizationError, PermissionError, TypeError, ValueError):
+                    reason_code = "completed_tool_sequence_not_fully_evidenced"
+                else:
+                    evidence_count = len(evidence_records)
+                    evidence_digest = hashlib.sha256(
+                        json.dumps(
+                            sorted(str(record.get("current_hash", "")) for record in evidence_records),
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    candidate_seed_eligible = bool(evidence_count)
+                    reason_code = "ready_for_owner_authored_candidate" if candidate_seed_eligible else "fenced_evidence_unavailable"
+
+        failure_classes: list[str] = []
+        failures = mission.failures if isinstance(mission.failures, (list, tuple)) else ()
+        for failure in failures[:32]:
+            if not isinstance(failure, dict):
+                continue
+            label = str(failure.get("class", "")).upper()
+            if re.fullmatch(r"[A-Z_]{1,32}", label) and label not in failure_classes:
+                failure_classes.append(label)
+            if len(failure_classes) >= 8:
+                break
+
+        digest_payload = {
+            "analysis_version": 1,
+            "mission_integrity_hash": mission.integrity_hash,
+            "owner_identity_ref": owner_ref,
+            "status": status.value,
+            "outcome_class": outcome_class,
+            "verified": verified,
+            "tool_sequence": tool_sequence,
+            "failure_classes": failure_classes,
+            "evidence_count": evidence_count,
+            "evidence_digest": evidence_digest,
+            "candidate_seed_eligible": candidate_seed_eligible,
+            "reason_code": reason_code,
+        }
+        analysis_digest = hashlib.sha256(
+            json.dumps(digest_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "analysis_version": 1,
+            "status": status.value,
+            "outcome_class": outcome_class,
+            "verified": verified,
+            "completed_tool_sequence": tool_sequence,
+            "failure_classes": failure_classes,
+            "evidence_count": evidence_count,
+            "candidate_seed_eligible": candidate_seed_eligible,
+            "reason_code": reason_code,
+            "analysis_digest": analysis_digest,
+        }
 
     def _trusted_mission_evidence(
         self,
