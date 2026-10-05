@@ -428,6 +428,55 @@ class MemoryProvider:
                 ),
             ).fetchone()
             return None if row is None else MemoryProvider._from_row(row)
+
+    @staticmethod
+    def get_specialist_memory_items(
+        *,
+        owner_identity_ref: str,
+        mission_id: str,
+        agent_id: str,
+        task_id: str,
+        limit: int = 4,
+    ) -> list[MemoryItem]:
+        """List only active untrusted specialist records in one exact child scope."""
+        if not all(isinstance(value, str) and value for value in (owner_identity_ref, mission_id, agent_id, task_id)):
+            return []
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 4:
+            raise ValueError("specialist_memory_query_limit_invalid")
+        expected_scope = (
+            f"owner:{owner_identity_ref}",
+            f"mission:{mission_id}",
+            f"agent:{agent_id}",
+            f"task:{task_id}",
+        )
+        with _get_memory_db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_items WHERE conversation_id=? "
+                "AND owner_identity_ref=? AND mission_id=? AND agent_id=? "
+                "AND scope=? AND domain=? AND trust_classification=? "
+                "AND validation_state=? AND sensitivity=? AND superseded_by IS NULL "
+                "ORDER BY created_at DESC, memory_id ASC LIMIT ?",
+                (
+                    f"mission:{mission_id}",
+                    owner_identity_ref,
+                    mission_id,
+                    agent_id,
+                    json.dumps(list(expected_scope)),
+                    MemoryDomain.TASK_STATE.value,
+                    TrustClassification.UNTRUSTED_DATA.value,
+                    MemoryValidationState.UNVERIFIED.value,
+                    MemorySensitivity.INTERNAL.value,
+                    limit,
+                ),
+            ).fetchall()
+            items: list[MemoryItem] = []
+            for row in rows:
+                try:
+                    items.append(MemoryProvider._from_row(row))
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    # A malformed or digest-mismatched record is not prompt data.
+                    continue
+            return items
     
     @staticmethod
     def get_memory_item(memory_id: str) -> MemoryItem | None:

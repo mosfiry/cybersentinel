@@ -653,6 +653,219 @@ def test_specialist_outputs_live_in_schema4_memory_and_parent_reads_only_verifie
         )
 
 
+def test_specialist_child_dispatch_includes_only_exact_scope_untrusted_memory(tmp_path):
+    from agent import memory
+    from agent.intelligence_layer.specialist_dispatch import (
+        MAX_SPECIALIST_INPUT_CHARS,
+        MAX_SPECIALIST_MEMORY_PROMPT_BYTES,
+        MAX_SPECIALIST_MEMORY_PROMPT_RECORDS,
+        _invoke_one,
+        _messages,
+    )
+    from agent.intelligence_layer.specialist_memory import SpecialistChildMemoryStore
+
+    seen = []
+    runtime, mission_id = _runtime(
+        tmp_path,
+        (PlanStep("alpha", "Analyze alpha", action="status"), PlanStep("beta", "Analyze beta", action="search")),
+        lambda provider, model, messages, **kwargs: seen.append((provider, model, messages)) or _proposal_response(provider, model),
+    )
+    mission = runtime.store.load(mission_id)
+    snapshot = runtime._typed_mission_snapshot(mission)
+    ready = runtime.task_graph_adapter.ready_specialist_steps(mission, snapshot)
+    step_ids = tuple(item[0] for item in ready)
+    task_by_step = dict(ready)
+    step_id, task_id = ready[0]
+    batch_id = "same-child-memory-prompt-test"
+    execution_ids = tuple(f"{batch_id}:{task_by_step[item]}" for item in step_ids)
+    execution_id = execution_ids[0]
+    runtime.task_graph_adapter.claim_specialist_batch(
+        mission, snapshot, step_ids, batch_id=batch_id,
+        provider_name="local", model_name="qwen-test", execution_ids=execution_ids,
+    )
+    mission.checkpoint = {
+        "status": "in_flight_specialists", "batch_id": batch_id,
+        "plan_version": mission.plan.version, "step_ids": list(step_ids),
+        "task_ids": [task_by_step[item] for item in step_ids], "execution_ids": list(execution_ids),
+        "task_execution_bindings": [
+            {"task_id": task_by_step[item], "execution_id": execution}
+            for item, execution in zip(step_ids, execution_ids)
+        ],
+        "provider_name": "local", "model_name": "qwen-test",
+    }
+    runtime.store.save(mission)
+    claimed = runtime.store.load(mission_id)
+    graph = _special_graph(claimed)
+    task = graph.tasks[task_id]
+    step = next(item for item in claimed.plan.steps if item.step_id == step_id)
+    memory_service = SpecialistChildMemoryStore()
+    seeded = memory_service.persist_proposal(
+        mission=claimed,
+        snapshot=snapshot,
+        graph=graph,
+        task_id=task_id,
+        step_id=step_id,
+        proposal={"summary": "same-agent prior analysis", "recommendations": ["recheck bounded indicators"], "open_questions": []},
+        provider="local",
+        model="qwen-test",
+        authorization_version=runtime.task_graph_adapter._expected_authorization_version(claimed),
+    )
+
+    baseline = _messages(task_id, step)
+    result = _invoke_one(
+        runtime,
+        mission_id=mission_id,
+        snapshot=snapshot,
+        batch_id=batch_id,
+        step_id=step_id,
+        task_id=task_id,
+        execution_id=execution_id,
+        step=step,
+        provider_name="local",
+        model_name="qwen-test",
+    )
+    assert result["success"] is True
+    provider, model, messages = seen[0]
+    assert (provider, model) == ("local", "qwen-test")
+    assert messages[:2] == baseline  # system and task instructions are byte-identical
+    assert len(messages) == 3 and messages[2]["role"] == "user"
+    memory_context = json.loads(messages[2]["content"].split("\n", 1)[1])
+    assert memory_context["trust"] == "untrusted_data"
+    assert memory_context["validation_state"] == "unverified"
+    assert memory_context["authority"] == "none"
+    assert memory_context["records"][0]["task_id"] == task_id
+    assert memory_context["records"][0]["step_id"] == step_id
+    assert memory_context["records"][0]["proposal"]["summary"] == "same-agent prior analysis"
+    assert seeded["memory_ref"].startswith("specialist-memory:")
+    assert _messages(task_id, step, prior_memory=[]) == baseline
+
+    # Even caller-supplied over-counted content is narrowed to the prompt budget.
+    retrieved = memory_service.retrieve_for_child_task(
+        mission=claimed,
+        snapshot=snapshot,
+        graph=graph,
+        task_id=task_id,
+        step_id=step_id,
+        authorization_version=runtime.task_graph_adapter._expected_authorization_version(claimed),
+    )
+    many = []
+    for index in range(MAX_SPECIALIST_MEMORY_PROMPT_RECORDS + 3):
+        item = dict(retrieved[0])
+        item["memory_ref"] = "specialist-memory:" + f"{index:064x}"
+        item["proposal"] = {"summary": "x" * 600, "recommendations": [], "open_questions": []}
+        many.append(item)
+    bounded = _messages(task_id, step, prior_memory=many)
+    assert sum(len(message["content"]) for message in bounded) <= MAX_SPECIALIST_INPUT_CHARS
+    bounded_context = json.loads(bounded[2]["content"].split("\n", 1)[1])
+    assert len(bounded_context["records"]) <= MAX_SPECIALIST_MEMORY_PROMPT_RECORDS
+    assert len(bounded[2]["content"].encode("utf-8")) <= MAX_SPECIALIST_MEMORY_PROMPT_BYTES
+
+    assert memory.MemoryProvider.get_specialist_memory_items(
+        owner_identity_ref=claimed.owner_identity_ref,
+        mission_id="foreign-mission",
+        agent_id=task.assigned_agent_id,
+        task_id=task_id,
+    ) == []
+    assert memory.MemoryProvider.get_specialist_memory_items(
+        owner_identity_ref=claimed.owner_identity_ref,
+        mission_id=mission_id,
+        agent_id="foreign-agent",
+        task_id=task_id,
+    ) == []
+    assert memory.MemoryProvider.get_specialist_memory_items(
+        owner_identity_ref="foreign-owner",
+        mission_id=mission_id,
+        agent_id=task.assigned_agent_id,
+        task_id=task_id,
+    ) == []
+
+
+def test_specialist_child_retrieval_excludes_revoked_expired_unknown_and_tampered_records(tmp_path):
+    from agent import memory
+    from agent.intelligence_layer.specialist_memory import SpecialistChildMemoryStore
+
+    runtime, mission_id = _runtime(
+        tmp_path,
+        (PlanStep("alpha", "Analyze alpha", action="status"), PlanStep("beta", "Analyze beta", action="search")),
+        lambda provider, model, _messages, **kwargs: _proposal_response(provider, model),
+    )
+    mission = runtime.store.load(mission_id)
+    snapshot = runtime._typed_mission_snapshot(mission)
+    ready = runtime.task_graph_adapter.ready_specialist_steps(mission, snapshot)
+    step_ids = tuple(item[0] for item in ready)
+    task_by_step = dict(ready)
+    step_id, task_id = ready[0]
+    batch_id = "child-memory-exclusion-test"
+    execution_ids = tuple(f"{batch_id}:{task_by_step[item]}" for item in step_ids)
+    execution_id = execution_ids[0]
+    runtime.task_graph_adapter.claim_specialist_batch(
+        mission, snapshot, step_ids, batch_id=batch_id,
+        provider_name="local", model_name="qwen-test", execution_ids=execution_ids,
+    )
+    mission.checkpoint = {
+        "status": "in_flight_specialists", "batch_id": batch_id,
+        "plan_version": mission.plan.version, "step_ids": list(step_ids),
+        "task_ids": [task_by_step[item] for item in step_ids], "execution_ids": list(execution_ids),
+        "task_execution_bindings": [
+            {"task_id": task_by_step[item], "execution_id": execution}
+            for item, execution in zip(step_ids, execution_ids)
+        ],
+        "provider_name": "local", "model_name": "qwen-test",
+    }
+    runtime.store.save(mission)
+    claimed = runtime.store.load(mission_id)
+    graph = _special_graph(claimed)
+    service = SpecialistChildMemoryStore()
+    saved = service.persist_proposal(
+        mission=claimed,
+        snapshot=snapshot,
+        graph=graph,
+        task_id=task_id,
+        step_id=step_id,
+        proposal={"summary": "must not leak after revocation/expiry/tamper", "recommendations": [], "open_questions": []},
+        provider="local",
+        model="qwen-test",
+        authorization_version=runtime.task_graph_adapter._expected_authorization_version(claimed),
+    )
+    retrieval_args = dict(
+        mission=claimed,
+        snapshot=snapshot,
+        graph=graph,
+        task_id=task_id,
+        step_id=step_id,
+        authorization_version=runtime.task_graph_adapter._expected_authorization_version(claimed),
+    )
+    assert service.retrieve_for_child_task(**retrieval_args)
+
+    with sqlite3.connect(memory.MEMORY_DB_PATH) as db:
+        db.execute("UPDATE memory_items SET sensitivity=? WHERE memory_id=?", (memory.MemorySensitivity.SENSITIVE.value, saved["memory_ref"]))
+    assert service.retrieve_for_child_task(**retrieval_args) == []
+
+    with sqlite3.connect(memory.MEMORY_DB_PATH) as db:
+        db.execute("UPDATE memory_items SET sensitivity=? WHERE memory_id=?", (memory.MemorySensitivity.INTERNAL.value, saved["memory_ref"]))
+    assert service.retrieve_for_child_task(**retrieval_args)
+
+    with sqlite3.connect(memory.MEMORY_DB_PATH) as db:
+        db.execute("UPDATE memory_items SET superseded_by=? WHERE memory_id=?", ("revoked", saved["memory_ref"]))
+    assert service.retrieve_for_child_task(**retrieval_args) == []
+
+    with sqlite3.connect(memory.MEMORY_DB_PATH) as db:
+        db.execute("UPDATE memory_items SET superseded_by=NULL, created_at=? WHERE memory_id=?", ("2000-01-01T00:00:00+00:00", saved["memory_ref"]))
+    assert service.retrieve_for_child_task(**retrieval_args) == []
+
+    with sqlite3.connect(memory.MEMORY_DB_PATH) as db:
+        db.execute("UPDATE memory_items SET created_at=? WHERE memory_id=?", (datetime.now(timezone.utc).isoformat(), saved["memory_ref"]))
+        row = db.execute("SELECT metadata FROM memory_items WHERE memory_id=?", (saved["memory_ref"],)).fetchone()
+        metadata = json.loads(row[0])
+        metadata["unknown_trust_extension"] = "maybe"
+        db.execute("UPDATE memory_items SET metadata=? WHERE memory_id=?", (json.dumps(metadata), saved["memory_ref"]))
+    assert service.retrieve_for_child_task(**retrieval_args) == []
+
+    with sqlite3.connect(memory.MEMORY_DB_PATH) as db:
+        db.execute("UPDATE memory_items SET metadata=? , content=? WHERE memory_id=?", (json.dumps({}), '{"tampered":true}', saved["memory_ref"]))
+    assert service.retrieve_for_child_task(**retrieval_args) == []
+
+
 def test_specialist_memory_rejects_corrupt_record_and_bounds_multibyte_payloads(tmp_path):
     from agent import memory
     from agent.intelligence_layer.specialist_memory import (

@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from .models import AgentLifecycle, TaskLifecycle
@@ -18,6 +19,9 @@ MAX_SPECIALIST_MEMORY_RECORD_BYTES = 4096
 MAX_SPECIALIST_MEMORY_INPUT_BYTES = 8192
 MAX_SPECIALIST_MEMORY_PARENT_BYTES = 8192
 MAX_SPECIALIST_MEMORY_PARENT_RECORDS = 4
+MAX_SPECIALIST_MEMORY_CHILD_RECORDS = 4
+MAX_SPECIALIST_MEMORY_CHILD_BYTES = 2048
+SPECIALIST_MEMORY_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passwd|secret|authorization|credential|private[_ -]?key)\b\s*[:=]\s*(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
@@ -321,6 +325,78 @@ class SpecialistChildMemoryStore:
             expected_plan_fingerprint=expected_plan_fingerprint,
         )
 
+    def retrieve_for_child_task(
+        self,
+        *,
+        mission: Any,
+        snapshot: Any,
+        graph: Any,
+        task_id: str,
+        step_id: str,
+        authorization_version: int,
+    ) -> list[dict[str, Any]]:
+        """Read only recent records for this currently running child/task scope."""
+        from agent.memory import MemoryProvider
+
+        self._authorized_graph(mission, snapshot, graph, authorization_version)
+        task = graph.tasks.get(task_id)
+        agent = graph.agents.get(task.assigned_agent_id) if task is not None else None
+        if (
+            task is None
+            or task.mission_id != mission.mission_id
+            or task.lifecycle is not TaskLifecycle.RUNNING
+            or agent is None
+            or agent.mission_id != mission.mission_id
+            or agent.owner_identity_ref != mission.owner_identity_ref
+            or agent.role != "mission_specialist_analyst"
+            or agent.parent_task_id != task_id
+            or agent.memory_scope != f"task:{step_id}"
+            or task_id != "specialist:" + hashlib.sha256(step_id.encode("utf-8")).hexdigest()[:24]
+            or not {"untrusted_analysis_only", "no_tools", "no_evidence", "no_owner_authority"}.issubset(set(agent.capabilities))
+            or agent.permission_scope.allowed_tools
+            or agent.permission_scope.allowed_actions
+            or agent.permission_scope.allowed_networks
+            or agent.permission_scope.allowed_credentials
+            or agent.permission_scope.workspace_root
+            or agent.permission_scope.scope
+        ):
+            return []
+
+        rows = MemoryProvider.get_specialist_memory_items(
+            owner_identity_ref=mission.owner_identity_ref,
+            mission_id=mission.mission_id,
+            agent_id=agent.agent_id,
+            task_id=task.task_id,
+            limit=MAX_SPECIALIST_MEMORY_CHILD_RECORDS,
+        )
+        records: list[dict[str, Any]] = []
+        total_bytes = 0
+        for item in rows:
+            try:
+                record = self._read_and_validate(
+                    memory_ref=item.memory_id,
+                    owner_identity_ref=mission.owner_identity_ref,
+                    mission_id=mission.mission_id,
+                    agent_id=agent.agent_id,
+                    task_id=task.task_id,
+                    expected_plan_fingerprint=str(mission.plan.fingerprint),
+                    expected_step_id=step_id,
+                )
+            except SpecialistMemoryError:
+                # Bad, stale, unknown-schema, or tampered records are excluded;
+                # they never become prompt content or grant Mission authority.
+                continue
+            if record is None:
+                continue
+            record_bytes = len(_canonical(record))
+            if record_bytes > MAX_SPECIALIST_MEMORY_CHILD_BYTES:
+                continue
+            if total_bytes + record_bytes > MAX_SPECIALIST_MEMORY_CHILD_BYTES:
+                break
+            records.append(record)
+            total_bytes += record_bytes
+        return records
+
     def retrieve_for_parent(
         self,
         *,
@@ -375,7 +451,7 @@ class SpecialistChildMemoryStore:
         expected_plan_fingerprint: str,
         expected_step_id: str | None = None,
     ) -> dict[str, Any] | None:
-        from agent.memory import MemoryProvider, MemoryValidationState, MemoryDomain, TrustClassification
+        from agent.memory import MemoryProvider, MemoryValidationState, MemoryDomain, MemorySensitivity, TrustClassification
 
         if not all(isinstance(value, str) and value for value in (memory_ref, owner_identity_ref, mission_id, agent_id, task_id)):
             return None
@@ -396,12 +472,22 @@ class SpecialistChildMemoryStore:
             or item.domain is not MemoryDomain.TASK_STATE
             or item.trust_classification is not TrustClassification.UNTRUSTED_DATA
             or item.validation_state is not MemoryValidationState.UNVERIFIED
+            or item.sensitivity is not MemorySensitivity.INTERNAL
             or item.superseded_by is not None
             or item.source != "tool_less_specialist"
             or item.scope != _scope(owner_identity_ref, mission_id, agent_id, task_id)
             or len(item.content.encode("utf-8")) > MAX_SPECIALIST_MEMORY_RECORD_BYTES
         ):
             raise SpecialistMemoryError("specialist_memory_scope_or_trust_invalid")
+        try:
+            created_at = datetime.fromisoformat(item.created_at.replace("Z", "+00:00"))
+            if created_at.tzinfo is None:
+                raise ValueError("memory_timestamp_timezone_missing")
+            age_seconds = (datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise SpecialistMemoryError("specialist_memory_timestamp_invalid") from exc
+        if age_seconds < -300 or age_seconds > SPECIALIST_MEMORY_MAX_AGE_SECONDS:
+            raise SpecialistMemoryError("specialist_memory_expired")
         metadata = item.metadata
         if not isinstance(metadata, dict) or set(metadata) != {
             "record_type", "authority", "task_id", "step_id", "provider", "model", "tool_identity",

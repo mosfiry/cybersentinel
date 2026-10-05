@@ -1,8 +1,10 @@
 """Provider-backed, tool-less analytic children for independent Mission tasks.
 
-Children receive only their own bounded plan-step description. They cannot call
-CyberSentinel tools, access Mission memory/files, create evidence, or authorize
-anything. Their validated JSON is still an untrusted proposal.
+Children receive their own bounded plan-step description and, when available,
+prevalidated untrusted memory from the exact same Owner/Mission/agent/task scope.
+They cannot directly query MemoryStore or access files, call CyberSentinel tools,
+create evidence, or authorize anything. Their validated JSON is still an
+untrusted proposal.
 """
 from __future__ import annotations
 
@@ -19,6 +21,8 @@ MAX_SPECIALIST_INPUT_CHARS = 4096
 MAX_SPECIALIST_OUTPUT_CHARS = 2000
 MAX_SPECIALIST_OUTPUT_TOKENS = 384
 SPECIALIST_TIMEOUT_SECONDS = 30
+MAX_SPECIALIST_MEMORY_PROMPT_BYTES = 2048
+MAX_SPECIALIST_MEMORY_PROMPT_RECORDS = 4
 _redact_secret_like_text = redact_specialist_text
 
 
@@ -55,9 +59,10 @@ def _batch_identity(mission: Any, step_ids: tuple[str, ...], provider: str, mode
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _messages(task_id: str, step: Any) -> list[dict[str, str]]:
+def _messages(task_id: str, step: Any, *, prior_memory: Any = ()) -> list[dict[str, str]]:
     # Exclude Mission-wide objectives, tool arguments, authorization, evidence
-    # bodies, memory, credentials, filesystem state, and sibling task content.
+    # bodies, credentials, filesystem state, and sibling task content. Same-task
+    # child memory is appended separately as untrusted user data below.
     context = {
         "child_task_id": task_id,
         "task_objective": _redact_secret_like_text(str(step.objective))[:2000],
@@ -76,6 +81,95 @@ def _messages(task_id: str, step: Any) -> list[dict[str, str]]:
         {"role": "system", "content": system},
         {"role": "user", "content": "UNTRUSTED_TASK_CONTEXT_JSON:\n" + encoded},
     ]
+    safe_memory: list[dict[str, Any]] = []
+    memory_fields = {
+        "record_type", "trust", "validation_state", "authority", "memory_ref", "task_id", "step_id",
+        "provider", "model", "tool_identity", "source_digest", "result_digest", "truncated", "proposal",
+    }
+    for item in prior_memory:
+        if len(safe_memory) >= MAX_SPECIALIST_MEMORY_PROMPT_RECORDS:
+            break
+        if (
+            not isinstance(item, dict)
+            or set(item) != memory_fields
+            or item.get("record_type") != "UNTRUSTED_SPECIALIST_CHILD_MEMORY"
+            or item.get("trust") != "untrusted_data"
+            or item.get("validation_state") != "unverified"
+            or item.get("authority") != "none"
+            or item.get("tool_identity") != "none"
+            or item.get("task_id") != task_id
+            or item.get("step_id") != str(getattr(step, "step_id", ""))
+            or not isinstance(item.get("memory_ref"), str)
+            or not item["memory_ref"].startswith("specialist-memory:")
+            or len(item["memory_ref"]) != len("specialist-memory:") + 64
+            or not isinstance(item.get("provider"), str)
+            or not isinstance(item.get("model"), str)
+            or not isinstance(item.get("truncated"), bool)
+            or any(
+                not isinstance(item.get(key), str)
+                or len(item[key]) != 64
+                or any(char not in "0123456789abcdef" for char in item[key])
+                for key in ("source_digest", "result_digest")
+            )
+            or not isinstance(item.get("proposal"), dict)
+            or set(item["proposal"]) != {"summary", "recommendations", "open_questions"}
+            or not isinstance(item["proposal"].get("summary"), str)
+            or len(item["proposal"]["summary"]) > 1200
+            or not isinstance(item["proposal"].get("recommendations"), list)
+            or len(item["proposal"]["recommendations"]) > 3
+            or not isinstance(item["proposal"].get("open_questions"), list)
+            or len(item["proposal"]["open_questions"]) > 3
+            or any(
+                not isinstance(value, str) or len(value) > 800
+                for key in ("recommendations", "open_questions")
+                for value in item["proposal"][key]
+            )
+        ):
+            continue
+        # Provider/model metadata is intentionally not sent as control data;
+        # the exact active provider remains selected by the durable Mission.
+        safe_memory.append({
+            "record_type": item["record_type"],
+            "trust": item["trust"],
+            "validation_state": item["validation_state"],
+            "authority": item["authority"],
+            "tool_identity": "none",
+            "task_id": task_id,
+            "step_id": str(getattr(step, "step_id", "")),
+            "source_digest": item["source_digest"],
+            "result_digest": item["result_digest"],
+            "proposal": item["proposal"],
+        })
+        payload = {
+            "record_type": "UNTRUSTED_SPECIALIST_MEMORY_CONTEXT",
+            "trust": "untrusted_data",
+            "validation_state": "unverified",
+            "authority": "none",
+            "records": safe_memory,
+        }
+        memory_content = "UNTRUSTED_SPECIALIST_MEMORY_JSON:\n" + json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        if (
+            len(memory_content.encode("utf-8")) > MAX_SPECIALIST_MEMORY_PROMPT_BYTES
+            or sum(len(message["content"]) for message in messages) + len(memory_content) > MAX_SPECIALIST_INPUT_CHARS
+        ):
+            safe_memory.pop()
+            break
+    if safe_memory:
+        payload = {
+            "record_type": "UNTRUSTED_SPECIALIST_MEMORY_CONTEXT",
+            "trust": "untrusted_data",
+            "validation_state": "unverified",
+            "authority": "none",
+            "records": safe_memory,
+        }
+        messages.append({
+            "role": "user",
+            "content": "UNTRUSTED_SPECIALIST_MEMORY_JSON:\n" + json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ),
+        })
     if sum(len(item["content"]) for item in messages) > MAX_SPECIALIST_INPUT_CHARS:
         raise ValueError("specialist_input_too_large")
     return messages
@@ -200,7 +294,19 @@ def _invoke_one(
     }
     try:
         _current, fence = _preflight(runtime, mission_id, snapshot, batch_id, task_id, execution_id)
-        messages = _messages(task_id, step)
+        nested = runtime.task_graph_adapter._specialist_envelope(_current, snapshot)
+        if nested is None:
+            raise SpecialistDispatchError("specialist_memory_graph_unavailable")
+        graph, _mapping, _envelope = nested
+        prior_memory = SpecialistChildMemoryStore().retrieve_for_child_task(
+            mission=_current,
+            snapshot=snapshot,
+            graph=graph,
+            task_id=task_id,
+            step_id=step_id,
+            authorization_version=runtime.task_graph_adapter._expected_authorization_version(_current),
+        )
+        messages = _messages(task_id, step, prior_memory=prior_memory)
         if runtime.specialist_generate is None or not provider_name or not model_name:
             return {**base, "success": False, "failure_code": "provider_unavailable", "validation_state": "PROVIDER_UNAVAILABLE"}
         # This callback is required to bind to the provider/model recorded when
