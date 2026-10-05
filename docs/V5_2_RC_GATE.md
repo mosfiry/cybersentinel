@@ -1,5 +1,29 @@
 # CyberSentinel v5.2 production-completion branch: release gate
 
+## Final acceptance status
+
+| Gate | Status | Evidence |
+|---|---|---|
+| Source integrity | PASS | Branch `work/v5.2-production-completion`, HEAD `103516c9b58cc37eaacda40c8d11ba6878ba64e9`; based on v5.1.0 source `26739d9b01b3b1ff492854e7e21789be20b1be0e`. |
+| Python | PASS | 1,225 passed, 1 skipped on the branch. |
+| Node | PASS | 5/5 Desktop tests passed. |
+| Windows CI | PASS | [Windows regression run 37243749816](https://github.com/mosfiry/cybersentinel/actions/runs/37243749816); Windows unit/API and Desktop contract coverage only, not real model inference or GUI acceptance. |
+| Windows install | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | Current device inventory contains only the Linux Sandbox; no installer run. |
+| First Run | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No interactive Windows application run. |
+| Owner login | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No interactive Windows application run. |
+| Hardware detection | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No interactive Windows application run. |
+| Qwen3 download | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | `scripts/windows_acceptance.ps1` was not run. |
+| Qwen3 integrity | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No Windows download or local integrity check was performed. |
+| Qwen3 activation | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No Windows activation was performed. |
+| Qwen3 real inference | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | CI, Linux tests, and mock/unit coverage are not accepted as Windows inference evidence. |
+| Real Mission | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No Windows Mission using the local Qwen3 runtime was executed. |
+| Evidence/Validator | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No Windows real-Mission evidence chain was produced. |
+| Close/Reopen | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No installed Windows application process was closed and reopened. |
+| Persistence/Resume | NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT | No post-restart Windows Mission/model state was inspected. |
+| Remote catalog update | NOT IMPLEMENTED | The application loads the bundled, versioned catalog; no remote catalog updater is shipped. |
+
+**RC decision: NOT RC — BLOCKED BY WINDOWS INTERACTIVE ACCEPTANCE.** No `v5.2.0` tag or GitHub Release was created. The `v5.1.0` tag, release, and assets were not changed.
+
 ## Scope and release boundary
 
 This work is based on the published `v5.1.0` source and belongs on `work/v5.2-production-completion`. The published `v5.1.0` tag, release, and every release asset remain immutable. This branch does **not** create a `v5.2.0` tag or final release, rebuild/re-sign/replace the `v5.1.0` installer, or claim Windows certification from Linux results. `desktop/package.json` intentionally remains at `5.1.0` until a separately approved RC packaging step.
