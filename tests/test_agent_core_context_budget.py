@@ -83,3 +83,32 @@ def test_observation_fallback_keeps_typed_provider_error_provenance():
     assert proposal.provenance["model_error"] == "ProviderRequestRejected"
     assert proposal.provenance["model_error_kind"] == "REQUEST_REJECTED"
     assert proposal.provenance["model_http_status"] == 400
+
+
+def test_initial_planning_uses_provider_context_window_token_budget(tmp_path: Path, monkeypatch):
+    import agent.agent_core as agent_core_module
+
+    router = CapturingRouter()
+    router.tool_calling = lambda messages, schemas, **_kwargs: {"content": "planning response"}
+    core = AgentCore(router, store=MissionStore(tmp_path / "missions.sqlite3"))
+    captured = {}
+
+    class MinimalContext:
+        def provider_messages(self):
+            return [{"role": "user", "content": "bounded"}]
+
+    def capture_build(cls, **kwargs):
+        captured.update(kwargs)
+        return MinimalContext()
+
+    monkeypatch.setattr(agent_core_module.ContextEngine, "build", classmethod(capture_build))
+    monkeypatch.setattr(core, "_schemas", lambda: [])
+
+    response = core._ask("current Owner task", policy_context="active policy", conversation_id="budget-test")
+
+    assert response["content"] == "planning response"
+    limits = captured["runtime_limits"]
+    assert limits.max_context_tokens == router.context_length * 4 // 5
+    assert limits.max_context_chars <= router.context_length * 2
+    assert captured["include_tool_summary"] is False
+    assert captured["include_tool_schema_tokens"] is True

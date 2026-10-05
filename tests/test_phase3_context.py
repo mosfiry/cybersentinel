@@ -1488,3 +1488,96 @@ class TestRequiredContextBudget:
         assert [message["content"] for message in context.messages] == ["system", "current request"]
         assert context.truncated is True
         assert any(item["source"] == "truncation" and item["messages_removed"] == 1 for item in context.provenance)
+
+    def test_provider_token_budget_drops_long_untrusted_mission_material_first(self, execution_state):
+        class LargeMemoryProvider(MemoryProvider):
+            def available(self):
+                return True
+
+            def retrieve_relevant(self, query, limit=5):
+                return [{"id": "memory-long", "content": "MEMORY_SENTINEL " + "m" * 5000}]
+
+        limits = RuntimeLimits(
+            max_context_messages=20,
+            max_context_chars=20000,
+            max_context_tokens=450,
+        )
+        builder = ContextBuilder(
+            owner_policy_context="OWNER_POLICY_SENTINEL",
+            execution_state=execution_state,
+            runtime_limits=limits,
+        )
+        builder.add_system_instructions("SYSTEM_SENTINEL")
+        builder.add_owner_policy()
+        builder.add_security_context("SECURITY_FENCE_SENTINEL")
+        builder.add_memory_context(LargeMemoryProvider(), "current task", limit=1)
+        builder.add_tool_result("adaptive_mission_state", {
+            "evidence": "EVIDENCE_SENTINEL " + "e" * 8000,
+        })
+        builder.add_user_message("CURRENT_TASK_SENTINEL")
+
+        context = builder.build()
+        serialized = "\n".join(message["content"] for message in context.messages)
+        assert "SYSTEM_SENTINEL" in serialized
+        assert "OWNER_POLICY_SENTINEL" in serialized
+        assert "SECURITY_FENCE_SENTINEL" in serialized
+        assert "CURRENT_TASK_SENTINEL" in serialized
+        assert "MEMORY_SENTINEL" not in serialized
+        assert "EVIDENCE_SENTINEL" not in serialized
+        assert context.budget.total_tokens <= limits.max_context_tokens
+        assert context.budget.tokens_removed > 0
+        budget_record = next(item for item in context.provenance if item["source"] == "truncation")
+        assert budget_record["estimated_tokens"] <= budget_record["token_limit"]
+
+    def test_canonical_tool_schema_tokens_count_toward_required_window(self, execution_state, monkeypatch):
+        import tools.registry as registry_module
+
+        monkeypatch.setattr(registry_module, "tool_definitions", lambda: [{"name": "inspect", "description": "inspect"}])
+        monkeypatch.setattr(registry_module, "model_tool_definitions", lambda: [{
+            "type": "function",
+            "function": {
+                "name": "inspect",
+                "description": "schema detail " * 300,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }])
+        limits = RuntimeLimits(
+            max_context_messages=20,
+            max_context_chars=20000,
+            max_tool_schema_chars=10000,
+            max_context_tokens=200,
+        )
+        builder = ContextBuilder(
+            owner_policy_context="policy",
+            execution_state=execution_state,
+            runtime_limits=limits,
+        )
+        builder.add_system_instructions("system")
+        builder.add_owner_policy()
+        builder.add_security_context("active fence")
+        builder.add_tool_definitions()
+        builder.add_user_message("current task")
+
+        assert builder.budget.fixed_tokens > limits.max_context_tokens
+        with pytest.raises(ContextBudgetExceeded) as error:
+            builder.build()
+        assert error.value.required_tokens > limits.max_context_tokens
+
+    def test_required_current_task_token_overflow_fails_closed(self, execution_state):
+        builder = ContextBuilder(
+            owner_policy_context="policy",
+            execution_state=execution_state,
+            runtime_limits=RuntimeLimits(
+                max_context_messages=10,
+                max_context_chars=10000,
+                max_context_tokens=100,
+            ),
+        )
+        builder.add_system_instructions("system")
+        builder.add_owner_policy()
+        builder.add_security_context("security")
+        builder.add_user_message("CURRENT_TASK " + "x" * 1000)
+
+        with pytest.raises(ContextBudgetExceeded) as error:
+            builder.build()
+        assert error.value.required_tokens > error.value.limits.max_context_tokens

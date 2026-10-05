@@ -24,12 +24,28 @@ class ModelRouter:
 
     @property
     def context_length(self) -> int | None:
-        lengths = [
-            value for provider in self.providers
-            if isinstance((value := getattr(provider, "context_length", None)), int)
-            and not isinstance(value, bool) and value > 0
-        ]
-        return min(lengths) if lengths else None
+        if not self.providers:
+            return None
+        lengths: list[int] = []
+        for provider in self.providers:
+            value = getattr(provider, "context_length", None)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                # A fallback provider without a declared window prevents a safe shared budget.
+                return None
+            lengths.append(value)
+        return min(lengths)
+
+    @staticmethod
+    def _context_length_from_env(variable: str) -> int | None:
+        raw = os.getenv(variable, "").strip()
+        if not raw:
+            return None
+        if not raw.isascii() or not raw.isdecimal():
+            raise ValueError(f"{variable} must be a positive integer")
+        value = int(raw)
+        if value < 1:
+            raise ValueError(f"{variable} must be a positive integer")
+        return value
 
     @classmethod
     def from_env(cls):
@@ -44,7 +60,14 @@ class ModelRouter:
                 streaming = os.getenv(f"{name}_LLM_STREAMING", "false").lower() == "true"
                 structured = os.getenv(f"{name}_LLM_STRUCTURED_OUTPUT", "false").lower() == "true"
                 priority = int(os.getenv(f"{name}_LLM_PRIORITY", str(position * 100 + 10)))
-                providers.append(OpenAICompatibleProvider(name.lower(), base, model, key, tool_calling=native, streaming=streaming, structured_output=structured, priority=priority))
+                providers.append(OpenAICompatibleProvider(
+                    name.lower(), base, model, key,
+                    tool_calling=native,
+                    streaming=streaming,
+                    structured_output=structured,
+                    priority=priority,
+                    context_length=cls._context_length_from_env(f"{name}_LLM_CONTEXT_LENGTH"),
+                ))
         base = os.getenv("LLM_BASE_URL", "").strip()
         model = os.getenv("LLM_MODEL", "").strip()
         key = secret_env("LLM_API_KEY")
@@ -52,7 +75,14 @@ class ModelRouter:
             native = os.getenv("LLM_TOOL_CALLING", "false").lower() == "true"
             streaming = os.getenv("LLM_STREAMING", "false").lower() == "true"
             structured = os.getenv("LLM_STRUCTURED_OUTPUT", "false").lower() == "true"
-            providers.append(OpenAICompatibleProvider("default", base, model, key, tool_calling=native, streaming=streaming, structured_output=structured, priority=1000))
+            providers.append(OpenAICompatibleProvider(
+                "default", base, model, key,
+                tool_calling=native,
+                streaming=streaming,
+                structured_output=structured,
+                priority=1000,
+                context_length=cls._context_length_from_env("LLM_CONTEXT_LENGTH"),
+            ))
         providers.sort(key=lambda item: int(getattr(item, "priority", 100)))
         return cls(providers)
 

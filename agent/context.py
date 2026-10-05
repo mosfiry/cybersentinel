@@ -76,6 +76,8 @@ class RuntimeLimits:
     max_retries: int = 3
     max_total_output_chars: int = 8000
     max_tool_schema_chars: int = 16000
+    # Derived from a configured provider context window; None preserves legacy char-only callers.
+    max_context_tokens: int | None = None
     
     @classmethod
     def from_owner_policy(cls) -> RuntimeLimits:
@@ -94,6 +96,37 @@ class RuntimeLimits:
             max_retries=limits_config.max_retries,
             max_total_output_chars=limits_config.max_total_output_chars,
         )
+
+
+_TOKEN_PUNCTUATION = frozenset("{}[],:;\"'`<>/\\=+-_")
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """Rough UTF-8 token estimate; not a model tokenizer or guaranteed upper bound."""
+    if not isinstance(text, str):
+        text = str(text)
+    encoded = text.encode("utf-8")
+    ascii_bytes = sum(1 for byte in encoded if byte < 128)
+    non_ascii_chars = sum(1 for char in text if not char.isascii())
+    non_ascii_bytes = len(encoded) - ascii_bytes
+    punctuation = sum(1 for char in text if char in _TOKEN_PUNCTUATION)
+    return max(
+        1,
+        (ascii_bytes + 3) // 4
+        + non_ascii_chars
+        + (non_ascii_bytes + 2) // 3
+        + (punctuation + 1) // 2,
+    )
+
+
+def _estimate_message_tokens(role: str, content: str) -> int:
+    """Estimate message tokens with explicit framing allowance."""
+    return _estimate_text_tokens(f"{role}\n{content}") + 8
+
+
+def _estimate_schema_tokens(schemas: list[dict[str, Any]]) -> int:
+    serialized = json.dumps(schemas, ensure_ascii=False, separators=(",", ":"))
+    return _estimate_text_tokens(serialized) + 8 * len(schemas) + 16
 
 
 # =============================================================================
@@ -162,61 +195,87 @@ class ContextBudget:
     limits: RuntimeLimits
     current_chars: int = 0
     current_messages: int = 0
+    current_tokens: int = 0
     fixed_chars: int = 0
+    fixed_tokens: int = 0
     truncated: bool = False
     messages_removed: int = 0
     chars_removed: int = 0
+    tokens_removed: int = 0
     required_overflow: bool = False
     truncation_reported: bool = False
-    
-    def can_add(self, chars: int, is_required: bool = False) -> bool:
+
+    @property
+    def total_tokens(self) -> int:
+        return self.current_tokens + self.fixed_tokens
+
+    def can_add(self, chars: int, is_required: bool = False, tokens: int = 0) -> bool:
         """Check if we can add more content."""
         if is_required:
             return True  # Required items are always added
         return (
             self.current_chars + chars <= self.limits.max_context_chars
             and self.current_messages + 1 <= self.limits.max_context_messages
+            and (
+                self.limits.max_context_tokens is None
+                or self.total_tokens + tokens <= self.limits.max_context_tokens
+            )
         )
-    
-    def add_item(self, chars: int, is_required: bool = False) -> bool:
+
+    def add_item(self, chars: int, is_required: bool = False, tokens: int = 0) -> bool:
         """Add item to budget. Returns True if added."""
-        if self.can_add(chars, is_required):
+        if chars < 0 or tokens < 0:
+            raise ValueError("context item size cannot be negative")
+        if self.can_add(chars, is_required, tokens):
             self.current_chars += chars
             self.current_messages += 1
+            self.current_tokens += tokens
             if is_required and (
                 self.current_chars > self.limits.max_context_chars
                 or self.current_messages > self.limits.max_context_messages
+                or (
+                    self.limits.max_context_tokens is not None
+                    and self.total_tokens > self.limits.max_context_tokens
+                )
             ):
                 self.required_overflow = True
             return True
-        self.record_truncation(1, chars)
+        self.record_truncation(1, chars, tokens)
         return False
 
-    def add_fixed(self, chars: int) -> None:
+    def add_fixed(self, chars: int, tokens: int = 0) -> None:
         """Count non-message payloads such as canonical tool schemas as required."""
-        if chars < 0:
+        if chars < 0 or tokens < 0:
             raise ValueError("context fixed payload size cannot be negative")
         self.fixed_chars += chars
+        self.fixed_tokens += tokens
         if self.fixed_chars > self.limits.max_tool_schema_chars:
             raise ToolSchemaBudgetExceeded(self.fixed_chars, self.limits.max_tool_schema_chars)
-    
-    def record_truncation(self, messages: int, chars: int) -> None:
+
+    def record_truncation(self, messages: int, chars: int, tokens: int = 0) -> None:
         """Record truncation that occurred."""
         self.truncated = True
         self.messages_removed += messages
         self.chars_removed += chars
+        self.tokens_removed += tokens
 
 
 class ContextBudgetExceeded(ValueError):
     """Protected system, Owner policy, or security context cannot fit the configured budget."""
 
-    def __init__(self, *, required_messages: int, required_chars: int, limits: RuntimeLimits):
+    def __init__(self, *, required_messages: int, required_chars: int, limits: RuntimeLimits, required_tokens: int = 0):
         self.required_messages = required_messages
         self.required_chars = required_chars
+        self.required_tokens = required_tokens
         self.limits = limits
+        token_detail = (
+            f", estimated_tokens={required_tokens}/{limits.max_context_tokens}"
+            if limits.max_context_tokens is not None
+            else ""
+        )
         super().__init__(
             f"required context exceeds limits: messages={required_messages}/{limits.max_context_messages}, "
-            f"chars={required_chars}/{limits.max_context_chars}"
+            f"chars={required_chars}/{limits.max_context_chars}{token_detail}"
         )
 
 
@@ -462,10 +521,12 @@ class ContextBuilder:
         owner_policy_context: str,
         execution_state: ExecutionState,
         runtime_limits: RuntimeLimits | None = None,
+        include_tool_schema_tokens: bool = True,
     ):
         self.owner_policy_context = owner_policy_context
         self.execution_state = execution_state
         self.runtime_limits = runtime_limits or RuntimeLimits()
+        self.include_tool_schema_tokens = bool(include_tool_schema_tokens)
         self.budget = ContextBudget(limits=self.runtime_limits)
         self.items: list[ContextItem] = []
         self.provenance: list[dict[str, Any]] = []
@@ -487,7 +548,7 @@ class ContextBuilder:
             "trust": "authoritative",
             "chars": len(instructions),
         })
-        self.budget.add_item(len(instructions), is_required=True)
+        self.budget.add_item(len(instructions), is_required=True, tokens=_estimate_message_tokens(item.role, item.content))
         return self
     
     def add_owner_policy(self) -> ContextBuilder:
@@ -508,7 +569,7 @@ class ContextBuilder:
             "trust": "authoritative",
             "chars": len(self.owner_policy_context),
         })
-        self.budget.add_item(len(self.owner_policy_context), is_required=True)
+        self.budget.add_item(len(self.owner_policy_context), is_required=True, tokens=_estimate_message_tokens(item.role, item.content))
         return self
     
     def add_security_context(self, context: str) -> ContextBuilder:
@@ -527,10 +588,10 @@ class ContextBuilder:
             "trust": "authoritative",
             "chars": len(context),
         })
-        self.budget.add_item(len(context), is_required=True)
+        self.budget.add_item(len(context), is_required=True, tokens=_estimate_message_tokens(item.role, item.content))
         return self
     
-    def add_tool_definitions(self) -> ContextBuilder:
+    def add_tool_definitions(self, *, include_summary: bool = True) -> ContextBuilder:
         """Add tool definitions from registry."""
         from tools.registry import model_tool_definitions, tool_definitions
         self.tool_definitions = tool_definitions()
@@ -538,31 +599,31 @@ class ContextBuilder:
         # audit aliases (parameters/input_schema) and policy metadata in tool_definitions.
         provider_schemas = model_tool_definitions()
         tool_schema_chars = len(json.dumps(provider_schemas, ensure_ascii=False, separators=(",", ":")))
-        self.budget.add_fixed(tool_schema_chars)
+        schema_tokens = _estimate_schema_tokens(provider_schemas) if self.include_tool_schema_tokens else 0
+        self.budget.add_fixed(tool_schema_chars, tokens=schema_tokens)
         
-        # Create a compact tool summary
-        tool_list = []
-        for tool in self.tool_definitions:
-            tool_list.append(f"{tool['name']}: {tool['description']}")
-        
+        tool_list = [f"{tool['name']}: {tool['description']}" for tool in self.tool_definitions]
         tools_content = "\n".join(tool_list)
-        
-        item = ContextItem(
-            role="system",
-            content=f"Available tools:\n{tools_content}",
-            source=ContextSource.TOOLS,
-            trust_level=TrustLevel.VALIDATED,
-            metadata={"tool_count": len(tool_list), "priority": "medium"},
-        )
-        if self.budget.add_item(item.char_count()):
-            self.items.append(item)
+        if include_summary:
+            item = ContextItem(
+                role="system",
+                content=f"Available tools:\n{tools_content}",
+                source=ContextSource.TOOLS,
+                trust_level=TrustLevel.VALIDATED,
+                metadata={"tool_count": len(tool_list), "priority": "medium"},
+            )
+            item_tokens = _estimate_message_tokens(item.role, item.content)
+            if self.budget.add_item(item.char_count(), tokens=item_tokens):
+                self.items.append(item)
         self.provenance.append({
             "source": "tools",
             "type": "registry",
             "trust": "validated",
             "count": len(tool_list),
-            "chars": len(tools_content) + len("Available tools:\n"),
+            "chars": len(tools_content) + len("Available tools:\n") if include_summary else 0,
             "schema_chars": tool_schema_chars,
+            "estimated_schema_tokens": schema_tokens,
+            "summary_included": bool(include_summary),
         })
         return self
     
@@ -601,7 +662,7 @@ class ContextBuilder:
                 metadata={"priority": "medium", "message_id": msg.get("id")},
             )
             
-            if self.budget.add_item(len(content)):
+            if self.budget.add_item(len(content), tokens=_estimate_message_tokens(item.role, item.content)):
                 self.items.append(item)
                 self.provenance.append({
                     "source": "conversation",
@@ -630,7 +691,7 @@ class ContextBuilder:
             "trust": "untrusted_data",
             "chars": len(content),
         })
-        self.budget.add_item(len(content), is_required=True)
+        self.budget.add_item(len(content), is_required=True, tokens=_estimate_message_tokens(item.role, item.content))
         return self
     
     def add_tool_result(self, name: str, result: dict[str, Any]) -> ContextBuilder:
@@ -647,7 +708,7 @@ class ContextBuilder:
             metadata={"tool_name": name, "priority": "medium"},
         )
         
-        if self.budget.add_item(len(content)):
+        if self.budget.add_item(len(content), tokens=_estimate_message_tokens(item.role, item.content)):
             self.items.append(item)
             self.provenance.append({
                 "source": "tool_result",
@@ -694,7 +755,7 @@ class ContextBuilder:
                 },
             )
             
-            if self.budget.add_item(len(wrapped_content)):
+            if self.budget.add_item(len(wrapped_content), tokens=_estimate_message_tokens(memory_item.role, memory_item.content)):
                 self.items.append(memory_item)
                 self.provenance.append({
                     "source": "memory",
@@ -727,7 +788,7 @@ class ContextBuilder:
                 },
             )
             
-            if self.budget.add_item(len(content) + 50):
+            if self.budget.add_item(len(content) + 50, tokens=_estimate_message_tokens(knowledge_item.role, knowledge_item.content)):
                 self.items.append(knowledge_item)
                 self.provenance.append({
                     "source": "knowledge",
@@ -782,15 +843,26 @@ class ContextBuilder:
         protected_chars = sum(item.char_count() for item in protected_items)
         required_messages = len(protected_items) + len(user_items)
         required_original_chars = protected_chars + sum(item.char_count() for item in user_items)
+        protected_tokens = self.budget.fixed_tokens + sum(
+            _estimate_message_tokens(item.role, item.content) for item in protected_items
+        )
+        required_original_tokens = protected_tokens + sum(
+            _estimate_message_tokens(item.role, item.content) for item in user_items
+        )
         if (
             protected_chars > self.runtime_limits.max_context_chars
             or required_messages > self.runtime_limits.max_context_messages
+            or (
+                self.runtime_limits.max_context_tokens is not None
+                and protected_tokens > self.runtime_limits.max_context_tokens
+            )
         ):
             self.budget.required_overflow = True
             raise ContextBudgetExceeded(
                 required_messages=required_messages,
                 required_chars=required_original_chars,
                 limits=self.runtime_limits,
+                required_tokens=required_original_tokens,
             )
 
         # Preserve the current request's prefix and a digest marker if it cannot fit;
@@ -806,6 +878,7 @@ class ContextBuilder:
                 remaining_chars -= item.char_count()
                 continue
             digest = hashlib.sha256(item.content.encode("utf-8")).hexdigest()
+            original_tokens = _estimate_message_tokens(item.role, item.content)
             marker = f"...[TRUNCATED sha256={digest}]"
             if remaining_chars < len(marker):
                 self.budget.required_overflow = True
@@ -813,6 +886,7 @@ class ContextBuilder:
                     required_messages=required_messages,
                     required_chars=required_original_chars,
                     limits=self.runtime_limits,
+                    required_tokens=required_original_tokens,
                 )
             content = item.content[: remaining_chars - len(marker)] + marker
             self.items[index] = ContextItem(
@@ -822,7 +896,11 @@ class ContextBuilder:
                 trust_level=item.trust_level,
                 metadata={**item.metadata, "truncated": True, "original_content_sha256": digest},
             )
-            self.budget.record_truncation(0, item.char_count() - len(content))
+            self.budget.record_truncation(
+                0,
+                item.char_count() - len(content),
+                max(0, original_tokens - _estimate_message_tokens(item.role, content)),
+            )
             self.provenance.append({
                 "source": "user",
                 "type": "request_truncated",
@@ -840,25 +918,40 @@ class ContextBuilder:
         required_items = [item for item in self.items if is_required(item)]
         required_chars = sum(item.char_count() for item in required_items)
         required_messages = len(required_items)
+        required_tokens = self.budget.fixed_tokens + sum(
+            _estimate_message_tokens(item.role, item.content) for item in required_items
+        )
         self.budget.required_overflow = (
             required_chars > self.runtime_limits.max_context_chars
             or required_messages > self.runtime_limits.max_context_messages
+            or (
+                self.runtime_limits.max_context_tokens is not None
+                and required_tokens > self.runtime_limits.max_context_tokens
+            )
         )
         if self.budget.required_overflow:
             raise ContextBudgetExceeded(
                 required_messages=required_messages,
                 required_chars=required_chars,
                 limits=self.runtime_limits,
+                required_tokens=required_tokens,
             )
 
         actual_chars = sum(item.char_count() for item in self.items)
         actual_messages = len(self.items)
+        actual_message_tokens = sum(_estimate_message_tokens(item.role, item.content) for item in self.items)
         self.budget.current_chars = actual_chars
         self.budget.current_messages = actual_messages
+        self.budget.current_tokens = actual_message_tokens
+        token_overflow = (
+            self.runtime_limits.max_context_tokens is not None
+            and self.budget.total_tokens > self.runtime_limits.max_context_tokens
+        )
         if (
             not self.budget.truncated
             and actual_chars <= self.runtime_limits.max_context_chars
             and actual_messages <= self.runtime_limits.max_context_messages
+            and not token_overflow
         ):
             return self
         
@@ -890,34 +983,47 @@ class ContextBuilder:
         new_items = list(required_items)
         current_chars = sum(item.char_count() for item in required_items)
         current_messages = len(required_items)
+        current_tokens = sum(_estimate_message_tokens(item.role, item.content) for item in required_items)
         chars_removed = 0
         messages_removed = 0
+        tokens_removed = 0
         
         # Add optional items until we hit the limit
         for item in optional_items:
             item_chars = item.char_count()
+            item_tokens = _estimate_message_tokens(item.role, item.content)
             if (
                 current_chars + item_chars <= self.runtime_limits.max_context_chars
                 and current_messages + 1 <= self.runtime_limits.max_context_messages
+                and (
+                    self.runtime_limits.max_context_tokens is None
+                    or self.budget.fixed_tokens + current_tokens + item_tokens <= self.runtime_limits.max_context_tokens
+                )
             ):
                 new_items.append(item)
                 current_chars += item_chars
                 current_messages += 1
+                current_tokens += item_tokens
             else:
                 chars_removed += item_chars
                 messages_removed += 1
+                tokens_removed += item_tokens
 
         self.items = new_items
         self.budget.current_chars = current_chars
         self.budget.current_messages = current_messages
-        if messages_removed > 0 or chars_removed > 0:
-            self.budget.record_truncation(messages_removed, chars_removed)
+        self.budget.current_tokens = current_tokens
+        if messages_removed > 0 or chars_removed > 0 or tokens_removed > 0:
+            self.budget.record_truncation(messages_removed, chars_removed, tokens_removed)
         if self.budget.truncated and not self.budget.truncation_reported:
             self.provenance.append({
                 "source": "truncation",
                 "type": "deterministic",
                 "messages_removed": self.budget.messages_removed,
                 "chars_removed": self.budget.chars_removed,
+                "tokens_removed": self.budget.tokens_removed,
+                "estimated_tokens": self.budget.total_tokens,
+                "token_limit": self.runtime_limits.max_context_tokens,
             })
             self.budget.truncation_reported = True
 
@@ -954,6 +1060,16 @@ class ContextBuilder:
         
         # Apply truncation
         self.apply_deterministic_truncation()
+
+        if self.runtime_limits.max_context_tokens is not None:
+            self.provenance.append({
+                "source": "context_budget",
+                "type": "provider_window_estimate",
+                "estimated_tokens": self.budget.total_tokens,
+                "token_limit": self.runtime_limits.max_context_tokens,
+                "tokens_removed": self.budget.tokens_removed,
+                "estimator": "utf8_heuristic_v1",
+            })
         
         # Convert items to messages
         messages = [item.to_message() for item in self.items]
@@ -1035,6 +1151,8 @@ class ContextEngine:
         evidence_state: list[dict[str, Any]] | None = None,
         strategy_state: dict[str, Any] | None = None,
         current_observation: dict[str, Any] | None = None,
+        include_tool_schema_tokens: bool = True,
+        include_tool_summary: bool = True,
     ) -> AgentContext:
         """Build context for a user request.
         
@@ -1048,6 +1166,8 @@ class ContextEngine:
             runtime_limits: Runtime limits from policy
             provider: Current provider name
             model: Current model name
+            include_tool_schema_tokens: Whether schemas are part of this provider request
+            include_tool_summary: Whether to add a textual tool list to the messages
             
         Returns:
             AgentContext with all necessary context
@@ -1068,6 +1188,7 @@ class ContextEngine:
             owner_policy_context=owner_policy_context,
             execution_state=execution_state,
             runtime_limits=runtime_limits,
+            include_tool_schema_tokens=include_tool_schema_tokens,
         )
         
         # 1. System Instructions (highest priority)
@@ -1086,7 +1207,7 @@ class ContextEngine:
         builder.add_security_context(security_context)
         
         # 4. Available Tools (from registry)
-        builder.add_tool_definitions()
+        builder.add_tool_definitions(include_summary=include_tool_summary)
         
         # 5. Conversation History
         if conversation_messages:

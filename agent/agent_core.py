@@ -104,7 +104,12 @@ class AgentCore:
         limits = RuntimeLimits()
         context_length = getattr(self.router, "context_length", None)
         if isinstance(context_length, int) and not isinstance(context_length, bool) and context_length > 0:
-            limits = replace(limits, max_context_chars=min(limits.max_context_chars, context_length * 2))
+            limits = replace(
+                limits,
+                max_context_chars=min(limits.max_context_chars, context_length * 2),
+                # Keep one fifth of the provider window for generation and framing variance.
+                max_context_tokens=max(1, context_length * 4 // 5),
+            )
         return limits
 
     @staticmethod
@@ -148,8 +153,11 @@ class AgentCore:
             owner_policy_context=policy_context,
             tool_results=tool_results or None,
             execution_state=ExecutionState.initial(request_id, conversation_id or "agent-core"),
+            runtime_limits=self._context_runtime_limits(),
             memory_provider=memory_provider,
             knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
+            include_tool_schema_tokens=True,
+            include_tool_summary=False,
         )
         messages = context.provider_messages()
         schemas = self._schemas()
@@ -224,6 +232,7 @@ class AgentCore:
             strategy_state=mission.get("strategy_state") or {},
             current_observation=payload.get("observation") or {},
             knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
+            include_tool_schema_tokens=False,
         )
         response = self.router.generate(context.provider_messages(), reasoning_profile=select_reasoning_profile(prompt))
         content = str(response.get("content", "") or "").strip()
