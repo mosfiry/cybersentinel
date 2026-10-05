@@ -934,7 +934,7 @@ class MissionRuntime:
         delegation_scope: Any = None,
     ) -> Any:
         """Dispatch native-model tools with the same strict workspace/evidence boundary."""
-        from tools.registry import TOOL_TIMEOUTS, execute as execute_tool, get_tool
+        from tools.registry import execute as execute_tool, get_tool
 
         spec = get_tool(name)
         if spec is None:
@@ -943,7 +943,7 @@ class MissionRuntime:
         if timeout_seconds is not None:
             if timeout_seconds <= 0:
                 raise _MissionBudgetExceeded("max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
-            timeout = min(timeout_seconds, TOOL_TIMEOUTS.get(name, spec.timeout))
+            timeout = min(timeout_seconds, spec.timeout)
 
         workspace = None
         evidence_store = None

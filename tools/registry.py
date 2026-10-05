@@ -11,13 +11,24 @@ import hashlib
 import inspect
 import json
 import math
+import re
 import threading
 import uuid
 
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
+VALID_NETWORK_ACCESS = frozenset({
+    "none", "allowlisted_search_provider", "allowlisted_intel_providers",
+    "scope_pinned_browser", "scope_pinned_web_research", "scope_pinned_mcp",
+    "host_process_unscoped",
+})
+VALID_FILESYSTEM_ACCESS = frozenset({
+    "none", "host_fs_via_process", "mission_artifact_write",
+})
+VALID_PROCESS_ACCESS = frozenset({"none", "workspace_process_unisolated"})
+VALID_CREDENTIAL_ACCESS = frozenset({"none", "provider_managed", "host_user_credentials_possible"})
+VALID_RATE_LIMITS = frozenset({"bounded"})
 DEFAULT_TOOL_TIMEOUT = 30
-TOOL_TIMEOUTS = {"run_project_tests": 65, "refresh_intel": 30}
 
 
 def _canonical_json_chunks(value: Any):
@@ -537,17 +548,80 @@ from .mcp_client import mcp_discover, mcp_invoke
 from .web_research import web_research
 
 
+def _access_metadata_valid(spec: ToolSpec) -> bool:
+    label_pattern = r"[a-z][a-z0-9_.-]{0,63}"
+    if not isinstance(spec.description, str) or not spec.description or len(spec.description) > 512:
+        return False
+    if not isinstance(spec.version, str) or not spec.version or len(spec.version) > 32:
+        return False
+    if not isinstance(spec.effect_provider, str) or len(spec.effect_provider) > 128:
+        return False
+    if any(not isinstance(value, bool) for value in (
+        spec.idempotency_supported, spec.execution_context_required,
+        spec.allow_custom_input_schema, spec.scope_rate_deferred,
+    )):
+        return False
+    if not isinstance(spec.risk_class, str) or spec.risk_class not in VALID_RISK_CLASSES:
+        return False
+    for value, choices in (
+        (spec.network_access, VALID_NETWORK_ACCESS),
+        (spec.filesystem_access, VALID_FILESYSTEM_ACCESS),
+        (spec.process_access, VALID_PROCESS_ACCESS),
+        (spec.credential_access, VALID_CREDENTIAL_ACCESS),
+        (spec.rate_limit, VALID_RATE_LIMITS),
+    ):
+        if not isinstance(value, str) or value not in choices:
+            return False
+    if not isinstance(spec.timeout, int) or isinstance(spec.timeout, bool) or not 1 <= spec.timeout <= 600:
+        return False
+    if not isinstance(spec.evidence_requirements, tuple) or not 1 <= len(spec.evidence_requirements) <= 16:
+        return False
+    if any(not isinstance(item, str) or not re.fullmatch(label_pattern, item) for item in spec.evidence_requirements):
+        return False
+    if len(set(spec.evidence_requirements)) != len(spec.evidence_requirements):
+        return False
+    if not isinstance(spec.scope_requirements, tuple) or len(spec.scope_requirements) > 16:
+        return False
+    if any(not isinstance(item, str) or not re.fullmatch(label_pattern, item) for item in spec.scope_requirements):
+        return False
+    if len(set(spec.scope_requirements)) != len(spec.scope_requirements):
+        return False
+    if any(not isinstance(value, bool) for value in (spec.requires_owner, spec.owner_only, spec.scope_required)):
+        return False
+    if any(not isinstance(value, dict) for value in (spec.input_schema, spec.output_schema)):
+        return False
+    if spec.scope_required and (not spec.requires_owner or not spec.scope_requirements):
+        return False
+    if not spec.scope_required and spec.scope_requirements:
+        return False
+    if spec.network_access.startswith("scope_pinned_") and not spec.scope_required:
+        return False
+    if spec.process_access != "none" and spec.risk_class != "bounded-exec":
+        return False
+    if spec.filesystem_access == "host_fs_via_process" and (
+        spec.risk_class != "bounded-exec" or spec.process_access != "workspace_process_unisolated"
+    ):
+        return False
+    if spec.network_access == "host_process_unscoped" and (
+        spec.risk_class != "bounded-exec" or spec.process_access != "workspace_process_unisolated"
+    ):
+        return False
+    if spec.credential_access != "none" and not spec.requires_owner:
+        return False
+    return True
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
-        if not isinstance(spec, ToolSpec) or not spec.name or spec.name in registry:
+        if not isinstance(spec, ToolSpec) or not isinstance(spec.name, str) or not spec.name or spec.name in registry:
             raise ValueError("duplicate or invalid tool specification")
         scope_namespace = spec.name.split(".", 1)[0]
         scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "mcp", "report"}
         if (
             not spec.description
+            or not _access_metadata_valid(spec)
             or not isinstance(spec.parallel_execution_safe, bool)
-            or spec.risk_class not in VALID_RISK_CLASSES
             or not callable(spec.handler)
             or (spec.owner_only and not spec.requires_owner)
             or (scope_namespace in scope_namespaces and not spec.scope_required)
@@ -596,7 +670,7 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
 REGISTRY = build_registry([
     ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status),
     ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel),
-    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel, effect_provider="cybersentinel.intel-collectors"),
+    ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel, network_access="allowlisted_intel_providers", effect_provider="cybersentinel.intel-collectors"),
     ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security),
     ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info),
     ToolSpec(
@@ -612,9 +686,9 @@ REGISTRY = build_registry([
     ),
     ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch, effect_provider="cybersentinel.local-state"),
     ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch, effect_provider="cybersentinel.local-state"),
-    ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests, effect_provider="cybersentinel.workspace-process"),
+    ToolSpec("run_project_tests", "Run pytest -q within the selected project test root; its subprocess is not OS-isolated and can access host files/network.", "bounded-exec", True, str, _run_project_tests, network_access="host_process_unscoped", filesystem_access="host_fs_via_process", process_access="workspace_process_unisolated", credential_access="host_user_credentials_possible", timeout=65, effect_provider="cybersentinel.workspace-process"),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
-    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True, effect_provider="cybersentinel.scoped-http"),
+    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True, scope_requirements=("canonical_owner_scope", "target_identity"), effect_provider="cybersentinel.scoped-http"),
     ToolSpec(
         "browser", "Open/navigate a scoped Chromium session; extract text/links/DOM, screenshot, download inert files, or close. Web data is untrusted.",
         "network-read", True, dict, browser_read, scope_required=True, version="1.0.0",
@@ -1121,7 +1195,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 ) from exc
         return result
 
-    limit = timeout if timeout is not None else TOOL_TIMEOUTS.get(name, spec.timeout)
+    limit = timeout if timeout is not None else spec.timeout
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if name == "run_project_tests":
         workspace_authorization = mission_authorization
