@@ -42,13 +42,14 @@ from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnder
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
 
-    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None):
+    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_registry: Any = None):
         self.router = router
         self.store = store or MissionStore(db_path or DB_PATH.with_name("missions.sqlite3"))
         self.max_iterations = max_iterations
         self.knowledge_retriever = knowledge_retriever or TypedKnowledgeRetriever()
         self.event_bus = event_bus
         self.hook_registry = hook_registry
+        self.skill_registry = skill_registry
         self.task_graph_policy = task_graph_policy or AgentGraphPolicy(
             max_retries=RecoveryPolicy().max_retries,
             max_parallel_tasks=4,
@@ -115,24 +116,38 @@ class AgentCore:
             return [ToolCall(payload["name"], payload.get("arguments") or {}, str(payload.get("id") or uuid.uuid4().hex))]
         return []
 
-    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "") -> dict[str, Any]:
+    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None) -> dict[str, Any]:
         profile = select_reasoning_profile(objective)
+        tool_results = [("observation", observation)] if observation else []
+        skill_tool_names: set[str] | None = None
+        if skill_context is not None:
+            tool_results.append(("approved_skill_guidance", {
+                "record_type": "UNTRUSTED_SKILL_GUIDANCE",
+                "authority": "none",
+                "content": dict(skill_context),
+            }))
+            ceiling = skill_context.get("allowed_tools_ceiling", ())
+            if isinstance(ceiling, (list, tuple)) and ceiling:
+                skill_tool_names = {str(item) for item in ceiling}
         context = ContextEngine.build(
             user_text=objective,
             conversation_id=conversation_id or "agent-core",
             owner_policy_context=policy_context,
-            tool_results=[("observation", observation)] if observation else None,
+            tool_results=tool_results or None,
             execution_state=ExecutionState.initial(request_id, conversation_id or "agent-core"),
             knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
         )
         messages = context.provider_messages()
+        schemas = self._schemas()
+        if skill_tool_names is not None:
+            schemas = [item for item in schemas if str(item.get("function", {}).get("name", "")) in skill_tool_names]
         try:
-            return self.router.tool_calling(messages, self._schemas(), reasoning_profile=profile)
+            return self.router.tool_calling(messages, schemas, reasoning_profile=profile)
         except CapabilityUnsupported:
             return self.router.generate(messages, reasoning_profile=profile)
 
-    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "") -> Plan:
-        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id)
+    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None) -> Plan:
+        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context)
         self._last_model_response = dict(response)
         calls = self._calls(response)
         steps: list[PlanStep] = []
@@ -212,6 +227,55 @@ class AgentCore:
         snapshot = capture_policy_snapshot(request_id, evidence)
         return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=evidence.session_id), policy_context_from_snapshot(snapshot)
 
+    @staticmethod
+    def _canonical_owner_ref_from_context(context: AuthorizationContext) -> str:
+        from security.owner_password import authenticated_owner
+        session_id = str(getattr(context, "session_id", "") or getattr(context.owner_evidence, "session_id", ""))
+        active_owner = authenticated_owner(session_id) if session_id else None
+        if not isinstance(active_owner, dict) or active_owner.get("owner_id") is None:
+            from .intelligence_layer.skills import SkillAuthorizationError
+            raise SkillAuthorizationError("an active canonical Owner session is required for Skill use")
+        return f"owner:{int(active_owner['owner_id'])}"
+
+    def _canonical_owner_ref_for_mission(self, mission: Mission) -> str:
+        try:
+            context = AuthorizationContext.from_dict(dict(mission.authorization_context or {}))
+        except (KeyError, TypeError, ValueError, PermissionError) as exc:
+            from .intelligence_layer.skills import SkillAuthorizationError
+            raise SkillAuthorizationError("Mission Owner evidence is invalid for Skill use") from exc
+        return self._canonical_owner_ref_from_context(context)
+
+    def _resolve_mission_skill_context(self, mission: Mission):
+        from .intelligence_layer.skills import SkillAuthorizationError
+        if not mission.skill_binding:
+            return None
+        if self.skill_registry is None:
+            raise SkillAuthorizationError("selected Skill registry is unavailable")
+        persisted = self.store.load(mission.mission_id)
+        if persisted is None or not persisted.verify_integrity():
+            raise SkillAuthorizationError("integrity-verified Mission state is unavailable")
+        delegated_view = bool((mission.provenance or {}).get("delegated_step_id"))
+        for field_name in ("mission_id", "request_id", "owner_identity_ref", "skill_binding", "authorization_context"):
+            if getattr(mission, field_name) != getattr(persisted, field_name):
+                raise SkillAuthorizationError("task Mission view does not match its integrity-covered parent")
+        try:
+            current_auth = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+            persisted_auth = MissionAuthorizationSnapshot.from_dict(dict(persisted.authorization_snapshot or {}))
+        except (KeyError, TypeError, ValueError, PermissionError) as exc:
+            raise SkillAuthorizationError("task Mission authorization snapshot is invalid") from exc
+        if current_auth.authorization_hash != persisted_auth.authorization_hash:
+            raise SkillAuthorizationError("task Mission authorization differs from its integrity-covered parent")
+        if not delegated_view and mission.scope_snapshot != persisted.scope_snapshot:
+            raise SkillAuthorizationError("Mission scope view does not match its integrity-covered state")
+        checkpoint = mission.checkpoint if isinstance(mission.checkpoint, dict) else {}
+        if checkpoint.get("status") in {"in_flight", "in_flight_parallel"} and checkpoint.get("skill_reference") != persisted.skill_binding:
+            raise SkillAuthorizationError("execution checkpoint does not match its Skill binding")
+        canonical_owner = self._canonical_owner_ref_for_mission(persisted)
+        return self.skill_registry.resolve_mission_context(
+            persisted,
+            canonical_owner_identity_ref=canonical_owner,
+        )
+
     def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None, delegation_scope: Any = None) -> dict[str, Any]:
         from .execution_fence import ExecutionFenceError
         from .external_effects import EffectRecoveryRequired
@@ -220,6 +284,13 @@ class AgentCore:
         execution_fence.assert_active_execution(mission)
         if step.action == "__planning_failure__":
             return {"success": False, "failure_class": dict(step.retry_policy).get("failure_class", "LOGIC"), "error": "malformed, empty, or unknown tool proposal"}
+        selected_skill_context = None
+        if mission.skill_binding:
+            from .intelligence_layer.skills import SkillAuthorizationError
+            selected_skill_context = self._resolve_mission_skill_context(mission)
+            if delegation_scope is None:
+                raise SkillAuthorizationError("Skill-bound tool dispatch requires a task-scoped delegation grant")
+            delegation_scope = selected_skill_context.narrow_task_scope(delegation_scope, tool_name=step.action)
         arguments = dict(step.retry_policy).get("arguments", {})
         argument = arguments.get("query") if isinstance(arguments, dict) else None
         raw = mission.authorization_context or {}
@@ -236,6 +307,7 @@ class AgentCore:
         decision = authorize_tool(item, context=context)
         if not decision.allowed:
             return {"success": False, "failure_class": "AUTHORIZATION", "error": decision.reason}
+        from .intelligence_layer.skills import SkillAuthorizationError
         try:
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
             workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
@@ -250,6 +322,10 @@ class AgentCore:
                 require_execution_fence=True,
             )
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
+            if selected_skill_context is not None:
+                # Last live Skill approval/revocation/expiry check immediately before canonical dispatch.
+                selected_skill_context = self._resolve_mission_skill_context(mission)
+                delegation_scope = selected_skill_context.narrow_task_scope(delegation_scope, tool_name=step.action)
             value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except EffectRecoveryRequired as exc:
@@ -262,6 +338,8 @@ class AgentCore:
                 "reason_code": exc.reason_code,
                 "execution_id": action_id,
             }
+        except SkillAuthorizationError:
+            raise
         except ExecutionFenceError:
             raise
         except Exception as exc:
@@ -317,7 +395,7 @@ class AgentCore:
             raise KeyError("unknown_mission")
         return result
 
-    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True) -> Mission:
+    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True, skill_id: str | None = None) -> Mission:
         request_id = request_id or uuid.uuid4().hex
         authorization_context, policy_context = self._auth(instruction, owner_session_token, request_id)
         if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
@@ -331,6 +409,19 @@ class AgentCore:
                 scope_snapshot=snapshot,
                 session_id=authorization_context.session_id,
             )
+        mission_id = uuid.uuid4().hex
+        skill_binding = None
+        skill_context_payload = None
+        if skill_id is not None:
+            from .intelligence_layer.skills import SkillAuthorizationError
+            if self.skill_registry is None:
+                raise SkillAuthorizationError("explicit Skill selection requires a configured Skill registry")
+            canonical_owner = self._canonical_owner_ref_from_context(authorization_context)
+            skill_binding = self.skill_registry.bind_mission(canonical_owner, mission_id, str(skill_id))
+            effective_scope = tuple((scope_context or {}).get("scope", ("workspace",)))
+            if skill_binding.allowed_scope and not set(skill_binding.allowed_scope).issubset(set(effective_scope)):
+                raise SkillAuthorizationError("selected Skill scope exceeds the Owner-requested Mission scope")
+            skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
         planning_policy = RecoveryPolicy()
         planning_run_id = uuid.uuid4().hex
         planning_failures: list[dict[str, Any]] = []
@@ -340,7 +431,12 @@ class AgentCore:
             provider_attempt = attempt_index + 1
             self._last_model_response = {}
             try:
-                candidate_plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id)
+                if skill_binding is not None:
+                    if self._canonical_owner_ref_from_context(authorization_context) != skill_binding.owner_identity_ref:
+                        from .intelligence_layer.skills import SkillAuthorizationError
+                        raise SkillAuthorizationError("active canonical Owner changed during Skill-guided planning")
+                    skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
+                candidate_plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id, skill_context=skill_context_payload)
             except ProviderError as exc:
                 kind = getattr(getattr(exc, "kind", None), "value", getattr(exc, "kind", "PROVIDER_FAILURE"))
                 retryable_kind = str(kind) in {"PROVIDER_FAILURE", "TIMEOUT"}
@@ -404,6 +500,11 @@ class AgentCore:
                 planning_exhausted = True
                 break
 
+            if skill_binding is not None:
+                proposed_tools = {str(step.action) for step in candidate_plan.steps if step.action != "__planning_failure__"}
+                if not proposed_tools.issubset(set(skill_binding.required_tools)):
+                    from .intelligence_layer.skills import SkillAuthorizationError
+                    raise SkillAuthorizationError("model proposal exceeds the explicitly selected Skill tool ceiling")
             if candidate_plan.steps and candidate_plan.steps[0].action == "__planning_failure__":
                 final_content = str(self._last_model_response.get("content", "") or "").strip()
                 if final_content and not self._last_model_response.get("error"):
@@ -441,10 +542,28 @@ class AgentCore:
         if plan is None:
             raise RuntimeError("owner mission planning ended without a plan or recorded failure")
         task_profile = TaskProfile.from_proposal(instruction, {"task_type": "owner_mission", "horizon": "long_horizon", "complexity": "multi_step", "likely_tools": [step.action for step in plan.steps if step.action != "__planning_failure__"]})
+        def replan_with_selected_skill(current: Mission, observation: dict[str, Any]) -> Plan:
+            selected_context = self._resolve_mission_skill_context(current) if current.skill_binding else None
+            selected_payload = selected_context.to_untrusted_context() if selected_context is not None else None
+            new_plan = self._plan(
+                current.objective,
+                observation,
+                policy_context=policy_context,
+                request_id=current.request_id,
+                conversation_id=current.mission_id,
+                skill_context=selected_payload,
+            )
+            if selected_context is not None:
+                proposed_tools = {str(step.action) for step in new_plan.steps if step.action != "__planning_failure__"}
+                if not proposed_tools.issubset(set(selected_context.binding.required_tools)):
+                    from .intelligence_layer.skills import SkillAuthorizationError
+                    raise SkillAuthorizationError("replanned action exceeds the selected Skill tool ceiling")
+            return new_plan
+
         runtime = MissionRuntime(
             self.store,
             executor=self._executor,
-            replanner=lambda mission, observation: self._plan(mission.objective, observation, policy_context=policy_context, request_id=mission.request_id, conversation_id=mission.mission_id),
+            replanner=replan_with_selected_skill,
             recovery_policy=RecoveryPolicy(),
             interpreter=ObservationInterpreter(proposer=self._observation_proposal),
             require_authorization_snapshot=True,
@@ -452,6 +571,7 @@ class AgentCore:
             event_bus=self.event_bus,
             hook_registry=self.hook_registry,
             task_graph_policy=self.task_graph_policy,
+            skill_context_provider=self._resolve_mission_skill_context,
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
@@ -518,6 +638,8 @@ class AgentCore:
             authorization_snapshot_factory=authorization_snapshot_factory,
             planning_failures=planning_failures or None,
             planning_exhausted=planning_exhausted,
+            mission_id=mission_id,
+            skill_binding=skill_binding.to_dict() if skill_binding is not None else None,
         )
         if getattr(self, "_last_model_response", None):
             mission.progress["initial_model_response"] = dict(self._last_model_response)
@@ -529,6 +651,16 @@ class AgentCore:
         if any(token in instruction.casefold() for token in ("investigate", "whether", "تحقق", "حقق", "حادث", "incident")):
             mission.hypotheses = [HypothesisState("H1", f"Primary explanation for: {mission.objective}", HypothesisStatus.ACTIVE, 0.5, provenance={"source": "owner_objective", "authority": None}).to_dict()]
         self.store.save(mission)
+        if skill_binding is not None:
+            try:
+                # Ensure the persisted Mission integrity and live approval still match before any worker can start.
+                self._resolve_mission_skill_context(mission)
+            except Exception:
+                mission.error = "selected Skill context failed live validation"
+                mission.failures.append({"class": FailureClass.AUTHORIZATION.value, "reason_code": "mission_skill_context_invalid"})
+                if not mission.is_terminal:
+                    mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+                return self.store.save(mission)
         if not run:
             return mission
         if plan.steps and plan.steps[0].action == "__planning_failure__":
@@ -556,7 +688,8 @@ class AgentCore:
             initial = result.progress.get("initial_model_response", {})
             if initial.get("tool_calls") and not result.progress.get("last_model_content"):
                 try:
-                    final_response = self._ask(result.objective, result.observations[-1] if result.observations else None, policy_context=policy_context, request_id=result.request_id, conversation_id=result.mission_id)
+                    skill_context = self._resolve_mission_skill_context(result) if result.skill_binding else None
+                    final_response = self._ask(result.objective, result.observations[-1] if result.observations else None, policy_context=policy_context, request_id=result.request_id, conversation_id=result.mission_id, skill_context=skill_context.to_untrusted_context() if skill_context is not None else None)
                     if final_response.get("content"):
                         result.progress["last_model_content"] = str(final_response["content"])
                         result.progress["last_model_response"] = dict(final_response)
@@ -660,7 +793,18 @@ class AgentCore:
     def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
         mission, _, fresh_snapshot = self._reauthorize_mission(mission_id, owner_session_token=owner_session_token)
         policy_context = policy_context_from_snapshot(fresh_snapshot)
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry, task_graph_policy=self.task_graph_policy)
+        def replan_resumed(current: Mission, observation: dict[str, Any]) -> Plan:
+            selected = self._resolve_mission_skill_context(current) if current.skill_binding else None
+            payload = selected.to_untrusted_context() if selected is not None else None
+            proposed = self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id, skill_context=payload)
+            if selected is not None:
+                tools = {str(step.action) for step in proposed.steps if step.action != "__planning_failure__"}
+                if not tools.issubset(set(selected.binding.required_tools)):
+                    from .intelligence_layer.skills import SkillAuthorizationError
+                    raise SkillAuthorizationError("replanned action exceeds the selected Skill tool ceiling")
+            return proposed
+
+        runtime = MissionRuntime(self.store, executor=self._executor, replanner=replan_resumed, recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry, task_graph_policy=self.task_graph_policy, skill_context_provider=self._resolve_mission_skill_context)
         return self._run_via_fenced_worker(runtime, mission_id, max_slices=max_slices or self.max_iterations)
 
 

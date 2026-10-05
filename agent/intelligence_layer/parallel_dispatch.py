@@ -112,6 +112,7 @@ def _recover_unknown_batch(runtime: Any, mission: Mission, fence: Any, entries: 
         step_id=step_ids[0] if step_ids else "",
         data={**failure, "recovery": "reconciliation_required"},
     )
+    skill_reference = (mission.checkpoint or {}).get("skill_reference")
     mission.checkpoint = {
         "status": "in_flight_parallel",
         "plan_version": mission.plan.version,
@@ -122,11 +123,13 @@ def _recover_unknown_batch(runtime: Any, mission: Mission, fence: Any, entries: 
         "execution_ids": action_ids,
         "ambiguous_execution_ids": action_ids,
     }
+    if isinstance(skill_reference, dict):
+        mission.checkpoint["skill_reference"] = dict(skill_reference)
     mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
     return runtime._save(mission, execution_fence=fence)
 
 
-def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any) -> Mission | None:
+def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any, *, skill_context: Any = None) -> Mission | None:
     """Run a contiguous independent batch of task-scoped, safe read tools.
 
     Returning ``None`` means normal single-step dispatch should proceed. A
@@ -222,6 +225,15 @@ def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any) -> M
     if len(selected) < 2:
         return None
 
+    if skill_context is not None:
+        try:
+            for item in selected:
+                item["delegation_scope"] = skill_context.narrow_task_scope(
+                    item["delegation_scope"], tool_name=item["step"].action
+                )
+        except Exception:
+            return runtime._block_on_skill_context(mission)
+
     # Claims, signatures, and checkpoint become one integrity-covered Mission
     # save before any thread can enter a tool handler.
     try:
@@ -252,6 +264,8 @@ def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any) -> M
         "action_ids": [str(item["action_id"]) for item in selected],
         "execution_ids": [str(item["action_id"]) for item in selected],
     }
+    if skill_context is not None:
+        mission.checkpoint["skill_reference"] = skill_context.reference
     first_fence = runtime._fence_for(
         mission,
         task_id=str(selected[0]["step"].step_id),
@@ -431,6 +445,8 @@ def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any) -> M
         "action_ids": [str(item["action_id"]) for item in selected],
         "fan_in": "completed_in_plan_order",
     }
+    if skill_context is not None:
+        batch_checkpoint["skill_reference"] = skill_context.reference
     mission.checkpoint = batch_checkpoint
 
     if interpretation_error is not None:

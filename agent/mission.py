@@ -91,12 +91,13 @@ class Mission:
     verification_history: list[dict[str, Any]] = field(default_factory=list)
     recovery_events: list[dict[str, Any]] = field(default_factory=list)
     agent_task_graph_state: dict[str, Any] = field(default_factory=dict)
+    skill_binding: dict[str, Any] | None = None
     semantic_intent: dict[str, Any] = field(default_factory=dict)
     integrity_hash: str = ""
 
     @classmethod
-    def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50, request_id: str = "", owner_identity_ref: str = "", owner_instruction: str = "", policy_snapshot: dict[str, Any] | None = None, authorization_snapshot: dict[str, Any] | None = None, provenance: dict[str, Any] | None = None) -> "Mission":
-        mission = cls(mission_id or uuid.uuid4().hex, owner_request, objective, MissionStatus.CREATED, plan, authorization_context=authorization_context, scope_snapshot=scope_snapshot, completion_criteria=completion_criteria or [], max_iterations=max_iterations, request_id=request_id, owner_identity_ref=owner_identity_ref, owner_instruction=owner_instruction or owner_request, policy_snapshot=policy_snapshot, authorization_snapshot=authorization_snapshot, provenance=provenance or {})
+    def create(cls, owner_request: str, objective: str, plan: Plan, *, mission_id: str | None = None, authorization_context: dict[str, Any] | None = None, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, max_iterations: int = 50, request_id: str = "", owner_identity_ref: str = "", owner_instruction: str = "", policy_snapshot: dict[str, Any] | None = None, authorization_snapshot: dict[str, Any] | None = None, provenance: dict[str, Any] | None = None, skill_binding: dict[str, Any] | None = None) -> "Mission":
+        mission = cls(mission_id or uuid.uuid4().hex, owner_request, objective, MissionStatus.CREATED, plan, authorization_context=authorization_context, scope_snapshot=scope_snapshot, completion_criteria=completion_criteria or [], max_iterations=max_iterations, request_id=request_id, owner_identity_ref=owner_identity_ref, owner_instruction=owner_instruction or owner_request, policy_snapshot=policy_snapshot, authorization_snapshot=authorization_snapshot, provenance=provenance or {}, skill_binding=dict(skill_binding) if skill_binding else None)
         mission.plan_history = [{"version": plan.version, "fingerprint": plan.fingerprint, "reason": "created"}]
         mission.transition(MissionStatus.PLANNING, "mission created")
         mission.emit(EventType.MISSION_STARTED, data={"objective": mission.objective})
@@ -147,7 +148,7 @@ class Mission:
         self.emit(EventType.TOOL_EXECUTED, step_id=step_id, data={"action_id": action_id, "status": status})
 
     def _unsigned_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "mission_id": self.mission_id,
             "owner_request": self.owner_request,
             "objective": self.objective,
@@ -190,6 +191,18 @@ class Mission:
             "agent_task_graph_state": self.agent_task_graph_state,
             "semantic_intent": self.semantic_intent,
         }
+        # Keep pre-Skill mission digests stable; only selected Skills add a new field.
+        if self.skill_binding:
+            payload["skill_binding"] = dict(self.skill_binding)
+        return payload
+
+    def verify_integrity(self) -> bool:
+        if not self.integrity_hash:
+            return False
+        expected = hashlib.sha256(
+            json.dumps(self._unsigned_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+        return expected == self.integrity_hash
 
     def to_dict(self) -> dict[str, Any]:
         payload = self._unsigned_dict()

@@ -1,10 +1,10 @@
-"""Owner-scoped, versioned procedural skills with explicit approval gates.
+"""Owner-scoped, versioned declarative Skills with explicit approval gates.
 
-The registry stores procedures, never executable Python or prompt authority. Candidate
-and approved skill records remain untrusted data. Every execution step is rechecked
-against a live typed MissionAuthorizationSnapshot and a derived DelegationScope, then
-handed to an injected dispatcher that must route through MissionRuntime/ToolRegistry
-and its evidence/fence boundary. This module does not call tool handlers directly.
+Candidate and approved Skill records are untrusted data, never executable Python or
+prompt authority. AgentCore/MissionRuntime integration consumes only bounded descriptive
+guidance plus a restrictive tool/scope ceiling; it does not invoke the procedure runner.
+The separate explicit SkillExecutor remains an opt-in host API and is not wired into
+production Mission dispatch by this module.
 """
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ class SkillStatus(str, Enum):
     APPROVED = "approved"
     DEPRECATED = "deprecated"
     REVOKED = "revoked"
+    EXPIRED = "expired"
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class SkillDefinition:
     confidence: float = 0.0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     output_bindings: Mapping[str, str] = field(default_factory=dict)
+    expires_at: str | None = None
     content_hash: str = ""
 
     def __post_init__(self) -> None:
@@ -179,6 +181,9 @@ class SkillDefinition:
         if isinstance(self.confidence, bool) or not isinstance(self.confidence, (int, float)) or not 0.0 <= float(self.confidence) <= 1.0:
             raise ValueError("skill confidence must be between 0 and 1")
         object.__setattr__(self, "confidence", float(self.confidence))
+        if self.expires_at is not None:
+            expiry = _parse_expiry(self.expires_at)
+            object.__setattr__(self, "expires_at", expiry.isoformat())
         payload = self._payload()
         digest = hashlib.sha256(_json_bytes(payload, max_bytes=_MAX_SKILL_BYTES)).hexdigest()
         if self.content_hash and not hmac.compare_digest(self.content_hash, digest):
@@ -186,7 +191,7 @@ class SkillDefinition:
         object.__setattr__(self, "content_hash", digest)
 
     def _payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "skill_id": self.skill_id,
             "name": self.name,
             "description": self.description,
@@ -207,6 +212,10 @@ class SkillDefinition:
             "created_at": self.created_at,
             "output_bindings": dict(self.output_bindings),
         }
+        # Omitting the optional field preserves hashes for existing v1 records.
+        if self.expires_at is not None:
+            payload["expires_at"] = self.expires_at
+        return payload
 
     def to_dict(self) -> dict[str, Any]:
         return {**self._payload(), "content_hash": self.content_hash}
@@ -243,6 +252,107 @@ class SkillRevision:
     owner_identity_ref: str
     definition: SkillDefinition
     status: SkillStatus
+
+
+@dataclass(frozen=True)
+class SkillMissionBinding:
+    """Small integrity-covered reference; Skill content is never copied into Mission state."""
+
+    owner_identity_ref: str
+    mission_id: str
+    skill_id: str
+    version: int
+    content_hash: str
+    required_tools: tuple[str, ...]
+    allowed_scope: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not all(str(value).strip() for value in (self.owner_identity_ref, self.mission_id, self.skill_id)):
+            raise ValueError("mission Skill reference is missing Owner, Mission, or Skill identity")
+        if not _ID_RE.fullmatch(self.skill_id) or isinstance(self.version, bool) or not isinstance(self.version, int) or self.version < 1:
+            raise ValueError("mission Skill reference has an invalid Skill revision")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(self.content_hash)):
+            raise ValueError("mission Skill reference requires a SHA-256 digest")
+        tools = tuple(str(item).strip() for item in self.required_tools)
+        scope = tuple(str(item).strip() for item in self.allowed_scope)
+        if not tools or any(not item for item in tools) or len(tools) != len(set(tools)):
+            raise ValueError("mission Skill reference requires unique canonical tools")
+        if any(not item for item in scope) or len(scope) != len(set(scope)):
+            raise ValueError("mission Skill reference scope must contain unique non-empty values")
+        object.__setattr__(self, "required_tools", tools)
+        object.__setattr__(self, "allowed_scope", scope)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "owner_identity_ref": self.owner_identity_ref,
+            "mission_id": self.mission_id,
+            "skill_id": self.skill_id,
+            "version": self.version,
+            "content_hash": self.content_hash,
+            "required_tools": list(self.required_tools),
+            "allowed_scope": list(self.allowed_scope),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SkillMissionBinding":
+        data = dict(value)
+        if data.pop("schema_version", None) != 1:
+            raise SkillAuthorizationError("mission Skill reference schema is invalid")
+        if set(data) != {"owner_identity_ref", "mission_id", "skill_id", "version", "content_hash", "required_tools", "allowed_scope"}:
+            raise SkillAuthorizationError("mission Skill reference fields are invalid")
+        data["required_tools"] = tuple(data["required_tools"])
+        data["allowed_scope"] = tuple(data["allowed_scope"])
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class MissionSkillContext:
+    """Transient, untrusted descriptive context plus a strict tool/scope ceiling."""
+
+    binding: SkillMissionBinding
+    guidance: Mapping[str, Any]
+    target_identity: str = ""
+    root_authorization_hash: str = ""
+
+    @property
+    def reference(self) -> dict[str, Any]:
+        return self.binding.to_dict()
+
+    def to_untrusted_context(self) -> dict[str, Any]:
+        return {
+            "record_type": "UNTRUSTED_SKILL_GUIDANCE",
+            "authority": "none",
+            "skill_reference": self.reference,
+            "guidance": dict(self.guidance),
+            "allowed_tools_ceiling": list(self.binding.required_tools),
+            "allowed_scope_ceiling": list(self.binding.allowed_scope),
+        }
+
+    def narrow_task_scope(self, parent: DelegationScope, *, tool_name: str) -> DelegationScope:
+        if not isinstance(parent, DelegationScope):
+            raise SkillAuthorizationError("a typed task scope is required for Skill-bound dispatch")
+        binding = self.binding
+        if (parent.owner_identity_ref, parent.mission_id) != (binding.owner_identity_ref, binding.mission_id):
+            raise SkillAuthorizationError("task scope belongs to another Owner or Mission")
+        if self.target_identity and parent.target_identity != self.target_identity:
+            raise SkillAuthorizationError("task scope target differs from the selected Mission")
+        if self.root_authorization_hash and parent.root_authorization_hash != self.root_authorization_hash:
+            raise SkillAuthorizationError("task scope authorization digest differs from the selected Mission")
+        if tool_name not in binding.required_tools or tool_name not in parent.allowed_tools or tool_name not in parent.allowed_actions:
+            raise SkillAuthorizationError("task tool is outside the selected Skill and parent grant")
+        scope = binding.allowed_scope or parent.scope
+        if not scope or not set(scope).issubset(parent.scope):
+            raise SkillAuthorizationError("selected Skill scope is outside the task scope")
+        return parent.narrow(
+            target_identity=parent.target_identity,
+            scope=scope,
+            allowed_tools=(tool_name,),
+            allowed_actions=(tool_name,),
+            allowed_networks=parent.allowed_networks,
+            allowed_credentials=parent.allowed_credentials,
+            workspace_root=parent.workspace_root,
+        )
 
 
 @dataclass(frozen=True)
@@ -547,6 +657,18 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_expiry(value: str) -> datetime:
+    if not isinstance(value, str) or not value.strip() or len(value) > 64:
+        raise ValueError("Skill expiry must be a bounded timezone-aware timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Skill expiry must be a valid timezone-aware timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Skill expiry must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
 class SkillRegistry:
     """Versioned SQLite skill registry with immutable revisions and owner action events."""
 
@@ -672,7 +794,10 @@ class SkillRegistry:
         definition = SkillDefinition.from_dict(json.loads(row[1]))
         if not hmac.compare_digest(str(row[0]), definition.content_hash):
             raise SkillError("stored skill revision content hash mismatch")
-        return SkillRevision(owner_ref, definition, self._event_status(conn, owner_ref, skill_id, version))
+        status = self._event_status(conn, owner_ref, skill_id, version)
+        if status is not SkillStatus.REVOKED and definition.expires_at is not None and _parse_expiry(definition.expires_at) <= datetime.now(timezone.utc):
+            status = SkillStatus.EXPIRED
+        return SkillRevision(owner_ref, definition, status)
 
     def register_candidate(
         self,
@@ -823,6 +948,97 @@ class SkillRegistry:
             if revision is None or revision.status is not SkillStatus.APPROVED:
                 return None
             return revision
+
+    def bind_mission(self, owner_identity_ref: str, mission_id: str, skill_id: str) -> SkillMissionBinding:
+        owner_ref = str(owner_identity_ref).strip()
+        if not owner_ref or not str(mission_id).strip():
+            raise SkillAuthorizationError("canonical Owner and Mission identities are required")
+        revision = self.get_active(owner_ref, skill_id)
+        if revision is None or revision.status is not SkillStatus.APPROVED:
+            raise SkillAuthorizationError("Skill has no current, approved, unexpired revision for this Owner")
+        validate_skill_definition(revision.definition, self.tool_specs)
+        return SkillMissionBinding(
+            owner_identity_ref=owner_ref,
+            mission_id=str(mission_id),
+            skill_id=revision.definition.skill_id,
+            version=revision.definition.version,
+            content_hash=revision.definition.content_hash,
+            required_tools=revision.definition.required_tools,
+            allowed_scope=revision.definition.allowed_scope,
+        )
+
+    def guidance_for_binding(self, binding: SkillMissionBinding) -> MissionSkillContext:
+        if not isinstance(binding, SkillMissionBinding):
+            raise SkillAuthorizationError("typed mission Skill reference is required")
+        revision = self.get_active(binding.owner_identity_ref, binding.skill_id)
+        if (
+            revision is None
+            or revision.status is not SkillStatus.APPROVED
+            or revision.definition.version != binding.version
+            or not hmac.compare_digest(revision.definition.content_hash, binding.content_hash)
+            or tuple(revision.definition.required_tools) != binding.required_tools
+            or tuple(revision.definition.allowed_scope) != binding.allowed_scope
+        ):
+            raise SkillAuthorizationError("selected Skill is no longer the same approved revision")
+        validate_skill_definition(revision.definition, self.tool_specs)
+        # Do not expose the declarative procedure, constants, tests, or examples as executable steps.
+        guidance = {
+            "name": revision.definition.name,
+            "description": revision.definition.description,
+            "capabilities": list(revision.definition.capabilities),
+            "preconditions": list(revision.definition.preconditions),
+            "postconditions": list(revision.definition.postconditions),
+        }
+        _json_bytes(guidance, max_bytes=16_000)
+        return MissionSkillContext(binding, guidance)
+
+    def resolve_mission_context(self, mission: Any, *, canonical_owner_identity_ref: str) -> MissionSkillContext:
+        """Resolve a reference only after checking persisted Mission integrity and current authority."""
+        if not isinstance(getattr(mission, "skill_binding", None), dict) or not mission.skill_binding:
+            raise SkillAuthorizationError("Mission has no selected Skill reference")
+        verify_integrity = getattr(mission, "verify_integrity", None)
+        if not callable(verify_integrity) or verify_integrity() is not True:
+            raise SkillAuthorizationError("Mission integrity is invalid")
+        binding = SkillMissionBinding.from_dict(mission.skill_binding)
+        if (str(canonical_owner_identity_ref), str(mission.owner_identity_ref), str(mission.mission_id)) != (
+            binding.owner_identity_ref, binding.owner_identity_ref, binding.mission_id
+        ):
+            raise SkillAuthorizationError("Skill reference belongs to another canonical Owner or Mission")
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+            expected_version = int(mission.provenance.get("authorization_snapshot_version", 1))
+            valid, reason = snapshot.validate_for_mission(
+                mission_id=mission.mission_id,
+                owner_identity=canonical_owner_identity_ref,
+                target_identity=str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity),
+                version=expected_version,
+            )
+        except (KeyError, TypeError, ValueError, PermissionError) as exc:
+            raise SkillAuthorizationError("Mission authorization is invalid for Skill context") from exc
+        if not valid:
+            raise SkillAuthorizationError("Mission authorization is invalid for Skill context")
+        context = self.guidance_for_binding(binding)
+        definition = self.get_active(binding.owner_identity_ref, binding.skill_id).definition
+        plan_tools = {str(step.action) for step in mission.plan.steps if str(step.action) != "__planning_failure__"}
+        if plan_tools - set(binding.required_tools):
+            raise SkillAuthorizationError("Mission plan exceeds the selected Skill tool ceiling")
+        if plan_tools - set(snapshot.allowed_tools) or plan_tools - set(snapshot.allowed_actions) or plan_tools.intersection(snapshot.forbidden_actions):
+            raise SkillAuthorizationError("Mission plan exceeds current Owner authorization")
+        if definition.allowed_scope and not set(definition.allowed_scope).issubset(set(snapshot.scope)):
+            raise SkillAuthorizationError("selected Skill scope exceeds current Mission scope")
+        for tool_name in plan_tools:
+            spec = self.tool_specs.get(tool_name)
+            requirements = set(getattr(spec, "scope_requirements", ())) if spec is not None else set()
+            if getattr(spec, "scope_required", False) and not requirements.issubset(set(definition.allowed_scope)):
+                raise SkillAuthorizationError("selected Skill scope does not satisfy a canonical tool requirement")
+            if getattr(spec, "scope_required", False) and not requirements.issubset(set(snapshot.scope)):
+                raise SkillAuthorizationError("Owner scope does not satisfy a canonical tool requirement")
+        return MissionSkillContext(
+            binding=context.binding,
+            guidance=context.guidance,
+            target_identity=snapshot.target_identity,
+            root_authorization_hash=snapshot.authorization_hash,
+        )
 
     def list_revisions(self, owner_identity_ref: str, skill_id: str) -> list[SkillRevision]:
         if not str(owner_identity_ref).strip():
@@ -1081,7 +1297,7 @@ class SkillExecutor:
 
 
 __all__ = [
-    "AuthorizedSkillDispatcher", "SkillApprovalGrant", "SkillAuthorizationError", "SkillCandidateEvidence",
+    "AuthorizedSkillDispatcher", "MissionSkillContext", "SkillMissionBinding", "SkillApprovalGrant", "SkillAuthorizationError", "SkillCandidateEvidence",
     "SkillCritique", "SkillDefinition", "SkillError", "SkillExecutionContext", "SkillExecutionReceipt",
     "SkillExecutor", "SkillLearningPipeline", "SkillRegistry",
     "SkillRevision", "SkillStatus", "SkillStep", "SkillStepReceipt", "SkillTestCase",

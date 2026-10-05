@@ -40,7 +40,7 @@ class _MissionBudgetExceeded(RuntimeError):
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_context_provider: Callable[[Mission], Any] | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -63,6 +63,7 @@ class MissionRuntime:
                 raise TypeError("MissionRuntime hook_registry must be a HookRegistry")
         self.event_bus = event_bus
         self.hook_registry = hook_registry
+        self.skill_context_provider = skill_context_provider
         if task_graph_policy is not None and not isinstance(task_graph_policy, AgentGraphPolicy):
             raise TypeError("MissionRuntime task_graph_policy must be an AgentGraphPolicy")
         self.task_graph_adapter = MissionTaskGraphAdapter(task_graph_policy) if task_graph_policy is not None else None
@@ -107,6 +108,40 @@ class MissionRuntime:
             max_chars = min(max_chars, context_length * 2)
         max_messages = self._limit_value(self.runtime_limits.max_context_messages)
         return max_chars, max_messages
+
+    def _skill_context_for(self, mission: Mission) -> Any:
+        if not mission.skill_binding:
+            return None
+        from .intelligence_layer.skills import MissionSkillContext, SkillAuthorizationError
+        if self.skill_context_provider is None:
+            raise SkillAuthorizationError("selected Skill has no live context validator")
+        context = self.skill_context_provider(mission)
+        if not isinstance(context, MissionSkillContext):
+            raise SkillAuthorizationError("selected Skill context validator returned an invalid result")
+        return context
+
+    @staticmethod
+    def _skill_dispatch_scope(mission: Mission, skill_context: Any, tool_name: str) -> Any:
+        from .intelligence_layer.models import DelegationScope
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        parent = DelegationScope.from_snapshot(snapshot, owner_identity_ref=mission.owner_identity_ref)
+        return skill_context.narrow_task_scope(parent, tool_name=tool_name)
+
+    def _block_on_skill_context(self, mission: Mission) -> Mission:
+        mission.error = "selected Skill context failed live validation"
+        mission.failures.append({
+            "class": FailureClass.AUTHORIZATION.value,
+            "reason_code": "mission_skill_context_invalid",
+        })
+        mission.emit(EventType.FAILURE_DIAGNOSED, data={
+            "class": FailureClass.AUTHORIZATION.value,
+            "reason_code": "mission_skill_context_invalid",
+            "recovery": "owner_review_required",
+        })
+        if not mission.is_terminal:
+            mission.transition(MissionStatus.SAFETY_BLOCKED, mission.error)
+        return self._save(mission)
 
     @staticmethod
     def _tool_output_payload(value: dict[str, Any]) -> dict[str, Any]:
@@ -713,7 +748,7 @@ class MissionRuntime:
             mission.transition(MissionStatus.READY, "plan persisted")
         return self.store.save(mission)
 
-    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, planning_failures: list[dict[str, Any]] | None = None, planning_exhausted: bool = False) -> Mission:
+    def create_from_owner_instruction(self, instruction: str, plan: Plan, *, authorization_context: Any, scope_snapshot: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, owner_identity_ref: str = "", provenance: dict[str, Any] | None = None, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, planning_failures: list[dict[str, Any]] | None = None, planning_exhausted: bool = False, mission_id: str | None = None, skill_binding: dict[str, Any] | None = None) -> Mission:
         """Create a Mission without allowing model understanding to rewrite the Owner objective."""
         from security.authorization_context import AuthorizationContext
         if not isinstance(authorization_context, AuthorizationContext):
@@ -743,6 +778,8 @@ class MissionRuntime:
             scope_snapshot=scope_snapshot,
             policy_snapshot=authorization_context.policy_snapshot.to_dict(),
             completion_criteria=completion_criteria,
+            mission_id=mission_id,
+            skill_binding=skill_binding,
             provenance={"source": "owner_instruction", **(provenance or {})},
             authorization_snapshot_factory=authorization_snapshot_factory,
             planning_failures=planning_failures,
@@ -834,6 +871,7 @@ class MissionRuntime:
         *,
         timeout_seconds: float | None = None,
         max_result_chars: int | None = None,
+        delegation_scope: Any = None,
     ) -> Any:
         """Dispatch native-model tools with the same strict workspace/evidence boundary."""
         from tools.registry import TOOL_TIMEOUTS, execute as execute_tool, get_tool
@@ -900,6 +938,8 @@ class MissionRuntime:
             max_result_chars=max_result_chars,
             event_bus=self.event_bus,
             hook_registry=self.hook_registry,
+            delegation_scope=delegation_scope,
+            scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None),
         )
 
     def _block_on_budget(self, mission: Mission, budget: str, limit: int) -> Mission:
@@ -993,10 +1033,24 @@ class MissionRuntime:
         if mission.is_terminal:
             return mission
         if (mission.checkpoint or {}).get("status") in {"in_flight", "in_flight_parallel"}:
-            mission.error = "in-flight native tool outcome is unknown; reconciliation required"
+            reference_mismatch = bool(mission.skill_binding) and (mission.checkpoint or {}).get("skill_reference") != mission.skill_binding
+            mission.error = (
+                "in-flight native Skill reference does not match the Mission binding; reconciliation required"
+                if reference_mismatch
+                else "in-flight native tool outcome is unknown; reconciliation required"
+            )
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
             return self._save(mission)
+        try:
+            initial_skill_context = self._skill_context_for(mission)
+        except Exception:
+            return self._block_on_skill_context(mission)
         model_tools, allowed_tool_names = self._canonical_model_tools(tools)
+        if initial_skill_context is not None:
+            allowed_tool_names.intersection_update(initial_skill_context.binding.required_tools)
+            model_tools = [item for item in model_tools if item.get("function", {}).get("name") in allowed_tool_names]
+            if not allowed_tool_names:
+                return self._block_on_skill_context(mission)
         run_id = run_id or str(mission.progress.get("model_run_id") or hashlib.sha256((mission.mission_id + mission.request_id).encode()).hexdigest()[:20])
         mission.progress["model_run_id"] = run_id
         progress = mission.progress.setdefault("model_loop", {"turns": [], "tool_results": [], "seen_call_ids": []})
@@ -1049,6 +1103,15 @@ class MissionRuntime:
                 return self._block_on_budget(mission, exc.budget, exc.limit)
             if heartbeat is not None:
                 heartbeat()
+            try:
+                skill_context = self._skill_context_for(mission)
+            except Exception:
+                return self._block_on_skill_context(mission)
+            if skill_context is not None:
+                allowed_tool_names.intersection_update(skill_context.binding.required_tools)
+                model_tools = [item for item in model_tools if item.get("function", {}).get("name") in allowed_tool_names]
+                if not allowed_tool_names:
+                    return self._block_on_skill_context(mission)
             turn_id = f"{run_id}:turn:{len(progress['turns']) + 1}"
             if mission.status is not MissionStatus.RUNNING:
                 mission.transition(
@@ -1065,6 +1128,7 @@ class MissionRuntime:
                 tool_results=progress.get("tool_results", ()),
                 tools=model_tools,
                 max_chars=context_char_limit,
+                skill_guidance=skill_context.to_untrusted_context() if skill_context is not None else None,
             )
             if assembled.context_chars > context_char_limit:
                 completed = self._complete_from_verified_evidence_after_budget(mission, budget="max_context_chars", limit=context_char_limit, run_id=run_id, turn_id=f"{run_id}:turn:{len(progress['turns']) + 1}")
@@ -1226,6 +1290,7 @@ class MissionRuntime:
                     seen=seen,
                     deadline=deadline,
                     result_caps={proposal.tool_call_id: cap for proposal, cap in zip(turn.tool_calls, result_caps)},
+                    skill_context=skill_context,
                 )
                 self._save(mission)
                 if mission.is_terminal:
@@ -1244,11 +1309,21 @@ class MissionRuntime:
                     remaining_seconds = self._remaining_seconds(deadline)
                     if remaining_seconds <= 0:
                         mission.checkpoint = {"status": "not_dispatched", "tool_call_id": proposal.tool_call_id, "run_id": run_id}
+                        if skill_context is not None:
+                            mission.checkpoint["skill_reference"] = skill_context.reference
                         return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
+                    from .intelligence_layer.skills import SkillAuthorizationError
                     try:
                         task_id = proposal.step_id or str(getattr(current_step, "step_id", "") or "__mission__")
                         execution_id = proposal.action_id or proposal.tool_call_id
+                        dispatch_skill_context = self._skill_context_for(mission)
+                        if dispatch_skill_context is not None and proposal.name not in dispatch_skill_context.binding.required_tools:
+                            from .intelligence_layer.skills import SkillAuthorizationError
+                            raise SkillAuthorizationError("model call exceeds the selected Skill tool ceiling")
+                        delegation_scope = self._skill_dispatch_scope(mission, dispatch_skill_context, proposal.name) if dispatch_skill_context is not None else None
                         mission.checkpoint = {"status": "in_flight", "tool_call_id": proposal.tool_call_id, "action_id": execution_id, "step_id": task_id, "run_id": run_id, "plan_version": mission.plan.version}
+                        if dispatch_skill_context is not None:
+                            mission.checkpoint["skill_reference"] = dispatch_skill_context.reference
                         dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
                         if dispatch_fence is not None:
                             dispatch_fence.assert_active_execution(mission)
@@ -1260,7 +1335,12 @@ class MissionRuntime:
                         remaining_seconds = self._remaining_seconds(deadline)
                         if remaining_seconds <= 0:
                             mission.checkpoint = {"status": "not_dispatched", "tool_call_id": proposal.tool_call_id, "run_id": run_id}
+                            if dispatch_skill_context is not None:
+                                mission.checkpoint["skill_reference"] = dispatch_skill_context.reference
                             return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
+                        dispatch_skill_context = self._skill_context_for(mission)
+                        if dispatch_skill_context is not None:
+                            delegation_scope = self._skill_dispatch_scope(mission, dispatch_skill_context, proposal.name)
                         raw = self._execute_native_tool(
                             proposal.name,
                             proposal.arguments,
@@ -1270,6 +1350,7 @@ class MissionRuntime:
                             execution_id,
                             timeout_seconds=remaining_seconds,
                             max_result_chars=result_caps[index],
+                            delegation_scope=delegation_scope,
                         )
                         observation = dict(raw or {})
                         observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
@@ -1288,7 +1369,12 @@ class MissionRuntime:
                                 mission.evidence.append({"criterion_id": criterion_id, "passed": True, "source": proposal.name, "result": {"source": proposal.name, "result": verified_result}, "provenance": {"mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id, "verification_authority": self._verification_authority(proposal.name)}})
                         mission.record_action(proposal.action_id or proposal.tool_call_id, proposal.step_id or proposal.name, "completed", observation)
                         mission.checkpoint = {"status": "completed", "tool_call_id": proposal.tool_call_id, "action_id": proposal.action_id, "step_id": proposal.step_id, "run_id": run_id}
+                        if dispatch_skill_context is not None:
+                            mission.checkpoint["skill_reference"] = dispatch_skill_context.reference
                         result = ToolCallResult(proposal, True, result=observation)
+                    except SkillAuthorizationError:
+                        mission.checkpoint = {**dict(mission.checkpoint or {}), "status": "not_dispatched"}
+                        return self._block_on_skill_context(mission)
                     except MissionAuthorizationError as exc:
                         authorization_expired = getattr(exc, "code", "authorization_denied") == "authorization_expired"
                         target_status = MissionStatus.OWNER_REAUTH_REQUIRED if authorization_expired else MissionStatus.AUTHORIZATION_BLOCKED
@@ -1304,6 +1390,8 @@ class MissionRuntime:
                             "plan_version": mission.plan.version,
                             "reason_code": reason_code,
                         }
+                        if dispatch_skill_context is not None:
+                            mission.checkpoint["skill_reference"] = dispatch_skill_context.reference
                         failure = {
                             "mission_id": mission.mission_id,
                             "request_id": mission.request_id,
@@ -1401,9 +1489,19 @@ class MissionRuntime:
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self._save(mission)
 
-    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str], deadline: float, result_caps: dict[str, int]) -> None:
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str], deadline: float, result_caps: dict[str, int], skill_context: Any = None) -> None:
         """Authorize and execute independent proposals concurrently, then fold results deterministically."""
         from security.authorization import authorize_tool
+        if mission.skill_binding:
+            try:
+                current_skill_context = self._skill_context_for(mission)
+                if skill_context is None or current_skill_context.reference != skill_context.reference:
+                    return self._block_on_skill_context(mission)
+                skill_context = current_skill_context
+                if any(proposal.name not in skill_context.binding.required_tools for proposal in proposals):
+                    return self._block_on_skill_context(mission)
+            except Exception:
+                return self._block_on_skill_context(mission)
         identity_errors = set(validate_proposals(proposals, mission_id=mission.mission_id, run_id=run_id, seen_call_ids=seen))
         authorized: list[tuple[Any, Any, Any]] = []
         results: list[ToolCallResult] = []
@@ -1432,6 +1530,8 @@ class MissionRuntime:
             progress["seen_call_ids"].extend(staged_seen_ids)
             progress["tool_results"].extend(result.to_dict() for result in results)
             mission.checkpoint = {"status": "not_dispatched_parallel", "run_id": run_id, "tool_call_ids": list(staged_seen_ids)}
+            if skill_context is not None:
+                mission.checkpoint["skill_reference"] = skill_context.reference
             self._block_on_budget(mission, "max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
             return
         seen.update(staged_seen_ids)
@@ -1447,10 +1547,13 @@ class MissionRuntime:
             "run_id": run_id,
             "plan_version": mission.plan.version,
         }
+        if skill_context is not None:
+            mission.checkpoint["skill_reference"] = skill_context.reference
         self._save(mission)
         def execute_one(item: tuple[Any, Any, Any]) -> dict[str, Any]:
             proposal, argument, decision = item
             try:
+                from .intelligence_layer.skills import SkillAuthorizationError
                 remaining_seconds = self._remaining_seconds(deadline)
                 if remaining_seconds <= 0:
                     raise _MissionBudgetExceeded("max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
@@ -1459,6 +1562,13 @@ class MissionRuntime:
                 dispatch_fence = self._fence_for(mission, task_id=task_id, execution_id=execution_id)
                 if dispatch_fence is not None:
                     dispatch_fence.assert_active_execution(mission)
+                worker_skill_context = self._skill_context_for(mission)
+                if worker_skill_context is not None:
+                    if worker_skill_context.reference != skill_context.reference or proposal.name not in worker_skill_context.binding.required_tools:
+                        raise SkillAuthorizationError("selected Skill changed before parallel dispatch")
+                    delegation_scope = self._skill_dispatch_scope(mission, worker_skill_context, proposal.name)
+                else:
+                    delegation_scope = None
                 remaining_seconds = self._remaining_seconds(deadline)
                 if remaining_seconds <= 0:
                     raise _MissionBudgetExceeded("max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
@@ -1471,6 +1581,7 @@ class MissionRuntime:
                     execution_id,
                     timeout_seconds=remaining_seconds,
                     max_result_chars=result_caps[proposal.tool_call_id],
+                    delegation_scope=delegation_scope,
                 ) or {})
             except _MissionBudgetExceeded as exc:
                 return {"_budget_exceeded": True, "budget": exc.budget, "limit": exc.limit}
@@ -1526,14 +1637,20 @@ class MissionRuntime:
                 "plan_version": mission.plan.version,
                 "run_id": run_id,
             }
+            if skill_context is not None:
+                mission.checkpoint["skill_reference"] = skill_context.reference
             mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error)
             return
         if budget_exceeded is not None:
             budget_name, budget_limit = budget_exceeded
             mission.checkpoint = {"status": "budget_blocked", "run_id": run_id, "tool_call_ids": [proposal.tool_call_id for proposal, _ in authorized]}
+            if skill_context is not None:
+                mission.checkpoint["skill_reference"] = skill_context.reference
             self._block_on_budget(mission, budget_name, budget_limit)
             return
         mission.checkpoint = {"status": "completed", "tool_call_ids": [item[0].tool_call_id for item in authorized], "run_id": run_id}
+        if skill_context is not None:
+            mission.checkpoint["skill_reference"] = skill_context.reference
 
     def run_slice(self, mission_id: str) -> Mission:
         mission = self._load(mission_id)
@@ -1548,6 +1665,9 @@ class MissionRuntime:
         checkpoint = dict(mission.checkpoint or {})
         checkpoint_status = checkpoint.get("status")
         if checkpoint_status in {"in_flight", "in_flight_parallel"}:
+            if mission.skill_binding and checkpoint.get("skill_reference") != mission.skill_binding:
+                mission.error = "in-flight Skill reference does not match the integrity-covered Mission binding"
+                mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason_code": "skill_checkpoint_binding_mismatch"})
             if checkpoint_status == "in_flight_parallel":
                 tool_call_ids = [
                     str(item)
@@ -1574,6 +1694,10 @@ class MissionRuntime:
                 )
                 mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
             return self._save(mission)
+        try:
+            skill_context = self._skill_context_for(mission)
+        except Exception:
+            return self._block_on_skill_context(mission)
         if mission.iteration_count >= mission.max_iterations:
             mission.error = "iteration budget exhausted"
             mission.emit(EventType.FAILURE_DETECTED, data={"class": FailureClass.RESOURCE.value, "reason": mission.error})
@@ -1605,7 +1729,7 @@ class MissionRuntime:
                 return self._block_on_task_graph(mission, exc)
             from .intelligence_layer.parallel_dispatch import run_parallel_graph_steps
 
-            parallel_result = run_parallel_graph_steps(self, mission, graph_snapshot)
+            parallel_result = run_parallel_graph_steps(self, mission, graph_snapshot, skill_context=skill_context)
             if parallel_result is not None:
                 return parallel_result
         signatures = mission.progress.setdefault("loop_signatures", {})
@@ -1643,12 +1767,26 @@ class MissionRuntime:
                 )
                 if delegation_scope is not None and not self._executor_accepts_delegation(self.executor):
                     raise MissionTaskGraphError("delegated mission task requires a scope-enforcing executor")
+                if skill_context is not None:
+                    if delegation_scope is None:
+                        delegation_scope = self._skill_dispatch_scope(mission, skill_context, step.action)
+                    else:
+                        delegation_scope = skill_context.narrow_task_scope(delegation_scope, tool_name=step.action)
+                    if not self._executor_accepts_delegation(self.executor):
+                        raise MissionTaskGraphError("Skill-bound mission step requires a scope-enforcing executor")
                 self.task_graph_adapter.claim_step(mission, graph_snapshot, step.step_id)
-            except (MissionTaskGraphError, KeyError, TypeError, ValueError) as exc:
+            except Exception as exc:
+                from .intelligence_layer.skills import SkillAuthorizationError
+                if isinstance(exc, SkillAuthorizationError):
+                    return self._block_on_skill_context(mission)
+                if not isinstance(exc, (MissionTaskGraphError, KeyError, TypeError, ValueError)):
+                    return self._block_on_task_graph(mission, exc)
                 return self._block_on_task_graph(mission, exc)
 
         mission.transition(MissionStatus.RUNNING, "step started", step_id=step.step_id)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "in_flight", "plan_version": mission.plan.version}
+        if skill_context is not None:
+            mission.checkpoint["skill_reference"] = skill_context.reference
         self._save(mission)
         dispatch_fence = self._fence_for(mission, task_id=step.step_id, execution_id=action_id)
         if dispatch_fence is not None:
@@ -1668,6 +1806,10 @@ class MissionRuntime:
         except ExecutionFenceError:
             raise
         except Exception as exc:
+            from .intelligence_layer.skills import SkillAuthorizationError
+            if isinstance(exc, SkillAuthorizationError):
+                mission.checkpoint = {**dict(mission.checkpoint or {}), "status": "not_dispatched"}
+                return self._block_on_skill_context(mission)
             # Keep the in-flight checkpoint durable. A new runtime can safely resume it.
             mission.error = type(exc).__name__
             mission.record_observation({"type": "execution_exception", "success": False, "error": str(exc), "action_id": action_id})
@@ -1716,6 +1858,8 @@ class MissionRuntime:
         success = bool(observation.get("success", observation.get("ok", False)))
         mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version}
+        if skill_context is not None:
+            mission.checkpoint["skill_reference"] = skill_context.reference
         if self.task_graph_adapter is not None:
             if success:
                 self.task_graph_adapter.complete_step(mission, step.step_id, observation, action_id)
