@@ -9,7 +9,7 @@ These tests fail if adaptation honesty breaks:
 
 import pytest
 
-from cyber.adaptive import AdaptiveAnalyst
+from cyber.adaptive import AdaptationReport, AdaptiveAnalyst
 from cyber.case_engine import CaseStatus, CyberCase, EvidenceStatus, Provenance
 from cyber.generalize import UnseenTechniqueMatcher
 from cyber.seed_corpus import build_seed_graph
@@ -90,3 +90,29 @@ class TestAdaptiveAnalyst:
         case = _case_from_runtime_like_events()
         analyst = AdaptiveAnalyst(case, matcher)
         assert analyst.matcher is matcher
+
+    def test_empty_promotion_is_refused_before_mutating_case(self):
+        case = _case_from_runtime_like_events()
+        analyst = AdaptiveAnalyst(case)
+
+        with pytest.raises(ValueError, match="non-empty evidence statement"):
+            analyst.promote("T1059", evidence_statement="  ")
+
+        assert case.evidence == {}
+
+    def test_adaptation_report_serializes_all_sections(self):
+        report = AdaptationReport(
+            mapped_observations=1,
+            unknown_observations=2,
+            tentative_hypotheses=[{"status": "TENTATIVE"}],
+            promoted=[{"status": "SUPPORTED"}],
+            hunts_run=[{"status": "NO_DETECTIONS"}],
+        )
+
+        assert report.to_dict() == {
+            "mapped_observations": 1,
+            "unknown_observations": 2,
+            "tentative_hypotheses": [{"status": "TENTATIVE"}],
+            "promoted": [{"status": "SUPPORTED"}],
+            "hunts_run": [{"status": "NO_DETECTIONS"}],
+        }
