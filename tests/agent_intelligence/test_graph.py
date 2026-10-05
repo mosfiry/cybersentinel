@@ -100,6 +100,16 @@ def test_lifecycle_transitions_are_deterministic_and_terminal_states_cannot_rest
         task.transition(TaskLifecycle.RUNNING)
 
 
+def test_legacy_task_record_without_memory_refs_remains_loadable():
+    task = TaskRecord.create(mission_id="mission-1", assigned_agent_id="agent-1", objective="legacy task", task_id="legacy-task")
+    payload = task.to_dict()
+    payload.pop("memory_refs")
+
+    restored = TaskRecord.from_dict(payload)
+
+    assert restored.memory_refs == ()
+
+
 def test_root_scope_canonicalizes_redundant_owner_grants():
     snapshot = authorization(
         allowed_tools=("status", "status", "search"),

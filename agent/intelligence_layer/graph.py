@@ -254,6 +254,19 @@ class TaskGraph:
                 result_bytes = json.dumps(task.result, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
                 if len(result_bytes) > self.policy.max_task_result_bytes:
                     raise TaskGraphError("task result exceeds policy byte limit")
+            if task.memory_refs:
+                agent = self.agents[task.assigned_agent_id]
+                if (
+                    task.lifecycle is not TaskLifecycle.COMPLETED
+                    or task.result_validation_state != "UNTRUSTED_PROPOSAL"
+                    or agent.role != "mission_specialist_analyst"
+                    or task.evidence_refs
+                    or task.artifacts
+                    or not isinstance(task.result, dict)
+                    or task.result.get("memory_ref") != task.memory_refs[0]
+                    or "proposal" in task.result
+                ):
+                    raise TaskGraphError("memory references are restricted to completed untrusted specialist tasks")
             if task.parent_task_id and task.parent_task_id not in self.tasks:
                 raise TaskGraphError("unknown parent task")
         self._check_dependency_cycles()

@@ -367,6 +367,67 @@ class MemoryProvider:
         with _memory_lock:
             with _get_memory_db() as conn:
                 MemoryProvider._insert_memory(conn, item)
+
+    @staticmethod
+    def store_idempotent_memory(item: MemoryItem) -> MemoryItem:
+        """Insert once by deterministic memory_id; never replace conflicting content."""
+        with _memory_lock:
+            with _get_memory_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM memory_items WHERE memory_id = ?",
+                    (item.memory_id,),
+                ).fetchone()
+                if row is None:
+                    MemoryProvider._insert_memory(conn, item)
+                    return item
+                existing = MemoryProvider._from_row(row)
+                old = existing.to_dict()
+                new = item.to_dict()
+                for field_name in ("created_at", "updated_at"):
+                    old.pop(field_name, None)
+                    new.pop(field_name, None)
+                if old != new:
+                    raise ValueError("memory_idempotency_conflict")
+                return existing
+
+    @staticmethod
+    def get_specialist_memory_item(
+        *,
+        memory_id: str,
+        owner_identity_ref: str,
+        mission_id: str,
+        agent_id: str,
+        task_id: str,
+    ) -> MemoryItem | None:
+        """Load an untrusted specialist item only under its full exact scope."""
+        if not all(isinstance(value, str) and value for value in (memory_id, owner_identity_ref, mission_id, agent_id, task_id)):
+            return None
+        expected_scope = (
+            f"owner:{owner_identity_ref}",
+            f"mission:{mission_id}",
+            f"agent:{agent_id}",
+            f"task:{task_id}",
+        )
+        with _get_memory_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM memory_items WHERE memory_id=? AND conversation_id=? "
+                "AND owner_identity_ref=? AND mission_id=? AND agent_id=? "
+                "AND scope=? AND domain=? AND trust_classification=? "
+                "AND validation_state=? AND superseded_by IS NULL",
+                (
+                    memory_id,
+                    f"mission:{mission_id}",
+                    owner_identity_ref,
+                    mission_id,
+                    agent_id,
+                    json.dumps(list(expected_scope)),
+                    MemoryDomain.TASK_STATE.value,
+                    TrustClassification.UNTRUSTED_DATA.value,
+                    MemoryValidationState.UNVERIFIED.value,
+                ),
+            ).fetchone()
+            return None if row is None else MemoryProvider._from_row(row)
     
     @staticmethod
     def get_memory_item(memory_id: str) -> MemoryItem | None:

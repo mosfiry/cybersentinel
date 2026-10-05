@@ -9,31 +9,17 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
-import re
 from typing import Any
 
 from .models import TaskLifecycle
+from .specialist_memory import SpecialistChildMemoryStore, redact_specialist_text
 
 MAX_SPECIALIST_CONCURRENCY = 2
 MAX_SPECIALIST_INPUT_CHARS = 4096
 MAX_SPECIALIST_OUTPUT_CHARS = 2000
 MAX_SPECIALIST_OUTPUT_TOKENS = 384
 SPECIALIST_TIMEOUT_SECONDS = 30
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passwd|secret|authorization|credential|private[_ -]?key)\b\s*[:=]\s*(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
-)
-_BEARER_SECRET = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
-_PEM_SECRET = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----")
-_RAW_TOKEN_SECRET = re.compile(
-    r"(?i)\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AIza[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
-)
-
-
-def _redact_secret_like_text(value: str) -> str:
-    text = _PEM_SECRET.sub("[REDACTED_PRIVATE_KEY]", value)
-    text = _BEARER_SECRET.sub("Bearer [REDACTED]", text)
-    text = _SECRET_ASSIGNMENT.sub(lambda match: match.group(0)[:match.start(1) - match.start(0)] + "[REDACTED]", text)
-    return _RAW_TOKEN_SECRET.sub("[REDACTED_TOKEN]", text)
+_redact_secret_like_text = redact_specialist_text
 
 
 class SpecialistDispatchError(RuntimeError):
@@ -365,11 +351,39 @@ def run_ready_specialist_batch(runtime: Any, mission: Any, snapshot: Any):
         # durable in-flight claim for recovery; never replay under renewed auth.
         raise SpecialistDispatchError("authorization_changed_during_specialist_batch")
 
+    memory_records: dict[str, dict[str, Any]] = {}
+    if not cancel_requested:
+        nested = adapter._specialist_envelope(latest, snapshot)
+        if nested is None:
+            raise SpecialistDispatchError("specialist memory write has no authorized graph")
+        graph, _mapping, _envelope = nested
+        memory_store = SpecialistChildMemoryStore()
+        authorization_version = adapter._expected_authorization_version(latest)
+        for outcome in outcomes:
+            if outcome.get("success") is not True:
+                continue
+            task_id = str(outcome["task_id"])
+            task = graph.tasks.get(task_id)
+            if task is None or task.cancel_requested:
+                continue
+            memory_records[task_id] = memory_store.persist_proposal(
+                mission=latest,
+                snapshot=snapshot,
+                graph=graph,
+                task_id=task_id,
+                step_id=str(outcome["step_id"]),
+                proposal=dict(outcome["proposal"]),
+                provider=str(outcome["provider_name"]),
+                model=str(outcome["model_name"]),
+                authorization_version=authorization_version,
+            )
+
     proposals = adapter.finish_specialist_batch(
         latest,
         snapshot,
         batch_id=batch_id,
         outcomes=outcomes,
+        memory_records=memory_records,
     )
     if cancel_requested:
         # Do not move a cancelled Mission checkpoint back into a runnable state.
@@ -385,7 +399,7 @@ def run_ready_specialist_batch(runtime: Any, mission: Any, snapshot: Any):
                 "authority": "none",
                 "trust": "untrusted_data",
                 "source": "tool_less_specialist",
-                "proposal": item["proposal"],
+                "memory_ref": item["memory_ref"],
             }
             latest.observations.append(observation)
         latest.progress.setdefault("specialist_batches", []).append({

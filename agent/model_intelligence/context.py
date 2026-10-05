@@ -7,9 +7,11 @@ from typing import Any, Iterable
 from .protocol import ConversationTurn
 
 
-STATE_KEYS = ("owner", "mission", "conversation", "plan", "observation", "evidence", "hypothesis", "strategy", "knowledge", "tool", "verification", "compaction", "skill_guidance")
+STATE_KEYS = ("owner", "mission", "conversation", "plan", "observation", "evidence", "hypothesis", "strategy", "knowledge", "tool", "verification", "compaction", "skill_guidance", "specialist_memory")
 LIVE_TOOL_RESULT = "LIVE_TOOL_RESULT"
 COMPACTED_TOOL_METADATA = "COMPACTED_TOOL_METADATA"
+MAX_SPECIALIST_MEMORY_CONTEXT_ITEMS = 4
+MAX_SPECIALIST_MEMORY_CONTEXT_BYTES = 8192
 
 
 @dataclass(frozen=True)
@@ -34,10 +36,28 @@ class ContextAssembler:
     def _hash(value: Any) -> str:
         return sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
 
-    def build(self, mission: Any, *, conversation: Iterable[ConversationTurn] = (), tool_results: Iterable[dict[str, Any]] = (), tools: Iterable[dict[str, Any]] = (), max_chars: int = 24000, skill_guidance: dict[str, Any] | None = None) -> AssembledContext:
+    def build(self, mission: Any, *, conversation: Iterable[ConversationTurn] = (), tool_results: Iterable[dict[str, Any]] = (), tools: Iterable[dict[str, Any]] = (), max_chars: int = 24000, skill_guidance: dict[str, Any] | None = None, specialist_memory: Iterable[dict[str, Any]] = ()) -> AssembledContext:
         durable_tools = [dict(item, record_type=item.get("record_type", LIVE_TOOL_RESULT)) for item in tool_results]
         conversation_items = list(conversation)
         tool_definitions = [dict(item) for item in tools]
+        specialist_items: list[dict[str, Any]] = []
+        specialist_bytes = 0
+        allowed_memory_fields = {
+            "record_type", "trust", "validation_state", "authority", "memory_ref", "task_id", "step_id",
+            "provider", "model", "tool_identity", "source_digest", "result_digest", "truncated", "proposal",
+        }
+        for item in specialist_memory:
+            if len(specialist_items) >= MAX_SPECIALIST_MEMORY_CONTEXT_ITEMS:
+                break
+            if not isinstance(item, dict) or set(item) != allowed_memory_fields:
+                raise ValueError("specialist memory context schema is invalid")
+            if item.get("record_type") != "UNTRUSTED_SPECIALIST_CHILD_MEMORY" or item.get("trust") != "untrusted_data" or item.get("validation_state") != "unverified" or item.get("authority") != "none" or item.get("tool_identity") != "none":
+                raise ValueError("specialist memory context trust binding is invalid")
+            encoded_item = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if specialist_bytes + len(encoded_item) > MAX_SPECIALIST_MEMORY_CONTEXT_BYTES:
+                break
+            specialist_items.append(dict(item))
+            specialist_bytes += len(encoded_item)
         skill_payload = None
         if skill_guidance is not None:
             skill_payload = {"trust": "untrusted_data", "authority": "none", "data": dict(skill_guidance)}
@@ -60,6 +80,12 @@ class ContextAssembler:
                 "tool_definitions": tool_definitions,
                 "verification": dict(mission.verification_state),
                 "compaction": {"compacted": compacted, "compacted_items": compacted_items, "max_chars": max_chars, "metadata_is_untrusted": True},
+                **({"specialist_memory": {
+                    "record_type": "UNTRUSTED_SPECIALIST_MEMORY_CONTEXT",
+                    "trust": "untrusted_data",
+                    "authority": "none",
+                    "items": specialist_items,
+                }} if specialist_items else {}),
                 **({"skill_guidance": skill_payload} if skill_payload is not None else {}),
             }
 
@@ -72,6 +98,15 @@ class ContextAssembler:
                 "record_type": "SKILL_GUIDANCE_OMITTED_FOR_CONTEXT_BUDGET",
                 "sha256": self._hash(skill_payload),
             }
+            sections = make_sections()
+        if specialist_items and self._size(sections) > max_chars:
+            specialist_items = [{
+                "record_type": "SPECIALIST_MEMORY_OMITTED_FOR_CONTEXT_BUDGET",
+                "count": len(specialist_items),
+                "sha256": self._hash(specialist_items),
+                "trust": "untrusted_metadata",
+                "authority": "none",
+            }]
             sections = make_sections()
         if self._size(sections) > max_chars:
             compacted = True
@@ -163,7 +198,7 @@ class ContextAssembler:
             messages = (system, state, *tuple(conversation_items)) if not live_tools else (system, state, *tuple(conversation_items), assistant_continuation, *tool_messages)
         context_chars = sum(len(item.content) for item in messages)
         digest = sha256(json.dumps([item.to_dict() for item in messages], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        provenance = tuple({"section": key, "authoritative": key in {"owner", "mission", "plan", "verification"}} for key in STATE_KEYS)
+        provenance = tuple({"section": key, "authoritative": key in {"owner", "mission", "plan", "verification"}} for key in STATE_KEYS if key != "specialist_memory" or specialist_items)
         return AssembledContext(messages, sections, digest, provenance, compacted, compacted_items, context_chars)
 
 

@@ -407,6 +407,7 @@ class TaskRecord:
     lifecycle: TaskLifecycle = TaskLifecycle.CREATED
     artifacts: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
+    memory_refs: tuple[str, ...] = ()
     result: Any = None
     result_validation_state: str = "UNVERIFIED"
     error: str = ""
@@ -424,6 +425,9 @@ class TaskRecord:
         self.dependencies = _strings(self.dependencies, field_name="dependencies")
         self.artifacts = _strings(self.artifacts, field_name="artifacts")
         self.evidence_refs = _strings(self.evidence_refs, field_name="evidence_refs")
+        self.memory_refs = _strings(self.memory_refs, field_name="memory_refs")
+        if len(self.memory_refs) > 1 or any(len(ref) > 96 or not ref.startswith("specialist-memory:") for ref in self.memory_refs):
+            raise ValueError("task memory references must be a single bounded specialist-memory reference")
         if not isinstance(self.lifecycle, TaskLifecycle):
             self.lifecycle = TaskLifecycle(self.lifecycle)
         if self.attempt_count < 0:
@@ -480,7 +484,7 @@ class TaskRecord:
             "task_id": self.task_id, "mission_id": self.mission_id, "assigned_agent_id": self.assigned_agent_id,
             "objective": self.objective, "parent_task_id": self.parent_task_id, "constraints": list(self.constraints),
             "dependencies": list(self.dependencies), "lifecycle": self.lifecycle.value, "artifacts": list(self.artifacts),
-            "evidence_refs": list(self.evidence_refs), "result": self.result,
+            "evidence_refs": list(self.evidence_refs), "memory_refs": list(self.memory_refs), "result": self.result,
             "result_validation_state": self.result_validation_state, "error": self.error,
             "attempt_count": self.attempt_count, "cancel_requested": self.cancel_requested,
             "created_at": self.created_at, "updated_at": self.updated_at,
@@ -489,7 +493,7 @@ class TaskRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
         values = dict(data)
-        for name in ("constraints", "dependencies", "artifacts", "evidence_refs"):
+        for name in ("constraints", "dependencies", "artifacts", "evidence_refs", "memory_refs"):
             values[name] = tuple(values.get(name, ()))
         values["lifecycle"] = TaskLifecycle(values.get("lifecycle", TaskLifecycle.CREATED.value))
         return cls(**values)

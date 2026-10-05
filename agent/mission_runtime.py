@@ -552,6 +552,65 @@ class MissionRuntime:
         from security.mission_authorization import MissionAuthorizationSnapshot
         return MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
 
+    def _specialist_memory_context(self, mission: Mission) -> list[dict[str, Any]]:
+        """Explicit parent read: validate persisted Mission, graph refs and each untrusted record."""
+        if self.task_graph_adapter is None:
+            return []
+        from .intelligence_layer.specialist_memory import (
+            MAX_SPECIALIST_MEMORY_PARENT_BYTES,
+            MAX_SPECIALIST_MEMORY_PARENT_RECORDS,
+            SpecialistChildMemoryStore,
+            SpecialistMemoryError,
+        )
+
+        persisted = self.store.load(mission.mission_id)
+        if (
+            persisted is None
+            or not persisted.verify_integrity()
+            or persisted.mission_id != mission.mission_id
+            or persisted.owner_identity_ref != mission.owner_identity_ref
+            or persisted.plan.fingerprint != mission.plan.fingerprint
+            or persisted.authorization_snapshot != mission.authorization_snapshot
+        ):
+            raise SpecialistMemoryError("parent_memory_mission_integrity_invalid")
+        authorized, _reason = self._mission_authorization(persisted)
+        if not authorized:
+            raise SpecialistMemoryError("parent_memory_authorization_invalid")
+        snapshot = self._typed_mission_snapshot(persisted)
+        nested = self.task_graph_adapter._specialist_envelope(persisted, snapshot)
+        if nested is None:
+            return []
+        graph, mapping, _envelope = nested
+        memory_store = SpecialistChildMemoryStore()
+        authorization_version = self.task_graph_adapter._expected_authorization_version(persisted)
+        candidates: list[tuple[str, str, str]] = []
+        for step in persisted.plan.steps:
+            step_id = str(step.step_id)
+            task_id = mapping.get(step_id)
+            task = graph.tasks.get(task_id) if task_id else None
+            if task is not None and task.lifecycle.value == "COMPLETED" and task.memory_refs:
+                candidates.append((step_id, str(task_id), task.memory_refs[0]))
+
+        selected = candidates[-MAX_SPECIALIST_MEMORY_PARENT_RECORDS:]
+        records: list[dict[str, Any]] = []
+        total_bytes = 0
+        for step_id, task_id, memory_ref in selected:
+            record = memory_store.retrieve_for_parent(
+                mission=persisted,
+                snapshot=snapshot,
+                graph=graph,
+                task_id=task_id,
+                step_id=step_id,
+                memory_ref=memory_ref,
+                authorization_version=authorization_version,
+            )
+            record_bytes = len(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+            if total_bytes + record_bytes > MAX_SPECIALIST_MEMORY_PARENT_BYTES:
+                break
+            records.append(record)
+            total_bytes += record_bytes
+        return records
+
     def _block_on_task_graph(self, mission: Mission, error: Exception) -> Mission:
         reason = f"agent task graph rejected dispatch: {type(error).__name__}"
         mission.error = reason
@@ -1124,12 +1183,17 @@ class MissionRuntime:
                 )
                 self._save(mission)
             current_step = mission.current_plan_step
+            try:
+                specialist_memory = self._specialist_memory_context(mission)
+            except Exception as exc:
+                return self._block_on_task_graph(mission, exc)
             assembled = ContextAssembler().build(
                 mission,
                 tool_results=progress.get("tool_results", ()),
                 tools=model_tools,
                 max_chars=context_char_limit,
                 skill_guidance=skill_context.to_untrusted_context() if skill_context is not None else None,
+                specialist_memory=specialist_memory,
             )
             if assembled.context_chars > context_char_limit:
                 completed = self._complete_from_verified_evidence_after_budget(mission, budget="max_context_chars", limit=context_char_limit, run_id=run_id, turn_id=f"{run_id}:turn:{len(progress['turns']) + 1}")

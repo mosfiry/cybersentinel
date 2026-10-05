@@ -515,6 +515,7 @@ class MissionTaskGraphAdapter:
         *,
         batch_id: str,
         outcomes: list[dict[str, Any]],
+        memory_records: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         nested = self._specialist_envelope(mission, snapshot)
         if nested is None:
@@ -540,15 +541,19 @@ class MissionTaskGraphAdapter:
                     agent.transition(AgentLifecycle.CANCELLED)
                 continue
             if outcome.get("success") is True:
-                proposal = dict(outcome["proposal"])
+                memory_record = (memory_records or {}).get(task_id)
+                if not isinstance(memory_record, dict):
+                    raise MissionTaskGraphError("successful specialist outcome has no durable memory reference")
+                memory_ref = memory_record.get("memory_ref")
+                if not isinstance(memory_ref, str) or not memory_ref.startswith("specialist-memory:") or len(memory_ref) != len("specialist-memory:") + 64:
+                    raise MissionTaskGraphError("successful specialist outcome has an invalid memory reference")
                 result = {
-                    "record_type": "UNTRUSTED_SPECIALIST_PROPOSAL",
+                    "record_type": "UNTRUSTED_SPECIALIST_PROPOSAL_REF",
                     "authority": "none",
-                    "provider": str(outcome["provider_name"]),
-                    "model": str(outcome["model_name"]),
-                    "proposal": proposal,
+                    "memory_ref": memory_ref,
                 }
                 graph.complete_task(task_id, result, evidence_refs=(), artifacts=())
+                task.memory_refs = (memory_ref,)
                 task.result_validation_state = "UNTRUSTED_PROPOSAL"
                 if agent.lifecycle is AgentLifecycle.RUNNING:
                     agent.transition(AgentLifecycle.COMPLETED)
