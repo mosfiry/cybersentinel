@@ -85,6 +85,8 @@ class ArtifactStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        fd = os.open(self.db_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(fd)
         self._initialize()
         try:
             os.chmod(self.db_path, 0o600)

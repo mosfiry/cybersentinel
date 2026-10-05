@@ -8,6 +8,22 @@ from .artifacts import (
     ArtifactStoreError,
     ArtifactValidation,
 )
+from .events import (
+    EventBus,
+    EventConflict,
+    EventDelivery,
+    EventError,
+    EventIntegrityError,
+    EventRecord,
+    EventStore,
+    HookAuthorizationError,
+    HookDecision,
+    HookInvocation,
+    HookPhase,
+    HookRegistry,
+    HookResult,
+    IntelligenceEventType,
+)
 from .graph import AgentGraphPolicy, TaskGraph, TaskGraphConflict, TaskGraphError
 from .models import (
     AgentLifecycle,
@@ -40,6 +56,9 @@ from .skills import (
 )
 
 __all__ = [
+    "EventBus", "EventConflict", "EventDelivery", "EventError", "EventIntegrityError",
+    "EventRecord", "EventStore", "HookAuthorizationError", "HookDecision", "HookInvocation",
+    "HookPhase", "HookRegistry", "HookResult", "IntelligenceEventType",
     "ArtifactIntegrityError", "ArtifactKind", "ArtifactRecord", "ArtifactSensitivity",
     "ArtifactStore", "ArtifactStoreError", "ArtifactValidation",
     "AgentGraphPolicy", "AgentLifecycle", "AgentRecord", "DelegationDenied", "DelegationScope",
