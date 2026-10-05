@@ -110,6 +110,67 @@ def test_public_session_does_not_grant_owner_authority(manager):
     assert manager.validate(session.session_id, session.csrf_token) == session
 
 
+def test_mission_observability_requires_owner_session_and_csrf(public_server, monkeypatch):
+    calls = []
+
+    class FakeObservability:
+        def get(self, mission_id, *, owner_session_token, **kwargs):
+            calls.append((mission_id, owner_session_token, kwargs))
+            if mission_id in {"foreign", "missing"}:
+                raise KeyError("unknown_mission")
+            return {"mission_id": mission_id, "graph": {"tasks": []}}
+
+    monkeypatch.setattr(
+        bridge.Handler,
+        "_mission_observability_service",
+        lambda self: FakeObservability(),
+    )
+    cookie, csrf = _owner_session(public_server)
+
+    status, denied, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/missions/mission-safe/observability",
+        headers={"Cookie": cookie},
+    )
+    assert status == 401
+    assert denied["ok"] is False
+
+    status, result, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/missions/mission-safe/observability?timeline_limit=5",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert result["observability"]["mission_id"] == "mission-safe"
+    assert calls[-1][1] == OWNER_TOKEN
+    assert "owner_session_token" not in json.dumps(result)
+
+    denied_results = []
+    for mission_id in ("foreign", "missing"):
+        denied_status, denied_body, _ = _request(
+            public_server,
+            "GET",
+            f"/api/public/missions/{mission_id}/observability",
+            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+        )
+        denied_results.append((denied_status, denied_body))
+    assert denied_results == [
+        (404, {"ok": False, "error": "unknown_mission"}),
+        (404, {"ok": False, "error": "unknown_mission"}),
+    ]
+
+    oversized_status, oversized, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/missions/mission-safe/observability?timeline_limit=51",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert oversized_status == 400
+    assert oversized["error"] == "invalid_observability_query"
+
+
 def test_public_session_rejects_missing_or_invalid_csrf(manager):
     session = manager.create()
     with pytest.raises(PermissionError, match="csrf"):

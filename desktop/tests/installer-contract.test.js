@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "../..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
@@ -60,6 +61,57 @@ test("Owner Skill descriptions and procedure metadata render as inert text", () 
   assert.doesNotMatch(skillsUi, /\.innerHTML|insertAdjacentHTML|DOMParser|eval\s*\(/);
   assert.ok(skillsUi.includes("UNTRUSTED") || skillsUi.includes("غير موثوقة"));
   assert.ok(skillsUi.includes("skill.procedure"), "only procedure metadata is presented");
+});
+
+test("Mission observability renderer treats hostile graph and event strings as inert text", () => {
+  const start = app.indexOf("function renderMissionObservability(");
+  const end = app.indexOf("\nasync function loadMoreMissionProgress", start);
+  assert.ok(start >= 0 && end > start, "Mission observability renderer is present");
+  const renderer = app.slice(start, end);
+  assert.match(renderer, /\.textContent\s*=/);
+  assert.doesNotMatch(renderer, /\.innerHTML|insertAdjacentHTML|DOMParser|eval\s*\(/);
+  assert.doesNotMatch(renderer, /argument_sha256|raw_tool_arguments|\btask\.result\b|\btask\.error\b/);
+
+  const elements = [];
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.textContent = "";
+      this.className = "";
+      this.listeners = {};
+      elements.push(this);
+    }
+    set innerHTML(_value) { throw new Error("HTML parsing is forbidden in this renderer"); }
+    appendChild(child) { this.children.push(child); return child; }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+  }
+  const context = {
+    document: { createElement: (tag) => new Element(tag) },
+    state: { missionViews: { observabilityError: "" }, selectedMissionId: "mission-safe" },
+    errorText: (error) => String(error?.message || ""),
+    loadMission: () => {},
+    loadMoreMissionProgress: () => {},
+  };
+  vm.runInNewContext(`${renderer}; globalThis.render = renderMissionObservability;`, context);
+  const root = new Element("root");
+  const attack = `<img src=x onerror=alert(1)>`;
+  context.render({
+    stage: { status: attack, current_step: { index: 0, step_id: attack, action: attack, task_status: "RUNNING" }, step_count: 1 },
+    graph: {
+      available: true,
+      revision: 1,
+      tasks: [{ task_id: attack, status: "RUNNING", agent_id: attack, agent_role: attack, agent_status: "RUNNING", dependencies: [attack], attempt_count: 1, result_state: "UNVERIFIED", error_category: attack, evidence_refs: [attack] }],
+      agents: [],
+    },
+    evidence_refs: [{ evidence_id: attack, sequence: 1, task_id: attack }],
+    evidence_ref_count: 1,
+    timeline: { events: [{ type: attack, timestamp: attack, step_ref: attack, error_category: attack }], has_more: false },
+    event_log: { events: [{ type: attack, timestamp: attack, tool: attack, task_ref: attack, success: true }], has_more: false },
+  }, root);
+  const renderedText = elements.map((element) => element.textContent).join("\n");
+  assert.ok(renderedText.includes(attack), "untrusted display values are represented only as text");
+  assert.equal(elements.length > 0, true);
 });
 
 test("NSIS installer packages backend and local runtime and has a stable artifact name", () => {

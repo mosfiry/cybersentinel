@@ -61,6 +61,9 @@ DESKTOP_MODE = os.environ.get("CYBERSENTINEL_DESKTOP_MODE", "").casefold() == "t
 DESKTOP_SETUP_TOKEN = os.environ.get("CYBERSENTINEL_DESKTOP_SETUP_TOKEN", "")
 _DESKTOP_MODEL_MANAGER: LocalModelManager | None = None
 _DESKTOP_MANAGER_LOCK = threading.Lock()
+_MISSION_EVENT_STORE = None
+_MISSION_EVENT_STORE_PATH: Path | None = None
+_MISSION_EVENT_STORE_LOCK = threading.Lock()
 
 
 def _project_store() -> WorkspaceProjectStore:
@@ -71,6 +74,25 @@ def _skill_registry():
     from agent.intelligence_layer.skills import SkillRegistry
 
     return SkillRegistry(DB_PATH.with_name("skills.sqlite3"))
+
+
+def _mission_event_store():
+    """Shared append-only, mission-scoped event journal for workers and reads."""
+    global _MISSION_EVENT_STORE, _MISSION_EVENT_STORE_PATH
+    path = DB_PATH.with_name("mission_events.sqlite3")
+    with _MISSION_EVENT_STORE_LOCK:
+        if _MISSION_EVENT_STORE is None or _MISSION_EVENT_STORE_PATH != path:
+            from agent.intelligence_layer.events import EventStore
+
+            _MISSION_EVENT_STORE = EventStore(path)
+            _MISSION_EVENT_STORE_PATH = path
+        return _MISSION_EVENT_STORE
+
+
+def _mission_event_bus():
+    from agent.intelligence_layer.events import EventBus
+
+    return EventBus(_mission_event_store())
 
 
 def _desktop_model_manager() -> LocalModelManager:
@@ -124,6 +146,7 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
         RUNTIME.router,
         db_path=DB_PATH.with_name("missions.sqlite3"),
         skill_registry=skills,
+        event_bus=_mission_event_bus(),
     )
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
     scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
@@ -134,6 +157,7 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
             executor=core._executor,
             require_authorization_snapshot=True,
             require_execution_fence=True,
+            event_bus=core.event_bus,
             task_graph_policy=core.task_graph_policy,
             skill_context_provider=core._resolve_mission_skill_context,
         )
@@ -202,18 +226,28 @@ class Handler(BaseHTTPRequestHandler):
             RUNTIME.router,
             db_path=DB_PATH.with_name("missions.sqlite3"),
             skill_registry=_skill_registry(),
+            event_bus=_mission_event_bus(),
         )
         runtime = MissionRuntime(
             core.store,
             executor=core._executor,
             require_authorization_snapshot=True,
             require_execution_fence=True,
+            event_bus=core.event_bus,
             task_graph_policy=core.task_graph_policy,
             skill_context_provider=core._resolve_mission_skill_context,
         )
         queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
         scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
         return MissionService(runtime, queue, scheduler, owner_revalidator=core.prepare_mission_for_queue)
+
+    def _mission_observability_service(self):
+        from api.observability import MissionObservabilityService
+
+        return MissionObservabilityService(
+            self._mission_service(),
+            event_store=_mission_event_store(),
+        )
 
     def _skill_service(self):
         from api.skills import OwnerSkillService
@@ -540,14 +574,52 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError) as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
         if parsed.path.startswith("/api/public/missions/"):
-            owner = self._public_mission_owner()
+            parts = [unquote(item) for item in parsed.path[len("/api/public/missions/"):].split("/")]
+            observability_route = len(parts) == 2 and parts[1] == "observability"
+            owner = self._public_mission_owner(csrf=observability_route)
             if owner is None:
                 return
-            parts = [unquote(item) for item in parsed.path[len("/api/public/missions/"):].split("/")]
             mission_id = parts[0] if parts else ""
             if not PUBLIC_MISSION_ID_RE.fullmatch(mission_id):
                 return self._send(404, {"ok": False, "error": "unknown_mission"})
             action = parts[1] if len(parts) > 1 else "status"
+            if action == "observability" and len(parts) == 2:
+                from api.observability import MissionObservabilityError, MissionObservabilityTooLarge
+
+                try:
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    allowed_query = {"timeline_offset", "timeline_limit", "event_after_sequence", "event_limit"}
+                    if set(query) - allowed_query:
+                        raise ValueError("invalid_observability_query")
+
+                    def query_int(name: str, default: int, maximum: int) -> int:
+                        values = query.get(name)
+                        if values is None:
+                            return default
+                        if len(values) != 1 or not re.fullmatch(r"[0-9]{1,10}", values[0]):
+                            raise ValueError("invalid_observability_query")
+                        value = int(values[0])
+                        if value > maximum:
+                            raise ValueError("invalid_observability_query")
+                        return value
+
+                    value = self._mission_observability_service().get(
+                        mission_id,
+                        owner_session_token=owner["session_token"],
+                        timeline_offset=query_int("timeline_offset", 0, 20_000),
+                        timeline_limit=query_int("timeline_limit", 25, 50),
+                        event_after_sequence=query_int("event_after_sequence", 0, 2_147_483_647),
+                        event_limit=query_int("event_limit", 25, 50),
+                    )
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "observability": value})
+                except KeyError:
+                    return self._send(404, {"ok": False, "error": "unknown_mission"})
+                except MissionObservabilityTooLarge:
+                    return self._send(413, {"ok": False, "error": "mission_observability_too_large"})
+                except MissionObservabilityError as exc:
+                    return self._send(409, {"ok": False, "error": str(exc)})
+                except ValueError as exc:
+                    return self._send(400, {"ok": False, "error": str(exc)})
             try:
                 service = self._mission_service()
                 service._authorized_mission(

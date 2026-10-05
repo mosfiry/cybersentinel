@@ -23,6 +23,8 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 from security.owner_policy import OwnerAuthenticationEvidence
 from security.session_reference import session_reference
 
+MAX_OBSERVABILITY_MISSION_BYTES = 16 * 1024 * 1024
+
 
 class MissionService:
     """Owner-scoped mission control plane; execution remains MissionRuntime-owned."""
@@ -79,6 +81,44 @@ class MissionService:
         if mission.owner_identity_ref != owner_ref:
             if not (allow_unbound_read and not mission.owner_identity_ref):
                 raise PermissionError("mission access denied")
+        return mission, owner_ref
+
+    def load_authorized_mission(self, mission_id: str, owner_session_token: str | None) -> tuple[Mission, str]:
+        """Load a Mission only through its authenticated Owner-scoped row filter."""
+        owner_ref = self._owner_identity_ref(owner_session_token)
+        if not isinstance(mission_id, str) or not mission_id or len(mission_id) > 128:
+            raise KeyError("unknown_mission")
+        try:
+            with sqlite3.connect(self.runtime.store.db_path) as db:
+                db.execute("BEGIN")
+                owner_filter = (
+                    "mission_id=? AND json_valid(payload) "
+                    "AND json_extract(payload, '$.owner_identity_ref')=?"
+                )
+                parameters = (mission_id, owner_ref)
+                size_row = db.execute(
+                    f"SELECT length(payload) FROM missions WHERE {owner_filter}",
+                    parameters,
+                ).fetchone()
+                if size_row is None:
+                    raise KeyError("unknown_mission")
+                if isinstance(size_row[0], bool) or not isinstance(size_row[0], int) or size_row[0] > MAX_OBSERVABILITY_MISSION_BYTES:
+                    raise ValueError("mission_observability_too_large")
+                row = db.execute(
+                    "SELECT payload FROM missions WHERE " + owner_filter,
+                    parameters,
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise KeyError("unknown_mission") from exc
+        if row is None:
+            raise KeyError("unknown_mission")
+        try:
+            payload = json.loads(row[0])
+            mission = Mission.from_dict(payload)
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("mission_integrity_invalid") from exc
+        if mission.mission_id != mission_id or mission.owner_identity_ref != owner_ref or not mission.verify_integrity():
+            raise ValueError("mission_integrity_invalid")
         return mission, owner_ref
 
     def _assert_unleased(self, mission_id: str) -> None:

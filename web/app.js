@@ -34,7 +34,7 @@ const state = {
   desktopSetup: null,
   modelManager: null,
   onboardingVisible: false,
-  missionViews: { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null },
+  missionViews: { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null, observability: null, observabilityError: "" },
   filePath: ".",
   activeView: "overview",
 };
@@ -233,7 +233,7 @@ function resetWorkspaceState() {
   state.conversationId = "";
   state.selectedMissionId = "";
   state.selectedMission = null;
-  state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null };
+  state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null, observability: null, observabilityError: "" };
   state.missions = [];
   state.skills = [];
   state.skillsLoaded = false;
@@ -893,6 +893,16 @@ function missionEndpoint(action) {
   return `/api/public/missions/${encodeURIComponent(state.selectedMissionId)}/${encodeURIComponent(action)}`;
 }
 
+function missionObservabilityEndpoint({ timelineOffset = 0, eventAfter = 0 } = {}) {
+  const query = new URLSearchParams({
+    timeline_offset: String(timelineOffset),
+    timeline_limit: "25",
+    event_after_sequence: String(eventAfter),
+    event_limit: "25",
+  });
+  return `${missionEndpoint("observability")}?${query.toString()}`;
+}
+
 async function selectMission(missionId) {
   state.selectedMissionId = String(missionId || "");
   state.filePath = ".";
@@ -904,7 +914,7 @@ async function loadMission(missionId = state.selectedMissionId) {
   if (!missionId || !state.ownerAuthenticated) return;
   state.selectedMissionId = String(missionId);
   try {
-    const [statusData, timelineData, evidenceData, artifactsData, logsData, effectsData, reportData] = await Promise.all([
+    const [statusData, timelineData, evidenceData, artifactsData, logsData, effectsData, reportData, observabilityData] = await Promise.all([
       api(missionEndpoint("status")),
       api(missionEndpoint("timeline")),
       api(missionEndpoint("evidence")),
@@ -912,6 +922,7 @@ async function loadMission(missionId = state.selectedMissionId) {
       api(missionEndpoint("logs")),
       api(missionEndpoint("effects")).catch((error) => ({ effects: [], error: error.message })),
       api(missionEndpoint("report")).catch((error) => ({ report: null, error: error.message })),
+      api(missionObservabilityEndpoint()).catch((error) => ({ observability: null, error: error.message })),
     ]);
     state.selectedMission = statusData.status || null;
     state.missionViews = {
@@ -923,6 +934,8 @@ async function loadMission(missionId = state.selectedMissionId) {
       effectsError: effectsData.error || "",
       report: reportData.report || null,
       reportError: reportData.error || "",
+      observability: observabilityData.observability || null,
+      observabilityError: observabilityData.error || "",
     };
     renderMissionHeader();
     renderActivityFromTimeline(state.missionViews.timeline);
@@ -1033,6 +1046,10 @@ function renderMissionView(view) {
     renderAgentSubtasks(mission, target);
     return;
   }
+  if (view === "observability") {
+    renderMissionObservability(state.missionViews.observability, target);
+    return;
+  }
   const values = view === "evidence" ? state.missionViews.evidence
     : view === "timeline" ? state.missionViews.timeline
       : view === "artifacts" ? state.missionViews.artifacts
@@ -1090,6 +1107,141 @@ function renderMissionView(view) {
   }
   if (view === "git") {
     renderGit();
+  }
+}
+
+function renderMissionObservability(data, target) {
+  const addText = (parent, tag, value, className = "") => {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    element.textContent = String(value ?? "");
+    parent.appendChild(element);
+    return element;
+  };
+  if (state.missionViews.observabilityError) {
+    addText(target, "p", `تعذر تحميل تقدم المهمة: ${errorText({ message: state.missionViews.observabilityError })}`, "notice warn");
+  }
+  const refresh = addText(target, "button", "تحديث التقدم", "observability-refresh");
+  refresh.type = "button";
+  refresh.addEventListener("click", () => loadMission(state.selectedMissionId));
+  if (!data) {
+    addText(target, "p", "لا تتوفر بيانات التقدم الآمنة لهذه المهمة حاليًا.", "muted");
+    return;
+  }
+
+  const stage = data.stage || {};
+  const stageCard = document.createElement("section");
+  stageCard.className = "result observability-card";
+  addText(stageCard, "h2", "المرحلة والمهمة الحالية");
+  const current = stage.current_step || null;
+  addText(stageCard, "p", `حالة المهمة: ${stage.status || "غير معروفة"} · الخطوة ${current ? Number(current.index) + 1 : "—"}/${Number(stage.step_count || 0)}`);
+  if (current) {
+    addText(stageCard, "p", `المهمة الحالية: ${current.step_id || "معرّف غير متاح"} · ${current.action || "عملية غير محددة"} · ${current.task_status || "حالة الرسم غير متاحة"}`);
+  } else {
+    addText(stageCard, "p", "لا توجد خطوة نشطة في خطة المهمة.", "muted");
+  }
+  if (stage.error_category) addText(stageCard, "p", `فئة التوقف/الإخفاق: ${stage.error_category}`, "observability-error");
+  target.appendChild(stageCard);
+
+  const graph = data.graph || {};
+  const graphCard = document.createElement("section");
+  graphCard.className = "result observability-card";
+  addText(graphCard, "h2", "حالة مهام الرسم والوكلاء المسجّلين");
+  addText(graphCard, "p", graph.available === true
+    ? `مراجعة الرسم: ${graph.revision} · المهام: ${(graph.tasks || []).length} · الوكلاء المسجلون: ${(graph.agents || []).length}`
+    : (graph.reason === "stale_plan" ? "حالة الرسم المحفوظة تخص خطة سابقة؛ لم تُعرض كحالة حالية." : "لم يُهيّأ رسم مهام لهذه المهمة."), "muted");
+  addText(graphCard, "p", "الحالة المعروضة من سجل الرسم فقط؛ لا تعني وجود وكلاء LLM مستقلين أو تنفيذ متوازٍ فعلي.", "muted");
+  (Array.isArray(graph.tasks) ? graph.tasks : []).forEach((task) => {
+    const card = document.createElement("article");
+    card.className = "observability-task";
+    addText(card, "h3", `${task.task_id || "مهمة"} · ${task.status || "غير معروفة"}`);
+    addText(card, "p", `التعيين: ${task.agent_role || "وكيل"} (${task.agent_id || "غير متاح"}) · حالة الوكيل: ${task.agent_status || "غير معروفة"}`);
+    addText(card, "p", `المتطلبات السابقة: ${(Array.isArray(task.dependencies) ? task.dependencies : []).join(", ") || "لا توجد"} · المحاولات: ${Number(task.attempt_count || 0)} · تحقق النتيجة: ${task.result_state || "غير محدد"}`);
+    if (task.error_category) addText(card, "p", `فئة الخطأ: ${task.error_category}`, "observability-error");
+    const refs = Array.isArray(task.evidence_refs) ? task.evidence_refs : [];
+    addText(card, "p", `مراجع الأدلة الموثقة: ${refs.join(", ") || "لا توجد مراجع مرتبطة"}`, "muted");
+    graphCard.appendChild(card);
+  });
+  (Array.isArray(graph.agents) ? graph.agents : []).forEach((agent) => {
+    const currentTasks = Array.isArray(agent.current_task_ids) ? agent.current_task_ids : [];
+    if (agent.status === "RUNNING" || currentTasks.length) {
+      addText(graphCard, "p", `وكيل يعمل: ${agent.role || "وكيل"} (${agent.agent_id || "غير متاح"}) · المهام الحالية: ${currentTasks.join(", ") || "غير محددة"}`, "observability-active-agent");
+    }
+  });
+  target.appendChild(graphCard);
+
+  const evidenceCard = document.createElement("section");
+  evidenceCard.className = "result observability-card";
+  addText(evidenceCard, "h2", "مراجع الأدلة الآمنة");
+  const references = Array.isArray(data.evidence_refs) ? data.evidence_refs : [];
+  addText(evidenceCard, "p", `مراجع إيصالات التنفيذ المعروضة: ${references.length} من ${Number(data.evidence_ref_count || 0)}. لا تُعرض حمولات الأدلة أو بيانات الأدوات.`, "muted");
+  references.forEach((reference) => addText(evidenceCard, "p", `${reference.evidence_id || "مرجع"} · التسلسل ${reference.sequence || "—"} · المهمة ${reference.task_id || "غير محددة"}`));
+  if (!references.length) addText(evidenceCard, "p", "لا توجد مراجع إيصالات مؤهلة لهذه المهمة.", "muted");
+  target.appendChild(evidenceCard);
+
+  const timelineCard = document.createElement("section");
+  timelineCard.className = "result observability-card";
+  addText(timelineCard, "h2", "السجل الزمني المنقّح");
+  const timelineEvents = Array.isArray(data.timeline?.events) ? data.timeline.events : [];
+  if (!timelineEvents.length) addText(timelineCard, "p", "لا توجد أحداث في هذه الصفحة.", "muted");
+  timelineEvents.forEach((event) => {
+    const row = document.createElement("article");
+    row.className = "observability-event";
+    addText(row, "time", event.timestamp || "");
+    addText(row, "span", `${event.type || "حدث"} · ${event.step_ref || "بلا خطوة"}${event.error_category ? ` · ${event.error_category}` : ""}`);
+    timelineCard.appendChild(row);
+  });
+  if (data.timeline?.has_more === true) {
+    const more = addText(timelineCard, "button", "تحميل أحداث لاحقة", "observability-more");
+    more.type = "button";
+    more.addEventListener("click", () => loadMoreMissionProgress("timeline"));
+  }
+  target.appendChild(timelineCard);
+
+  const eventCard = document.createElement("section");
+  eventCard.className = "result observability-card";
+  addText(eventCard, "h2", "أحداث الأدوات والمهام المحفوظة");
+  const taskEvents = Array.isArray(data.event_log?.events) ? data.event_log.events : [];
+  if (!taskEvents.length) addText(eventCard, "p", "لا توجد أحداث محفوظة في سجل المهام لهذه الصفحة.", "muted");
+  taskEvents.forEach((event) => {
+    const row = document.createElement("article");
+    row.className = "observability-event";
+    addText(row, "time", event.timestamp || "");
+    const status = typeof event.success === "boolean" ? (event.success ? "نجاح" : "إخفاق") : "";
+    addText(row, "span", `${event.type || "حدث"} · ${event.tool || "أداة غير محددة"} · ${event.task_ref || "مهمة غير محددة"}${status ? ` · ${status}` : ""}`);
+    eventCard.appendChild(row);
+  });
+  if (data.event_log?.has_more === true) {
+    const more = addText(eventCard, "button", "تحميل أحداث إضافية", "observability-more");
+    more.type = "button";
+    more.addEventListener("click", () => loadMoreMissionProgress("event_log"));
+  }
+  target.appendChild(eventCard);
+}
+
+async function loadMoreMissionProgress(kind) {
+  const current = state.missionViews.observability;
+  if (!current || !state.selectedMissionId) return;
+  const timelineOffset = kind === "timeline" ? current.timeline?.next_offset : current.timeline?.offset || 0;
+  const eventAfter = kind === "event_log" ? current.event_log?.next_after_sequence : current.event_log?.after_sequence || 0;
+  try {
+    const response = await api(missionObservabilityEndpoint({ timelineOffset: timelineOffset || 0, eventAfter: eventAfter || 0 }));
+    if (state.selectedMissionId !== response.mission_id && response.mission_id) return;
+    const next = response.observability;
+    if (!next) return;
+    if (kind === "timeline") {
+      next.timeline.events = [...(current.timeline?.events || []), ...(next.timeline?.events || [])];
+      next.event_log = current.event_log;
+    } else {
+      next.event_log.events = [...(current.event_log?.events || []), ...(next.event_log?.events || [])];
+      next.timeline = current.timeline;
+    }
+    state.missionViews.observability = next;
+    state.missionViews.observabilityError = "";
+    if (state.activeView === "observability") renderMissionView("observability");
+  } catch (error) {
+    state.missionViews.observabilityError = error.message;
+    if (state.activeView === "observability") renderMissionView("observability");
   }
 }
 
