@@ -120,7 +120,7 @@ def test_installer_and_exact_sha_workflow_build_a_private_artifact_not_a_release
     assert build["extraResources"][0]["to"] == "backend"
     assert build["extraResources"][1]["to"] == "llama"
     assert build["nsis"]["allowToChangeInstallationDirectory"] is True
-    assert PACKAGE["version"] == "5.1.0"
+    assert PACKAGE["version"] == "5.2.0-rc1"
     assert "work/windows-native-local-llm" in WORKFLOW
     assert "windows-latest" in WORKFLOW
     assert "python -m pytest -q" in WORKFLOW
@@ -129,7 +129,7 @@ def test_installer_and_exact_sha_workflow_build_a_private_artifact_not_a_release
     assert "scripts/download_llama_runtime.py" in WORKFLOW
     assert "scripts/build_desktop_backend.py" in WORKFLOW
     assert "scripts/write_installer_manifest.py" in WORKFLOW
-    assert "CyberSentinel-Setup-5.1.0.exe" in WORKFLOW
+    assert "CyberSentinel-v5.2.0-rc1.exe" in WORKFLOW
     assert "actions/upload-artifact@v4" in WORKFLOW
     assert "contents: read" in WORKFLOW
     assert "release:" not in WORKFLOW

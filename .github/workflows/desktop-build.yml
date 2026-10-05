@@ -1,4 +1,4 @@
-name: cybersentinel-windows-installer
+name: cybersentinel-windows-rc-installer
 
 on:
   push:
@@ -88,20 +88,28 @@ jobs:
           }
       - name: Build and smoke-test bundled backend
         run: python scripts/build_desktop_backend.py
-      - name: Build unsigned Windows x64 NSIS installer
+      - name: Build unsigned Windows x64 RC installer
         working-directory: desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist
-      - name: Hash and describe installer
-        run: python scripts/write_installer_manifest.py desktop/dist --version 5.1.0 --source-commit $env:GITHUB_SHA
-      - name: Upload installer and SHA-256 manifest for this commit
+      - name: Hash and describe RC installer with provenance
+        env:
+          CYBERSENTINEL_WINDOWS_RUNNER_ACCEPTANCE: "NOT_RUN"
+        run: >-
+          python scripts/write_installer_manifest.py desktop/dist
+          --version 5.2.0-rc1
+          --source-commit $env:GITHUB_SHA
+          --parent-tested-commit 103516c9b58cc37eaacda40c8d11ba6878ba64e9
+          --installer-name CyberSentinel-v5.2.0-rc1.exe
+      - name: Upload RC installer, checksum, and provenance as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cybersentinel-windows-installer-${{ github.sha }}
+          name: CyberSentinel-v5.2.0-rc1-${{ github.sha }}
           path: |
-            desktop/dist/CyberSentinel-Setup-5.1.0.exe
-            desktop/dist/CyberSentinel-Setup-5.1.0.exe.sha256
+            desktop/dist/CyberSentinel-v5.2.0-rc1.exe
+            desktop/dist/CyberSentinel-v5.2.0-rc1.exe.sha256
             desktop/dist/installer-manifest.json
           if-no-files-found: error
+          compression-level: 0
           retention-days: 90

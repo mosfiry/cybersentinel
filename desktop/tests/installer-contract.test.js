@@ -51,12 +51,12 @@ test("user workflow exposes projects, model installation/switch, findings and li
 });
 
 test("NSIS installer packages backend and local runtime and has a stable artifact name", () => {
-  assert.equal(pkg.version, "5.1.0");
+  assert.equal(pkg.version, "5.2.0-rc1");
   assert.deepEqual(pkg.build.win.target, [{ target: "nsis", arch: ["x64"] }]);
   assert.equal(pkg.build.win.icon, "build/icon.ico");
   assert.deepEqual(pkg.build.extraResources.map((resource) => resource.to), ["backend", "llama"]);
   assert.equal(pkg.build.nsis.allowToChangeInstallationDirectory, true);
-  assert.equal(pkg.build.nsis.artifactName, "CyberSentinel-Setup-${version}.exe");
+  assert.equal(pkg.build.nsis.artifactName, "CyberSentinel-v${version}.exe");
 });
 
 test("Windows ICO contains a valid PNG-backed 256x256 image resource", () => {

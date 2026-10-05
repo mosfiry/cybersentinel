@@ -1,7 +1,7 @@
 {
   "name": "cybersentinel-desktop",
   "productName": "CyberSentinel",
-  "version": "5.1.0",
+  "version": "5.2.0-rc1",
   "description": "CyberSentinel X Windows Desktop with bundled backend and offline-capable local inference",
   "author": "Mohammed Sfiry",
   "license": "UNLICENSED",
@@ -57,7 +57,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "runAfterFinish": true,
-      "artifactName": "CyberSentinel-Setup-${version}.exe"
+      "artifactName": "CyberSentinel-v${version}.exe"
     }
   }
 }
