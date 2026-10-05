@@ -487,6 +487,7 @@ class MissionService:
         elif mission.status in {MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.OWNER_REAUTH_REQUIRED}:
             mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
             mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+        self.runtime.request_agent_task_cancellation(mission)
         return self.runtime.store.save(mission).to_dict()
 
     def schedule_mission(

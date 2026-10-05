@@ -26,6 +26,7 @@ from security.mission_authorization import MissionAuthorizationSnapshot
 from .execution_fence import authorization_digest, authorization_snapshot_matches_mission
 from .mission import Mission, MissionStatus, MissionStore
 from .mission_runtime import MissionRuntime
+from .intelligence_layer.graph import AgentGraphPolicy
 from .mission_worker import MissionQueue, MissionWorker
 from .planning import FailureClass, Plan, PlanStep, RecoveryAction, RecoveryPolicy, TaskProfile, select_reasoning_profile
 from .provider_api import ProviderError, ToolCall
@@ -41,13 +42,14 @@ from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnder
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
 
-    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None):
+    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None):
         self.router = router
         self.store = store or MissionStore(db_path or DB_PATH.with_name("missions.sqlite3"))
         self.max_iterations = max_iterations
         self.knowledge_retriever = knowledge_retriever or TypedKnowledgeRetriever()
         self.event_bus = event_bus
         self.hook_registry = hook_registry
+        self.task_graph_policy = task_graph_policy or AgentGraphPolicy(max_retries=RecoveryPolicy().max_retries, max_parallel_tasks=1)
 
     def understand_mission_intent(self, instruction: str) -> MissionIntent:
         """Return typed semantic intent; model output remains an untrusted proposal."""
@@ -443,6 +445,7 @@ class AgentCore:
             require_execution_fence=True,
             event_bus=self.event_bus,
             hook_registry=self.hook_registry,
+            task_graph_policy=self.task_graph_policy,
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
@@ -651,7 +654,7 @@ class AgentCore:
     def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
         mission, _, fresh_snapshot = self._reauthorize_mission(mission_id, owner_session_token=owner_session_token)
         policy_context = policy_context_from_snapshot(fresh_snapshot)
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry)
+        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry, task_graph_policy=self.task_graph_policy)
         return self._run_via_fenced_worker(runtime, mission_id, max_slices=max_slices or self.max_iterations)
 
 

@@ -90,6 +90,7 @@ class Mission:
     replan_history: list[dict[str, Any]] = field(default_factory=list)
     verification_history: list[dict[str, Any]] = field(default_factory=list)
     recovery_events: list[dict[str, Any]] = field(default_factory=list)
+    agent_task_graph_state: dict[str, Any] = field(default_factory=dict)
     semantic_intent: dict[str, Any] = field(default_factory=dict)
     integrity_hash: str = ""
 
@@ -186,6 +187,7 @@ class Mission:
             "replan_history": self.replan_history,
             "verification_history": self.verification_history,
             "recovery_events": self.recovery_events,
+            "agent_task_graph_state": self.agent_task_graph_state,
             "semantic_intent": self.semantic_intent,
         }
 

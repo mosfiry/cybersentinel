@@ -22,6 +22,8 @@ from .model_protocol import ConversationTurn, NativeModel, RouterNativeModel, To
 from .provider_api import InvalidModelResponse, MAX_PROVIDER_LABEL_CHARS, ProviderError
 from .model_intelligence.context import ContextAssembler
 from .model_intelligence.tool_calls import execute_bounded_parallel, validate_proposals
+from .intelligence_layer.graph import AgentGraphPolicy
+from .intelligence_layer.runtime_adapter import MissionTaskGraphAdapter, MissionTaskGraphError
 from security.mission_authorization import MissionAuthorizationError
 
 MAX_TOOL_ERROR_CHARS = 128
@@ -38,7 +40,7 @@ class _MissionBudgetExceeded(RuntimeError):
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -61,6 +63,9 @@ class MissionRuntime:
                 raise TypeError("MissionRuntime hook_registry must be a HookRegistry")
         self.event_bus = event_bus
         self.hook_registry = hook_registry
+        if task_graph_policy is not None and not isinstance(task_graph_policy, AgentGraphPolicy):
+            raise TypeError("MissionRuntime task_graph_policy must be an AgentGraphPolicy")
+        self.task_graph_adapter = MissionTaskGraphAdapter(task_graph_policy) if task_graph_policy is not None else None
 
     @staticmethod
     def _limit_value(value: Any) -> int:
@@ -494,6 +499,34 @@ class MissionRuntime:
             return False, f"authorization snapshot invalid: {type(exc).__name__}"
 
     @staticmethod
+    def _typed_mission_snapshot(mission: Mission) -> Any:
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        return MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+
+    def _block_on_task_graph(self, mission: Mission, error: Exception) -> Mission:
+        reason = f"agent task graph rejected dispatch: {type(error).__name__}"
+        mission.error = reason
+        mission.failures.append({"class": FailureClass.UNKNOWN.value, "reason": reason, "boundary": "agent_task_graph"})
+        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=str(getattr(mission.current_plan_step, "step_id", "")), data={
+            "class": FailureClass.UNKNOWN.value,
+            "reason": reason,
+            "recovery": "owner_review_required",
+        })
+        mission.transition(MissionStatus.SAFETY_BLOCKED, reason)
+        return self._save(mission)
+
+    def request_agent_task_cancellation(self, mission: Mission) -> None:
+        """Record graph cancellation after the caller has authenticated Owner control."""
+        if self.task_graph_adapter is None:
+            return
+        try:
+            self.task_graph_adapter.cancel(mission)
+        except MissionTaskGraphError:
+            # Mission cancellation/recovery remains authoritative; a graph audit
+            # failure must never turn an Owner cancellation into permission to run.
+            mission.recovery_events.append({"event": "agent_task_graph_cancellation_requires_review"})
+
+    @staticmethod
     def _default_authorizer(mission: Mission, step: PlanStep) -> tuple[bool, str]:
         if step.authorization_requirement and not mission.authorization_context:
             return False, "owner authorization required"
@@ -625,6 +658,10 @@ class MissionRuntime:
         mission.provenance["owner_runtime_limits"] = {
             "max_execution_steps": self._limit_value(self.runtime_limits.max_execution_steps),
         }
+        if self.task_graph_adapter is not None:
+            if not mission.authorization_snapshot:
+                raise MissionTaskGraphError("graph-backed missions require a persisted authorization snapshot")
+            self.task_graph_adapter.ensure(mission, self._typed_mission_snapshot(mission))
         if planning_failures:
             for item in planning_failures:
                 if not isinstance(item, dict):
@@ -1546,6 +1583,13 @@ class MissionRuntime:
         step = mission.current_plan_step
         action_id = f"{mission.mission_id}:{mission.plan.version}:{step.step_id}:{mission.current_step}"
         mission.emit(EventType.STEP_SELECTED, step_id=step.step_id, data={"action_id": action_id, "plan_version": mission.plan.version})
+        graph_snapshot = None
+        if self.task_graph_adapter is not None:
+            try:
+                graph_snapshot = self._typed_mission_snapshot(mission)
+                self.task_graph_adapter.ensure(mission, graph_snapshot)
+            except (MissionTaskGraphError, KeyError, TypeError, ValueError) as exc:
+                return self._block_on_task_graph(mission, exc)
         signatures = mission.progress.setdefault("loop_signatures", {})
         signature = hashlib.sha256(json.dumps({"plan": mission.plan.fingerprint, "step": step.step_id, "action": step.action}, sort_keys=True).encode()).hexdigest()
         signatures[signature] = int(signatures.get(signature, 0)) + 1
@@ -1570,6 +1614,12 @@ class MissionRuntime:
 
         if self.require_execution_fence and not self._executor_accepts_fence(self.executor):
             raise ExecutionFenceError("strict runtime executor does not accept execution fences")
+
+        if self.task_graph_adapter is not None:
+            try:
+                self.task_graph_adapter.claim_step(mission, graph_snapshot, step.step_id)
+            except (MissionTaskGraphError, KeyError, TypeError, ValueError) as exc:
+                return self._block_on_task_graph(mission, exc)
 
         mission.transition(MissionStatus.RUNNING, "step started", step_id=step.step_id)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "in_flight", "plan_version": mission.plan.version}
@@ -1637,6 +1687,11 @@ class MissionRuntime:
         success = bool(observation.get("success", observation.get("ok", False)))
         mission.record_action(action_id, step.step_id, "completed" if success else "failed", observation)
         mission.checkpoint = {"step_id": step.step_id, "action_id": action_id, "status": "completed", "plan_version": mission.plan.version}
+        if self.task_graph_adapter is not None:
+            if success:
+                self.task_graph_adapter.complete_step(mission, step.step_id, observation, action_id)
+            else:
+                self.task_graph_adapter.fail_step(mission, step.step_id, str(observation.get("error", "mission step failed")))
         try:
             strategy_decision = self._interpret_observation(mission, step, observation, success=success)
         except (TypeError, ValueError, KeyError) as exc:
