@@ -980,7 +980,7 @@ class MissionRuntime:
             if spec.execution_context_required:
                 from security.authorization_context import AuthorizationContext
                 if not isinstance(mission.authorization_context, dict):
-                    raise ExecutionFenceError("native Browser dispatch requires the persisted Owner authorization record")
+                    raise ExecutionFenceError("native context-required tool dispatch requires the persisted Owner authorization record")
                 owner_authorization = AuthorizationContext.from_dict(dict(mission.authorization_context))
             target_identity = (
                 str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity)

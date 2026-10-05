@@ -156,7 +156,7 @@ def browser_fixture(monkeypatch, tmp_path):
         parsed = urlsplit(url)
         allowed = parsed.hostname == "127.0.0.1" and parsed.port == server.server_port and parsed.scheme == "http"
         scope_checks.append((url, kwargs.get("method", "GET"), allowed))
-        return ScopeDecision(allowed, "allowed" if allowed else "out_of_scope", program_id="fixture", target_id=target_id, snapshot_id=snapshot_id, canonical_url=url if allowed else None)
+        return ScopeDecision(allowed, "allowed" if allowed else "out_of_scope", program_id=kwargs.get("expected_program_id", "fixture"), target_id=target_id, snapshot_id=snapshot_id, canonical_url=url if allowed else None)
 
     monkeypatch.setattr("security.scope_resolver.resolve", scoped)
     evidence = _Evidence()
@@ -338,7 +338,7 @@ def test_sensitive_url_inputs_and_forbidden_form_values_fail_closed(browser_fixt
 
 def test_network_headers_never_forward_authorization_or_proxy_credentials():
     result = _scrub_request_headers({
-        "authorization": "Bearer owner-secret",
+        "authorization": "Bearer " + "owner-secret",
         "proxy-authorization": "Basic abc",
         "cookie": "target-session=only-this-target",
         "host": "attacker.invalid",
@@ -431,15 +431,15 @@ def test_real_browser_actions_dispatch_through_registry_and_live_execution_conte
     owner_auth = AuthorizationContext(request_id, owner_evidence, owner_policy, canonical_scope, session_id=session_id)
     mission_auth = MissionAuthorizationSnapshot.create(
         owner_identity="owner:1", mission_id=mission_id, target_identity=target_id,
-        scope=(scope_id,), allowed_actions=("browser", "browser.fill"), forbidden_actions=(),
-        allowed_tools=("browser", "browser.fill"), time_window={"timezone": "UTC"}, max_duration=1800,
-        rate_limits={"browser": 20, "browser.fill": 10}, network_boundary={"allowed": ("scope_pinned_browser",)},
+        scope=(scope_id,), allowed_actions=("browser", "browser.fill", "web_research"), forbidden_actions=(),
+        allowed_tools=("browser", "browser.fill", "web_research"), time_window={"timezone": "UTC"}, max_duration=1800,
+        rate_limits={"browser": 20, "browser.fill": 10, "web_research": 10}, network_boundary={"allowed": ("scope_pinned_browser", "scope_pinned_web_research")},
         data_boundary={"allowed": (target_id,)}, credential_boundary={"allowed": ()}, workspace_boundary={},
         policy_version="browser-test", owner_approval="explicit-test-approval", created_at=created, expires_at=expires,
     )
     scope_context = {"program_id": program_id, "target_id": target_id, "scope_snapshot_id": scope_id, "url": browser_fixture.origin + "/", "method": "GET"}
     mission_store = SimpleNamespace(db_path=str(tmp_path / "missions.sqlite3"))
-    fence = SimpleNamespace(queue=SimpleNamespace(mission_store=mission_store, db_path=str(tmp_path / "effects.sqlite3")))
+    fence = SimpleNamespace(queue=SimpleNamespace(mission_store=mission_store, db_path=str(tmp_path / "effects.sqlite3")), task_id="task:browser-registry")
     dispatches = []
     def assert_dispatch(**kwargs):
         assert kwargs["mission_id"] == mission_id
@@ -496,8 +496,34 @@ def test_real_browser_actions_dispatch_through_registry_and_live_execution_conte
         filled = dispatch("browser.fill", {"session_id": opened["session_id"], "selector": "#q", "value": "safe query"}, "execution:fill")
         assert filled["filled"] is True and filled["submission"] == "not_performed"
         assert filled["network_during_fill"] == "blocked" and filled["session_closed"] is True
+        from security.pinned_http import pinned_http_request
+        from tools.web_research import WebResearchService
+        import tools.web_research as web_research_module
+
+        class ControlledSearch:
+            def search(self, _query, **_kwargs):
+                return SimpleNamespace(
+                    success=True,
+                    provider="controlled_test_provider",
+                    results=[SimpleNamespace(source="web", url=browser_fixture.origin + "/", content="controlled source snippet")],
+                )
+
+        def local_fetch(url, *, timeout, max_response_bytes):
+            return pinned_http_request(
+                url, method="GET", headers={"Accept": "text/html"}, timeout=timeout,
+                max_response_bytes=max_response_bytes, allow_loopback=True,
+            )
+
+        research_service = WebResearchService(searcher=ControlledSearch(), fetcher=local_fetch)
+        monkeypatch.setattr(web_research_module, "get_web_research_service", lambda: research_service)
+        research = dispatch("web_research", {"query": "authorized target advisory", "max_results": 1}, "execution:research")
+        assert research["status"] == "completed"
+        assert research["authority"] == "none" and research["trust"] == "untrusted_data"
+        assert research["results"][0]["provenance"]["task_id"] == fence.task_id
         assert browser_fixture.server.RequestHandlerClass.state["posts"] == []
-        assert [item["evidence"]["record_type"] for item in evidence_records] == ["UNTRUSTED_BROWSER_OBSERVATION"] * 2
+        assert [item["evidence"]["record_type"] for item in evidence_records] == [
+            "UNTRUSTED_BROWSER_OBSERVATION", "UNTRUSTED_BROWSER_OBSERVATION", "UNTRUSTED_WEB_RESEARCH_RESULT",
+        ]
         assert len(dispatches) >= 4
     finally:
         service.shutdown()

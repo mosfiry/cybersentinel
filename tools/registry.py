@@ -502,8 +502,19 @@ _BROWSER_FILL_SCHEMA = {
     "additionalProperties": False,
 }
 
+_WEB_RESEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "maxLength": 512},
+        "max_results": {"type": "integer", "minimum": 1, "maximum": 3},
+    },
+    "required": ["query"],
+    "additionalProperties": False,
+}
+
 
 from .browser import browser_fill, browser_read
+from .web_research import web_research
 
 
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
@@ -601,6 +612,17 @@ REGISTRY = build_registry([
         evidence_requirements=("execution_fence", "local_form_fill_only"),
         timeout=30, effect_provider="cybersentinel.browser", execution_context_required=True,
         scope_rate_deferred=True, allow_custom_input_schema=True,
+    ),
+    ToolSpec(
+        "web_research", "Search the existing web provider, fetch only Mission-in-scope pages, and return cited untrusted excerpts.",
+        "network-read", True, dict, web_research, owner_only=True, scope_required=True,
+        version="1.0.0", input_schema=_WEB_RESEARCH_SCHEMA,
+        network_access="scope_pinned_web_research",
+        scope_requirements=("canonical_owner_scope", "target_identity", "dns_pinned_get_only"),
+        evidence_requirements=("execution_fence", "mission_task_provenance", "untrusted_source_content"),
+        timeout=30, effect_provider="cybersentinel.web-research",
+        execution_context_required=True, scope_rate_deferred=True,
+        allow_custom_input_schema=True,
     ),
 ])
 
