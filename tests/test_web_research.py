@@ -249,7 +249,7 @@ def test_registry_exposes_bounded_owner_scoped_research_but_denies_unfenced_disp
 
     from agent.execution_fence import ExecutionFenceError
     from agent.context import RuntimeLimits
-    from tools.registry import REGISTRY, execute, tool_definitions
+    from tools.registry import REGISTRY, execute, model_tool_definitions
 
     spec = REGISTRY["web_research"]
     assert spec.execution_context_required and spec.owner_only and spec.scope_required
@@ -257,7 +257,7 @@ def test_registry_exposes_bounded_owner_scoped_research_but_denies_unfenced_disp
     assert spec.validate_input({"query": "advisory", "max_results": 3})[0]
     assert not spec.validate_input({"query": "advisory", "max_results": 4})[0]
     assert not spec.validate_input({"query": "advisory", "ignore_scope": True})[0]
-    schema_chars = len(json.dumps(tool_definitions(), ensure_ascii=False, separators=(",", ":")))
+    schema_chars = len(json.dumps(model_tool_definitions(), ensure_ascii=False, separators=(",", ":")))
     assert schema_chars <= RuntimeLimits().max_tool_schema_chars
     with pytest.raises(ExecutionFenceError, match="execution fence"):
         execute("web_research", {"query": "advisory"})

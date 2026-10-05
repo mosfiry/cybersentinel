@@ -887,3 +887,221 @@ def test_project_import_requires_main_process_capability_owner_and_csrf(public_s
         "description": "from native picker",
         "selected_root": str(selected_root),
     }
+
+
+class _FakeMCPStore:
+    def __init__(self):
+        self.calls = []
+        self.server_id = "mcp_" + "a" * 32
+        self.server = {
+            "server_id": self.server_id,
+            "endpoint": "https://mcp.example.test/mcp",
+            "trust_level": "UNTRUSTED",
+            "identity_sha256": "",
+            "protocol_version": "",
+            "updated_at": "2026-10-05T00:00:00+00:00",
+        }
+        self.tool = {
+            "name": "lookup_record",
+            "schema": {"input": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}, "output": None},
+            "schema_sha256": "a" * 64,
+            "approved": False,
+        }
+
+    def register_server(self, **kwargs):
+        self.calls.append(("register", kwargs))
+        return {**self.server, "endpoint": kwargs["endpoint"]}
+
+    def list_servers(self, **kwargs):
+        self.calls.append(("list", kwargs))
+        return [{**self.server, "tools": [dict(self.tool)]}]
+
+    def get_server(self, **kwargs):
+        self.calls.append(("get_server", kwargs))
+        return dict(self.server)
+
+    def get_tool(self, **kwargs):
+        self.calls.append(("get_tool", kwargs))
+        return dict(self.tool)
+
+    def set_trust(self, **kwargs):
+        self.calls.append(("trust", kwargs))
+        if not isinstance(kwargs["trust_level"], str) or kwargs["trust_level"] not in {"TRUSTED", "KNOWN", "UNTRUSTED", "BLOCKED"}:
+            raise ValueError("invalid_mcp_trust_level")
+        self.server["trust_level"] = kwargs["trust_level"]
+        return dict(self.server)
+
+    def approve_tool(self, **kwargs):
+        self.calls.append(("approve", kwargs))
+        self.tool["approved"] = True
+        return dict(self.tool)
+
+
+def _fake_mcp_context(self, mission_id, owner):
+    if mission_id in {"foreign", "missing"}:
+        raise KeyError("unknown_mission")
+    return None, f"owner:{int(owner['owner_id'])}", None, {
+        "scope_snapshot_id": "scope-safe",
+        "target_id": "target-safe",
+        "program_id": "program-safe",
+    }
+
+
+def test_public_mcp_management_requires_owner_csrf_and_exact_mission(public_server, monkeypatch):
+    import security.scope_resolver as scope_resolver
+
+    store = _FakeMCPStore()
+    calls = []
+    monkeypatch.setattr(bridge.Handler, "_mcp_mission_context", _fake_mcp_context)
+    monkeypatch.setattr(bridge.Handler, "_mcp_server_store", lambda self: store)
+    monkeypatch.setattr(bridge.Handler, "_assert_mcp_endpoint_scope", staticmethod(lambda endpoint, _scope: endpoint))
+    cookie, csrf = _owner_session(public_server)
+
+    status, _, _ = _request(public_server, "GET", "/api/public/missions/mission-safe/mcp", headers={"Cookie": cookie})
+    assert status == 401
+    status, _, _ = _request(
+        public_server, "POST", "/api/public/missions/mission-safe/mcp",
+        body={"endpoint": "https://mcp.example.test/mcp"}, headers={"Cookie": cookie},
+    )
+    assert status == 401
+
+    status, registered, _ = _request(
+        public_server, "POST", "/api/public/missions/mission-safe/mcp",
+        body={"endpoint": "https://mcp.example.test/mcp"}, headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 201
+    assert registered["server"]["trust_level"] == "UNTRUSTED"
+    assert store.calls[-1][1]["owner_identity_ref"] == "owner:7"
+    assert store.calls[-1][1]["mission_id"] == "mission-safe"
+
+    status, inventory, _ = _request(
+        public_server, "GET", "/api/public/missions/mission-safe/mcp",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert inventory["servers"][0]["tools"][0]["schema_sha256"] == "a" * 64
+    assert "schema" not in inventory["servers"][0]["tools"][0]
+    assert "owner_identity_ref" not in json.dumps(inventory)
+
+    status, details, _ = _request(
+        public_server, "GET",
+        f"/api/public/missions/mission-safe/mcp?server_id={store.server_id}&tool_name=lookup_record",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert details["tool"]["name"] == "lookup_record"
+    assert details["tool"]["schema_sha256"] == "a" * 64
+
+    status, trusted, _ = _request(
+        public_server, "POST", f"/api/public/missions/mission-safe/mcp/{store.server_id}/trust",
+        body={"trust_level": "TRUSTED"}, headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert trusted["server"]["trust_level"] == "TRUSTED"
+    status, approved, _ = _request(
+        public_server, "POST", f"/api/public/missions/mission-safe/mcp/{store.server_id}/approve",
+        body={"tool_name": "lookup_record", "schema_sha256": "a" * 64},
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert approved["tool"]["approved"] is True
+    assert all(call[1].get("owner_identity_ref", "owner:7") == "owner:7" for call in store.calls)
+
+    status, malformed_trust, _ = _request(
+        public_server, "POST", f"/api/public/missions/mission-safe/mcp/{store.server_id}/trust",
+        body={"trust_level": []}, headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 400
+    assert malformed_trust["error"] == "invalid_mcp_trust_level"
+
+    status, denied, _ = _request(
+        public_server, "GET", "/api/public/missions/foreign/mcp",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 404
+    assert denied == {"ok": False, "error": "unknown_mission_or_mcp_record"}
+
+    status, rejected, _ = _request(
+        public_server, "POST", "/api/public/missions/mission-safe/mcp",
+        body={"endpoint": "https://mcp.example.test/mcp", "owner_identity_ref": "owner:999"},
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 400
+    assert rejected["error"] == "invalid_mcp_registration"
+
+
+def test_public_mcp_inventory_is_size_bounded(public_server, monkeypatch):
+    class LargeStore(_FakeMCPStore):
+        def list_servers(self, **kwargs):
+            return [{
+                **self.server,
+                "server_id": "mcp_" + f"{index:032x}",
+                "tools": [{"name": "t" * 128, "schema_sha256": "b" * 64, "approved": False} for _ in range(32)],
+            } for index in range(32)]
+
+    monkeypatch.setattr(bridge.Handler, "_mcp_mission_context", _fake_mcp_context)
+    monkeypatch.setattr(bridge.Handler, "_mcp_server_store", lambda self: LargeStore())
+    cookie, csrf = _owner_session(public_server)
+    status, payload, _ = _request(
+        public_server, "GET", "/api/public/missions/mission-safe/mcp",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 413
+    assert payload == {"ok": False, "error": "mcp_inventory_too_large"}
+
+
+def test_mcp_mission_context_checks_canonical_owner_integrity_and_capabilities(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from security.mission_authorization import MissionAuthorizationSnapshot
+
+    created = datetime.now(timezone.utc)
+    snapshot = MissionAuthorizationSnapshot.create(
+        owner_identity="owner:7", mission_id="mission-safe", target_identity="target-safe",
+        scope=["network"], allowed_actions=["mcp.discover", "mcp.invoke"], forbidden_actions=[],
+        allowed_tools=["mcp.discover", "mcp.invoke"], time_window={"timezone": "UTC"}, max_duration=3600,
+        rate_limits={"mcp.discover": 10, "mcp.invoke": 10},
+        network_boundary={"allowed": ["https://mcp.example.test"]}, data_boundary={"allowed": ["target-safe"]},
+        credential_boundary={"allowed": []}, workspace_boundary={}, policy_version="test-policy",
+        owner_approval="explicit-test-owner-approval", created_at=created.isoformat(),
+        expires_at=(created + timedelta(hours=1)).isoformat(),
+    )
+    scope = {"scope_snapshot_id": "scope-safe", "target_id": "target-safe", "program_id": "program-safe"}
+    mission = SimpleNamespace(
+        mission_id="mission-safe", owner_identity_ref="owner:7", authorization_snapshot=snapshot.to_dict(),
+        scope_snapshot=scope, provenance={"authorization_snapshot_version": 1}, verify_integrity=lambda: True,
+    )
+
+    class Service:
+        def load_authorized_mission(self, mission_id, owner_session_token):
+            assert owner_session_token == OWNER_TOKEN
+            if mission_id != "mission-safe":
+                raise KeyError("unknown_mission")
+            return mission, "owner:7"
+
+    dummy = SimpleNamespace(_mission_service=lambda: Service())
+    loaded, owner_ref, loaded_snapshot, loaded_scope = bridge.Handler._mcp_mission_context(
+        dummy, "mission-safe", {"session_token": OWNER_TOKEN}
+    )
+    assert loaded is mission
+    assert owner_ref == "owner:7"
+    assert loaded_snapshot.mission_id == "mission-safe"
+    assert loaded_scope == scope
+
+    mission.verify_integrity = lambda: False
+    with pytest.raises(ValueError, match="mission_integrity_invalid"):
+        bridge.Handler._mcp_mission_context(dummy, "mission-safe", {"session_token": OWNER_TOKEN})
+
+    mission.verify_integrity = lambda: True
+    insufficient = MissionAuthorizationSnapshot.create(
+        owner_identity="owner:7", mission_id="mission-safe", target_identity="target-safe",
+        scope=["network"], allowed_actions=["mcp.discover"], forbidden_actions=[], allowed_tools=["mcp.discover"],
+        time_window={"timezone": "UTC"}, max_duration=3600, rate_limits={"mcp.discover": 1},
+        network_boundary={"allowed": ["https://mcp.example.test"]}, data_boundary={"allowed": ["target-safe"]},
+        credential_boundary={"allowed": []}, workspace_boundary={}, policy_version="test-policy",
+        owner_approval="explicit-test-owner-approval", created_at=created.isoformat(),
+        expires_at=(created + timedelta(hours=1)).isoformat(),
+    )
+    mission.authorization_snapshot = insufficient.to_dict()
+    with pytest.raises(PermissionError, match="mcp_mission_capability_missing"):
+        bridge.Handler._mcp_mission_context(dummy, "mission-safe", {"session_token": OWNER_TOKEN})

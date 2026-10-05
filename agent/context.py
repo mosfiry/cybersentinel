@@ -489,9 +489,12 @@ class ContextBuilder:
     
     def add_tool_definitions(self) -> ContextBuilder:
         """Add tool definitions from registry."""
-        from tools.registry import tool_definitions
+        from tools.registry import model_tool_definitions, tool_definitions
         self.tool_definitions = tool_definitions()
-        tool_schema_chars = len(json.dumps(self.tool_definitions, ensure_ascii=False, separators=(",", ":")))
+        # The model receives canonical function schemas, not the duplicated local
+        # audit aliases (parameters/input_schema) and policy metadata in tool_definitions.
+        provider_schemas = model_tool_definitions()
+        tool_schema_chars = len(json.dumps(provider_schemas, ensure_ascii=False, separators=(",", ":")))
         self.budget.add_fixed(tool_schema_chars)
         
         # Create a compact tool summary

@@ -259,6 +259,27 @@ def test_tool_registry_persists_effect_before_handler_and_never_replays_success(
     assert calls == ["private-payload"]
 
 
+def test_mcp_remote_tool_error_keeps_external_effect_ambiguous(tmp_path, monkeypatch):
+    _store, mission, snapshot, queue, _identity, _claim, fence = _leased_fence(
+        tmp_path, tool_name="mcp.invoke"
+    )
+    spec = _effect_spec(
+        "mcp.invoke",
+        lambda _value: {"status": "remote_tool_error", "success": False, "trust": "untrusted_remote_result"},
+    )
+
+    result = _execute(monkeypatch, spec, mission, snapshot, fence)
+    assert result["success"] is False
+    ledger = ExternalEffectLedger(queue.db_path)
+    record = ledger.list_effects(mission_id=mission.mission_id)[0]
+    assert record.state == EffectState.RECOVERY_REQUIRED
+    assert [item["to_state"] for item in ledger.history(record.effect_id)] == [
+        "PLANNED", "RESERVED", "DISPATCHED", "AMBIGUOUS", "RECOVERY_REQUIRED"
+    ]
+    with pytest.raises(EffectDispatchBlocked):
+        _execute(monkeypatch, spec, mission, snapshot, fence)
+
+
 def test_oversized_effect_result_is_summarized_before_ledger_persistence(tmp_path, monkeypatch):
     _store, mission, snapshot, queue, _identity, _claim, fence = _leased_fence(
         tmp_path,

@@ -245,6 +245,53 @@ class Handler(BaseHTTPRequestHandler):
         scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
         return MissionService(runtime, queue, scheduler, owner_revalidator=core.prepare_mission_for_queue)
 
+    def _mcp_server_store(self):
+        from tools.mcp_client import MCPServerStore
+
+        return MCPServerStore(DB_PATH.with_name("mcp_registry.sqlite3"))
+
+    def _mcp_mission_context(self, mission_id: str, owner: dict):
+        """Load only the authenticated Owner's intact Mission and its exact MCP scope."""
+        service = self._mission_service()
+        mission, owner_ref = service.load_authorized_mission(mission_id, owner["session_token"])
+        if not mission.verify_integrity() or mission.owner_identity_ref != owner_ref:
+            raise ValueError("mission_integrity_invalid")
+        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity)
+        valid, reason = snapshot.validate_for_mission(
+            mission_id=mission.mission_id,
+            owner_identity=owner_ref,
+            target_identity=target_identity,
+            version=int(mission.provenance.get("authorization_snapshot_version", 1)),
+        )
+        if not valid:
+            raise PermissionError(reason)
+        for capability in ("mcp.discover", "mcp.invoke"):
+            if capability not in snapshot.allowed_actions or capability not in snapshot.allowed_tools:
+                raise PermissionError("mcp_mission_capability_missing")
+        scope = mission.scope_snapshot
+        if not isinstance(scope, dict) or not {"scope_snapshot_id", "target_id", "program_id"}.issubset(scope):
+            raise PermissionError("mcp_mission_scope_unavailable")
+        return mission, owner_ref, snapshot, scope
+
+    @staticmethod
+    def _assert_mcp_endpoint_scope(endpoint: str, scope: dict) -> str:
+        from security.scope_resolver import resolve
+        from tools.mcp_client import canonical_mcp_endpoint
+
+        normalized = canonical_mcp_endpoint(endpoint)
+        decision = resolve(
+            str(scope["scope_snapshot_id"]),
+            str(scope["target_id"]),
+            normalized,
+            method="POST",
+            expected_program_id=str(scope["program_id"]),
+            consume_rate=False,
+        )
+        if not decision.allowed:
+            raise PermissionError("mcp_server_out_of_scope")
+        return normalized
+
     def _mission_observability_service(self):
         from api.observability import MissionObservabilityService
 
@@ -599,13 +646,56 @@ class Handler(BaseHTTPRequestHandler):
             parts = [unquote(item) for item in parsed.path[len("/api/public/missions/"):].split("/")]
             observability_route = len(parts) == 2 and parts[1] == "observability"
             evaluation_route = len(parts) == 2 and parts[1] == "evaluation"
-            owner = self._public_mission_owner(csrf=observability_route or evaluation_route)
+            mcp_route = len(parts) == 2 and parts[1] == "mcp"
+            owner = self._public_mission_owner(csrf=observability_route or evaluation_route or mcp_route)
             if owner is None:
                 return
             mission_id = parts[0] if parts else ""
             if not PUBLIC_MISSION_ID_RE.fullmatch(mission_id):
                 return self._send(404, {"ok": False, "error": "unknown_mission"})
             action = parts[1] if len(parts) > 1 else "status"
+            if action == "mcp" and len(parts) == 2:
+                try:
+                    if len(parsed.query) > 512:
+                        raise ValueError("invalid_mcp_query")
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    if set(query) - {"server_id", "tool_name"}:
+                        raise ValueError("invalid_mcp_query")
+                    if any(len(values) != 1 for values in query.values()):
+                        raise ValueError("invalid_mcp_query")
+                    server_id = query.get("server_id", [""])[0]
+                    tool_name = query.get("tool_name", [""])[0]
+                    if bool(server_id) != bool(tool_name):
+                        raise ValueError("invalid_mcp_query")
+                    _mission, owner_ref, _snapshot, _scope = self._mcp_mission_context(mission_id, owner)
+                    store = self._mcp_server_store()
+                    if server_id:
+                        server = store.get_server(owner_identity_ref=owner_ref, mission_id=mission_id, server_id=server_id)
+                        tool = store.get_tool(owner_identity_ref=owner_ref, mission_id=mission_id, server_id=server_id, tool_name=tool_name)
+                        payload = {
+                            "ok": True,
+                            "mission_id": mission_id,
+                            "server": server,
+                            "tool": {"name": tool["name"], "schema": tool["schema"], "schema_sha256": tool["schema_sha256"], "approved": tool["approved"]},
+                        }
+                    else:
+                        servers = store.list_servers(owner_identity_ref=owner_ref, mission_id=mission_id)
+                        safe_servers = [{
+                            **{key: server[key] for key in ("server_id", "endpoint", "trust_level", "identity_sha256", "protocol_version", "updated_at")},
+                            "tools": [{"name": tool["name"], "schema_sha256": tool["schema_sha256"], "approved": tool["approved"]} for tool in server["tools"]],
+                        } for server in servers]
+                        payload = {"ok": True, "mission_id": mission_id, "servers": safe_servers}
+                    if len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 65_536:
+                        return self._send(413, {"ok": False, "error": "mcp_inventory_too_large"})
+                    return self._send(200, payload)
+                except KeyError:
+                    return self._send(404, {"ok": False, "error": "unknown_mission_or_mcp_record"})
+                except PermissionError as exc:
+                    return self._send(403, {"ok": False, "error": str(exc)})
+                except RuntimeError:
+                    return self._send(409, {"ok": False, "error": "mcp_registry_integrity_invalid"})
+                except ValueError as exc:
+                    return self._send(400, {"ok": False, "error": str(exc)})
             if action == "observability" and len(parts) == 2:
                 from api.observability import MissionObservabilityError, MissionObservabilityTooLarge
 
@@ -797,6 +887,61 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"ok": False, "error": "public_boundary_disabled"})
         if not self._public_origin_allowed():
             return self._send(403, {"ok": False, "error": "origin_not_allowed"})
+        if path.startswith("/api/public/missions/"):
+            parts = [unquote(item) for item in path[len("/api/public/missions/"):].split("/")]
+            if len(parts) >= 2 and parts[1] == "mcp":
+                owner = self._public_mission_owner(csrf=True)
+                if owner is None:
+                    return
+                mission_id = parts[0]
+                if not PUBLIC_MISSION_ID_RE.fullmatch(mission_id):
+                    return self._send(404, {"ok": False, "error": "unknown_mission"})
+                try:
+                    _mission, owner_ref, _snapshot, scope = self._mcp_mission_context(mission_id, owner)
+                    store = self._mcp_server_store()
+                    if len(parts) == 2:
+                        payload = self._read_json()
+                        if not isinstance(payload, dict) or set(payload) != {"endpoint"}:
+                            raise ValueError("invalid_mcp_registration")
+                        endpoint = self._assert_mcp_endpoint_scope(payload["endpoint"], scope)
+                        server = store.register_server(owner_identity_ref=owner_ref, mission_id=mission_id, endpoint=endpoint)
+                        return self._send(201, {"ok": True, "mission_id": mission_id, "server": server})
+                    if len(parts) != 4:
+                        return self._send(404, {"ok": False, "error": "not_found"})
+                    server_id, operation = parts[2], parts[3]
+                    if operation == "trust":
+                        payload = self._read_json()
+                        if not isinstance(payload, dict) or set(payload) != {"trust_level"}:
+                            raise ValueError("invalid_mcp_trust_request")
+                        server = store.set_trust(
+                            owner_identity_ref=owner_ref,
+                            mission_id=mission_id,
+                            server_id=server_id,
+                            trust_level=payload["trust_level"],
+                        )
+                        return self._send(200, {"ok": True, "mission_id": mission_id, "server": server})
+                    if operation == "approve":
+                        payload = self._read_json()
+                        if not isinstance(payload, dict) or set(payload) != {"tool_name", "schema_sha256"}:
+                            raise ValueError("invalid_mcp_tool_approval")
+                        tool = store.approve_tool(
+                            owner_identity_ref=owner_ref,
+                            mission_id=mission_id,
+                            server_id=server_id,
+                            tool_name=payload["tool_name"],
+                            schema_sha256=payload["schema_sha256"],
+                        )
+                        return self._send(200, {"ok": True, "mission_id": mission_id, "tool": {"name": tool["name"], "schema_sha256": tool["schema_sha256"], "approved": tool["approved"]}})
+                    return self._send(404, {"ok": False, "error": "unknown_mcp_operation"})
+                except KeyError:
+                    return self._send(404, {"ok": False, "error": "unknown_mission_or_mcp_record"})
+                except PermissionError as exc:
+                    return self._send(403, {"ok": False, "error": str(exc)})
+                except ValueError as exc:
+                    status = 413 if str(exc) == "request_too_large" else 400
+                    return self._send(status, {"ok": False, "error": str(exc)})
+                except RuntimeError:
+                    return self._send(409, {"ok": False, "error": "mcp_registry_integrity_invalid"})
         if path == "/api/public/session":
             session = PUBLIC_SESSIONS.create()
             return self._send(
