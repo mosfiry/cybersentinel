@@ -130,6 +130,42 @@ class SkillTestCase:
         return cls(**data)
 
 
+@dataclass(frozen=True)
+class SkillCondition:
+    """A bounded, non-executable assertion over one declared input or output field."""
+
+    condition_id: str
+    field: str
+    operator: str
+    expected: Any = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.condition_id, str) or not _ID_RE.fullmatch(self.condition_id)
+            or not isinstance(self.field, str) or not _ID_RE.fullmatch(self.field)
+        ):
+            raise ValueError("skill condition identifiers must be bounded identifiers")
+        if not isinstance(self.operator, str) or self.operator not in {"exists", "non_empty", "equals", "not_equals", "one_of", "contains", "gte", "lte"}:
+            raise ValueError("unsupported Skill condition operator")
+        expected = json.loads(_json_bytes(self.expected, max_bytes=4096))
+        if self.operator in {"exists", "non_empty"} and expected is not None:
+            raise ValueError("presence conditions do not accept an expected value")
+        if self.operator == "one_of" and (not isinstance(expected, list) or not expected or len(expected) > 64):
+            raise ValueError("one_of conditions require a bounded non-empty list")
+        if self.operator == "contains" and isinstance(expected, (dict, list)):
+            raise ValueError("contains conditions require a scalar expected value")
+        if self.operator in {"gte", "lte"} and (not isinstance(expected, (int, float)) or isinstance(expected, bool)):
+            raise ValueError("numeric conditions require a numeric expected value")
+        object.__setattr__(self, "expected", expected)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"condition_id": self.condition_id, "field": self.field, "operator": self.operator, "expected": self.expected}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SkillCondition":
+        return cls(**dict(value))
+
+
 _DEFAULT_INPUT_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
 _DEFAULT_OUTPUT_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
 
@@ -157,6 +193,8 @@ class SkillDefinition:
     output_bindings: Mapping[str, str] = field(default_factory=dict)
     expires_at: str | None = None
     content_hash: str = ""
+    precondition_checks: tuple[SkillCondition, ...] = ()
+    postcondition_checks: tuple[SkillCondition, ...] = ()
 
     def __post_init__(self) -> None:
         if not _ID_RE.fullmatch(str(self.skill_id)):
@@ -176,6 +214,14 @@ class SkillDefinition:
         object.__setattr__(self, "examples", tuple(dict(x) for x in self.examples))
         object.__setattr__(self, "tests", tuple(self.tests))
         object.__setattr__(self, "output_bindings", {str(k): str(v) for k, v in dict(self.output_bindings).items()})
+        object.__setattr__(self, "precondition_checks", tuple(
+            item if isinstance(item, SkillCondition) else SkillCondition.from_dict(item)
+            for item in self.precondition_checks
+        ))
+        object.__setattr__(self, "postcondition_checks", tuple(
+            item if isinstance(item, SkillCondition) else SkillCondition.from_dict(item)
+            for item in self.postcondition_checks
+        ))
         object.__setattr__(self, "input_schema", dict(self.input_schema or _DEFAULT_INPUT_SCHEMA))
         object.__setattr__(self, "output_schema", dict(self.output_schema or _DEFAULT_OUTPUT_SCHEMA))
         if isinstance(self.confidence, bool) or not isinstance(self.confidence, (int, float)) or not 0.0 <= float(self.confidence) <= 1.0:
@@ -215,6 +261,11 @@ class SkillDefinition:
         # Omitting the optional field preserves hashes for existing v1 records.
         if self.expires_at is not None:
             payload["expires_at"] = self.expires_at
+        # Keep absent assertions out of the payload so legacy schema-v1 hashes stay stable.
+        if self.precondition_checks:
+            payload["precondition_checks"] = [check.to_dict() for check in self.precondition_checks]
+        if self.postcondition_checks:
+            payload["postcondition_checks"] = [check.to_dict() for check in self.postcondition_checks]
         return payload
 
     def to_dict(self) -> dict[str, Any]:
@@ -232,6 +283,8 @@ class SkillDefinition:
         data["examples"] = tuple(data.get("examples", ()))
         data["tests"] = tuple(SkillTestCase.from_dict(item) for item in data.get("tests", ()))
         data["output_bindings"] = dict(data.get("output_bindings", {}))
+        data["precondition_checks"] = tuple(SkillCondition.from_dict(item) for item in data.get("precondition_checks", ()))
+        data["postcondition_checks"] = tuple(SkillCondition.from_dict(item) for item in data.get("postcondition_checks", ()))
         return cls(**data)
 
 
@@ -551,6 +604,47 @@ def validate_object(value: Any, schema: Mapping[str, Any]) -> tuple[bool, str]:
     return True, "valid"
 
 
+def _strict_json_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, (int, float)) and not isinstance(left, bool) and isinstance(right, (int, float)) and not isinstance(right, bool):
+        return left == right
+    return type(left) is type(right) and left == right
+
+
+def _evaluate_conditions(checks: tuple[SkillCondition, ...], values: Mapping[str, Any]) -> tuple[bool, str]:
+    for check in checks:
+        exists = check.field in values
+        if check.operator == "exists":
+            passed = exists
+        elif not exists:
+            passed = False
+        else:
+            value = values[check.field]
+            expected = check.expected
+            if check.operator == "non_empty":
+                passed = value is not None and value != "" and value != [] and value != {}
+            elif check.operator == "equals":
+                passed = _strict_json_equal(value, expected)
+            elif check.operator == "not_equals":
+                passed = not _strict_json_equal(value, expected)
+            elif check.operator == "one_of":
+                passed = any(_strict_json_equal(value, candidate) for candidate in expected)
+            elif check.operator == "contains":
+                if isinstance(value, str) and isinstance(expected, str):
+                    passed = expected in value
+                elif isinstance(value, list):
+                    passed = any(_strict_json_equal(expected, candidate) for candidate in value)
+                else:
+                    passed = False
+            elif check.operator in {"gte", "lte"}:
+                numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+                passed = numeric and (value >= expected if check.operator == "gte" else value <= expected)
+            else:
+                passed = False
+        if not passed:
+            return False, check.condition_id
+    return True, ""
+
+
 def _resolve_binding(reference: str, inputs: Mapping[str, Any], outputs: Mapping[str, Any]) -> Any:
     parts = reference.split(".")
     if len(parts) == 2 and parts[0] == "input" and parts[1] in inputs:
@@ -571,10 +665,24 @@ def validate_skill_definition(definition: SkillDefinition, tool_specs: Mapping[s
         raise SkillError("skill procedure must contain 1–32 bounded steps")
     if not 1 <= len(definition.tests) <= _MAX_TESTS:
         raise SkillError("skill requires deterministic test cases")
-    if len(definition.examples) > 32 or len(definition.preconditions) > 64 or len(definition.postconditions) > 64:
+    if (
+        len(definition.examples) > 32 or len(definition.preconditions) > 64 or len(definition.postconditions) > 64
+        or len(definition.precondition_checks) > 64 or len(definition.postcondition_checks) > 64
+    ):
         raise SkillError("skill metadata exceeds bounds")
     _validate_schema_definition(definition.input_schema)
     _validate_schema_definition(definition.output_schema)
+    for label, checks, schema in (
+        ("precondition", definition.precondition_checks, definition.input_schema),
+        ("postcondition", definition.postcondition_checks, definition.output_schema),
+    ):
+        ids = [check.condition_id for check in checks]
+        if len(ids) != len(set(ids)):
+            raise SkillError(f"duplicate Skill {label} check id")
+        properties = set(schema.get("properties", {}))
+        for check in checks:
+            if not isinstance(check, SkillCondition) or check.field not in properties:
+                raise SkillError(f"Skill {label} check must reference a declared field")
     if not definition.output_bindings:
         raise SkillError("skill requires explicit output bindings")
     if set(definition.output_bindings) != set(definition.output_schema.get("properties", {})):
@@ -615,6 +723,9 @@ def validate_skill_definition(definition: SkillDefinition, tool_specs: Mapping[s
         valid, reason = validate_object(test.inputs, definition.input_schema)
         if not valid:
             raise SkillError(f"invalid test case {test.test_id}: {reason}")
+        conditions_pass, failed_condition = _evaluate_conditions(definition.precondition_checks, test.inputs)
+        if not conditions_pass:
+            raise SkillError(f"test case {test.test_id} fails precondition check: {failed_condition}")
         if test.expected_tool_sequence != tuple(actual_tools):
             raise SkillError(f"test case {test.test_id} does not cover the exact procedure tool sequence")
         step_ids_for_test = {step.step_id for step in definition.procedure}
@@ -637,6 +748,9 @@ def validate_skill_definition(definition: SkillDefinition, tool_specs: Mapping[s
         valid_output, reason = validate_object(simulated_result, definition.output_schema)
         if not valid_output:
             raise SkillError(f"test case {test.test_id} fails output schema validation: {reason}")
+        conditions_pass, failed_condition = _evaluate_conditions(definition.postcondition_checks, simulated_result)
+        if not conditions_pass:
+            raise SkillError(f"test case {test.test_id} fails postcondition check: {failed_condition}")
     for output_name, reference in definition.output_bindings.items():
         if not _ID_RE.fullmatch(output_name) or not isinstance(reference, str):
             raise SkillError("invalid output binding")
@@ -1140,6 +1254,8 @@ class SkillLearningPipeline:
 
         if not str(owner_identity_ref).strip() or not mission_id or not trajectory or len(trajectory) > 10000:
             raise SkillError("skill learning requires a bounded completed mission trajectory")
+        if not definition.precondition_checks or not definition.postcondition_checks:
+            raise SkillError("new Skill candidates require machine-checkable preconditions and postconditions")
         if self.mission_owner_resolver(mission_id) != owner_identity_ref:
             raise SkillAuthorizationError("mission owner does not match skill candidate owner")
         trajectory_payload = [dict(event) for event in trajectory]
@@ -1235,6 +1351,9 @@ class SkillExecutor:
         valid_inputs, input_reason = validate_object(inputs, definition.input_schema)
         if not valid_inputs:
             raise SkillError("invalid skill inputs: " + input_reason)
+        conditions_pass, failed_condition = _evaluate_conditions(definition.precondition_checks, inputs)
+        if not conditions_pass:
+            raise SkillError("skill precondition failed: " + failed_condition)
         run_id = uuid.uuid4().hex
         input_hash = hashlib.sha256(_json_bytes(dict(inputs), max_bytes=16_000)).hexdigest()
         self.registry.record_run_event(
@@ -1290,6 +1409,9 @@ class SkillExecutor:
             valid_output, output_reason = validate_object(result, definition.output_schema)
             if not valid_output:
                 raise SkillError("skill output schema rejected procedure result: " + output_reason)
+            conditions_pass, failed_condition = _evaluate_conditions(definition.postcondition_checks, result)
+            if not conditions_pass:
+                raise SkillError("skill postcondition failed: " + failed_condition)
             result_json = _json_bytes(dict(result), max_bytes=_MAX_RESULT_BYTES)
         except Exception as exc:
             state = "CANCELLED" if isinstance(exc, InterruptedError) else "FAILED"
@@ -1315,7 +1437,7 @@ class SkillExecutor:
 
 __all__ = [
     "AuthorizedSkillDispatcher", "MissionSkillContext", "SkillMissionBinding", "SkillApprovalGrant", "SkillAuthorizationError", "SkillCandidateEvidence",
-    "SkillCritique", "SkillDefinition", "SkillError", "SkillExecutionContext", "SkillExecutionReceipt",
+    "SkillCondition", "SkillCritique", "SkillDefinition", "SkillError", "SkillExecutionContext", "SkillExecutionReceipt",
     "SkillExecutor", "SkillLearningPipeline", "SkillRegistry",
     "SkillRevision", "SkillStatus", "SkillStep", "SkillStepReceipt", "SkillTestCase",
     "validate_object", "validate_skill_definition",

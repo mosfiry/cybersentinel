@@ -7,7 +7,7 @@ import pytest
 from api.missions import MissionService
 from api.skills import OwnerSkillService
 from agent.agent_core import AgentCore
-from agent.intelligence_layer.skills import SkillAuthorizationError, SkillDefinition, SkillError, SkillStep, SkillTestCase
+from agent.intelligence_layer.skills import SkillAuthorizationError, SkillCondition, SkillDefinition, SkillError, SkillStep, SkillTestCase
 from agent.mission import MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue
@@ -63,6 +63,8 @@ def _candidate_definition(description: str) -> SkillDefinition:
         tests=(SkillTestCase("test-fixture", {"query": "."}, ("run_project_tests",), {"test-step": {"ok": True}}),),
         provenance="derived from an Owner-verified mission",
         output_bindings={"ok": "step.test-step.ok"},
+        precondition_checks=(SkillCondition("query-nonempty", "query", "non_empty"),),
+        postcondition_checks=(SkillCondition("ok-true", "ok", "equals", True),),
     )
 
 
