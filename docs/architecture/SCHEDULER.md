@@ -1,0 +1,7 @@
+# Mission and Task Scheduling
+
+The production execution path remains the existing MissionStore, MissionQueue, worker, and MissionRuntime. It persists leases/checkpoints, revalidates owner authorization, fences effects, and quarantines ambiguous in-flight work rather than replaying it automatically. These safeguards remain authoritative for real mission execution.
+
+The added `TaskGraph` scheduler is deterministic in-memory orchestration over a bounded dependency graph. Its SQLite store persists graph revisions, but it is not wired to MissionQueue or the worker lifecycle and does not independently dispatch tasks. Graph persistence and mission/queue/evidence persistence are separate transactions; cross-store reconciliation is not claimed.
+
+Recurring/unattended schedules, multi-host high availability, coordinated backup across mission databases, and complete Owner-facing schedule list/get/update/delete UI/API are not established by this change. Preserve the existing conservative recovery behavior; do not replay a task solely because its graph record says it is ready. A future integration needs idempotent migrations, authenticated CRUD, restart/failover tests, and an explicit reconciliation contract.

@@ -1,0 +1,9 @@
+# Model Context Protocol (MCP)
+
+CyberSentinel does not currently contain an MCP client, server transport, MCP registry, or remote tool-discovery path. A configured connector name or a `ToolSpec` namespace alone would not establish MCP support. No MCP server is launched or contacted by the current implementation.
+
+The host boundary remains `tools/registry.py`: `ToolSpec` is the canonical definition for input schema, risk, required authorization, effect provider, timeout, scope, and evidence requirements. Any future MCP adapter must translate an explicitly Owner-approved server and capability revision into that same registry and dispatch boundary before the tool can run. It must not create a parallel tool registry or call remote tools directly from model output.
+
+A remote server must have a stable identity and content-bound capability version, explicit trust level, allowed tools/missions/scopes, and a credential policy. Unknown tools, changed schemas, unapproved servers, missing mission grants, and stale approvals must fail closed. Tool discovery descriptions, prompts, resources, and results are untrusted data; a server receives no Owner privileges merely because it speaks MCP.
+
+Transport work must also bound message size and time, honor cancellation, prevent SSRF and redirect escape, keep credentials out of logs/results, and attach request/response hashes and evidence provenance. Authentication material should be injected through the existing secret boundary rather than persisted with server records. Restart, idempotency, timeout-race, revocation, and effect-fence tests are required before claiming a production client.
