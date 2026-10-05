@@ -100,6 +100,17 @@ class AgentCore:
 
         return model_tool_definitions()
 
+    @staticmethod
+    def _schemas_for_mission_authorization(mission: Mission, schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        allowed = set(snapshot.allowed_tools)
+        return [
+            schema for schema in schemas
+            if isinstance(schema, dict)
+            and isinstance(schema.get("function"), dict)
+            and str(schema["function"].get("name", "")) in allowed
+        ]
+
     def _context_runtime_limits(self) -> RuntimeLimits:
         limits = RuntimeLimits()
         context_length = getattr(self.router, "context_length", None)
@@ -111,6 +122,26 @@ class AgentCore:
                 max_context_tokens=max(1, context_length * 4 // 5),
             )
         return limits
+
+    @staticmethod
+    def _planning_tool_allowlist(scope_context: dict[str, Any] | None) -> set[str] | None:
+        if scope_context is None:
+            return None
+        schemas = AgentCore._schemas()
+        registered = {
+            str(item.get("function", {}).get("name", ""))
+            for item in schemas
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+        allowed_raw = scope_context.get("allowed_tools")
+        forbidden_raw = scope_context.get("forbidden_actions", ())
+        for label, raw in (("allowed_tools", allowed_raw), ("forbidden_actions", forbidden_raw)):
+            if raw is None and label == "allowed_tools":
+                continue
+            if not isinstance(raw, (list, tuple, set, frozenset)) or any(not isinstance(item, str) for item in raw):
+                raise ValueError(f"invalid_{label}")
+        allowed = registered if allowed_raw is None else registered.intersection(allowed_raw)
+        return allowed.difference(forbidden_raw or ())
 
     @staticmethod
     def _calls(response: dict[str, Any]) -> list[ToolCall]:
@@ -134,9 +165,17 @@ class AgentCore:
             return [ToolCall(payload["name"], payload.get("arguments") or {}, str(payload.get("id") or uuid.uuid4().hex))]
         return []
 
-    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None) -> dict[str, Any]:
+    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None, available_tool_names: set[str] | None = None) -> dict[str, Any]:
         profile = select_reasoning_profile(objective)
         tool_results = [("observation", observation)] if observation else []
+        schemas = self._schemas()
+        effective_tool_names = {
+            str(item.get("function", {}).get("name", ""))
+            for item in schemas
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+        if available_tool_names is not None:
+            effective_tool_names.intersection_update(available_tool_names)
         skill_tool_names: set[str] | None = None
         if skill_context is not None:
             tool_results.append(("approved_skill_guidance", {
@@ -147,6 +186,7 @@ class AgentCore:
             ceiling = skill_context.get("allowed_tools_ceiling", ())
             if isinstance(ceiling, (list, tuple)) and ceiling:
                 skill_tool_names = {str(item) for item in ceiling}
+                effective_tool_names.intersection_update(skill_tool_names)
         context = ContextEngine.build(
             user_text=objective,
             conversation_id=conversation_id or "agent-core",
@@ -158,18 +198,22 @@ class AgentCore:
             knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
             include_tool_schema_tokens=True,
             include_tool_summary=False,
+            tool_schema_names=effective_tool_names,
         )
         messages = context.provider_messages()
-        schemas = self._schemas()
-        if skill_tool_names is not None:
-            schemas = [item for item in schemas if str(item.get("function", {}).get("name", "")) in skill_tool_names]
+        schemas = [
+            item for item in schemas
+            if str(item.get("function", {}).get("name", "")) in effective_tool_names
+        ]
+        if not schemas:
+            return self.router.generate(messages, reasoning_profile=profile)
         try:
             return self.router.tool_calling(messages, schemas, reasoning_profile=profile)
         except CapabilityUnsupported:
             return self.router.generate(messages, reasoning_profile=profile)
 
-    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None) -> Plan:
-        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context, memory_provider=memory_provider)
+    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None, available_tool_names: set[str] | None = None) -> Plan:
+        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context, memory_provider=memory_provider, available_tool_names=available_tool_names)
         self._last_model_response = dict(response)
         calls = self._calls(response)
         steps: list[PlanStep] = []
@@ -474,6 +518,7 @@ class AgentCore:
             if skill_binding.allowed_scope and not set(skill_binding.allowed_scope).issubset(set(effective_scope)):
                 raise SkillAuthorizationError("selected Skill scope exceeds the Owner-requested Mission scope")
             skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
+        planning_tool_names = self._planning_tool_allowlist(scope_context)
         planning_policy = RecoveryPolicy()
         planning_run_id = uuid.uuid4().hex
         planning_failures: list[dict[str, Any]] = []
@@ -488,7 +533,7 @@ class AgentCore:
                         from .intelligence_layer.skills import SkillAuthorizationError
                         raise SkillAuthorizationError("active canonical Owner changed during Skill-guided planning")
                     skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
-                candidate_plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id, skill_context=skill_context_payload, memory_provider=memory_provider)
+                candidate_plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id, skill_context=skill_context_payload, memory_provider=memory_provider, available_tool_names=planning_tool_names)
             except ProviderError as exc:
                 kind = getattr(getattr(exc, "kind", None), "value", getattr(exc, "kind", "PROVIDER_FAILURE"))
                 retryable_kind = str(kind) in {"PROVIDER_FAILURE", "TIMEOUT"}
@@ -595,6 +640,9 @@ class AgentCore:
             raise RuntimeError("owner mission planning ended without a plan or recorded failure")
         task_profile = TaskProfile.from_proposal(instruction, {"task_type": "owner_mission", "horizon": "long_horizon", "complexity": "multi_step", "likely_tools": [step.action for step in plan.steps if step.action != "__planning_failure__"]})
         def replan_with_selected_skill(current: Mission, observation: dict[str, Any]) -> Plan:
+            persisted_authorization = MissionAuthorizationSnapshot.from_dict(
+                dict(current.authorization_snapshot or {})
+            )
             selected_context = self._resolve_mission_skill_context(current) if current.skill_binding else None
             selected_payload = selected_context.to_untrusted_context() if selected_context is not None else None
             new_plan = self._plan(
@@ -605,6 +653,7 @@ class AgentCore:
                 conversation_id=current.mission_id,
                 skill_context=selected_payload,
                 memory_provider=memory_provider,
+                available_tool_names=set(persisted_authorization.allowed_tools),
             )
             if selected_context is not None:
                 proposed_tools = {str(step.action) for step in new_plan.steps if step.action != "__planning_failure__"}
@@ -756,12 +805,15 @@ class AgentCore:
                 except Exception:
                     pass
 
+        mission_tool_schemas: list[dict[str, Any]] = []
+        if native_model is not None:
+            mission_tool_schemas = self._schemas_for_mission_authorization(mission, self._schemas())
         return self._run_via_fenced_worker(
             runtime,
             mission.mission_id,
             max_slices=self.max_iterations,
             native_model=native_model,
-            tools=self._schemas() if native_model is not None else None,
+            tools=mission_tool_schemas if native_model is not None else None,
             postprocess=postprocess if native_model is None else None,
         )
 

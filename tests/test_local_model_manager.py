@@ -194,9 +194,11 @@ class FakeLocalInferenceProvider:
         self.model = ""
         self.failure = failure
         self.calls = 0
+        self.last_kwargs = {}
 
-    def generate(self, messages, **_kwargs):
+    def generate(self, messages, **kwargs):
         self.calls += 1
+        self.last_kwargs = kwargs
         assert messages[-1]["content"] == "Reply with the single word CYBERSENTINEL_LOCAL_OK."
         if self.failure:
             raise RuntimeError(self.failure)
@@ -268,6 +270,32 @@ def test_local_inference_uses_active_provider_and_stop_restores_external_router(
     assert router.providers == [external_provider]
     with pytest.raises(RuntimeError, match="local_runtime_not_ready"):
         manager.test_inference()
+
+
+def test_qwen3_local_smoke_disables_thinking_with_bounded_completion(tmp_path):
+    """Control-plane contract test; actual Qwen inference is tested by the opt-in harness."""
+    payload = b"qwen3-model-bits"
+    spec = make_spec("qwen3-4b-q4-k-m", payload)
+    local_provider = FakeLocalInferenceProvider()
+    manager, _runtime, _router = make_manager(
+        tmp_path,
+        [spec],
+        {spec.filename: payload},
+        runtime=FakeLocalInferenceRuntime(local_provider),
+    )
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+    manager.activate(spec.model_id)
+    wait_operation(manager, "complete")
+
+    manager.test_inference()
+
+    assert local_provider.last_kwargs == {
+        "temperature": 0,
+        "timeout": 90,
+        "max_tokens": 64,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
 
 
 def test_local_inference_failure_is_visible_and_never_falls_back(tmp_path):

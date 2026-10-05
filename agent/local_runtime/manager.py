@@ -356,14 +356,21 @@ class LocalModelManager:
             self._begin_operation("inference_test", spec, "testing")
 
         try:
+            generation_options: dict[str, Any] = {
+                "temperature": 0,
+                "timeout": 90,
+                "max_tokens": 64,
+            }
+            if spec.model_id.startswith("qwen3-"):
+                # Qwen3 defaults to a reasoning channel; tiny smoke-test token
+                # limits can end before the user-facing content is produced.
+                generation_options["chat_template_kwargs"] = {"enable_thinking": False}
             response = provider.generate(
                 [
                     {"role": "system", "content": "Follow the user request exactly and answer briefly."},
                     {"role": "user", "content": "Reply with the single word CYBERSENTINEL_LOCAL_OK."},
                 ],
-                temperature=0,
-                timeout=90,
-                max_tokens=24,
+                **generation_options,
             )
             text = str(getattr(response, "text", "") or "").strip()
             if not text:

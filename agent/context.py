@@ -591,13 +591,28 @@ class ContextBuilder:
         self.budget.add_item(len(context), is_required=True, tokens=_estimate_message_tokens(item.role, item.content))
         return self
     
-    def add_tool_definitions(self, *, include_summary: bool = True) -> ContextBuilder:
+    def add_tool_definitions(
+        self,
+        *,
+        include_summary: bool = True,
+        tool_schema_names: set[str] | None = None,
+    ) -> ContextBuilder:
         """Add tool definitions from registry."""
         from tools.registry import model_tool_definitions, tool_definitions
-        self.tool_definitions = tool_definitions()
+        local_definitions = tool_definitions()
         # The model receives canonical function schemas, not the duplicated local
         # audit aliases (parameters/input_schema) and policy metadata in tool_definitions.
         provider_schemas = model_tool_definitions()
+        if tool_schema_names is not None:
+            self.tool_definitions = [
+                item for item in local_definitions if str(item.get("name", "")) in tool_schema_names
+            ]
+            provider_schemas = [
+                item for item in provider_schemas
+                if str(item.get("function", {}).get("name", "")) in tool_schema_names
+            ]
+        else:
+            self.tool_definitions = local_definitions
         tool_schema_chars = len(json.dumps(provider_schemas, ensure_ascii=False, separators=(",", ":")))
         schema_tokens = _estimate_schema_tokens(provider_schemas) if self.include_tool_schema_tokens else 0
         self.budget.add_fixed(tool_schema_chars, tokens=schema_tokens)
@@ -1153,6 +1168,7 @@ class ContextEngine:
         current_observation: dict[str, Any] | None = None,
         include_tool_schema_tokens: bool = True,
         include_tool_summary: bool = True,
+        tool_schema_names: set[str] | None = None,
     ) -> AgentContext:
         """Build context for a user request.
         
@@ -1207,7 +1223,10 @@ class ContextEngine:
         builder.add_security_context(security_context)
         
         # 4. Available Tools (from registry)
-        builder.add_tool_definitions(include_summary=include_tool_summary)
+        builder.add_tool_definitions(
+            include_summary=include_tool_summary,
+            tool_schema_names=tool_schema_names,
+        )
         
         # 5. Conversation History
         if conversation_messages:

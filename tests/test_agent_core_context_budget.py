@@ -102,7 +102,7 @@ def test_initial_planning_uses_provider_context_window_token_budget(tmp_path: Pa
         return MinimalContext()
 
     monkeypatch.setattr(agent_core_module.ContextEngine, "build", classmethod(capture_build))
-    monkeypatch.setattr(core, "_schemas", lambda: [])
+    monkeypatch.setattr(core, "_schemas", lambda: [{"type": "function", "function": {"name": "status"}}])
 
     response = core._ask("current Owner task", policy_context="active policy", conversation_id="budget-test")
 
@@ -112,3 +112,84 @@ def test_initial_planning_uses_provider_context_window_token_budget(tmp_path: Pa
     assert limits.max_context_chars <= router.context_length * 2
     assert captured["include_tool_summary"] is False
     assert captured["include_tool_schema_tokens"] is True
+
+
+def test_initial_planning_sends_and_budgets_only_scope_permitted_tools(tmp_path: Path, monkeypatch):
+    import agent.agent_core as agent_core_module
+    from tools.registry import model_tool_definitions
+
+    router = CapturingRouter()
+    router.schemas = []
+
+    def tool_calling(messages, schemas, **_kwargs):
+        router.messages = list(messages)
+        router.schemas = list(schemas)
+        return {"content": "bounded proposal"}
+
+    router.tool_calling = tool_calling
+    core = AgentCore(router, store=MissionStore(tmp_path / "missions.sqlite3"))
+    all_names = {item["function"]["name"] for item in model_tool_definitions()}
+    scope_context = {"forbidden_actions": sorted(all_names - {"status"})}
+    available = core._planning_tool_allowlist(scope_context)
+    captured = {}
+    original_build = agent_core_module.ContextEngine.build
+
+    def capture_build(cls, **kwargs):
+        context = original_build(**kwargs)
+        captured["tool_schema_names"] = kwargs["tool_schema_names"]
+        captured["context"] = context
+        return context
+
+    monkeypatch.setattr(agent_core_module.ContextEngine, "build", classmethod(capture_build))
+    response = core._ask(
+        "Observe the current read-only status.",
+        policy_context="authenticated owner policy",
+        conversation_id="scope-budget-test",
+        available_tool_names=available,
+    )
+
+    assert response["content"] == "bounded proposal"
+    assert available == {"status"}
+    assert captured["tool_schema_names"] == {"status"}
+    assert [item["function"]["name"] for item in router.schemas] == ["status"]
+    assert captured["context"].budget.total_tokens < captured["context"].budget.limits.max_context_tokens
+
+
+def test_malformed_scope_tool_lists_fail_closed(tmp_path: Path):
+    import pytest
+
+    core = AgentCore(CapturingRouter(), store=MissionStore(tmp_path / "missions.sqlite3"))
+    with pytest.raises(ValueError, match="invalid_forbidden_actions"):
+        core._planning_tool_allowlist({"forbidden_actions": "status"})
+    with pytest.raises(ValueError, match="invalid_allowed_tools"):
+        core._planning_tool_allowlist({"allowed_tools": ["status", 7]})
+
+
+def test_mission_dispatch_filters_schemas_by_persisted_authorization():
+    from types import SimpleNamespace
+    from security.mission_authorization import MissionAuthorizationSnapshot
+    from tools.registry import model_tool_definitions
+
+    snapshot = MissionAuthorizationSnapshot.create(
+        owner_identity="owner-ref",
+        mission_id="authorized-mission",
+        target_identity="local-status",
+        scope=("workspace",),
+        allowed_actions=("status",),
+        forbidden_actions=(),
+        allowed_tools=("status",),
+        time_window={"timezone": "UTC"},
+        max_duration=60,
+        rate_limits={"status": 1},
+        network_boundary={"allowed": ()},
+        data_boundary={"allowed": ("local-status",)},
+        credential_boundary={"allowed": ()},
+        workspace_boundary={"root": "/tmp"},
+        policy_version="owner-policy",
+        owner_approval="owner-approval-proof",
+    )
+    mission = SimpleNamespace(authorization_snapshot=snapshot.to_dict())
+
+    selected = AgentCore._schemas_for_mission_authorization(mission, model_tool_definitions())
+
+    assert [item["function"]["name"] for item in selected] == ["status"]
