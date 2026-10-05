@@ -54,76 +54,376 @@ def auth(root: str, *, mission_id: str = "m1", owner: str = "owner-proof", actio
 
 
 def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkeypatch):
-    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert 2 + 2 == 4\n")
-    snapshot = auth(str(tmp_path))
-    workspace = Workspace(tmp_path)
+    import hashlib
+    import socket
+    from owner_session_testutils import allow_owner_sessions
+    from security.authorization_context import AuthorizationContext
+    from security.mission_authorization import MissionAuthorizationSnapshot
+    from security.owner_policy import OwnerPolicySnapshot, _issue_evidence
+    from security.scope import ProgramAuthorization, ScopeSnapshot, TargetIdentity
+
+    request_id, session_id = "req-sandbox-test", "session-sandbox-test"
+    mission_id, target_id = "mission-sandbox-test", "target-sandbox-test"
+    scope_id, program_id = "scope-sandbox-test", "program-sandbox-test"
+    allow_owner_sessions(monkeypatch, session_id)
     import security.owner_policy as owner_policy
     monkeypatch.setattr(owner_policy, "STATE_PATH", tmp_path / "owner-policy.json")
-    evidence = owner_policy._issue_evidence("username_password", "req-1", "proof")
-    context = AuthorizationContext(request_id="req-1", owner_evidence=evidence, policy_snapshot=owner_policy.capture_policy_snapshot("req-1", evidence))
-    decision = authorize_tool(["run_project_tests", "."], context=context)
+    monkeypatch.setenv("CYBERSENTINEL_SYNTHETIC_HOST_SECRET", "synthetic-test-only-value")
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    network_port = listener.getsockname()[1]
+    outside_file = tmp_path.parent / f"{tmp_path.name}-host-only.txt"
+    outside_file.write_text("host-only-test-data", encoding="utf-8")
+    test_source = f'''\
+import errno, os, resource, socket, subprocess, sys
+from pathlib import Path
+import pytest
+
+HOST_ONLY_PATH = {str(outside_file)!r}
+HOST_SERVICE_PORT = {network_port}
+
+def test_host_environment_is_not_inherited():
+    assert os.environ.get("CYBERSENTINEL_SYNTHETIC_HOST_SECRET") is None
+    assert os.environ.get("OPENAI_API_KEY") is None
+
+def test_workspace_is_read_only_and_host_files_are_absent():
+    with pytest.raises(OSError):
+        (Path(__file__).parent / "write-outside-workspace.txt").write_text("blocked")
+    with pytest.raises(OSError):
+        Path(HOST_ONLY_PATH).read_text(encoding="utf-8")
+    with pytest.raises(OSError):
+        Path(HOST_ONLY_PATH).write_text("blocked", encoding="utf-8")
+
+def test_path_traversal_cannot_leave_workspace_or_reach_host_files():
+    traversed_workspace_file = Path("../../workspace/project/test_sandbox_contract.py")
+    assert traversed_workspace_file.read_text(encoding="utf-8")
+    with pytest.raises(OSError):
+        traversed_workspace_file.write_text("blocked", encoding="utf-8")
+    relative_host_path = os.path.relpath(HOST_ONLY_PATH, os.getcwd())
+    with pytest.raises(OSError):
+        Path(relative_host_path).read_text(encoding="utf-8")
+
+def test_host_network_is_unreachable():
+    assert {{name for _, name in socket.if_nameindex()}} <= {{"lo"}}
+    probe = socket.socket()
+    probe.settimeout(0.2)
+    try:
+        with pytest.raises(OSError):
+            probe.connect(("127.0.0.1", HOST_SERVICE_PORT))
+    finally:
+        probe.close()
+
+def test_kernel_resource_limits_and_tmpfs_quotas_are_applied():
+    assert resource.getrlimit(resource.RLIMIT_CPU)[0] <= 60
+    assert resource.getrlimit(resource.RLIMIT_AS)[0] <= 1_073_741_824
+    assert resource.getrlimit(resource.RLIMIT_FSIZE)[0] <= 4_194_304
+    assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 128
+    assert resource.getrlimit(resource.RLIMIT_NPROC)[0] <= 32
+    tmp = os.statvfs("/tmp")
+    artifacts = os.statvfs("/artifacts")
+    assert tmp.f_blocks * tmp.f_frsize <= 67_108_864 + tmp.f_frsize
+    assert artifacts.f_blocks * artifacts.f_frsize <= 4_194_304 + artifacts.f_frsize
+
+def test_file_descriptor_abuse_hits_the_kernel_limit():
+    opened = []
+    try:
+        while True:
+            opened.append(os.open("/dev/null", os.O_RDONLY))
+    except OSError as exc:
+        assert exc.errno == errno.EMFILE
+    finally:
+        for fd in opened:
+            os.close(fd)
+    assert len(opened) <= resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+
+def test_child_process_abuse_hits_the_kernel_limit():
+    children = []
+    refused = False
+    try:
+        for _ in range(40):
+            try:
+                child = os.fork()
+            except OSError as exc:
+                assert exc.errno == errno.EAGAIN
+                refused = True
+                break
+            if child == 0:
+                os._exit(0)
+            children.append(child)
+    finally:
+        for child in children:
+            os.waitpid(child, 0)
+    assert refused and len(children) < 40
+
+def test_file_size_abuse_hits_the_kernel_limit():
+    path = f"/tmp/file-size-limit-{{os.getpid()}}"
+    code = (
+        "import os,signal,sys; signal.signal(signal.SIGXFSZ, signal.SIG_IGN); "
+        "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o600); "
+        "block=b'x'*1048576; total=0\\n"
+        "try:\\n"
+        " while total < 6291456:\\n"
+        "  try: total += os.write(fd, block)\\n"
+        "  except OSError: break\\n"
+        " else: raise AssertionError('file size limit not applied')\\n"
+        "finally: os.close(fd)\\n"
+    )
+    completed = subprocess.run([sys.executable, "-c", code, path], capture_output=True, timeout=5)
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert 0 < Path(path).stat().st_size <= resource.getrlimit(resource.RLIMIT_FSIZE)[0]
+    Path(path).unlink()
+'''
+    test_contract = tmp_path / "test_sandbox_contract.py"
+    test_contract.write_text(test_source, encoding="utf-8")
+
+    now = datetime.now(timezone.utc)
+    created, expires = now.isoformat(), (now + timedelta(minutes=30)).isoformat()
+    owner_evidence = _issue_evidence("username_password", request_id, session_id, session_id)
+    owner_policy = OwnerPolicySnapshot(
+        request_id=request_id,
+        owner_instruction="Owner-approved isolated workspace test",
+        owner_instruction_fingerprint=hashlib.sha256(b"Owner-approved isolated workspace test").hexdigest(),
+        owner_policy_fingerprint="sandbox-test-policy",
+        authority_snapshot={}, authentication={}, captured_at=created,
+    )
+    program = ProgramAuthorization(
+        program_id=program_id, platform="test", scope_version="1", retrieved_at=created,
+        in_scope_assets=({"host": "127.0.0.1", "schemes": ["http"], "ports": [network_port], "paths": ["/"]},),
+        owner_session_id=session_id,
+    )
+    target = TargetIdentity(target_id, program_id, "127.0.0.1", allowed_ports=(network_port,), allowed_paths=("/",))
+    canonical_scope = ScopeSnapshot(scope_id, program, (target,), created_at=created, expires_at=expires)
+    owner_auth = AuthorizationContext(request_id, owner_evidence, owner_policy, canonical_scope, session_id=session_id)
+    scope_context = {
+        "program_id": program_id, "target_id": target_id,
+        "scope_snapshot_id": scope_id, "url": f"http://127.0.0.1:{network_port}/", "method": "GET",
+    }
+    snapshot = MissionAuthorizationSnapshot.create(
+        owner_identity="owner:1", mission_id=mission_id, target_identity=target_id,
+        scope=(scope_id,), allowed_actions=("run_project_tests",), forbidden_actions=(),
+        allowed_tools=("run_project_tests",), time_window={"timezone": "UTC"}, max_duration=60,
+        rate_limits={"run_project_tests": 5}, network_boundary={"allowed": ()},
+        data_boundary={"allowed": (target_id,)}, credential_boundary={"allowed": ()},
+        workspace_boundary={"root": str(tmp_path.resolve())}, policy_version="sandbox-test-v1",
+        owner_approval="explicit-sandbox-test-approval", created_at=created, expires_at=expires,
+    )
+    decision = authorize_tool(["run_project_tests", "."], context=owner_auth)
     assert decision.allowed and decision.decision is not None
 
     mission_store = MissionStore(tmp_path / "missions.sqlite3")
     queue = MissionQueue(tmp_path / "mission-queue.sqlite3", require_execution_fence=True, mission_store=mission_store)
-    queue.enqueue("m1")
+    queue.enqueue(mission_id)
     identity = queue.register_worker("governed-test-worker")
     identity_fence = ExecutionFence.for_worker(queue, identity)
-    now = datetime.now(timezone.utc).isoformat()
     claim = queue.claim_next(
-        now=now,
-        worker_id=identity.worker_id,
+        now=datetime.now(timezone.utc).isoformat(), worker_id=identity.worker_id,
         worker_instance_id=identity.worker_instance_id,
-        runtime_generation=identity.runtime_generation,
-        execution_fence=identity_fence,
+        runtime_generation=identity.runtime_generation, execution_fence=identity_fence,
     )
     assert claim is not None
     mission_record = Mission.create(
-        "workspace test",
-        "workspace test",
+        "workspace test", "workspace test",
         Plan(version=1, objective="workspace test", steps=(PlanStep("workspace-step", "run tests", action="run_project_tests"),)),
-        mission_id="m1",
-        request_id="req-1",
-        owner_identity_ref=snapshot.owner_identity,
+        mission_id=mission_id, request_id=request_id, owner_identity_ref=snapshot.owner_identity,
         authorization_snapshot=snapshot.to_dict(),
     )
+    mission_record.scope_snapshot = scope_context
+    mission_record.authorization_context = owner_auth.to_dict()
     mission_record.transition(MissionStatus.READY, "test mission ready")
     mission_store.save(mission_record)
     fence = identity_fence.with_lease(claim).for_mission(
         mission_record, task_id="workspace-step", execution_id="workspace-execution-1"
     )
-    binding = mission_store.bind_execution_claim("m1", fence)
+    binding = mission_store.bind_execution_claim(mission_id, fence)
     assert binding.terminal_status is None and binding.lease_binding_id is not None
-    mission_record = mission_store.load("m1")
+    mission_record = mission_store.load(mission_id)
     mission_record.checkpoint = {
-        "status": "in_flight",
-        "step_id": fence.task_id,
-        "action_id": fence.execution_id,
-        "plan_version": mission_record.plan.version,
+        "status": "in_flight", "step_id": fence.task_id,
+        "action_id": fence.execution_id, "plan_version": mission_record.plan.version,
     }
     mission_store.save(mission_record, execution_fence=fence)
     store = EvidenceChainStore(
-        tmp_path / "evidence.sqlite3",
-        execution_fence=fence,
-        mission_store=mission_store,
-        mission=mission_record,
-        require_execution_fence=True,
+        tmp_path / "evidence.sqlite3", execution_fence=fence,
+        mission_store=mission_store, mission=mission_record, require_execution_fence=True,
     )
-    result = execute(
-        "run_project_tests", ".", authorization_decision=decision.decision,
-        request_id="req-1", mission_authorization=snapshot, workspace=workspace,
-        evidence_store=store, mission_id="m1", execution_fence=fence,
-        execution_id="workspace-execution-1",
+    workspace = Workspace(
+        tmp_path, authorization_snapshot=snapshot, mission_id=mission_id,
+        request_id=request_id, tool_id="run_project_tests", evidence_store=store,
     )
-    assert result["ok"] is True
-    assert result["returncode"] == 0
-    records = store.list(request_id="req-1")
-    assert records and store.verify()
-    provenance = records[0]["evidence"]["provenance"]
-    assert provenance["mission_id"] == "m1"
-    assert provenance["request_id"] == "req-1"
-    assert provenance["tool_id"] == "run_project_tests"
-    assert provenance["authorization_snapshot_hash"] == snapshot.authorization_hash
+    try:
+        with pytest.raises(WorkspaceBoundaryError):
+            workspace.resolve("../")
+
+        dispatch_args = dict(
+            request_id=request_id, owner_authorization=owner_auth,
+            owner_authorization_record=owner_auth.to_dict(), scope_context=scope_context,
+            workspace=workspace, evidence_store=store, mission_id=mission_id,
+            target_identity=target_id, execution_fence=fence,
+            execution_id="workspace-execution-1",
+        )
+        with pytest.raises(PermissionError, match="current persisted Mission authorization version"):
+            execute(
+                "run_project_tests", ".", authorization_decision=decision.decision,
+                mission_authorization=snapshot, **dispatch_args,
+            )
+        with pytest.raises(PermissionError, match="current persisted Mission authorization version"):
+            execute(
+                "run_project_tests", ".", authorization_decision=decision.decision,
+                mission_authorization=snapshot,
+                mission_authorization_version=snapshot.version + 1,
+                **dispatch_args,
+            )
+
+        result = execute(
+            "run_project_tests", ".", authorization_decision=decision.decision,
+            request_id=request_id, mission_authorization=snapshot,
+            mission_authorization_version=int(mission_record.provenance.get("authorization_snapshot_version", 1)),
+            owner_authorization=owner_auth,
+            owner_authorization_record=owner_auth.to_dict(), scope_context=scope_context,
+            workspace=workspace, evidence_store=store, mission_id=mission_id,
+            target_identity=target_id, execution_fence=fence,
+            execution_id="workspace-execution-1",
+        )
+        assert result["ok"] is True, {key: result.get(key) for key in ("returncode", "output", "artifact_refs")}
+        assert result["returncode"] == 0
+        assert "8 passed" in result["output"]
+        assert result["sandbox_backend"] == "bubblewrap+prlimit"
+        assert result["artifact_refs"]
+        assert not (tmp_path / "write-outside-workspace.txt").exists()
+        records = store.list(request_id=request_id)
+        assert records and store.verify()
+        process_records = [record for record in records if record.get("source") == "sandboxed-process:run_project_tests"]
+        assert len(process_records) == 1
+        process_record = process_records[0]
+        evidence_payload = process_record["evidence"]
+        assert evidence_payload["record_type"] == "UNTRUSTED_SANDBOX_PROCESS_RESULT"
+        assert evidence_payload["trust"] == "untrusted_data"
+        assert evidence_payload["authority"] == "none"
+        assert evidence_payload["network"] == "disabled"
+        assert result["artifact_refs"][0]["validation"] == "unvalidated"
+        assert "synthetic-test-only-value" not in repr(workspace.audit)
+        assert process_record["mission_id"] == mission_id
+        assert process_record["request_id"] == request_id
+        assert process_record["task_id"] == "workspace-step"
+        assert process_record["execution_id"] == "workspace-execution-1"
+        assert process_record["authorization_hash"] == fence.authorization_hash
+        assert process_record["fence_id"] == fence.fence_id
+        assert outside_file.read_text(encoding="utf-8") == "host-only-test-data"
+
+        timeout_root = tmp_path / "timeout-workspace"
+        timeout_root.mkdir()
+        timeout_marker = f"cybersentinel-sandbox-child-{tmp_path.name}"
+        timeout_source = f'''\
+import subprocess, sys, time
+
+def test_detached_child_cannot_outlive_tool_cancellation():
+    subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", {timeout_marker!r}],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    while True:
+        time.sleep(0.1)
+'''
+        (timeout_root / "test_timeout.py").write_text(timeout_source, encoding="utf-8")
+        timeout_mission_id = "mission-sandbox-timeout-test"
+        timeout_snapshot_data = snapshot.to_dict()
+        timeout_snapshot_data["mission_id"] = timeout_mission_id
+        timeout_snapshot_data["workspace_boundary"] = {"root": str(timeout_root.resolve())}
+        timeout_snapshot_data.pop("authorization_hash", None)
+        timeout_snapshot = MissionAuthorizationSnapshot.from_dict(timeout_snapshot_data)
+        timeout_mission = Mission.create(
+            "timeout sandbox test", "timeout sandbox test",
+            Plan(version=1, objective="timeout sandbox test", steps=(
+                PlanStep("timeout-step", "cancel a detached child", action="run_project_tests"),
+            )),
+            mission_id=timeout_mission_id, request_id=request_id,
+            owner_identity_ref=timeout_snapshot.owner_identity,
+            authorization_snapshot=timeout_snapshot.to_dict(),
+        )
+        timeout_mission.scope_snapshot = scope_context
+        timeout_mission.authorization_context = owner_auth.to_dict()
+        timeout_mission.transition(MissionStatus.READY, "authorized timeout test")
+        mission_store.save(timeout_mission)
+        queue.enqueue(timeout_mission_id)
+        timeout_identity = queue.register_worker("governed-timeout-test-worker")
+        timeout_identity_fence = ExecutionFence.for_worker(queue, timeout_identity)
+        timeout_claim = queue.claim_next(
+            now=datetime.now(timezone.utc).isoformat(), worker_id=timeout_identity.worker_id,
+            worker_instance_id=timeout_identity.worker_instance_id,
+            runtime_generation=timeout_identity.runtime_generation,
+            execution_fence=timeout_identity_fence,
+        )
+        assert timeout_claim is not None
+        timeout_fence = timeout_identity_fence.with_lease(timeout_claim).for_mission(
+            timeout_mission, task_id="timeout-step", execution_id="timeout-execution",
+        )
+        timeout_binding = mission_store.bind_execution_claim(timeout_mission_id, timeout_fence)
+        assert timeout_binding.terminal_status is None and timeout_binding.lease_binding_id is not None
+        timeout_mission = mission_store.load(timeout_mission_id)
+        timeout_mission.checkpoint = {
+            "status": "in_flight", "step_id": timeout_fence.task_id,
+            "action_id": timeout_fence.execution_id, "plan_version": timeout_mission.plan.version,
+        }
+        mission_store.save(timeout_mission, execution_fence=timeout_fence)
+        timeout_store = EvidenceChainStore(
+            tmp_path / "timeout-evidence.sqlite3", execution_fence=timeout_fence,
+            mission_store=mission_store, mission=timeout_mission, require_execution_fence=True,
+        )
+        timeout_workspace = Workspace(
+            timeout_root, authorization_snapshot=timeout_snapshot,
+            mission_id=timeout_mission_id, request_id=request_id,
+            tool_id="run_project_tests", evidence_store=timeout_store,
+        )
+        try:
+            from agent.external_effects import EffectRecoveryRequired
+
+            with pytest.raises(EffectRecoveryRequired) as timed_out:
+                execute(
+                    "run_project_tests", ".", timeout=3.0,
+                    authorization_decision=decision.decision,
+                    request_id=request_id, mission_authorization=timeout_snapshot,
+                    mission_authorization_version=int(timeout_mission.provenance.get("authorization_snapshot_version", 1)),
+                    owner_authorization=owner_auth,
+                    owner_authorization_record=owner_auth.to_dict(), scope_context=scope_context,
+                    workspace=timeout_workspace, evidence_store=timeout_store,
+                    mission_id=timeout_mission_id, target_identity=target_id,
+                    execution_fence=timeout_fence, execution_id="timeout-execution",
+                )
+            assert timed_out.value.reason_code == "TOOL_TIMEOUT"
+            assert timed_out.value.state == "RECOVERY_REQUIRED"
+            deadline = time.monotonic() + 8
+            process_events = []
+            while time.monotonic() < deadline:
+                process_events = [event for event in timeout_workspace.audit if event.operation == "process"]
+                if process_events:
+                    break
+                time.sleep(0.05)
+            assert process_events
+            assert process_events[-1].result == "failure"
+            assert process_events[-1].exit_code is None
+            assert timeout_store.verify()
+            time.sleep(0.2)
+            marker_bytes = timeout_marker.encode("utf-8")
+            marker_process_alive = False
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    if marker_bytes in (entry / "cmdline").read_bytes():
+                        marker_process_alive = True
+                        break
+                except OSError:
+                    continue
+            assert not marker_process_alive
+        finally:
+            timeout_workspace.close()
+    finally:
+        listener.close()
+        outside_file.unlink(missing_ok=True)
+        workspace.close()
 
 
 def test_workspace_requires_snapshot_and_blocks_boundary_and_symlink(tmp_path):
@@ -169,37 +469,23 @@ def test_workspace_rejects_symlink_swapped_after_authorization(tmp_path):
     assert (outside / "secret.txt").read_text() == "do-not-read"
 
 
-def test_process_manager_requires_snapshot_and_does_not_store_raw_argv(tmp_path):
-    secret_arg = "OWNER_PROCESS_SECRET_SENTINEL"
+def test_process_manager_requires_registry_execution_context_before_launch(tmp_path):
     workspace = Workspace(
         tmp_path,
         authorization_snapshot=auth(str(tmp_path), actions=["process"], tools=[]),
     )
-    handle = ProcessManager(workspace).start(
-        ("python", "-c", f"print({secret_arg!r})"),
-        cwd=".",
-    )
-    result = handle.monitor(timeout=5)
-    assert result.ok and secret_arg in result.stdout
-    event = workspace.audit[-1]
-    assert event.operation == "process_start"
-    assert event.command == ("python",)
-    assert event.command_hash
-    assert secret_arg not in repr(event)
+    with pytest.raises(WorkspacePolicyError, match="ExecutionContext"):
+        ProcessManager(workspace).start(("python", "-c", "raise SystemExit(0)"), cwd=".")
+    assert workspace.audit == []
 
 
 def test_process_output_is_bounded_while_captured(tmp_path):
-    workspace = Workspace(
-        tmp_path,
-        policy=WorkspacePolicy(max_output_bytes=128),
-        authorization_snapshot=auth(str(tmp_path), actions=["process"], tools=[]),
-    )
-    result = workspace.run_process(
-        ("python", "-c", "import sys; sys.stdout.write('x' * 1000000)"),
-        timeout=5,
-    )
-    assert result.ok
-    assert len(result.stdout.encode("utf-8")) <= 128
+    import io
+    from workspace.environment import _drain_tail
+    tail = bytearray()
+    _drain_tail(io.BytesIO(b"x" * 1_000_000), tail, 128)
+    assert len(tail) == 128
+    assert bytes(tail) == b"x" * 128
 
 
 def test_snapshot_tamper_expiry_wrong_mission_target_and_forbidden_tool_are_blocked(tmp_path):

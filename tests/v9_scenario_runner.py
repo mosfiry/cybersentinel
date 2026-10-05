@@ -20,6 +20,8 @@ from agent.providers import OpenAICompatibleProvider
 from v13_scenario_runner import (
     WATCH_KEYWORD,
     _LiveBridge,
+    _local_workspace_scope_context,
+    _persist_local_workspace_scope,
     _emit,
     _run_scenario,
 )
@@ -206,15 +208,13 @@ class _V9LiveBridge(_LiveBridge):
 
     def create_mission(self, session: str) -> tuple[str, dict[str, Any]]:
         objective = "Owner instruction: run deterministic local tests and register a local defensive watch keyword"
+        scope_snapshot = _persist_local_workspace_scope(
+            session, "v9-temporary-workspace", namespace="v9",
+        )
         payload = {
             "objective": objective,
             "plan": self._provider_plan(objective),
-            "scope_context": {
-                "target_id": "v9-temporary-workspace",
-                "workspace_root": str(self.workspace.resolve()),
-                "allowed_networks": [],
-                "allowed_credentials": [],
-            },
+            "scope_context": _local_workspace_scope_context(scope_snapshot, self.workspace),
             "completion_criteria": [
                 {
                     "criterion_id": "tests-pass",

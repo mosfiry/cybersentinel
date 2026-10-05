@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import math
+import mimetypes
 import re
 import threading
 import uuid
@@ -23,9 +24,9 @@ VALID_NETWORK_ACCESS = frozenset({
     "host_process_unscoped",
 })
 VALID_FILESYSTEM_ACCESS = frozenset({
-    "none", "host_fs_via_process", "mission_artifact_write",
+    "none", "host_fs_via_process", "mission_artifact_write", "workspace_read_only_artifact_write",
 })
-VALID_PROCESS_ACCESS = frozenset({"none", "workspace_process_unisolated"})
+VALID_PROCESS_ACCESS = frozenset({"none", "workspace_process_unisolated", "workspace_process_sandboxed"})
 VALID_CREDENTIAL_ACCESS = frozenset({"none", "provider_managed", "host_user_credentials_possible"})
 VALID_RATE_LIMITS = frozenset({"bounded"})
 DEFAULT_TOOL_TIMEOUT = 30
@@ -259,6 +260,7 @@ class ToolSpec:
     scope_url_argument: str | None = None
     scope_rate_deferred: bool = False
     allow_custom_input_schema: bool = False
+    workspace_scope_required: bool = False
 
     def __post_init__(self) -> None:
         if not self.input_schema:
@@ -272,6 +274,8 @@ class ToolSpec:
     def required_authorization(self) -> str:
         if self.scope_required:
             return "owner_and_scope_snapshot"
+        if self.workspace_scope_required:
+            return "owner_and_workspace_root"
         return "owner" if self.requires_owner else "none"
 
     def metadata(self) -> dict[str, Any]:
@@ -295,6 +299,7 @@ class ToolSpec:
             "idempotency_supported": self.idempotency_supported,
             "parallel_execution_safe": self.parallel_execution_safe,
             "execution_context_required": self.execution_context_required,
+            "workspace_scope_required": self.workspace_scope_required,
             "scope_url_argument": self.scope_url_argument,
             "scope_rate_deferred": self.scope_rate_deferred,
             "allow_custom_input_schema": self.allow_custom_input_schema,
@@ -452,9 +457,22 @@ def _unwatch(argument):
     return {"keyword": argument, "watches": watches()}
 
 
-def _run_project_tests(argument, *, workspace=None):
-    if workspace is None:
-        raise PermissionError("run_project_tests requires governed Workspace")
+def _run_project_tests(argument, *, workspace=None, execution_context=None):
+    if workspace is None or execution_context is None:
+        raise PermissionError("run_project_tests requires the canonical Mission Workspace and ExecutionContext")
+    execution_context.assert_active()
+    authorization = execution_context.mission_authorization
+    authorized_root = str(dict(authorization.workspace_boundary).get("root", "")).strip()
+    if not authorized_root or Path(workspace.root).resolve() != Path(authorized_root).expanduser().resolve():
+        raise PermissionError("run_project_tests workspace differs from the Owner-authorized Mission root")
+    if (
+        getattr(workspace, "authorization_snapshot", None) is None
+        or workspace.authorization_snapshot.authorization_hash != authorization.authorization_hash
+        or str(workspace.mission_id) != execution_context.mission_id
+        or str(workspace.request_id) != execution_context.request_id
+        or str(workspace.tool_id) != execution_context.tool_id
+    ):
+        raise PermissionError("run_project_tests Workspace binding is not current for this Mission")
     target = argument or "."
     try:
         if not workspace.resolve(target).is_dir():
@@ -463,8 +481,109 @@ def _run_project_tests(argument, *, workspace=None):
         if isinstance(exc, ValueError):
             raise
         raise ValueError("project directory is outside the configured test root") from exc
-    result = workspace.develop((sys.executable, "-m", "pytest", "-q"), cwd=target, timeout=60)
-    return {"ok": result.ok, "timed_out": result.timed_out, "returncode": result.exit_code, "output": (result.stdout + result.stderr)[-4000:]}
+    mission_timeout = getattr(authorization, "max_duration", 60)
+    if isinstance(mission_timeout, bool) or not isinstance(mission_timeout, (int, float)) or not math.isfinite(mission_timeout) or mission_timeout <= 0:
+        raise PermissionError("Mission process timeout is invalid")
+    result = workspace.develop(
+        ("python3", "-m", "pytest", "-q", "--junitxml=/artifacts/pytest.xml"),
+        cwd=target,
+        timeout=min(60, float(mission_timeout)),
+        cancellation_event=execution_context.cancellation_event,
+    )
+    execution_context.assert_active()
+    if execution_context.artifact_store is None:
+        raise PermissionError("run_project_tests requires the Mission artifact store")
+
+    from agent.intelligence_layer.artifacts import ArtifactKind, ArtifactSensitivity, ArtifactValidation
+    artifact_refs: list[dict[str, Any]] = []
+    scope_values = tuple(
+        value for value in (
+            str(execution_context.scope_snapshot.get("scope_snapshot_id", "")),
+            str(execution_context.scope_snapshot.get("target_id", "")),
+        ) if value
+    )
+    command_digest = hashlib.sha256(
+        json.dumps(result.command, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    workspace_digest = hashlib.sha256(str(Path(workspace.root).resolve()).encode("utf-8")).hexdigest()
+    for captured in result.artifacts:
+        media_type = mimetypes.guess_type(captured.filename)[0] or "application/octet-stream"
+        record = execution_context.artifact_store.put(
+            owner_identity_ref=execution_context.owner_identity,
+            mission_id=execution_context.mission_id,
+            task_id=str(execution_context.execution_fence.task_id),
+            kind=ArtifactKind.REPORT,
+            content=captured.content,
+            filename=captured.filename,
+            media_type=media_type,
+            sensitivity=ArtifactSensitivity.SENSITIVE,
+            validation=ArtifactValidation.UNVALIDATED,
+            confidence=0.0,
+            scope=scope_values,
+            provenance={
+                "source": "sandboxed-project-test-runner",
+                "tool_id": execution_context.tool_id,
+                "execution_id": execution_context.execution_id,
+                "command_sha256": command_digest,
+                "workspace_root_sha256": workspace_digest,
+                "relative_path_sha256": hashlib.sha256(captured.relative_path.encode("utf-8", errors="replace")).hexdigest(),
+            },
+            metadata={"trust": "untrusted_data", "authority": "none", "sandbox_backend": result.sandbox_backend},
+        )
+        artifact_refs.append({
+            "artifact_id": record.artifact_id,
+            "sha256": record.content_sha256,
+            "size_bytes": record.size_bytes,
+            "kind": record.kind.value,
+            "validation": record.validation.value,
+        })
+
+    from .web_research import redact_specialist_text
+    raw_output = (result.stdout + result.stderr)[-16_000:]
+    safe_output = redact_specialist_text(raw_output)[-4_000:]
+    evidence_payload = {
+        "claim": "Bounded project tests ran inside a network-isolated OS sandbox",
+        "source": "sandboxed-process:run_project_tests",
+        "evidence": {
+            "record_type": "UNTRUSTED_SANDBOX_PROCESS_RESULT",
+            "trust": "untrusted_data",
+            "authority": "none",
+            "sandbox_backend": result.sandbox_backend,
+            "network": "disabled",
+            "workspace_mode": "read_only",
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "cancelled": result.cancelled,
+            "output_sha256": hashlib.sha256(raw_output.encode("utf-8", errors="replace")).hexdigest(),
+            "artifact_refs": artifact_refs,
+            "artifact_capture_truncated": result.artifact_capture_truncated,
+        },
+        "verification": "observed",
+        "confidence": 5,
+        "request_id": execution_context.request_id,
+    }
+    evidence = execution_context.evidence_store.append(
+        evidence_payload, execution_fence=execution_context.execution_fence,
+    )
+    return {
+        "ok": result.ok,
+        "timed_out": result.timed_out,
+        "cancelled": result.cancelled,
+        "returncode": result.exit_code,
+        "output": safe_output,
+        "trust": "untrusted_data",
+        "authority": "none",
+        "sandbox_backend": result.sandbox_backend,
+        "network": "disabled",
+        "workspace_mode": "read_only",
+        "artifact_refs": artifact_refs,
+        "artifact_capture_truncated": result.artifact_capture_truncated,
+        "evidence_ref": {
+            "evidence_id": str(evidence.get("evidence_id", "")),
+            "sequence": int(evidence.get("sequence", 0)),
+            "current_hash": str(evidence.get("current_hash", "")),
+        },
+    }
 
 
 def _red_team_assess(argument):
@@ -558,7 +677,7 @@ def _access_metadata_valid(spec: ToolSpec) -> bool:
         return False
     if any(not isinstance(value, bool) for value in (
         spec.idempotency_supported, spec.execution_context_required,
-        spec.allow_custom_input_schema, spec.scope_rate_deferred,
+        spec.allow_custom_input_schema, spec.scope_rate_deferred, spec.workspace_scope_required,
     )):
         return False
     if not isinstance(spec.risk_class, str) or spec.risk_class not in VALID_RISK_CLASSES:
@@ -592,7 +711,13 @@ def _access_metadata_valid(spec: ToolSpec) -> bool:
         return False
     if spec.scope_required and (not spec.requires_owner or not spec.scope_requirements):
         return False
-    if not spec.scope_required and spec.scope_requirements:
+    if not spec.scope_required and not spec.workspace_scope_required and spec.scope_requirements:
+        return False
+    if spec.workspace_scope_required and (
+        not spec.requires_owner
+        or not spec.execution_context_required
+        or "owner_mission_workspace_root" not in spec.scope_requirements
+    ):
         return False
     if spec.network_access.startswith("scope_pinned_") and not spec.scope_required:
         return False
@@ -600,6 +725,13 @@ def _access_metadata_valid(spec: ToolSpec) -> bool:
         return False
     if spec.filesystem_access == "host_fs_via_process" and (
         spec.risk_class != "bounded-exec" or spec.process_access != "workspace_process_unisolated"
+    ):
+        return False
+    if spec.filesystem_access == "workspace_read_only_artifact_write" and (
+        spec.risk_class != "bounded-exec"
+        or spec.process_access != "workspace_process_sandboxed"
+        or not spec.workspace_scope_required
+        or not spec.execution_context_required
     ):
         return False
     if spec.network_access == "host_process_unscoped" and (
@@ -648,6 +780,7 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
                 or spec.filesystem_access != "none"
                 or spec.process_access != "none"
                 or spec.credential_access != "none"
+                or spec.workspace_scope_required
             ))
         ):
             raise ValueError(f"invalid registry metadata for {spec.name}")
@@ -686,7 +819,18 @@ REGISTRY = build_registry([
     ),
     ToolSpec("watch", "إضافة كلمة مراقب دفاعية محلية", "state-write", True, str, _watch, effect_provider="cybersentinel.local-state"),
     ToolSpec("unwatch", "إزالة كلمة مراقب دفاعية محلية", "state-write", True, str, _unwatch, effect_provider="cybersentinel.local-state"),
-    ToolSpec("run_project_tests", "Run pytest -q within the selected project test root; its subprocess is not OS-isolated and can access host files/network.", "bounded-exec", True, str, _run_project_tests, network_access="host_process_unscoped", filesystem_access="host_fs_via_process", process_access="workspace_process_unisolated", credential_access="host_user_credentials_possible", timeout=65, effect_provider="cybersentinel.workspace-process"),
+    ToolSpec(
+        "run_project_tests",
+        "Run a fixed pytest command inside rootless Bubblewrap with network disabled, a read-only Owner-authorized workspace mount, cleared host environment, hard resource limits, and bounded untrusted reports.",
+        "bounded-exec", True, str, _run_project_tests,
+        owner_only=True, network_access="none",
+        filesystem_access="workspace_read_only_artifact_write",
+        process_access="workspace_process_sandboxed", credential_access="none",
+        scope_requirements=("owner_mission_workspace_root",),
+        timeout=65, effect_provider="cybersentinel.workspace-process",
+        evidence_requirements=("owner_mission_context", "sandbox_profile", "untrusted_artifact_refs", "exit_status"),
+        execution_context_required=True, workspace_scope_required=True,
+    ),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
     ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True, scope_requirements=("canonical_owner_scope", "target_identity"), effect_provider="cybersentinel.scoped-http"),
     ToolSpec(
@@ -809,7 +953,7 @@ def _scope_urls_for_tool(spec: ToolSpec, argument: Any, scope_context: dict[str,
     return urls
 
 
-def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, owner_authorization: Any = None, owner_authorization_record: dict[str, Any] | None = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None, delegation_scope: Any = None, scope_ref: str | None = None):
+def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, mission_authorization_version: int | None = None, owner_authorization: Any = None, owner_authorization_record: dict[str, Any] | None = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None, delegation_scope: Any = None, scope_ref: str | None = None):
     import math
 
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
@@ -866,6 +1010,12 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
     if mission_authorization is not None:
         from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
         snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
+        if spec.execution_context_required and (
+            isinstance(mission_authorization_version, bool)
+            or not isinstance(mission_authorization_version, int)
+            or mission_authorization_version != snapshot.version
+        ):
+            raise PermissionError("ExecutionContext-bound dispatch requires the current persisted Mission authorization version")
         allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
         if not allowed:
             code = "authorization_expired" if reason == "authorization snapshot expired or not active" else "authorization_denied"
@@ -887,6 +1037,15 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 target_identity=target_identity or snapshot.target_identity,
             ):
                 raise PermissionError("tool, action, target, or scope exceeds task delegation")
+    if spec.workspace_scope_required:
+        if snapshot is None or workspace is None:
+            raise PermissionError("tool requires the canonical Owner-authorized Mission workspace")
+        from workspace import Workspace
+        if not isinstance(workspace, Workspace):
+            raise PermissionError("tool requires a governed Workspace instance")
+        authorized_root = str(dict(snapshot.workspace_boundary).get("root", "")).strip()
+        if not authorized_root or Path(workspace.root).resolve() != Path(authorized_root).expanduser().resolve():
+            raise PermissionError("Workspace root differs from the Owner-authorized Mission boundary")
     if execution_fence is not None:
         execution_fence.assert_dispatch(
             mission_id=str(mission_id or ""),
@@ -912,7 +1071,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         ):
             raise PermissionError("tool requires the canonical Owner/Mission ExecutionContext")
         artifact_store = None
-        if spec.filesystem_access == "mission_artifact_write":
+        if spec.filesystem_access in {"mission_artifact_write", "workspace_read_only_artifact_write"}:
             if not bool(getattr(evidence_store, "require_execution_fence", False)):
                 raise PermissionError("artifact writes require the strict fenced Mission evidence store")
             from agent.intelligence_layer.artifacts import ArtifactStore
@@ -940,6 +1099,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             tool_argument=argument,
             owner_authorization=owner_authorization,
             mission_authorization=snapshot,
+            mission_authorization_version=mission_authorization_version,
             authorization_decision=authorization_decision,
             execution_fence=execution_fence,
             evidence_store=evidence_store,
@@ -1105,7 +1265,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 authorization_snapshot=mission_authorization,
             )
         handler_kwargs = {}
-        if name == "run_project_tests":
+        if spec.workspace_scope_required:
             handler_kwargs["workspace"] = workspace_context
         if spec.idempotency_supported:
             handler_kwargs["idempotency_key"] = effect.idempotency_key
@@ -1197,18 +1357,11 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
 
     limit = timeout if timeout is not None else spec.timeout
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
-    if name == "run_project_tests":
+    if spec.workspace_scope_required:
         workspace_authorization = mission_authorization
         if workspace is None:
-            from datetime import datetime, timedelta, timezone
-            from security.mission_authorization import MissionAuthorizationSnapshot
-            root = Path(os.getenv("CYBERSENTINEL_TEST_ROOT", Path.cwd())).expanduser().resolve()
-            legacy_owner = getattr(authorization_decision, "owner_evidence_fingerprint", "legacy-compatibility")
-            compatibility_snapshot = MissionAuthorizationSnapshot.create(owner_identity=legacy_owner, mission_id=str(request_id or "legacy-request"), target_identity="legacy-workspace", scope=("workspace",), allowed_actions=(name,), forbidden_actions=(), allowed_tools=(name,), time_window={"timezone": "UTC"}, max_duration=60, rate_limits={name: 1}, network_boundary={"allowed": ()}, data_boundary={"allowed": ("legacy-workspace",)}, credential_boundary={"allowed": ()}, workspace_boundary={"root": str(root)}, policy_version="compatibility", owner_approval=legacy_owner, created_at=datetime.now(timezone.utc).isoformat(), expires_at=(datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat())
-            from workspace import Workspace
-            workspace = Workspace(root, authorization_snapshot=compatibility_snapshot)
-            workspace_authorization = compatibility_snapshot
-        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=workspace_authorization, evidence_store=evidence_store)
+            raise PermissionError("Owner-authorized Mission Workspace is required for sandboxed execution")
+        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=snapshot, evidence_store=evidence_store, execution_context=tool_execution_context)
         def dispatch_workspace():
             return invoke_handler(workspace_context=workspace)
         future = executor.submit(dispatch_workspace)

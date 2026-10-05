@@ -31,6 +31,7 @@ from core import db as core_db
 from security.owner_password import OWNER_USERNAME, create_owner_account, login, revoke_session
 from security.mission_authorization import MissionAuthorizationSnapshot
 from tools.registry import REGISTRY
+from owner_session_testutils import persist_canonical_scope, workspace_scope_context
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,7 @@ class V10Environment:
     scheduler_db: Path
     evidence_db: Path
     workspace: Path
+    scope_snapshot: object
     owner_id: int
     owner_session_id: str
     core: AgentCore
@@ -72,6 +74,24 @@ class V10Environment:
         context, _policy_context = self.core._auth(
             objective, self.owner_session_id, request_id
         )
+        mission_scope = {
+            "target_id": "v10-local-target",
+            "workspace_root": str(self.workspace.resolve()),
+            "allowed_targets": ["v10-local-target"],
+            "allowed_networks": [],
+            "allowed_credentials": [],
+        }
+        if action == "run_project_tests":
+            from security.authorization_context import AuthorizationContext
+
+            context = AuthorizationContext(
+                request_id=context.request_id,
+                owner_evidence=context.owner_evidence,
+                policy_snapshot=context.policy_snapshot,
+                scope_snapshot=self.scope_snapshot,
+                session_id=context.session_id,
+            )
+            mission_scope = workspace_scope_context(self.scope_snapshot, self.workspace)
         query = "." if action == "run_project_tests" else keyword or f"v10-{uuid.uuid4().hex}"
         step = PlanStep(
             step_id="v10-step-1",
@@ -109,13 +129,7 @@ class V10Environment:
             instruction=objective,
             plan=plan,
             authorization_context=context,
-            scope_snapshot={
-                "target_id": "v10-local-target",
-                "workspace_root": str(self.workspace.resolve()),
-                "allowed_targets": ["v10-local-target"],
-                "allowed_networks": [],
-                "allowed_credentials": [],
-            },
+            scope_snapshot=mission_scope,
             completion_criteria=[criterion],
             authorization_snapshot_factory=snapshot_factory,
         )
@@ -137,6 +151,12 @@ def v10_env(tmp_path, monkeypatch) -> V10Environment:
 
     owner_id = create_owner_account(OWNER_USERNAME, TEST_PASSWORD)
     session = login(OWNER_USERNAME, TEST_PASSWORD)
+    scope_snapshot = persist_canonical_scope(
+        monkeypatch,
+        tmp_path,
+        owner_session_token=session["session_id"],
+        target_id="v10-local-target",
+    )
     core = AgentCore(
         _NoModelRouter(),
         db_path=db_path.with_name("missions.sqlite3"),
@@ -170,6 +190,7 @@ def v10_env(tmp_path, monkeypatch) -> V10Environment:
         scheduler_db=db_path.with_name("mission_scheduler.sqlite3"),
         evidence_db=db_path.with_name("evidence_chain.db"),
         workspace=workspace,
+        scope_snapshot=scope_snapshot,
         owner_id=owner_id,
         owner_session_id=session["session_id"],
         core=core,
@@ -453,6 +474,7 @@ def _spawn(
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(child_home),
         "DB_PATH": str(env.db_path),
+        "SCOPE_DB_PATH": str(env.db_path.with_name("scope.sqlite3")),
         "PYTHONPATH": str(ROOT),
         "PYTHON_DOTENV_DISABLED": "1",
         "PYTHONUNBUFFERED": "1",

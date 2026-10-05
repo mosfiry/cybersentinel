@@ -964,12 +964,11 @@ class MissionRuntime:
 
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
             mission_authorization = snapshot
-            if name == "run_project_tests":
-                from workspace import Workspace
+            workspace_root = ""
+            if spec.workspace_scope_required:
                 workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
                 if not workspace_root:
                     raise ExecutionFenceError("native workspace dispatch requires the Owner-authorized workspace root")
-                workspace = Workspace(workspace_root)
             evidence_store = EvidenceChainStore(
                 Path(self.store.db_path).with_name("evidence_chain.db"),
                 execution_fence=execution_fence,
@@ -977,6 +976,16 @@ class MissionRuntime:
                 mission=mission,
                 require_execution_fence=True,
             )
+            if spec.workspace_scope_required:
+                from workspace import Workspace
+                workspace = Workspace(
+                    workspace_root,
+                    authorization_snapshot=snapshot,
+                    mission_id=mission.mission_id,
+                    request_id=mission.request_id,
+                    tool_id=name,
+                    evidence_store=evidence_store,
+                )
             if spec.execution_context_required:
                 from security.authorization_context import AuthorizationContext
                 if not isinstance(mission.authorization_context, dict):
@@ -995,6 +1004,7 @@ class MissionRuntime:
             scope_context=mission.scope_snapshot,
             request_id=mission.request_id,
             mission_authorization=mission_authorization,
+            mission_authorization_version=int(mission.provenance.get("authorization_snapshot_version", 1)),
             owner_authorization=owner_authorization,
             owner_authorization_record=dict(mission.authorization_context or {}) if spec.execution_context_required else None,
             workspace=workspace,

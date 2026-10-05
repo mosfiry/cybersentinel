@@ -58,17 +58,17 @@ def test_workspace_root_path_validation_and_file_operations(tmp_path):
 
 def test_workspace_shell_and_process_timeout_are_policy_governed(tmp_path):
     ws = Workspace(tmp_path, policy=WorkspacePolicy(allowed_shell_commands=("python",), default_timeout=0.05), authorization_snapshot=snapshot(root=str(tmp_path), actions=["shell", "process"], tools=[], live=True))
-    result = ws.run_shell("python -c 'print(42)'", timeout=2)
-    assert result.ok and result.stdout.strip() == "42"
+    with pytest.raises(WorkspacePolicyError, match="ExecutionContext"):
+        ws.run_shell("python -c 'print(42)'", timeout=2)
     with pytest.raises(WorkspacePolicyError):
         ws.run_shell("bash -c 'echo unsafe'")
-    timed = ws.run_process(("python", "-c", "import time; time.sleep(1)"), timeout=0.01)
-    assert timed.timed_out and timed.exit_code is None
+    with pytest.raises(WorkspacePolicyError, match="ExecutionContext"):
+        ws.run_process(("python", "-c", "import time; time.sleep(1)"), timeout=0.01)
 
 
 def test_tool_registry_exposes_typed_metadata_without_second_registry():
     definitions = {item["tool_id"]: item for item in tool_definitions()}
-    assert definitions["run_project_tests"]["required_authorization"] == "owner"
+    assert definitions["run_project_tests"]["required_authorization"] == "owner_and_workspace_root"
     assert get_tool("run_project_tests").version == "1.0.0"
     assert "evidence_requirements" in definitions["run_project_tests"]
 

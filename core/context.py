@@ -41,6 +41,7 @@ class ExecutionContext:
     tool_argument: Any = field(default=None, repr=False, compare=False)
     owner_authorization: Any = field(default=None, repr=False, compare=False)
     mission_authorization: Any = field(default=None, repr=False, compare=False)
+    mission_authorization_version: int | None = field(default=None, repr=False, compare=False)
     authorization_decision: Any = field(default=None, repr=False, compare=False)
     execution_fence: Any = field(default=None, repr=False, compare=False)
     evidence_store: Any = field(default=None, repr=False, compare=False)
@@ -74,6 +75,8 @@ class ExecutionContext:
                 "target_identity": self.target_identity,
                 "tool_id": self.tool_id,
             })
+            if self.mission_authorization_version is not None:
+                result["mission_authorization_version"] = self.mission_authorization_version
         return result
 
     def assert_active(self) -> None:
@@ -116,10 +119,18 @@ class ExecutionContext:
         if self.owner_identity != canonical_owner or self.mission_authorization.owner_identity != canonical_owner:
             raise PermissionError("canonical Owner identity does not match the Mission")
 
+        expected_version = self.mission_authorization_version
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version != self.mission_authorization.version
+        ):
+            raise PermissionError("Mission authorization snapshot version is not bound to the current Mission")
         valid, reason = self.mission_authorization.validate_for_mission(
             mission_id=self.mission_id,
             owner_identity=canonical_owner,
             target_identity=self.target_identity,
+            version=expected_version,
         )
         if not valid:
             raise PermissionError("Mission authorization is not current: " + reason)

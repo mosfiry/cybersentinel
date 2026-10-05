@@ -485,6 +485,7 @@ def test_real_browser_actions_dispatch_through_registry_and_live_execution_conte
             return execute(
                 tool, argument, request_id=request_id, authorization_decision=decision,
                 scope_context=scope_context, mission_authorization=mission_auth,
+                mission_authorization_version=mission_auth.version,
                 owner_authorization=owner_auth, owner_authorization_record=owner_auth.to_dict(),
                 evidence_store=evidence_store, mission_id=mission_id, target_identity=target_id,
                 execution_fence=fence, execution_id=execution_id,

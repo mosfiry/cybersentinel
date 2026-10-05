@@ -316,11 +316,11 @@ class AgentCore:
         try:
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
             workspace = None
-            if step.action == "run_project_tests":
+            workspace_root = ""
+            if spec.workspace_scope_required:
                 workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
                 if not workspace_root:
                     raise PermissionError("mission workspace boundary required")
-                workspace = Workspace(workspace_root)
             evidence_store = EvidenceChainStore(
                 Path(self.store.db_path).with_name("evidence_chain.db"),
                 execution_fence=execution_fence,
@@ -328,12 +328,21 @@ class AgentCore:
                 mission=mission,
                 require_execution_fence=True,
             )
+            if spec.workspace_scope_required:
+                workspace = Workspace(
+                    workspace_root,
+                    authorization_snapshot=snapshot,
+                    mission_id=mission.mission_id,
+                    request_id=mission.request_id,
+                    tool_id=step.action,
+                    evidence_store=evidence_store,
+                )
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
             if selected_skill_context is not None:
                 # Last live Skill approval/revocation/expiry check immediately before canonical dispatch.
                 selected_skill_context = self._resolve_mission_skill_context(mission)
                 delegation_scope = selected_skill_context.narrow_task_scope(delegation_scope, tool_name=step.action)
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, owner_authorization=context, owner_authorization_record=dict(raw), workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, mission_authorization_version=int(mission.provenance.get("authorization_snapshot_version", 1)), owner_authorization=context, owner_authorization_record=dict(raw), workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except EffectRecoveryRequired as exc:
             return {
@@ -776,7 +785,13 @@ class AgentCore:
             raise PermissionError("authorization snapshot cannot be renewed") from exc
         old_scope_id = ((mission.authorization_context or {}).get("scope_snapshot_id") if isinstance(mission.authorization_context, dict) else None)
         fresh_scope = get_snapshot(str(old_scope_id)) if old_scope_id else None
-        fresh_context = AuthorizationContext(request_id=mission.request_id, owner_evidence=evidence, policy_snapshot=fresh_snapshot, scope_snapshot=fresh_scope)
+        fresh_context = AuthorizationContext(
+            request_id=mission.request_id,
+            owner_evidence=evidence,
+            policy_snapshot=fresh_snapshot,
+            scope_snapshot=fresh_scope,
+            session_id=evidence.session_id,
+        )
         mission.authorization_context = fresh_context.to_dict()
         mission.policy_snapshot = fresh_snapshot.to_dict()
         mission.recovery_events.append({"event": "owner_revalidated", "authorization_source": "username_password", "evidence_fingerprint": fresh_context.owner_evidence_fingerprint})

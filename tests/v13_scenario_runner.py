@@ -23,6 +23,51 @@ POLL_INTERVAL = "0.5"
 MAX_POLLS = "8"
 
 
+def _persist_local_workspace_scope(session: str, target_id: str, *, namespace: str):
+    """Persist an Owner-authenticated, localhost-only scope for an isolated scenario."""
+    from security.scope import ProgramAuthorization, TargetIdentity, make_snapshot
+    from security.scope_store import init_scope_store, save_snapshot
+
+    now = datetime.now(timezone.utc)
+    program_id = f"{namespace}-local-workspace-program"
+    snapshot = make_snapshot(
+        f"{namespace}-scope-{session_reference(session)[:24]}",
+        ProgramAuthorization(
+            program_id=program_id,
+            platform=f"{namespace}-owner-approved-local-workspace",
+            scope_version="1",
+            retrieved_at=now.isoformat(),
+            in_scope_assets=({"host": "127.0.0.1", "schemes": ["http"], "ports": [80], "paths": ["/"]},),
+            # The persisted Owner scope survives a fresh login by the same canonical Owner.
+            owner_session_id="",
+            source="owner",
+        ),
+        [TargetIdentity(
+            target_id, program_id, "127.0.0.1", asset_type="local_workspace",
+            environment="test", allowed_ports=(80,), allowed_paths=("/",),
+        )],
+        expires_at=(now + timedelta(minutes=30)).isoformat(),
+    )
+    init_scope_store()
+    save_snapshot(snapshot, owner_session_token=session)
+    return snapshot
+
+
+def _local_workspace_scope_context(snapshot, workspace_root: Path) -> dict[str, Any]:
+    target = snapshot.targets[0]
+    return {
+        "program_id": snapshot.authorization.program_id,
+        "target_id": target.target_id,
+        "scope_snapshot_id": snapshot.snapshot_id,
+        "url": f"http://{target.host}/",
+        "method": "GET",
+        "workspace_root": str(workspace_root.resolve()),
+        "scope": ["workspace"],
+        "allowed_networks": [],
+        "allowed_credentials": [],
+    }
+
+
 def _emit(payload: dict[str, Any], exit_code: int = 0) -> int:
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")), flush=True)
     return exit_code
@@ -256,6 +301,8 @@ class _LiveBridge:
         return str(payload["session"]["session_id"])
 
     def create_mission(self, session: str) -> tuple[str, dict[str, Any]]:
+        target_id = "v13-temporary-workspace"
+        scope_snapshot = _persist_local_workspace_scope(session, target_id, namespace="v13")
         objective = "Owner instruction: run deterministic local tests and register a local defensive watch keyword"
         payload = {
             "objective": objective,
@@ -288,12 +335,7 @@ class _LiveBridge:
                     },
                 ],
             },
-            "scope_context": {
-                "target_id": "v13-temporary-workspace",
-                "workspace_root": str(self.workspace.resolve()),
-                "allowed_networks": [],
-                "allowed_credentials": [],
-            },
+            "scope_context": _local_workspace_scope_context(scope_snapshot, self.workspace),
             "completion_criteria": [
                 {"criterion_id": "tests-pass", "description": "project pytest process exits successfully", "check": "pytest_success", "required": True},
                 {"criterion_id": "watch-registered", "description": "requested local defensive watch is persisted", "check": "watch_registered", "required": True},

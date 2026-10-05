@@ -55,6 +55,25 @@ class MissionService:
         if not str(kwargs.get("request_id") or "").strip():
             context_request_id = getattr(kwargs.get("authorization_context"), "request_id", "")
             kwargs["request_id"] = str(context_request_id or uuid.uuid4().hex)
+        owner_session_token = kwargs.pop("owner_session_token", None)
+        if owner_session_token is not None:
+            canonical_owner = self._owner_identity_ref(str(owner_session_token))
+            supplied_owner = str(kwargs.get("owner_identity_ref") or "")
+            if supplied_owner and supplied_owner != canonical_owner:
+                raise PermissionError("authenticated Owner does not match the requested Mission identity")
+            kwargs["owner_identity_ref"] = canonical_owner
+            if kwargs.get("authorization_context") is None:
+                scope_data = kwargs.get("scope_snapshot")
+                scope_snapshot_id = (
+                    scope_data.get("scope_snapshot_id")
+                    if isinstance(scope_data, dict) else None
+                )
+                owner_context = self._owner_context(
+                    str(owner_session_token),
+                    request_id=str(kwargs["request_id"]),
+                    scope_snapshot_id=str(scope_snapshot_id) if scope_snapshot_id else None,
+                )
+                kwargs["authorization_context"] = owner_context.to_dict()
         mission = self.runtime.create(owner_request, objective, plan, **kwargs)
         return mission.to_dict()
 
@@ -581,17 +600,31 @@ class MissionService:
             authorization_snapshot=authorization,
         ).__dict__.copy()
 
-    def _owner_context(self, owner_session_token: str):
+    def _owner_context(
+        self,
+        owner_session_token: str,
+        *,
+        request_id: str | None = None,
+        scope_snapshot_id: str | None = None,
+    ):
         from security.authorization_context import AuthorizationContext
         from security.owner_policy import authenticate_owner, capture_policy_snapshot
 
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         evidence = authenticate_owner(owner_session_token, request_id)
         snapshot = capture_policy_snapshot(request_id, evidence)
+        scope_snapshot = None
+        if scope_snapshot_id:
+            from security.scope_store import get_snapshot
+
+            scope_snapshot = get_snapshot(scope_snapshot_id)
+            if scope_snapshot is None:
+                raise PermissionError("canonical persisted Owner scope snapshot is required")
         return AuthorizationContext(
             request_id=request_id,
             owner_evidence=evidence,
             policy_snapshot=snapshot,
+            scope_snapshot=scope_snapshot,
             session_id=evidence.session_id,
         )
 

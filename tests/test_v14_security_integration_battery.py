@@ -16,7 +16,7 @@ from agent.mission_worker import MissionQueue, MissionWorker, WorkerMissionState
 from agent.model_router import ModelRouter
 from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 from api.missions import MissionService
-from owner_session_testutils import allow_owner_sessions
+from owner_session_testutils import allow_owner_sessions, persist_canonical_scope, workspace_scope_context
 from security.scope_store import init_scope_store
 
 
@@ -106,6 +106,10 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
         "def test_smoke():\n    assert 2 + 2 == 4\n",
         encoding="utf-8",
     )
+    scope_snapshot = persist_canonical_scope(
+        monkeypatch, tmp_path, owner_session_token="owner-session",
+        target_id="v14-local-workspace", bind_session=False,
+    )
     core, store, provider = _core(
         tmp_path, monkeypatch, response=_run_project_tests_proposal()
     )
@@ -114,7 +118,7 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
         "Run the local project tests and verify their result",
         owner_session_token="owner-session",
         request_id="v14-owner-worker-request",
-        scope_context={"workspace_root": str(project_root)},
+        scope_context=workspace_scope_context(scope_snapshot, project_root),
         run=False,
     )
 
@@ -154,8 +158,21 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     completed = worker.run_once(max_slices=5)
 
     assert completed is not None
-    assert completed.state is WorkerMissionState.COMPLETED
     persisted = MissionStore(tmp_path / "missions.sqlite3").load(mission.mission_id)
+    from security.owner_password import authenticated_owner
+    persisted_session = (persisted.authorization_context or {}).get("session_id")
+    persisted_evidence = (persisted.authorization_context or {}).get("owner_evidence", {})
+    assert completed.state is WorkerMissionState.COMPLETED, {
+        "queue_error": completed.last_error,
+        "mission_status": persisted.status.value,
+        "mission_error": persisted.error,
+        "owner_context_session_active": bool(authenticated_owner(str(persisted_session or ""))),
+        "owner_evidence_session_matches": persisted_evidence.get("session_id") == persisted_session,
+        "last_action_error": (
+            persisted.action_history[-1].get("observation", {}).get("error")
+            if persisted.action_history else None
+        ),
+    }
     assert persisted.status is MissionStatus.GOAL_COMPLETED
     assert persisted.action_history[0]["status"] == "completed"
     assert persisted.evidence
@@ -166,9 +183,16 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
         mission_store=store,
     )
     records = evidence_store.list(request_id=mission.request_id)
-    assert records
+    assert len(records) >= 2
     assert evidence_store.verify()
-    provenance = records[0]["evidence"]["provenance"]
+    process_records = [record for record in records if record.get("source") == "sandboxed-process:run_project_tests"]
+    workspace_events = [
+        record for record in records
+        if record.get("source") == "workspace:run_project_tests"
+        and record.get("evidence", {}).get("operation") == "process"
+    ]
+    assert len(process_records) == 1 and len(workspace_events) == 1
+    provenance = workspace_events[0]["evidence"]["provenance"]
     assert provenance["mission_id"] == mission.mission_id
     assert provenance["request_id"] == mission.request_id
     assert provenance["tool_id"] == "run_project_tests"
@@ -193,6 +217,11 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
         encoding="utf-8",
     )
     monkeypatch.setenv("CYBERSENTINEL_TEST_ROOT", str(decoy_root))
+    target_id = f"native-workspace-{parallel}"
+    scope_snapshot = persist_canonical_scope(
+        monkeypatch, tmp_path, owner_session_token="native-owner-session",
+        target_id=target_id,
+    )
     tool_calls = [ToolCall("run_project_tests", {"query": "."}, "native-workspace-call")]
     if parallel:
         tool_calls.append(ToolCall("status", {}, "native-status-call"))
@@ -209,7 +238,7 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
         "Run the authorized local project tests and verify their result",
         owner_session_token="native-owner-session",
         request_id=f"native-workspace-{parallel}",
-        scope_context={"workspace_root": str(authorized_root)},
+        scope_context=workspace_scope_context(scope_snapshot, authorized_root),
     )
 
     assert provider.calls == 3
@@ -225,14 +254,24 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
         mission_store=store,
     )
     records = evidence_store.list(request_id=mission.request_id)
-    assert len(records) == 1
+    assert len(records) == 2
     assert evidence_store.verify()
-    assert records[0]["task_id"]
-    assert records[0]["execution_id"]
-    assert records[0]["evidence"]["result"] == "success"
-    assert records[0]["evidence"]["provenance"]["workspace"] == str(authorized_root.resolve())
+    process_records = [record for record in records if record.get("source") == "sandboxed-process:run_project_tests"]
+    workspace_events = [
+        record for record in records
+        if record.get("source") == "workspace:run_project_tests"
+        and record.get("evidence", {}).get("operation") == "process"
+    ]
+    assert len(process_records) == 1 and len(workspace_events) == 1
+    process_record = process_records[0]
+    assert process_record["task_id"]
+    assert process_record["execution_id"]
+    assert process_record["evidence"]["record_type"] == "UNTRUSTED_SANDBOX_PROCESS_RESULT"
+    assert process_record["evidence"]["exit_code"] == 0
+    assert process_record["evidence"]["trust"] == "untrusted_data"
+    assert workspace_events[0]["evidence"]["provenance"]["workspace"] == str(authorized_root.resolve())
     assert any(
-        receipt["evidence_id"] == records[0]["evidence_id"]
+        receipt["evidence_id"] == process_record["evidence_id"]
         for receipt in store.load(mission.mission_id).progress["execution_evidence_refs"]
     )
 

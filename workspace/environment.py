@@ -9,11 +9,17 @@ from typing import Any, Callable, Iterable, Sequence
 import heapq
 import errno
 import hashlib
+import math
+import mimetypes
 import os
+import re
 import signal
 import shlex
+import shutil
 import stat
 import subprocess
+import sys
+import tempfile
 import time
 
 
@@ -33,6 +39,41 @@ class WorkspacePolicy:
     max_processes: int = 4
     max_output_bytes: int = 64_000
     default_timeout: float = 30.0
+    max_timeout_seconds: float = 60.0
+    max_cpu_seconds: int = 60
+    max_memory_bytes: int = 1_073_741_824
+    max_file_bytes: int = 16_777_216
+    max_open_files: int = 128
+    max_child_processes: int = 32
+    max_artifacts: int = 8
+    max_artifact_bytes: int = 1_048_576
+    max_total_artifact_bytes: int = 4_194_304
+    max_temp_bytes: int = 67_108_864
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allowed_shell_commands, tuple) or not self.allowed_shell_commands:
+            raise ValueError("allowed process commands must be a non-empty tuple")
+        if any(not isinstance(item, str) or not item.isidentifier() and not item.replace("-", "").isalnum() for item in self.allowed_shell_commands):
+            raise ValueError("allowed process commands must be simple executable names")
+        positive_ints = (
+            self.max_processes, self.max_output_bytes, self.max_cpu_seconds,
+            self.max_memory_bytes, self.max_file_bytes, self.max_open_files,
+            self.max_child_processes, self.max_artifacts, self.max_artifact_bytes,
+            self.max_total_artifact_bytes, self.max_temp_bytes,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in positive_ints):
+            raise ValueError("workspace resource limits must be positive integers")
+        for value in (self.default_timeout, self.max_timeout_seconds):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError("workspace timeouts must be positive finite numbers")
+        if self.default_timeout > self.max_timeout_seconds:
+            raise ValueError("default timeout cannot exceed the maximum timeout")
+        if self.max_artifact_bytes > 4 * 1024 * 1024:
+            raise ValueError("single artifact limit exceeds ArtifactStore's hard cap")
+        if self.max_total_artifact_bytes < self.max_artifact_bytes:
+            raise ValueError("total artifact limit must cover at least one artifact")
+        if self.max_temp_bytes > 512 * 1024 * 1024:
+            raise ValueError("sandbox temporary storage exceeds its hard maximum")
 
     def authorize(self, operation: str, *, command: Sequence[str] = (), network: bool = False, credentials: bool = False) -> None:
         if network and not self.allow_network:
@@ -40,10 +81,13 @@ class WorkspacePolicy:
         if credentials and not self.allow_credentials:
             raise WorkspacePolicyError("credential access denied by workspace policy")
         if operation == "shell":
-            if not command or str(command[0]) not in self.allowed_shell_commands:
+            if not command or Path(str(command[0])).name not in self.allowed_shell_commands:
                 raise WorkspacePolicyError("shell command denied by workspace policy")
-        if operation == "process" and len(command) > self.max_processes * 1024:
-            raise WorkspacePolicyError("process command is unreasonably large")
+        if operation in {"process", "development"}:
+            if not command or Path(str(command[0])).name not in self.allowed_shell_commands:
+                raise WorkspacePolicyError("process command denied by workspace policy")
+            if len(command) > 64 or any(not isinstance(item, str) or "\x00" in item or len(item) > 4096 for item in command) or sum(len(item) for item in command) > 16_384:
+                raise WorkspacePolicyError("process command is unreasonably large")
 
 
 @dataclass(frozen=True)
@@ -127,7 +171,7 @@ def _stop_process_tree(process: Popen, *, grace_seconds: float = 2.0) -> None:
 class Workspace:
     """A root-confined, auditable operating environment for AgentCore tools."""
 
-    def __init__(self, root: str | Path, *, policy: WorkspacePolicy | None = None, mission_id: str = "", request_id: str = "", tool_id: str = "", authorization_snapshot: Any = None, evidence_store: Any = None):
+    def __init__(self, root: str | Path, *, policy: WorkspacePolicy | None = None, mission_id: str = "", request_id: str = "", tool_id: str = "", authorization_snapshot: Any = None, evidence_store: Any = None, execution_context: Any = None):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._supports_dir_fd = os.name == "posix" and os.open in getattr(os, "supports_dir_fd", set())
@@ -145,6 +189,7 @@ class Workspace:
         self.tool_id = tool_id
         self.authorization_snapshot = authorization_snapshot
         self.evidence_store = evidence_store
+        self.execution_context = execution_context
 
     @property
     def supports_secure_public_workspace_access(self) -> bool:
@@ -253,10 +298,47 @@ class Workspace:
         except Exception:
             pass
 
-    def bind(self, *, mission_id: str, request_id: str, tool_id: str, authorization_snapshot: Any, evidence_store: Any = None) -> "Workspace":
+    def bind(self, *, mission_id: str, request_id: str, tool_id: str, authorization_snapshot: Any, evidence_store: Any = None, execution_context: Any = None) -> "Workspace":
         self.mission_id, self.request_id, self.tool_id = mission_id, request_id, tool_id
         self.authorization_snapshot, self.evidence_store = authorization_snapshot, evidence_store
+        self.execution_context = execution_context
         return self
+
+    def _require_execution_context(self) -> Any:
+        context = self.execution_context
+        if context is None or not callable(getattr(context, "assert_active", None)):
+            raise WorkspacePolicyError("process execution requires the canonical ToolRegistry ExecutionContext")
+        context.assert_active()
+        if (
+            context.mission_id != self.mission_id
+            or context.request_id != self.request_id
+            or context.tool_id != self.tool_id
+            or context.mission_authorization is not self.authorization_snapshot
+            or context.evidence_store is not self.evidence_store
+        ):
+            raise WorkspacePolicyError("process ExecutionContext does not match this Mission Workspace")
+        return context
+
+    def _require_process_authority(self) -> Any:
+        if self.tool_id != "git_read":
+            return self._require_execution_context()
+        snapshot = self.authorization_snapshot
+        if snapshot is None or not self.mission_id or not self.request_id:
+            raise WorkspacePolicyError("Owner-scoped Git reads require a bound Mission authorization snapshot")
+        valid, reason = snapshot.validate_for_mission(
+            mission_id=self.mission_id,
+            owner_identity=snapshot.owner_identity,
+            target_identity=snapshot.target_identity,
+        )
+        if not valid:
+            raise WorkspacePolicyError("Mission authorization is not current: " + reason)
+        allowed, reason = snapshot.check(
+            action="git_read", tool_id="git_read", target_identity=snapshot.target_identity,
+            workspace_path=str(self.root),
+        )
+        if not allowed:
+            raise WorkspacePolicyError("Mission authorization blocked Git read: " + reason)
+        return None
 
     def _authorize(self, operation: str, *, path: str = ".", command: Sequence[str] = (), network: str | None = None, credential: str | None = None) -> None:
         if self.authorization_snapshot is None:
@@ -570,65 +652,317 @@ class Workspace:
         self.policy.authorize("shell", command=argv, network=network, credentials=credentials)
         return self.run_process(argv, timeout=timeout, network=network, credentials=credentials)
 
-    def run_process(self, argv: Sequence[str], *, timeout: float | None = None, network: bool = False, credentials: bool = False, cwd: str | Path = ".") -> "ProcessResult":
-        command = tuple(str(item) for item in argv)
-        if not command:
-            raise ValueError("process command must not be empty")
-        self._authorize("process", path=str(cwd), command=command, network="network" if network else None, credential="credential" if credentials else None)
-        self.policy.authorize("process", command=command, network=network, credentials=credentials)
-        return self._run_process_authorized(command, timeout=timeout, cwd=cwd)
+    def _canonical_command(self, command: tuple[str, ...]) -> tuple[str, ...]:
+        requested = command[0]
+        name = Path(requested).name
+        if self.tool_id == "git_read":
+            prefix = ("git", "--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false")
+            allowed_git = {
+                prefix + ("status", "--short", "--branch"),
+                prefix + ("branch", "--show-current"),
+                prefix + ("log", "-8", "--oneline", "--decorate"),
+                prefix + ("diff", "--no-ext-diff", "--no-textconv", "--no-color", "--", "."),
+                prefix + ("rev-parse", "--show-toplevel"),
+                prefix + ("rev-parse", "HEAD"),
+                prefix + ("remote", "get-url", "origin"),
+            }
+            if command not in allowed_git or name != "git":
+                raise WorkspacePolicyError("only fixed read-only Git queries are available")
+            resolved_git = shutil.which("git", path="/usr/bin:/bin")
+            if resolved_git is None:
+                raise WorkspacePolicyError("approved Git executable is unavailable")
+            if "/" in requested or "\\" in requested:
+                try:
+                    if Path(requested).resolve(strict=True) != Path(resolved_git).resolve(strict=True):
+                        raise WorkspacePolicyError("Git executable path is not the approved runtime binary")
+                except OSError as exc:
+                    raise WorkspacePolicyError("Git executable path is unavailable") from exc
+            return (str(Path(resolved_git).resolve()), *command[1:])
+        expected = ("python3", "-m", "pytest", "-q", "--junitxml=/artifacts/pytest.xml")
+        if self.tool_id != "run_project_tests" or name != expected[0] or command[1:] != expected[1:]:
+            raise WorkspacePolicyError("only the fixed Mission-authorized pytest command is available")
+        safe_path = os.pathsep.join((str(Path(sys.prefix) / "bin"), "/usr/local/bin", "/usr/bin", "/bin"))
+        resolved = shutil.which(name, path=safe_path)
+        if resolved is None and re.fullmatch(r"python(?:3)?(?:\.\d+)*", name):
+            resolved = shutil.which("python3" if "3" in name else "python", path=safe_path)
+        if resolved is None:
+            raise WorkspacePolicyError("approved process executable is unavailable")
+        if "/" in requested or "\\" in requested:
+            try:
+                if Path(requested).resolve(strict=True) != Path(resolved).resolve(strict=True):
+                    raise WorkspacePolicyError("process executable path is not the approved runtime binary")
+            except OSError as exc:
+                raise WorkspacePolicyError("process executable path is unavailable") from exc
+        return (str(Path(resolved)), *command[1:])
 
-    def _run_process_authorized(
-        self, command: tuple[str, ...], *, timeout: float | None, cwd: str | Path
-    ) -> "ProcessResult":
-        workdir = self._logical_path(cwd)
-        cwd_fd = self._open_dir_fd(cwd)
-        popen_options: dict[str, Any] = {
-            "stdin": DEVNULL,
-            "stdout": PIPE,
-            "stderr": PIPE,
-            "text": False,
-            "env": {"PATH": os.environ.get("PATH", "")},
-            "start_new_session": os.name == "posix",
-        }
-        if cwd_fd is not None and os.path.isdir("/proc/self/fd"):
-            popen_options["cwd"] = f"/proc/self/fd/{cwd_fd}"
-            popen_options["pass_fds"] = (cwd_fd,)
-        else:
-            popen_options["cwd"] = self.resolve(cwd)
-        started = time.time()
+    def _sandbox_popen(
+        self,
+        command: tuple[str, ...],
+        *,
+        cwd: str | Path,
+        artifact_fd: int,
+        timeout: float,
+    ) -> Popen[bytes]:
+        self._require_process_authority()
+        if sys.platform != "linux" or os.name != "posix" or os.geteuid() == 0:
+            raise WorkspacePolicyError("required rootless Linux process sandbox is unavailable")
+        bwrap = shutil.which("bwrap", path="/usr/bin:/bin")
+        if not bwrap:
+            raise WorkspacePolicyError("bubblewrap sandbox is unavailable; process dispatch denied")
+        safe_path = os.pathsep.join((str(Path(sys.prefix) / "bin"), "/usr/local/bin", "/usr/bin", "/bin"))
+        prlimit = shutil.which("prlimit", path=safe_path)
+        if not prlimit:
+            raise WorkspacePolicyError("resource-limit launcher is unavailable; process dispatch denied")
+
+        root_fd = self._open_dir_fd(".")
+        cwd_fd = None
+        if root_fd is None:
+            raise WorkspacePolicyError("race-resistant workspace handles are required for process isolation")
         try:
-            process = Popen(command, **popen_options)
+            cwd_fd = self._open_dir_fd(cwd)
+            if cwd_fd is None:
+                raise WorkspacePolicyError("race-resistant working-directory handle is required")
+
+            args: list[str] = [
+                bwrap,
+                "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+            ]
+            mounted_roots: list[Path] = []
+            for source in ("/usr", "/lib", "/lib64", "/bin"):
+                if Path(source).exists():
+                    args.extend(("--dir", source, "--ro-bind", source, source))
+                    mounted_roots.append(Path(source).resolve())
+
+            for prefix_value in dict.fromkeys((sys.prefix, sys.base_prefix)):
+                prefix = Path(prefix_value).resolve()
+                if prefix == Path("/") or any(prefix == root or root in prefix.parents for root in mounted_roots):
+                    continue
+                for parent in reversed(prefix.parents):
+                    if parent == Path("/") or any(parent == root or root in parent.parents for root in mounted_roots):
+                        continue
+                    args.extend(("--dir", str(parent)))
+                args.extend(("--dir", str(prefix), "--ro-bind", str(prefix), str(prefix)))
+                mounted_roots.append(prefix)
+
+            args.extend(("--dir", "/workspace", "--dir", "/workspace/project"))
+            args.extend(("--ro-bind-fd", str(root_fd), "/workspace/project"))
+            args.extend(("--dir", "/workspace/cwd", "--ro-bind-fd", str(cwd_fd), "/workspace/cwd"))
+            args.extend(("--dev", "/dev", "--proc", "/proc"))
+            args.extend(("--size", str(self.policy.max_temp_bytes), "--tmpfs", "/tmp"))
+            args.extend(("--size", str(self.policy.max_total_artifact_bytes), "--tmpfs", "/artifacts"))
+            args.extend(("--bind-fd", str(artifact_fd), "/artifacts/pytest.xml"))
+            args.extend(("--chdir", "/workspace/cwd", "--clearenv"))
+            for key, value in (
+                ("PATH", safe_path),
+                ("HOME", "/tmp"),
+                ("TMPDIR", "/tmp"),
+                ("LANG", "C.UTF-8"),
+                ("PYTHONDONTWRITEBYTECODE", "1"),
+                ("PYTHONNOUSERSITE", "1"),
+                ("PYTEST_ADDOPTS", "-p no:cacheprovider"),
+                ("CYBERSENTINEL_ARTIFACT_DIR", "/artifacts"),
+            ):
+                args.extend(("--setenv", key, value))
+
+            cpu_limit = min(self.policy.max_cpu_seconds, max(2, math.ceil(timeout) + 1))
+            limit_argv = (
+                prlimit,
+                f"--cpu={cpu_limit}:{cpu_limit}",
+                f"--as={self.policy.max_memory_bytes}:{self.policy.max_memory_bytes}",
+                f"--fsize={min(self.policy.max_file_bytes, self.policy.max_total_artifact_bytes)}:{min(self.policy.max_file_bytes, self.policy.max_total_artifact_bytes)}",
+                f"--nofile={self.policy.max_open_files}:{self.policy.max_open_files}",
+                f"--nproc={self.policy.max_child_processes}:{self.policy.max_child_processes}",
+                "--core=0:0",
+                "--",
+                *command,
+            )
+            args.extend(("--", *limit_argv))
+            return Popen(
+                args,
+                stdin=DEVNULL,
+                stdout=PIPE,
+                stderr=PIPE,
+                text=False,
+                cwd="/",
+                env={"PATH": safe_path, "LANG": "C"},
+                start_new_session=True,
+                pass_fds=(root_fd, cwd_fd, artifact_fd),
+            )
         finally:
             if cwd_fd is not None:
                 os.close(cwd_fd)
-        stdout_tail, stderr_tail = bytearray(), bytearray()
-        readers = [
-            Thread(target=_drain_tail, args=(process.stdout, stdout_tail, self.policy.max_output_bytes), daemon=True),
-            Thread(target=_drain_tail, args=(process.stderr, stderr_tail, self.policy.max_output_bytes), daemon=True),
-        ]
-        for reader in readers:
-            reader.start()
-        timed_out = False
-        try:
-            process.wait(timeout=timeout or self.policy.default_timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _stop_process_tree(process)
-        finally:
+            os.close(root_fd)
+
+    def _capture_artifacts(self, directory: str) -> tuple[tuple["ProcessArtifact", ...], bool]:
+        artifacts: list[ProcessArtifact] = []
+        total_bytes = 0
+        scanned = 0
+        truncated = False
+        scan_cap = max(self.policy.max_artifacts * 16, 32)
+
+        def walk(current: str, prefix: str, depth: int) -> None:
+            nonlocal total_bytes, scanned, truncated
+            try:
+                entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+            except OSError:
+                truncated = True
+                return
+            for entry in entries:
+                scanned += 1
+                if scanned > scan_cap or len(artifacts) >= self.policy.max_artifacts:
+                    truncated = True
+                    return
+                relative = f"{prefix}/{entry.name}" if prefix else entry.name
+                try:
+                    if entry.is_symlink():
+                        truncated = True
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < 3:
+                            walk(entry.path, relative, depth + 1)
+                        else:
+                            truncated = True
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    info = entry.stat(follow_symlinks=False)
+                    if info.st_size > self.policy.max_artifact_bytes or total_bytes + info.st_size > self.policy.max_total_artifact_bytes:
+                        truncated = True
+                        continue
+                    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                    fd = os.open(entry.path, flags)
+                    try:
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            continue
+                        with os.fdopen(fd, "rb", closefd=False) as stream:
+                            content = stream.read(self.policy.max_artifact_bytes + 1)
+                    finally:
+                        os.close(fd)
+                    if len(content) > self.policy.max_artifact_bytes or total_bytes + len(content) > self.policy.max_total_artifact_bytes:
+                        truncated = True
+                        continue
+                    filename = Path(entry.name).name[:200] or "sandbox-output"
+                    artifacts.append(ProcessArtifact(relative, filename, content, hashlib.sha256(content).hexdigest()))
+                    total_bytes += len(content)
+                except OSError:
+                    truncated = True
+
+        walk(directory, "", 0)
+        return tuple(artifacts), truncated
+
+    def run_process(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float | None = None,
+        network: bool = False,
+        credentials: bool = False,
+        cwd: str | Path = ".",
+        cancellation_event: Any = None,
+    ) -> "ProcessResult":
+        command = tuple(str(item) for item in argv)
+        if not command:
+            raise ValueError("process command must not be empty")
+        execution_context = self._require_process_authority()
+        if network or credentials:
+            raise WorkspacePolicyError("sandboxed processes never receive network or host credentials")
+        if cancellation_event is None and execution_context is not None:
+            cancellation_event = execution_context.cancellation_event
+        self._authorize("process", path=str(cwd), command=command, network="network" if network else None, credential="credential" if credentials else None)
+        self.policy.authorize("process", command=command, network=network, credentials=credentials)
+        command = self._canonical_command(command)
+        return self._run_process_authorized(
+            command, timeout=timeout, cwd=cwd, cancellation_event=cancellation_event,
+        )
+
+    def _run_process_authorized(
+        self,
+        command: tuple[str, ...],
+        *,
+        timeout: float | None,
+        cwd: str | Path,
+        cancellation_event: Any = None,
+    ) -> "ProcessResult":
+        execution_context = self._require_process_authority()
+        if cancellation_event is None and execution_context is not None:
+            cancellation_event = execution_context.cancellation_event
+        effective_timeout = self.policy.default_timeout if timeout is None else timeout
+        if isinstance(effective_timeout, bool) or not isinstance(effective_timeout, (int, float)) or not math.isfinite(effective_timeout) or effective_timeout <= 0:
+            raise WorkspacePolicyError("process timeout must be a positive finite number")
+        if effective_timeout > self.policy.max_timeout_seconds:
+            raise WorkspacePolicyError("process timeout exceeds the workspace policy limit")
+        workdir = self._logical_path(cwd)
+        started = time.time()
+        with tempfile.TemporaryDirectory(prefix="cybersentinel-process-artifacts-") as artifact_directory:
+            os.chmod(artifact_directory, 0o700)
+            artifact_path = Path(artifact_directory) / "pytest.xml"
+            artifact_flags = os.O_CREAT | os.O_RDWR | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            artifact_fd = os.open(artifact_path, artifact_flags, 0o600)
+            try:
+                process = self._sandbox_popen(
+                    command, cwd=cwd, artifact_fd=artifact_fd,
+                    timeout=float(effective_timeout),
+                )
+            finally:
+                os.close(artifact_fd)
+            stdout_tail, stderr_tail = bytearray(), bytearray()
+            readers = [
+                Thread(target=_drain_tail, args=(process.stdout, stdout_tail, self.policy.max_output_bytes), daemon=True),
+                Thread(target=_drain_tail, args=(process.stderr, stderr_tail, self.policy.max_output_bytes), daemon=True),
+            ]
+            for reader in readers:
+                reader.start()
+            timed_out = False
+            cancelled = False
+            deadline = time.monotonic() + float(effective_timeout)
+            while process.poll() is None:
+                if cancellation_event is not None and bool(getattr(cancellation_event, "is_set", lambda: False)()):
+                    cancelled = True
+                    _stop_process_tree(process, grace_seconds=0.25)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    _stop_process_tree(process, grace_seconds=0.25)
+                    break
+                try:
+                    process.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
             _join_process_readers(process, readers)
             if process.stdout:
                 process.stdout.close()
             if process.stderr:
                 process.stderr.close()
-        stdout = bytes(stdout_tail).decode("utf-8", errors="replace")
-        stderr = bytes(stderr_tail).decode("utf-8", errors="replace")
-        result = ProcessResult(command, stdout, stderr, None if timed_out else process.returncode, timed_out, time.time() - started)
-        self._record("process", path=workdir, command=command, output_value=result.to_dict(), result="success" if result.ok else "failure", exit_code=result.exit_code)
+            artifacts, capture_truncated = self._capture_artifacts(artifact_directory)
+            stdout = bytes(stdout_tail).decode("utf-8", errors="replace")
+            stderr = bytes(stderr_tail).decode("utf-8", errors="replace")
+            result = ProcessResult(
+                command, stdout, stderr,
+                None if timed_out or cancelled else process.returncode,
+                timed_out, time.time() - started,
+                cancelled=cancelled, artifacts=artifacts,
+                artifact_capture_truncated=capture_truncated,
+            )
+        audit_summary = {
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "cancelled": result.cancelled,
+            "duration_seconds": round(result.duration_seconds, 3),
+            "sandbox_backend": result.sandbox_backend,
+            "stdout_bytes": len(stdout.encode("utf-8", errors="replace")),
+            "stderr_bytes": len(stderr.encode("utf-8", errors="replace")),
+            "stdout_sha256": hashlib.sha256(stdout.encode("utf-8", errors="replace")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr.encode("utf-8", errors="replace")).hexdigest(),
+            "artifacts": [item.to_dict() for item in artifacts],
+            "artifact_capture_truncated": capture_truncated,
+        }
+        self._record("process", path=workdir, command=command, output_value=audit_summary, result="success" if result.ok else "failure", exit_code=result.exit_code)
         return result
 
     def git(self, operation: str, *arguments: str, timeout: float | None = None) -> "ProcessResult":
-        allowed = {"status", "diff", "log", "branch", "checkout", "commit", "apply", "revert"}
+        allowed = {"status", "diff", "log", "branch"}
         if operation not in allowed:
             raise WorkspacePolicyError("unsupported git operation")
         self._authorize("git", command=("git", operation, *arguments))
@@ -660,11 +994,41 @@ class Workspace:
         )
         self._authorize("git", command=command)
         self.policy.authorize("process", command=command)
-        return self._run_process_authorized(command, timeout=timeout, cwd=".")
+        context = self._require_process_authority()
+        return self._run_process_authorized(
+            self._canonical_command(command), timeout=timeout, cwd=".",
+            cancellation_event=context.cancellation_event if context is not None else None,
+        )
 
-    def develop(self, command: Sequence[str], *, timeout: float | None = None, cwd: str | Path = ".") -> "ProcessResult":
+    def develop(
+        self,
+        command: Sequence[str],
+        *,
+        timeout: float | None = None,
+        cwd: str | Path = ".",
+        cancellation_event: Any = None,
+    ) -> "ProcessResult":
         self._authorize("development", path=str(cwd), command=command)
-        return self.run_process(command, timeout=timeout, cwd=cwd)
+        return self.run_process(command, timeout=timeout, cwd=cwd, cancellation_event=cancellation_event)
+
+
+@dataclass(frozen=True)
+class ProcessArtifact:
+    relative_path: str
+    filename: str
+    content: bytes = field(repr=False)
+    sha256: str = ""
+
+    @property
+    def size_bytes(self) -> int:
+        return len(self.content)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "filename": self.filename,
+            "sha256": self.sha256,
+            "size_bytes": len(self.content),
+        }
 
 
 @dataclass(frozen=True)
@@ -675,22 +1039,43 @@ class ProcessResult:
     exit_code: int | None
     timed_out: bool
     duration_seconds: float
+    cancelled: bool = False
+    sandbox_backend: str = "bubblewrap+prlimit"
+    artifacts: tuple[ProcessArtifact, ...] = ()
+    artifact_capture_truncated: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out
+        return self.exit_code == 0 and not self.timed_out and not self.cancelled
 
     def to_dict(self) -> dict[str, Any]:
-        return {"command": list(self.command), "stdout": self.stdout, "stderr": self.stderr, "exit_code": self.exit_code, "timed_out": self.timed_out, "duration_seconds": self.duration_seconds, "ok": self.ok}
+        return {
+            "command": list(self.command),
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "exit_code": self.exit_code,
+            "timed_out": self.timed_out,
+            "cancelled": self.cancelled,
+            "duration_seconds": self.duration_seconds,
+            "sandbox_backend": self.sandbox_backend,
+            "artifacts": [item.to_dict() for item in self.artifacts],
+            "artifact_capture_truncated": self.artifact_capture_truncated,
+            "ok": self.ok,
+        }
 
 
 class ProcessHandle:
     """Controlled asynchronous process handle with bounded output and termination."""
 
-    def __init__(self, process: Popen[bytes], command: tuple[str, ...], max_output_bytes: int):
+    def __init__(self, process: Popen[bytes], command: tuple[str, ...], max_output_bytes: int, *, temporary_directory: Any = None, max_timeout_seconds: float = 60.0, cancellation_event: Any = None):
         self.process = process
         self.command = command
         self.max_output_bytes = max_output_bytes
+        self.max_timeout_seconds = max_timeout_seconds
+        self.temporary_directory = temporary_directory
+        self.cancellation_event = cancellation_event
+        self._cancelled = False
+        self._cleaned = False
         self._stdout_tail, self._stderr_tail = bytearray(), bytearray()
         self._readers = [
             Thread(target=_drain_tail, args=(process.stdout, self._stdout_tail, max_output_bytes), daemon=True),
@@ -705,11 +1090,23 @@ class ProcessHandle:
     def monitor(self, timeout: float | None = None) -> ProcessResult:
         started = time.time()
         timed_out = False
-        try:
-            self.process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self.terminate()
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0 or timeout > self.max_timeout_seconds):
+            raise WorkspacePolicyError("process monitor timeout is outside the workspace policy limit")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.process.poll() is None:
+            if self.cancellation_event is not None and bool(getattr(self.cancellation_event, "is_set", lambda: False)()):
+                self._cancelled = True
+                self.terminate()
+                break
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                timed_out = True
+                self.terminate()
+                break
+            try:
+                self.process.wait(timeout=0.1 if remaining is None else min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
         _join_process_readers(self.process, self._readers)
         if self.process.stdout:
             self.process.stdout.close()
@@ -717,10 +1114,26 @@ class ProcessHandle:
             self.process.stderr.close()
         stdout = bytes(self._stdout_tail).decode("utf-8", errors="replace")
         stderr = bytes(self._stderr_tail).decode("utf-8", errors="replace")
-        return ProcessResult(self.command, stdout, stderr, None if timed_out else self.process.returncode, timed_out, time.time() - started)
+        result = ProcessResult(
+            self.command, stdout, stderr,
+            None if timed_out or self._cancelled else self.process.returncode,
+            timed_out, time.time() - started, cancelled=self._cancelled,
+        )
+        self._cleanup()
+        return result
 
     def terminate(self) -> None:
+        self._cancelled = self.process.poll() is None
         _stop_process_tree(self.process)
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        if self.temporary_directory is not None:
+            self.temporary_directory.cleanup()
+            self.temporary_directory = None
 
 
 class ProcessManager:
@@ -734,6 +1147,9 @@ class ProcessManager:
         command = tuple(str(item) for item in argv)
         if not command:
             raise ValueError("process command must not be empty")
+        if network or credentials:
+            raise WorkspacePolicyError("sandboxed processes never receive network or host credentials")
+        execution_context = self.workspace._require_execution_context()
         self.workspace._authorize(
             "process", path=str(cwd), command=command,
             network="network" if network else None,
@@ -744,29 +1160,34 @@ class ProcessManager:
             if len(self.active) + self._starting >= self.workspace.policy.max_processes:
                 raise WorkspacePolicyError("process limit reached")
             self._starting += 1
-        cwd_fd = None
+        temporary_directory = tempfile.TemporaryDirectory(prefix="cybersentinel-managed-process-")
         try:
-            cwd_fd = self.workspace._open_dir_fd(cwd)
-            popen_options: dict[str, Any] = {
-                "stdin": DEVNULL,
-                "stdout": PIPE,
-                "stderr": PIPE,
-                "text": False,
-                "env": {"PATH": os.environ.get("PATH", "")},
-                "start_new_session": os.name == "posix",
-            }
-            if cwd_fd is not None and os.path.isdir("/proc/self/fd"):
-                popen_options["cwd"] = f"/proc/self/fd/{cwd_fd}"
-                popen_options["pass_fds"] = (cwd_fd,)
-            else:
-                popen_options["cwd"] = self.workspace.resolve(cwd)
-            process = Popen(command, **popen_options)
+            command = self.workspace._canonical_command(command)
+            self.workspace.policy.authorize("process", command=command)
+            artifact_path = Path(temporary_directory.name) / "pytest.xml"
+            artifact_fd = os.open(
+                artifact_path,
+                os.O_CREAT | os.O_RDWR | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            try:
+                process = self.workspace._sandbox_popen(
+                    command, cwd=cwd, artifact_fd=artifact_fd,
+                    timeout=self.workspace.policy.max_timeout_seconds,
+                )
+            finally:
+                os.close(artifact_fd)
         finally:
-            if cwd_fd is not None:
-                os.close(cwd_fd)
             with self._lock:
                 self._starting -= 1
-        handle = ProcessHandle(process, command, self.workspace.policy.max_output_bytes)
+            if "process" not in locals():
+                temporary_directory.cleanup()
+        handle = ProcessHandle(
+            process, command, self.workspace.policy.max_output_bytes,
+            temporary_directory=temporary_directory,
+            max_timeout_seconds=self.workspace.policy.max_timeout_seconds,
+            cancellation_event=execution_context.cancellation_event,
+        )
         with self._lock:
             self.active.add(handle)
         try:

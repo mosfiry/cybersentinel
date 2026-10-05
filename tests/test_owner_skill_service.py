@@ -13,7 +13,7 @@ from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue
 from agent.model_router import ModelRouter
 from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
-from owner_session_testutils import allow_owner_sessions
+from owner_session_testutils import allow_owner_sessions, persist_canonical_scope, workspace_scope_context
 
 
 class StatusProvider:
@@ -74,18 +74,16 @@ def _completed_mission(tmp_path: Path, monkeypatch):
         "def test_verified_source():\n    assert 2 + 2 == 4\n",
         encoding="utf-8",
     )
+    scope_snapshot = persist_canonical_scope(
+        monkeypatch, tmp_path, owner_session_token="valid-owner",
+        target_id="local-project:owner-skill-test",
+    )
     store = MissionStore(tmp_path / "missions.sqlite3")
     core = AgentCore(ModelRouter([StatusProvider()]), store=store)
     mission = core.run_owner_mission(
         "Run project tests and verify they pass",
         owner_session_token="valid-owner",
-        scope_context={
-            "target_id": "local-project:owner-skill-test",
-            "workspace_root": str(project.resolve()),
-            "scope": ["workspace"],
-            "allowed_networks": [],
-            "allowed_credentials": [],
-        },
+        scope_context=workspace_scope_context(scope_snapshot, project),
     )
     assert mission.status.value == "GOAL_COMPLETED"
     assert mission.verify_integrity()

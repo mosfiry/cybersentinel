@@ -50,7 +50,7 @@ def test_canonical_registry_is_single_source_with_complete_access_contracts():
         metadata = spec.metadata()
         assert expected_fields <= metadata.keys()
         assert metadata["risk_class"]
-        assert metadata["required_authorization"] in {"none", "owner", "owner_and_scope_snapshot"}
+        assert metadata["required_authorization"] in {"none", "owner", "owner_and_scope_snapshot", "owner_and_workspace_root"}
         assert isinstance(metadata["scope_requirements"], list)
         assert isinstance(metadata["input_schema"], dict)
         assert isinstance(metadata["output_schema"], dict)
@@ -63,10 +63,10 @@ def test_canonical_registry_is_single_source_with_complete_access_contracts():
         assert get_tool(name) is spec
     pytest_tool = REGISTRY["run_project_tests"]
     assert pytest_tool.risk_class == "bounded-exec"
-    assert pytest_tool.network_access == "host_process_unscoped"
-    assert pytest_tool.filesystem_access == "host_fs_via_process"
-    assert pytest_tool.process_access == "workspace_process_unisolated"
-    assert pytest_tool.credential_access == "host_user_credentials_possible"
+    assert pytest_tool.network_access == "none"
+    assert pytest_tool.filesystem_access == "workspace_read_only_artifact_write"
+    assert pytest_tool.process_access == "workspace_process_sandboxed"
+    assert pytest_tool.credential_access == "none"
     assert pytest_tool.timeout == 65
     assert "git.status" not in REGISTRY and "archive.inspect" not in REGISTRY
 
