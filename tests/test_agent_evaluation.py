@@ -9,6 +9,7 @@ from evaluation.agent_evaluation import (
     EvaluationError,
     EvaluationMeasurement,
     EvaluationMetric as M,
+    EvaluationPolicy,
     EvaluationRun,
     EvaluationStore,
     EvaluationVerdict as V,
@@ -142,3 +143,27 @@ def test_evaluation_store_caps_query_and_preserves_private_file_mode(tmp_path):
     assert store.db_path.stat().st_mode & 0o077 == 0
     with pytest.raises(EvaluationError, match="limit"):
         store.list(owner_identity_ref="owner:1", limit=101)
+
+
+def test_evaluation_policy_and_nested_provenance_are_deeply_immutable():
+    original = complete_run()
+    caller_provenance = {"nested": [{"source": "verified"}]}
+    run = EvaluationRun(
+        owner_identity_ref=original.owner_identity_ref,
+        mission_id=original.mission_id,
+        task_id=original.task_id,
+        case_id=original.case_id,
+        benchmark_version=original.benchmark_version,
+        provider_id=original.provider_id,
+        model_id=original.model_id,
+        measurements=original.measurements,
+        provenance=caller_provenance,
+        created_at=original.created_at,
+    )
+    caller_provenance["nested"][0]["source"] = "changed-after-construction"
+    assert run.provenance["nested"][0]["source"] == "verified"
+    with pytest.raises(TypeError):
+        run.provenance["nested"][0]["source"] = "mutated"
+    policy = EvaluationPolicy()
+    with pytest.raises(TypeError):
+        policy.minimums[M.TASK_SUCCESS] = 0.0

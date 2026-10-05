@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping
 
 
@@ -85,6 +86,22 @@ def _canonical(value: Any, label: str, limit: int = 32_768) -> str:
     return encoded
 
 
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class EvaluationMeasurement:
     metric: EvaluationMetric
@@ -144,7 +161,8 @@ class EvaluationRun:
         object.__setattr__(self, "measurements", normalized)
         if not isinstance(self.provenance, Mapping) or any(not isinstance(key, str) for key in self.provenance):
             raise EvaluationError("provenance must be an object with string keys")
-        _canonical(dict(self.provenance), "provenance", 16_384)
+        provenance_json = _canonical(dict(self.provenance), "provenance", 16_384)
+        object.__setattr__(self, "provenance", _freeze_json(json.loads(provenance_json)))
         if not isinstance(self.created_at, str):
             raise EvaluationError("created_at must be an ISO timestamp")
         try:
@@ -168,7 +186,7 @@ class EvaluationRun:
             "model_id": self.model_id,
             "created_at": self.created_at,
             "measurements": [item.to_dict() for item in sorted(self.measurements, key=lambda m: m.metric.value)],
-            "provenance": dict(self.provenance),
+            "provenance": _plain_json(self.provenance),
         }
 
 
@@ -204,7 +222,7 @@ class EvaluationPolicy:
                 raise EvaluationError(f"{name} keys must be EvaluationMetric values")
             if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in values.values()):
                 raise EvaluationError(f"{name} values must be finite numbers")
-            object.__setattr__(self, name, values)
+            object.__setattr__(self, name, MappingProxyType(values))
         if set(self.minimums) & set(self.maximums):
             raise EvaluationError("a metric cannot have both a minimum and maximum threshold")
         for metric, value in self.minimums.items():
