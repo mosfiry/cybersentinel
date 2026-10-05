@@ -4,7 +4,7 @@
 
 | Gate | Status | Evidence |
 |---|---|---|
-| Source integrity | PASS | Branch `work/v5.2-production-completion`, HEAD `103516c9b58cc37eaacda40c8d11ba6878ba64e9`; based on v5.1.0 source `26739d9b01b3b1ff492854e7e21789be20b1be0e`. |
+| Source integrity | PASS | Branch `work/v5.2-production-completion`; tested product/code SHA `103516c9b58cc37eaacda40c8d11ba6878ba64e9`; based on v5.1.0 source `26739d9b01b3b1ff492854e7e21789be20b1be0e`. The final branch update `019110ab4bd762490f2fc37d14cad16040dffbd0` changes only this gate document. |
 | Python | PASS | 1,225 passed, 1 skipped on the branch. |
 | Node | PASS | 5/5 Desktop tests passed. |
 | Windows CI | PASS | [Windows regression run 37243749816](https://github.com/mosfiry/cybersentinel/actions/runs/37243749816); Windows unit/API and Desktop contract coverage only, not real model inference or GUI acceptance. |
