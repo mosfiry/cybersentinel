@@ -97,11 +97,15 @@ test("Mission observability renderer treats hostile graph and event strings as i
   const root = new Element("root");
   const attack = `<img src=x onerror=alert(1)>`;
   context.render({
-    stage: { status: attack, current_step: { index: 0, step_id: attack, action: attack, task_status: "RUNNING" }, step_count: 1 },
+    stage: { status: attack, current_step: { index: 0, step_id: attack, action: attack, task_status: "RUNNING", specialist_task_id: attack, specialist_task_status: "RUNNING" }, step_count: 1 },
     graph: {
       available: true,
       revision: 1,
-      tasks: [{ task_id: attack, status: "RUNNING", agent_id: attack, agent_role: attack, agent_status: "RUNNING", dependencies: [attack], attempt_count: 1, result_state: "UNVERIFIED", error_category: attack, evidence_refs: [attack] }],
+      specialist_available: true,
+      specialist_revision: 2,
+      tasks: [
+        { task_id: attack, task_kind: "mission_specialist_analysis", status: "RUNNING", agent_id: attack, agent_role: attack, agent_status: "RUNNING", dependencies: [attack], attempt_count: 1, result_state: "UNVERIFIED", error_category: attack, evidence_refs: [attack] },
+      ],
       agents: [],
     },
     evidence_refs: [{ evidence_id: attack, sequence: 1, task_id: attack }],

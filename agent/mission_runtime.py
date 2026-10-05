@@ -40,7 +40,7 @@ class _MissionBudgetExceeded(RuntimeError):
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_context_provider: Callable[[Mission], Any] | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_context_provider: Callable[[Mission], Any] | None = None, specialist_generate: Callable[..., dict[str, Any]] | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -64,6 +64,7 @@ class MissionRuntime:
         self.event_bus = event_bus
         self.hook_registry = hook_registry
         self.skill_context_provider = skill_context_provider
+        self.specialist_generate = specialist_generate
         if task_graph_policy is not None and not isinstance(task_graph_policy, AgentGraphPolicy):
             raise TypeError("MissionRuntime task_graph_policy must be an AgentGraphPolicy")
         self.task_graph_adapter = MissionTaskGraphAdapter(task_graph_policy) if task_graph_policy is not None else None
@@ -1656,6 +1657,33 @@ class MissionRuntime:
         mission = self._load(mission_id)
         if mission.is_terminal:
             return mission
+        checkpoint = dict(mission.checkpoint or {})
+        checkpoint_status = checkpoint.get("status")
+        if checkpoint_status == "in_flight_specialists":
+            # Quarantine is a non-executing state transition. Do it before
+            # current authorization validation so an expired/renewed Owner
+            # snapshot cannot leave ambiguous provider calls marked RUNNING.
+            if self.task_graph_adapter is None:
+                return self._block_on_task_graph(mission, MissionTaskGraphError("specialist recovery has no task graph adapter"))
+            try:
+                graph_snapshot = self._typed_mission_snapshot(mission)
+                batch_id = str(checkpoint.get("batch_id", ""))
+                if not batch_id:
+                    raise MissionTaskGraphError("specialist recovery checkpoint has no batch identity")
+                self.task_graph_adapter.quarantine_specialist_batch(mission, graph_snapshot, batch_id=batch_id)
+                mission.recovery_events.append({
+                    "event": "specialist_batch_quarantined_no_replay",
+                    "batch_id": batch_id,
+                    "task_ids": list(checkpoint.get("task_ids", ()))[:2],
+                })
+                mission.checkpoint = {
+                    "status": "specialists_quarantined",
+                    "batch_id": batch_id,
+                    "task_ids": list(checkpoint.get("task_ids", ()))[:2],
+                }
+                return self._save(mission)
+            except (MissionTaskGraphError, KeyError, TypeError, ValueError, PermissionError) as exc:
+                return self._block_on_task_graph(mission, exc)
         authorization_ok, authorization_reason = self._mission_authorization(mission)
         if not authorization_ok:
             mission.error = authorization_reason
@@ -1727,6 +1755,14 @@ class MissionRuntime:
                 self.task_graph_adapter.ensure(mission, graph_snapshot)
             except (MissionTaskGraphError, KeyError, TypeError, ValueError) as exc:
                 return self._block_on_task_graph(mission, exc)
+            if self.specialist_generate is not None:
+                try:
+                    from .intelligence_layer.specialist_dispatch import run_ready_specialist_batch
+                    specialist_result = run_ready_specialist_batch(self, mission, graph_snapshot)
+                except Exception as exc:
+                    return self._block_on_task_graph(mission, exc)
+                if specialist_result is not None:
+                    return specialist_result
             from .intelligence_layer.parallel_dispatch import run_parallel_graph_steps
 
             parallel_result = run_parallel_graph_steps(self, mission, graph_snapshot, skill_context=skill_context)

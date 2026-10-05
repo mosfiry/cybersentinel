@@ -1137,6 +1137,9 @@ function renderMissionObservability(data, target) {
   addText(stageCard, "p", `حالة المهمة: ${stage.status || "غير معروفة"} · الخطوة ${current ? Number(current.index) + 1 : "—"}/${Number(stage.step_count || 0)}`);
   if (current) {
     addText(stageCard, "p", `المهمة الحالية: ${current.step_id || "معرّف غير متاح"} · ${current.action || "عملية غير محددة"} · ${current.task_status || "حالة الرسم غير متاحة"}`);
+    if (current.specialist_task_status) {
+      addText(stageCard, "p", `مهمة التحليل التابعة: ${current.specialist_task_id || "معرّف غير متاح"} · ${current.specialist_task_status}`, "muted");
+    }
   } else {
     addText(stageCard, "p", "لا توجد خطوة نشطة في خطة المهمة.", "muted");
   }
@@ -1148,13 +1151,14 @@ function renderMissionObservability(data, target) {
   graphCard.className = "result observability-card";
   addText(graphCard, "h2", "حالة مهام الرسم والوكلاء المسجّلين");
   addText(graphCard, "p", graph.available === true
-    ? `مراجعة الرسم: ${graph.revision} · المهام: ${(graph.tasks || []).length} · الوكلاء المسجلون: ${(graph.agents || []).length}`
+    ? `مراجعة رسم التنفيذ: ${graph.revision} · مراجعة رسم التحليل: ${graph.specialist_revision || "—"} · المهام: ${(graph.tasks || []).length} · الوكلاء المسجلون: ${(graph.agents || []).length}`
     : (graph.reason === "stale_plan" ? "حالة الرسم المحفوظة تخص خطة سابقة؛ لم تُعرض كحالة حالية." : "لم يُهيّأ رسم مهام لهذه المهمة."), "muted");
-  addText(graphCard, "p", "الحالة المعروضة من سجل الرسم فقط؛ لا تعني وجود وكلاء LLM مستقلين أو تنفيذ متوازٍ فعلي.", "muted");
+  addText(graphCard, "p", "قد تظهر مهام تحليل متخصصة تستخدم مزود النموذج المسجل للمهمة؛ نواتجها مقترحات غير موثوقة بلا أدوات أو صلاحية. لا يعني ذلك تنفيذًا متوازيًا لأدوات المهمة.", "muted");
   (Array.isArray(graph.tasks) ? graph.tasks : []).forEach((task) => {
     const card = document.createElement("article");
     card.className = "observability-task";
     addText(card, "h3", `${task.task_id || "مهمة"} · ${task.status || "غير معروفة"}`);
+    if (task.task_kind === "mission_specialist_analysis") addText(card, "p", "تحليل متخصص · مقترح غير موثوق فقط", "muted");
     addText(card, "p", `التعيين: ${task.agent_role || "وكيل"} (${task.agent_id || "غير متاح"}) · حالة الوكيل: ${task.agent_status || "غير معروفة"}`);
     addText(card, "p", `المتطلبات السابقة: ${(Array.isArray(task.dependencies) ? task.dependencies : []).join(", ") || "لا توجد"} · المحاولات: ${Number(task.attempt_count || 0)} · تحقق النتيجة: ${task.result_state || "غير محدد"}`);
     if (task.error_category) addText(card, "p", `فئة الخطأ: ${task.error_category}`, "observability-error");

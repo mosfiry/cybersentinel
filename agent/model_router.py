@@ -200,6 +200,60 @@ class ModelRouter:
             raise self._aggregate_failure("all model providers failed", attempts)
         raise ProviderFailure("no model provider configured")
 
+    def generate_for_provider(
+        self,
+        provider_name: str,
+        model_name: str,
+        messages: list[dict],
+        temperature: float | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Call only the provider/model pair already bound to this Mission.
+
+        Unlike :meth:`generate`, this method deliberately has no fallback loop.
+        A missing provider, model mismatch, or unsupported generation capability
+        is a closed failure; callers must not silently move Mission context to a
+        different configured provider.
+        """
+        name = str(provider_name or "")
+        model = str(model_name or "")
+        if not name or not model:
+            raise CapabilityUnsupported("Mission has no bound provider identity")
+        matches = [
+            provider for provider in self.providers
+            if str(getattr(provider, "name", "")) == name
+            and str(getattr(provider, "model", "")) == model
+        ]
+        if len(matches) != 1:
+            raise CapabilityUnsupported("bound provider/model is unavailable")
+        provider = matches[0]
+        if not self._caps(provider).generate:
+            raise CapabilityUnsupported(
+                "bound provider does not support generation",
+                provider=name,
+                model=model,
+            )
+        if temperature is None:
+            temperature = 0.2
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature):
+            raise ValueError("temperature must be finite")
+        timeout = kwargs.get("timeout")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be a positive finite number")
+        fn = getattr(provider, "generate", None) or getattr(provider, "chat", None)
+        if not callable(fn):
+            raise CapabilityUnsupported("bound provider has no generation method", provider=name, model=model)
+        try:
+            response = fn(messages, temperature=temperature, **kwargs)
+            return self._trusted(self._normalize(response, provider, "generate"), provider, "generate")
+        except Exception as exc:
+            raise self._classify(exc, provider) from exc
+
     def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float | None = None, *, reasoning_profile: ReasoningProfile | None = None, **kwargs: Any) -> dict[str, Any]:
         if reasoning_profile is not None:
             temperature = reasoning_profile.temperature

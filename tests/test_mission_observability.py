@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.intelligence_layer.events import EventStore, IntelligenceEventType
+from agent.intelligence_layer.graph import TaskGraph
 from agent.intelligence_layer.runtime_adapter import MissionTaskGraphAdapter
 from agent.mission import Mission, MissionStore
 from agent.planning import Plan, PlanStep
@@ -124,6 +125,68 @@ def test_projection_is_owner_bound_and_excludes_untrusted_prompts_results_errors
         assert forbidden not in encoded
     with pytest.raises(KeyError, match="unknown_mission"):
         _service_for(mission).get(mission.mission_id, owner_session_token="foreign-session")
+
+
+def test_projection_includes_running_specialist_agents_but_never_proposal_bodies(tmp_path):
+    mission, store = _stored_mission(tmp_path, step_count=2)
+    snapshot = make_test_snapshot(mission)
+    adapter = MissionTaskGraphAdapter()
+    adapter.ensure(mission, snapshot)
+    ready = adapter.ready_specialist_steps(mission, snapshot)
+    step_ids = tuple(step_id for step_id, _task_id in ready)
+    task_by_step = dict(ready)
+    batch_id = "observability-specialist-batch"
+    execution_ids = tuple(f"{batch_id}:{task_by_step[step_id]}" for step_id in step_ids)
+    adapter.claim_specialist_batch(
+        mission,
+        snapshot,
+        step_ids,
+        batch_id=batch_id,
+        provider_name="local",
+        model_name="qwen-test",
+        execution_ids=execution_ids,
+    )
+    task_ids = tuple(task_by_step[step_id] for step_id in step_ids)
+    bindings = [
+        {"task_id": task_id, "execution_id": execution_id}
+        for task_id, execution_id in zip(task_ids, execution_ids)
+    ]
+    mission.checkpoint = {
+        "status": "in_flight_specialists",
+        "batch_id": batch_id,
+        "task_ids": list(task_ids),
+        "execution_ids": list(execution_ids),
+        "task_execution_bindings": bindings,
+    }
+    specialist = mission.agent_task_graph_state["specialist_graph"]
+    specialist_graph = TaskGraph.from_dict(specialist["graph"])
+    specialist_graph.tasks[task_ids[0]].result = {
+        "record_type": "UNTRUSTED_SPECIALIST_PROPOSAL",
+        "authority": "none",
+        "proposal": {"summary": "PROPOSAL_BODY_SECRET"},
+    }
+    specialist_graph.tasks[task_ids[0]].result_validation_state = "UNTRUSTED_PROPOSAL"
+    specialist["graph"] = specialist_graph.to_dict()
+    store.save(mission)
+    mission = store.load(mission.mission_id)
+
+    response = _service_for(mission).get(
+        mission.mission_id,
+        owner_session_token="owner-session-token",
+    )
+
+    specialist_tasks = [task for task in response["graph"]["tasks"] if task["task_kind"] == "mission_specialist_analysis"]
+    specialist_agents = [agent for agent in response["graph"]["agents"] if agent["role"] == "mission_specialist_analyst"]
+    assert response["graph"]["specialist_available"] is True
+    assert response["graph"]["specialist_revision"] is not None
+    assert len(specialist_tasks) == 2
+    assert len(specialist_agents) == 2
+    assert all(task["status"] == "RUNNING" for task in specialist_tasks)
+    assert all(agent["status"] == "RUNNING" for agent in specialist_agents)
+    assert response["stage"]["current_step"]["specialist_task_status"] == "RUNNING"
+    encoded = json.dumps(response, ensure_ascii=False)
+    assert "PROPOSAL_BODY_SECRET" not in encoded
+    assert '"proposal"' not in encoded
 
 
 def test_foreign_mission_and_missing_mission_are_the_same_service_result(tmp_path):

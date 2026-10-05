@@ -321,7 +321,7 @@ class ExecutionFence:
         if not isinstance(checkpoint, Mapping):
             raise ExecutionFenceError("execution fence has no active mission checkpoint")
         status = str(checkpoint.get("status", ""))
-        if status not in {"in_flight", "in_flight_parallel"}:
+        if status not in {"in_flight", "in_flight_parallel", "in_flight_specialists"}:
             raise ExecutionFenceError("execution fence does not match an in-flight mission checkpoint")
 
         task_ids = {str(checkpoint.get("step_id", ""))}
@@ -339,6 +339,21 @@ class ExecutionFence:
             if not isinstance(values, (list, tuple, set, frozenset)):
                 raise ExecutionFenceError("active mission checkpoint identity list is invalid")
             destination.update(str(value) for value in values if value)
+        if status == "in_flight_specialists":
+            bindings = checkpoint.get("task_execution_bindings")
+            if not isinstance(bindings, (list, tuple)) or not bindings or len(bindings) > 2:
+                raise ExecutionFenceError("specialist checkpoint task/execution bindings are invalid")
+            valid_pairs = set()
+            for binding in bindings:
+                if not isinstance(binding, Mapping):
+                    raise ExecutionFenceError("specialist checkpoint task/execution binding is malformed")
+                bound_task = binding.get("task_id")
+                bound_execution = binding.get("execution_id")
+                if not isinstance(bound_task, str) or not bound_task or not isinstance(bound_execution, str) or not bound_execution:
+                    raise ExecutionFenceError("specialist checkpoint task/execution binding is incomplete")
+                valid_pairs.add((bound_task, bound_execution))
+            if (self.task_id, self.execution_id) not in valid_pairs:
+                raise ExecutionFenceError("execution fence does not match a bound specialist child")
         if self.task_id not in task_ids or self.execution_id not in execution_ids:
             raise ExecutionFenceError("execution fence does not match the active mission checkpoint")
         return self

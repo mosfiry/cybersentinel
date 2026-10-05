@@ -42,7 +42,7 @@ from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnder
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
 
-    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_registry: Any = None):
+    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_registry: Any = None, enable_specialist_agents: bool = False):
         self.router = router
         self.store = store or MissionStore(db_path or DB_PATH.with_name("missions.sqlite3"))
         self.max_iterations = max_iterations
@@ -50,11 +50,19 @@ class AgentCore:
         self.event_bus = event_bus
         self.hook_registry = hook_registry
         self.skill_registry = skill_registry
+        self.enable_specialist_agents = bool(enable_specialist_agents)
         self.task_graph_policy = task_graph_policy or AgentGraphPolicy(
             max_retries=RecoveryPolicy().max_retries,
             max_parallel_tasks=4,
             enable_task_delegation=True,
         )
+
+    def _specialist_generate(self, provider_name: str, model_name: str, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        """Use only the Mission's recorded provider/model; never route/fallback."""
+        generate = getattr(self.router, "generate_for_provider", None)
+        if not callable(generate):
+            raise CapabilityUnsupported("configured router does not support exact-provider generation")
+        return generate(provider_name, model_name, messages, **kwargs)
 
     def understand_mission_intent(self, instruction: str) -> MissionIntent:
         """Return typed semantic intent; model output remains an untrusted proposal."""
@@ -572,6 +580,7 @@ class AgentCore:
             hook_registry=self.hook_registry,
             task_graph_policy=self.task_graph_policy,
             skill_context_provider=self._resolve_mission_skill_context,
+            specialist_generate=self._specialist_generate if self.enable_specialist_agents else None,
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
@@ -804,7 +813,7 @@ class AgentCore:
                     raise SkillAuthorizationError("replanned action exceeds the selected Skill tool ceiling")
             return proposed
 
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=replan_resumed, recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry, task_graph_policy=self.task_graph_policy, skill_context_provider=self._resolve_mission_skill_context)
+        runtime = MissionRuntime(self.store, executor=self._executor, replanner=replan_resumed, recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry, task_graph_policy=self.task_graph_policy, skill_context_provider=self._resolve_mission_skill_context, specialist_generate=self._specialist_generate if self.enable_specialist_agents else None)
         return self._run_via_fenced_worker(runtime, mission_id, max_slices=max_slices or self.max_iterations)
 
 

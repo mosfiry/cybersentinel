@@ -113,6 +113,7 @@ class MissionObservabilityService:
             raise MissionObservabilityTooLarge("mission_plan_exceeds_observability_limit")
 
         graph, step_to_task = self._graph_projection(mission, owner_ref)
+        graph, specialist_step_to_task = self._merge_specialist_graph(mission, owner_ref, graph)
         evidence_refs = self._evidence_projection(mission, step_to_task)
         evidence_by_task: dict[str, list[str]] = {}
         for evidence_ref in evidence_refs:
@@ -135,6 +136,13 @@ class MissionObservabilityService:
                 "task_id": task_id,
                 "task_status": task_status,
             }
+            specialist_task_id = specialist_step_to_task.get(step_id or "")
+            if specialist_task_id:
+                current_step["specialist_task_id"] = specialist_task_id
+                current_step["specialist_task_status"] = next(
+                    (item["status"] for item in graph["tasks"] if item["task_id"] == specialist_task_id),
+                    None,
+                )
 
         timeline_slice = mission.trajectory[offset:offset + page_size]
         timeline_events = [self._trajectory_event(item, sequence=offset + index + 1) for index, item in enumerate(timeline_slice)]
@@ -172,8 +180,15 @@ class MissionObservabilityService:
             raise MissionObservabilityTooLarge("mission_observability_response_too_large")
         return result
 
-    def _graph_projection(self, mission: Mission, owner_ref: str) -> tuple[dict[str, Any], dict[str, str]]:
-        state = mission.agent_task_graph_state
+    def _graph_projection(
+        self,
+        mission: Mission,
+        owner_ref: str,
+        *,
+        state_override: dict[str, Any] | None = None,
+        expected_steps: set[str] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        state = mission.agent_task_graph_state if state_override is None else state_override
         empty = {"available": False, "reason": "not_initialized", "revision": None, "tasks": [], "agents": []}
         if state in (None, {}):
             return empty, {}
@@ -311,11 +326,15 @@ class MissionObservabilityService:
             mapping[safe_step] = safe_task
         if len(set(mapping.values())) != len(mapping):
             raise MissionObservabilityError("mission_graph_integrity_invalid")
-        expected_steps = {
+        plan_step_ids = {
             safe_id
             for safe_id in (self._safe_ref(getattr(step, "step_id", "")) for step in mission.plan.steps)
             if safe_id is not None
         }
+        if expected_steps is None:
+            expected_steps = plan_step_ids
+        elif not expected_steps.issubset(plan_step_ids):
+            raise MissionObservabilityError("mission_graph_integrity_invalid")
         if set(mapping) != expected_steps or set(mapping.values()) != set(graph.tasks):
             raise MissionObservabilityError("mission_graph_integrity_invalid")
         task_views: list[dict[str, Any]] = []
@@ -336,6 +355,7 @@ class MissionObservabilityService:
                 agent_current_tasks[safe_agent_id].append(safe_task_id)
             task_views.append({
                 "task_id": safe_task_id,
+                "task_kind": "mission_specialist_analysis" if state_override is not None else "mission_action",
                 "status": task.lifecycle.value,
                 "dependencies": dependencies,
                 "agent_id": safe_agent_id,
@@ -353,6 +373,82 @@ class MissionObservabilityService:
             "current_task_ids": sorted(agent_current_tasks[agent_id]),
         } for agent_id, agent in sorted(graph.agents.items())]
         return {"available": True, "reason": "", "revision": revision, "tasks": task_views, "agents": agent_views}, mapping
+
+    def _merge_specialist_graph(
+        self,
+        mission: Mission,
+        owner_ref: str,
+        graph: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        state = mission.agent_task_graph_state
+        raw = state.get("specialist_graph") if isinstance(state, dict) else None
+        if raw is None:
+            return {**graph, "specialist_available": False, "specialist_revision": None}, {}
+        if not isinstance(raw, dict):
+            raise MissionObservabilityError("mission_specialist_graph_integrity_invalid")
+        raw_mapping = raw.get("step_task_ids")
+        raw_graph = raw.get("graph")
+        revision = raw.get("revision")
+        plan_version = raw.get("plan_version")
+        plan_fingerprint = raw.get("plan_fingerprint")
+        authorization_hash = raw.get("authorization_hash")
+        if (
+            isinstance(raw.get("schema_version"), bool)
+            or raw.get("schema_version") != 1
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+            or isinstance(plan_version, bool)
+            or not isinstance(plan_version, int)
+            or plan_version != mission.plan.version
+            or plan_fingerprint != mission.plan.fingerprint
+            or not isinstance(authorization_hash, str)
+            or not _SHA256_HEX.fullmatch(authorization_hash)
+            or not isinstance(raw_graph, dict)
+            or raw_graph.get("authorization_hash") != authorization_hash
+            or not isinstance(raw_mapping, dict)
+            or len(raw_mapping) > self.MAX_TASKS
+        ):
+            raise MissionObservabilityError("mission_specialist_graph_integrity_invalid")
+        expected_steps: set[str] = set()
+        for step_id in raw_mapping:
+            safe_step = self._safe_ref(step_id)
+            if safe_step is None or safe_step in expected_steps:
+                raise MissionObservabilityError("mission_specialist_graph_integrity_invalid")
+            expected_steps.add(safe_step)
+        nested_state = {
+            "schema_version": raw.get("schema_version"),
+            "plan_fingerprint": plan_fingerprint,
+            "plan_version": plan_version,
+            "revision": revision,
+            "step_task_ids": raw_mapping,
+            "graph": raw_graph,
+        }
+        specialist_projection, specialist_mapping = self._graph_projection(
+            mission,
+            owner_ref,
+            state_override=nested_state,
+            expected_steps=expected_steps,
+        )
+        if not specialist_projection.get("available"):
+            raise MissionObservabilityError("mission_specialist_graph_integrity_invalid")
+        if (
+            len(graph["tasks"]) + len(specialist_projection["tasks"]) > self.MAX_TASKS
+            or len(graph["agents"]) + len(specialist_projection["agents"]) > self.MAX_AGENTS
+        ):
+            raise MissionObservabilityTooLarge("mission_graph_exceeds_observability_limit")
+        task_ids = [item["task_id"] for item in graph["tasks"] + specialist_projection["tasks"]]
+        agent_ids = [item["agent_id"] for item in graph["agents"] + specialist_projection["agents"]]
+        if len(task_ids) != len(set(task_ids)) or len(agent_ids) != len(set(agent_ids)):
+            raise MissionObservabilityError("mission_specialist_graph_integrity_invalid")
+        merged = {
+            **graph,
+            "tasks": sorted(graph["tasks"] + specialist_projection["tasks"], key=lambda item: item["task_id"]),
+            "agents": sorted(graph["agents"] + specialist_projection["agents"], key=lambda item: item["agent_id"]),
+            "specialist_available": True,
+            "specialist_revision": revision,
+        }
+        return merged, specialist_mapping
 
     def _evidence_projection(self, mission: Mission, step_to_task: dict[str, str]) -> list[dict[str, Any]]:
         raw = mission.progress.get("execution_evidence_refs", [])

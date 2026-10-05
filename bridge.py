@@ -147,6 +147,7 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
         db_path=DB_PATH.with_name("missions.sqlite3"),
         skill_registry=skills,
         event_bus=_mission_event_bus(),
+        enable_specialist_agents=True,
     )
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
     scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
@@ -160,6 +161,7 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
             event_bus=core.event_bus,
             task_graph_policy=core.task_graph_policy,
             skill_context_provider=core._resolve_mission_skill_context,
+            specialist_generate=core._specialist_generate,
         )
 
     return MissionWorker(queue, runtime_factory, worker_id=worker_id, scheduler=scheduler)
@@ -227,6 +229,7 @@ class Handler(BaseHTTPRequestHandler):
             db_path=DB_PATH.with_name("missions.sqlite3"),
             skill_registry=_skill_registry(),
             event_bus=_mission_event_bus(),
+            enable_specialist_agents=True,
         )
         runtime = MissionRuntime(
             core.store,
@@ -236,6 +239,7 @@ class Handler(BaseHTTPRequestHandler):
             event_bus=core.event_bus,
             task_graph_policy=core.task_graph_policy,
             skill_context_provider=core._resolve_mission_skill_context,
+            specialist_generate=core._specialist_generate,
         )
         queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
         scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
