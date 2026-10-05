@@ -144,6 +144,11 @@ def test_frontend_contains_no_browser_secret_prompt_or_storage():
     assert "X-CSRF-Token" in source
     assert "evidence_reference" in source
     assert "OWNER_CONFIRM_APPLIED" in source
+    assert 'id="skillsLink"' in Path("web/index.html").read_text(encoding="utf-8")
+    assert 'id="missionSkill"' in Path("web/index.html").read_text(encoding="utf-8")
+    skills_ui = source[source.index("async function skillsPanel()"):source.index("async function settingsPanel()")]
+    assert ".innerHTML" not in skills_ui
+    assert "textContent" in skills_ui
 
 
 def test_http_public_boundary_sets_cookie_and_requires_owner_and_csrf(public_server):
@@ -252,8 +257,9 @@ def test_public_mission_create_uses_server_project_scope_and_queues_owner_missio
             captured["project_assignment"] = (owner_id, mission_id, selected_id)
 
     class FakeCore:
-        def __init__(self, router, *, db_path):
+        def __init__(self, router, *, db_path, skill_registry):
             captured["db_path"] = db_path
+            captured["skill_registry"] = skill_registry
 
         def run_owner_mission(self, objective, **kwargs):
             captured["objective"] = objective
@@ -277,6 +283,8 @@ def test_public_mission_create_uses_server_project_scope_and_queues_owner_missio
     monkeypatch.setattr(bridge, "AgentCore", FakeCore)
     monkeypatch.setattr(bridge.Handler, "_mission_service", lambda self: FakeService())
     monkeypatch.setattr(bridge, "_project_store", lambda: FakeProjects())
+    registry_sentinel = object()
+    monkeypatch.setattr(bridge, "_skill_registry", lambda: registry_sentinel)
     status, payload, _headers = _request(
         public_server,
         "POST",
@@ -284,6 +292,7 @@ def test_public_mission_create_uses_server_project_scope_and_queues_owner_missio
         body={
             "objective": "Review the service",
             "project_id": project_id,
+            "skill_id": "approved-guide",
             "scope_context": {"workspace_root": "/", "allowed_networks": ["*"]},
         },
         headers={"Cookie": cookie, "X-CSRF-Token": csrf},
@@ -295,8 +304,148 @@ def test_public_mission_create_uses_server_project_scope_and_queues_owner_missio
     assert captured["scope_context"]["workspace_root"] == str(project_root.resolve())
     assert captured["scope_context"]["target_id"] == f"local-project:{project_id}"
     assert captured["scope_context"]["allowed_networks"] == []
+    assert captured["skill_registry"] is registry_sentinel
+    assert captured["skill_id"] == "approved-guide"
     assert captured["project_assignment"] == (7, "mission-abc", project_id)
     assert "authorization_snapshot" not in payload["mission"]
+
+
+def test_public_skill_routes_require_owner_and_csrf_and_forward_narrow_requests(public_server, monkeypatch):
+    public_cookie, csrf, _ = _public_session(public_server)
+    status, payload, _headers = _request(
+        public_server,
+        "GET",
+        "/api/public/skills",
+        headers={"Cookie": public_cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 403
+    assert payload["error"] == "owner_authorization_required"
+
+    cookie, owner_csrf = _owner_session(public_server)
+    captured = []
+    sample = {
+        "skill_id": "owner-guide",
+        "name": "Owner guide",
+        "version": 1,
+        "status": "candidate",
+        "active": False,
+        "content_hash": "a" * 64,
+        "execution_mode": "untrusted_guidance_only",
+    }
+
+    class FakeSkills:
+        def list_revisions(self, owner_session_token):
+            assert owner_session_token == OWNER_TOKEN
+            return [sample]
+
+        def detail(self, owner_session_token, skill_id, version):
+            assert owner_session_token == OWNER_TOKEN
+            if skill_id != "owner-guide" or version != 1:
+                raise KeyError("unknown_skill_revision")
+            return sample
+
+        def submit_candidate(self, owner_session_token, mission_id, definition):
+            assert owner_session_token == OWNER_TOKEN
+            captured.append(("candidate", mission_id, definition))
+            return sample
+
+        def approve(self, owner_session_token, skill_id, version, content_hash):
+            captured.append(("approve", owner_session_token, skill_id, version, content_hash))
+            return {**sample, "status": "approved", "active": True}
+
+        def revoke(self, owner_session_token, skill_id, version, content_hash):
+            captured.append(("revoke", owner_session_token, skill_id, version, content_hash))
+            return {**sample, "status": "revoked", "active": False}
+
+    monkeypatch.setattr(bridge.Handler, "_skill_service", lambda self: FakeSkills())
+    status, payload, _headers = _request(
+        public_server,
+        "GET",
+        "/api/public/skills",
+        headers={"Cookie": cookie},
+    )
+    assert status == 401
+
+    status, payload, _headers = _request(
+        public_server,
+        "GET",
+        "/api/public/skills",
+        headers={"Cookie": cookie, "X-CSRF-Token": "incorrect-token"},
+    )
+    assert status == 401
+
+    status, payload, _headers = _request(
+        public_server,
+        "GET",
+        "/api/public/skills",
+        headers={"Cookie": cookie, "X-CSRF-Token": owner_csrf},
+    )
+    assert status == 200
+    assert payload["skills"][0]["skill_id"] == "owner-guide"
+
+    status, payload, _headers = _request(
+        public_server,
+        "GET",
+        "/api/public/skills/owner-guide/1",
+        headers={"Cookie": cookie, "X-CSRF-Token": owner_csrf},
+    )
+    assert status == 200
+    assert payload["skill"]["content_hash"] == "a" * 64
+
+    status, _payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/candidates",
+        body={"mission_id": "mission-owned", "definition": {"skill_id": "owner-guide"}},
+        headers={"Cookie": cookie},
+    )
+    assert status == 401
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/candidates",
+        body={
+            "mission_id": "mission-owned",
+            "definition": {"skill_id": "owner-guide"},
+            "evidence": {"verified": True},
+        },
+        headers={"Cookie": cookie, "X-CSRF-Token": owner_csrf},
+    )
+    assert status == 400
+    assert payload["error"] == "invalid_skill_candidate_request"
+    assert captured == []
+
+    status, payload, _headers = _request(
+        public_server,
+        "POST",
+        "/api/public/skills/candidates",
+        body={"mission_id": "mission-owned", "definition": {"skill_id": "owner-guide"}},
+        headers={"Cookie": cookie, "X-CSRF-Token": owner_csrf},
+    )
+    assert status == 201
+    assert captured[0] == ("candidate", "mission-owned", {"skill_id": "owner-guide"})
+
+    for action, expected in (("approve", "approved"), ("revoke", "revoked")):
+        status, payload, _headers = _request(
+            public_server,
+            "POST",
+            f"/api/public/skills/owner-guide/1/{action}",
+            body={"content_hash": "a" * 64},
+            headers={"Cookie": cookie, "X-CSRF-Token": owner_csrf},
+        )
+        assert status == 200
+        assert payload["skill"]["status"] == expected
+    assert [item[0] for item in captured] == ["candidate", "approve", "revoke"]
+
+    status, payload, _headers = _request(
+        public_server,
+        "GET",
+        "/api/public/skills/foreign-owner-skill/1",
+        headers={"Cookie": cookie, "X-CSRF-Token": owner_csrf},
+    )
+    assert status == 404
+    assert payload["error"] == "unknown_skill_revision"
 
 
 def test_public_mission_read_rejects_legacy_unbound_mission(public_server, monkeypatch):

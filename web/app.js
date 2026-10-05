@@ -21,6 +21,11 @@ const state = {
   ownerUsername: "",
   conversationId: "",
   missions: [],
+  skills: [],
+  skillsLoaded: false,
+  skillsError: "",
+  selectedSkillDetail: null,
+  activeInfoPanel: "",
   selectedMissionId: "",
   selectedMission: null,
   projects: [],
@@ -33,6 +38,48 @@ const state = {
   filePath: ".",
   activeView: "overview",
 };
+
+function renderMissionSkillOptions() {
+  const selector = document.querySelector("#missionSkill");
+  if (!selector) return;
+  const previous = selector.value;
+  selector.replaceChildren();
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "بدون مهارة";
+  selector.appendChild(none);
+  const approved = state.skills.filter((skill) => skill && skill.status === "approved" && skill.active === true);
+  approved.forEach((skill) => {
+    const option = document.createElement("option");
+    option.value = String(skill.skill_id || "");
+    option.textContent = `${skill.name || skill.skill_id} · v${skill.version} · ${String(skill.content_hash || "").slice(0, 12)}`;
+    selector.appendChild(option);
+  });
+  if (approved.some((skill) => skill.skill_id === previous)) selector.value = previous;
+  selector.disabled = !state.ownerAuthenticated || !approved.length;
+}
+
+async function loadSkills() {
+  if (!state.ownerAuthenticated) {
+    state.skills = [];
+    state.skillsLoaded = false;
+    state.skillsError = "owner_authorization_required";
+    renderMissionSkillOptions();
+    return;
+  }
+  try {
+    const data = await api("/api/public/skills");
+    state.skills = Array.isArray(data.skills) ? data.skills : [];
+    state.skillsLoaded = true;
+    state.skillsError = "";
+  } catch (error) {
+    state.skills = [];
+    state.skillsLoaded = false;
+    state.skillsError = errorText(error);
+  }
+  renderMissionSkillOptions();
+  if (state.activeInfoPanel === "skills") renderSkillsPanel();
+}
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => document.querySelectorAll(selector);
@@ -153,6 +200,7 @@ async function status() {
     if (window.cybersentinelDesktop?.isDesktop) {
       try { await refreshDesktopSetup(); } catch (error) { setModelNotice(errorText(error), "error"); }
     }
+    if (state.ownerAuthenticated && !state.skillsLoaded) await loadSkills();
     if (state.ownerAuthenticated && !state.projectsLoaded) await loadProjects();
   } catch (error) {
     const runtime = $("#runtimeState");
@@ -170,6 +218,7 @@ function updateAuthUI(data) {
   }
   state.ownerAuthenticated = nextAuthenticated;
   state.ownerUsername = nextUsername;
+  renderMissionSkillOptions();
   const label = state.ownerAuthenticated
     ? `مسجل الدخول: ${state.ownerUsername || "المالك"}`
     : "غير مسجل الدخول";
@@ -186,6 +235,11 @@ function resetWorkspaceState() {
   state.selectedMission = null;
   state.missionViews = { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null };
   state.missions = [];
+  state.skills = [];
+  state.skillsLoaded = false;
+  state.skillsError = "";
+  state.selectedSkillDetail = null;
+  state.activeInfoPanel = "";
   state.projects = [];
   state.projectsLoaded = false;
   state.activeProjectId = "";
@@ -198,6 +252,7 @@ function resetWorkspaceState() {
   state.activeView = "overview";
   updateSideLinks();
   renderProjects();
+  renderMissionSkillOptions();
 }
 
 function setModelNotice(message, kind = "") {
@@ -1249,6 +1304,7 @@ async function readGit(operation) {
 
 function showInfoPanel(nodes) {
   showView("info");
+  state.activeInfoPanel = "";
   const panel = $("#infoPanel");
   panel.replaceChildren();
   (Array.isArray(nodes) ? nodes : [nodes]).forEach((node) => panel.appendChild(node));
@@ -1262,6 +1318,204 @@ function toolsPanel() {
   note.className = "muted";
   note.textContent = "عقد مفقود: لا يوجد مسار عام لعرض الأدوات المتاحة لحساب المالك. عُرضت حالة عدم توفر صادقة بدل بيانات ملفقة.";
   showInfoPanel([box, note]);
+}
+
+async function skillsPanel() {
+  const panel = document.createElement("div");
+  panel.id = "skillsPanel";
+  panel.className = "settings-layout";
+  showInfoPanel(panel);
+  state.activeInfoPanel = "skills";
+  if (state.ownerAuthenticated && !state.missions.length) await loadMissions();
+  await loadSkills();
+  renderSkillsPanel();
+}
+
+function renderSkillsPanel() {
+  const panel = document.querySelector("#skillsPanel");
+  if (!panel || state.activeInfoPanel !== "skills") return;
+  panel.replaceChildren();
+  const title = document.createElement("h1");
+  title.textContent = "المهارات";
+  const notice = document.createElement("p");
+  notice.className = "notice warn";
+  notice.textContent = "المهارات بيانات وإرشادات غير موثوقة فقط؛ لا تُنفّذ إجراءاتها. التفويض والنطاق وTarget Identity وسياسة الأدوات والتنفيذ والأدلة تظل حاكمة. الاختيار لكل مهمة صريح.";
+  panel.append(title, notice);
+  if (!state.ownerAuthenticated) {
+    const login = document.createElement("p");
+    login.textContent = "سجّل الدخول بحساب المالك لإدارة المهارات.";
+    panel.appendChild(login);
+    return;
+  }
+  if (state.skillsError) {
+    const error = document.createElement("p");
+    error.className = "notice error";
+    error.textContent = state.skillsError;
+    panel.appendChild(error);
+  }
+  const heading = document.createElement("h2");
+  heading.textContent = "إصدارات هذا المالك";
+  panel.appendChild(heading);
+  if (!state.skills.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "لا توجد إصدارات مهارات مسجلة.";
+    panel.appendChild(empty);
+  }
+  state.skills.forEach((skill) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "mission-item";
+    item.textContent = `${skill.name || skill.skill_id} · v${skill.version} · ${skill.status}${skill.active ? " · نشطة" : ""}`;
+    item.addEventListener("click", () => loadSkillDetail(skill.skill_id, skill.version));
+    panel.appendChild(item);
+  });
+  if (state.selectedSkillDetail) renderSkillDetail(panel, state.selectedSkillDetail);
+  renderSkillCandidateForm(panel);
+}
+
+async function loadSkillDetail(skillId, version) {
+  try {
+    const path = `/api/public/skills/${encodeURIComponent(skillId)}/${encodeURIComponent(version)}`;
+    const data = await api(path);
+    state.selectedSkillDetail = data.skill || null;
+    state.skillsError = "";
+    renderSkillsPanel();
+  } catch (error) {
+    state.skillsError = errorText(error);
+    renderSkillsPanel();
+  }
+}
+
+function renderSkillDetail(panel, skill) {
+  const detail = document.createElement("article");
+  detail.className = "result";
+  const title = document.createElement("h2");
+  title.textContent = `${skill.name || skill.skill_id} · v${skill.version}`;
+  const status = document.createElement("p");
+  status.textContent = `الحالة: ${skill.status}${skill.active ? " · فعالة للاختيار الصريح" : ""} · الاستخدام: ${skill.execution_mode || "غير معروف"}`;
+  const description = document.createElement("p");
+  description.textContent = skill.description || "لا يوجد وصف.";
+  const constraints = document.createElement("pre");
+  constraints.className = "result json-view";
+  constraints.textContent = JSON.stringify({
+    content_hash: skill.content_hash,
+    expires_at: skill.expires_at,
+    required_tools: skill.required_tools,
+    allowed_scope: skill.allowed_scope,
+    capabilities: skill.capabilities,
+    preconditions: skill.preconditions,
+    postconditions: skill.postconditions,
+    procedure_metadata_only: skill.procedure,
+    source_mission_id: skill.source_mission_id,
+  }, null, 2);
+  const warning = document.createElement("p");
+  warning.className = "muted";
+  warning.textContent = "محتوى الإجراء غير تنفيذي؛ المعلمات والثوابت والأمثلة لا تُعرض ولا تُشغّل.";
+  detail.append(title, status, description, constraints, warning);
+  const actions = document.createElement("div");
+  actions.className = "action-row";
+  const approveAction = skill.status === "candidate" ? "approve" : null;
+  const revokeAction = skill.status === "approved" ? "revoke" : null;
+  const action = approveAction || revokeAction;
+  if (action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action === "approve" ? "موافقة المالك على هذا الإصدار" : "إلغاء الموافقة";
+    if (action === "revoke") button.className = "danger";
+    button.addEventListener("click", async () => {
+      const digest = String(skill.content_hash || "");
+      const descriptionText = action === "approve"
+        ? `الموافقة على ${skill.skill_id} v${skill.version} ذات SHA-256 ${digest}؟ لن تُنفّذ إجراءاتها، ولا يمكن اختيارها إلا لمهمة صريحة ضمن التفويض.`
+        : `إلغاء الموافقة على ${skill.skill_id} v${skill.version} ذات SHA-256 ${digest}؟ ستُمنع الاستخدامات الجديدة.`;
+      if (!window.confirm(descriptionText)) return;
+      try {
+        await api(`/api/public/skills/${encodeURIComponent(skill.skill_id)}/${encodeURIComponent(skill.version)}/${action}`, {
+          method: "POST", body: JSON.stringify({ content_hash: digest }),
+        });
+        state.selectedSkillDetail = null;
+        state.skillsError = "";
+        await loadSkills();
+      } catch (error) {
+        state.skillsError = errorText(error);
+        renderSkillsPanel();
+      }
+    });
+    actions.appendChild(button);
+  }
+  detail.appendChild(actions);
+  panel.appendChild(detail);
+}
+
+function renderSkillCandidateForm(panel) {
+  const heading = document.createElement("h2");
+  heading.textContent = "إرسال مرشح من مهمة مكتملة ومتحققة";
+  const note = document.createElement("p");
+  note.className = "muted";
+  note.textContent = "المراجع والأدلة تُشتق على الخادم من السجل المُسيّج؛ لا تقبل الواجهة ادعاءات أدلة من العميل. المرشح غير قابل للتحرير بعد التسجيل ولا يُعتمد تلقائيًا.";
+  const form = document.createElement("form");
+  form.className = "project-form";
+  const missions = state.missions.filter((item) => item.status === "GOAL_COMPLETED" && item.verification_state?.verified === true);
+  const missionLabel = document.createElement("label");
+  missionLabel.textContent = "المهمة المصدر";
+  const missionSelect = document.createElement("select");
+  missionSelect.required = true;
+  missions.forEach((mission) => {
+    const option = document.createElement("option");
+    option.value = String(mission.mission_id || "");
+    option.textContent = `${mission.objective || mission.mission_id} · ${mission.mission_id}`;
+    missionSelect.appendChild(option);
+  });
+  if (!missions.length) {
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "لا توجد مهمة مكتملة ومتحققة محمّلة";
+    missionSelect.appendChild(empty);
+  }
+  const definitionLabel = document.createElement("label");
+  definitionLabel.textContent = "تعريف Skill declarative بصيغة JSON (حد 24,000 محرف؛ بلا أسرار)";
+  const definitionInput = document.createElement("textarea");
+  definitionInput.rows = 14;
+  definitionInput.maxLength = 24000;
+  definitionInput.required = true;
+  definitionInput.autocomplete = "off";
+  definitionInput.spellcheck = false;
+  definitionInput.placeholder = "الصق تعريف Skill كاملًا: المعرّف والوصف والإصدار والأدوات والنطاق والمخططات والخطوات والشروط والاختبارات. الإجراء لن يُنفّذ.";
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "إرسال للمراجعة";
+  submit.disabled = !missions.length;
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    let definition;
+    try {
+      definition = JSON.parse(definitionInput.value);
+      if (!definition || typeof definition !== "object" || Array.isArray(definition)) throw new Error("expected_json_object");
+    } catch (error) {
+      state.skillsError = `JSON غير صالح: ${String(error.message || error)}`;
+      renderSkillsPanel();
+      return;
+    }
+    submit.disabled = true;
+    try {
+      const data = await api("/api/public/skills/candidates", {
+        method: "POST",
+        body: JSON.stringify({ mission_id: missionSelect.value, definition }),
+      });
+      state.selectedSkillDetail = data.skill || null;
+      state.skillsError = "";
+      await loadSkills();
+    } catch (error) {
+      state.skillsError = errorText(error);
+      renderSkillsPanel();
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  missionLabel.appendChild(missionSelect);
+  definitionLabel.appendChild(definitionInput);
+  form.append(missionLabel, definitionLabel, submit);
+  panel.append(heading, note, form);
 }
 
 async function settingsPanel() {
@@ -1323,6 +1577,7 @@ async function settingsPanel() {
 
 function showView(view) {
   state.activeView = view;
+  if (view !== "info") state.activeInfoPanel = "";
   $$("#missionTabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === view));
   const isConversation = view === "conversation";
   const isInfo = view === "info";
@@ -1359,6 +1614,7 @@ $("#activityToggle").onclick = () => {
   $("#activityToggle").setAttribute("aria-expanded", String(open));
 };
 $("#toolsLink").onclick = toolsPanel;
+$("#skillsLink").onclick = skillsPanel;
 $("#settingsLink").onclick = settingsPanel;
 $("#refreshMissions")?.addEventListener("click", loadMissions);
 
@@ -1372,9 +1628,14 @@ $("#missionForm").onsubmit = async (event) => {
   try {
     const data = await api("/api/public/missions", {
       method: "POST",
-      body: JSON.stringify({ objective: $("#missionObjective").value.trim(), project_id: state.activeProjectId }),
+      body: JSON.stringify({
+        objective: $("#missionObjective").value.trim(),
+        project_id: state.activeProjectId,
+        ...($("#missionSkill").value ? { skill_id: $("#missionSkill").value } : {}),
+      }),
     });
     $("#missionObjective").value = "";
+    $("#missionSkill").value = "";
     state.selectedMissionId = data.mission_id || data.mission?.mission_id || "";
     setNotice(`أُنشئت المهمة من الخادم. الحالة الحالية: ${data.mission?.status || "غير متاحة"} · ${data.queue?.state || "حالة الطابور غير متاحة"}`, "ok");
     pushActivity(`أُنشئت مهمة: ${state.selectedMissionId || "معرّف غير متاح"}`, "ok");

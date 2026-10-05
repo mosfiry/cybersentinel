@@ -100,6 +100,18 @@ def test_lifecycle_transitions_are_deterministic_and_terminal_states_cannot_rest
         task.transition(TaskLifecycle.RUNNING)
 
 
+def test_root_scope_canonicalizes_redundant_owner_grants():
+    snapshot = authorization(
+        allowed_tools=("status", "status", "search"),
+        allowed_actions=("read", "read"),
+        scope=("host:example.test", "host:example.test"),
+    )
+    root_scope = DelegationScope.from_snapshot(snapshot)
+    assert root_scope.allowed_tools == ("status", "search")
+    assert root_scope.allowed_actions == ("read",)
+    assert root_scope.scope == ("host:example.test",)
+
+
 def test_child_scope_is_explicitly_narrowed_and_bound_to_parent():
     snapshot = authorization(workspace_root="/tmp/cs-workspace")
     parent = DelegationScope.from_snapshot(snapshot)

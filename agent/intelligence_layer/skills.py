@@ -1047,6 +1047,23 @@ class SkillRegistry:
             versions = conn.execute("SELECT version FROM skill_revisions WHERE owner_identity_ref=? AND skill_id=? ORDER BY version", (owner_identity_ref, skill_id)).fetchall()
             return [self._load_revision(conn, owner_identity_ref, skill_id, int(row[0])) for row in versions]
 
+    def list_owner_revisions(self, owner_identity_ref: str, *, limit: int = 200) -> list[SkillRevision]:
+        """List a bounded set of revisions for exactly one canonical Owner."""
+        owner_ref = str(owner_identity_ref).strip()
+        if not owner_ref:
+            return []
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("skill revision list limit must be between 1 and 500")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT skill_id,version FROM skill_revisions WHERE owner_identity_ref=? ORDER BY created_at DESC,skill_id,version DESC LIMIT ?",
+                (owner_ref, limit),
+            ).fetchall()
+            return [
+                self._load_revision(conn, owner_ref, str(row[0]), int(row[1]))
+                for row in rows
+            ]
+
     def events(self, owner_identity_ref: str, skill_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM skill_events WHERE owner_identity_ref=? AND skill_id=? ORDER BY rowid", (owner_identity_ref, skill_id)).fetchall()

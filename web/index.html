@@ -72,6 +72,11 @@
         <form id="missionForm">
           <label for="missionProject">المشروع</label>
           <select id="missionProject" required></select>
+          <label for="missionSkill">مهارة معتمدة (اختياري)</label>
+          <select id="missionSkill">
+            <option value="">بدون مهارة</option>
+          </select>
+          <small>الاختيار اختياري وصريح لكل مهمة؛ المهارة تضيف إرشادًا غير موثوق ولا تنفّذ إجراءاتها.</small>
           <label for="missionObjective">ماذا تريد أن تنجز؟</label>
           <textarea id="missionObjective" rows="3" maxlength="12000" required placeholder="صف هدف المهمة بلغة طبيعية…"></textarea>
           <button id="createMission" type="submit">إنشاء المهمة</button>
@@ -102,6 +107,7 @@
         <h2>الأدوات والإعدادات</h2>
         <div class="side-links">
           <button type="button" id="toolsLink">الأدوات</button>
+          <button type="button" id="skillsLink">المهارات</button>
           <button type="button" id="settingsLink">النماذج والإعدادات</button>
         </div>
       </nav>

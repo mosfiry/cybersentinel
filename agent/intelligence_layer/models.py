@@ -120,6 +120,7 @@ class DelegationScope:
         snapshot: MissionAuthorizationSnapshot,
         *,
         owner_identity_ref: str | None = None,
+        authorization_version: int = 1,
         at: str | None = None,
     ) -> "DelegationScope":
         if not isinstance(snapshot, MissionAuthorizationSnapshot):
@@ -131,6 +132,7 @@ class DelegationScope:
             mission_id=snapshot.mission_id,
             owner_identity=snapshot.owner_identity,
             target_identity=snapshot.target_identity,
+            version=authorization_version,
             at=at,
         )
         if not valid:
@@ -141,11 +143,15 @@ class DelegationScope:
             target_identity=snapshot.target_identity,
             root_authorization_hash=snapshot.authorization_hash,
             parent_grant_hash=snapshot.authorization_hash,
-            scope=tuple(snapshot.scope),
-            allowed_tools=tuple(snapshot.allowed_tools),
-            allowed_actions=tuple(snapshot.allowed_actions),
-            allowed_networks=tuple(snapshot.network_boundary.get("allowed", ())),
-            allowed_credentials=tuple(snapshot.credential_boundary.get("allowed", ())),
+            # Owner snapshots are set-valued grants, but legacy fixtures and
+            # persisted authorization records may contain redundant entries.
+            # Stable de-duplication cannot widen a grant and keeps the derived
+            # scope canonical; child scopes continue to reject duplicates.
+            scope=tuple(dict.fromkeys(snapshot.scope)),
+            allowed_tools=tuple(dict.fromkeys(snapshot.allowed_tools)),
+            allowed_actions=tuple(dict.fromkeys(snapshot.allowed_actions)),
+            allowed_networks=tuple(dict.fromkeys(snapshot.network_boundary.get("allowed", ()))),
+            allowed_credentials=tuple(dict.fromkeys(snapshot.credential_boundary.get("allowed", ()))),
             workspace_root=str(snapshot.workspace_boundary.get("root", "") or ""),
         )
 
@@ -252,13 +258,20 @@ class DelegationScope:
             return False
         return True
 
-    def validate_current(self, snapshot: MissionAuthorizationSnapshot, *, at: str | None = None) -> None:
+    def validate_current(
+        self,
+        snapshot: MissionAuthorizationSnapshot,
+        *,
+        authorization_version: int = 1,
+        at: str | None = None,
+    ) -> None:
         if not isinstance(snapshot, MissionAuthorizationSnapshot):
             raise TypeError("current Owner authorization snapshot is required")
         valid, reason = snapshot.validate_for_mission(
             mission_id=self.mission_id,
             owner_identity=self.owner_identity_ref,
             target_identity=self.target_identity,
+            version=authorization_version,
             at=at,
         )
         if not valid or snapshot.authorization_hash != self.root_authorization_hash:

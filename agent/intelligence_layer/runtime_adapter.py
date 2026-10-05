@@ -37,11 +37,25 @@ class MissionTaskGraphAdapter:
         suffix = hashlib.sha256(step_id.encode("utf-8")).hexdigest()[:16]
         return f"{index:04d}:{suffix}"
 
-    def _build(self, mission: Any, snapshot: MissionAuthorizationSnapshot) -> tuple[TaskGraph, dict[str, str]]:
+    @staticmethod
+    def _expected_authorization_version(mission: Any) -> int:
+        provenance = getattr(mission, "provenance", {})
+        value = provenance.get("authorization_snapshot_version", 1) if isinstance(provenance, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise MissionTaskGraphError("mission authorization version is invalid")
+        return value
+
+    def _build(
+        self,
+        mission: Any,
+        snapshot: MissionAuthorizationSnapshot,
+        authorization_version: int,
+    ) -> tuple[TaskGraph, dict[str, str]]:
         graph = TaskGraph.create(
             snapshot,
             owner_identity_ref=mission.owner_identity_ref,
             policy=self.policy,
+            authorization_version=authorization_version,
         )
         agent_id = "mission-coordinator-" + hashlib.sha256(mission.mission_id.encode("utf-8")).hexdigest()[:20]
         root = AgentRecord.create(
@@ -49,7 +63,7 @@ class MissionTaskGraphAdapter:
             owner_identity_ref=mission.owner_identity_ref,
             role="mission_runtime_coordinator",
             capabilities=("canonical_tool_dispatch", "plan_step_scheduling"),
-            permission_scope=graph.root_scope(snapshot),
+            permission_scope=graph.root_scope(snapshot, authorization_version=authorization_version),
             agent_id=agent_id,
         )
         graph.add_agent(root)
@@ -226,7 +240,15 @@ class MissionTaskGraphAdapter:
         if agent.parent_agent_id is not None and agent.lifecycle in {AgentLifecycle.READY, AgentLifecycle.RUNNING}:
             agent.transition(AgentLifecycle.COMPLETED)
 
-    def _restore_completed_prefix(self, mission: Any, graph: TaskGraph, mapping: dict[str, str], *, from_index: int = 0) -> None:
+    def _restore_completed_prefix(
+        self,
+        mission: Any,
+        graph: TaskGraph,
+        mapping: dict[str, str],
+        *,
+        authorization_version: int,
+        from_index: int = 0,
+    ) -> None:
         completed_indices = set(range(min(max(int(mission.current_step), 0), len(mission.plan.steps))))
         if mission.current_step < len(mission.plan.steps):
             current = mission.plan.steps[mission.current_step]
@@ -248,7 +270,11 @@ class MissionTaskGraphAdapter:
             graph.refresh_ready_tasks()
             if task_id not in graph.ready_task_ids():
                 raise MissionTaskGraphError("mission cursor conflicts with task-graph dependencies")
-            graph.claim_task(task_id, MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {})))
+            graph.claim_task(
+                task_id,
+                MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {})),
+                authorization_version=authorization_version,
+            )
             action_record = self._action_record(mission, step.step_id)
             result = action_record.get("observation", {}) if action_record else {"recovered_from_mission_cursor": True}
             action_id = str(action_record.get("action_id", "")) if action_record else ""
@@ -290,6 +316,7 @@ class MissionTaskGraphAdapter:
         graph: TaskGraph,
         mapping: dict[str, str],
         snapshot: MissionAuthorizationSnapshot,
+        authorization_version: int,
     ) -> None:
         reverse_old = {step: task_id for step, task_id in old_mapping.items()}
         for index, step in enumerate(mission.plan.steps):
@@ -308,7 +335,7 @@ class MissionTaskGraphAdapter:
             if current.task_id not in graph.ready_task_ids():
                 raise MissionTaskGraphError("persisted graph outcome conflicts with current dependencies")
             current.attempt_count = max(0, previous.attempt_count - 1)
-            graph.claim_task(current.task_id, snapshot)
+            graph.claim_task(current.task_id, snapshot, authorization_version=authorization_version)
             if previous.lifecycle is TaskLifecycle.COMPLETED:
                 graph.complete_task(current.task_id, previous.result, evidence_refs=previous.evidence_refs, artifacts=previous.artifacts)
             else:
@@ -324,28 +351,50 @@ class MissionTaskGraphAdapter:
         try:
             if not mission.owner_identity_ref or mission.owner_identity_ref != snapshot.owner_identity:
                 raise MissionTaskGraphError("mission Owner identity does not match current authorization")
+            authorization_version = self._expected_authorization_version(mission)
+            valid, reason = snapshot.validate_for_mission(
+                mission_id=mission.mission_id,
+                owner_identity=mission.owner_identity_ref,
+                target_identity=snapshot.target_identity,
+                version=authorization_version,
+            )
+            if not valid:
+                raise MissionTaskGraphError(reason)
             prior = self._decode(mission)
             fingerprint = mission.plan.fingerprint
             if prior is not None:
                 old_graph, old_mapping, old_fingerprint, old_revision, old_plan_version = prior
                 if old_fingerprint == fingerprint and old_graph.authorization_hash == snapshot.authorization_hash and old_graph.policy == self.policy:
-                    old_graph.validate_current_authorization(snapshot)
+                    old_graph.validate_current_authorization(snapshot, authorization_version=authorization_version)
                     before = old_graph.to_dict()
                     self._reconcile_running(mission, old_graph, old_mapping)
-                    self._restore_completed_prefix(mission, old_graph, old_mapping)
+                    self._restore_completed_prefix(
+                        mission,
+                        old_graph,
+                        old_mapping,
+                        authorization_version=authorization_version,
+                    )
                     self._all_tasks_completed(old_graph)
                     if old_graph.to_dict() != before:
                         self._store(mission, old_graph, old_mapping, fingerprint, old_revision)
                     return old_graph
 
-            graph, mapping = self._build(mission, snapshot)
+            graph, mapping = self._build(mission, snapshot, authorization_version)
             revision = prior[3] if prior is not None else 0
             same_plan = prior is not None and prior[2] == fingerprint
             if same_plan:
                 old_graph, old_mapping, _old_fp, _old_revision, _old_plan_version = prior
                 old_graph.validate()
                 self._reconcile_running(mission, old_graph, old_mapping)
-                self._restore_prior_states(mission, old_graph, old_mapping, graph, mapping, snapshot)
+                self._restore_prior_states(
+                    mission,
+                    old_graph,
+                    old_mapping,
+                    graph,
+                    mapping,
+                    snapshot,
+                    authorization_version,
+                )
             else:
                 if prior is not None and any(item.lifecycle is TaskLifecycle.RUNNING for item in prior[0].tasks.values()):
                     checkpoint = mission.checkpoint if isinstance(mission.checkpoint, dict) else {}
@@ -356,7 +405,12 @@ class MissionTaskGraphAdapter:
                     )
                     if not authorized_no_effect:
                         raise MissionTaskGraphError("plan changed while a graph task remained in flight")
-                self._restore_completed_prefix(mission, graph, mapping)
+                self._restore_completed_prefix(
+                    mission,
+                    graph,
+                    mapping,
+                    authorization_version=authorization_version,
+                )
             self._all_tasks_completed(graph)
             self._store(mission, graph, mapping, fingerprint, revision)
             return graph
@@ -380,7 +434,10 @@ class MissionTaskGraphAdapter:
             agent = graph.agents[task.assigned_agent_id]
             if agent.parent_task_id != task_id or agent.role != "mission_plan_step_executor":
                 continue
-            agent.permission_scope.validate_current(snapshot)
+            agent.permission_scope.validate_current(
+                snapshot,
+                authorization_version=self._expected_authorization_version(mission),
+            )
             entries.append({
                 "index": index,
                 "step": step,
@@ -405,7 +462,10 @@ class MissionTaskGraphAdapter:
         agent = graph.agents[graph.tasks[task_id].assigned_agent_id]
         if agent.parent_task_id != task_id or agent.role != "mission_plan_step_executor":
             return None
-        agent.permission_scope.validate_current(snapshot)
+        agent.permission_scope.validate_current(
+            snapshot,
+            authorization_version=self._expected_authorization_version(mission),
+        )
         return agent.permission_scope
 
     def claim_steps(self, mission: Any, snapshot: MissionAuthorizationSnapshot, step_ids: tuple[str, ...] | list[str]) -> TaskGraph:
@@ -429,7 +489,11 @@ class MissionTaskGraphAdapter:
                 agent = graph.agents[task.assigned_agent_id]
                 if agent.parent_agent_id is not None and agent.lifecycle is AgentLifecycle.WAITING:
                     agent.transition(AgentLifecycle.READY)
-            graph.claim_task(task_id, snapshot)
+            graph.claim_task(
+                task_id,
+                snapshot,
+                authorization_version=self._expected_authorization_version(mission),
+            )
         self._store(mission, graph, mapping, str(state["plan_fingerprint"]), int(state["revision"]))
         return graph
 

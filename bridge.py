@@ -67,6 +67,12 @@ def _project_store() -> WorkspaceProjectStore:
     return WorkspaceProjectStore(root_base=DB_PATH.parent / "workspaces")
 
 
+def _skill_registry():
+    from agent.intelligence_layer.skills import SkillRegistry
+
+    return SkillRegistry(DB_PATH.with_name("skills.sqlite3"))
+
+
 def _desktop_model_manager() -> LocalModelManager:
     global _DESKTOP_MODEL_MANAGER
     with _DESKTOP_MANAGER_LOCK:
@@ -113,12 +119,24 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
     processes should be assigned distinct IDs; a restarted process should reuse
     its logical ID so the queue advances and enforces its durable generation.
     """
-    core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
+    skills = _skill_registry()
+    core = AgentCore(
+        RUNTIME.router,
+        db_path=DB_PATH.with_name("missions.sqlite3"),
+        skill_registry=skills,
+    )
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
     scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
 
     def runtime_factory() -> MissionRuntime:
-        return MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True, require_execution_fence=True)
+        return MissionRuntime(
+            core.store,
+            executor=core._executor,
+            require_authorization_snapshot=True,
+            require_execution_fence=True,
+            task_graph_policy=core.task_graph_policy,
+            skill_context_provider=core._resolve_mission_skill_context,
+        )
 
     return MissionWorker(queue, runtime_factory, worker_id=worker_id, scheduler=scheduler)
 
@@ -180,11 +198,30 @@ class Handler(BaseHTTPRequestHandler):
         return {**session, "session_token": token}
 
     def _mission_service(self) -> MissionService:
-        core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
-        runtime = MissionRuntime(core.store, executor=core._executor, require_authorization_snapshot=True, require_execution_fence=True)
+        core = AgentCore(
+            RUNTIME.router,
+            db_path=DB_PATH.with_name("missions.sqlite3"),
+            skill_registry=_skill_registry(),
+        )
+        runtime = MissionRuntime(
+            core.store,
+            executor=core._executor,
+            require_authorization_snapshot=True,
+            require_execution_fence=True,
+            task_graph_policy=core.task_graph_policy,
+            skill_context_provider=core._resolve_mission_skill_context,
+        )
         queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
         scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
         return MissionService(runtime, queue, scheduler, owner_revalidator=core.prepare_mission_for_queue)
+
+    def _skill_service(self):
+        from api.skills import OwnerSkillService
+
+        return OwnerSkillService(
+            DB_PATH.with_name("skills.sqlite3"),
+            self._mission_service(),
+        )
 
     def _mission_owner(self):
         if not self._bridge_auth():
@@ -443,6 +480,34 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 })
             return self._send(200, {"ok": True, "providers": safe_providers})
+        if parsed.path == "/api/public/skills":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                skills = self._skill_service().list_revisions(owner["session_token"])
+                return self._send(200, {"ok": True, "skills": skills})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except (ValueError, TypeError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
+        if parsed.path.startswith("/api/public/skills/"):
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            parts = [unquote(item) for item in parsed.path[len("/api/public/skills/"):].split("/")]
+            if len(parts) != 2:
+                return self._send(404, {"ok": False, "error": "unknown_skill_revision"})
+            try:
+                version = int(parts[1])
+                skill = self._skill_service().detail(owner["session_token"], parts[0], version)
+                return self._send(200, {"ok": True, "skill": skill})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_skill_revision"})
+            except (ValueError, TypeError) as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
         if parsed.path == "/api/public/missions":
             owner = self._public_mission_owner()
             if owner is None:
@@ -787,6 +852,51 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "authenticated": False}, headers={
                 "Set-Cookie": self._public_owner_cookie_header("", 0)
             })
+        if path == "/api/public/skills/candidates":
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict) or set(payload) != {"mission_id", "definition"}:
+                    raise ValueError("invalid_skill_candidate_request")
+                skill = self._skill_service().submit_candidate(
+                    owner["session_token"],
+                    payload["mission_id"],
+                    payload["definition"],
+                )
+                return self._send(201, {"ok": True, "skill": skill})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_mission"})
+            except ValueError as exc:
+                status = 413 if str(exc) == "request_too_large" else 400
+                return self._send(status, {"ok": False, "error": str(exc)})
+        if path.startswith("/api/public/skills/"):
+            owner = self._public_mission_owner(csrf=True)
+            if owner is None:
+                return
+            parts = [unquote(item) for item in path[len("/api/public/skills/"):].split("/")]
+            if len(parts) != 3 or parts[2] not in {"approve", "revoke"}:
+                return self._send(404, {"ok": False, "error": "unknown_skill_action"})
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict) or set(payload) != {"content_hash"}:
+                    raise ValueError("content_hash_required")
+                version = int(parts[1])
+                service = self._skill_service()
+                if parts[2] == "approve":
+                    skill = service.approve(owner["session_token"], parts[0], version, payload["content_hash"])
+                else:
+                    skill = service.revoke(owner["session_token"], parts[0], version, payload["content_hash"])
+                return self._send(200, {"ok": True, "skill": skill})
+            except PermissionError as exc:
+                return self._send(403, {"ok": False, "error": str(exc)})
+            except KeyError:
+                return self._send(404, {"ok": False, "error": "unknown_skill_revision"})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
         if path == "/api/public/chat":
             owner = self._public_mission_owner(csrf=True)
             if owner is None:
@@ -843,13 +953,21 @@ class Handler(BaseHTTPRequestHandler):
                     else store.ensure_default(int(owner["owner_id"]))
                 )
                 scope_context = self._public_scope_context(project)
-                core = AgentCore(RUNTIME.router, db_path=DB_PATH.with_name("missions.sqlite3"))
+                selected_skill = payload.get("skill_id")
+                if selected_skill is not None and (not isinstance(selected_skill, str) or not selected_skill.strip() or len(selected_skill) > 128):
+                    raise ValueError("invalid_skill_selection")
+                core = AgentCore(
+                    RUNTIME.router,
+                    db_path=DB_PATH.with_name("missions.sqlite3"),
+                    skill_registry=_skill_registry(),
+                )
                 mission = core.run_owner_mission(
                     objective,
                     owner_session_token=owner["session_token"],
                     request_id=uuid.uuid4().hex,
                     scope_context=scope_context,
                     run=False,
+                    skill_id=selected_skill,
                 )
                 store.assign_mission(int(owner["owner_id"]), mission.mission_id, project.project_id)
                 service = self._mission_service()

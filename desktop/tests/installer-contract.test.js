@@ -50,6 +50,18 @@ test("user workflow exposes projects, model installation/switch, findings and li
   }
 });
 
+test("Owner Skill descriptions and procedure metadata render as inert text", () => {
+  const start = app.indexOf("async function skillsPanel()");
+  const end = app.indexOf("async function settingsPanel()");
+  assert.ok(start >= 0 && end > start, "Skills panel renderer is present");
+  const skillsUi = app.slice(start, end);
+  assert.match(skillsUi, /description\.textContent\s*=\s*skill\.description/);
+  assert.match(skillsUi, /constraints\.textContent\s*=\s*JSON\.stringify/);
+  assert.doesNotMatch(skillsUi, /\.innerHTML|insertAdjacentHTML|DOMParser|eval\s*\(/);
+  assert.ok(skillsUi.includes("UNTRUSTED") || skillsUi.includes("غير موثوقة"));
+  assert.ok(skillsUi.includes("skill.procedure"), "only procedure metadata is presented");
+});
+
 test("NSIS installer packages backend and local runtime and has a stable artifact name", () => {
   assert.equal(pkg.version, "5.2.0-rc1");
   assert.deepEqual(pkg.build.win.target, [{ target: "nsis", arch: ["x64"] }]);

@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import threading
+import pytest
 
 from agent.intelligence_layer.graph import AgentGraphPolicy
 from agent.intelligence_layer.models import AgentLifecycle, TaskLifecycle
+from agent.intelligence_layer.runtime_adapter import MissionTaskGraphError
 from agent.execution_fence import ExecutionFence
 from agent.mission import Mission, MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
@@ -266,6 +268,48 @@ def test_fresh_owner_snapshot_rebinds_graph_without_replaying_completed_steps(tm
     assert after_second.agent_task_graph_state["graph"]["authorization_hash"] != before_hash
     assert all(item["lifecycle"] == TaskLifecycle.COMPLETED.value for item in tasks)
     assert calls == ["first", "second"]
+
+
+def test_renewed_authorization_version_restores_and_claims_graph_tasks(tmp_path):
+    calls = []
+    rt = _runtime(tmp_path, lambda mission, step, action_id: calls.append(step.step_id) or {"success": True})
+    plan = Plan.initial("renewed graph authorization").replan(
+        steps=(
+            PlanStep("first", "first", action="search"),
+            PlanStep("second", "second", prerequisites=("first",), action="run_project_tests"),
+        ),
+        reason="test plan",
+    )
+    mission = rt.create("renewed graph authorization", "renewed graph authorization", plan, owner_identity_ref="test-owner")
+    after_first = rt.run_slice(mission.mission_id)
+    assert after_first.current_step == 1
+
+    refreshed = rt.store.load(mission.mission_id)
+    renewed = make_test_snapshot(refreshed).amend(owner_approval="test-owner-renewal", changes={})
+    refreshed.authorization_snapshot = renewed.to_dict()
+    refreshed.provenance["authorization_snapshot_version"] = renewed.version
+    rt.store.save(refreshed)
+
+    completed = rt.run_slice(mission.mission_id)
+    tasks = completed.agent_task_graph_state["graph"]["tasks"]
+    assert renewed.version == 2
+    assert completed.current_step == 2
+    assert all(item["lifecycle"] == TaskLifecycle.COMPLETED.value for item in tasks)
+    assert calls == ["first", "second"]
+
+
+def test_task_graph_adapter_rejects_snapshot_version_not_bound_by_mission(tmp_path):
+    rt = _runtime(tmp_path, lambda mission, step, action_id: {"success": True})
+    plan = Plan.initial("mismatched graph authorization").replan(
+        steps=(PlanStep("step", "step", action="search"),),
+        reason="test plan",
+    )
+    mission = rt.create("mismatched graph authorization", "mismatched graph authorization", plan, owner_identity_ref="test-owner")
+    renewed = make_test_snapshot(mission).amend(owner_approval="test-owner-renewal", changes={})
+    mission.authorization_snapshot = renewed.to_dict()
+    # Keep the canonical mission provenance at version 1: the graph adapter must fail closed.
+    with pytest.raises(MissionTaskGraphError, match="authorization snapshot version invalid"):
+        rt.task_graph_adapter.ensure(mission, renewed)
 
 
 def test_expired_snapshot_cannot_claim_or_dispatch_a_graph_task(tmp_path):

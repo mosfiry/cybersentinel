@@ -92,6 +92,7 @@ class TaskGraph:
         *,
         owner_identity_ref: str | None = None,
         policy: AgentGraphPolicy | None = None,
+        authorization_version: int = 1,
         at: str | None = None,
     ) -> "TaskGraph":
         if not isinstance(snapshot, MissionAuthorizationSnapshot):
@@ -101,6 +102,7 @@ class TaskGraph:
             mission_id=snapshot.mission_id,
             owner_identity=snapshot.owner_identity,
             target_identity=snapshot.target_identity,
+            version=authorization_version,
             at=at,
         )
         if not valid:
@@ -115,13 +117,20 @@ class TaskGraph:
             policy=policy,
         )
 
-    def validate_current_authorization(self, snapshot: MissionAuthorizationSnapshot, *, at: str | None = None) -> None:
+    def validate_current_authorization(
+        self,
+        snapshot: MissionAuthorizationSnapshot,
+        *,
+        authorization_version: int = 1,
+        at: str | None = None,
+    ) -> None:
         if not isinstance(snapshot, MissionAuthorizationSnapshot):
             raise TypeError("a typed current MissionAuthorizationSnapshot is required")
         valid, reason = snapshot.validate_for_mission(
             mission_id=self.mission_id,
             owner_identity=self.owner_identity_ref,
             target_identity=self.target_identity,
+            version=authorization_version,
             at=at,
         )
         if not valid:
@@ -129,9 +138,20 @@ class TaskGraph:
         if snapshot.authorization_hash != self.authorization_hash:
             raise DelegationDenied("mission authorization snapshot changed")
 
-    def root_scope(self, snapshot: MissionAuthorizationSnapshot, *, at: str | None = None) -> DelegationScope:
-        self.validate_current_authorization(snapshot, at=at)
-        return DelegationScope.from_snapshot(snapshot, owner_identity_ref=self.owner_identity_ref, at=at)
+    def root_scope(
+        self,
+        snapshot: MissionAuthorizationSnapshot,
+        *,
+        authorization_version: int = 1,
+        at: str | None = None,
+    ) -> DelegationScope:
+        self.validate_current_authorization(snapshot, authorization_version=authorization_version, at=at)
+        return DelegationScope.from_snapshot(
+            snapshot,
+            owner_identity_ref=self.owner_identity_ref,
+            authorization_version=authorization_version,
+            at=at,
+        )
 
     def add_agent(self, agent: AgentRecord) -> None:
         if agent.agent_id in self.agents:
@@ -281,9 +301,16 @@ class TaskGraph:
         ]
         return tuple(sorted(ready)[:capacity])
 
-    def claim_task(self, task_id: str, snapshot: MissionAuthorizationSnapshot, *, at: str | None = None) -> TaskRecord:
+    def claim_task(
+        self,
+        task_id: str,
+        snapshot: MissionAuthorizationSnapshot,
+        *,
+        authorization_version: int = 1,
+        at: str | None = None,
+    ) -> TaskRecord:
         """Claim a graph node only after current Owner authorization is revalidated."""
-        self.validate_current_authorization(snapshot, at=at)
+        self.validate_current_authorization(snapshot, authorization_version=authorization_version, at=at)
         self.refresh_ready_tasks()
         task = self.tasks.get(task_id)
         if task is None:
