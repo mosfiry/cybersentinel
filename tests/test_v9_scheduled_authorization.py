@@ -96,6 +96,14 @@ def _fixture(tmp_path: Path, monkeypatch, *, failpoint=None):
         plan,
         request_id="v9-schedule-request",
         owner_identity_ref="owner:1",
+        scope_snapshot={
+            "scope": ["workspace"],
+            "target_id": "test-target",
+            "workspace_root": "/workspace/test",
+            "allowed_networks": [],
+            "allowed_credentials": [],
+            "forbidden_actions": [],
+        },
     )
     worker = MissionWorker(queue, runtime_factory, scheduler=scheduler)
     return store, runtime, queue, scheduler, service, mission, worker, executions
@@ -114,7 +122,7 @@ def _schedule(service: MissionService, mission_id: str, *, schedule_id: str = "v
     )
 
 
-def test_schedule_requires_fresh_owner_and_persists_only_snapshot_binding(tmp_path, monkeypatch):
+def test_schedule_requires_fresh_owner_and_persists_auth_mission_and_scope_bindings(tmp_path, monkeypatch):
     store, _runtime, queue, scheduler, service, mission, worker, _executions = _fixture(tmp_path, monkeypatch)
     worker.recover_after_restart()
 
@@ -127,7 +135,7 @@ def test_schedule_requires_fresh_owner_and_persists_only_snapshot_binding(tmp_pa
     snapshot = persisted.authorization_snapshot
     with sqlite3.connect(scheduler.db_path) as db:
         row = db.execute(
-            "SELECT owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at "
+            "SELECT owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at,mission_integrity_hash,scope_snapshot_hash "
             "FROM mission_schedules WHERE schedule_id=?",
             ("v9-once",),
         ).fetchone()
@@ -136,11 +144,103 @@ def test_schedule_requires_fresh_owner_and_persists_only_snapshot_binding(tmp_pa
         snapshot["authorization_hash"],
         snapshot["version"],
         snapshot["expires_at"],
+        persisted.integrity_hash,
+        scheduler._scope_snapshot_hash(persisted),
     )
     with sqlite3.connect(scheduler.db_path) as db:
         raw = repr(db.execute("SELECT * FROM mission_schedules").fetchone())
     assert "current-owner-session" not in raw
     assert persisted.provenance["authorization_snapshot_version"] == snapshot["version"]
+
+
+@pytest.mark.parametrize(
+    "scope_snapshot",
+    [
+        None,
+        {},
+        {"scope": [], "target_id": "test-target"},
+        {"scope": ["workspace"], "target_id": ""},
+    ],
+)
+def test_schedule_rejects_missing_or_malformed_scope_snapshot(tmp_path, monkeypatch, scope_snapshot):
+    store, _runtime, queue, scheduler, service, mission, worker, executions = _fixture(tmp_path, monkeypatch)
+    worker.recover_after_restart()
+    changed = store.load(mission.mission_id)
+    changed.scope_snapshot = scope_snapshot
+    store.save(changed)
+
+    with pytest.raises(PermissionError, match="ScopeSnapshot"):
+        _schedule(service, mission.mission_id)
+
+    with sqlite3.connect(scheduler.db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM mission_schedules").fetchone()[0] == 0
+    with pytest.raises(KeyError):
+        queue.get(mission.mission_id)
+    assert executions == []
+
+
+def test_schedule_rejects_oversized_scope_snapshot(tmp_path, monkeypatch):
+    store, _runtime, queue, scheduler, service, mission, worker, executions = _fixture(tmp_path, monkeypatch)
+    worker.recover_after_restart()
+    changed = store.load(mission.mission_id)
+    changed.scope_snapshot["padding"] = "x" * (64 * 1024)
+    store.save(changed)
+
+    with pytest.raises(PermissionError, match="ScopeSnapshot exceeds the size limit"):
+        _schedule(service, mission.mission_id)
+
+    with sqlite3.connect(scheduler.db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM mission_schedules").fetchone()[0] == 0
+    with pytest.raises(KeyError):
+        queue.get(mission.mission_id)
+    assert executions == []
+
+
+def test_scope_snapshot_drift_after_schedule_is_quarantined_before_queue_dispatch(tmp_path, monkeypatch):
+    store, _runtime, queue, scheduler, service, mission, worker, executions = _fixture(tmp_path, monkeypatch)
+    worker.recover_after_restart()
+    _schedule(service, mission.mission_id)
+
+    changed = store.load(mission.mission_id)
+    changed.scope_snapshot["target_id"] = "different-target"
+    changed = store.save(changed)
+    # Keep the Mission hash current but deliberately leave the scope fingerprint
+    # as the Owner approved it, exercising the independent snapshot comparison.
+    with sqlite3.connect(scheduler.db_path) as db:
+        db.execute(
+            "UPDATE mission_schedules SET mission_integrity_hash=? WHERE schedule_id=?",
+            (changed.integrity_hash, "v9-once"),
+        )
+
+    dispatched = scheduler.dispatch_due(now=datetime.now(timezone.utc).isoformat())
+
+    assert dispatched[0].state is WorkerMissionState.NEEDS_INPUT
+    assert store.load(mission.mission_id).status is MissionStatus.OWNER_REAUTH_REQUIRED
+    assert queue.get(mission.mission_id).state is WorkerMissionState.NEEDS_INPUT
+    assert executions == []
+
+
+def test_scope_binding_survives_scheduler_restart_and_due_dispatch(tmp_path, monkeypatch):
+    store, _runtime, queue, scheduler, service, mission, worker, executions = _fixture(tmp_path, monkeypatch)
+    worker.recover_after_restart()
+    _schedule(service, mission.mission_id)
+
+    replacement_queue = MissionQueue(
+        queue.db_path,
+        require_execution_fence=True,
+        mission_store=store,
+    )
+    replacement_scheduler = MissionScheduler(
+        scheduler.db_path,
+        replacement_queue,
+        mission_store=store,
+    )
+    dispatched = replacement_scheduler.dispatch_due(now=datetime.now(timezone.utc).isoformat())
+
+    assert dispatched[0].state is WorkerMissionState.COMPLETED
+    assert replacement_queue.get(mission.mission_id).state is WorkerMissionState.QUEUED
+    assert store.load(mission.mission_id).status is MissionStatus.READY
+    assert executions == []
 
 
 def test_scheduled_queue_row_is_not_claimable_without_snapshot_validation(tmp_path, monkeypatch):

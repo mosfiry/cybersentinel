@@ -343,7 +343,20 @@ def test_mission_service_uses_canonical_runtime_and_persistent_queue(tmp_path, m
     scheduler = MissionScheduler(Path(tmp_path) / "scheduler.sqlite3", queue)
     core = AgentCore(ModelRouter([]), store=store)
     service = MissionService(runtime, queue, scheduler, owner_revalidator=core.prepare_mission_for_queue)
-    mission = service.create_mission("build", "build", Plan.initial("build"), owner_identity_ref="owner:1")
+    mission = service.create_mission(
+        "build",
+        "build",
+        Plan.initial("build"),
+        owner_identity_ref="owner:1",
+        scope_snapshot={
+            "scope": ["workspace"],
+            "target_id": "test-target",
+            "workspace_root": "/workspace/test",
+            "allowed_networks": [],
+            "allowed_credentials": [],
+            "forbidden_actions": [],
+        },
+    )
     assert mission["request_id"]
     initial_iterations = store.load(mission["mission_id"]).iteration_count
     started = service.start_mission(mission["mission_id"], owner_session_token="service-owner")

@@ -6,6 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 from contextlib import contextmanager, nullcontext
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -1086,7 +1087,8 @@ class MissionScheduler:
                 "schedule_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, next_run_at TEXT NOT NULL, "
                 "interval_seconds INTEGER, retry_limit INTEGER NOT NULL, retries INTEGER NOT NULL, state TEXT NOT NULL, "
                 "owner_identity_ref TEXT NOT NULL DEFAULT '', authorization_hash TEXT NOT NULL DEFAULT '', "
-                "authorization_version INTEGER NOT NULL DEFAULT 0, authorization_expires_at TEXT NOT NULL DEFAULT '')"
+                "authorization_version INTEGER NOT NULL DEFAULT 0, authorization_expires_at TEXT NOT NULL DEFAULT '', "
+                "mission_integrity_hash TEXT NOT NULL DEFAULT '', scope_snapshot_hash TEXT NOT NULL DEFAULT '')"
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(mission_schedules)")}
             for column, definition in (
@@ -1094,6 +1096,8 @@ class MissionScheduler:
                 ("authorization_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("authorization_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("authorization_expires_at", "TEXT NOT NULL DEFAULT ''"),
+                ("mission_integrity_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("scope_snapshot_hash", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if column not in columns:
                     db.execute(f"ALTER TABLE mission_schedules ADD COLUMN {column} {definition}")
@@ -1181,6 +1185,37 @@ class MissionScheduler:
         if mission.mission_id != mission_id:
             raise ExecutionFenceError("scheduled MissionStore identity mismatch")
         return mission, encoded
+
+    @staticmethod
+    def _scope_snapshot_hash(mission: Mission) -> str:
+        scope = mission.scope_snapshot
+        if not isinstance(scope, dict) or not scope:
+            raise PermissionError("scheduled Mission ScopeSnapshot is required")
+        target_id = scope.get("target_id")
+        scope_names = scope.get("scope")
+        if (
+            not isinstance(target_id, str)
+            or not target_id.strip()
+            or len(target_id) > 256
+            or not isinstance(scope_names, list)
+            or not scope_names
+            or len(scope_names) > 128
+            or any(not isinstance(item, str) or not item.strip() or len(item) > 256 for item in scope_names)
+        ):
+            raise PermissionError("scheduled Mission ScopeSnapshot is malformed")
+        try:
+            encoded = json.dumps(
+                scope,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise PermissionError("scheduled Mission ScopeSnapshot is not canonical JSON") from exc
+        if len(encoded) > 64 * 1024:
+            raise PermissionError("scheduled Mission ScopeSnapshot exceeds the size limit")
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _validate_snapshot(
@@ -1359,6 +1394,10 @@ class MissionScheduler:
         current = _utc_text(datetime.now(timezone.utc))
         with self._attached_transaction() as (db, queue_schema, mission_schema, owner_schema):
             mission, _encoded = self._load_mission(db, mission_schema, mission_id)
+            if not mission.verify_integrity() or len(mission.integrity_hash) != 64:
+                raise PermissionError("scheduled Mission integrity is unavailable")
+            mission_integrity_hash = mission.integrity_hash
+            scope_snapshot_hash = self._scope_snapshot_hash(mission)
             persisted = self._validate_snapshot(
                 mission,
                 db=db,
@@ -1405,7 +1444,7 @@ class MissionScheduler:
                     (WorkerMissionState.CANCELLED.value, mission_id, WorkerMissionState.SCHEDULED.value),
                 )
             db.execute(
-                "INSERT INTO mission_schedules(schedule_id,mission_id,next_run_at,interval_seconds,retry_limit,retries,state,owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at) VALUES(?,?,?,?,?,?,?, ?,?,?,?)",
+                "INSERT INTO mission_schedules(schedule_id,mission_id,next_run_at,interval_seconds,retry_limit,retries,state,owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at,mission_integrity_hash,scope_snapshot_hash) VALUES(?,?,?,?,?,?,?, ?,?,?,?,?,?)",
                 (
                     item.schedule_id,
                     item.mission_id,
@@ -1418,6 +1457,8 @@ class MissionScheduler:
                     persisted.authorization_hash,
                     persisted.version,
                     persisted.expires_at,
+                    mission_integrity_hash,
+                    scope_snapshot_hash,
                 ),
             )
             self._call_fault_injector("after_schedule_insert")
@@ -1493,7 +1534,7 @@ class MissionScheduler:
     def _dispatch_due_bound(self, schedule_id: str, *, now: str) -> bool:
         with self._attached_transaction() as (db, queue_schema, mission_schema, owner_schema):
             row = db.execute(
-                "SELECT schedule_id,mission_id,next_run_at,state,owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at "
+                "SELECT schedule_id,mission_id,next_run_at,state,owner_identity_ref,authorization_hash,authorization_version,authorization_expires_at,mission_integrity_hash,scope_snapshot_hash "
                 "FROM mission_schedules WHERE schedule_id=?",
                 (schedule_id,),
             ).fetchone()
@@ -1519,6 +1560,8 @@ class MissionScheduler:
             schedule_owner, snapshot_hash = str(row[4]), str(row[5])
             snapshot_version = row[6] if type(row[6]) is int else -1
             snapshot_expiry = str(row[7])
+            scheduled_mission_hash = str(row[8] or "")
+            scheduled_scope_hash = str(row[9] or "")
             try:
                 mission, encoded_before = self._load_mission(db, mission_schema, mission_id)
             except (KeyError, ExecutionFenceError, TypeError, ValueError, AttributeError):
@@ -1583,6 +1626,13 @@ class MissionScheduler:
                     raise PermissionError("scheduled mission runtime state is malformed")
                 if queue_state_invalid:
                     raise PermissionError("scheduled queue state is malformed")
+                if (
+                    not mission.verify_integrity()
+                    or len(scheduled_mission_hash) != 64
+                    or scheduled_mission_hash != mission.integrity_hash
+                    or scheduled_scope_hash != self._scope_snapshot_hash(mission)
+                ):
+                    raise PermissionError("scheduled Mission integrity or ScopeSnapshot changed")
                 self._validate_snapshot(
                     mission,
                     db=db,

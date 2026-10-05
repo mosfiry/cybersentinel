@@ -662,7 +662,22 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
 
     plan = {"version": 1, "objective": "api mission", "steps": [{"step_id": "s1", "objective": "status", "action": "status"}]}
     try:
-        status, created = request("POST", "/api/missions", {"objective": "api mission", "plan": plan})
+        status, created = request(
+            "POST",
+            "/api/missions",
+            {
+                "objective": "api mission",
+                "plan": plan,
+                "scope_context": {
+                    "scope": ["workspace"],
+                    "target_id": "api-target",
+                    "workspace_root": str(Path.cwd().resolve()),
+                    "allowed_networks": [],
+                    "allowed_credentials": [],
+                    "forbidden_actions": [],
+                },
+            },
+        )
         assert status == 201
         mission_id = created["mission_id"]
         report_chain = tmp_path / "evidence_chain.db"
