@@ -309,8 +309,28 @@ class EvaluationStore:
     SCHEMA_VERSION = 1
     MAX_ROWS = 100
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
+        if not isinstance(read_only, bool):
+            raise EvaluationError("read_only must be a boolean")
+        self._read_only = read_only
+        if self._read_only:
+            if self.db_path.is_symlink() or not self.db_path.is_file():
+                raise EvaluationError("evaluation store is unavailable")
+            try:
+                with self._connect() as connection:
+                    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(evaluation_runs)")}
+                required = {
+                    "evaluation_id", "owner_identity_ref", "mission_id", "task_id", "case_id",
+                    "benchmark_version", "provider_id", "model_id", "idempotency_key", "created_at",
+                    "measurements_json", "provenance_json", "evaluation_sha256", "record_sha256",
+                }
+                if version != self.SCHEMA_VERSION or not required.issubset(columns):
+                    raise EvaluationError("evaluation store schema is unavailable")
+            except sqlite3.Error as exc:
+                raise EvaluationError("evaluation store is unavailable") from exc
+            return
         self.db_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         fd = os.open(self.db_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         os.close(fd)
@@ -322,7 +342,11 @@ class EvaluationStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(str(self.db_path), timeout=5.0)
+        if self._read_only:
+            uri = self.db_path.resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+        else:
+            connection = sqlite3.connect(str(self.db_path), timeout=5.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
         try:
@@ -387,6 +411,8 @@ class EvaluationStore:
         return hashlib.sha256(manifest.encode("utf-8")).hexdigest()
 
     def append(self, run: EvaluationRun, *, idempotency_key: str) -> StoredEvaluation:
+        if self._read_only:
+            raise EvaluationError("evaluation store is read-only")
         if not isinstance(run, EvaluationRun):
             raise EvaluationError("run must be an EvaluationRun")
         key = _identity(idempotency_key, "idempotency key")

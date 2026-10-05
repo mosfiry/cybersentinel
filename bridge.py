@@ -253,6 +253,24 @@ class Handler(BaseHTTPRequestHandler):
             event_store=_mission_event_store(),
         )
 
+    def _mission_evaluation_service(self):
+        from api.evaluation_observability import MissionEvaluationSummaryService
+        from evaluation.agent_evaluation import EvaluationStore
+
+        mission_service = self._mission_service()
+        evaluation_path = DB_PATH.with_name("agent_evaluations.sqlite3")
+        evaluation_store = (
+            EvaluationStore(evaluation_path, read_only=True)
+            if evaluation_path.exists() or evaluation_path.is_symlink()
+            else None
+        )
+        evidence_path = Path(mission_service.runtime.store.db_path).with_name("evidence_chain.db")
+        return MissionEvaluationSummaryService(
+            mission_service,
+            evaluation_store,
+            evidence_db_path=evidence_path,
+        )
+
     def _skill_service(self):
         from api.skills import OwnerSkillService
 
@@ -580,7 +598,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/public/missions/"):
             parts = [unquote(item) for item in parsed.path[len("/api/public/missions/"):].split("/")]
             observability_route = len(parts) == 2 and parts[1] == "observability"
-            owner = self._public_mission_owner(csrf=observability_route)
+            evaluation_route = len(parts) == 2 and parts[1] == "evaluation"
+            owner = self._public_mission_owner(csrf=observability_route or evaluation_route)
             if owner is None:
                 return
             mission_id = parts[0] if parts else ""
@@ -624,6 +643,31 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(409, {"ok": False, "error": str(exc)})
                 except ValueError as exc:
                     return self._send(400, {"ok": False, "error": str(exc)})
+            if action == "evaluation" and len(parts) == 2:
+                from api.evaluation_observability import (
+                    MissionEvaluationSummaryError,
+                    MissionEvaluationSummaryTooLarge,
+                )
+                from evaluation.agent_evaluation import EvaluationError
+
+                if parsed.query:
+                    return self._send(400, {"ok": False, "error": "invalid_evaluation_query"})
+                try:
+                    value = self._mission_evaluation_service().get(
+                        mission_id,
+                        owner_session_token=owner["session_token"],
+                    )
+                    return self._send(200, {"ok": True, "mission_id": mission_id, "evaluation": value})
+                except KeyError:
+                    return self._send(404, {"ok": False, "error": "unknown_mission"})
+                except MissionEvaluationSummaryTooLarge:
+                    return self._send(413, {"ok": False, "error": "mission_evaluation_too_large"})
+                except MissionEvaluationSummaryError as exc:
+                    return self._send(409, {"ok": False, "error": str(exc)})
+                except EvaluationError:
+                    return self._send(409, {"ok": False, "error": "evaluation_store_unavailable"})
+                except ValueError:
+                    return self._send(400, {"ok": False, "error": "invalid_evaluation_request"})
             try:
                 service = self._mission_service()
                 service._authorized_mission(

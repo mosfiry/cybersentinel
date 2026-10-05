@@ -34,7 +34,7 @@ const state = {
   desktopSetup: null,
   modelManager: null,
   onboardingVisible: false,
-  missionViews: { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null, observability: null, observabilityError: "" },
+  missionViews: { timeline: [], evidence: [], artifacts: [], logs: [], effects: [], report: null, observability: null, observabilityError: "", evaluation: null, evaluationError: "" },
   filePath: ".",
   activeView: "overview",
 };
@@ -903,6 +903,10 @@ function missionObservabilityEndpoint({ timelineOffset = 0, eventAfter = 0 } = {
   return `${missionEndpoint("observability")}?${query.toString()}`;
 }
 
+function missionEvaluationEndpoint() {
+  return missionEndpoint("evaluation");
+}
+
 async function selectMission(missionId) {
   state.selectedMissionId = String(missionId || "");
   state.filePath = ".";
@@ -914,7 +918,7 @@ async function loadMission(missionId = state.selectedMissionId) {
   if (!missionId || !state.ownerAuthenticated) return;
   state.selectedMissionId = String(missionId);
   try {
-    const [statusData, timelineData, evidenceData, artifactsData, logsData, effectsData, reportData, observabilityData] = await Promise.all([
+    const [statusData, timelineData, evidenceData, artifactsData, logsData, effectsData, reportData, observabilityData, evaluationData] = await Promise.all([
       api(missionEndpoint("status")),
       api(missionEndpoint("timeline")),
       api(missionEndpoint("evidence")),
@@ -923,6 +927,7 @@ async function loadMission(missionId = state.selectedMissionId) {
       api(missionEndpoint("effects")).catch((error) => ({ effects: [], error: error.message })),
       api(missionEndpoint("report")).catch((error) => ({ report: null, error: error.message })),
       api(missionObservabilityEndpoint()).catch((error) => ({ observability: null, error: error.message })),
+      api(missionEvaluationEndpoint()).catch((error) => ({ evaluation: null, error: error.message })),
     ]);
     state.selectedMission = statusData.status || null;
     state.missionViews = {
@@ -936,6 +941,8 @@ async function loadMission(missionId = state.selectedMissionId) {
       reportError: reportData.error || "",
       observability: observabilityData.observability || null,
       observabilityError: observabilityData.error || "",
+      evaluation: evaluationData.evaluation || null,
+      evaluationError: evaluationData.error || "",
     };
     renderMissionHeader();
     renderActivityFromTimeline(state.missionViews.timeline);
@@ -1124,6 +1131,37 @@ function renderMissionObservability(data, target) {
   const refresh = addText(target, "button", "تحديث التقدم", "observability-refresh");
   refresh.type = "button";
   refresh.addEventListener("click", () => loadMission(state.selectedMissionId));
+
+  const evaluationCard = document.createElement("section");
+  evaluationCard.className = "result observability-card evaluation-summary";
+  addText(evaluationCard, "h2", "ملخص التقييم المسجّل");
+  const evaluation = state.missionViews.evaluation;
+  if (state.missionViews.evaluationError) {
+    addText(evaluationCard, "p", "تعذر عرض سجل التقييم بأمان؛ لم تُستنتج مقاييس أو نتيجة.", "muted");
+  } else if (!evaluation || evaluation.status !== "run_recorded") {
+    addText(evaluationCard, "p", "لا توجد جولة تقييم مسجّلة لهذه المهمة؛ لم تُنشأ مقاييس أو نتيجة.", "muted");
+  } else {
+    addText(evaluationCard, "p", "قيم مسجّلة فقط؛ لا يحفظ السجل حكمًا نهائيًا ولا تُعد هذه القيم نتيجة متحققة.", "muted");
+    const metricUnits = {
+      task_success: "ratio", evidence_quality: "ratio", hallucination: "ratio",
+      tool_correctness: "ratio", skill_usefulness: "ratio", memory_usefulness: "ratio",
+      latency: "ms", cost: "units", recovery: "ratio", safety_violations: "count",
+    };
+    const metrics = Array.isArray(evaluation.metrics) ? evaluation.metrics.slice(0, 10) : [];
+    metrics.forEach((metric) => {
+      if (!metric || !Object.hasOwn(metricUnits, metric.metric)) return;
+      const value = typeof metric.value === "number" && Number.isFinite(metric.value)
+        ? `${String(metric.value)} ${metricUnits[metric.metric]}`
+        : "غير مسجّل";
+      addText(evaluationCard, "p", `${metric.metric}: ${value}`);
+      const refs = Array.isArray(metric.verified_evidence_refs)
+        ? metric.verified_evidence_refs.filter((reference) => typeof reference === "string" && /^evref_[0-9a-f]{64}$/.test(reference)).slice(0, 4)
+        : [];
+      if (refs.length) addText(evaluationCard, "p", `مراجع دليل موثّقة مبهمة: ${refs.join(", ")}`, "muted");
+    });
+  }
+  target.appendChild(evaluationCard);
+
   if (!data) {
     addText(target, "p", "لا تتوفر بيانات التقدم الآمنة لهذه المهمة حاليًا.", "muted");
     return;

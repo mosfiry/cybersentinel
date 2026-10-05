@@ -118,6 +118,61 @@ test("Mission observability renderer treats hostile graph and event strings as i
   assert.equal(elements.length > 0, true);
 });
 
+test("Mission evaluation summary renders only whitelisted numbers and opaque evidence references", () => {
+  const start = app.indexOf("function renderMissionObservability(");
+  const end = app.indexOf("\nasync function loadMoreMissionProgress", start);
+  assert.ok(start >= 0 && end > start, "Mission observability renderer is present");
+  const renderer = app.slice(start, end);
+  assert.match(renderer, /evaluation-summary/);
+  assert.match(renderer, /\.textContent\s*=/);
+  assert.doesNotMatch(renderer, /\.innerHTML|insertAdjacentHTML|DOMParser|eval\s*\(/);
+
+  const elements = [];
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.textContent = "";
+      this.className = "";
+      this.listeners = {};
+      elements.push(this);
+    }
+    set innerHTML(_value) { throw new Error("HTML parsing is forbidden in this renderer"); }
+    appendChild(child) { this.children.push(child); return child; }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+  }
+  const attack = `<img src=x onerror=alert(1)>`;
+  const context = {
+    document: { createElement: (tag) => new Element(tag) },
+    state: {
+      missionViews: {
+        observabilityError: "",
+        evaluationError: "",
+        evaluation: {
+          status: "run_recorded",
+          verdict: attack,
+          metrics: [
+            { metric: "task_success", value: attack, verified_evidence_refs: [attack] },
+            { metric: attack, value: 1, verified_evidence_refs: ["evref_" + "a".repeat(64)] },
+            { metric: "evidence_quality", value: 0.9, verified_evidence_refs: ["evref_" + "b".repeat(64)] },
+          ],
+        },
+      },
+      selectedMissionId: "mission-safe",
+    },
+    errorText: (error) => String(error?.message || ""),
+    loadMission: () => {},
+    loadMoreMissionProgress: () => {},
+  };
+  vm.runInNewContext(`${renderer}; globalThis.render = renderMissionObservability;`, context);
+  const root = new Element("root");
+  context.render({}, root);
+  const renderedText = elements.map((element) => element.textContent).join("\n");
+  assert.ok(renderedText.includes("task_success: غير مسجّل"));
+  assert.ok(renderedText.includes("evref_" + "b".repeat(64)));
+  assert.ok(!renderedText.includes(attack), "arbitrary evaluation strings and raw evidence IDs are omitted");
+});
+
 test("NSIS installer packages backend and local runtime and has a stable artifact name", () => {
   assert.equal(pkg.version, "5.2.0-rc1");
   assert.deepEqual(pkg.build.win.target, [{ target: "nsis", arch: ["x64"] }]);

@@ -171,6 +171,72 @@ def test_mission_observability_requires_owner_session_and_csrf(public_server, mo
     assert oversized["error"] == "invalid_observability_query"
 
 
+def test_mission_evaluation_summary_requires_owner_csrf_and_exact_mission_scope(public_server, monkeypatch):
+    calls = []
+
+    class FakeEvaluationSummary:
+        def get(self, mission_id, *, owner_session_token):
+            calls.append((mission_id, owner_session_token))
+            if mission_id in {"foreign", "missing"}:
+                raise KeyError("unknown_mission")
+            return {
+                "status": "no_run",
+                "run_count": 0,
+                "verdict": "not_persisted",
+                "metrics": [],
+            }
+
+    monkeypatch.setattr(
+        bridge.Handler,
+        "_mission_evaluation_service",
+        lambda self: FakeEvaluationSummary(),
+    )
+    cookie, csrf = _owner_session(public_server)
+
+    status, denied, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/missions/mission-safe/evaluation",
+        headers={"Cookie": cookie},
+    )
+    assert status == 401
+    assert denied["ok"] is False
+
+    status, result, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/missions/mission-safe/evaluation",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert status == 200
+    assert result["evaluation"]["status"] == "no_run"
+    assert calls[-1] == ("mission-safe", OWNER_TOKEN)
+    assert OWNER_TOKEN not in json.dumps(result)
+
+    denied_results = []
+    for mission_id in ("foreign", "missing"):
+        denied_status, denied_body, _ = _request(
+            public_server,
+            "GET",
+            f"/api/public/missions/{mission_id}/evaluation",
+            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+        )
+        denied_results.append((denied_status, denied_body))
+    assert denied_results == [
+        (404, {"ok": False, "error": "unknown_mission"}),
+        (404, {"ok": False, "error": "unknown_mission"}),
+    ]
+
+    query_status, query_error, _ = _request(
+        public_server,
+        "GET",
+        "/api/public/missions/mission-safe/evaluation?limit=101",
+        headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+    )
+    assert query_status == 400
+    assert query_error == {"ok": False, "error": "invalid_evaluation_query"}
+
+
 def test_public_session_rejects_missing_or_invalid_csrf(manager):
     session = manager.create()
     with pytest.raises(PermissionError, match="csrf"):
