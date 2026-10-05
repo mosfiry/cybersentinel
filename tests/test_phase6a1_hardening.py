@@ -36,6 +36,7 @@ def test_provider_failover_trace_and_capability_truthfulness():
     class Failing:
         name = "qwen"
         model = "qwen-test"
+        deployment = "local"
         capabilities = ProviderCapabilities(generate=True, tool_calling=True, structured_output=False)
         def generate(self, messages, **kwargs):
             raise TimeoutError("qwen timeout")
@@ -45,6 +46,7 @@ def test_provider_failover_trace_and_capability_truthfulness():
     class Working:
         name = "deepseek"
         model = "deepseek-test"
+        deployment = "local"
         capabilities = ProviderCapabilities(generate=True, tool_calling=True, structured_output=False)
         def generate(self, messages, **kwargs):
             return {"content": "fallback success"}
@@ -63,6 +65,7 @@ def test_router_skips_provider_without_native_tool_calling():
     class TextOnly:
         name = "text"
         model = "text"
+        deployment = "local"
         capabilities = ProviderCapabilities(generate=True, tool_calling=False, structured_output=True)
         def generate(self, messages, **kwargs):
             return {"content": "text"}
@@ -70,6 +73,7 @@ def test_router_skips_provider_without_native_tool_calling():
     class Tools:
         name = "tools"
         model = "tools"
+        deployment = "local"
         capabilities = ProviderCapabilities(generate=True, tool_calling=True, structured_output=False)
         def tool_calling(self, messages, tools, **kwargs):
             return {"content": "native"}

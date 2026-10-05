@@ -355,6 +355,7 @@ def test_model_router_shares_one_monotonic_deadline_across_provider_failover(mon
         def __init__(self, name: str):
             self.name = name
             self.model = f"{name}-model"
+            self.deployment = "local"
             self.capabilities = ProviderCapabilities(tool_calling=True)
 
         def tool_calling(self, _messages, _tools, *, timeout, **_kwargs):

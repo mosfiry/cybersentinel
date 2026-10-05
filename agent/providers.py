@@ -13,8 +13,11 @@ from .provider_api import (
     MAX_PROVIDER_RESPONSE_BYTES,
     MAX_PROVIDER_TOOL_CALLS,
     MAX_PROVIDER_TOOL_NAME_CHARS,
+    HardwareRequirements,
     InvalidModelResponse,
     ProviderCapabilities,
+    ProviderDeployment,
+    ProviderMetadata,
     ProviderResponse,
     ToolCall,
     enforce_json_byte_limit,
@@ -23,7 +26,28 @@ from .provider_api import (
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, name: str, base_url: str, model: str, api_key: str = "", *, tool_calling: bool = False, streaming: bool = False, structured_output: bool = False, priority: int = 100, parallel_tool_calls: bool = False, reasoning: bool = False, reasoning_budget: bool = False, long_context: bool = False, vision: bool = False, context_length: int | None = None):
+    def __init__(
+        self,
+        name: str,
+        base_url: str,
+        model: str,
+        api_key: str = "",
+        *,
+        tool_calling: bool = False,
+        streaming: bool = False,
+        structured_output: bool = False,
+        priority: int = 100,
+        parallel_tool_calls: bool = False,
+        reasoning: bool = False,
+        reasoning_budget: bool = False,
+        long_context: bool = False,
+        vision: bool = False,
+        context_length: int | None = None,
+        model_version: str | None = None,
+        quantization: str | None = None,
+        deployment: ProviderDeployment | str = ProviderDeployment.UNKNOWN,
+        hardware_requirements: HardwareRequirements | None = None,
+    ):
         self.name = name
         self.base_url = base_url.rstrip("/")
         parsed_base = urlsplit(self.base_url)
@@ -38,6 +62,26 @@ class OpenAICompatibleProvider:
         self.last_error = ""
         self.priority = priority
         self.capabilities = ProviderCapabilities(generate=True, stream=streaming, tool_calling=tool_calling, structured_output=structured_output, chat=True, native_chat=True, parallel_tool_calls=parallel_tool_calls, reasoning=reasoning, reasoning_budget=reasoning_budget, long_context=long_context, vision=vision)
+        self.model_version = model_version
+        self.quantization = quantization
+        self.deployment = ProviderDeployment(deployment)
+        self.hardware_requirements = (
+            hardware_requirements if hardware_requirements is not None else HardwareRequirements()
+        )
+        _ = self.metadata  # Validate the complete metadata contract at construction time.
+
+    @property
+    def metadata(self) -> ProviderMetadata:
+        return ProviderMetadata(
+            provider_id=self.name,
+            model_identity=self.model,
+            capabilities=self.capabilities,
+            context_length=self.context_length,
+            model_version=self.model_version,
+            quantization=self.quantization,
+            deployment=self.deployment,
+            hardware_requirements=self.hardware_requirements,
+        )
 
     def status(self) -> dict:
         return {
@@ -49,6 +93,7 @@ class OpenAICompatibleProvider:
             "last_error": self.last_error,
             "priority": self.priority,
             "capabilities": self.capabilities.__dict__.copy(),
+            "metadata": self.metadata.public(),
         }
 
     def _request(self, payload: dict[str, Any], timeout: int = 90) -> dict[str, Any]:

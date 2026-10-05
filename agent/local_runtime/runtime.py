@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Protocol
 
 from agent.model_router import ModelRouter
-from agent.provider_api import ProviderCapabilities
+from agent.provider_api import HardwareRequirements, ProviderCapabilities, ProviderDeployment
 from agent.providers import OpenAICompatibleProvider
 
 from .catalog import ModelSpec
@@ -112,6 +112,16 @@ class LlamaCppRuntime:
             structured_output=False,
             priority=0,
             context_length=spec.context_length,
+            model_version=spec.model_version or None,
+            quantization=spec.quantization,
+            deployment=ProviderDeployment.LOCAL,
+            hardware_requirements=HardwareRequirements(
+                accelerator="cpu" if "llama.cpp-cpu" in spec.backend_compatibility else "unknown",
+                min_ram_gib=spec.min_ram_gib,
+                min_vram_gib=spec.min_vram_gib or None,
+                min_cpu_cores=spec.min_cpu_cores,
+                min_disk_gib=(spec.size_bytes + 2 * (1024**3) - 1) // (1024**3),
+            ),
         )
         self.provider.capabilities = ProviderCapabilities(
             generate=True,

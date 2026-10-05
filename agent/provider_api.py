@@ -90,6 +90,108 @@ class ProviderCapabilities:
     vision: bool = False
 
 
+class ProviderDeployment(StrEnum):
+    LOCAL = "local"
+    REMOTE = "remote"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class HardwareRequirements:
+    accelerator: str = "unknown"
+    min_ram_gib: int | None = None
+    min_vram_gib: int | None = None
+    min_cpu_cores: int | None = None
+    min_disk_gib: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.accelerator, str) or self.accelerator not in {
+            "cpu", "nvidia", "amd", "apple", "any", "unknown"
+        }:
+            raise ValueError("invalid provider accelerator requirement")
+        for name in ("min_ram_gib", "min_vram_gib", "min_cpu_cores", "min_disk_gib"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 1_000_000
+            ):
+                raise ValueError(f"invalid provider hardware requirement: {name}")
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "accelerator": self.accelerator,
+            "min_ram_gib": self.min_ram_gib,
+            "min_vram_gib": self.min_vram_gib,
+            "min_cpu_cores": self.min_cpu_cores,
+            "min_disk_gib": self.min_disk_gib,
+        }
+
+
+@dataclass(frozen=True)
+class ProviderMetadata:
+    provider_id: str
+    model_identity: str
+    capabilities: ProviderCapabilities
+    context_length: int | None = None
+    model_version: str | None = None
+    quantization: str | None = None
+    deployment: ProviderDeployment = ProviderDeployment.UNKNOWN
+    hardware_requirements: HardwareRequirements = field(default_factory=HardwareRequirements)
+
+    def __post_init__(self) -> None:
+        for name, value, limit in (
+            ("provider_id", self.provider_id, 128),
+            ("model_identity", self.model_identity, 256),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > limit
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            ):
+                raise ValueError(f"invalid provider metadata: {name}")
+        for name, value in (("model_version", self.model_version), ("quantization", self.quantization)):
+            if value is not None and (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 64
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            ):
+                raise ValueError(f"invalid provider metadata: {name}")
+        if self.context_length is not None and (
+            isinstance(self.context_length, bool)
+            or not isinstance(self.context_length, int)
+            or self.context_length < 1
+        ):
+            raise ValueError("invalid provider metadata: context_length")
+        if not isinstance(self.capabilities, ProviderCapabilities):
+            raise ValueError("invalid provider metadata: capabilities")
+        if any(type(value) is not bool for value in self.capabilities.__dict__.values()):
+            raise ValueError("invalid provider metadata: capability flags must be boolean")
+        if not isinstance(self.hardware_requirements, HardwareRequirements):
+            raise ValueError("invalid provider metadata: hardware_requirements")
+        try:
+            deployment = ProviderDeployment(self.deployment)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid provider deployment") from exc
+        object.__setattr__(self, "deployment", deployment)
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "model_identity": self.model_identity,
+            "model_version": self.model_version,
+            "quantization": self.quantization,
+            "context_length": self.context_length,
+            "tool_calling": self.capabilities.tool_calling,
+            "streaming": self.capabilities.stream,
+            "structured_output": self.capabilities.structured_output,
+            "reasoning": self.capabilities.reasoning,
+            "capabilities": self.capabilities.__dict__.copy(),
+            "deployment": self.deployment.value,
+            "hardware_requirements": self.hardware_requirements.public(),
+        }
+
+
 @dataclass(frozen=True)
 class ToolCall:
     name: str

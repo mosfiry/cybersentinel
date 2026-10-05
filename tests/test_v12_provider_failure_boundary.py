@@ -367,6 +367,7 @@ class _FailingProvider:
     def __init__(self, name, model, error):
         self.name = name
         self.model = model
+        self.deployment = "remote"
         self.error = error
         self.capabilities = ProviderCapabilities(generate=True)
 
@@ -426,6 +427,7 @@ def test_router_fails_over_once_per_provider_with_shared_deadline_and_trusted_id
 
     class Provider:
         capabilities = ProviderCapabilities(generate=True)
+        deployment = "local"
 
         def __init__(self, name, model, error=None):
             self.name = name

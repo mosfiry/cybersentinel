@@ -10,6 +10,7 @@ from tools.registry import REGISTRY
 class FailingProvider:
     name = "broken"
     model = "broken-model"
+    deployment = "local"
     def __init__(self):
         self.failure_count = 0
         self.last_error = ""
@@ -24,6 +25,7 @@ class FailingProvider:
 class WorkingProvider:
     name = "backup"
     model = "backup-model"
+    deployment = "local"
     def status(self):
         return {"name": self.name, "model": self.model, "failure_count": 0, "last_error": ""}
     def chat(self, messages, temperature=0):

@@ -5,10 +5,10 @@ import errno
 import math
 import time
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from .provider_api import CapabilityUnsupported, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderError, ProviderFailure, ProviderRequestRejected, ProviderResponse, ProviderTimeout, response_from_legacy, validate_provider_response
+from .provider_api import CapabilityUnsupported, HardwareRequirements, InvalidModelResponse, ProviderAuthenticationFailure, ProviderCapabilities, ProviderDeployment, ProviderError, ProviderFailure, ProviderRequestRejected, ProviderResponse, ProviderTimeout, response_from_legacy, validate_provider_response
 from .providers import OpenAICompatibleProvider
 from .planning import ReasoningProfile
 from security.runtime_secrets import secret_env
@@ -17,20 +17,85 @@ from security.runtime_secrets import secret_env
 @dataclass
 class ModelRouter:
     providers: list[Any]
-    last_trace: list[dict[str, Any]] = None
+    last_trace: list[dict[str, Any]] = field(default_factory=list)
+    allow_cross_deployment_fallback: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.allow_cross_deployment_fallback, bool):
+            raise ValueError("allow_cross_deployment_fallback must be boolean")
         self.last_trace = []
+
+    @staticmethod
+    def _deployment(provider: Any) -> ProviderDeployment:
+        metadata = getattr(provider, "metadata", None)
+        raw = getattr(metadata, "deployment", getattr(provider, "deployment", ProviderDeployment.UNKNOWN))
+        try:
+            return ProviderDeployment(raw)
+        except (TypeError, ValueError):
+            return ProviderDeployment.UNKNOWN
+
+    def _routable_providers(self, capability: str) -> tuple[list[Any], list[Any]]:
+        eligible = [
+            provider for provider in self.providers
+            if bool(getattr(self._caps(provider), capability, False))
+        ]
+        if not eligible or self.allow_cross_deployment_fallback:
+            return eligible, []
+        primary = self._deployment(self.providers[0]) if self.providers else ProviderDeployment.UNKNOWN
+        if primary == ProviderDeployment.UNKNOWN:
+            allowed = [provider for provider in eligible if provider is self.providers[0]]
+        else:
+            allowed = [provider for provider in eligible if self._deployment(provider) == primary]
+        allowed_ids = {id(provider) for provider in allowed}
+        return allowed, [provider for provider in eligible if id(provider) not in allowed_ids]
+
+    @staticmethod
+    def _deployment_trace(provider: Any, *, capability: str) -> dict[str, Any]:
+        return {
+            "provider": str(getattr(provider, "name", "unknown"))[:128],
+            "model": str(getattr(provider, "model", "unknown"))[:256],
+            "status": "skipped",
+            "reason": "deployment_boundary",
+            "capability": capability,
+            "deployment": ModelRouter._deployment(provider).value,
+        }
+
+    def _routing_traces(
+        self, candidates: list[Any], blocked: list[Any], *, capability: str
+    ) -> list[dict[str, Any]]:
+        traces = [self._deployment_trace(provider, capability=capability) for provider in blocked]
+        if self.allow_cross_deployment_fallback and self.providers:
+            primary = self._deployment(self.providers[0])
+            for provider in candidates:
+                deployment = self._deployment(provider)
+                if deployment != primary:
+                    traces.append({
+                        "status": "explicit_cross_deployment_fallback_enabled",
+                        "capability": capability,
+                        "from_deployment": primary.value,
+                        "to_deployment": deployment.value,
+                        "provider": str(getattr(provider, "name", "unknown"))[:128],
+                    })
+        return traces
 
     @property
     def context_length(self) -> int | None:
         if not self.providers:
             return None
+        if self.allow_cross_deployment_fallback:
+            candidates = self.providers
+        else:
+            primary = self._deployment(self.providers[0])
+            candidates = (
+                [self.providers[0]]
+                if primary == ProviderDeployment.UNKNOWN
+                else [provider for provider in self.providers if self._deployment(provider) == primary]
+            )
         lengths: list[int] = []
-        for provider in self.providers:
+        for provider in candidates:
             value = getattr(provider, "context_length", None)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                # A fallback provider without a declared window prevents a safe shared budget.
+                # Any provider reachable under the deployment policy can be the active route.
                 return None
             lengths.append(value)
         return min(lengths)
@@ -46,6 +111,71 @@ class ModelRouter:
         if value < 1:
             raise ValueError(f"{variable} must be a positive integer")
         return value
+
+    @staticmethod
+    def _provider_variable(prefix: str, suffix: str) -> str:
+        return f"{prefix}_LLM_{suffix}" if prefix else f"LLM_{suffix}"
+
+    @classmethod
+    def _provider_label_from_env(cls, prefix: str, suffix: str) -> str | None:
+        variable = cls._provider_variable(prefix, suffix)
+        value = os.getenv(variable, "").strip()
+        return value or None
+
+    @classmethod
+    def _provider_integer_from_env(
+        cls, prefix: str, suffix: str, *, zero_means_unset: bool = False
+    ) -> int | None:
+        variable = cls._provider_variable(prefix, suffix)
+        raw = os.getenv(variable, "").strip()
+        if not raw:
+            return None
+        if not raw.isascii() or not raw.isdecimal():
+            raise ValueError(f"{variable} must be a positive integer")
+        value = int(raw)
+        if zero_means_unset and value == 0:
+            return None
+        if value < 1 or value > 1_000_000:
+            raise ValueError(f"{variable} must be a positive integer")
+        return value
+
+    @classmethod
+    def _deployment_from_env(cls, prefix: str) -> ProviderDeployment:
+        variable = cls._provider_variable(prefix, "DEPLOYMENT")
+        raw = os.getenv(variable, "unknown").strip().lower()
+        try:
+            return ProviderDeployment(raw)
+        except ValueError as exc:
+            raise ValueError(f"{variable} must be local, remote, or unknown") from exc
+
+    @classmethod
+    def _provider_metadata_kwargs(cls, prefix: str) -> dict[str, Any]:
+        hardware = HardwareRequirements(
+            accelerator=(cls._provider_label_from_env(prefix, "ACCELERATOR") or "unknown").lower(),
+            min_ram_gib=cls._provider_integer_from_env(prefix, "MIN_RAM_GIB"),
+            min_vram_gib=cls._provider_integer_from_env(prefix, "MIN_VRAM_GIB", zero_means_unset=True),
+            min_cpu_cores=cls._provider_integer_from_env(prefix, "MIN_CPU_CORES"),
+            min_disk_gib=cls._provider_integer_from_env(prefix, "MIN_DISK_GIB"),
+        )
+        return {
+            "model_version": cls._provider_label_from_env(prefix, "MODEL_VERSION"),
+            "quantization": cls._provider_label_from_env(prefix, "QUANTIZATION"),
+            "deployment": cls._deployment_from_env(prefix),
+            "hardware_requirements": hardware,
+            "reasoning": os.getenv(cls._provider_variable(prefix, "REASONING"), "false").strip().lower() == "true",
+            "reasoning_budget": os.getenv(cls._provider_variable(prefix, "REASONING_BUDGET"), "false").strip().lower() == "true",
+            "parallel_tool_calls": os.getenv(cls._provider_variable(prefix, "PARALLEL_TOOL_CALLS"), "false").strip().lower() == "true",
+            "long_context": os.getenv(cls._provider_variable(prefix, "LONG_CONTEXT"), "false").strip().lower() == "true",
+            "vision": os.getenv(cls._provider_variable(prefix, "VISION"), "false").strip().lower() == "true",
+        }
+
+    @staticmethod
+    def _cross_deployment_fallback_from_env() -> bool:
+        variable = "LLM_ALLOW_CROSS_DEPLOYMENT_FALLBACK"
+        raw = os.getenv(variable, "false").strip().lower()
+        if raw not in {"true", "false"}:
+            raise ValueError(f"{variable} must be true or false")
+        return raw == "true"
 
     @classmethod
     def from_env(cls):
@@ -67,6 +197,7 @@ class ModelRouter:
                     structured_output=structured,
                     priority=priority,
                     context_length=cls._context_length_from_env(f"{name}_LLM_CONTEXT_LENGTH"),
+                    **cls._provider_metadata_kwargs(name),
                 ))
         base = os.getenv("LLM_BASE_URL", "").strip()
         model = os.getenv("LLM_MODEL", "").strip()
@@ -82,9 +213,13 @@ class ModelRouter:
                 structured_output=structured,
                 priority=1000,
                 context_length=cls._context_length_from_env("LLM_CONTEXT_LENGTH"),
+                **cls._provider_metadata_kwargs(""),
             ))
         providers.sort(key=lambda item: int(getattr(item, "priority", 100)))
-        return cls(providers)
+        return cls(
+            providers,
+            allow_cross_deployment_fallback=cls._cross_deployment_fallback_from_env(),
+        )
 
     def status(self):
         result = []
@@ -198,10 +333,9 @@ class ModelRouter:
             deadline = time.monotonic() + float(timeout)
         errors = []
         attempts: list[dict[str, str]] = []
-        self.last_trace = []
-        for provider in self.providers:
-            if not self._caps(provider).generate:
-                continue
+        candidates, blocked = self._routable_providers("generate")
+        self.last_trace = self._routing_traces(candidates, blocked, capability="generate")
+        for provider in candidates:
             call_kwargs = dict(kwargs)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -228,6 +362,8 @@ class ModelRouter:
             raise ProviderTimeout("provider call deadline expired", attempts=attempts)
         if errors:
             raise self._aggregate_failure("all model providers failed", attempts)
+        if blocked:
+            raise CapabilityUnsupported("no generation provider available within deployment policy")
         raise ProviderFailure("no model provider configured")
 
     def generate_for_provider(
@@ -297,10 +433,9 @@ class ModelRouter:
             deadline = time.monotonic() + float(timeout)
         errors = []
         attempts: list[dict[str, str]] = []
-        self.last_trace = []
-        for provider in self.providers:
-            if not self._caps(provider).tool_calling:
-                continue
+        candidates, blocked = self._routable_providers("tool_calling")
+        self.last_trace = self._routing_traces(candidates, blocked, capability="tool_calling")
+        for provider in candidates:
             call_kwargs = dict(kwargs)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -327,6 +462,8 @@ class ModelRouter:
             raise ProviderTimeout("provider call deadline expired", attempts=attempts)
         if errors:
             raise self._aggregate_failure("native tool providers failed", attempts)
+        if blocked:
+            raise CapabilityUnsupported("no native tool provider available within deployment policy")
         raise CapabilityUnsupported("no provider supports native tool calling")
 
     def chat(self, messages: list[dict], temperature: float | None = None, *, tools: list[dict] | None = None, reasoning_profile: ReasoningProfile | None = None) -> dict:
