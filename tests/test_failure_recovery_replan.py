@@ -197,6 +197,53 @@ def test_reconcile_executed_records_evidence_without_replay(tmp_path, monkeypatc
     assert finished.status is MissionStatus.GOAL_COMPLETED
 
 
+def test_concurrent_reconciliation_accepts_one_writer_and_preserves_ready_state(tmp_path, monkeypatch):
+    import threading
+    import tools.registry
+
+    runtime, mission, result, _ = _ambiguous_execution_runtime(tmp_path, monkeypatch, RuntimeError("crash"))
+    assert result.status is MissionStatus.RECOVERY_REQUIRED
+    db = Path(tmp_path) / "missions.sqlite3"
+    loaded_barrier = threading.Barrier(2)
+
+    class CoordinatedStore(MissionStore):
+        def load(self, mission_id):
+            loaded = super().load(mission_id)
+            if loaded is not None and (loaded.checkpoint or {}).get("status") == "in_flight":
+                loaded_barrier.wait(timeout=3)
+            return loaded
+
+    runtimes = [
+        MissionRuntime(CoordinatedStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot),
+        MissionRuntime(CoordinatedStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot),
+    ]
+    outcomes = []
+    errors = []
+
+    def reconcile(rt):
+        try:
+            outcomes.append(rt.reconcile_in_flight(mission.mission_id, executed=True, observation={"success": True, "source": "concurrent-receipt"}))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reconcile, args=(rt,)) for rt in runtimes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(outcomes) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert str(errors[0]) in {"stale mission write rejected", "concurrent mission write rejected"}
+    persisted = MissionStore(db).load(mission.mission_id)
+    assert persisted.status is MissionStatus.READY
+    assert persisted.checkpoint.get("reconciled") is True
+    assert len(persisted.action_history) == 1
+    assert len(persisted.evidence) == 1
+
+
 def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_path, monkeypatch):
     import tools.registry
 
