@@ -34,7 +34,13 @@ def test_registered_tool_schemas_are_explicit_and_exact():
             assert not spec.validate_input({"query": "status", "extra": "ignored"})[0]
             assert not spec.validate_input({"query": 7})[0]
             assert not spec.validate_input({"query": "x" * (MAX_ARG_LENGTH + 1)})[0]
+        elif spec.argument_type is dict:
+            assert spec.allow_custom_input_schema is True
+            assert schema["properties"]
+            assert not spec.validate_input({})[0]
+            assert not spec.validate_input({"extra": "ignored"})[0]
         else:
+            assert spec.allow_custom_input_schema is False
             assert schema["properties"] == {}
             assert spec.validate_input({}) == (True, "valid", None)
             assert not spec.validate_input({"extra": "ignored"})[0]

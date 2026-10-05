@@ -24,6 +24,20 @@ test("packaged launch uses bundled executables and durable userData, not Python 
   assert.doesNotMatch(main, /CYBERSENTINEL_REPO/);
 });
 
+test("packaged Browser includes pinned Chromium and verifies the bundled runtime", () => {
+  const resource = pkg.build.extraResources.find((item) => item.from === "build/browser/ms-playwright");
+  assert.ok(resource, "Playwright's managed Chromium cache is included in the installer");
+  assert.equal(resource.to, "browser/ms-playwright");
+  assert.match(main, /env\.PLAYWRIGHT_BROWSERS_PATH\s*=\s*path\.join\(process\.resourcesPath, "browser", "ms-playwright"\)/);
+  const builder = read("scripts/build_desktop_backend.py");
+  assert.match(builder, /playwright_version_mismatch/);
+  assert.match(builder, /--desktop-browser-self-test/);
+  assert.match(builder, /--collect-all[\s\S]*?playwright/);
+  const dockerfile = read("Dockerfile");
+  assert.match(dockerfile, /PLAYWRIGHT_BROWSERS_PATH=\/ms-playwright/);
+  assert.match(dockerfile, /playwright install --with-deps chromium/);
+});
+
 test("renderer only receives narrow bootstrap and native-folder IPC methods", () => {
   assert.match(main, /contextIsolation: true/);
   assert.match(preload, /createOwner:/);
@@ -177,7 +191,7 @@ test("NSIS installer packages backend and local runtime and has a stable artifac
   assert.equal(pkg.version, "5.2.0-rc1");
   assert.deepEqual(pkg.build.win.target, [{ target: "nsis", arch: ["x64"] }]);
   assert.equal(pkg.build.win.icon, "build/icon.ico");
-  assert.deepEqual(pkg.build.extraResources.map((resource) => resource.to), ["backend", "llama"]);
+  assert.deepEqual(pkg.build.extraResources.map((resource) => resource.to), ["backend", "llama", "browser/ms-playwright"]);
   assert.equal(pkg.build.nsis.allowToChangeInstallationDirectory, true);
   assert.equal(pkg.build.nsis.artifactName, "CyberSentinel-v${version}.exe");
 });

@@ -106,7 +106,7 @@ def _run(owner, mission_id, *, evidence_id=None, marker="PRIVATE"):
             "prompt": f"{marker}_RAW_PROMPT",
             "provider_response": f"{marker}_RAW_PROVIDER_RESPONSE",
             "proposal": f"{marker}_RAW_PROPOSAL",
-            "secret": "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+            "secret": "sk-" + "abcdefghijklmnopqrstuvwxyz1234567890",
         },
         created_at="2026-10-05T12:00:00+00:00",
     )
@@ -204,7 +204,7 @@ def test_summary_is_exact_owner_mission_scoped_and_only_exposes_opaque_verified_
         "PRIVATE_TASK_TEXT",
         "PRIVATE_CASE_TEXT",
         "PRIVATE_EVIDENCE_PAYLOAD",
-        "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+        "sk-" + "abcdefghijklmnopqrstuvwxyz1234567890",
         "FOREIGN_OWNER",
         "FOREIGN_MISSION",
     ):

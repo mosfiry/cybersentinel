@@ -949,25 +949,27 @@ class MissionRuntime:
         evidence_store = None
         target_identity = None
         mission_authorization = mission.authorization_snapshot
-        if name == "run_project_tests":
+        owner_authorization = None
+        if name == "run_project_tests" or spec.execution_context_required:
             if execution_fence is None:
-                raise ExecutionFenceError("native workspace dispatch requires an execution fence")
+                raise ExecutionFenceError("native Mission tool dispatch requires an execution fence")
             if (
                 not execution_fence.queue.require_execution_fence
                 or execution_fence.queue.mission_store is not self.store
             ):
-                raise ExecutionFenceError("native workspace dispatch requires its strict queue and MissionStore")
+                raise ExecutionFenceError("native Mission tool dispatch requires its strict queue and MissionStore")
             execution_fence.assert_active_execution(mission)
             from security.mission_authorization import MissionAuthorizationSnapshot
-            from workspace import Workspace
             from .evidence import EvidenceChainStore
 
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
             mission_authorization = snapshot
-            workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
-            if not workspace_root:
-                raise ExecutionFenceError("native workspace dispatch requires the Owner-authorized workspace root")
-            workspace = Workspace(workspace_root)
+            if name == "run_project_tests":
+                from workspace import Workspace
+                workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
+                if not workspace_root:
+                    raise ExecutionFenceError("native workspace dispatch requires the Owner-authorized workspace root")
+                workspace = Workspace(workspace_root)
             evidence_store = EvidenceChainStore(
                 Path(self.store.db_path).with_name("evidence_chain.db"),
                 execution_fence=execution_fence,
@@ -975,6 +977,11 @@ class MissionRuntime:
                 mission=mission,
                 require_execution_fence=True,
             )
+            if spec.execution_context_required:
+                from security.authorization_context import AuthorizationContext
+                if not isinstance(mission.authorization_context, dict):
+                    raise ExecutionFenceError("native Browser dispatch requires the persisted Owner authorization record")
+                owner_authorization = AuthorizationContext.from_dict(dict(mission.authorization_context))
             target_identity = (
                 str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity)
                 if isinstance(mission.scope_snapshot, dict)
@@ -988,6 +995,8 @@ class MissionRuntime:
             scope_context=mission.scope_snapshot,
             request_id=mission.request_id,
             mission_authorization=mission_authorization,
+            owner_authorization=owner_authorization,
+            owner_authorization_record=dict(mission.authorization_context or {}) if spec.execution_context_required else None,
             workspace=workspace,
             evidence_store=evidence_store,
             mission_id=mission.mission_id,

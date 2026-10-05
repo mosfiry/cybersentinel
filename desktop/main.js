@@ -119,6 +119,11 @@ function bridgeEnvironment() {
   env.CYBERSENTINEL_LLM_RUNTIME_DIR = app.isPackaged
     ? path.join(process.resourcesPath, "llama")
     : path.join(app.getAppPath(), "build", "llama");
+  if (app.isPackaged) {
+    env.PLAYWRIGHT_BROWSERS_PATH = path.join(process.resourcesPath, "browser", "ms-playwright");
+  } else if (process.env.PLAYWRIGHT_BROWSERS_PATH) {
+    env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  }
   env.CYBERSENTINEL_SECRETS_DIR = path.join(root, "secrets");
   env.DB_PATH = path.join(state, "intel.sqlite3");
   env.TASK_DB_PATH = path.join(state, "tasks.sqlite3");

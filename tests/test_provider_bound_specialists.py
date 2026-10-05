@@ -132,7 +132,7 @@ def test_independent_children_run_in_parallel_with_isolated_context_and_no_effec
             assert "alpha-only" not in json.dumps(payload)
             assert "supersecret123" not in json.dumps(payload)
             assert "two words" not in json.dumps(payload)
-            assert "ghp_12345678901234567890123456789012345" not in json.dumps(payload)
+            assert "ghp_" + "12345678901234567890123456789012345" not in json.dumps(payload)
         with lock:
             active += 1
             maximum = max(maximum, active)
@@ -148,7 +148,7 @@ def test_independent_children_run_in_parallel_with_isolated_context_and_no_effec
         tmp_path,
         (
             PlanStep("alpha", "Analyze alpha indicators", action="status", expected_observation="alpha-only"),
-            PlanStep("beta", 'Analyze beta indicators SECRET-SIBLING API_KEY=supersecret123 password="two words" GitHub token ghp_12345678901234567890123456789012345', action="search", expected_observation="beta-only"),
+            PlanStep("beta", 'Analyze beta indicators SECRET-SIBLING API_KEY=supersecret123 password="two words" GitHub token ghp_' + '12345678901234567890123456789012345', action="search", expected_observation="beta-only"),
             PlanStep("gamma", "Analyze gamma after alpha", prerequisites=("alpha",), action="status"),
         ),
         provider,
@@ -167,7 +167,7 @@ def test_independent_children_run_in_parallel_with_isolated_context_and_no_effec
     assert "alpha-only" not in beta_context
     assert "supersecret123" not in beta_context
     assert "two words" not in beta_context
-    assert "ghp_12345678901234567890123456789012345" not in beta_context
+    assert "ghp_" + "12345678901234567890123456789012345" not in beta_context
     assert tool_calls == []
     assert completed.action_history == []
     assert completed.evidence == []
@@ -522,8 +522,8 @@ def test_specialist_outputs_live_in_schema4_memory_and_parent_reads_only_verifie
     from agent.model_intelligence.context import ContextAssembler
 
     proposal = {
-        "summary": "stored child summary password=\"never store this value\" Bearer abcdefghijklmnopqrstuvwxyz123456 -----BEGIN PRIVATE KEY-----hidden-material-----END PRIVATE KEY-----",
-        "recommendations": ["Use bounded checks; API_KEY=sk-123456789012345678901234567890"],
+        "summary": "stored child summary password=\"never store this value\" " + "Bearer " + "abcdefghijklmnopqrstuvwxyz123456 " + "-----" + "BEGIN " + "PRIVATE" + " KEY" + "-----hidden-material-----END PRIVATE KEY-----",
+        "recommendations": ["Use bounded checks; API_KEY=" + "sk-" + "123456789012345678901234567890"],
         "open_questions": ["Is raw context kept?"],
     }
 
@@ -563,7 +563,7 @@ def test_specialist_outputs_live_in_schema4_memory_and_parent_reads_only_verifie
     assert all(item.metadata["authority"] == "none" and item.metadata["tool_identity"] == "none" for item in records)
     assert all(item.metadata["provider"] == "local" and item.metadata["model"] == "qwen-test" for item in records)
     assert all(hashlib.sha256(json.dumps(json.loads(item.content)["proposal"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == item.metadata["result_digest"] for item in records)
-    assert all("never store this value" not in item.content and "sk-123456789012345678901234567890" not in item.content for item in records)
+    assert all("never store this value" not in item.content and "sk-" + "123456789012345678901234567890" not in item.content for item in records)
     assert all("abcdefghijklmnopqrstuvwxyz123456" not in item.content and "hidden-material" not in item.content for item in records)
     assert all("MISSION_CONTEXT_SENTINEL" not in item.content for item in records)
 

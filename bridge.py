@@ -1515,6 +1515,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if "--desktop-browser-self-test" in sys.argv[1:]:
+        from tools.browser import BrowserService
+
+        service = BrowserService()
+        try:
+            service._executor.submit(service._ensure_browser).result(timeout=45)
+            browser_version = service._executor.submit(lambda: str(service._browser.version)).result(timeout=5)
+        finally:
+            service.shutdown()
+        print(json.dumps({"ok": True, "browser_runtime": "chromium", "browser_version": browser_version}), flush=True)
+        return
     if "--desktop-self-test" in sys.argv[1:]:
         required = (WEB / "index.html", WEB / "app.js", WEB / "style.css")
         missing = [path.name for path in required if not path.is_file()]

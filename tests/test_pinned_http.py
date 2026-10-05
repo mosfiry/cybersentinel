@@ -115,6 +115,15 @@ def test_loopback_http_works_for_local_provider_but_redirect_is_not_followed():
                 max_response_bytes=64,
                 allow_loopback=True,
             )
+        redirect = pinned_http_request(
+            f"http://127.0.0.1:{server.server_port}/redirect",
+            max_response_bytes=64,
+            allow_loopback=True,
+            allow_redirect_response=True,
+        )
+        assert redirect.status == 302
+        assert redirect.headers["location"] == "http://169.254.169.254/latest/meta-data/"
+        assert redirect.body == b"local-model"
     finally:
         server.shutdown()
         server.server_close()

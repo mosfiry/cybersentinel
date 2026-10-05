@@ -29,3 +29,4 @@ tokens/
 .DS_Store
 .vscode/
 .idea/
+desktop/build/browser/

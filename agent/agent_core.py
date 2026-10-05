@@ -300,15 +300,12 @@ class AgentCore:
                 raise SkillAuthorizationError("Skill-bound tool dispatch requires a task-scoped delegation grant")
             delegation_scope = selected_skill_context.narrow_task_scope(delegation_scope, tool_name=step.action)
         arguments = dict(step.retry_policy).get("arguments", {})
-        argument = arguments.get("query") if isinstance(arguments, dict) else None
         raw = mission.authorization_context or {}
         context = AuthorizationContext.from_dict(raw)
         spec = get_tool(step.action)
         if spec is None:
             return {"success": False, "failure_class": "TOOL", "error": "unknown tool"}
-        valid, reason = spec.validate(argument)
-        if isinstance(arguments, dict) and set(arguments) - {"query"}:
-            return {"success": False, "failure_class": "TOOL", "error": "invalid tool arguments"}
+        valid, reason, argument = spec.validate_input(arguments)
         if not valid:
             return {"success": False, "failure_class": "TOOL", "error": reason}
         item = step.action if argument is None else [step.action, argument]
@@ -318,10 +315,12 @@ class AgentCore:
         from .intelligence_layer.skills import SkillAuthorizationError
         try:
             snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
-            workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
-            if not workspace_root:
-                raise PermissionError("mission workspace boundary required")
-            workspace = Workspace(workspace_root)
+            workspace = None
+            if step.action == "run_project_tests":
+                workspace_root = str(snapshot.workspace_boundary.get("root", "")).strip()
+                if not workspace_root:
+                    raise PermissionError("mission workspace boundary required")
+                workspace = Workspace(workspace_root)
             evidence_store = EvidenceChainStore(
                 Path(self.store.db_path).with_name("evidence_chain.db"),
                 execution_fence=execution_fence,
@@ -334,7 +333,7 @@ class AgentCore:
                 # Last live Skill approval/revocation/expiry check immediately before canonical dispatch.
                 selected_skill_context = self._resolve_mission_skill_context(mission)
                 delegation_scope = selected_skill_context.narrow_task_scope(delegation_scope, tool_name=step.action)
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, owner_authorization=context, owner_authorization_record=dict(raw), workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except EffectRecoveryRequired as exc:
             return {

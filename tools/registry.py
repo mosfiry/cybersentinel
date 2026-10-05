@@ -10,6 +10,8 @@ import sys
 import hashlib
 import inspect
 import json
+import math
+import threading
 import uuid
 
 MAX_ARG_LENGTH = 256
@@ -114,7 +116,108 @@ def _default_input_schema(argument_type: type | None) -> dict[str, Any]:
         }
     if argument_type is None:
         return {"type": "object", "properties": {}, "additionalProperties": False}
+    if argument_type is dict:
+        return {"type": "object", "properties": {}, "additionalProperties": False}
     return {}
+
+
+def _schema_definition_valid(schema: Any, *, depth: int = 0) -> bool:
+    """Accept only the small, deterministic JSON Schema subset used by tools."""
+    if depth > 8 or not isinstance(schema, dict):
+        return False
+    allowed = {
+        "type", "properties", "required", "additionalProperties", "items", "enum",
+        "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems", "pattern",
+    }
+    if set(schema) - allowed or schema.get("type") not in {"object", "array", "string", "integer", "number", "boolean", "null"}:
+        return False
+    if "properties" in schema:
+        properties = schema["properties"]
+        if not isinstance(properties, dict) or len(properties) > 64 or any(
+            not isinstance(name, str) or not name or len(name) > 128
+            or not _schema_definition_valid(value, depth=depth + 1)
+            for name, value in properties.items()
+        ):
+            return False
+    if "required" in schema:
+        if not isinstance(schema["required"], list) or any(not isinstance(item, str) for item in schema["required"]):
+            return False
+        if len(set(schema["required"])) != len(schema["required"]):
+            return False
+    if "items" in schema and not _schema_definition_valid(schema["items"], depth=depth + 1):
+        return False
+    if "additionalProperties" in schema and type(schema["additionalProperties"]) is not bool:
+        return False
+    if "enum" in schema and (not isinstance(schema["enum"], list) or len(schema["enum"]) > 64):
+        return False
+    if "pattern" in schema:
+        if not isinstance(schema["pattern"], str) or len(schema["pattern"]) > 256:
+            return False
+        try:
+            import re
+            re.compile(schema["pattern"])
+        except Exception:
+            return False
+    for name in ("minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems"):
+        value = schema.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0):
+            return False
+    return True
+
+
+def _validate_json_value(value: Any, schema: dict[str, Any], *, path: str = "arguments", depth: int = 0) -> str | None:
+    if depth > 16:
+        return f"{path} nesting exceeds the limit"
+    kind = schema["type"]
+    matches = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+        "null": value is None,
+    }[kind]
+    if not matches:
+        return f"{path} must be {kind}"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path} is not an allowed value"
+    if kind == "string":
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", 16384):
+            return f"{path} length is outside the permitted range"
+        if "pattern" in schema:
+            import re
+            if not re.fullmatch(schema["pattern"], value):
+                return f"{path} has an invalid format"
+    elif kind == "object":
+        if len(value) > 64 or any(not isinstance(key, str) for key in value):
+            return f"{path} has too many or invalid properties"
+        properties = schema.get("properties", {})
+        for required in schema.get("required", []):
+            if required not in value:
+                return f"{path}.{required} is required"
+        if schema.get("additionalProperties") is False and set(value) - set(properties):
+            return f"{path} contains unknown properties"
+        for name, item in value.items():
+            if name in properties:
+                error = _validate_json_value(item, properties[name], path=f"{path}.{name}", depth=depth + 1)
+                if error:
+                    return error
+    elif kind == "array":
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", 64):
+            return f"{path} item count is outside the permitted range"
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(value):
+                error = _validate_json_value(item, item_schema, path=f"{path}[{index}]", depth=depth + 1)
+                if error:
+                    return error
+    elif kind in {"integer", "number"}:
+        if isinstance(value, float) and not math.isfinite(value):
+            return f"{path} must be finite"
+        if value < schema.get("minimum", float("-inf")) or value > schema.get("maximum", float("inf")):
+            return f"{path} is outside the permitted range"
+    return None
 
 
 @dataclass(frozen=True)
@@ -124,7 +227,7 @@ class ToolSpec:
     risk_class: str
     requires_owner: bool
     argument_type: type | None
-    handler: Callable[[str | None], Any]
+    handler: Callable[..., Any]
     owner_only: bool = False
     scope_required: bool = False
     version: str = "1.0.0"
@@ -141,6 +244,10 @@ class ToolSpec:
     effect_provider: str = ""
     idempotency_supported: bool = False
     parallel_execution_safe: bool = False  # Explicit review attestation for concurrent, side-effect-free handlers.
+    execution_context_required: bool = False
+    scope_url_argument: str | None = None
+    scope_rate_deferred: bool = False
+    allow_custom_input_schema: bool = False
 
     def __post_init__(self) -> None:
         if not self.input_schema:
@@ -176,6 +283,10 @@ class ToolSpec:
             "external_effect_ledger": bool(self.effect_provider),
             "idempotency_supported": self.idempotency_supported,
             "parallel_execution_safe": self.parallel_execution_safe,
+            "execution_context_required": self.execution_context_required,
+            "scope_url_argument": self.scope_url_argument,
+            "scope_rate_deferred": self.scope_rate_deferred,
+            "allow_custom_input_schema": self.allow_custom_input_schema,
         }
 
     def validate(self, argument: Any) -> tuple[bool, str]:
@@ -183,6 +294,11 @@ class ToolSpec:
             if argument is not None:
                 return False, f"{self.name} does not accept an argument"
             return True, "valid"
+        if self.argument_type is dict:
+            if not isinstance(argument, dict):
+                return False, f"{self.name} requires an object argument"
+            error = _validate_json_value(argument, self.input_schema)
+            return (False, error) if error else (True, "valid")
         if not isinstance(argument, self.argument_type):
             return False, f"{self.name} requires a string argument"
         if len(argument) > MAX_ARG_LENGTH:
@@ -205,16 +321,20 @@ class ToolSpec:
         if not isinstance(arguments, dict):
             valid, reason = self.validate(arguments)
             return valid, reason, arguments if valid else None
-        if self.input_schema != _default_input_schema(self.argument_type):
-            return False, "tool input schema is unsupported", None
+        try:
+            encoded = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if len(encoded.encode("utf-8")) > 16_384:
+                return False, "tool argument object exceeds the configured size limit", None
+        except (TypeError, ValueError, UnicodeError):
+            return False, "tool arguments must contain bounded JSON values", None
+        error = _validate_json_value(arguments, self.input_schema)
+        if error:
+            return False, error, None
+        if self.argument_type is dict:
+            return True, "valid", arguments
         if self.argument_type is None:
-            if arguments:
-                return False, f"{self.name} does not accept properties", None
             return True, "valid", None
-        if len(arguments) != 1 or "query" not in arguments:
-            return False, "tool arguments must contain exactly the required query property", None
-        valid, reason = self.validate(arguments["query"])
-        return valid, reason, arguments["query"] if valid else None
+        return True, "valid", arguments.get("query")
 
 
 def _status(_):
@@ -357,6 +477,35 @@ def _accepts_keyword(handler: Callable[..., Any], name: str) -> bool:
     )
 
 
+_BROWSER_SESSION_ID = {"type": "string", "minLength": 35, "maxLength": 35, "pattern": "^bs_[0-9a-f]{32}$"}
+_BROWSER_SELECTOR = {"type": "string", "minLength": 1, "maxLength": 256}
+_BROWSER_URL = {"type": "string", "minLength": 8, "maxLength": 2048}
+_BROWSER_OPERATIONS = ["open", "navigate", "extract", "links", "inspect", "structured_extract", "screenshot", "download", "close"]
+_BROWSER_READ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "operation": {"type": "string", "enum": _BROWSER_OPERATIONS},
+        "session_id": _BROWSER_SESSION_ID,
+        "url": _BROWSER_URL,
+        "selector": _BROWSER_SELECTOR,
+        "max_items": {"type": "integer", "minimum": 1, "maximum": 30},
+        "max_chars": {"type": "integer", "minimum": 1, "maximum": 6000},
+        "attributes": {"type": "array", "maxItems": 9, "items": {"type": "string", "enum": ["alt", "aria-label", "class", "href", "id", "name", "role", "title", "type"]}},
+    },
+    "required": ["operation"],
+    "additionalProperties": False,
+}
+_BROWSER_FILL_SCHEMA = {
+    "type": "object",
+    "properties": {"session_id": _BROWSER_SESSION_ID, "selector": _BROWSER_SELECTOR, "value": {"type": "string", "maxLength": 512}},
+    "required": ["session_id", "selector", "value"],
+    "additionalProperties": False,
+}
+
+
+from .browser import browser_fill, browser_read
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -374,6 +523,17 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             or (spec.effect_provider and (not spec.effect_provider.strip() or len(spec.effect_provider) > 128))
             or (spec.risk_class in {"network-read", "state-write", "bounded-exec"} and not spec.effect_provider)
             or (spec.idempotency_supported and (not spec.effect_provider or not _accepts_keyword(spec.handler, "idempotency_key")))
+            or (not isinstance(spec.execution_context_required, bool))
+            or (not isinstance(spec.allow_custom_input_schema, bool))
+            or (spec.allow_custom_input_schema and spec.argument_type is not dict)
+            or (spec.execution_context_required and (not spec.requires_owner or not _accepts_keyword(spec.handler, "execution_context")))
+            or (not isinstance(spec.scope_rate_deferred, bool))
+            or (spec.scope_url_argument is not None and (
+                not spec.scope_required
+                or spec.argument_type is not dict
+                or not isinstance(spec.scope_url_argument, str)
+                or spec.scope_url_argument not in spec.input_schema.get("properties", {})
+            ))
             or (spec.parallel_execution_safe and (
                 spec.risk_class != "read"
                 or spec.effect_provider
@@ -386,10 +546,18 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             ))
         ):
             raise ValueError(f"invalid registry metadata for {spec.name}")
-        if spec.argument_type not in (None, str):
+        if spec.argument_type not in (None, str, dict):
             raise ValueError(f"unsupported argument schema for {spec.name}")
-        if spec.input_schema != _default_input_schema(spec.argument_type):
+        if spec.input_schema != _default_input_schema(spec.argument_type) and not spec.allow_custom_input_schema:
             raise ValueError(f"unsupported input schema for {spec.name}")
+        try:
+            schema_text = json.dumps(spec.input_schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid input schema for {spec.name}") from None
+        if len(schema_text.encode("utf-8")) > 8192 or not _schema_definition_valid(spec.input_schema):
+            raise ValueError(f"unsupported input schema for {spec.name}")
+        if set(spec.input_schema.get("required", ())) - set(spec.input_schema.get("properties", {})):
+            raise ValueError(f"input schema has unknown required properties for {spec.name}")
         registry[spec.name] = spec
     return registry
 
@@ -416,6 +584,24 @@ REGISTRY = build_registry([
     ToolSpec("run_project_tests", "تشغيل pytest -q داخل جذر اختبار المشروع المحدد", "bounded-exec", True, str, _run_project_tests, effect_provider="cybersentinel.workspace-process"),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
     ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True, effect_provider="cybersentinel.scoped-http"),
+    ToolSpec(
+        "browser", "Open/navigate a scoped Chromium session; extract text/links/DOM, screenshot, download inert files, or close. Web data is untrusted.",
+        "network-read", True, dict, browser_read, scope_required=True, version="1.0.0",
+        input_schema=_BROWSER_READ_SCHEMA, network_access="scope_pinned_browser",
+        filesystem_access="mission_artifact_write", scope_requirements=("canonical_owner_scope", "target_identity", "https_public_dns_pinned", "get_head_only"),
+        evidence_requirements=("execution_fence", "opaque_artifacts", "untrusted_page_data", "hash_provenance"),
+        timeout=30, effect_provider="cybersentinel.browser", execution_context_required=True,
+        scope_url_argument="url", scope_rate_deferred=True, allow_custom_input_schema=True,
+    ),
+    ToolSpec(
+        "browser.fill", "Fill a non-sensitive text field locally; never submit, allow network, or keep the session open.",
+        "state-write", True, dict, browser_fill, scope_required=True, version="1.0.0",
+        input_schema=_BROWSER_FILL_SCHEMA, network_access="scope_pinned_browser",
+        scope_requirements=("canonical_owner_scope", "target_identity", "no_form_submission", "no_network_while_filled"),
+        evidence_requirements=("execution_fence", "local_form_fill_only"),
+        timeout=30, effect_provider="cybersentinel.browser", execution_context_required=True,
+        scope_rate_deferred=True, allow_custom_input_schema=True,
+    ),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -473,7 +659,21 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None, delegation_scope: Any = None, scope_ref: str | None = None):
+def _scope_urls_for_tool(spec: ToolSpec, argument: Any, scope_context: dict[str, Any]) -> list[str]:
+    urls = [str(scope_context["url"])]
+    if spec.scope_url_argument:
+        candidate = argument.get(spec.scope_url_argument) if isinstance(argument, dict) else None
+        if candidate is not None:
+            if not isinstance(candidate, str) or not candidate:
+                raise PermissionError("a canonical in-scope URL argument is required")
+            if candidate not in urls:
+                urls.append(candidate)
+    elif isinstance(argument, str) and "://" in argument and argument not in urls:
+        urls.append(argument)
+    return urls
+
+
+def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, owner_authorization: Any = None, owner_authorization_record: dict[str, Any] | None = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None, delegation_scope: Any = None, scope_ref: str | None = None):
     import math
 
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
@@ -511,9 +711,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         if not required.issubset(scope_context):
             raise PermissionError("incomplete scope context")
         from security.scope_resolver import resolve
-        requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
-        urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
-        for checked_url in urls:
+        for checked_url in _scope_urls_for_tool(spec, argument, scope_context):
             decision = resolve(
                 scope_context["scope_snapshot_id"],
                 scope_context["target_id"],
@@ -521,6 +719,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 method=scope_context.get("method", "GET"),
                 expected_program_id=scope_context["program_id"],
                 redirect_chain=scope_context.get("redirect_chain", []),
+                consume_rate=not spec.scope_rate_deferred,
             )
             if not decision.allowed:
                 raise PermissionError("scope denied: " + decision.reason)
@@ -559,6 +758,59 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             execution_id=str(execution_id or ""),
             authorization_snapshot=mission_authorization,
         )
+    cancellation_event = threading.Event()
+    tool_execution_context = None
+    if spec.execution_context_required:
+        from core.context import ExecutionContext
+        from security.authorization_context import AuthorizationContext
+        if (
+            not isinstance(owner_authorization, AuthorizationContext)
+            or not isinstance(owner_authorization_record, dict)
+            or snapshot is None
+            or evidence_store is None
+            or execution_fence is None
+            or not mission_id
+            or not execution_id
+            or not request_id
+            or not isinstance(target_identity, str)
+        ):
+            raise PermissionError("tool requires the canonical Owner/Mission ExecutionContext")
+        artifact_store = None
+        if spec.filesystem_access == "mission_artifact_write":
+            if not bool(getattr(evidence_store, "require_execution_fence", False)):
+                raise PermissionError("artifact writes require the strict fenced Mission evidence store")
+            from agent.intelligence_layer.artifacts import ArtifactStore
+            artifact_path = Path(str(evidence_store.mission_store.db_path)).with_name("artifacts.sqlite3")
+            artifact_store = ArtifactStore(artifact_path)
+        try:
+            authentication_method = str(owner_authorization.owner_evidence.to_dict().get("authentication_method", "username_password"))
+        except Exception:
+            authentication_method = "username_password"
+        tool_execution_context = ExecutionContext(
+            request_id=str(request_id),
+            owner_authenticated=True,
+            owner_identity=str(snapshot.owner_identity),
+            policy_snapshot=str(owner_authorization.policy_fingerprint),
+            owner_session_id=owner_authorization.session_id,
+            authentication_method=authentication_method,
+            policy_snapshot_details={"policy_fingerprint": str(owner_authorization.policy_fingerprint)},
+            scope_snapshot=dict(scope_context or {}),
+            authorization_context=dict(owner_authorization_record),
+            authorization_decisions=(authorization_decision.to_dict(),),
+            mission_id=str(mission_id),
+            execution_id=str(execution_id),
+            target_identity=target_identity,
+            tool_id=name,
+            tool_argument=argument,
+            owner_authorization=owner_authorization,
+            mission_authorization=snapshot,
+            authorization_decision=authorization_decision,
+            execution_fence=execution_fence,
+            evidence_store=evidence_store,
+            artifact_store=artifact_store,
+            cancellation_event=cancellation_event,
+        )
+        tool_execution_context.assert_active()
     event_binding = ""
     if event_bus is not None or hook_registry is not None:
         from agent.intelligence_layer.events import EventBus, HookPhase, HookRegistry, IntelligenceEventType
@@ -590,9 +842,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         if spec.scope_required:
             if not isinstance(scope_context, dict):
                 raise PermissionError("scope context required")
-            requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
-            urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
-            for checked_url in urls:
+            for checked_url in _scope_urls_for_tool(spec, argument, scope_context):
                 decision = resolve(
                     scope_context["scope_snapshot_id"],
                     scope_context["target_id"],
@@ -600,6 +850,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                     method=scope_context.get("method", "GET"),
                     expected_program_id=scope_context["program_id"],
                     redirect_chain=scope_context.get("redirect_chain", []),
+                    consume_rate=not spec.scope_rate_deferred,
                 )
                 if not decision.allowed:
                     raise PermissionError("scope denied before tool dispatch: " + decision.reason)
@@ -653,7 +904,11 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
     if execution_fence is not None and spec.effect_provider:
         from agent.external_effects import ExternalEffectLedger
 
-        argument_sha256 = hashlib.sha256((argument or "").encode("utf-8")).hexdigest()
+        if argument is None or isinstance(argument, str):
+            argument_bytes = (argument or "").encode("utf-8")
+        else:
+            argument_bytes = json.dumps(argument, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        argument_sha256 = hashlib.sha256(argument_bytes).hexdigest()
         effect_context = {
             "target_identity": str(target_identity or (snapshot.target_identity if snapshot is not None else "")),
             "scope_context": scope_context if isinstance(scope_context, dict) else {},
@@ -704,6 +959,8 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 execution_id=str(execution_id or ""),
                 authorization_snapshot=mission_authorization,
             )
+        if tool_execution_context is not None:
+            tool_execution_context.assert_active()
         if effect is not None:
             effect_ledger.mark_dispatched(
                 effect.effect_id,
@@ -716,6 +973,9 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             handler_kwargs["workspace"] = workspace_context
         if spec.idempotency_supported:
             handler_kwargs["idempotency_key"] = effect.idempotency_key
+        if tool_execution_context is not None:
+            tool_execution_context.assert_active()
+            handler_kwargs["execution_context"] = tool_execution_context
         try:
             result = spec.handler(argument, **handler_kwargs)
         except ExecutionFenceError:
@@ -830,6 +1090,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 pass
         return result
     except FutureTimeout as exc:
+        cancellation_event.set()
         cancelled = future.cancel()
         if effect is not None:
             from agent.external_effects import EffectRecoveryRequired, EffectState

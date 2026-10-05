@@ -159,12 +159,15 @@ def pinned_http_request(
     timeout: float = 15.0,
     max_response_bytes: int = 2_000_000,
     allow_loopback: bool = False,
+    allow_redirect_response: bool = False,
 ) -> PinnedHTTPResponse:
     """Send one bounded HTTP request to a DNS-pinned address without redirects.
 
     Environment proxies are intentionally ignored so that they cannot redirect
-    the request around the validated destination. Only explicitly configured
-    loopback model endpoints may use clear-text HTTP or a private address.
+    the request around the validated destination. Redirects are not followed;
+    an intercepting browser may explicitly request the bounded 3xx response so
+    its next URL can receive a separate scope decision. Only explicitly
+    configured loopback model endpoints may use clear-text HTTP/private hosts.
     """
     if not isinstance(url, str) or not url or len(url) > _MAX_URL_LENGTH:
         raise PinnedRequestError("URL is empty or exceeds the limit")
@@ -214,7 +217,7 @@ def pinned_http_request(
     try:
         connection.request(method, target, body=body, headers=request_headers)
         response = connection.getresponse()
-        if 300 <= response.status < 400:
+        if 300 <= response.status < 400 and not allow_redirect_response:
             response.close()
             raise PinnedRequestError("HTTP redirects are not allowed")
         content = response.read(max_response_bytes + 1)

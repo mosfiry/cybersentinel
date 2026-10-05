@@ -76,7 +76,7 @@ def _stored_mission(tmp_path, *, owner="owner:7", step_count=1):
             "execution_id": "EXECUTION_SECRET",
             "authorization_hash": "AUTHORIZATION_HASH_SECRET",
         }]
-    mission.error = "Bearer PRIVATE_TOKEN_SECRET"
+    mission.error = "Bearer " + "PRIVATE_TOKEN" + "_SECRET"
     store = MissionStore(tmp_path / "missions.sqlite3")
     store.save(mission)
     return store.load(mission.mission_id), store

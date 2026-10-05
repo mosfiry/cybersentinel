@@ -45,6 +45,11 @@
         "from": "build/llama",
         "to": "llama",
         "filter": ["**/*"]
+      },
+      {
+        "from": "build/browser/ms-playwright",
+        "to": "browser/ms-playwright",
+        "filter": ["**/*"]
       }
     ],
     "win": {
