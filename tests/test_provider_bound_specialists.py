@@ -121,6 +121,8 @@ def test_independent_children_run_in_parallel_with_isolated_context_and_no_effec
         if payload["task_objective"].startswith("Analyze beta"):
             assert "alpha-only" not in json.dumps(payload)
             assert "supersecret123" not in json.dumps(payload)
+            assert "two words" not in json.dumps(payload)
+            assert "ghp_12345678901234567890123456789012345" not in json.dumps(payload)
         with lock:
             active += 1
             maximum = max(maximum, active)
@@ -136,7 +138,7 @@ def test_independent_children_run_in_parallel_with_isolated_context_and_no_effec
         tmp_path,
         (
             PlanStep("alpha", "Analyze alpha indicators", action="status", expected_observation="alpha-only"),
-            PlanStep("beta", "Analyze beta indicators SECRET-SIBLING API_KEY=supersecret123", action="search", expected_observation="beta-only"),
+            PlanStep("beta", 'Analyze beta indicators SECRET-SIBLING API_KEY=supersecret123 password="two words" GitHub token ghp_12345678901234567890123456789012345', action="search", expected_observation="beta-only"),
             PlanStep("gamma", "Analyze gamma after alpha", prerequisites=("alpha",), action="status"),
         ),
         provider,
@@ -154,6 +156,8 @@ def test_independent_children_run_in_parallel_with_isolated_context_and_no_effec
     beta_context = next(value for objective, value in by_objective.items() if objective.startswith("Analyze beta indicators"))
     assert "alpha-only" not in beta_context
     assert "supersecret123" not in beta_context
+    assert "two words" not in beta_context
+    assert "ghp_12345678901234567890123456789012345" not in beta_context
     assert tool_calls == []
     assert completed.action_history == []
     assert completed.evidence == []
