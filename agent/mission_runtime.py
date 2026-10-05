@@ -40,7 +40,7 @@ class _MissionBudgetExceeded(RuntimeError):
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_context_provider: Callable[[Mission], Any] | None = None, specialist_generate: Callable[..., dict[str, Any]] | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_context_provider: Callable[[Mission], Any] | None = None, specialist_generate: Callable[..., dict[str, Any]] | None = None, mission_memory_writer: Callable[[Mission], Any] | None = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -65,6 +65,9 @@ class MissionRuntime:
         self.hook_registry = hook_registry
         self.skill_context_provider = skill_context_provider
         self.specialist_generate = specialist_generate
+        if mission_memory_writer is not None and not callable(mission_memory_writer):
+            raise TypeError("mission_memory_writer must be callable")
+        self.mission_memory_writer = mission_memory_writer
         if task_graph_policy is not None and not isinstance(task_graph_policy, AgentGraphPolicy):
             raise TypeError("MissionRuntime task_graph_policy must be an AgentGraphPolicy")
         self.task_graph_adapter = MissionTaskGraphAdapter(task_graph_policy) if task_graph_policy is not None else None
@@ -488,8 +491,18 @@ class MissionRuntime:
         if fence is None:
             if self.require_execution_fence:
                 raise ExecutionFenceError("mission state mutation requires an execution fence")
-            return self.store.save(mission)
-        return self.store.save(mission, execution_fence=fence)
+            saved = self.store.save(mission)
+        else:
+            saved = self.store.save(mission, execution_fence=fence)
+        if saved.is_terminal and self.mission_memory_writer is not None:
+            try:
+                self.mission_memory_writer(saved)
+            except Exception:
+                # Optional memory persistence must never change a committed
+                # Mission outcome or cause a replay of its external effects.
+                import logging
+                logging.getLogger(__name__).warning("mission_episode_memory_persist_failed")
+        return saved
 
     @staticmethod
     def _executor_accepts_fence(executor: Callable[..., Any]) -> bool:

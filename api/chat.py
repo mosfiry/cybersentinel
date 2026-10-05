@@ -27,7 +27,7 @@ def _runtime() -> MissionTaskAdapter:
 
 
 def _agent_core() -> AgentCore:
-    return AgentCore(RUNTIME.router)
+    return AgentCore(RUNTIME.router, enable_mission_memory=True)
 
 
 def _task_public(task) -> dict[str, Any]:

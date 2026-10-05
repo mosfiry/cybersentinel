@@ -319,6 +319,10 @@ class DurableMemoryProvider(MemoryProvider):
         owner_identity_ref: str | None = None,
         mission_id: str | None = None,
         agent_id: str | None = None,
+        scope: tuple[str, ...] | list[str] | None = None,
+        strict_scope: bool = False,
+        exclude_mission_id: str | None = None,
+        max_age_days: int = 90,
         minimum_confidence: float | None = None,
     ):
         self.conversation_id = conversation_id
@@ -327,10 +331,49 @@ class DurableMemoryProvider(MemoryProvider):
         self.owner_identity_ref = owner_identity_ref
         self.mission_id = mission_id
         self.agent_id = agent_id
+        self.scope = tuple(str(value) for value in scope) if scope is not None else None
+        self.strict_scope = bool(strict_scope)
+        self.exclude_mission_id = exclude_mission_id
+        self.max_age_days = max_age_days
         self.minimum_confidence = minimum_confidence
 
     def retrieve_relevant(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         from agent.memory import MemoryProvider as DurableProvider
+        if self.strict_scope:
+            if not self.owner_identity_ref or not self.scope:
+                return []
+            return [
+                {
+                    "id": result.item.memory_id,
+                    "content": result.item.content,
+                    "memory_type": result.item.memory_type.value,
+                    "trust_classification": result.item.trust_classification.value,
+                    "provenance": result.item.provenance,
+                    "content_hash": result.item.content_hash,
+                    "domain": result.item.domain.value,
+                    "request_id": result.item.request_id,
+                    "source": result.item.source,
+                    "mission_id": result.item.mission_id,
+                    "scope": list(result.item.scope),
+                    "confidence": result.confidence,
+                    "sensitivity": result.item.sensitivity.value,
+                    "validation_state": result.item.validation_state.value,
+                    "relevance": result.relevance,
+                    "recency": result.recency,
+                    "provenance_score": result.provenance_score,
+                    "score": result.score,
+                }
+                for result in DurableProvider.retrieve_scoped_memory(
+                    owner_identity_ref=self.owner_identity_ref,
+                    scope=self.scope,
+                    query=query,
+                    limit=min(max(int(limit), 1), 20),
+                    domain=self.domain,
+                    exclude_mission_id=self.exclude_mission_id or self.mission_id,
+                    minimum_confidence=self.minimum_confidence if self.minimum_confidence is not None else 0.0,
+                    max_age_days=self.max_age_days,
+                )
+            ]
         return [
             {
                 "id": item.memory_id,
@@ -632,15 +675,26 @@ class ContextBuilder:
             if not content:
                 continue
             
+            wrapped_content = f"[UNTRUSTED_MEMORY][NO_AUTHORITY] {content}"
             memory_item = ContextItem(
                 role="user",
-                content=f"[UNTRUSTED_MEMORY] {content}",
+                content=wrapped_content,
                 source=ContextSource.MEMORY,
                 trust_level=TrustLevel.UNTRUSTED_DATA,
-                metadata={"memory_id": item.get("id"), "priority": "low"},
+                metadata={
+                    "memory_id": item.get("id"),
+                    "source": item.get("source"),
+                    "provenance": item.get("provenance"),
+                    "relevance": item.get("relevance"),
+                    "recency": item.get("recency"),
+                    "confidence": item.get("confidence"),
+                    "provenance_score": item.get("provenance_score"),
+                    "score": item.get("score"),
+                    "priority": "low",
+                },
             )
             
-            if self.budget.add_item(len(content) + 10):
+            if self.budget.add_item(len(wrapped_content)):
                 self.items.append(memory_item)
                 self.provenance.append({
                     "source": "memory",

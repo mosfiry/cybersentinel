@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -25,8 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MEMORY_DB_PATH = Path(os.getenv("MEMORY_DB_PATH", str(ROOT / "memory.sqlite3"))).expanduser()
 MEMORY_SCHEMA_VERSION = 4
 
-# Ensure database directory exists
-MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+# Ensure a newly created database directory/file is private to the app owner.
+MEMORY_DB_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 # Lock for thread-safe database operations
 _memory_lock = threading.Lock()
@@ -74,6 +75,14 @@ class MemoryValidationState(str, Enum):
     REJECTED = "rejected"
 
 
+class MemoryLayer(str, Enum):
+    """Logical memory layers projected over the existing v4 record types."""
+    WORKING = "working"
+    EPISODIC = "episodic"
+    SEMANTIC = "semantic"
+    PROCEDURAL = "procedural"
+
+
 @dataclass(frozen=True)
 class MemoryItem:
     """Individual memory item with provenance."""
@@ -119,6 +128,19 @@ class MemoryItem:
             object.__setattr__(self, "sensitivity", MemorySensitivity(self.sensitivity))
         if not isinstance(self.validation_state, MemoryValidationState):
             object.__setattr__(self, "validation_state", MemoryValidationState(self.validation_state))
+
+    @property
+    def layer(self) -> MemoryLayer:
+        """Map legacy record types to logical layers without changing schema v4."""
+        if self.memory_type in {MemoryType.RECENT, MemoryType.ACTIVE_OBJECTIVE, MemoryType.UNRESOLVED_QUESTION}:
+            return MemoryLayer.WORKING
+        if self.memory_type in {MemoryType.INVESTIGATION, MemoryType.TOOL_RESULT, MemoryType.REASONING_CASE, MemoryType.DECISION}:
+            return MemoryLayer.EPISODIC
+        if self.memory_type in {MemoryType.FACT, MemoryType.PROJECT_FACT, MemoryType.PREFERENCE, MemoryType.SUMMARY}:
+            return MemoryLayer.SEMANTIC
+        # Executable procedures are deliberately not MemoryItems; approved declarative
+        # Skills remain in the separate Owner-controlled SkillRegistry.
+        return MemoryLayer.EPISODIC
     
     @classmethod
     def create(
@@ -212,10 +234,27 @@ class MemoryItem:
         return cls(**data)
 
 
+@dataclass(frozen=True)
+class MemoryRetrieval:
+    """A ranked but still-untrusted memory item and its auditable score parts."""
+    item: MemoryItem
+    relevance: float
+    recency: float
+    confidence: float
+    provenance_score: float
+    score: float
+
+
 @contextmanager
 def _get_memory_db():
     """Get memory database connection context manager."""
     conn = sqlite3.connect(str(MEMORY_DB_PATH), check_same_thread=False)
+    if os.name == "posix":
+        try:
+            os.chmod(MEMORY_DB_PATH, 0o600)
+        except OSError:
+            conn.close()
+            raise
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -632,6 +671,122 @@ class MemoryProvider:
 
         sorted_memory = sorted(all_memory, key=sort_key)
         return sorted_memory[:limit]
+
+    @staticmethod
+    def retrieve_scoped_memory(
+        *,
+        owner_identity_ref: str,
+        scope: tuple[str, ...] | list[str],
+        query: str,
+        limit: int = 5,
+        domain: MemoryDomain | str | None = None,
+        exclude_mission_id: str | None = None,
+        minimum_confidence: float = 0.0,
+        max_age_days: int = 90,
+        max_total_bytes: int = 16_384,
+    ) -> list["MemoryRetrieval"]:
+        """Retrieve only exact Owner/scope matches using bounded deterministic ranking.
+
+        Mission IDs remain provenance; matching across Missions is allowed only when
+        the canonical Owner and hashed Owner-approved scope key are identical.
+        Returned records remain untrusted data regardless of score or validation state.
+        """
+        owner = str(owner_identity_ref).strip()
+        canonical_scope = tuple(str(value).strip() for value in scope)
+        text = str(query)
+        if not owner or len(owner) > 256 or not canonical_scope or len(canonical_scope) > 16 or any(not value or len(value) > 256 for value in canonical_scope) or len(set(canonical_scope)) != len(canonical_scope):
+            raise ValueError("scoped_memory_owner_and_scope_required")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+            raise ValueError("scoped_memory_limit_invalid")
+        if not text.strip() or len(text) > 2048:
+            return []
+        if isinstance(max_age_days, bool) or not isinstance(max_age_days, int) or not 1 <= max_age_days <= 3650:
+            raise ValueError("scoped_memory_age_limit_invalid")
+        if isinstance(max_total_bytes, bool) or not isinstance(max_total_bytes, int) or not 1 <= max_total_bytes <= 65_536:
+            raise ValueError("scoped_memory_byte_limit_invalid")
+        if isinstance(minimum_confidence, bool) or not isinstance(minimum_confidence, (int, float)) or not 0 <= float(minimum_confidence) <= 1:
+            raise ValueError("scoped_memory_confidence_invalid")
+        domain_value = domain.value if isinstance(domain, MemoryDomain) else str(domain) if domain is not None else None
+        normalize_tokens = lambda value: re.findall(r"\w+", value.casefold().replace("_", " ").replace("-", " "))
+        query_terms = set(normalize_tokens(text))
+        if not query_terms:
+            return []
+        query_terms = set(sorted(query_terms)[:64])
+        scope_json = json.dumps(list(canonical_scope), ensure_ascii=False)
+        clauses = [
+            "owner_identity_ref = ?", "scope = ?", "superseded_by IS NULL",
+            "sensitivity != ?", "validation_state != ?",
+            "length(CAST(content AS BLOB)) <= 8192", "length(metadata) <= 8192",
+        ]
+        values: list[Any] = [owner, scope_json, MemorySensitivity.SENSITIVE.value, MemoryValidationState.REJECTED.value]
+        if domain_value is not None:
+            clauses.append("domain = ?")
+            values.append(domain_value)
+        if exclude_mission_id is not None:
+            clauses.append("mission_id != ?")
+            values.append(str(exclude_mission_id))
+        with _get_memory_db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_items WHERE " + " AND ".join(clauses)
+                + " ORDER BY updated_at DESC, memory_id ASC LIMIT 500",
+                values,
+            ).fetchall()
+
+        now = datetime.now(timezone.utc)
+        half_life_days = max(1.0, max_age_days / 3.0)
+        ranked: list[MemoryRetrieval] = []
+        for row in rows:
+            try:
+                item = MemoryProvider._from_row(row)
+                updated = datetime.fromisoformat(item.updated_at.replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                age_days = (now - updated.astimezone(timezone.utc)).total_seconds() / 86_400
+                content_bytes = len(item.content.encode("utf-8"))
+                if age_days < -0.005 or age_days > max_age_days or content_bytes > 8192:
+                    continue
+                if item.owner_identity_ref != owner or item.scope != canonical_scope:
+                    continue
+                if item.confidence < float(minimum_confidence) or not item.source.strip() or not item.provenance.strip():
+                    continue
+                metadata = item.metadata if isinstance(item.metadata, dict) else {}
+                if metadata.get("revoked") is True:
+                    continue
+                if "revoked" in metadata and metadata.get("revoked") is not False:
+                    continue
+                expires_at = metadata.get("expires_at")
+                if expires_at is not None:
+                    if not isinstance(expires_at, str):
+                        continue
+                    expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    if expires.tzinfo is None:
+                        expires = expires.replace(tzinfo=timezone.utc)
+                    if expires.astimezone(timezone.utc) <= now:
+                        continue
+                content_terms = set(normalize_tokens(item.content))
+                overlap = query_terms & content_terms
+                if not overlap:
+                    continue
+                relevance = len(overlap) / len(query_terms)
+                recency = math.pow(2.0, -max(0.0, age_days) / half_life_days)
+                provenance_score = 1.0 if re.search(r"(?:sha256:)?[0-9a-f]{64}", item.provenance.casefold()) else 0.5
+                score = 0.45 * relevance + 0.20 * recency + 0.20 * item.confidence + 0.15 * provenance_score
+                ranked.append(MemoryRetrieval(item, relevance, recency, item.confidence, provenance_score, score))
+            except (KeyError, TypeError, ValueError, OverflowError, UnicodeError, json.JSONDecodeError):
+                # Corrupt, unknown, or digest-mismatched records never reach prompts.
+                continue
+        ranked.sort(key=lambda result: (-result.score, -result.recency, result.item.mission_id, result.item.memory_id))
+        selected: list[MemoryRetrieval] = []
+        used_bytes = 0
+        for result in ranked:
+            item_bytes = len(result.item.content.encode("utf-8"))
+            if used_bytes + item_bytes > max_total_bytes:
+                continue
+            selected.append(result)
+            used_bytes += item_bytes
+            if len(selected) >= limit:
+                break
+        return selected
     
     @staticmethod
     def delete_memory(memory_id: str) -> bool:

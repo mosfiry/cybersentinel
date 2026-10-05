@@ -23,6 +23,9 @@ from core.config import (
     PUBLIC_WEB_ORIGIN,
     DB_PATH,
 )
+# Keep the existing schema-v4 MemoryStore beside the configured application DB.
+# An explicit operator-provided path remains authoritative.
+os.environ.setdefault("MEMORY_DB_PATH", str(DB_PATH.with_name("memory.sqlite3")))
 from core.engine import RUNTIME, status
 from core.lifecycle import get as get_lifecycle, request_cancel
 from core.db import events_for_request, reasoning_for_request
@@ -148,6 +151,7 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
         skill_registry=skills,
         event_bus=_mission_event_bus(),
         enable_specialist_agents=True,
+        enable_mission_memory=True,
     )
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
     scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
@@ -162,6 +166,7 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
             task_graph_policy=core.task_graph_policy,
             skill_context_provider=core._resolve_mission_skill_context,
             specialist_generate=core._specialist_generate,
+            mission_memory_writer=core.mission_memory_writer,
         )
 
     return MissionWorker(queue, runtime_factory, worker_id=worker_id, scheduler=scheduler)
@@ -230,6 +235,7 @@ class Handler(BaseHTTPRequestHandler):
             skill_registry=_skill_registry(),
             event_bus=_mission_event_bus(),
             enable_specialist_agents=True,
+            enable_mission_memory=True,
         )
         runtime = MissionRuntime(
             core.store,
@@ -240,6 +246,7 @@ class Handler(BaseHTTPRequestHandler):
             task_graph_policy=core.task_graph_policy,
             skill_context_provider=core._resolve_mission_skill_context,
             specialist_generate=core._specialist_generate,
+            mission_memory_writer=core.mission_memory_writer,
         )
         queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
         scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)

@@ -42,7 +42,7 @@ from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnder
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
 
-    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_registry: Any = None, enable_specialist_agents: bool = False):
+    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None, task_graph_policy: AgentGraphPolicy | None = None, skill_registry: Any = None, enable_specialist_agents: bool = False, enable_mission_memory: bool = False):
         self.router = router
         self.store = store or MissionStore(db_path or DB_PATH.with_name("missions.sqlite3"))
         self.max_iterations = max_iterations
@@ -51,6 +51,11 @@ class AgentCore:
         self.hook_registry = hook_registry
         self.skill_registry = skill_registry
         self.enable_specialist_agents = bool(enable_specialist_agents)
+        self.enable_mission_memory = bool(enable_mission_memory)
+        self.mission_memory_writer = None
+        if self.enable_mission_memory:
+            from .intelligence_layer.mission_memory import persist_terminal_episode
+            self.mission_memory_writer = persist_terminal_episode
         self.task_graph_policy = task_graph_policy or AgentGraphPolicy(
             max_retries=RecoveryPolicy().max_retries,
             max_parallel_tasks=4,
@@ -124,7 +129,7 @@ class AgentCore:
             return [ToolCall(payload["name"], payload.get("arguments") or {}, str(payload.get("id") or uuid.uuid4().hex))]
         return []
 
-    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None) -> dict[str, Any]:
         profile = select_reasoning_profile(objective)
         tool_results = [("observation", observation)] if observation else []
         skill_tool_names: set[str] | None = None
@@ -143,6 +148,7 @@ class AgentCore:
             owner_policy_context=policy_context,
             tool_results=tool_results or None,
             execution_state=ExecutionState.initial(request_id, conversation_id or "agent-core"),
+            memory_provider=memory_provider,
             knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
         )
         messages = context.provider_messages()
@@ -154,8 +160,8 @@ class AgentCore:
         except CapabilityUnsupported:
             return self.router.generate(messages, reasoning_profile=profile)
 
-    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None) -> Plan:
-        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context)
+    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None) -> Plan:
+        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context, memory_provider=memory_provider)
         self._last_model_response = dict(response)
         calls = self._calls(response)
         steps: list[PlanStep] = []
@@ -426,6 +432,27 @@ class AgentCore:
                 session_id=authorization_context.session_id,
             )
         mission_id = uuid.uuid4().hex
+        memory_provider = None
+        memory_scope_key = None
+        mission_memory_writer = self.mission_memory_writer
+        canonical_owner_ref = ""
+        scope_snapshot_id = ""
+        if self.enable_mission_memory:
+            canonical_owner_ref = self._canonical_owner_ref_from_context(authorization_context)
+            canonical_scope_snapshot = authorization_context.scope_snapshot
+            scope_snapshot_id = str(getattr(canonical_scope_snapshot, "snapshot_id", "") or "")
+        if self.enable_mission_memory and canonical_owner_ref and scope_snapshot_id:
+            from .intelligence_layer.mission_memory import live_scope_snapshot_id, memory_scope_ref, provider_for_scope
+            scope_snapshot_id = live_scope_snapshot_id(authorization_context)
+            if not scope_snapshot_id:
+                canonical_owner_ref = ""
+            else:
+                memory_scope_key = memory_scope_ref(canonical_owner_ref, scope_snapshot_id)
+                memory_provider = provider_for_scope(
+                    canonical_owner_ref,
+                    scope_snapshot_id,
+                    exclude_mission_id=mission_id,
+                )
         skill_binding = None
         skill_context_payload = None
         if skill_id is not None:
@@ -452,7 +479,7 @@ class AgentCore:
                         from .intelligence_layer.skills import SkillAuthorizationError
                         raise SkillAuthorizationError("active canonical Owner changed during Skill-guided planning")
                     skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
-                candidate_plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id, skill_context=skill_context_payload)
+                candidate_plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id, skill_context=skill_context_payload, memory_provider=memory_provider)
             except ProviderError as exc:
                 kind = getattr(getattr(exc, "kind", None), "value", getattr(exc, "kind", "PROVIDER_FAILURE"))
                 retryable_kind = str(kind) in {"PROVIDER_FAILURE", "TIMEOUT"}
@@ -568,6 +595,7 @@ class AgentCore:
                 request_id=current.request_id,
                 conversation_id=current.mission_id,
                 skill_context=selected_payload,
+                memory_provider=memory_provider,
             )
             if selected_context is not None:
                 proposed_tools = {str(step.action) for step in new_plan.steps if step.action != "__planning_failure__"}
@@ -589,6 +617,7 @@ class AgentCore:
             task_graph_policy=self.task_graph_policy,
             skill_context_provider=self._resolve_mission_skill_context,
             specialist_generate=self._specialist_generate if self.enable_specialist_agents else None,
+            mission_memory_writer=mission_memory_writer,
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
@@ -651,7 +680,12 @@ class AgentCore:
             authorization_context=authorization_context,
             scope_snapshot=scope_context,
             completion_criteria=criteria,
-            provenance={"component": "AgentCore", "planner": "model_proposal", "task_profile": task_profile.to_dict()},
+            provenance={
+                "component": "AgentCore",
+                "planner": "model_proposal",
+                "task_profile": task_profile.to_dict(),
+                **({"mission_memory_scope_ref": memory_scope_key} if memory_scope_key else {}),
+            },
             authorization_snapshot_factory=authorization_snapshot_factory,
             planning_failures=planning_failures or None,
             planning_exhausted=planning_exhausted,
