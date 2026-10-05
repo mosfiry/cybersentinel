@@ -5,12 +5,14 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 
 from agent.intelligence_layer.graph import AgentGraphPolicy
 from agent.intelligence_layer.models import AgentLifecycle, TaskLifecycle
+from agent.execution_fence import ExecutionFence
 from agent.mission import Mission, MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
-from agent.mission_worker import WorkerMissionState
+from agent.mission_worker import MissionQueue, WorkerMissionState
 from agent.planning import FailureClass, Plan, PlanStep, RecoveryPolicy
 from api.missions import MissionService
 from runtime_authorization import make_test_snapshot
@@ -35,6 +37,68 @@ def _service_for(rt: MissionRuntime, mission_id: str) -> MissionService:
     service = MissionService(rt, _Queue())
     service._authorized_mission = lambda requested_id, owner_session_token: (rt.store.load(requested_id), "test-owner")
     return service
+
+
+def _safe_parallel_tool(_name: str):
+    return SimpleNamespace(
+        parallel_execution_safe=True,
+        risk_class="read",
+        effect_provider="",
+        idempotency_supported=False,
+        scope_required=False,
+        network_access="none",
+        filesystem_access="none",
+        process_access="none",
+        credential_access="none",
+        validate=lambda argument: (argument is None, "no arguments accepted"),
+    )
+
+
+def _strict_parallel_runtime(tmp_path: Path, executor, plan: Plan, *, recovery_policy=None):
+    policy = AgentGraphPolicy(
+        max_agents=8,
+        max_tasks=16,
+        max_parallel_tasks=2,
+        max_retries=1,
+        enable_task_delegation=True,
+    )
+    store = MissionStore(tmp_path / "parallel-missions.sqlite3")
+    runtime = MissionRuntime(
+        store,
+        executor=executor,
+        authorization_snapshot_factory=make_test_snapshot,
+        task_graph_policy=policy,
+        recovery_policy=recovery_policy,
+    )
+    mission = runtime.create(plan.objective, plan.objective, plan, owner_identity_ref="test-owner")
+    queue = MissionQueue(
+        tmp_path / "parallel-queue.sqlite3",
+        require_execution_fence=True,
+        mission_store=store,
+    )
+    queue.enqueue(mission.mission_id)
+    identity = queue.register_worker("parallel-graph-test-worker")
+    identity_fence = ExecutionFence.for_worker(queue, identity)
+    claim = queue.claim_next(
+        now=datetime.now(timezone.utc).isoformat(),
+        worker_id=identity.worker_id,
+        worker_instance_id=identity.worker_instance_id,
+        runtime_generation=identity.runtime_generation,
+        lease_seconds=600,
+        execution_fence=identity_fence,
+    )
+    assert claim is not None
+    first_step = plan.steps[0]
+    first_execution = f"{mission.mission_id}:{mission.plan.version}:{first_step.step_id}:0"
+    fence = identity_fence.with_lease(claim).for_mission(
+        mission,
+        task_id=first_step.step_id,
+        execution_id=first_execution,
+    )
+    store.bind_execution_claim(mission.mission_id, fence)
+    runtime.set_execution_fence(fence)
+    runtime.require_execution_fence = True
+    return runtime, mission.mission_id, queue
 
 
 def test_graph_gates_real_plan_dispatch_and_state_is_durable(tmp_path):
@@ -262,3 +326,161 @@ def test_malformed_persisted_graph_mapping_safety_blocks_before_dispatch(tmp_pat
     assert blocked.status is MissionStatus.SAFETY_BLOCKED
     assert blocked.failures[-1]["boundary"] == "agent_task_graph"
     assert calls == []
+
+
+def test_bounded_graph_fanout_uses_task_scoped_context_and_real_fences(tmp_path, monkeypatch):
+    from tools import registry
+
+    monkeypatch.setattr(registry, "get_tool", _safe_parallel_tool)
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+    worker_views = []
+
+    def execute(mission, step, action_id, *, execution_fence, delegation_scope):
+        nonlocal active, max_active
+        execution_fence.assert_active_execution(mission)
+        assert delegation_scope.allowed_tools == (step.action,)
+        assert delegation_scope.allowed_actions == (step.action,)
+        assert delegation_scope.permits(
+            tool=step.action,
+            action=step.action,
+            scope_ref=delegation_scope.scope[0],
+            target_identity=delegation_scope.target_identity,
+        )
+        assert len(mission.plan.steps) == 1
+        assert mission.observations == []
+        assert mission.action_history == []
+        assert mission.owner_request == ""
+        assert mission.progress["delegation_scope_fingerprint"] == delegation_scope.fingerprint
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            worker_views.append((step.step_id, action_id, mission.mission_id))
+        try:
+            barrier.wait(timeout=5)
+            return {"success": True, "result": {"action": step.action}}
+        finally:
+            with lock:
+                active -= 1
+
+    execute.task_delegation_scope_enforced = True
+    plan = Plan.initial("bounded parallel read").replan(
+        steps=(
+            PlanStep("first", "read first", action="status"),
+            PlanStep("second", "read second", action="latest_intel"),
+        ),
+        reason="independent read tasks",
+    )
+    runtime, mission_id, _queue = _strict_parallel_runtime(tmp_path, execute, plan)
+
+    completed = runtime.run_slice(mission_id)
+
+    task_map = completed.agent_task_graph_state["step_task_ids"]
+    tasks = {item["task_id"]: item for item in completed.agent_task_graph_state["graph"]["tasks"]}
+    children = [item for item in completed.agent_task_graph_state["graph"]["agents"] if item.get("parent_agent_id")]
+    assert completed.status is MissionStatus.READY
+    assert completed.current_step == 2
+    assert max_active == 2
+    assert [item["step_id"] for item in completed.action_history] == ["first", "second"]
+    assert all(tasks[task_map[name]]["lifecycle"] == TaskLifecycle.COMPLETED.value for name in ("first", "second"))
+    assert len(children) == 2
+    assert all(item["lifecycle"] == AgentLifecycle.COMPLETED.value for item in children)
+    for step_id, action in (("first", "status"), ("second", "latest_intel")):
+        child = next(item for item in children if item["parent_task_id"] == task_map[step_id])
+        assert child["memory_scope"] == f"task:{step_id}"
+        assert child["permission_scope"]["target_identity"] == completed.agent_task_graph_state["graph"]["target_identity"]
+        assert child["permission_scope"]["allowed_tools"] == [action]
+        action_record = next(item for item in completed.action_history if item["step_id"] == step_id)
+        assert tasks[task_map[step_id]]["result"]["action_id"] == action_record["action_id"]
+        assert tasks[task_map[step_id]]["result"]["result_sha256"]
+    assert len({item[1] for item in worker_views}) == 2
+
+
+def test_parallel_partial_failure_is_fanned_in_deterministically_and_blocks_dependents(tmp_path, monkeypatch):
+    from tools import registry
+
+    monkeypatch.setattr(registry, "get_tool", _safe_parallel_tool)
+    barrier = threading.Barrier(2)
+    calls = []
+
+    def execute(mission, step, action_id, *, execution_fence, delegation_scope):
+        execution_fence.assert_active_execution(mission)
+        calls.append(step.step_id)
+        barrier.wait(timeout=5)
+        if step.step_id == "second":
+            return {"success": False, "failure_class": FailureClass.TRANSIENT.value, "error": "temporary"}
+        return {"success": True, "result": {"step": step.step_id}}
+
+    execute.task_delegation_scope_enforced = True
+    plan = Plan.initial("parallel partial failure").replan(
+        steps=(
+            PlanStep("first", "first", action="status"),
+            PlanStep("second", "second", action="latest_intel"),
+            PlanStep("third", "third depends on second", prerequisites=("second",), action="status"),
+        ),
+        reason="two independent tasks then dependent task",
+    )
+    recovery = RecoveryPolicy(max_retries=1, retryable=frozenset({FailureClass.TRANSIENT}))
+    runtime, mission_id, _queue = _strict_parallel_runtime(tmp_path, execute, plan, recovery_policy=recovery)
+
+    partial = runtime.run_slice(mission_id)
+
+    state = partial.agent_task_graph_state
+    tasks = {item["task_id"]: item for item in state["graph"]["tasks"]}
+    mapping = state["step_task_ids"]
+    assert partial.status is MissionStatus.READY
+    assert partial.current_step == 1
+    assert tasks[mapping["first"]]["lifecycle"] == TaskLifecycle.COMPLETED.value
+    assert tasks[mapping["second"]]["lifecycle"] == TaskLifecycle.FAILED.value
+    assert tasks[mapping["third"]]["lifecycle"] == TaskLifecycle.BLOCKED.value
+    assert [item["step_id"] for item in partial.action_history] == ["first", "second"]
+    assert sorted(calls) == ["first", "second"]
+
+
+def test_crash_during_graph_fanout_quarantines_all_claims_and_never_replays(tmp_path, monkeypatch):
+    from tools import registry
+
+    monkeypatch.setattr(registry, "get_tool", _safe_parallel_tool)
+    barrier = threading.Barrier(2)
+    calls = []
+    lock = threading.Lock()
+
+    def crash_one(mission, step, action_id, *, execution_fence, delegation_scope):
+        execution_fence.assert_active_execution(mission)
+        with lock:
+            calls.append(action_id)
+        barrier.wait(timeout=5)
+        if step.step_id == "first":
+            raise RuntimeError("simulated worker loss after dispatch")
+        return {"success": True, "result": {"step": step.step_id}}
+
+    crash_one.task_delegation_scope_enforced = True
+    plan = Plan.initial("parallel crash recovery").replan(
+        steps=(
+            PlanStep("first", "first", action="status"),
+            PlanStep("second", "second", action="latest_intel"),
+        ),
+        reason="crash recovery test",
+    )
+    runtime, mission_id, _queue = _strict_parallel_runtime(tmp_path, crash_one, plan)
+
+    recovered = runtime.run_slice(mission_id)
+    calls_after_dispatch = list(calls)
+    recovered_again = runtime.run_slice(mission_id)
+
+    task_states = [item["lifecycle"] for item in recovered.agent_task_graph_state["graph"]["tasks"]]
+    assert recovered.status is MissionStatus.RECOVERY_REQUIRED
+    assert recovered.checkpoint["status"] == "in_flight_parallel"
+    assert set(task_states) == {TaskLifecycle.RUNNING.value}
+    assert recovered_again.status is MissionStatus.RECOVERY_REQUIRED
+    assert calls == calls_after_dispatch
+    assert len(calls_after_dispatch) == 2
+
+
+def test_existing_builtin_tools_are_not_parallel_opted_in():
+    from tools.registry import REGISTRY
+
+    assert REGISTRY
+    assert all(spec.parallel_execution_safe is False for spec in REGISTRY.values())

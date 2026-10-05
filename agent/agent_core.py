@@ -49,7 +49,11 @@ class AgentCore:
         self.knowledge_retriever = knowledge_retriever or TypedKnowledgeRetriever()
         self.event_bus = event_bus
         self.hook_registry = hook_registry
-        self.task_graph_policy = task_graph_policy or AgentGraphPolicy(max_retries=RecoveryPolicy().max_retries, max_parallel_tasks=1)
+        self.task_graph_policy = task_graph_policy or AgentGraphPolicy(
+            max_retries=RecoveryPolicy().max_retries,
+            max_parallel_tasks=4,
+            enable_task_delegation=True,
+        )
 
     def understand_mission_intent(self, instruction: str) -> MissionIntent:
         """Return typed semantic intent; model output remains an untrusted proposal."""
@@ -208,7 +212,7 @@ class AgentCore:
         snapshot = capture_policy_snapshot(request_id, evidence)
         return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=evidence.session_id), policy_context_from_snapshot(snapshot)
 
-    def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None) -> dict[str, Any]:
+    def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None, delegation_scope: Any = None) -> dict[str, Any]:
         from .execution_fence import ExecutionFenceError
         from .external_effects import EffectRecoveryRequired
         if execution_fence is None:
@@ -246,7 +250,7 @@ class AgentCore:
                 require_execution_fence=True,
             )
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry)
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except EffectRecoveryRequired as exc:
             return {
@@ -262,6 +266,8 @@ class AgentCore:
             raise
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
+
+    _executor.task_delegation_scope_enforced = True
 
     def _run_via_fenced_worker(self, runtime: MissionRuntime, mission_id: str, *, max_slices: int, native_model: Any = None, tools: list[dict[str, Any]] | None = None, postprocess: Any = None) -> Mission:
         """Run a synchronous facade call through the durable production fence."""

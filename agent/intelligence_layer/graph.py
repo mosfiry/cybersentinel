@@ -34,6 +34,7 @@ class AgentGraphPolicy:
     max_retries: int = 2
     max_task_result_bytes: int = 65536
     max_task_objective_chars: int = 10000
+    enable_task_delegation: bool = False
 
     def __post_init__(self) -> None:
         for name in ("max_agents", "max_tasks", "max_parallel_tasks", "max_task_result_bytes", "max_task_objective_chars"):
@@ -42,8 +43,10 @@ class AgentGraphPolicy:
                 raise ValueError(f"{name} must be a positive integer")
         if isinstance(self.max_retries, bool) or not isinstance(self.max_retries, int) or self.max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
+        if not isinstance(self.enable_task_delegation, bool):
+            raise ValueError("enable_task_delegation must be a boolean")
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
 
     @classmethod
@@ -292,6 +295,10 @@ class TaskGraph:
         agent = self.agents[task.assigned_agent_id]
         if agent.lifecycle is AgentLifecycle.READY:
             agent.transition(AgentLifecycle.RUNNING)
+        if agent.parent_agent_id is not None:
+            parent = self.agents[agent.parent_agent_id]
+            if parent.lifecycle is AgentLifecycle.READY:
+                parent.transition(AgentLifecycle.RUNNING)
         task.transition(TaskLifecycle.RUNNING)
         task.attempt_count += 1
         return task

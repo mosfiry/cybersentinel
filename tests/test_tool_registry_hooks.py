@@ -13,8 +13,10 @@ from agent.intelligence_layer.events import (
     HookRegistry,
     IntelligenceEventType as E,
 )
+from agent.intelligence_layer.models import DelegationScope
 from runtime_authorization import make_test_snapshot
-from tools.registry import REGISTRY, execute, get_tool
+from security.mission_authorization import MissionAuthorizationError
+from tools.registry import REGISTRY, ToolSpec, build_registry, execute, get_tool
 
 
 class _Fence:
@@ -29,7 +31,7 @@ def _snapshot():
     mission = SimpleNamespace(
         owner_identity_ref="owner:1",
         mission_id="mission:hooks",
-        plan=SimpleNamespace(steps=(SimpleNamespace(action="status"),)),
+        plan=SimpleNamespace(steps=(SimpleNamespace(action="status"), SimpleNamespace(action="latest_intel"))),
         max_iterations=2,
     )
     return make_test_snapshot(mission)
@@ -125,3 +127,93 @@ def test_event_journal_failure_blocks_dispatch_before_handler(tmp_path, monkeypa
     with pytest.raises(RuntimeError, match="journal unavailable"):
         _dispatch(snapshot=snapshot, bus=bus, hooks=None, execution_fence=_Fence())
     assert handler_calls == []
+
+
+def test_canonical_registry_revalidates_task_scope_before_handler(monkeypatch):
+    snapshot = _snapshot()
+    parent = DelegationScope.from_snapshot(snapshot)
+    child = parent.narrow(
+        target_identity=snapshot.target_identity,
+        scope=("workspace",),
+        allowed_tools=("status",),
+        allowed_actions=("status",),
+        workspace_root=None,
+    )
+    handler_calls = []
+    monkeypatch.setitem(
+        REGISTRY,
+        "status",
+        replace(get_tool("status"), handler=lambda _argument: handler_calls.append("status") or {"ok": True}),
+    )
+
+    result = execute(
+        "status",
+        None,
+        request_id="request:1",
+        mission_authorization=snapshot,
+        mission_id=snapshot.mission_id,
+        target_identity=snapshot.target_identity,
+        execution_fence=_Fence(),
+        execution_id="action:1",
+        delegation_scope=child,
+        scope_ref="workspace",
+    )
+
+    assert result == {"ok": True}
+    assert handler_calls == ["status"]
+    with pytest.raises(PermissionError, match="exceeds task delegation"):
+        execute(
+            "latest_intel",
+            None,
+            request_id="request:1",
+            mission_authorization=snapshot,
+            mission_id=snapshot.mission_id,
+            target_identity=snapshot.target_identity,
+            execution_fence=_Fence(),
+            execution_id="action:2",
+            delegation_scope=child,
+            scope_ref="workspace",
+        )
+    with pytest.raises(MissionAuthorizationError, match="target identity outside authorization snapshot"):
+        execute(
+            "status",
+            None,
+            request_id="request:1",
+            mission_authorization=snapshot,
+            mission_id=snapshot.mission_id,
+            target_identity="different-target",
+            execution_fence=_Fence(),
+            execution_id="action:3",
+            delegation_scope=child,
+            scope_ref="workspace",
+        )
+    assert handler_calls == ["status"]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        ToolSpec(
+            "unsafe_parallel_network",
+            "test-only unsafe parallel declaration",
+            "read",
+            False,
+            None,
+            lambda _argument: {"ok": True},
+            network_access="bounded",
+            parallel_execution_safe=True,
+        ),
+        ToolSpec(
+            "nonboolean_parallel_declaration",
+            "test-only malformed parallel declaration",
+            "read",
+            False,
+            None,
+            lambda _argument: {"ok": True},
+            parallel_execution_safe="yes",
+        ),
+    ],
+)
+def test_registry_rejects_invalid_parallel_safety_attestation(spec):
+    with pytest.raises(ValueError, match="invalid registry metadata"):
+        build_registry([spec])

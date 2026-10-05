@@ -466,6 +466,19 @@ class MissionRuntime:
             for parameter in parameters
         )
 
+    @staticmethod
+    def _executor_accepts_delegation(executor: Callable[..., Any]) -> bool:
+        try:
+            parameters = inspect.signature(executor).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        accepts = any(
+            parameter.name == "delegation_scope" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        function = getattr(executor, "__func__", executor)
+        return accepts and getattr(function, "task_delegation_scope_enforced", False) is True
+
     def persist_execution_state(self, mission: Mission) -> Mission:
         """Persist execution-owned metadata before the worker releases its lease."""
         return self._save(mission)
@@ -1590,6 +1603,11 @@ class MissionRuntime:
                 self.task_graph_adapter.ensure(mission, graph_snapshot)
             except (MissionTaskGraphError, KeyError, TypeError, ValueError) as exc:
                 return self._block_on_task_graph(mission, exc)
+            from .intelligence_layer.parallel_dispatch import run_parallel_graph_steps
+
+            parallel_result = run_parallel_graph_steps(self, mission, graph_snapshot)
+            if parallel_result is not None:
+                return parallel_result
         signatures = mission.progress.setdefault("loop_signatures", {})
         signature = hashlib.sha256(json.dumps({"plan": mission.plan.fingerprint, "step": step.step_id, "action": step.action}, sort_keys=True).encode()).hexdigest()
         signatures[signature] = int(signatures.get(signature, 0)) + 1
@@ -1615,8 +1633,16 @@ class MissionRuntime:
         if self.require_execution_fence and not self._executor_accepts_fence(self.executor):
             raise ExecutionFenceError("strict runtime executor does not accept execution fences")
 
+        delegation_scope = None
         if self.task_graph_adapter is not None:
             try:
+                delegation_scope = self.task_graph_adapter.delegation_scope_for_step(
+                    mission,
+                    graph_snapshot,
+                    step.step_id,
+                )
+                if delegation_scope is not None and not self._executor_accepts_delegation(self.executor):
+                    raise MissionTaskGraphError("delegated mission task requires a scope-enforcing executor")
                 self.task_graph_adapter.claim_step(mission, graph_snapshot, step.step_id)
             except (MissionTaskGraphError, KeyError, TypeError, ValueError) as exc:
                 return self._block_on_task_graph(mission, exc)
@@ -1631,7 +1657,10 @@ class MissionRuntime:
             if dispatch_fence is None:
                 result = self.executor(mission, step, action_id)
             elif self._executor_accepts_fence(self.executor):
-                result = self.executor(mission, step, action_id, execution_fence=dispatch_fence)
+                if delegation_scope is not None:
+                    result = self.executor(mission, step, action_id, execution_fence=dispatch_fence, delegation_scope=delegation_scope)
+                else:
+                    result = self.executor(mission, step, action_id, execution_fence=dispatch_fence)
             elif self.require_execution_fence:
                 raise ExecutionFenceError("strict runtime executor does not accept execution fences")
             else:

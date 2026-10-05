@@ -140,6 +140,7 @@ class ToolSpec:
     evidence_requirements: tuple[str, ...] = ("authorization_decision", "observation")
     effect_provider: str = ""
     idempotency_supported: bool = False
+    parallel_execution_safe: bool = False  # Explicit review attestation for concurrent, side-effect-free handlers.
 
     def __post_init__(self) -> None:
         if not self.input_schema:
@@ -174,6 +175,7 @@ class ToolSpec:
             "evidence_requirements": list(self.evidence_requirements),
             "external_effect_ledger": bool(self.effect_provider),
             "idempotency_supported": self.idempotency_supported,
+            "parallel_execution_safe": self.parallel_execution_safe,
         }
 
     def validate(self, argument: Any) -> tuple[bool, str]:
@@ -364,6 +366,7 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
         scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "report"}
         if (
             not spec.description
+            or not isinstance(spec.parallel_execution_safe, bool)
             or spec.risk_class not in VALID_RISK_CLASSES
             or not callable(spec.handler)
             or (spec.owner_only and not spec.requires_owner)
@@ -371,6 +374,16 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
             or (spec.effect_provider and (not spec.effect_provider.strip() or len(spec.effect_provider) > 128))
             or (spec.risk_class in {"network-read", "state-write", "bounded-exec"} and not spec.effect_provider)
             or (spec.idempotency_supported and (not spec.effect_provider or not _accepts_keyword(spec.handler, "idempotency_key")))
+            or (spec.parallel_execution_safe and (
+                spec.risk_class != "read"
+                or spec.effect_provider
+                or spec.idempotency_supported
+                or spec.scope_required
+                or spec.network_access != "none"
+                or spec.filesystem_access != "none"
+                or spec.process_access != "none"
+                or spec.credential_access != "none"
+            ))
         ):
             raise ValueError(f"invalid registry metadata for {spec.name}")
         if spec.argument_type not in (None, str):
@@ -460,7 +473,7 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None):
+def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None, delegation_scope: Any = None, scope_ref: str | None = None):
     import math
 
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
@@ -512,6 +525,9 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             if not decision.allowed:
                 raise PermissionError("scope denied: " + decision.reason)
     snapshot = None
+    delegated_scope = None
+    if delegation_scope is not None and mission_authorization is None:
+        raise PermissionError("delegated tool dispatch requires a current mission authorization snapshot")
     if mission_authorization is not None:
         from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
         snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
@@ -519,6 +535,23 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         if not allowed:
             code = "authorization_expired" if reason == "authorization snapshot expired or not active" else "authorization_denied"
             raise MissionAuthorizationError("mission authorization blocked: " + reason, code=code)
+        if delegation_scope is not None:
+            from agent.intelligence_layer.models import DelegationScope
+
+            if not isinstance(delegation_scope, DelegationScope):
+                raise PermissionError("delegated tool dispatch requires a typed DelegationScope")
+            delegated_scope = delegation_scope
+            delegated_scope.validate_current(snapshot)
+            if any((spec.network_access != "none", spec.filesystem_access != "none", spec.process_access != "none", spec.credential_access != "none")):
+                raise PermissionError("delegated scope does not grant network, filesystem, process, or credential access")
+            delegated_scope_ref = str(scope_ref or (delegated_scope.scope[0] if delegated_scope.scope else ""))
+            if not delegated_scope.permits(
+                tool=name,
+                action=name,
+                scope_ref=delegated_scope_ref,
+                target_identity=target_identity or snapshot.target_identity,
+            ):
+                raise PermissionError("tool, action, target, or scope exceeds task delegation")
     if execution_fence is not None:
         execution_fence.assert_dispatch(
             mission_id=str(mission_id or ""),
@@ -579,6 +612,15 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         if not allowed:
             code = "authorization_expired" if reason == "authorization snapshot expired or not active" else "authorization_denied"
             raise MissionAuthorizationError("mission authorization blocked before tool dispatch: " + reason, code=code)
+        if delegated_scope is not None:
+            delegated_scope.validate_current(snapshot)
+            if not delegated_scope.permits(
+                tool=name,
+                action=name,
+                scope_ref=str(scope_ref or (delegated_scope.scope[0] if delegated_scope.scope else "")),
+                target_identity=target_identity or snapshot.target_identity,
+            ):
+                raise PermissionError("task delegation changed before tool dispatch")
         if event_bus is not None:
             event_bus.publish(
                 owner_identity_ref=str(snapshot.owner_identity),

@@ -13,7 +13,7 @@ from typing import Any
 from security.mission_authorization import MissionAuthorizationSnapshot
 
 from .graph import AgentGraphPolicy, TaskGraph, TaskGraphError
-from .models import AgentRecord, DelegationDenied, TaskLifecycle, TaskRecord
+from .models import AgentLifecycle, AgentRecord, DelegationDenied, TaskLifecycle, TaskRecord
 
 
 class MissionTaskGraphError(RuntimeError):
@@ -54,6 +54,7 @@ class MissionTaskGraphAdapter:
         )
         graph.add_agent(root)
         graph.activate_agent(agent_id)
+        root_scope = root.permission_scope
         step_ids = [step.step_id for step in mission.plan.steps]
         if len(set(step_ids)) != len(step_ids) or any(not str(step_id).strip() for step_id in step_ids):
             raise MissionTaskGraphError("mission plan has invalid or duplicate step identities")
@@ -76,7 +77,56 @@ class MissionTaskGraphAdapter:
             if any(item not in task_ids for item in step.prerequisites):
                 raise MissionTaskGraphError("mission plan prerequisite refers to an unknown step")
         graph.add_tasks(tasks)
+        # Each delegated worker is bound to exactly one task and one canonical
+        # tool/action. Steps without a valid narrow grant, or beyond policy agent
+        # capacity, stay assigned to the coordinator and therefore run serially.
+        from tools.registry import get_tool
+
+        for step in (mission.plan.steps if graph.policy.enable_task_delegation else ()):
+            action = str(step.action or "").strip()
+            if not action or action == "__planning_failure__" or len(graph.agents) >= graph.policy.max_agents:
+                continue
+            tool_spec = get_tool(action)
+            if tool_spec is None or tool_spec.parallel_execution_safe is not True:
+                continue
+            if root_scope.allowed_tools and action not in root_scope.allowed_tools:
+                continue
+            if root_scope.allowed_actions and action not in root_scope.allowed_actions:
+                continue
+            if step.scope_requirement:
+                if root_scope.scope and step.scope_requirement not in root_scope.scope:
+                    continue
+                child_scope_values = (step.scope_requirement,)
+            else:
+                child_scope_values = root_scope.scope or (f"task:{step.step_id}",)
+            task_id = task_ids[step.step_id]
+            child_scope = root_scope.narrow(
+                target_identity=root_scope.target_identity,
+                scope=child_scope_values,
+                allowed_tools=(action,),
+                allowed_actions=(action,),
+                allowed_networks=(),
+                allowed_credentials=(),
+                workspace_root=None,
+            )
+            child_id = "mission-step-agent-" + hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:20]
+            child = AgentRecord.create(
+                mission_id=mission.mission_id,
+                owner_identity_ref=mission.owner_identity_ref,
+                role="mission_plan_step_executor",
+                capabilities=("canonical_tool_dispatch",),
+                permission_scope=child_scope,
+                parent_agent_id=agent_id,
+                parent_task_id=task_id,
+                context_ref=f"mission:{mission.mission_id}:step:{step.step_id}",
+                memory_scope=f"task:{step.step_id}",
+                agent_id=child_id,
+            )
+            graph.add_agent(child)
+            graph.activate_agent(child_id)
+            graph.tasks[task_id].assigned_agent_id = child_id
         graph.refresh_ready_tasks()
+        graph.validate()
         return graph, task_ids
 
     def _decode(self, mission: Any) -> tuple[TaskGraph, dict[str, str], str, int, int] | None:
@@ -172,6 +222,9 @@ class MissionTaskGraphAdapter:
             task_id,
             self._compact_result(step_id=step_id, result=result, success=True, action_id=action_id),
         )
+        agent = graph.agents[graph.tasks[task_id].assigned_agent_id]
+        if agent.parent_agent_id is not None and agent.lifecycle in {AgentLifecycle.READY, AgentLifecycle.RUNNING}:
+            agent.transition(AgentLifecycle.COMPLETED)
 
     def _restore_completed_prefix(self, mission: Any, graph: TaskGraph, mapping: dict[str, str], *, from_index: int = 0) -> None:
         completed_indices = set(range(min(max(int(mission.current_step), 0), len(mission.plan.steps))))
@@ -189,6 +242,9 @@ class MissionTaskGraphAdapter:
                 continue
             if task.lifecycle is TaskLifecycle.FAILED:
                 graph.retry_task(task_id)
+                agent = graph.agents[task.assigned_agent_id]
+                if agent.parent_agent_id is not None and agent.lifecycle is AgentLifecycle.WAITING:
+                    agent.transition(AgentLifecycle.READY)
             graph.refresh_ready_tasks()
             if task_id not in graph.ready_task_ids():
                 raise MissionTaskGraphError("mission cursor conflicts with task-graph dependencies")
@@ -213,6 +269,9 @@ class MissionTaskGraphAdapter:
             else:
                 reason = str(result.get("error", "reconciled action failure")) if isinstance(result, dict) else "reconciled action failure"
                 graph.fail_task(task_id, reason)
+                agent = graph.agents[graph.tasks[task_id].assigned_agent_id]
+                if agent.parent_agent_id is not None and agent.lifecycle is AgentLifecycle.RUNNING:
+                    agent.transition(AgentLifecycle.WAITING)
             changed = True
         return changed
 
@@ -255,6 +314,9 @@ class MissionTaskGraphAdapter:
             else:
                 graph.fail_task(current.task_id, previous.error or "restored failed task state")
                 graph.tasks[current.task_id].attempt_count = previous.attempt_count
+                agent = graph.agents[current.assigned_agent_id]
+                if agent.parent_agent_id is not None and agent.lifecycle is AgentLifecycle.RUNNING:
+                    agent.transition(AgentLifecycle.WAITING)
 
     def ensure(self, mission: Any, snapshot: MissionAuthorizationSnapshot) -> TaskGraph:
         if not isinstance(snapshot, MissionAuthorizationSnapshot):
@@ -303,19 +365,111 @@ class MissionTaskGraphAdapter:
         except (DelegationDenied, TaskGraphError, KeyError, TypeError, ValueError) as exc:
             raise MissionTaskGraphError(f"mission task graph rejected: {type(exc).__name__}") from exc
 
-    def claim_step(self, mission: Any, snapshot: MissionAuthorizationSnapshot, step_id: str) -> TaskGraph:
+    def ready_steps(self, mission: Any, snapshot: MissionAuthorizationSnapshot) -> tuple[dict[str, Any], ...]:
+        """Return authorized graph-ready child tasks in stable plan order."""
+        graph = self.ensure(mission, snapshot)
+        state = mission.agent_task_graph_state
+        mapping = dict(state["step_task_ids"])
+        ready_ids = set(graph.ready_task_ids())
+        entries: list[dict[str, Any]] = []
+        for index, step in enumerate(mission.plan.steps):
+            task_id = mapping.get(step.step_id)
+            if task_id not in ready_ids:
+                continue
+            task = graph.tasks[task_id]
+            agent = graph.agents[task.assigned_agent_id]
+            if agent.parent_task_id != task_id or agent.role != "mission_plan_step_executor":
+                continue
+            agent.permission_scope.validate_current(snapshot)
+            entries.append({
+                "index": index,
+                "step": step,
+                "task_id": task_id,
+                "agent_id": agent.agent_id,
+                "delegation_scope": agent.permission_scope,
+            })
+        return tuple(entries)
+
+    def delegation_scope_for_step(
+        self,
+        mission: Any,
+        snapshot: MissionAuthorizationSnapshot,
+        step_id: str,
+    ):
         graph = self.ensure(mission, snapshot)
         state = mission.agent_task_graph_state
         mapping = dict(state["step_task_ids"])
         task_id = mapping.get(step_id)
         if not task_id or task_id not in graph.tasks:
-            raise MissionTaskGraphError("current plan step has no graph task")
-        task = graph.tasks[task_id]
-        if task.lifecycle is TaskLifecycle.FAILED:
-            graph.retry_task(task_id)
-        graph.claim_task(task_id, snapshot)
+            raise MissionTaskGraphError("mission plan step has no graph task")
+        agent = graph.agents[graph.tasks[task_id].assigned_agent_id]
+        if agent.parent_task_id != task_id or agent.role != "mission_plan_step_executor":
+            return None
+        agent.permission_scope.validate_current(snapshot)
+        return agent.permission_scope
+
+    def claim_steps(self, mission: Any, snapshot: MissionAuthorizationSnapshot, step_ids: tuple[str, ...] | list[str]) -> TaskGraph:
+        """Claim a ready batch and persist one graph revision before any dispatch."""
+        ids = tuple(str(item) for item in step_ids)
+        if not ids or len(set(ids)) != len(ids):
+            raise MissionTaskGraphError("graph batch claim requires unique step identities")
+        graph = self.ensure(mission, snapshot)
+        state = mission.agent_task_graph_state
+        mapping = dict(state["step_task_ids"])
+        steps = {step.step_id: step for step in mission.plan.steps}
+        if any(step_id not in steps for step_id in ids):
+            raise MissionTaskGraphError("graph batch claim refers to an unknown plan step")
+        for step_id in ids:
+            task_id = mapping.get(step_id)
+            if not task_id or task_id not in graph.tasks:
+                raise MissionTaskGraphError("current plan step has no graph task")
+            task = graph.tasks[task_id]
+            if task.lifecycle is TaskLifecycle.FAILED:
+                graph.retry_task(task_id)
+                agent = graph.agents[task.assigned_agent_id]
+                if agent.parent_agent_id is not None and agent.lifecycle is AgentLifecycle.WAITING:
+                    agent.transition(AgentLifecycle.READY)
+            graph.claim_task(task_id, snapshot)
         self._store(mission, graph, mapping, str(state["plan_fingerprint"]), int(state["revision"]))
         return graph
+
+    def claim_step(self, mission: Any, snapshot: MissionAuthorizationSnapshot, step_id: str) -> TaskGraph:
+        return self.claim_steps(mission, snapshot, (step_id,))
+
+    def complete_steps(self, mission: Any, outcomes: list[dict[str, Any]]) -> None:
+        state = mission.agent_task_graph_state
+        if not isinstance(state, dict) or not isinstance(outcomes, list) or not outcomes:
+            raise MissionTaskGraphError("mission graph batch completion is malformed")
+        graph = TaskGraph.from_dict(dict(state["graph"]))
+        mapping = {str(key): str(value) for key, value in dict(state["step_task_ids"]).items()}
+        seen: set[str] = set()
+        for item in outcomes:
+            if not isinstance(item, dict):
+                raise MissionTaskGraphError("mission graph batch outcome is malformed")
+            step_id = str(item.get("step_id", ""))
+            if not step_id or step_id in seen:
+                raise MissionTaskGraphError("mission graph batch has duplicate or missing step identity")
+            seen.add(step_id)
+            task_id = mapping.get(step_id)
+            if task_id is None or graph.tasks[task_id].lifecycle is not TaskLifecycle.RUNNING:
+                raise MissionTaskGraphError("only claimed graph tasks can complete a batch")
+            if item.get("success") is True:
+                self._complete(
+                    graph,
+                    task_id,
+                    step_id=step_id,
+                    result=item.get("result", {}),
+                    action_id=str(item.get("action_id", "")),
+                )
+            elif item.get("success") is False:
+                graph.fail_task(task_id, str(item.get("error", "mission step failed")))
+                agent = graph.agents[graph.tasks[task_id].assigned_agent_id]
+                if agent.parent_agent_id is not None and agent.lifecycle is AgentLifecycle.RUNNING:
+                    agent.transition(AgentLifecycle.WAITING)
+            else:
+                raise MissionTaskGraphError("mission graph batch outcome has no boolean success value")
+        self._all_tasks_completed(graph)
+        self._store(mission, graph, mapping, str(state["plan_fingerprint"]), int(state["revision"]))
 
     def complete_step(self, mission: Any, step_id: str, result: Any, action_id: str) -> None:
         state = mission.agent_task_graph_state
@@ -326,9 +480,7 @@ class MissionTaskGraphAdapter:
         task_id = mapping.get(step_id)
         if task_id is None or graph.tasks[task_id].lifecycle is not TaskLifecycle.RUNNING:
             raise MissionTaskGraphError("only the currently claimed graph task can complete")
-        self._complete(graph, task_id, step_id=step_id, result=result, action_id=action_id)
-        self._all_tasks_completed(graph)
-        self._store(mission, graph, mapping, str(state["plan_fingerprint"]), int(state["revision"]))
+        self.complete_steps(mission, [{"step_id": step_id, "result": result, "success": True, "action_id": action_id}])
 
     def fail_step(self, mission: Any, step_id: str, reason: str) -> None:
         state = mission.agent_task_graph_state
@@ -340,6 +492,9 @@ class MissionTaskGraphAdapter:
         if task_id is None or graph.tasks[task_id].lifecycle is not TaskLifecycle.RUNNING:
             raise MissionTaskGraphError("only the currently claimed graph task can fail")
         graph.fail_task(task_id, reason)
+        agent = graph.agents[graph.tasks[task_id].assigned_agent_id]
+        if agent.parent_agent_id is not None and agent.lifecycle is AgentLifecycle.RUNNING:
+            agent.transition(AgentLifecycle.WAITING)
         self._store(mission, graph, mapping, str(state["plan_fingerprint"]), int(state["revision"]))
 
     def cancel(self, mission: Any) -> None:
@@ -357,6 +512,14 @@ class MissionTaskGraphAdapter:
                 raise MissionTaskGraphError("mission graph cancellation identity or revision mismatch")
             for task_id in sorted(graph.tasks):
                 graph.cancel_task(task_id, propagate=False)
+                task = graph.tasks[task_id]
+                agent = graph.agents[task.assigned_agent_id]
+                if (
+                    task.lifecycle is TaskLifecycle.CANCELLED
+                    and agent.parent_agent_id is not None
+                    and agent.lifecycle in {AgentLifecycle.CREATED, AgentLifecycle.READY, AgentLifecycle.RUNNING, AgentLifecycle.WAITING, AgentLifecycle.BLOCKED}
+                ):
+                    agent.transition(AgentLifecycle.CANCELLED)
             root = next((item for item in graph.agents.values() if item.parent_agent_id is None), None)
             if root is not None and not any(item.lifecycle is TaskLifecycle.RUNNING for item in graph.tasks.values()):
                 if root.lifecycle.value in {"CREATED", "READY", "RUNNING", "WAITING", "BLOCKED"}:
