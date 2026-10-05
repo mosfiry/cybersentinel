@@ -460,7 +460,7 @@ def get_tool(name: str) -> ToolSpec | None:
     return REGISTRY.get(name)
 
 
-def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None):
+def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None):
     import math
 
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
@@ -526,6 +526,85 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             execution_id=str(execution_id or ""),
             authorization_snapshot=mission_authorization,
         )
+    event_binding = ""
+    if event_bus is not None or hook_registry is not None:
+        from agent.intelligence_layer.events import EventBus, HookPhase, HookRegistry, IntelligenceEventType
+
+        if event_bus is not None and not isinstance(event_bus, EventBus):
+            raise TypeError("event_bus must be an EventBus")
+        if hook_registry is not None and not isinstance(hook_registry, HookRegistry):
+            raise TypeError("hook_registry must be a HookRegistry")
+        if snapshot is None or not mission_id or not snapshot.owner_identity:
+            raise PermissionError("mission-bound hooks and event records require an Owner authorization snapshot")
+        event_binding = hashlib.sha256(
+            "\0".join((str(snapshot.owner_identity), str(mission_id), str(request_id or ""), str(execution_id or ""), spec.tool_id)).encode("utf-8")
+        ).hexdigest()
+        argument_sha256 = hashlib.sha256(
+            json.dumps(argument, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ).hexdigest()
+        if hook_registry is not None:
+            hook_result = hook_registry.run(
+                owner_identity_ref=str(snapshot.owner_identity),
+                mission_id=str(mission_id),
+                phase=HookPhase.BEFORE_TOOL,
+                correlation_id=str(execution_id or request_id or event_binding),
+                data={"tool_id": spec.tool_id, "tool_version": spec.version, "risk_class": spec.risk_class, "argument_sha256": argument_sha256},
+            )
+            if not hook_result.allowed:
+                raise PermissionError("tool dispatch blocked by current mission policy hook")
+        if authorization_decision is not None and not authorization_decision.is_valid_for(name, argument, str(request_id or "")):
+            raise PermissionError("AuthorizationDecision expired or changed before tool dispatch")
+        if spec.scope_required:
+            if not isinstance(scope_context, dict):
+                raise PermissionError("scope context required")
+            requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
+            urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
+            for checked_url in urls:
+                decision = resolve(
+                    scope_context["scope_snapshot_id"],
+                    scope_context["target_id"],
+                    checked_url,
+                    method=scope_context.get("method", "GET"),
+                    expected_program_id=scope_context["program_id"],
+                    redirect_chain=scope_context.get("redirect_chain", []),
+                )
+                if not decision.allowed:
+                    raise PermissionError("scope denied before tool dispatch: " + decision.reason)
+        allowed, reason = snapshot.check(
+            action=name,
+            tool_id=name,
+            target_identity=target_identity or snapshot.target_identity,
+            at=None,
+        )
+        if not allowed:
+            code = "authorization_expired" if reason == "authorization snapshot expired or not active" else "authorization_denied"
+            raise MissionAuthorizationError("mission authorization blocked before tool dispatch: " + reason, code=code)
+        if event_bus is not None:
+            event_bus.publish(
+                owner_identity_ref=str(snapshot.owner_identity),
+                mission_id=str(mission_id),
+                event_type=IntelligenceEventType.TASK_STARTED,
+                idempotency_key=f"task-started:{event_binding}",
+                request_id=str(request_id or ""),
+                task_id=str(execution_id or ""),
+                payload={"tool_id": spec.tool_id, "tool_version": spec.version, "phase": "pre-dispatch"},
+            )
+            event_bus.publish(
+                owner_identity_ref=str(snapshot.owner_identity),
+                mission_id=str(mission_id),
+                event_type=IntelligenceEventType.TOOL_CALLED,
+                idempotency_key=f"tool-called:{event_binding}",
+                request_id=str(request_id or ""),
+                task_id=str(execution_id or ""),
+                payload={"tool_id": spec.tool_id, "tool_version": spec.version, "risk_class": spec.risk_class, "argument_sha256": argument_sha256, "phase": "pre-dispatch"},
+            )
+        if execution_fence is not None:
+            execution_fence.assert_dispatch(
+                mission_id=str(mission_id or ""),
+                request_id=str(request_id or ""),
+                execution_id=str(execution_id or ""),
+                authorization_snapshot=mission_authorization,
+            )
     effect_ledger = None
     effect = None
     dispatch_id = ""
@@ -689,7 +768,25 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             return invoke_handler()
         future = executor.submit(dispatch_tool)
     try:
-        return future.result(timeout=limit)
+        result = future.result(timeout=limit)
+        if event_bus is not None:
+            try:
+                from agent.intelligence_layer.events import IntelligenceEventType
+
+                success = bool(result.get("success", result.get("ok", True))) if isinstance(result, dict) else True
+                event_bus.publish(
+                    owner_identity_ref=str(snapshot.owner_identity),
+                    mission_id=str(mission_id),
+                    event_type=IntelligenceEventType.TASK_COMPLETED,
+                    idempotency_key=f"tool-completed:{event_binding}:{int(success)}",
+                    request_id=str(request_id or ""),
+                    task_id=str(execution_id or ""),
+                    payload={"tool_id": spec.tool_id, "tool_version": spec.version, "success": success},
+                )
+            except Exception:
+                # A post-effect observer must not turn a known result into an ambiguous retry.
+                pass
+        return result
     except FutureTimeout as exc:
         cancelled = future.cancel()
         if effect is not None:

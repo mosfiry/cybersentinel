@@ -38,7 +38,7 @@ class _MissionBudgetExceeded(RuntimeError):
 class MissionRuntime:
     """Persistent autonomous mission loop. Every slice is restart-safe and bounded."""
 
-    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None):
+    def __init__(self, store: MissionStore, *, executor: Callable[[Mission, PlanStep, str], dict[str, Any]], authorizer: Callable[[Mission, PlanStep], tuple[bool, str]] | None = None, replanner: Callable[[Mission, dict[str, Any]], Plan] | None = None, verifier: Callable[[Mission], GoalVerification] | None = None, recovery_policy: RecoveryPolicy | None = None, interpreter: ObservationInterpreter | None = None, require_authorization_snapshot: bool = True, authorization_snapshot_factory: Callable[[Mission], Any] | None = None, execution_fence: ExecutionFence | None = None, require_execution_fence: bool = False, runtime_limits: RuntimeLimits | None = None, event_bus: Any = None, hook_registry: Any = None):
         self.store = store
         self.executor = executor
         self.authorizer = authorizer or self._default_authorizer
@@ -53,6 +53,14 @@ class MissionRuntime:
         self.runtime_limits = runtime_limits if runtime_limits is not None else RuntimeLimits.from_owner_policy()
         if not isinstance(self.runtime_limits, RuntimeLimits):
             raise TypeError("MissionRuntime requires RuntimeLimits")
+        if event_bus is not None or hook_registry is not None:
+            from .intelligence_layer.events import EventBus, HookRegistry
+            if event_bus is not None and not isinstance(event_bus, EventBus):
+                raise TypeError("MissionRuntime event_bus must be an EventBus")
+            if hook_registry is not None and not isinstance(hook_registry, HookRegistry):
+                raise TypeError("MissionRuntime hook_registry must be a HookRegistry")
+        self.event_bus = event_bus
+        self.hook_registry = hook_registry
 
     @staticmethod
     def _limit_value(value: Any) -> int:
@@ -840,6 +848,8 @@ class MissionRuntime:
             execution_id=execution_id,
             timeout=timeout,
             max_result_chars=max_result_chars,
+            event_bus=self.event_bus,
+            hook_registry=self.hook_registry,
         )
 
     def _block_on_budget(self, mission: Mission, budget: str, limit: int) -> Mission:

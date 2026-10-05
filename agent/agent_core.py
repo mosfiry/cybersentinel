@@ -41,11 +41,13 @@ from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnder
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
 
-    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None):
+    def __init__(self, router: Any, *, store: MissionStore | None = None, db_path: str | Path | None = None, max_iterations: int = 50, knowledge_retriever: TypedKnowledgeRetriever | None = None, event_bus: Any = None, hook_registry: Any = None):
         self.router = router
         self.store = store or MissionStore(db_path or DB_PATH.with_name("missions.sqlite3"))
         self.max_iterations = max_iterations
         self.knowledge_retriever = knowledge_retriever or TypedKnowledgeRetriever()
+        self.event_bus = event_bus
+        self.hook_registry = hook_registry
 
     def understand_mission_intent(self, instruction: str) -> MissionIntent:
         """Return typed semantic intent; model output remains an untrusted proposal."""
@@ -242,7 +244,7 @@ class AgentCore:
                 require_execution_fence=True,
             )
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id)
+            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry)
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except EffectRecoveryRequired as exc:
             return {
@@ -439,6 +441,8 @@ class AgentCore:
             interpreter=ObservationInterpreter(proposer=self._observation_proposal),
             require_authorization_snapshot=True,
             require_execution_fence=True,
+            event_bus=self.event_bus,
+            hook_registry=self.hook_registry,
         )
         target_identity = str((scope_context or {}).get("target_id") or "local-workspace")
         workspace_root = str((scope_context or {}).get("workspace_root") or Path.cwd().resolve())
@@ -647,7 +651,7 @@ class AgentCore:
     def resume_mission(self, mission_id: str, *, owner_session_token: str, max_slices: int | None = None) -> Mission:
         mission, _, fresh_snapshot = self._reauthorize_mission(mission_id, owner_session_token=owner_session_token)
         policy_context = policy_context_from_snapshot(fresh_snapshot)
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True)
+        runtime = MissionRuntime(self.store, executor=self._executor, replanner=lambda current, observation: self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id), recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry)
         return self._run_via_fenced_worker(runtime, mission_id, max_slices=max_slices or self.max_iterations)
 
 
