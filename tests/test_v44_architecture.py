@@ -39,7 +39,9 @@ def test_router_fails_over_and_records_first_failure():
 
 
 def test_registry_has_schema_and_per_tool_policy():
-    assert REGISTRY["search"].risk_class == "read"
+    assert REGISTRY["search"].risk_class == "network-read"
+    assert REGISTRY["search"].version == "2.0.0"
+    assert REGISTRY["search"].network_access == "allowlisted_search_provider"
     assert REGISTRY["watch"].risk_class == "state-write"
     assert REGISTRY["search"].metadata()["external_effect_ledger"] is True
     assert REGISTRY["search"].metadata()["idempotency_supported"] is False

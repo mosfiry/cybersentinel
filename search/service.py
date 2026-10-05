@@ -36,7 +36,7 @@ from .local_knowledge import LocalKnowledgeProvider
 from .github_provider import GitHubProvider
 from .nvd_provider import NVDProvider
 from .mitre_provider import MITREProvider
-from .web_provider import WebSearchProviderUnavailable
+from .web_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +169,8 @@ class SearchService:
             logger.warning(f"Failed to initialize MITRE provider: {e}")
             self._providers["mitre"] = _UnavailableProvider("mitre")
         
-        # Web provider (unavailable in Phase 4)
-        self._providers["web"] = WebSearchProviderUnavailable()
+        # Public web provider: anonymous, read-only, DNS-pinned and untrusted.
+        self._providers["web"] = WebSearchProvider()
     
     def get_provider(self, name: str) -> SearchProvider | None:
         """Get a provider by name."""

@@ -1,351 +1,269 @@
-"""
-Web Search Provider
+"""Read-only public-web search using a bounded DNS-pinned transport.
 
-Web search provider for general web searches.
-All results are UNTRUSTED_DATA.
+Search results and snippets are untrusted data. The provider never fetches result
+URLs, follows redirects, or treats remote content as authorization or policy.
 """
-
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import re
-from datetime import datetime, timezone
-from typing import Any
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urljoin, urlsplit
 
+from security.pinned_http import PinnedRequestError, PinnedSession
+
+from .exceptions import (
+    InvalidRequestError,
+    NetworkError,
+    ParseError,
+    ParseError,
+    ProviderError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+    RateLimitError,
+    ResponseTooLargeError,
+    SSRFError,
+)
 from .providers import (
+    ProviderCapability,
+    ProviderStatus,
     SearchProvider,
     SearchRequest,
     SearchResponse,
     SearchResult,
     SearchScope,
-    ProviderStatus,
-    ProviderCapability,
 )
-from .exceptions import (
-    ProviderUnavailableError,
-    ProviderTimeoutError,
-    RateLimitError,
-    InvalidRequestError,
-    ParseError,
-    NetworkError,
-    ResponseTooLargeError,
-    SSRFError,
-)
-from .ssrf import check_url_ssrf, validate_url, is_safe_url
+
+
+class _SearchResultsParser(HTMLParser):
+    """Extract only DuckDuckGo result titles, links, and snippets as plain text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.titles: list[tuple[str, str]] = []
+        self.snippets: list[str] = []
+        self._title: dict[str, object] | None = None
+        self._snippet: dict[str, object] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        classes = set((values.get("class") or "").split())
+        if tag == "a" and "result__a" in classes:
+            self._title = {"href": values.get("href") or "", "parts": []}
+        if "result__snippet" in classes:
+            self._snippet = {"tag": tag, "parts": []}
+
+    def handle_data(self, data: str) -> None:
+        if self._title is not None:
+            self._title["parts"].append(data)
+        elif self._snippet is not None:
+            self._snippet["parts"].append(data)
+
+    @staticmethod
+    def _clean(parts: list[str]) -> str:
+        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._title is not None and tag == "a":
+            self.titles.append((str(self._title["href"]), self._clean(self._title["parts"])))
+            self._title = None
+        if self._snippet is not None and tag == self._snippet["tag"]:
+            self.snippets.append(self._clean(self._snippet["parts"]))
+            self._snippet = None
 
 
 class WebSearchProvider(SearchProvider):
-    """Web search provider with read-only capabilities.
-    
-    This provider performs web searches using available connectors.
-    All results are UNTRUSTED_DATA.
-    All operations are READ-ONLY in Phase 4.
-    
-    Note: This provider requires a real web search connector to be available.
-    If no connector is available, it will be marked as UNAVAILABLE.
+    """Anonymous, read-only web search through DuckDuckGo's HTML interface.
+
+    Availability reports whether the local pinned HTTP transport is configured;
+    it deliberately does not make an outbound probe. Endpoint reachability is
+    established only by an actual bounded search request.
     """
-    
+
     name = "web"
     scope = SearchScope.WEB
-    capabilities = frozenset({
-        ProviderCapability.SEARCH,
-        ProviderCapability.READ_ONLY,
-    })
-    
-    # Configuration
-    # Try to use gh CLI if available, otherwise fall back to HTTP
-    USE_GH_CLI = True
-    
-    # Limits
+    capabilities = frozenset({ProviderCapability.SEARCH, ProviderCapability.READ_ONLY})
+
+    ENDPOINT = "https://html.duckduckgo.com/html/"
     max_results = 10
-    max_response_bytes = 100000  # 100KB
-    max_result_chars = 10000
-    timeout = 30.0
-    
-    def __init__(self):
-        """Initialize provider."""
-        self._session = None
-        self._status = self._check_availability()
-    
-    def _get_session(self) -> Any:
-        """Get or create HTTP session with proper headers."""
-        if self._session is None:
-            try:
-                import httpx
-                headers = {
-                    "Accept": "application/json",
-                    "User-Agent": "CyberSentinel-X/1.0",
-                }
-                self._session = httpx.Client(
-                    headers=headers,
-                    timeout=self.timeout,
-                    follow_redirects=False,
-                )
-            except ImportError:
-                try:
-                    import requests
-                    from requests.adapters import HTTPAdapter
-                    from urllib3.util.retry import Retry
-                    
-                    headers = {
-                        "Accept": "application/json",
-                        "User-Agent": "CyberSentinel-X/1.0",
-                    }
-                    
-                    retry = Retry(
-                        total=3,
-                        backoff_factor=0.5,
-                        status_forcelist=[429, 500, 502, 503, 504],
-                    )
-                    adapter = HTTPAdapter(max_retries=retry)
-                    self._session = requests.Session()
-                    self._session.mount("https://", adapter)
-                    self._session.mount("http://", adapter)
-                    self._session.headers.update(headers)
-                except ImportError:
-                    raise ProviderUnavailableError(
-                        "No HTTP library available (neither httpx nor requests)",
-                        provider=self.name,
-                    )
-        return self._session
-    
-    def _check_availability(self) -> ProviderStatus:
-        """Check if provider is available."""
-        # Check if gh CLI is available
-        if self.USE_GH_CLI:
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ["gh", "--version"],
-                    capture_output=True,
-                    timeout=5.0,
-                )
-                if result.returncode == 0:
-                    return ProviderStatus.AVAILABLE
-            except Exception:
-                pass
-        
-        # Local, dependency-free capability check: constructing the HTTP
-        # session proves an HTTP client library is usable. No third-party
-        # endpoint is contacted during availability probing (SSRF posture:
-        # no outbound request is needed to answer "is a client library present").
-        try:
-            session = self._get_session()
-        except Exception:
-            return ProviderStatus.UNAVAILABLE
-        if session is not None and hasattr(session, "get"):
-            return ProviderStatus.AVAILABLE
-        return ProviderStatus.UNAVAILABLE
-    
+    max_response_bytes = 100_000
+    max_result_chars = 4_000
+    timeout = 15.0
+    max_query_chars = 512
+    status = ProviderStatus.IMPLEMENTED
+
+    def __init__(self, *, session: PinnedSession | None = None) -> None:
+        self._session = session or PinnedSession(
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.8",
+                "User-Agent": "CyberSentinel-X/1.0 (read-only web research)",
+            },
+            timeout=self.timeout,
+            max_response_bytes=self.max_response_bytes,
+        )
+        self._status = ProviderStatus.IMPLEMENTED
+        self.status = self._status
+
     def check_availability(self) -> ProviderStatus:
-        """Check if provider is available."""
-        self._status = self._check_availability()
+        """Report local transport availability without making a network probe."""
         return self._status
-    
-    def _search_with_gh_cli(
-        self,
-        query: str,
-        max_results: int,
-    ) -> list[SearchResult]:
-        """Search using gh CLI."""
-        results = []
-        
+
+    @staticmethod
+    def _safe_result_url(href: str) -> str | None:
+        url = urljoin(WebSearchProvider.ENDPOINT, href.strip())
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or len(url) > 4096
+            or any(ord(char) < 0x20 for char in url)
+        ):
+            return None
+        if parsed.hostname.casefold() in {"duckduckgo.com", "www.duckduckgo.com"} and parsed.path == "/l/":
+            destination = parse_qs(parsed.query, keep_blank_values=False).get("uddg", [""])[0]
+            if not destination:
+                return None
+            url = destination
+            parsed = urlsplit(url)
+            if (
+                parsed.scheme.casefold() not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or len(url) > 4096
+            ):
+                return None
+        return url
+
+    def _parse_results(self, body: bytes, query: str, limit: int) -> list[SearchResult]:
         try:
-            import subprocess
-            import json
-            
-            # Use gh search command
-            # Note: gh search requires authentication
-            cmd = [
-                "gh",
-                "search",
-                "repos",
-                query,
-                "--limit",
-                str(min(max_results, 100)),
-                "--json",
-                "name,description,htmlUrl,stargazerCount,updatedAt",
-            ]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=self.timeout,
-                text=True,
-            )
-            
-            if result.returncode != 0:
-                # Try without authentication
-                cmd = [
-                    "gh",
-                    "search",
-                    "repos",
-                    query,
-                    "--limit",
-                    str(min(max_results, 100)),
-                    "--json",
-                    "name,description,htmlUrl",
-                ]
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    timeout=self.timeout,
-                    text=True,
-                )
-            
-            if result.returncode == 0:
-                repos = json.loads(result.stdout)
-                for repo in repos[:max_results]:
-                    result_item = self._normalize_gh_result(repo, "repository")
-                    if result_item:
-                        results.append(result_item)
-        except Exception:
-            pass
-        
-        return results
-    
-    def _search_with_http(
-        self,
-        query: str,
-        max_results: int,
-    ) -> list[SearchResult]:
-        """Search using HTTP requests.
-        
-        This is a fallback method that uses a mock/search simulation.
-        For real web search, a proper API key would be needed.
-        """
-        results = []
-        
-        # For Phase 4, we mark web search as unavailable
-        # since we don't have a real web search API configured
-        # This is intentional - we don't want to create fake implementations
-        
-        return results
-    
-    def _normalize_gh_result(
-        self,
-        data: dict[str, Any],
-        source_type: str,
-    ) -> SearchResult | None:
-        """Normalize a GitHub CLI result into SearchResult."""
+            html = body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ParseError("Web search response is not valid UTF-8", provider=self.name) from exc
+        parser = _SearchResultsParser()
         try:
-            name = data.get("name", "")
-            description = data.get("description", "") or ""
-            html_url = data.get("htmlUrl", "") or data.get("html_url", "")
-            
-            content = f"{name}\n{description}"
-            content = self.truncate_result(content)
-            content = self.sanitize_content(content)
-            
-            # Calculate hash
-            content_bytes = content.encode('utf-8')
-            content_hash = hashlib.sha256(content_bytes).hexdigest()
-            
-            return SearchResult(
-                result_id=f"web:{source_type}:{html_url}",
-                title=name or "Untitled",
-                content=content,
+            parser.feed(html)
+            parser.close()
+        except Exception as exc:
+            raise ParseError("Web search response could not be parsed", provider=self.name) from exc
+
+        query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        results: list[SearchResult] = []
+        for index, (href, title) in enumerate(parser.titles):
+            url = self._safe_result_url(href)
+            title = self.sanitize_content(re.sub(r"\s+", " ", title).strip())
+            snippet = parser.snippets[index].strip() if index < len(parser.snippets) else ""
+            if not url or not title:
+                continue
+            prefix = "[UNTRUSTED_WEB_RESULT] "
+            text_limit = max(0, self.max_result_chars - len(prefix))
+            text = self.sanitize_content(snippet)
+            if len(text) > text_limit:
+                marker = "...[TRUNCATED]"
+                text = text[: max(0, text_limit - len(marker))] + marker[:text_limit]
+            text = prefix + text
+            digest = hashlib.sha256((title + "\n" + text).encode("utf-8")).hexdigest()
+            url_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
+            results.append(SearchResult(
+                result_id=f"web:duckduckgo:{url_id}",
+                title=title[:512],
+                content=text,
                 source="web",
-                source_type=source_type,
-                url=html_url,
+                source_type="web_search_result",
+                url=url,
+                content_hash=digest,
                 provenance={
                     "source": "web",
-                    "type": source_type,
                     "provider": self.name,
-                    "via": "gh_cli",
+                    "backend": "duckduckgo_html",
+                    "trust": "untrusted_data",
+                    "query_sha256": query_hash,
+                    "retrieved_at_source": "search_response",
                 },
                 metadata={
-                    "url": html_url,
-                    "content_hash": content_hash,
+                    "query_sha256": query_hash,
+                    "result_index": index,
+                    "content_sha256": digest,
                 },
-            )
-        except Exception:
-            return None
-    
+            ))
+            if len(results) >= limit:
+                break
+        return results
+
     def search(self, request: SearchRequest) -> SearchResponse:
-        """Execute a web search request.
-        
-        This provider is intentionally limited in Phase 4.
-        Real web search requires proper API configuration.
-        """
-        # Validate scope
-        if request.scope and request.scope != SearchScope.WEB:
+        if request.scope is not None and request.scope is not SearchScope.WEB:
             raise InvalidRequestError(
-                f"Web provider only supports WEB scope, got {request.scope}",
-                provider=self.name,
+                f"Web provider only supports WEB scope, got {request.scope}", provider=self.name
             )
-        
-        # Check availability
-        self.check_availability()
-        
-        # For Phase 4, web search is marked as unavailable
-        # This is intentional per the requirements
-        if self._status != ProviderStatus.CONFIGURED:
-            raise ProviderUnavailableError(
-                "Web search provider requires API configuration. "
-                "Not available in Phase 4 without explicit connector.",
-                provider=self.name,
-            )
-        
+        if not isinstance(request.query, str):
+            raise InvalidRequestError("Query must be text", provider=self.name)
         query = request.query.strip()
-        
-        # Try gh CLI first
-        if self.USE_GH_CLI:
-            results = self._search_with_gh_cli(query, request.max_results)
-        else:
-            results = self._search_with_http(query, request.max_results)
-        
+        if not query:
+            raise InvalidRequestError("Query must not be empty", provider=self.name)
+        if len(query) > self.max_query_chars:
+            raise InvalidRequestError("Query exceeds the web search length limit", provider=self.name)
+        if not isinstance(request.max_results, int) or isinstance(request.max_results, bool) or request.max_results < 1:
+            raise InvalidRequestError("Result limit must be a positive integer", provider=self.name)
+
+        limit = min(request.max_results, self.max_results)
+        timeout = min(float(request.timeout), self.timeout)
+        try:
+            response = self._session.get(
+                self.ENDPOINT,
+                params={"q": query, "kl": "us-en"},
+                timeout=timeout,
+            )
+        except PinnedRequestError as exc:
+            message = str(exc).casefold()
+            if "response exceeds" in message:
+                raise ResponseTooLargeError("Web search response exceeds the configured size limit", provider=self.name) from exc
+            if "timed out" in message or "timeout" in message:
+                raise ProviderTimeoutError("Web search request timed out", provider=self.name) from exc
+            raise SSRFError("Web search request was rejected by the pinned network policy", provider=self.name) from exc
+        except TimeoutError as exc:
+            raise ProviderTimeoutError("Web search request timed out", provider=self.name) from exc
+        except Exception as exc:
+            raise NetworkError("Web search request failed", provider=self.name) from exc
+
+        status = int(response.status_code)
+        if status == 202:
+            raise ProviderUnavailableError(
+                "Web search endpoint returned an anti-automation response",
+                provider=self.name,
+            )
+        if status == 429:
+            raise RateLimitError("Web search provider rate limited the request", provider=self.name)
+        if status >= 500:
+            raise ProviderError(f"Web search provider returned HTTP {status}", provider=self.name)
+        if status != 200:
+            raise ProviderError(f"Web search provider returned HTTP {status}", provider=self.name)
+        content_type = str(response.headers.get("content-type", "")).casefold()
+        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            raise ParseError("Web search provider returned an unexpected content type", provider=self.name)
+        body = response.body
+        if not isinstance(body, bytes):
+            raise ParseError("Web search response body is not bytes", provider=self.name)
+        if len(body) > self.max_response_bytes:
+            raise ResponseTooLargeError("Web search response exceeds the configured size limit", provider=self.name)
+
+        results = self._parse_results(body, query, limit)
         return SearchResponse(
             request=request,
-            results=results[:request.max_results],
+            results=results,
             total_results=len(results),
             provider=self.name,
             metadata={
-                "query": query,
-                "status": self._status.value,
+                "backend": "duckduckgo_html",
+                "response_bytes": len(body),
+                "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                "trust": "untrusted_data",
+                "remote_fetch_performed": False,
             },
         )
 
 
 class WebSearchProviderUnavailable(WebSearchProvider):
-    """Web search provider that is explicitly unavailable.
-    
-    This is the actual implementation for Phase 4, as we don't have
-    a real web search connector configured.
-    """
-    
-    name = "web"
-    scope = SearchScope.WEB
-    capabilities = frozenset({
-        ProviderCapability.SEARCH,
-        ProviderCapability.READ_ONLY,
-    })
-    
-    status = ProviderStatus.NOT_CONFIGURED
-    
-    def __init__(self):
-        """Initialize provider as unavailable."""
-        pass
-    
-    def check_availability(self) -> ProviderStatus:
-        """Check if provider is available."""
-        return self.status
-    
-    def search(self, request: SearchRequest) -> SearchResponse:
-        """Execute a web search request - always unavailable in Phase 4."""
-        raise ProviderUnavailableError(
-            "Web search provider is not configured in Phase 4. "
-            "Real web search requires explicit API connector configuration.",
-            provider=self.name,
-        )
-
-
-# Provider error for compatibility
-class ProviderError(Exception):
-    """Generic provider error."""
-    def __init__(self, message: str, provider: str | None = None):
-        super().__init__(message)
-        self.message = message
-        self.provider = provider
+    """Deprecated compatibility name; use :class:`WebSearchProvider` directly."""
