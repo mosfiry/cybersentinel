@@ -29,9 +29,35 @@ jobs:
         id: install_bwrap
         continue-on-error: true
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes bubblewrap
-          bwrap --version
+          sudo apt-get install --yes build-essential meson ninja-build libcap-dev pkg-config
+          archive="$RUNNER_TEMP/bubblewrap-0.9.0.tar.xz"
+          source_dir="$RUNNER_TEMP/bubblewrap-0.9.0"
+          build_dir="$RUNNER_TEMP/bubblewrap-build"
+          stage_dir="$RUNNER_TEMP/bubblewrap-stage"
+          curl --fail --location --silent --show-error \
+            https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            c6347eaced49ac0141996f46bba3b089e5e6ea4408bc1c43bab9f2d05dd094e1 \
+            "$archive" | sha256sum --check -
+          mkdir -p "$source_dir"
+          tar -xJf "$archive" --strip-components=1 -C "$source_dir"
+          meson setup "$build_dir" "$source_dir" \
+            --prefix=/opt/bubblewrap-0.9.0 \
+            -Dtests=true \
+            -Dselinux=disabled \
+            -Dman=disabled \
+            -Dbash_completion=disabled \
+            -Dzsh_completion=disabled
+          meson compile -C "$build_dir"
+          meson test -C "$build_dir" --print-errorlogs
+          DESTDIR="$stage_dir" meson install -C "$build_dir"
+          bwrap_bin="$stage_dir/opt/bubblewrap-0.9.0/bin/bwrap"
+          test "$("$bwrap_bin" --version)" = "bubblewrap 0.9.0"
+          "$bwrap_bin" --help | grep -Fq -- '--size BYTES'
+          echo "$stage_dir/opt/bubblewrap-0.9.0/bin" >> "$GITHUB_PATH"
       - name: Verify rootless network-isolated execution capability
         id: rootless_preflight
         continue-on-error: true
