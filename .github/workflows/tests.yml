@@ -32,20 +32,20 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes build-essential meson ninja-build libcap-dev pkg-config
-          archive="$RUNNER_TEMP/bubblewrap-0.9.0.tar.xz"
-          source_dir="$RUNNER_TEMP/bubblewrap-0.9.0"
+          archive="$RUNNER_TEMP/bubblewrap-0.10.0.tar.xz"
+          source_dir="$RUNNER_TEMP/bubblewrap-0.10.0"
           build_dir="$RUNNER_TEMP/bubblewrap-build"
           stage_dir="$RUNNER_TEMP/bubblewrap-stage"
           curl --fail --location --silent --show-error \
-            https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz \
+            https://github.com/containers/bubblewrap/releases/download/v0.10.0/bubblewrap-0.10.0.tar.xz \
             --output "$archive"
           printf '%s  %s\n' \
-            c6347eaced49ac0141996f46bba3b089e5e6ea4408bc1c43bab9f2d05dd094e1 \
+            65d92cf44a63a51e1b7771f70c05013dce5bd6b0b2841c4b4be54b0c45565471 \
             "$archive" | sha256sum --check -
           mkdir -p "$source_dir"
           tar -xJf "$archive" --strip-components=1 -C "$source_dir"
           meson setup "$build_dir" "$source_dir" \
-            --prefix=/opt/bubblewrap-0.9.0 \
+            --prefix=/opt/bubblewrap-0.10.0 \
             -Dtests=true \
             -Dselinux=disabled \
             -Dman=disabled \
@@ -54,13 +54,14 @@ jobs:
           meson compile -C "$build_dir"
           meson test -C "$build_dir" --print-errorlogs
           DESTDIR="$stage_dir" meson install -C "$build_dir"
-          bwrap_bin="$stage_dir/opt/bubblewrap-0.9.0/bin/bwrap"
-          test "$("$bwrap_bin" --version)" = "bubblewrap 0.9.0"
+          bwrap_bin="$stage_dir/opt/bubblewrap-0.10.0/bin/bwrap"
+          test "$("$bwrap_bin" --version)" = "bubblewrap 0.10.0"
           "$bwrap_bin" --help | grep -Fq -- '--size BYTES'
+          "$bwrap_bin" --help | grep -Fq -- '--ro-bind-fd'
           sudo install -m 0755 "$bwrap_bin" /usr/bin/bwrap
-          test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.9.0"
+          test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.10.0"
           cmp --silent "$bwrap_bin" /usr/bin/bwrap
-          echo "$stage_dir/opt/bubblewrap-0.9.0/bin" >> "$GITHUB_PATH"
+          echo "$stage_dir/opt/bubblewrap-0.10.0/bin" >> "$GITHUB_PATH"
       - name: Verify rootless network-isolated execution capability
         id: rootless_preflight
         continue-on-error: true
