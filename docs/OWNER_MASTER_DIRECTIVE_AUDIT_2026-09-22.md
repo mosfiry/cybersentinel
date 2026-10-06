@@ -315,3 +315,8 @@ git diff --check
 | Scope firewall | STATIC VERIFIED + INTEGRATION VERIFIED (unit) | immutable snapshots; scope-blocked transitions; registry re-check |
 | Dead runtime removal | NOT IMPLEMENTED | blockers documented in section 4 |
 | Final verification | STATIC VERIFIED | `GoalVerification` deterministic; model "final" not accepted without evidence |
+
+
+## Superseding authority-order correction (2026-10-06)
+
+The 2026-09-22 order above records the design at that audit date. The v5.2 final-completion mission requires immutable system/platform constraints to sit above Owner Instruction. The current metadata contract encodes `SYSTEM_PLATFORM > OWNER_INSTRUCTION > OWNER_POLICY > ...`; Owner Instruction remains the highest application-configurable authority. This correction is reflected in `security/authority.py`, `docs/AGENT_ARCHITECTURE.md`, and the authority-order regression tests. It changes the documented and serialized tier ordering only: the repository audit found no runtime path that consumes `AuthorityTier` as a tool-authorization decision. External host constraints remain outside application control and non-overridable.

@@ -9,10 +9,11 @@ from search.ssrf import check_url_ssrf, validate_url
 from security.authority import AuthorityTier, authority_snapshot
 
 
-def test_owner_instruction_is_highest_application_authority():
-    assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.SYSTEM_PLATFORM > AuthorityTier.OWNER_POLICY
+def test_system_platform_is_outer_authority_and_owner_is_highest_application_authority():
+    assert AuthorityTier.SYSTEM_PLATFORM > AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.OWNER_POLICY
     snapshot = authority_snapshot()
-    assert snapshot["application_policy_order"][:3] == ["OWNER_INSTRUCTION", "SYSTEM_PLATFORM", "OWNER_POLICY"]
+    assert snapshot["authority_order"][:3] == ["SYSTEM_PLATFORM", "OWNER_INSTRUCTION", "OWNER_POLICY"]
+    assert snapshot["application_policy_order"][:2] == ["OWNER_INSTRUCTION", "OWNER_POLICY"]
 
 
 def test_local_fallback_is_honest_and_does_not_claim_model_execution():

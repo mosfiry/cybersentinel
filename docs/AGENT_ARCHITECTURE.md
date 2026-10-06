@@ -69,13 +69,13 @@ The adaptive loop is fail-closed. Provider failure, invalid JSON, identity misma
 The stable CVE fixture at `knowledge/fixtures/incident_cve_x.json` contains a primary advisory, counter-evidence showing a patched asset version, a low-confidence IOC report, and an unverified public claim. It is used only for defensive hypothesis evaluation and does not grant exploit or network-execution authority.
 
 
-## Owner authority tiers — binding semantics (2026-09-22 audit)
+## Owner authority tiers — current binding semantics (updated 2026-10-06)
 
 The internal authority hierarchy of CyberSentinel X is fixed:
 
 ```text
-OWNER_INSTRUCTION (800)
-  > SYSTEM_PLATFORM (700)
+SYSTEM_PLATFORM (900)
+  > OWNER_INSTRUCTION (800)
   > OWNER_POLICY (600)
   > DETERMINISTIC_ENFORCEMENT
   > AUTHORIZATION_SCOPE
@@ -84,25 +84,21 @@ OWNER_INSTRUCTION (800)
   > EXTERNAL_DATA
 ```
 
-Semantics that remove a historical ambiguity:
+Semantics:
 
-- `SYSTEM_PLATFORM` names the **internal CyberSentinel platform layer** — the
-  process boundary, separation between bridge transport authentication and
-  server-managed Owner sessions, lifecycle persistence, audit-chain integrity,
-  and deterministic enforcement. There is no runtime `OWNER_TOKEN` credential.
-  It is an application-internal tier, **not** the external hosting or runtime
-  constraints of the machine/network the service happens to run on.
-- External platform constraints that CyberSentinel does not control (OS
-  sandbox, host network policy, provider-side limits) are **outside** this
-  hierarchy. No code path may claim to override them, and no Owner Instruction
-  can be interpreted as overriding them.
-- `OWNER_INSTRUCTION` is the highest **application** authority. It is never
-  re-ordered below `SYSTEM_PLATFORM`, and `SYSTEM_PLATFORM` is never used to
-  synthesize a competing application objective.
-- Components that read `AuthorityTier` values must treat them as
-  documentation of this ordering, not as an execution input. A clearer name
-  (for example `INTERNAL_PLATFORM_LAYER`) may be introduced only if this
-  documented order is preserved exactly.
+- `SYSTEM_PLATFORM` is the immutable outer system/platform boundary. It
+  outranks every application authority and cannot be redefined by Owner text,
+  model output, knowledge, memory, tools, or external data. There is no runtime
+  `OWNER_TOKEN` credential.
+- External constraints CyberSentinel does not control (OS sandbox, host
+  network policy, provider-side limits) are outside application control and
+  likewise cannot be overridden by any Owner Instruction.
+- `OWNER_INSTRUCTION` is the highest **application-configurable** authority:
+  it governs OwnerPolicy and derived application rules, but remains below
+  `SYSTEM_PLATFORM`.
+- Components that read `AuthorityTier` values treat them as descriptive
+  metadata, not an execution input. Numeric tiers and snapshots must still
+  represent the same strict system-first precedence.
 
 ## Runtime inventory — canonical vs compatibility status (2026-09-22 audit)
 

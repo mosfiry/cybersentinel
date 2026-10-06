@@ -1,11 +1,16 @@
-"""OWNER_INSTRUCTION charter — the supreme legislative source of CyberSentinel X.
+"""OWNER_INSTRUCTION charter — the supreme application-policy source of CyberSentinel X.
+
+Immutable system/platform constraints form the outer boundary above this charter
+and cannot be redefined by Owner instructions.
 
 Constitutional invariants (issued by the Owner 2026-09-27, immutable):
 
-1. OWNER_INSTRUCTION is the charter: the single legislative source that
+1. OWNER_INSTRUCTION is the application charter: the single legislative source that
    defines policy, ethics, protection, security, scope, delegation,
    objectives, permissions, prohibitions, and execution conditions.
-2. No second legislative authority exists. POLICY, ETHICS, SECURITY,
+2. No second legislative authority exists within application policy.
+   SYSTEM_PLATFORM is the immutable outer boundary and outranks this charter.
+   POLICY, ETHICS, SECURITY,
    SCOPE, AUTHORIZATION and DELEGATION are DERIVED from the charter —
    they never compete with it and can never override it.
 3. Any application rule that contradicts the charter is an
@@ -52,7 +57,8 @@ class RuleProvenance(str, Enum):
     KNOWLEDGE_BASE = "knowledge_base"
 
 
-#: The constitutional precedence. Index 0 is supreme; nothing may outrank it.
+#: Application-charter precedence. Index 0 is supreme within application policy;
+#: the immutable SYSTEM_PLATFORM boundary remains above this sequence.
 CHARTER_PRECEDENCE: tuple[RuleProvenance, ...] = (
     RuleProvenance.OWNER_INSTRUCTION,
     RuleProvenance.DERIVED_SYSTEM_RULE,

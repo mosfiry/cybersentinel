@@ -5,10 +5,10 @@ from typing import Any
 
 
 class AuthorityTier(IntEnum):
-    # Owner Instruction is the highest application authority. Platform safety
-    # boundaries remain immutable, but are not an alternate application goal.
+    # Immutable system/platform constraints are the outer authority boundary.
+    SYSTEM_PLATFORM = 900
+    # Owner Instruction is the highest application-configurable authority.
     OWNER_INSTRUCTION = 800
-    SYSTEM_PLATFORM = 700
     OWNER_POLICY = 600
     DETERMINISTIC_ENFORCEMENT = 500
     AUTHORIZATION_SCOPE = 400
@@ -21,7 +21,7 @@ FIXED_AUTHORITY_TIERS = tuple(item.name for item in AuthorityTier)
 
 
 def assert_authority_invariant() -> None:
-    assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.SYSTEM_PLATFORM
+    assert AuthorityTier.SYSTEM_PLATFORM > AuthorityTier.OWNER_INSTRUCTION
     assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.OWNER_POLICY
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.DETERMINISTIC_ENFORCEMENT
     assert AuthorityTier.DETERMINISTIC_ENFORCEMENT > AuthorityTier.AUTHORIZATION_SCOPE
@@ -41,8 +41,33 @@ def authority_snapshot() -> dict[str, Any]:
     assert_authority_invariant()
     return {
         "tiers": {tier.name: int(tier) for tier in AuthorityTier},
-        "application_policy_order": ["OWNER_INSTRUCTION", "SYSTEM_PLATFORM", "OWNER_POLICY", "DETERMINISTIC_ENFORCEMENT", "AUTHORIZATION_SCOPE", "TOOL_RUNTIME", "MODEL_OUTPUT", "EXTERNAL_DATA"],
-        "owner_above": ["MODEL_OUTPUT", "EXTERNAL_DATA", "TOOL_RUNTIME", "AUTHORIZATION_SCOPE", "DETERMINISTIC_ENFORCEMENT"],
+        "authority_order": list(FIXED_AUTHORITY_TIERS),
+        "application_policy_order": [
+            "OWNER_INSTRUCTION",
+            "OWNER_POLICY",
+            "DETERMINISTIC_ENFORCEMENT",
+            "AUTHORIZATION_SCOPE",
+            "TOOL_RUNTIME",
+            "MODEL_OUTPUT",
+            "EXTERNAL_DATA",
+        ],
+        "system_above": [
+            "OWNER_INSTRUCTION",
+            "OWNER_POLICY",
+            "DETERMINISTIC_ENFORCEMENT",
+            "AUTHORIZATION_SCOPE",
+            "TOOL_RUNTIME",
+            "MODEL_OUTPUT",
+            "EXTERNAL_DATA",
+        ],
+        "owner_above": [
+            "OWNER_POLICY",
+            "DETERMINISTIC_ENFORCEMENT",
+            "AUTHORIZATION_SCOPE",
+            "TOOL_RUNTIME",
+            "MODEL_OUTPUT",
+            "EXTERNAL_DATA",
+        ],
         "system_boundary_immutable": True,
         "closed_world": True,
     }

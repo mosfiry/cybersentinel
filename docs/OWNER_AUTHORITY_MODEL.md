@@ -19,7 +19,7 @@ SYSTEM_PLATFORM
 
 An Owner update requires an issued `OwnerAuthenticationEvidence` containing method, authenticated time, expiry, proof fingerprint, request ID, optional session ID, nonce, and an HMAC signature. Boolean fields such as `owner_authenticated=True` are not accepted by the Owner Instruction writer. Evidence is request-bound, time-bounded, signature-checked, and nonce-replay-protected within the process.
 
-The current implementation supports token-issued evidence and session-challenge evidence. A copied evidence object is a bearer capability for its exact request, but replay of its nonce is rejected. The signing secret and replay set are process-local; distributed replay protection is not claimed.
+The current evidence source is `username_password`, backed by the server-managed Owner session; token-issued and session-challenge sources are not claimed. A copied evidence object is a bearer capability for its exact request, but replay of its nonce is rejected. The signing secret and replay set are process-local; serialized worker validation instead checks the exact request, evidence fingerprint, expiry, and active Owner session. Distributed replay protection is not claimed.
 
 ## OwnerInstruction Entity
 
