@@ -25,6 +25,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: pip install
         run: python -m pip install -r requirements.txt
+      - name: Install rootless Linux process isolation for governed workspace tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          bwrap --version
       - name: Install pinned Playwright Chromium for Browser integration tests
         run: python -m playwright install --with-deps chromium
       - name: compileall

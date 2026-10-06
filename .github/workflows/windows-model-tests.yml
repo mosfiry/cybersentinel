@@ -2,7 +2,7 @@ name: Windows Model Manager Regressions
 
 on:
   push:
-    branches: [work/v5.2-production-completion]
+    branches: [work/v5.2-production-completion, work/v5.2-final-completion]
     paths:
       - "agent/local_runtime/**"
       - "bridge.py"

@@ -2,7 +2,7 @@ name: cybersentinel-windows-rc-installer
 
 on:
   push:
-    branches: [work/windows-native-local-llm, work/hermes-level-agent-intelligence]
+    branches: [work/windows-native-local-llm, work/hermes-level-agent-intelligence, work/v5.2-final-completion]
     paths:
       - "desktop/**"
       - "web/**"
