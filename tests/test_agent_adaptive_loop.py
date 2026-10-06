@@ -181,6 +181,41 @@ def test_successful_status_observation_skips_only_optional_model_proposal():
     assert search_observation.provenance["proposal_origin"] == "model"
 
 
+def test_runtime_passes_trusted_status_success_into_observation_interpreter(tmp_path):
+    calls = []
+
+    def proposer(payload):
+        calls.append(payload["action"])
+        return {"summary": "provider proposal"}
+
+    interpreter = ObservationInterpreter(
+        proposer=proposer,
+        model_skip_success_actions=("status",),
+    )
+    rt = make_runtime(tmp_path, lambda mission, step, action_id: {}, interpreter=interpreter)
+    mission = rt.create("check status", "check status", initial_plan())
+    step = mission.current_plan_step
+
+    successful = rt._interpret_observation(
+        mission,
+        step,
+        {"action_id": "status-success", "status": "ready"},
+        success=True,
+    )
+    failed = rt._interpret_observation(
+        mission,
+        step,
+        {"action_id": "status-failure", "error": "unavailable"},
+        success=False,
+    )
+
+    assert successful is not None and failed is not None
+    assert calls == ["status"]
+    assert mission.interpretations[0]["summary"] == "ready"
+    assert mission.interpretations[0]["provenance"]["source"] == "deterministic_observation_interpreter"
+    assert mission.interpretations[1]["provenance"]["proposal_origin"] == "model"
+
+
 def test_crash_after_action_requires_recovery_without_replay(tmp_path):
     calls = []
 

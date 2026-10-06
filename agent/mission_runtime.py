@@ -886,12 +886,13 @@ class MissionRuntime:
         previous = mission.observations[-2] if len(mission.observations) > 1 else None
         if not should_interpret_observation(observation, previous=previous):
             return None
+        interpreted_observation = {**observation, "success": bool(success)}
         proposal = self.interpreter.interpret(
             mission=mission.to_dict(),
             plan=mission.plan.to_dict(),
             current_step=step.to_dict(),
             action=step.action,
-            observation=observation,
+            observation=interpreted_observation,
             evidence=mission.evidence,
             hypothesis_state=mission.hypotheses,
             knowledge_context=mission.knowledge_context,
