@@ -162,6 +162,42 @@ def test_scope_expansion_is_rejected(overrides):
         parent.narrow(**request)
 
 
+@pytest.mark.parametrize(("parent_overrides", "child_override"), [
+    ({"scope": ()}, {"scope": ("host:example.test",)}),
+    ({"allowed_tools": ()}, {"allowed_tools": ("status",)}),
+    ({"allowed_actions": ()}, {"allowed_actions": ("read",)}),
+    ({}, {"allowed_networks": ("internet",)}),
+    ({}, {"allowed_credentials": ("credential-store",)}),
+])
+def test_empty_parent_grant_cannot_be_widened(parent_overrides, child_override):
+    snapshot = authorization(**parent_overrides)
+    parent = DelegationScope.from_snapshot(snapshot)
+    request = {
+        "target_identity": parent.target_identity,
+        "scope": ("host:example.test",),
+        "allowed_tools": ("status",),
+        "allowed_actions": ("read",),
+    }
+    request.update(child_override)
+
+    with pytest.raises(DelegationDenied):
+        parent.narrow(**request)
+
+    forged_child = DelegationScope(
+        owner_identity_ref=parent.owner_identity_ref,
+        mission_id=parent.mission_id,
+        target_identity=parent.target_identity,
+        root_authorization_hash=parent.root_authorization_hash,
+        parent_grant_hash=parent.fingerprint,
+        scope=tuple(request["scope"]),
+        allowed_tools=tuple(request["allowed_tools"]),
+        allowed_actions=tuple(request["allowed_actions"]),
+        allowed_networks=tuple(request.get("allowed_networks", ())),
+        allowed_credentials=tuple(request.get("allowed_credentials", ())),
+    )
+    assert not forged_child.is_subset_of(parent)
+
+
 def test_delegation_requires_explicit_tool_action_and_scope():
     parent = DelegationScope.from_snapshot(authorization())
     with pytest.raises(ValueError):

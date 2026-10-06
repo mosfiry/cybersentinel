@@ -176,6 +176,27 @@ def _origin(url: str) -> str:
     return f"{parts.scheme.casefold()}://{host}:{port}"
 
 
+def _delegated_network_host_allowed(context: ExecutionContext, url: str) -> bool:
+    """Fail closed when a delegated Browser request leaves its exact host grant."""
+    delegated = getattr(context, "delegation_scope", None)
+    if delegated is None:
+        return True
+    try:
+        from agent.intelligence_layer.models import DelegationScope
+        from security.scope import canonical_host
+
+        if not isinstance(delegated, DelegationScope):
+            return False
+        host = urlsplit(url).hostname
+        if not host:
+            return False
+        requested = canonical_host(host)
+        granted = {canonical_host(item) for item in delegated.allowed_networks}
+        return requested in granted
+    except (TypeError, ValueError, PermissionError):
+        return False
+
+
 def _scrub_request_headers(headers: dict[str, str]) -> dict[str, str]:
     selected = {}
     for name, value in headers.items():
@@ -440,6 +461,8 @@ class BrowserService:
             raise BrowserOperationError("browser_session_scope_mismatch")
         try:
             current_url = self._assert_user_url(session.page.url)
+            if not _delegated_network_host_allowed(context, current_url):
+                raise BrowserOperationError("delegated_network_scope_mismatch")
             scope = context.scope_snapshot
             from security.scope_resolver import resolve
             decision = resolve(
@@ -484,6 +507,10 @@ class BrowserService:
             parts = urlsplit(url)
             if parts.scheme.casefold() not in {"https", "http"} or parts.username is not None or parts.password is not None:
                 session.last_block_code = "scheme_not_allowed"
+                route.abort("blockedbyclient")
+                return
+            if not _delegated_network_host_allowed(context, url):
+                session.last_block_code = "delegated_network_denied"
                 route.abort("blockedbyclient")
                 return
             from security.scope_resolver import resolve
@@ -535,6 +562,10 @@ class BrowserService:
                     session.last_block_code = "redirect_destination_denied"
                     route.abort("blockedbyclient")
                     return
+                if not _delegated_network_host_allowed(context, redirected_url):
+                    session.last_block_code = "delegated_redirect_denied"
+                    route.abort("blockedbyclient")
+                    return
                 redirected_scope = resolve(
                     str(scope["scope_snapshot_id"]),
                     str(scope["target_id"]),
@@ -575,7 +606,15 @@ class BrowserService:
         def command():
             context.assert_active()
             if requested_session:
-                session = self._get_session(context, requested_session)
+                if not isinstance(requested_session, str) or not re.fullmatch(r"bs_[a-f0-9]{32}", requested_session):
+                    raise BrowserOperationError("session_id_invalid")
+                # A Mission plan may bind later Browser operations to an explicit
+                # session ID before the first navigation. Create that ID only when
+                # absent; existing sessions still require full Owner/scope binding.
+                if requested_session in self._sessions:
+                    session = self._get_session(context, requested_session)
+                else:
+                    session = self._new_session(context, requested_session)
             else:
                 session_id = "bs_" + uuid.uuid4().hex
                 session = self._new_session(context, session_id)

@@ -312,3 +312,178 @@ def test_watch_evidence_uses_persisted_readback_not_tool_claim(tmp_path, monkeyp
     )
 
     assert verified == ("watch", {"keyword": "critical", "persisted": True})
+
+
+def _browser_verification_fixture(runtime, *, expected_text="This domain is for use in documentation examples"):
+    url = "https://example.com/"
+    plan = Plan.initial("open a scoped page and extract its title and body").replan(
+        steps=(PlanStep("browser-open", "open scoped page", action="browser"),), reason="test"
+    )
+    mission = runtime.create(
+        "Open the scoped documentation example",
+        "open a scoped page and extract its title and body",
+        plan,
+        scope_snapshot={"url": url, "scope_snapshot_id": "scope-test", "target_id": "target-test"},
+        completion_criteria=[{
+            "criterion_id": "browser-page",
+            "check": "browser_extraction",
+            "expected_title": "Example Domain",
+            "expected_text": expected_text,
+        }],
+    )
+    browser_result = {
+        "ok": True,
+        "session_id": "bs_0123456789abcdef0123456789abcdef",
+        "url": url,
+        "title": "Example Domain",
+        "text": "This domain is for use in documentation examples without needing permission.",
+        "scope_enforced": True,
+        "network_transport": "dns_pinned",
+        "trust": "untrusted_page_data",
+        "authority": "none",
+        "evidence_ref": {
+            "evidence_id": "browser-evidence-1",
+            "sequence": 1,
+            "current_hash": "a" * 64,
+        },
+    }
+    return mission, browser_result, {"operation": "open", "url": url}
+
+
+def test_browser_extraction_evidence_is_scope_bound_and_keeps_page_untrusted(tmp_path):
+    runtime = _runtime(tmp_path)
+    mission, browser_result, arguments = _browser_verification_fixture(runtime)
+
+    verified = runtime._successful_observation_evidence(
+        mission,
+        {"success": True, "result": browser_result},
+        tool_name="browser",
+        tool_argument=arguments,
+    )
+
+    assert verified is not None
+    criterion_id, evidence = verified
+    assert criterion_id == "browser-page"
+    assert evidence["network_transport"] == "dns_pinned"
+    assert evidence["trust"] == "untrusted_page_data"
+    assert evidence["authority"] == "none"
+    assert evidence["evidence_ref"]["current_hash"] == "a" * 64
+
+
+def test_browser_extraction_evidence_rejects_scope_or_content_mismatch(tmp_path):
+    runtime = _runtime(tmp_path)
+    mission, browser_result, arguments = _browser_verification_fixture(runtime)
+    browser_result["url"] = "https://not-example.com/"
+    assert runtime._successful_observation_evidence(
+        mission,
+        {"success": True, "result": browser_result},
+        tool_name="browser",
+        tool_argument=arguments,
+    ) is None
+
+    mission, browser_result, arguments = _browser_verification_fixture(
+        runtime, expected_text="unexpected content"
+    )
+    assert runtime._successful_observation_evidence(
+        mission,
+        {"success": True, "result": browser_result},
+        tool_name="browser",
+        tool_argument=arguments,
+    ) is None
+def test_mcp_discovery_evidence_requires_owner_scoped_identity_and_unapproved_schema(tmp_path):
+    runtime = _runtime(tmp_path)
+    server_id = "mcp_" + "1" * 32
+    plan = Plan.initial("discover the owner-scoped MCP tool").replan(
+        steps=(PlanStep("discover", "discover MCP", action="mcp.discover"),), reason="test"
+    )
+    mission = runtime.create(
+        "Discover MCP",
+        "discover the owner-scoped MCP tool",
+        plan,
+        completion_criteria=[{
+            "criterion_id": "mcp-discovered",
+            "check": "mcp_discovery",
+            "expected_tool_name": "read_acceptance_record",
+            "expected_trust_level": "UNTRUSTED",
+        }],
+    )
+    result = {
+        "status": "discovered",
+        "trust_level": "UNTRUSTED",
+        "server_id": server_id,
+        "identity_sha256": "b" * 64,
+        "tools": [{"name": "read_acceptance_record", "schema_sha256": "c" * 64, "approved": False}],
+        "schema_details_required": True,
+        "descriptions_withheld": True,
+        "evidence_ref": "d" * 64,
+    }
+    verified = runtime._successful_observation_evidence(
+        mission,
+        {"success": True, "result": result},
+        tool_name="mcp.discover",
+        tool_argument={"server_id": server_id},
+    )
+    assert verified is not None
+    assert verified[0] == "mcp-discovered"
+    assert verified[1]["trust_level"] == "UNTRUSTED"
+    assert verified[1]["schema_approved_before_owner_review"] is False
+    assert verified[1]["authority"] == "none"
+
+    result["identity_sha256"] = "invalid"
+    assert runtime._successful_observation_evidence(
+        mission,
+        {"success": True, "result": result},
+        tool_name="mcp.discover",
+        tool_argument={"server_id": server_id},
+    ) is None
+
+
+def test_mcp_invocation_evidence_keeps_remote_content_untrusted(tmp_path):
+    runtime = _runtime(tmp_path)
+    server_id = "mcp_" + "2" * 32
+    plan = Plan.initial("invoke the owner-approved MCP tool").replan(
+        steps=(PlanStep("invoke", "invoke MCP", action="mcp.invoke"),), reason="test"
+    )
+    mission = runtime.create(
+        "Invoke MCP",
+        "invoke the owner-approved MCP tool",
+        plan,
+        completion_criteria=[{
+            "criterion_id": "mcp-invoked",
+            "check": "mcp_invoke",
+            "expected_tool_name": "read_acceptance_record",
+        }],
+    )
+    arguments = {"server_id": server_id, "tool_name": "read_acceptance_record", "arguments": {"query": "safe"}}
+    result = {
+        "status": "completed",
+        "success": True,
+        "server_id": server_id,
+        "tool_name": "read_acceptance_record",
+        "trust": "untrusted_remote_result",
+        "result": {
+            "is_error": False,
+            "content": ["[UNTRUSTED_MCP_TOOL_OUTPUT] fixture data"],
+            "structured_content": {"ok": True, "receipt": "fixture"},
+        },
+        "evidence_ref": "e" * 64,
+    }
+    verified = runtime._successful_observation_evidence(
+        mission,
+        {"success": True, "result": result},
+        tool_name="mcp.invoke",
+        tool_argument=arguments,
+    )
+    assert verified is not None
+    assert verified[0] == "mcp-invoked"
+    assert verified[1]["trust"] == "untrusted_remote_result"
+    assert verified[1]["authority"] == "none"
+    assert verified[1]["content_items_marked_untrusted"] == 1
+
+    result["trust"] = "trusted"
+    assert runtime._successful_observation_evidence(
+        mission,
+        {"success": True, "result": result},
+        tool_name="mcp.invoke",
+        tool_argument=arguments,
+    ) is None

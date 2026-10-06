@@ -307,6 +307,46 @@ def test_owner_skill_service_qualifies_only_real_fenced_mission_evidence(tmp_pat
     assert service.registry.get_active("owner:1", candidate["skill_id"]) is None
 
 
+def test_owner_skill_service_versions_rolls_back_and_retires_with_owner_audit(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    service, mission, _store = _completed_mission(tmp_path, monkeypatch)
+    first_definition = _candidate_definition("bounded owner guide revision one")
+    first = service.submit_candidate("valid-owner", mission.mission_id, first_definition.to_dict())
+    approved_first = service.approve("valid-owner", first["skill_id"], 1, first["content_hash"])
+    assert approved_first["active"] is True
+
+    second_definition = replace(
+        _candidate_definition("bounded owner guide revision two"),
+        version=2,
+        content_hash="",
+    )
+    second = service.submit_candidate("valid-owner", mission.mission_id, second_definition.to_dict())
+    approved_second = service.approve("valid-owner", second["skill_id"], 2, second["content_hash"])
+    assert approved_second["active"] is True
+    assert service.registry.get_active("owner:1", first["skill_id"]).definition.version == 2
+
+    rolled_back = service.rollback("valid-owner", first["skill_id"], 1, first["content_hash"])
+    assert rolled_back["status"] == "approved"
+    assert rolled_back["active"] is True
+    assert service.registry.get_active("owner:1", first["skill_id"]).definition.version == 1
+
+    retired = service.deprecate("valid-owner", first["skill_id"], 1, first["content_hash"])
+    assert retired["status"] == "deprecated"
+    assert retired["active"] is False
+    assert service.registry.get_active("owner:1", first["skill_id"]) is None
+
+    events = service.registry.events("owner:1", first["skill_id"])
+    assert [event["action"] for event in events] == [
+        "candidate_registered", "approved", "candidate_registered", "approved",
+        "rollback_activated", "deprecated",
+    ]
+    rollback_event = next(event for event in events if event["action"] == "rollback_activated")
+    assert rollback_event["decision_id"].startswith("owner-skill-rollback:")
+    assert rollback_event["details"]["previous_version"] == 2
+    assert events[-1]["decision_id"].startswith("owner-skill-deprecate:")
+
+
 def test_owner_skill_service_rejects_foreign_owner_mission_and_revision_access(tmp_path, monkeypatch):
     service, mission, _store = _completed_mission(tmp_path, monkeypatch)
     definition = _candidate_definition("bounded status guidance")

@@ -264,6 +264,66 @@ def test_real_chromium_navigation_extraction_links_inspection_and_screenshot(bro
     assert all(item["evidence"]["trust"] == "untrusted_data" for item in browser_fixture.evidence.records)
 
 
+def test_browser_open_creates_a_new_explicit_mission_bound_session(browser_fixture):
+    _ensure_chromium_available()
+    session_id = "bs_" + "a" * 32
+    opened = browser_fixture.service.open(
+        {"url": browser_fixture.origin + "/", "session_id": session_id},
+        browser_fixture.context,
+    )
+    assert opened["ok"] is True
+    assert opened["session_id"] == session_id
+    browser_fixture.context.tool_id = "browser.links"
+    links = browser_fixture.service.links({"session_id": session_id}, browser_fixture.context)
+    assert links["links"][0]["text"] == "Next step"
+
+
+def test_browser_acceptance_runner_cannot_pass_on_cleanup_checks_after_early_error(tmp_path, monkeypatch):
+    import json
+    import scripts.run_browser_mission_acceptance as runner
+    import agent.agent_core as agent_core
+    import tools.browser as browser_tools
+
+    class FakeBrowserService:
+        def __init__(self):
+            self._sessions = {}
+            self._stopped = False
+
+    service = FakeBrowserService()
+    monkeypatch.setattr(browser_tools, "get_browser_service", lambda: service)
+    monkeypatch.setattr(
+        browser_tools,
+        "shutdown_browser_service",
+        lambda: setattr(service, "_stopped", True),
+    )
+
+    class FailingAgentCore:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("injected_failure_before_feature_checks")
+
+    monkeypatch.setattr(agent_core, "AgentCore", FailingAgentCore)
+    artifact = tmp_path / "browser-acceptance.json"
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(sys, "argv", [
+        "run_browser_mission_acceptance.py",
+        "--artifact", str(artifact),
+        "--state-dir", str(state_dir),
+        "--url", "https://example.com/",
+    ])
+
+    assert runner.main() == 1
+    evidence = json.loads(artifact.read_text(encoding="utf-8"))
+    assert evidence["error_type"] == "RuntimeError"
+    assert evidence["status"] == "FAIL"
+    assert evidence["checks"]["cleanup_browser_session_stopped"] is True
+    assert evidence["checks"]["cleanup_environment_patch_reverted"] is True
+    assert evidence["checks"]["all_browser_acceptance_checks_pass"] is False
+    assert not any(
+        evidence["checks"].get(name) is True
+        for name in runner._BROWSER_FEATURE_CHECKS
+    )
+
+
 def test_real_browser_download_is_inert_and_form_fill_never_submits(browser_fixture):
     _ensure_chromium_available()
     service, ctx = browser_fixture.service, browser_fixture.context

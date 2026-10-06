@@ -610,6 +610,56 @@ class OwnerSkillService:
         approved = self._decision_registry(owner_ref, "approve", skill_id, version, "owner-skill-approve:" + uuid.uuid4().hex).approve(owner_ref, skill_id, version)
         return self._public_revision(approved, active=True, source_mission_id=evidence.mission_id)
 
+    def rollback(
+        self,
+        owner_session_token: str,
+        skill_id: str,
+        target_version: int,
+        content_hash: str,
+    ) -> dict[str, Any]:
+        """Owner-authorize reactivation of an immutable, previously approved revision."""
+        owner_ref = self._owner_ref(owner_session_token)
+        revision = self._get_revision(owner_ref, skill_id, target_version)
+        if revision.status not in {SkillStatus.APPROVED, SkillStatus.DEPRECATED}:
+            raise SkillError("rollback target must be a previously approved revision")
+        if not _SHA256.fullmatch(str(content_hash)) or not hmac.compare_digest(revision.definition.content_hash, content_hash):
+            raise SkillAuthorizationError("Skill revision content digest changed")
+        evidence = self._source_evidence(owner_ref, skill_id, target_version)
+        self._revalidate_candidate_source(owner_session_token, revision, evidence)
+        rolled_back = self._decision_registry(
+            owner_ref, "rollback", skill_id, target_version, "owner-skill-rollback:" + uuid.uuid4().hex,
+        ).rollback(owner_ref, skill_id, target_version)
+        return self._public_revision(rolled_back, active=True, source_mission_id=evidence.mission_id)
+
+    def deprecate(
+        self,
+        owner_session_token: str,
+        skill_id: str,
+        version: int,
+        content_hash: str,
+    ) -> dict[str, Any]:
+        """Owner-authorize retirement of a currently approved Skill revision."""
+        owner_ref = self._owner_ref(owner_session_token)
+        revision = self._get_revision(owner_ref, skill_id, version)
+        if revision.status is not SkillStatus.APPROVED:
+            raise SkillError("only a currently approved Skill revision can be deprecated")
+        if not _SHA256.fullmatch(str(content_hash)) or not hmac.compare_digest(revision.definition.content_hash, content_hash):
+            raise SkillAuthorizationError("Skill revision content digest changed")
+        evidence = self._source_evidence(owner_ref, skill_id, version)
+        self._revalidate_candidate_source(owner_session_token, revision, evidence)
+        self._decision_registry(
+            owner_ref, "deprecate", skill_id, version, "owner-skill-deprecate:" + uuid.uuid4().hex,
+        ).deprecate(owner_ref, skill_id, version)
+        updated = self.registry.get_revision(owner_ref, skill_id, version)
+        if updated is None:
+            raise SkillAuthorizationError("Skill revision disappeared after deprecation")
+        active = self.registry.get_active(owner_ref, skill_id)
+        return self._public_revision(
+            updated,
+            active=bool(active and active.definition.version == version),
+            source_mission_id=evidence.mission_id,
+        )
+
     def revoke(
         self,
         owner_session_token: str,

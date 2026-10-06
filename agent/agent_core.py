@@ -239,6 +239,8 @@ class AgentCore:
         calls = self._calls(response)
         steps: list[PlanStep] = []
         for index, call in enumerate(calls, start=1):
+            if available_tool_names is not None and call.name not in available_tool_names:
+                continue
             spec = get_tool(call.name)
             if spec is None:
                 continue
@@ -962,6 +964,7 @@ class AgentCore:
             task_graph_policy=self.task_graph_policy,
             skill_context_provider=self._resolve_mission_skill_context,
             specialist_generate=self._specialist_generate if self.enable_specialist_agents else None,
+            mission_memory_writer=self.mission_memory_writer,
         )
         return self._run_via_fenced_worker(runtime, mission_id, max_slices=max_slices or self.max_iterations)
 

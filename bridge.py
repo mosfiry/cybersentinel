@@ -37,7 +37,8 @@ from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 from core.health import readiness_snapshot
 from api.missions import MissionService
-from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker
+from agent.mission_worker import MissionQueue, MissionWorker
+from agent.mission_series_scheduler import MissionSeriesScheduler
 from agent.mission_runtime import MissionRuntime
 from agent.mission import MissionStore
 from agent.agent_core import AgentCore
@@ -154,7 +155,7 @@ def build_mission_worker(*, worker_id: str = "worker") -> MissionWorker:
         enable_mission_memory=True,
     )
     queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
-    scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
+    scheduler = MissionSeriesScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue, mission_store=core.store)
     from evaluation.agent_evaluation import EvaluationStore
     from evaluation.mission_outcomes import MissionOutcomeRecorder
     evaluation_recorder = MissionOutcomeRecorder(
@@ -262,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
             mission_memory_writer=core.mission_memory_writer,
         )
         queue = MissionQueue(DB_PATH.with_name("mission_queue.sqlite3"), require_execution_fence=True, mission_store=core.store)
-        scheduler = MissionScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue)
+        scheduler = MissionSeriesScheduler(DB_PATH.with_name("mission_scheduler.sqlite3"), queue, mission_store=core.store)
         return MissionService(runtime, queue, scheduler, owner_revalidator=core.prepare_mission_for_queue)
 
     def _mcp_server_store(self):

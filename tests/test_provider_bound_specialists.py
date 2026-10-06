@@ -122,9 +122,12 @@ def test_independent_children_run_in_parallel_with_isolated_context_and_no_effec
     def provider(provider_name, model_name, messages, **kwargs):
         nonlocal active, maximum
         assert provider_name == "local" and model_name == "qwen-test"
-        assert kwargs["max_tokens"] <= 384 and kwargs["timeout"] <= 30
+        assert 0 < kwargs["max_tokens"] <= 96 and kwargs["timeout"] <= 30
         assert len(json.dumps(messages)) <= 4096
         payload = json.loads(messages[1]["content"].split("\n", 1)[1])
+        assert "/no_think" in messages[0]["content"]
+        assert "one sentence no more than 120 characters" in messages[0]["content"]
+        assert "recommendations and open_questions must be empty arrays" in messages[0]["content"]
         assert set(payload) == {"child_task_id", "task_objective", "expected_observation"}
         if payload["task_objective"].startswith("Analyze alpha"):
             assert "SECRET-SIBLING" not in json.dumps(payload)

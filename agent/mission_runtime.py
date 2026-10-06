@@ -758,6 +758,163 @@ class MissionRuntime:
                     criterion_id = str(item.get("criterion_id") or "")
                     if criterion_id and check in {"watch_registered", "local_watch"}:
                         return criterion_id, {"keyword": tool_argument.strip(), "persisted": True}
+
+        if tool_name == "browser" and isinstance(tool_argument, dict) and isinstance(result, dict):
+            operation = str(tool_argument.get("operation", "")).casefold()
+            browser_url = str(result.get("url", ""))
+            requested_url = str(tool_argument.get("url", ""))
+            scoped_url = str((mission.scope_snapshot or {}).get("url", "")) if isinstance(mission.scope_snapshot, dict) else ""
+
+            def _https_origin(value: str) -> tuple[str, str, int] | None:
+                try:
+                    from urllib.parse import urlsplit
+                    parts = urlsplit(value)
+                    if parts.scheme.casefold() != "https" or not parts.hostname or parts.username is not None or parts.password is not None:
+                        return None
+                    return (parts.scheme.casefold(), parts.hostname.casefold(), parts.port or 443)
+                except (TypeError, ValueError):
+                    return None
+
+            evidence_ref = result.get("evidence_ref")
+            title = str(result.get("title", ""))
+            text = str(result.get("text", ""))
+            origins_match = (
+                _https_origin(requested_url) is not None
+                and _https_origin(requested_url) == _https_origin(browser_url) == _https_origin(scoped_url)
+            )
+            evidence_ref_valid = (
+                isinstance(evidence_ref, dict)
+                and bool(str(evidence_ref.get("evidence_id", "")))
+                and type(evidence_ref.get("sequence")) is int
+                and evidence_ref.get("sequence", 0) > 0
+                and bool(re.fullmatch(r"[0-9a-f]{64}", str(evidence_ref.get("current_hash", ""))))
+            )
+            browser_observation_valid = (
+                operation in {"open", "navigate"}
+                and result.get("ok") is True
+                and bool(re.fullmatch(r"bs_[0-9a-f]{32}", str(result.get("session_id", ""))))
+                and origins_match
+                and bool(title.strip())
+                and bool(text.strip())
+                and result.get("scope_enforced") is True
+                and result.get("network_transport") == "dns_pinned"
+                and result.get("trust") == "untrusted_page_data"
+                and result.get("authority") == "none"
+                and evidence_ref_valid
+            )
+            if browser_observation_valid:
+                for item in required:
+                    check = str(item.get("check", "runtime")).casefold()
+                    criterion_id = str(item.get("criterion_id") or "")
+                    expected_title = str(item.get("expected_title", ""))
+                    expected_text = str(item.get("expected_text", ""))
+                    if (
+                        criterion_id
+                        and check in {"browser_extraction", "browser_page_extraction"}
+                        and (expected_title or expected_text)
+                        and (not expected_title or title.casefold() == expected_title.casefold())
+                        and (not expected_text or expected_text.casefold() in text.casefold())
+                    ):
+                        return criterion_id, {
+                            "url": browser_url,
+                            "title_sha256": hashlib.sha256(title.encode("utf-8")).hexdigest(),
+                            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                            "text_chars": len(text),
+                            "scope_enforced": True,
+                            "network_transport": "dns_pinned",
+                            "trust": "untrusted_page_data",
+                            "authority": "none",
+                            "evidence_ref": dict(evidence_ref),
+                        }
+
+        if tool_name == "mcp.discover" and isinstance(tool_argument, dict) and isinstance(result, dict):
+            server_id = str(tool_argument.get("server_id", ""))
+            identity = str(result.get("identity_sha256", ""))
+            evidence_ref = str(result.get("evidence_ref", ""))
+            tools = result.get("tools")
+            discovery_valid = (
+                bool(re.fullmatch(r"mcp_[0-9a-f]{32}", server_id))
+                and result.get("status") == "discovered"
+                and result.get("server_id") == server_id
+                and bool(re.fullmatch(r"[0-9a-f]{64}", identity))
+                and bool(re.fullmatch(r"[0-9a-f]{64}", evidence_ref))
+                and isinstance(tools, list)
+                and result.get("descriptions_withheld") is True
+                and result.get("schema_details_required") is True
+            )
+            if discovery_valid:
+                for item in required:
+                    check = str(item.get("check", "runtime")).casefold()
+                    criterion_id = str(item.get("criterion_id") or "")
+                    expected_name = str(item.get("expected_tool_name", ""))
+                    expected_trust = str(item.get("expected_trust_level", "UNTRUSTED"))
+                    matches = [entry for entry in tools if isinstance(entry, dict) and entry.get("name") == expected_name]
+                    if (
+                        criterion_id
+                        and check == "mcp_discovery"
+                        and expected_name
+                        and result.get("trust_level") == expected_trust
+                        and len(matches) == 1
+                        and bool(re.fullmatch(r"[0-9a-f]{64}", str(matches[0].get("schema_sha256", ""))))
+                        and matches[0].get("approved") is False
+                    ):
+                        return criterion_id, {
+                            "server_id": server_id,
+                            "identity_sha256": identity,
+                            "trust_level": expected_trust,
+                            "tool_name": expected_name,
+                            "schema_sha256": matches[0]["schema_sha256"],
+                            "schema_approved_before_owner_review": False,
+                            "descriptions_withheld": True,
+                            "authority": "none",
+                            "evidence_ref_sha256": evidence_ref,
+                        }
+
+        if tool_name == "mcp.invoke" and isinstance(tool_argument, dict) and isinstance(result, dict):
+            server_id = str(tool_argument.get("server_id", ""))
+            expected_name = str(tool_argument.get("tool_name", ""))
+            evidence_ref = str(result.get("evidence_ref", ""))
+            remote = result.get("result")
+            structured = remote.get("structured_content") if isinstance(remote, dict) else None
+            content = remote.get("content") if isinstance(remote, dict) else None
+            remote_content_valid = (
+                isinstance(structured, dict)
+                and isinstance(content, list)
+                and bool(content)
+                and all(isinstance(entry, str) and entry.startswith("[UNTRUSTED_MCP_TOOL_OUTPUT] ") for entry in content)
+            )
+            invoke_valid = (
+                bool(re.fullmatch(r"mcp_[0-9a-f]{32}", server_id))
+                and bool(expected_name)
+                and result.get("status") == "completed"
+                and result.get("success") is True
+                and result.get("server_id") == server_id
+                and result.get("tool_name") == expected_name
+                and result.get("trust") == "untrusted_remote_result"
+                and isinstance(remote, dict)
+                and remote.get("is_error") is False
+                and remote_content_valid
+                and bool(re.fullmatch(r"[0-9a-f]{64}", evidence_ref))
+            )
+            if invoke_valid:
+                for item in required:
+                    check = str(item.get("check", "runtime")).casefold()
+                    criterion_id = str(item.get("criterion_id") or "")
+                    criterion_tool = str(item.get("expected_tool_name", ""))
+                    if criterion_id and check == "mcp_invoke" and criterion_tool == expected_name:
+                        structured_hash = hashlib.sha256(
+                            json.dumps(structured, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest()
+                        return criterion_id, {
+                            "server_id": server_id,
+                            "tool_name": expected_name,
+                            "schema_pinned_invocation": True,
+                            "remote_output_sha256": structured_hash,
+                            "trust": "untrusted_remote_result",
+                            "authority": "none",
+                            "content_items_marked_untrusted": len(content),
+                            "evidence_ref_sha256": evidence_ref,
+                        }
         return None
 
     @staticmethod
@@ -766,6 +923,9 @@ class MissionRuntime:
             "run_project_tests": "project_test_process_exit",
             "status": "validated_status_snapshot",
             "watch": "persisted_watch_store",
+            "browser": "scoped_browser_extraction_observation",
+            "mcp.discover": "owner_scoped_mcp_identity_and_schema_discovery",
+            "mcp.invoke": "owner_approved_schema_pinned_mcp_invocation_evidence",
         }.get(tool_name, "")
 
     def create(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> Mission:
@@ -1678,7 +1838,7 @@ class MissionRuntime:
                                 mission,
                                 observation,
                                 tool_name=proposal.name,
-                                tool_argument=argument,
+                                tool_argument=proposal.arguments if proposal.name in {"browser", "mcp.discover", "mcp.invoke"} else argument,
                             )
                             if verified_evidence:
                                 criterion_id, verified_result = verified_evidence
@@ -1928,7 +2088,7 @@ class MissionRuntime:
                     mission,
                     observation,
                     tool_name=proposal.name,
-                    tool_argument=proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None,
+                    tool_argument=proposal.arguments if proposal.name in {"browser", "mcp.discover", "mcp.invoke"} else (proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None),
                 )
                 if verified_evidence:
                     criterion_id, verified_result = verified_evidence
@@ -2232,7 +2392,7 @@ class MissionRuntime:
             return self._save(mission)
         if success:
             step_arguments = dict(step.retry_policy).get("arguments", {})
-            tool_argument = step_arguments.get("query") if isinstance(step_arguments, dict) else None
+            tool_argument = step_arguments if step.action in {"browser", "mcp.discover", "mcp.invoke"} else (step_arguments.get("query") if isinstance(step_arguments, dict) else None)
             verified_evidence = self._successful_observation_evidence(
                 mission,
                 observation,

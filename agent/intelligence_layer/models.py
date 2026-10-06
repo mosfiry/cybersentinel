@@ -192,7 +192,7 @@ class DelegationScope:
         allowed_credentials: Iterable[str] = (),
         workspace_root: str | None = None,
     ) -> "DelegationScope":
-        """Return explicit child limits; empty child tools/actions are never wildcard grants."""
+        """Return explicit child limits; empty parent grants authorize no expansion."""
         if str(target_identity) != self.target_identity:
             raise DelegationDenied("child target must equal the authorized target")
         child_scope = _strings(scope, field_name="scope", allow_empty=False)
@@ -207,7 +207,7 @@ class DelegationScope:
             (child_networks, self.allowed_networks, "network"),
             (child_credentials, self.allowed_credentials, "credential"),
         ):
-            if permitted and not set(requested).issubset(permitted):
+            if not set(requested).issubset(permitted):
                 raise DelegationDenied(f"child {label} exceeds parent delegation")
         child_workspace = "" if workspace_root is None else str(Path(workspace_root).expanduser().resolve())
         if self.workspace_root:
@@ -247,7 +247,7 @@ class DelegationScope:
             (self.allowed_networks, parent.allowed_networks),
             (self.allowed_credentials, parent.allowed_credentials),
         ):
-            if parent_values and not set(child_values).issubset(parent_values):
+            if not set(child_values).issubset(parent_values):
                 return False
         if parent.workspace_root:
             root = Path(parent.workspace_root)
@@ -276,6 +276,43 @@ class DelegationScope:
         )
         if not valid or snapshot.authorization_hash != self.root_authorization_hash:
             raise DelegationDenied(reason if not valid else "mission authorization snapshot changed")
+
+    def is_within_owner_authorization(self, snapshot: MissionAuthorizationSnapshot) -> bool:
+        """Check every delegated capability against the immutable Owner grant."""
+        if not isinstance(snapshot, MissionAuthorizationSnapshot):
+            return False
+        try:
+            owner_grant = type(self).from_snapshot(
+                snapshot,
+                owner_identity_ref=self.owner_identity_ref,
+                authorization_version=snapshot.version,
+            )
+        except (TypeError, ValueError, DelegationDenied):
+            return False
+        if (
+            self.owner_identity_ref != owner_grant.owner_identity_ref
+            or self.mission_id != owner_grant.mission_id
+            or self.target_identity != owner_grant.target_identity
+            or self.root_authorization_hash != owner_grant.root_authorization_hash
+        ):
+            return False
+        for child_values, owner_values in (
+            (self.scope, owner_grant.scope),
+            (self.allowed_tools, owner_grant.allowed_tools),
+            (self.allowed_actions, owner_grant.allowed_actions),
+            (self.allowed_networks, owner_grant.allowed_networks),
+            (self.allowed_credentials, owner_grant.allowed_credentials),
+        ):
+            if not set(child_values).issubset(owner_values):
+                return False
+        if owner_grant.workspace_root:
+            root = Path(owner_grant.workspace_root)
+            candidate = Path(self.workspace_root or owner_grant.workspace_root).expanduser().resolve()
+            if candidate != root and root not in candidate.parents:
+                return False
+        elif self.workspace_root:
+            return False
+        return True
 
     def permits(
         self,

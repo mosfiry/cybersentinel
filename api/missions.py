@@ -600,6 +600,67 @@ class MissionService:
             authorization_snapshot=authorization,
         ).__dict__.copy()
 
+    def schedule_mission_series(
+        self,
+        occurrence_mission_ids: list[str],
+        *,
+        owner_session_token: str | None = None,
+        run_at: str,
+        interval_seconds: int,
+        retry_mission_ids: list[str] | None = None,
+        schedule_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Schedule bounded recurrence from separately Owner-authorized Missions.
+
+        The recurring grant is a series of immutable mission identities, not
+        permission to clone or widen one Mission's authority at dispatch time.
+        """
+        if self.scheduler is None or not callable(getattr(self.scheduler, "schedule_series", None)):
+            raise RuntimeError("recurring series scheduler is not configured")
+        if not isinstance(occurrence_mission_ids, list) or len(occurrence_mission_ids) < 2:
+            raise ValueError("at least two separately authorized occurrence Missions are required")
+        retries = retry_mission_ids or []
+        if not isinstance(retries, list):
+            raise ValueError("retry_mission_ids must be a list of separately authorized Missions")
+        if not isinstance(owner_session_token, str) or not owner_session_token.strip():
+            raise PermissionError("an active Owner session is required to authorize a recurring series")
+        owner_ref = self._owner_identity_ref(owner_session_token)
+        for mission_id in occurrence_mission_ids + retries:
+            mission, _ = self._authorized_mission(mission_id, owner_session_token)
+            if mission.is_terminal or mission.status is MissionStatus.RECOVERY_REQUIRED:
+                raise ValueError("series Missions must be new, resumable Owner-authorized Missions")
+            self._assert_unleased(mission_id)
+            mission = self._reauthorize_before_enqueue(mission_id, owner_session_token)
+            if mission.owner_identity_ref != owner_ref:
+                raise PermissionError("series Mission Owner identity changed during reauthorization")
+            if not isinstance(mission.authorization_snapshot, dict):
+                raise PermissionError("series Mission authorization snapshot is unavailable")
+            try:
+                authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PermissionError("series Mission authorization snapshot is invalid") from exc
+            if not isinstance(mission.provenance, dict):
+                raise PermissionError("series Mission authorization provenance is invalid")
+            snapshot_version = mission.provenance.get("authorization_snapshot_version", 0)
+            if type(snapshot_version) is not int:
+                raise PermissionError("series Mission authorization version is invalid")
+            valid, reason = authorization.validate_for_mission(
+                mission_id=mission.mission_id,
+                owner_identity=owner_ref,
+                target_identity=authorization.target_identity,
+                version=snapshot_version,
+            )
+            if not valid:
+                raise PermissionError("series Mission authorization is invalid: " + reason)
+        return self.scheduler.schedule_series(
+            occurrence_mission_ids,
+            retry_mission_ids=retries,
+            run_at=run_at,
+            interval_seconds=interval_seconds,
+            schedule_id=schedule_id,
+            owner_identity_ref=owner_ref,
+        )
+
     def _owner_context(
         self,
         owner_session_token: str,

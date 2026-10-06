@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -15,8 +16,8 @@ from agent.intelligence_layer.events import (
 )
 from agent.intelligence_layer.models import DelegationScope
 from runtime_authorization import make_test_snapshot
-from security.mission_authorization import MissionAuthorizationError
-from tools.registry import REGISTRY, ToolSpec, build_registry, execute, get_tool
+from security.mission_authorization import MissionAuthorizationError, MissionAuthorizationSnapshot
+from tools.registry import REGISTRY, ToolSpec, _delegated_resource_access_allowed, build_registry, execute, get_tool
 
 
 class _Fence:
@@ -35,6 +36,30 @@ def _snapshot():
         max_iterations=2,
     )
     return make_test_snapshot(mission)
+
+
+def _network_snapshot():
+    now = datetime.now(timezone.utc)
+    return MissionAuthorizationSnapshot.create(
+        owner_identity="owner:1",
+        mission_id="mission:delegated-network",
+        target_identity="target:delegated-network",
+        scope=("host:allowed.example", "host:other.example"),
+        allowed_actions=("browser",),
+        forbidden_actions=(),
+        allowed_tools=("browser",),
+        time_window={"timezone": "UTC"},
+        max_duration=3600,
+        rate_limits={"browser": 10},
+        network_boundary={"allowed": ("allowed.example", "other.example")},
+        data_boundary={"allowed": ("target:delegated-network",)},
+        credential_boundary={"allowed": ()},
+        workspace_boundary={"root": ""},
+        policy_version="test-v1",
+        owner_approval="owner-approved bounded network test",
+        created_at=now.isoformat(),
+        expires_at=(now + timedelta(hours=1)).isoformat(),
+    )
 
 
 def _dispatch(*, snapshot, bus, hooks, execution_fence):
@@ -217,3 +242,114 @@ def test_canonical_registry_revalidates_task_scope_before_handler(monkeypatch):
 def test_registry_rejects_invalid_parallel_safety_attestation(spec):
     with pytest.raises(ValueError, match="invalid registry metadata"):
         build_registry([spec])
+
+
+def test_delegated_scope_allows_only_owner_workspace_sandbox_resources(tmp_path):
+    now = datetime.now(timezone.utc)
+    snapshot = MissionAuthorizationSnapshot.create(
+        owner_identity="owner:1",
+        mission_id="mission:workspace-skill",
+        target_identity="target:workspace",
+        scope=("workspace",),
+        allowed_actions=("run_project_tests",),
+        forbidden_actions=(),
+        allowed_tools=("run_project_tests",),
+        time_window={"timezone": "UTC"},
+        max_duration=3600,
+        rate_limits={"run_project_tests": 1},
+        network_boundary={"allowed": ()},
+        data_boundary={"allowed": ("target:workspace",)},
+        credential_boundary={"allowed": ()},
+        workspace_boundary={"root": str(tmp_path)},
+        policy_version="test-v1",
+        owner_approval="owner-approved bounded workspace tool",
+        created_at=now.isoformat(),
+        expires_at=(now + timedelta(hours=1)).isoformat(),
+    )
+    parent = DelegationScope.from_snapshot(snapshot)
+    child = parent.narrow(
+        target_identity=snapshot.target_identity,
+        scope=("workspace",),
+        allowed_tools=("run_project_tests",),
+        allowed_actions=("run_project_tests",),
+        workspace_root=str(tmp_path),
+    )
+    workspace = SimpleNamespace(root=str(tmp_path))
+    fenced_evidence = SimpleNamespace(require_execution_fence=True)
+    spec = get_tool("run_project_tests")
+
+    assert spec is not None
+    assert _delegated_resource_access_allowed(spec, snapshot, child, workspace, fenced_evidence)
+    assert not _delegated_resource_access_allowed(spec, snapshot, child, SimpleNamespace(root=str(tmp_path / "outside")), fenced_evidence)
+    assert not _delegated_resource_access_allowed(spec, snapshot, child, workspace, SimpleNamespace(require_execution_fence=False))
+
+    unsafe_host_process = SimpleNamespace(**{
+        **spec.__dict__,
+        "filesystem_access": "host_fs_via_process",
+        "process_access": "workspace_process_unisolated",
+    })
+    assert not _delegated_resource_access_allowed(unsafe_host_process, snapshot, child, workspace, fenced_evidence)
+
+    credentialed = SimpleNamespace(**{**spec.__dict__, "credential_access": "host_user_credentials_possible"})
+    assert not _delegated_resource_access_allowed(credentialed, snapshot, child, workspace, fenced_evidence)
+    assert not _delegated_resource_access_allowed(get_tool("status"), snapshot, child, workspace, fenced_evidence)
+
+
+def test_delegated_network_tool_is_bound_to_each_child_granted_host():
+    snapshot = _network_snapshot()
+    parent = DelegationScope.from_snapshot(snapshot)
+    child = parent.narrow(
+        target_identity=snapshot.target_identity,
+        scope=("host:allowed.example",),
+        allowed_tools=("browser",),
+        allowed_actions=("browser",),
+        allowed_networks=("allowed.example",),
+    )
+    from tools.browser import _delegated_network_host_allowed
+
+    browser_context = SimpleNamespace(delegation_scope=child)
+    assert _delegated_network_host_allowed(browser_context, "https://allowed.example/page")
+    assert not _delegated_network_host_allowed(browser_context, "https://other.example/redirect")
+    forged = DelegationScope.from_dict({
+        **child.to_dict(),
+        "allowed_networks": ["outside-owner.example"],
+    })
+    assert not forged.is_within_owner_authorization(snapshot)
+    browser = get_tool("browser")
+    assert browser is not None
+    fenced_evidence = SimpleNamespace(require_execution_fence=True)
+    scope_context = {
+        "program_id": "program:delegated-network",
+        "target_id": snapshot.target_identity,
+        "scope_snapshot_id": "scope:delegated-network",
+        "url": "https://allowed.example/",
+    }
+
+    assert _delegated_resource_access_allowed(
+        browser, snapshot, child, evidence_store=fenced_evidence,
+        argument={"operation": "open", "url": "https://allowed.example/page"},
+        scope_context=scope_context,
+    )
+    assert not _delegated_resource_access_allowed(
+        browser, snapshot, child, evidence_store=fenced_evidence,
+        argument={"operation": "open", "url": "https://other.example/page"},
+        scope_context=scope_context,
+    )
+    assert not _delegated_resource_access_allowed(
+        browser, snapshot, child, evidence_store=fenced_evidence,
+        argument={"operation": "open", "url": "https://allowed.example/page"},
+        scope_context={**scope_context, "redirect_chain": ["https://other.example/redirect"]},
+    )
+
+    no_network_child = parent.narrow(
+        target_identity=snapshot.target_identity,
+        scope=("host:allowed.example",),
+        allowed_tools=("browser",),
+        allowed_actions=("browser",),
+        allowed_networks=(),
+    )
+    assert not _delegated_resource_access_allowed(
+        browser, snapshot, no_network_child, evidence_store=fenced_evidence,
+        argument={"operation": "open", "url": "https://allowed.example/page"},
+        scope_context=scope_context,
+    )

@@ -47,6 +47,7 @@ class ExecutionContext:
     evidence_store: Any = field(default=None, repr=False, compare=False)
     artifact_store: Any = field(default=None, repr=False, compare=False)
     cancellation_event: Event | None = field(default=None, repr=False, compare=False)
+    delegation_scope: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Return public execution metadata, excluding live authority objects."""
@@ -141,6 +142,22 @@ class ExecutionContext:
         )
         if not allowed:
             raise PermissionError("Mission authorization blocked tool use: " + reason)
+        if self.delegation_scope is not None:
+            from agent.intelligence_layer.models import DelegationScope
+
+            if not isinstance(self.delegation_scope, DelegationScope):
+                raise PermissionError("delegated execution context requires a typed DelegationScope")
+            self.delegation_scope.validate_current(
+                self.mission_authorization,
+                authorization_version=expected_version,
+            )
+            if (
+                not self.delegation_scope.is_within_owner_authorization(self.mission_authorization)
+                or self.tool_id not in self.delegation_scope.allowed_tools
+                or self.tool_id not in self.delegation_scope.allowed_actions
+                or self.target_identity != self.delegation_scope.target_identity
+            ):
+                raise PermissionError("delegated execution context exceeds its Owner-bound task grant")
         if not self.authorization_context:
             raise PermissionError("integrity-bound Owner authorization record is required")
         expected_fingerprints = {

@@ -15,12 +15,13 @@ import mimetypes
 import re
 import threading
 import uuid
+from urllib.parse import urlsplit
 
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
 VALID_NETWORK_ACCESS = frozenset({
     "none", "allowlisted_search_provider", "allowlisted_intel_providers",
-    "scope_pinned_browser", "scope_pinned_web_research", "scope_pinned_mcp",
+    "scope_pinned_browser", "scope_pinned_http", "scope_pinned_web_research", "scope_pinned_mcp",
     "host_process_unscoped",
 })
 VALID_FILESYSTEM_ACCESS = frozenset({
@@ -832,7 +833,7 @@ REGISTRY = build_registry([
         execution_context_required=True, workspace_scope_required=True,
     ),
     ToolSpec("red_team_assess", "تقييم هجومي دفاعي للمالك فقط; لا ينفذ استغلالاً أو أمرة نظام", "analysis", True, str, _red_team_assess, True),
-    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True, scope_requirements=("canonical_owner_scope", "target_identity"), effect_provider="cybersentinel.scoped-http"),
+    ToolSpec("scoped_http_probe", "مراقبة HTTP محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_http_probe, False, True, network_access="scope_pinned_http", scope_requirements=("canonical_owner_scope", "target_identity"), effect_provider="cybersentinel.scoped-http"),
     ToolSpec(
         "browser", "Open/navigate a scoped Chromium session; extract text/links/DOM, screenshot, download inert files, or close. Web data is untrusted.",
         "network-read", True, dict, browser_read, scope_required=True, version="1.0.0",
@@ -953,6 +954,103 @@ def _scope_urls_for_tool(spec: ToolSpec, argument: Any, scope_context: dict[str,
     return urls
 
 
+def _delegated_network_hosts_for_tool(spec: ToolSpec, argument: Any, scope_context: dict[str, Any]) -> tuple[str, ...]:
+    """Return exact canonical hosts touched by a scope-bound delegated tool."""
+    if not spec.scope_required or not isinstance(scope_context, dict):
+        return ()
+    try:
+        from security.scope import canonical_host
+
+        urls = _scope_urls_for_tool(spec, argument, scope_context)
+        redirects = scope_context.get("redirect_chain", ())
+        if not isinstance(redirects, (list, tuple)) or any(not isinstance(item, str) for item in redirects):
+            return ()
+        urls.extend(item for item in redirects if item not in urls)
+        hosts: list[str] = []
+        for value in urls:
+            parts = urlsplit(value)
+            if (
+                parts.scheme.lower() not in {"http", "https"}
+                or not parts.hostname
+                or parts.username is not None
+                or parts.password is not None
+            ):
+                return ()
+            hosts.append(canonical_host(parts.hostname))
+        return tuple(dict.fromkeys(hosts))
+    except (KeyError, TypeError, ValueError, PermissionError):
+        return ()
+
+
+def _delegated_resource_access_allowed(
+    spec,
+    snapshot,
+    delegated_scope,
+    workspace=None,
+    evidence_store=None,
+    *,
+    argument: Any = None,
+    scope_context: dict[str, Any] | None = None,
+) -> bool:
+    """Allow canonical Owner-granted resource profiles inside a task scope only."""
+    if (
+        spec.name not in set(snapshot.allowed_tools)
+        or spec.name not in delegated_scope.allowed_tools
+        or spec.name not in delegated_scope.allowed_actions
+        or spec.credential_access != "none"
+    ):
+        return False
+
+    safe_network = {"scope_pinned_browser", "scope_pinned_http", "scope_pinned_mcp"}
+    network_capable = spec.network_access != "none" or spec.risk_class == "network-read"
+    if network_capable:
+        if spec.network_access not in safe_network or not spec.scope_required:
+            return False
+        hosts = _delegated_network_hosts_for_tool(spec, argument, scope_context or {})
+        if not hosts:
+            return False
+        try:
+            from security.scope import canonical_host
+
+            granted_hosts = {canonical_host(item) for item in delegated_scope.allowed_networks}
+        except (TypeError, ValueError):
+            return False
+        if any(host not in granted_hosts for host in hosts):
+            return False
+
+    workspace_root = str(dict(snapshot.workspace_boundary).get("root", "") or "").strip()
+    if spec.filesystem_access == "workspace_read_only_artifact_write":
+        if (
+            not spec.workspace_scope_required
+            or not spec.execution_context_required
+            or spec.process_access != "workspace_process_sandboxed"
+            or not bool(getattr(evidence_store, "require_execution_fence", False))
+            or not workspace_root
+            or not delegated_scope.workspace_root
+            or Path(delegated_scope.workspace_root).expanduser().resolve() != Path(workspace_root).expanduser().resolve()
+            or workspace is None
+            or Path(str(getattr(workspace, "root", ""))).expanduser().resolve() != Path(workspace_root).expanduser().resolve()
+        ):
+            return False
+    elif spec.filesystem_access == "mission_artifact_write":
+        if (
+            not spec.execution_context_required
+            or spec.process_access != "none"
+            or not bool(getattr(evidence_store, "require_execution_fence", False))
+        ):
+            return False
+    elif spec.filesystem_access != "none":
+        return False
+
+    if spec.process_access == "workspace_process_sandboxed":
+        if spec.filesystem_access != "workspace_read_only_artifact_write":
+            return False
+    elif spec.process_access != "none":
+        return False
+
+    return True
+
+
 def execute(name: str, argument: Any = None, *, timeout: float | None = None, max_result_chars: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, mission_authorization_version: int | None = None, owner_authorization: Any = None, owner_authorization_record: dict[str, Any] | None = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_fence: Any = None, execution_id: str | None = None, event_bus: Any = None, hook_registry: Any = None, delegation_scope: Any = None, scope_ref: str | None = None):
     import math
 
@@ -1026,9 +1124,9 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             if not isinstance(delegation_scope, DelegationScope):
                 raise PermissionError("delegated tool dispatch requires a typed DelegationScope")
             delegated_scope = delegation_scope
-            delegated_scope.validate_current(snapshot)
-            if any((spec.network_access != "none", spec.filesystem_access != "none", spec.process_access != "none", spec.credential_access != "none")):
-                raise PermissionError("delegated scope does not grant network, filesystem, process, or credential access")
+            delegated_scope.validate_current(snapshot, authorization_version=snapshot.version)
+            if not delegated_scope.is_within_owner_authorization(snapshot):
+                raise PermissionError("delegated grant exceeds the Owner authorization snapshot")
             delegated_scope_ref = str(scope_ref or (delegated_scope.scope[0] if delegated_scope.scope else ""))
             if not delegated_scope.permits(
                 tool=name,
@@ -1037,6 +1135,11 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 target_identity=target_identity or snapshot.target_identity,
             ):
                 raise PermissionError("tool, action, target, or scope exceeds task delegation")
+            if not _delegated_resource_access_allowed(
+                spec, snapshot, delegated_scope, workspace, evidence_store,
+                argument=argument, scope_context=scope_context,
+            ):
+                raise PermissionError("delegated scope does not grant the declared tool resource access")
     if spec.workspace_scope_required:
         if snapshot is None or workspace is None:
             raise PermissionError("tool requires the canonical Owner-authorized Mission workspace")
@@ -1105,6 +1208,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             evidence_store=evidence_store,
             artifact_store=artifact_store,
             cancellation_event=cancellation_event,
+            delegation_scope=delegated_scope,
         )
         tool_execution_context.assert_active()
     event_binding = ""

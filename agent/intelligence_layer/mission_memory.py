@@ -169,7 +169,7 @@ def persist_terminal_episode(mission: Any):
         json.dumps(provenance_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     memory_id = hashlib.sha256(
-        f"mission-episode-v1\0{owner}\0{mission_id}\0{source_digest}".encode("utf-8")
+        f"mission-episode-v1\0{owner}\0{mission_id}\0{expected_scope_ref}".encode("utf-8")
     ).hexdigest()
 
     from agent.memory import (
@@ -182,8 +182,30 @@ def persist_terminal_episode(mission: Any):
         TrustClassification,
     )
 
+    conversation_id = "owner-mission-episodes:" + hashlib.sha256(owner.encode("utf-8")).hexdigest()
+    existing_items = MemoryProvider.get_memory_by_conversation(
+        conversation_id,
+        active_only=True,
+        domain=MemoryDomain.LEARNING,
+        trust_classification=TrustClassification.UNTRUSTED_DATA,
+        owner_identity_ref=owner,
+        mission_id=mission_id,
+        agent_id="mission-coordinator",
+    )
+    for existing in existing_items:
+        if existing.source != "mission_runtime_episode" or existing.scope != (expected_scope_ref,):
+            continue
+        if (
+            existing.validation_state is not MemoryValidationState.UNVERIFIED
+            or existing.sensitivity is not MemorySensitivity.INTERNAL
+        ):
+            continue
+        if existing.content != content:
+            raise ValueError("mission_episode_idempotency_conflict")
+        return existing
+
     item = MemoryItem.create(
-        conversation_id="owner-mission-episodes:" + hashlib.sha256(owner.encode("utf-8")).hexdigest(),
+        conversation_id=conversation_id,
         content=content,
         memory_type=MemoryType.INVESTIGATION,
         trust_classification=TrustClassification.UNTRUSTED_DATA,
