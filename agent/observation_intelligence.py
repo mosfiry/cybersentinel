@@ -147,13 +147,24 @@ def should_interpret_observation(observation: dict[str, Any], *, previous: dict[
 class ObservationInterpreter:
     """Produces typed proposals; it never mutates authority, scope, or authorization."""
 
-    def __init__(self, proposer: Callable[[dict[str, Any]], dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        proposer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        *,
+        model_skip_success_actions: Iterable[str] = (),
+    ):
         self.proposer = proposer
+        self.model_skip_success_actions = frozenset(
+            str(action).strip() for action in model_skip_success_actions if str(action).strip()
+        )
 
     def interpret(self, *, mission: dict[str, Any], plan: dict[str, Any], current_step: dict[str, Any] | None, action: str, observation: dict[str, Any], evidence: Iterable[dict[str, Any]], hypothesis_state: dict[str, Any], knowledge_context: Iterable[dict[str, Any]] = (), conversation_context: Iterable[dict[str, Any]] = ()) -> ObservationInterpretationProposal:
         obs_id = observation_id(str(observation.get("action_id", action)), observation)
         base = self._deterministic(mission, plan, current_step, action, observation, obs_id)
-        if self.proposer is None:
+        if self.proposer is None or (
+            action in self.model_skip_success_actions
+            and bool(observation.get("success", observation.get("ok", False)))
+        ):
             return base
         try:
             proposal = dict(self.proposer({

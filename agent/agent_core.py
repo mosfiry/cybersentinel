@@ -688,7 +688,10 @@ class AgentCore:
             executor=self._executor,
             replanner=replan_with_selected_skill,
             recovery_policy=RecoveryPolicy(),
-            interpreter=ObservationInterpreter(proposer=self._observation_proposal),
+            interpreter=ObservationInterpreter(
+                proposer=self._observation_proposal,
+                model_skip_success_actions=("status",),
+            ),
             require_authorization_snapshot=True,
             require_execution_fence=True,
             event_bus=self.event_bus,
@@ -943,7 +946,23 @@ class AgentCore:
                     raise SkillAuthorizationError("replanned action exceeds the selected Skill tool ceiling")
             return proposed
 
-        runtime = MissionRuntime(self.store, executor=self._executor, replanner=replan_resumed, recovery_policy=RecoveryPolicy(), interpreter=ObservationInterpreter(proposer=self._observation_proposal), require_authorization_snapshot=True, require_execution_fence=True, event_bus=self.event_bus, hook_registry=self.hook_registry, task_graph_policy=self.task_graph_policy, skill_context_provider=self._resolve_mission_skill_context, specialist_generate=self._specialist_generate if self.enable_specialist_agents else None)
+        runtime = MissionRuntime(
+            self.store,
+            executor=self._executor,
+            replanner=replan_resumed,
+            recovery_policy=RecoveryPolicy(),
+            interpreter=ObservationInterpreter(
+                proposer=self._observation_proposal,
+                model_skip_success_actions=("status",),
+            ),
+            require_authorization_snapshot=True,
+            require_execution_fence=True,
+            event_bus=self.event_bus,
+            hook_registry=self.hook_registry,
+            task_graph_policy=self.task_graph_policy,
+            skill_context_provider=self._resolve_mission_skill_context,
+            specialist_generate=self._specialist_generate if self.enable_specialist_agents else None,
+        )
         return self._run_via_fenced_worker(runtime, mission_id, max_slices=max_slices or self.max_iterations)
 
 

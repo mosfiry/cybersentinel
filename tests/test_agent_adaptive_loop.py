@@ -144,6 +144,43 @@ def test_model_proposal_cannot_change_authority_fields():
     assert not hasattr(result, "owner_instruction")
 
 
+def test_successful_status_observation_skips_only_optional_model_proposal():
+    calls = []
+
+    def proposer(payload):
+        calls.append(payload["action"])
+        return {"summary": "provider proposal"}
+
+    interpreter = ObservationInterpreter(
+        proposer=proposer,
+        model_skip_success_actions=("status",),
+    )
+
+    def interpret(action, observation):
+        return interpreter.interpret(
+            mission={},
+            plan={},
+            current_step={},
+            action=action,
+            observation=observation,
+            evidence=(),
+            hypothesis_state=(),
+        )
+
+    successful_status = interpret("status", {"action_id": "status-1", "success": True, "status": "ready"})
+    assert calls == []
+    assert successful_status.summary == "ready"
+    assert successful_status.provenance["source"] == "deterministic_observation_interpreter"
+
+    failed_status = interpret("status", {"action_id": "status-2", "success": False, "error": "unavailable"})
+    assert calls == ["status"]
+    assert failed_status.provenance["proposal_origin"] == "model"
+
+    search_observation = interpret("search", {"action_id": "search-1", "success": True})
+    assert calls == ["status", "search"]
+    assert search_observation.provenance["proposal_origin"] == "model"
+
+
 def test_crash_after_action_requires_recovery_without_replay(tmp_path):
     calls = []
 
