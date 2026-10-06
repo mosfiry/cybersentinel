@@ -26,11 +26,15 @@ jobs:
       - name: pip install
         run: python -m pip install -r requirements.txt
       - name: Install rootless Linux process isolation for governed workspace tests
+        id: install_bwrap
+        continue-on-error: true
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
           bwrap --version
       - name: Verify rootless network-isolated execution capability
+        id: rootless_preflight
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -39,12 +43,20 @@ jobs:
             exit 1
           fi
       - name: Install pinned Playwright Chromium for Browser integration tests
+        id: playwright_install
+        continue-on-error: true
         run: python -m playwright install --with-deps chromium
       - name: compileall
+        id: compileall
+        continue-on-error: true
         run: python -m compileall -q .
       - name: pytest
+        id: pytest
+        continue-on-error: true
         run: python -m pytest -q
       - name: Build and smoke-test container runtime (no publish)
+        id: container_smoke
+        continue-on-error: true
         shell: bash
         env:
           BRIDGE_PUBLISHED_PORT: "18787"
@@ -140,8 +152,12 @@ jobs:
           test "$third" = "3"
           curl --fail --silent --show-error --max-time 10 http://127.0.0.1:18787/api/health
       - name: git diff check
+        id: diff_check
+        continue-on-error: true
         run: git diff --check
       - name: Secret and sensitive-file scan
+        id: secret_scan
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -150,11 +166,35 @@ jobs:
             cat sens_out.txt >&2
             exit 1
           fi
-          if MATCHES=$(git grep -n -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example'); then
-            echo "Secret-scan match:" >&2
-            echo "$MATCHES" >&2
+          if MATCHED_FILES=$(git grep -l -I -E '(gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- ':!*.example'); then
+            echo "Secret-like pattern detected; matching file contents suppressed:" >&2
+            echo "$MATCHED_FILES" >&2
             exit 1
           fi
+      - name: Enforce all Linux acceptance gates
+        if: always()
+        shell: bash
+        env:
+          INSTALL_BWRAP_OUTCOME: ${{ steps.install_bwrap.outcome }}
+          ROOTLESS_PREFLIGHT_OUTCOME: ${{ steps.rootless_preflight.outcome }}
+          PLAYWRIGHT_OUTCOME: ${{ steps.playwright_install.outcome }}
+          COMPILEALL_OUTCOME: ${{ steps.compileall.outcome }}
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+          CONTAINER_SMOKE_OUTCOME: ${{ steps.container_smoke.outcome }}
+          DIFF_CHECK_OUTCOME: ${{ steps.diff_check.outcome }}
+          SECRET_SCAN_OUTCOME: ${{ steps.secret_scan.outcome }}
+        run: |
+          set -euo pipefail
+          names=(install_bwrap rootless_preflight playwright_install compileall pytest container_smoke diff_check secret_scan)
+          outcomes=("$INSTALL_BWRAP_OUTCOME" "$ROOTLESS_PREFLIGHT_OUTCOME" "$PLAYWRIGHT_OUTCOME" "$COMPILEALL_OUTCOME" "$PYTEST_OUTCOME" "$CONTAINER_SMOKE_OUTCOME" "$DIFF_CHECK_OUTCOME" "$SECRET_SCAN_OUTCOME")
+          failed=0
+          for index in "${!names[@]}"; do
+            if [[ "${outcomes[$index]}" != "success" ]]; then
+              echo "::error::Required Linux gate '${names[$index]}' ended as '${outcomes[$index]}'."
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: Write run summary
         if: always()
         shell: bash
