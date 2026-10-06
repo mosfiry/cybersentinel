@@ -10,9 +10,9 @@ These tests fail if a boundary is removed:
 import pytest
 
 from cyber.case_engine import CyberCase, EvidenceStatus, Provenance
-from cyber.hunting import HuntHypothesis, ThreatHunter
+from cyber.hunting import HuntHypothesis, HuntResult, ThreatHunter
 from cyber.incident_response import IRPlaybook
-from cyber.knowledge_model import CyberKnowledgeGraph, SourceClass
+from cyber.knowledge_model import ClaimEdge, CyberKnowledgeGraph, EdgeStatus, Entity, Provenance as GraphProvenance, SourceClass
 from cyber.malware import CapabilityClaim, MalwareTriage, triage_sample, record_triage_in_graph
 
 
@@ -192,6 +192,21 @@ class TestIRPlaybook:
 
 
 class TestThreatHunting:
+    def test_hunt_result_serializes_without_aliasing_lists(self):
+        result = HuntResult(
+            hunt_id="hunt-serialization",
+            status="NO_DETECTIONS",
+            findings=["finding-1"],
+            unknowns=["unknown-1"],
+        )
+
+        dumped = result.to_dict()
+        dumped["findings"].append("mutated")
+        dumped["unknowns"].append("mutated")
+
+        assert result.findings == ["finding-1"]
+        assert result.unknowns == ["unknown-1"]
+
     def _graph(self):
         g = CyberKnowledgeGraph()
         from cyber.intel_ingest import IntelIngest
@@ -236,3 +251,51 @@ class TestThreatHunting:
         ))
         assert res.status == "NO_DETECTIONS"
         assert any("not in the graph" in u for u in res.unknowns)
+
+    def test_cycle_does_not_repeat_entities_during_traversal(self):
+        g = CyberKnowledgeGraph()
+        g.add_entity(Entity(entity_id="M1", entity_type="MALWARE"))
+        g.add_entity(Entity(entity_id="T1", entity_type="TTP"))
+        provenance = GraphProvenance(source="sensor", source_class=SourceClass.REAL)
+        g.add_claim(ClaimEdge("USES", "M1", "T1", provenance, status=EdgeStatus.WEAK))
+        g.add_claim(ClaimEdge("USES", "T1", "M1", provenance, status=EdgeStatus.WEAK))
+
+        result = ThreatHunter(g).run(HuntHypothesis(
+            hunt_id="hunt-cycle",
+            statement="find TTPs",
+            entry_entity="M1",
+            traverse_relations=("USES",),
+            target_type="TTP",
+        ))
+
+        assert result.status == "DETECTED"
+        assert result.findings == ["T1"]
+
+    def test_missing_traversal_entity_is_reported_as_no_detection(self):
+        class HidesTargetGraph(CyberKnowledgeGraph):
+            def entity(self, entity_id):
+                if entity_id == "hidden-target":
+                    return None
+                return super().entity(entity_id)
+
+        g = HidesTargetGraph()
+        g.add_entity(Entity(entity_id="M1", entity_type="MALWARE"))
+        g.add_entity(Entity(entity_id="hidden-target", entity_type="TTP"))
+        g.add_claim(ClaimEdge(
+            "USES",
+            "M1",
+            "hidden-target",
+            GraphProvenance(source="sensor", source_class=SourceClass.REAL),
+            status=EdgeStatus.WEAK,
+        ))
+
+        result = ThreatHunter(g).run(HuntHypothesis(
+            hunt_id="hunt-hidden-target",
+            statement="find hidden targets",
+            entry_entity="M1",
+            traverse_relations=("USES",),
+            target_type="TTP",
+        ))
+
+        assert result.status == "NO_DETECTIONS"
+        assert result.findings == []
