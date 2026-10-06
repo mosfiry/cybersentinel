@@ -57,6 +57,9 @@ jobs:
           bwrap_bin="$stage_dir/opt/bubblewrap-0.9.0/bin/bwrap"
           test "$("$bwrap_bin" --version)" = "bubblewrap 0.9.0"
           "$bwrap_bin" --help | grep -Fq -- '--size BYTES'
+          sudo install -m 0755 "$bwrap_bin" /usr/bin/bwrap
+          test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.9.0"
+          cmp --silent "$bwrap_bin" /usr/bin/bwrap
           echo "$stage_dir/opt/bubblewrap-0.9.0/bin" >> "$GITHUB_PATH"
       - name: Verify rootless network-isolated execution capability
         id: rootless_preflight
