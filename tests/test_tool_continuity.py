@@ -204,3 +204,69 @@ def test_parallel_tool_exception_requires_reconciliation(tmp_path, monkeypatch):
     assert reconciled.status.name == "READY"
     assert reconciled.checkpoint.get("status") == "completed"
     assert reconciled.checkpoint.get("reconciled") is True
+
+
+def test_concurrent_parallel_reconciliation_accepts_one_unresolved_subset_writer(tmp_path, monkeypatch):
+    import threading
+    import tools.registry
+
+    executions = []
+
+    def fixture(name, argument, **kwargs):
+        executions.append(name)
+        if len(executions) == 2:
+            raise RuntimeError("parallel receipt unknown")
+        return {"ok": True, "source": "parallel-fixture"}
+
+    monkeypatch.setattr(tools.registry, "execute", fixture)
+    runtime = _runtime(tmp_path)
+    mission = _mission(runtime)
+
+    class FailingParallelModel:
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            return ModelTurn(turn_id, tool_calls=(
+                _call(mission_id, run_id, turn_id, plan_version, 1, "call_001"),
+                _call(mission_id, run_id, turn_id, plan_version, 2, "call_002"),
+            ))
+
+    result = runtime.run_model_loop(mission.mission_id, FailingParallelModel(), tools=[{"name": "status"}], max_turns=1)
+    assert result.status.name == "RECOVERY_REQUIRED"
+    db = Path(tmp_path) / "missions.sqlite3"
+    loaded_barrier = threading.Barrier(2)
+
+    class CoordinatedStore(MissionStore):
+        def load(self, mission_id):
+            loaded = super().load(mission_id)
+            if loaded is not None and (loaded.checkpoint or {}).get("status") == "in_flight_parallel":
+                loaded_barrier.wait(timeout=3)
+            return loaded
+
+    runtimes = [
+        MissionRuntime(CoordinatedStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot),
+        MissionRuntime(CoordinatedStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot),
+    ]
+    outcomes = []
+    errors = []
+
+    def reconcile(rt):
+        try:
+            outcomes.append(rt.reconcile_in_flight(mission.mission_id, executed=True, observation={"success": True, "source": "parallel-concurrent-receipt"}))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reconcile, args=(rt,)) for rt in runtimes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(outcomes) == 1
+    assert len(errors) == 1
+    assert str(errors[0]) in {"stale mission write rejected", "concurrent mission write rejected"}
+    persisted = MissionStore(db).load(mission.mission_id)
+    assert persisted.status.name == "READY"
+    assert persisted.checkpoint.get("reconciled") is True
+    assert persisted.checkpoint.get("ambiguous_tool_call_ids") == ["call_002"]
+    assert len(persisted.action_history) == 2
+    assert len(persisted.evidence) == 2
