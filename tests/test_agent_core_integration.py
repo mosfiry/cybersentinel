@@ -128,6 +128,50 @@ def test_agent_001_to_008_owner_goal_runs_real_mission_loop(mission_env):
     assert any(item["event"] == "GoalVerified" for item in mission.trajectory)
 
 
+def test_mission_follow_up_requires_matching_owner_before_mutating_state(mission_env):
+    provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "follow-up-plan")])])
+    store = MissionStore(Path(mission_env) / "follow-up-missions.sqlite3")
+    core = AgentCore(ModelRouter([provider]), store=store)
+    mission = core.run_owner_mission(
+        "Review local status", owner_session_token="valid-owner", run=False
+    )
+
+    with pytest.raises(PermissionError):
+        core.continue_mission_instruction(
+            mission.mission_id,
+            "Unauthorized update",
+            owner_session_token="invalid-owner",
+        )
+    unchanged = store.load(mission.mission_id)
+    assert unchanged is not None
+    assert "last_follow_up" not in unchanged.progress
+    assert not unchanged.progress.get("mission_intents")
+
+    class FollowUpIntent:
+        def to_dict(self):
+            return {"kind": "review", "authorized": False}
+
+    core.understand_mission_intent = lambda _instruction: FollowUpIntent()
+    updated = core.continue_mission_instruction(
+        mission.mission_id,
+        "Check the latest status observation",
+        owner_session_token="valid-owner",
+    )
+    reopened = store.load(mission.mission_id)
+
+    assert reopened is not None
+    assert updated.progress["last_follow_up"] == "Check the latest status observation"
+    assert reopened.progress["mission_intents"][-1]["intent"] == {
+        "kind": "review",
+        "authorized": False,
+    }
+    assert any(
+        item.get("event") == "StrategyDecided"
+        and item.get("data", {}).get("type") == "mission_follow_up"
+        for item in reopened.trajectory
+    )
+
+
 def test_agent_core_explicit_approved_skill_is_untrusted_guidance_only(mission_env):
     registry, definition = approved_status_skill(mission_env)
     provider = MissionProvider([ProviderResponse(tool_calls=[ToolCall("status", {}, "skill-status-1")])])

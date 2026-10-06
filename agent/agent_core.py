@@ -82,11 +82,32 @@ class AgentCore:
                 return json.loads(content[start:end + 1]) if start >= 0 and end > start else {}
         return NaturalLanguageUnderstanding(proposer=propose).understand(instruction)
 
-    def continue_mission_instruction(self, mission_id: str, instruction: str) -> Mission:
-        """Persist a follow-up as an instruction on the same mission, never a new mission."""
+    def continue_mission_instruction(
+        self, mission_id: str, instruction: str, *, owner_session_token: str
+    ) -> Mission:
+        """Persist an Owner-authenticated follow-up on the same mission.
+
+        This records intent only; a separately authorized resume is still
+        required to execute any resulting plan.
+        """
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError("mission_instruction_required")
         mission = self.store.load(mission_id)
         if mission is None:
             raise KeyError("unknown_mission")
+        evidence = authenticate_owner(owner_session_token, mission.request_id)
+        from security.owner_password import authenticated_owner
+
+        active_owner = authenticated_owner(evidence.session_id)
+        if (
+            not isinstance(active_owner, dict)
+            or active_owner.get("owner_id") is None
+            or mission.owner_identity_ref != f"owner:{int(active_owner['owner_id'])}"
+        ):
+            raise PermissionError("authenticated Owner does not match the mission's durable Owner identity")
+        mission, _, _ = self._reauthorize_mission(
+            mission_id, owner_session_token=owner_session_token
+        )
         intent = self.understand_mission_intent(instruction)
         updates = mission.progress.setdefault("mission_intents", [])
         updates.append({"instruction": instruction, "intent": intent.to_dict()})
