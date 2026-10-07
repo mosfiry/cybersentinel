@@ -1193,14 +1193,29 @@ def main() -> int:
         try:
             report_code, report_body, report_raw = approval_api_request("GET", report_path)
             report_before_approval = report_body.get("report", {})
+            findings_before_approval = [
+                item for item in report_before_approval.get("findings", []) if isinstance(item, dict)
+            ]
+            finding_statuses_before_approval = {
+                str(item.get("criterion_id", "")): str(item.get("status", ""))
+                for item in findings_before_approval
+            }
+            untrusted_remote_criteria = {"browser-page", "mcp-discovery", "mcp-invocation"}
             if (
                 report_code != 200
                 or report_body.get("ok") is not True
                 or report_before_approval.get("mission_summary", {}).get("mission_status") != "GOAL_COMPLETED"
-                or report_before_approval.get("mission_summary", {}).get("outcome") != "VERIFIED"
+                or report_before_approval.get("mission_summary", {}).get("outcome") not in {"VERIFIED", "PARTIALLY_VERIFIED"}
                 or report_before_approval.get("evidence", {}).get("execution_chain_integrity") != "VALID"
                 or report_before_approval.get("final_report_approval", {}).get("status") != "PENDING"
-                or not any(item.get("status") == "PASS" for item in report_before_approval.get("findings", []) if isinstance(item, dict))
+                or not any(
+                    finding_statuses_before_approval.get(criterion) == "PASS"
+                    for criterion in {"validated-status", "project-tests-pass"}
+                )
+                or not all(
+                    finding_statuses_before_approval.get(criterion) == "UNVERIFIED_PROVENANCE"
+                    for criterion in untrusted_remote_criteria
+                )
             ):
                 raise RuntimeError("integrated_mission_report_not_eligible_for_owner_approval")
 
@@ -1282,9 +1297,10 @@ def main() -> int:
             "mission_report_finding_count": len(report_before_approval.get("findings", [])),
             "mission_report_verified_findings": [
                 {"criterion_id": item.get("criterion_id"), "status": item.get("status")}
-                for item in report_before_approval.get("findings", [])
+                for item in findings_before_approval
                 if isinstance(item, dict) and item.get("status") == "PASS"
             ],
+            "mission_report_unverified_remote_findings": sorted(untrusted_remote_criteria),
             "owner_fixture_is_not_final_user_approval": True,
         })
         result["checks"]["digest_bound_final_owner_report_approval"] = True
