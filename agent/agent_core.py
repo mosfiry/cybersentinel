@@ -165,6 +165,50 @@ class AgentCore:
         return allowed.difference(forbidden_raw or ())
 
     @staticmethod
+    def _intent_tool_allowlist(objective: str) -> set[str] | None:
+        """Return an intent hint for provider schemas, never an authorization grant."""
+        if not isinstance(objective, str) or not objective.strip():
+            return None
+        text = " ".join(objective.casefold().split())
+        rules = (
+            (r"\b(?:status|health(?: check)?)\b|(?:حالة|صحة)", {"status"}),
+            (r"\b(?:verify|confirm|check)\b.{0,32}\b(?:result|outcome|completion)\b|\b(?:result|outcome|completion)\b.{0,32}\b(?:verify|confirm|check)\b", {"status"}),
+            (r"\b(?:local security|security check|tcp listeners?|listening ports?|open ports?|port scan)\b|فحص (?:أمن|الأمان|المنافذ)", {"local_security_check"}),
+            (r"\b(?:system information|system info|operating system|host details)\b|معلومات النظام", {"local_system_info"}),
+            (r"\b(?:latest[\s_-]+(?:locally[\s_-]+available[\s_-]+)?(?:threat[\s_-]+)?(?:intel|intelligence)|(?:latest[\s_-]+)?threat[\s_-]+feed|cisa advisories)\b", {"latest_intel"}),
+            (r"\b(?:refresh|collect|fetch|update)\b.{0,32}\b(?:intel|intelligence|threat feed)\b|\b(?:intel|intelligence|threat feed)\b.{0,32}\b(?:refresh|collect|fetch|update)\b", {"refresh_intel"}),
+            (r"\b(?:research|search|look up|lookup|investigate|cve(?:s)?|vulnerability advisory)\b|ابحث|استقص", {"search", "web_research"}),
+            (r"\b(?:watch|monitor)\b|\b(?:add|create)\b.{0,16}\bwatch\b", {"watch"}),
+            (r"\b(?:unwatch|stop watching|remove monitoring)\b", {"unwatch"}),
+            (r"\bpytest\b|\btest suite\b|\bproject tests\b|\b(?:run|execute|rerun|re-run)\b.{0,24}\btests?\b|تشغيل الاختبارات", {"run_project_tests"}),
+            (r"\b(?:red[- ]team|adversarial security assessment)\b", {"red_team_assess"}),
+            (r"\b(?:http probe|scoped http probe|probe the endpoint)\b", {"scoped_http_probe"}),
+            (r"\b(?:browser|navigate to|open (?:the )?website|webpage)\b", {"browser"}),
+            (r"\b(?:fill|complete|submit|type into)\b.{0,24}\b(?:browser|form|field)\b", {"browser.fill"}),
+            (r"\bmcp\b", {"mcp.discover", "mcp.invoke"}),
+        )
+        selected: set[str] = set()
+        for pattern, tool_names in rules:
+            if re.search(pattern, text):
+                selected.update(tool_names)
+        return selected or None
+
+    def _eligible_planning_tools(
+        self, objective: str, permitted_tool_names: set[str] | None
+    ) -> set[str]:
+        """Reduce model-visible schemas to the task and existing Owner scope."""
+        registered = {
+            str(item.get("function", {}).get("name", ""))
+            for item in self._schemas()
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+        permitted = registered if permitted_tool_names is None else registered.intersection(permitted_tool_names)
+        intent = self._intent_tool_allowlist(objective)
+        # This is context-size/capability selection only. Scope authorization,
+        # plan validation, Mission snapshots, and execution checks remain separate.
+        return permitted if intent is None else permitted.intersection(intent)
+
+    @staticmethod
     def _calls(response: dict[str, Any]) -> list[ToolCall]:
         calls: list[ToolCall] = []
         for item in response.get("tool_calls") or []:
@@ -234,12 +278,16 @@ class AgentCore:
             return self.router.generate(messages, reasoning_profile=profile)
 
     def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None, available_tool_names: set[str] | None = None) -> Plan:
-        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context, memory_provider=memory_provider, available_tool_names=available_tool_names)
+        eligible_tool_names = self._eligible_planning_tools(objective, available_tool_names)
+        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context, memory_provider=memory_provider, available_tool_names=eligible_tool_names)
         self._last_model_response = dict(response)
         calls = self._calls(response)
         steps: list[PlanStep] = []
         for index, call in enumerate(calls, start=1):
-            if available_tool_names is not None and call.name not in available_tool_names:
+            if call.name not in eligible_tool_names:
+                if skill_context is not None:
+                    from .intelligence_layer.skills import SkillAuthorizationError
+                    raise SkillAuthorizationError("model proposal exceeds the explicitly selected Skill tool ceiling")
                 continue
             spec = get_tool(call.name)
             if spec is None:

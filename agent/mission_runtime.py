@@ -1097,6 +1097,17 @@ class MissionRuntime:
             "in-flight reconciliation requires authenticated Owner authorization through EffectReconciliationEngine"
         )
 
+    @staticmethod
+    def _normalize_native_tool_result(raw: Any) -> dict[str, Any]:
+        """Normalize supported native tool payloads without discarding valid output."""
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, list):
+            return {"items": raw}
+        raise TypeError("native tool result must be a mapping or list")
+
     def _execute_native_tool(
         self,
         name: str,
@@ -1756,6 +1767,9 @@ class MissionRuntime:
                     mission.transition(MissionStatus.READY, mission.error)
                 return self._save(mission)
             if len(turn.tool_calls) > 1:
+                parallel_workers = min(4, max(1, len(turn.tool_calls)))
+                if getattr(model, "parallel_tool_calls", True) is False:
+                    parallel_workers = 1
                 self._run_parallel_model_calls(
                     mission,
                     turn.tool_calls,
@@ -1767,6 +1781,7 @@ class MissionRuntime:
                     deadline=deadline,
                     result_caps={proposal.tool_call_id: cap for proposal, cap in zip(turn.tool_calls, result_caps)},
                     skill_context=skill_context,
+                    max_workers=parallel_workers,
                 )
                 self._save(mission)
                 if mission.is_terminal:
@@ -1828,7 +1843,7 @@ class MissionRuntime:
                             max_result_chars=result_caps[index],
                             delegation_scope=delegation_scope,
                         )
-                        observation = dict(raw or {})
+                        observation = self._normalize_native_tool_result(raw)
                         observation.update({"type": "tool_observation", "action_id": proposal.action_id, "step_id": proposal.step_id, "mission_id": mission.mission_id, "tool_call_id": proposal.tool_call_id})
                         mission.record_observation(observation)
                         if current_step is not None:
@@ -1965,9 +1980,13 @@ class MissionRuntime:
         mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
         return self._save(mission)
 
-    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str], deadline: float, result_caps: dict[str, int], skill_context: Any = None) -> None:
+    def _run_parallel_model_calls(self, mission: Mission, proposals: tuple[Any, ...], *, auth_context: Any, run_id: str, current_step: Any, progress: dict[str, Any], seen: set[str], deadline: float, result_caps: dict[str, int], skill_context: Any = None, max_workers: int | None = None) -> None:
         """Authorize and execute independent proposals concurrently, then fold results deterministically."""
         from security.authorization import authorize_tool
+        if max_workers is not None and (
+            isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1
+        ):
+            raise ValueError("parallel tool worker limit must be a positive integer")
         if mission.skill_binding:
             try:
                 current_skill_context = self._skill_context_for(mission)
@@ -2048,7 +2067,7 @@ class MissionRuntime:
                 remaining_seconds = self._remaining_seconds(deadline)
                 if remaining_seconds <= 0:
                     raise _MissionBudgetExceeded("max_execution_time_seconds", self._limit_value(self.runtime_limits.max_execution_time_seconds))
-                return dict(self._execute_native_tool(
+                native_result = self._execute_native_tool(
                     proposal.name,
                     proposal.arguments,
                     decision.decision,
@@ -2058,14 +2077,18 @@ class MissionRuntime:
                     timeout_seconds=remaining_seconds,
                     max_result_chars=result_caps[proposal.tool_call_id],
                     delegation_scope=delegation_scope,
-                ) or {})
+                )
+                return self._normalize_native_tool_result(native_result)
             except _MissionBudgetExceeded as exc:
                 return {"_budget_exceeded": True, "budget": exc.budget, "limit": exc.limit}
             except Exception as exc:
                 # An exception after dispatch cannot prove that the external side effect did not happen.
                 # Preserve ambiguity so recovery cannot blindly replay this proposal.
                 return {"_ambiguous": True, "error": str(exc), "failure_class": FailureClass.UNKNOWN.value, "exception": type(exc).__name__}
-        raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=min(4, max(1, len(authorized))))
+        worker_count = min(4, max(1, len(authorized)))
+        if max_workers is not None:
+            worker_count = min(worker_count, max_workers)
+        raw_results = execute_bounded_parallel(authorized, execute_one, max_workers=worker_count)
         ambiguous: list[tuple[Any, dict[str, Any]]] = []
         budget_exceeded: tuple[str, int] | None = None
         for item, raw in zip(authorized, raw_results):

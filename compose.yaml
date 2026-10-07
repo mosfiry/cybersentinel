@@ -2,12 +2,12 @@ name: cybersentinel
 
 services:
   workspace-init:
-    image: ${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.0.0}
+    image: ${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.2.0-rc1}
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        CYBERSENTINEL_VERSION: ${CYBERSENTINEL_VERSION:-5.0.0}
+        CYBERSENTINEL_VERSION: ${CYBERSENTINEL_VERSION:-5.2.0-rc1}
     init: true
     user: "10001:10001"
     working_dir: /var/lib/cybersentinel
@@ -24,12 +24,12 @@ services:
       - cybersentinel-state:/var/lib/cybersentinel
 
   bridge:
-    image: ${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.0.0}
+    image: ${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.2.0-rc1}
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        CYBERSENTINEL_VERSION: ${CYBERSENTINEL_VERSION:-5.0.0}
+        CYBERSENTINEL_VERSION: ${CYBERSENTINEL_VERSION:-5.2.0-rc1}
     init: true
     user: "10001:10001"
     working_dir: /var/lib/cybersentinel
@@ -103,12 +103,12 @@ services:
       start_period: 15s
 
   mission-worker:
-    image: ${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.0.0}
+    image: ${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.2.0-rc1}
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        CYBERSENTINEL_VERSION: ${CYBERSENTINEL_VERSION:-5.0.0}
+        CYBERSENTINEL_VERSION: ${CYBERSENTINEL_VERSION:-5.2.0-rc1}
     init: true
     user: "10001:10001"
     working_dir: /var/lib/cybersentinel

@@ -358,7 +358,7 @@ class LocalModelManager:
         try:
             generation_options: dict[str, Any] = {
                 "temperature": 0,
-                "timeout": 90,
+                "timeout": float(getattr(provider, "request_timeout_seconds", 90)),
                 "max_tokens": 64,
             }
             if spec.model_id.startswith("qwen3-"):

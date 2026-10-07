@@ -36,7 +36,7 @@ from agent.task_manager import TaskManager
 from tools.registry import tool_definitions
 from core.version import PRODUCT_NAME, SERVER_VERSION, VERSION
 from core.health import readiness_snapshot
-from api.missions import MissionService
+from api.missions import MissionReportApprovalConflict, MissionService
 from agent.mission_worker import MissionQueue, MissionWorker
 from agent.mission_series_scheduler import MissionSeriesScheduler
 from agent.mission_runtime import MissionRuntime
@@ -1606,6 +1606,20 @@ class Handler(BaseHTTPRequestHandler):
                         evidence_reference=str(payload.get("evidence_reference", "")),
                     )
                     return self._send(200, {"ok": True, "mission_id": mission_id, "reconciliation": result})
+                if action == "approve-report":
+                    payload = self._read_json()
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {"report_sha256"}
+                        or not isinstance(payload.get("report_sha256"), str)
+                    ):
+                        raise ValueError("invalid_report_approval_request")
+                    approval = service.approve_report(
+                        mission_id,
+                        owner_session_token=auth["session_token"],
+                        report_sha256=payload["report_sha256"],
+                    )
+                    return self._send(200, {"ok": True, **approval})
                 if action == "start" or action == "resume":
                     if action == "start":
                         result = service.start_mission(
@@ -1637,6 +1651,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return self._send(201, {"ok": True, "schedule": schedule})
                 return self._send(404, {"ok": False, "error": "unknown_mission_action"})
+            except MissionReportApprovalConflict as exc:
+                return self._send(409, {"ok": False, "error": str(exc)})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
             except (ValueError, KeyError) as exc:

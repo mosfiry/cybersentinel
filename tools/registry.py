@@ -17,6 +17,8 @@ import threading
 import uuid
 from urllib.parse import urlsplit
 
+from workspace.environment import MAX_SANDBOX_PROCESS_SECONDS
+
 MAX_ARG_LENGTH = 256
 VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-exec", "analysis"})
 VALID_NETWORK_ACCESS = frozenset({
@@ -361,7 +363,14 @@ def _status(_):
 
 def _latest_intel(_):
     from core.intel import latest_intel
-    return latest_intel(50)
+    records = latest_intel(50)
+    untrusted_records = []
+    for record in records:
+        item = dict(record)
+        item["trust_classification"] = "UNTRUSTED_DATA"
+        item["authority"] = "none"
+        untrusted_records.append(item)
+    return untrusted_records
 
 
 def _refresh_intel(_):
@@ -485,10 +494,18 @@ def _run_project_tests(argument, *, workspace=None, execution_context=None):
     mission_timeout = getattr(authorization, "max_duration", 60)
     if isinstance(mission_timeout, bool) or not isinstance(mission_timeout, (int, float)) or not math.isfinite(mission_timeout) or mission_timeout <= 0:
         raise PermissionError("Mission process timeout is invalid")
+    workspace_timeout = getattr(getattr(workspace, "policy", None), "max_timeout_seconds", MAX_SANDBOX_PROCESS_SECONDS)
+    if isinstance(workspace_timeout, bool) or not isinstance(workspace_timeout, (int, float)) or not math.isfinite(workspace_timeout) or workspace_timeout <= 0:
+        raise PermissionError("Workspace process timeout is invalid")
+    effective_timeout = min(
+        MAX_SANDBOX_PROCESS_SECONDS,
+        float(mission_timeout),
+        float(workspace_timeout),
+    )
     result = workspace.develop(
         ("python3", "-m", "pytest", "-q", "--junitxml=/artifacts/pytest.xml"),
         cwd=target,
-        timeout=min(60, float(mission_timeout)),
+        timeout=effective_timeout,
         cancellation_event=execution_context.cancellation_event,
     )
     execution_context.assert_active()
@@ -828,7 +845,7 @@ REGISTRY = build_registry([
         filesystem_access="workspace_read_only_artifact_write",
         process_access="workspace_process_sandboxed", credential_access="none",
         scope_requirements=("owner_mission_workspace_root",),
-        timeout=65, effect_provider="cybersentinel.workspace-process",
+        timeout=int(MAX_SANDBOX_PROCESS_SECONDS) + 10, effect_provider="cybersentinel.workspace-process",
         evidence_requirements=("owner_mission_context", "sandbox_profile", "untrusted_artifact_refs", "exit_status"),
         execution_context_required=True, workspace_scope_required=True,
     ),

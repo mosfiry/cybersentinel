@@ -84,9 +84,20 @@ def main() -> int:
         raise SystemExit(f"installer_missing_or_empty:{installer}")
 
     repo_root = Path(__file__).resolve().parents[1]
+    canonical_version = (repo_root / "VERSION").read_text(encoding="ascii").strip()
+    if args.version != canonical_version:
+        raise SystemExit("manifest_version_does_not_match_repository_VERSION")
     package_path = repo_root / "desktop" / "package.json"
     lock_path = repo_root / "desktop" / "package-lock.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    if package.get("version") != canonical_version:
+        raise SystemExit("desktop_package_version_does_not_match_repository_VERSION")
+    if (
+        lock.get("version") != canonical_version
+        or lock.get("packages", {}).get("", {}).get("version") != canonical_version
+    ):
+        raise SystemExit("desktop_package_lock_version_does_not_match_repository_VERSION")
     digest = sha256(installer)
     size_bytes = installer.stat().st_size
     (directory / f"{installer.name}.sha256").write_text(

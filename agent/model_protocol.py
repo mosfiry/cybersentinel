@@ -274,6 +274,7 @@ class RouterNativeModel:
             raise TypeError("allow_generate_fallback must be a boolean")
         self.router = router
         self.allow_generate_fallback = allow_generate_fallback
+        self.parallel_tool_calls = False
         self.trusted_provider = ""
         self.trusted_model = ""
         self.trusted_capability = ""
@@ -282,6 +283,18 @@ class RouterNativeModel:
     def context_length(self) -> int | None:
         value = getattr(self.router, "context_length", None)
         return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+    def _provider_supports_parallel_tool_calls(self, provider_name: str, model_name: str) -> bool:
+        providers = getattr(self.router, "providers", ())
+        matches = [
+            item for item in providers
+            if str(getattr(item, "name", "")) == provider_name
+            and str(getattr(item, "model", "")) == model_name
+        ]
+        if len(matches) != 1:
+            return False
+        capabilities = getattr(matches[0], "capabilities", None)
+        return getattr(capabilities, "parallel_tool_calls", False) is True
 
     def complete(self, messages: Sequence[ConversationTurn], tools: Sequence[dict[str, Any]], *, mission_id: str, run_id: str, turn_id: str, plan_version: int, timeout_seconds: float | None = None) -> ModelTurn:
         payload = [item.to_dict() for item in messages]
@@ -330,6 +343,7 @@ class RouterNativeModel:
         self.trusted_provider = provider
         self.trusted_model = model
         self.trusted_capability = capability
+        self.parallel_tool_calls = self._provider_supports_parallel_tool_calls(provider, model)
         return model_turn_from_provider(response, mission_id=mission_id, run_id=run_id, turn_id=turn_id, request_id="", plan_version=plan_version)
 
 

@@ -8,10 +8,11 @@ from pathlib import Path
 import pytest
 
 from scripts.write_installer_manifest import main
+from core.version import VERSION as REPOSITORY_VERSION
 
 
 def test_installer_manifest_binds_digest_and_source_commit(tmp_path: Path, monkeypatch) -> None:
-    installer = tmp_path / "CyberSentinel-Setup-5.1.0.exe"
+    installer = tmp_path / f"CyberSentinel-Setup-{REPOSITORY_VERSION}.exe"
     installer.write_bytes(b"fixture-nsis-installer")
     source_commit = "2ef29b7de9eb43a7880223d0d256699eac2d4945"
     monkeypatch.setattr(
@@ -21,7 +22,7 @@ def test_installer_manifest_binds_digest_and_source_commit(tmp_path: Path, monke
             "write_installer_manifest.py",
             str(tmp_path),
             "--version",
-            "5.1.0",
+            REPOSITORY_VERSION,
             "--source-commit",
             source_commit,
         ],
@@ -31,6 +32,7 @@ def test_installer_manifest_binds_digest_and_source_commit(tmp_path: Path, monke
 
     digest = hashlib.sha256(installer.read_bytes()).hexdigest()
     manifest = json.loads((tmp_path / "installer-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == REPOSITORY_VERSION
     assert manifest["source_commit"] == source_commit
     assert manifest["sha256"] == digest
     assert manifest["size_bytes"] == installer.stat().st_size
@@ -46,11 +48,31 @@ def test_installer_manifest_rejects_non_full_source_sha(tmp_path: Path, monkeypa
             "write_installer_manifest.py",
             str(tmp_path),
             "--version",
-            "5.1.0",
+            REPOSITORY_VERSION,
             "--source-commit",
             "2ef29b7",
         ],
     )
 
     with pytest.raises(SystemExit, match="source_commit_must_be_full_lowercase_git_sha"):
+        main()
+
+
+def test_installer_manifest_rejects_candidate_version_mismatch(tmp_path: Path, monkeypatch) -> None:
+    installer = tmp_path / "CyberSentinel-Setup-5.1.0.exe"
+    installer.write_bytes(b"fixture-installer")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "write_installer_manifest.py",
+            str(tmp_path),
+            "--version",
+            "5.1.0",
+            "--source-commit",
+            "2ef29b7de9eb43a7880223d0d256699eac2d4945",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="manifest_version_does_not_match_repository_VERSION"):
         main()

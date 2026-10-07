@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 
-ARG CYBERSENTINEL_VERSION=5.0.0
+ARG CYBERSENTINEL_VERSION=5.2.0-rc1
 
 LABEL org.opencontainers.image.title="CyberSentinel" \
       org.opencontainers.image.description="Self-hosted single-host runtime" \

@@ -58,6 +58,63 @@ def test_native_loop_executes_tool_then_models_again(tmp_path, monkeypatch):
     assert any(event["event"] == "ModelTurn" for event in result.trajectory)
 
 
+def test_native_loop_preserves_list_valued_tool_results(tmp_path, monkeypatch):
+    import tools.registry
+
+    items = [{"source": "fixture-list-result", "trust_classification": "UNTRUSTED_DATA"}]
+    monkeypatch.setattr(tools.registry, "execute", lambda *_args, **_kwargs: items)
+
+    class ListResultModel:
+        def __init__(self):
+            self.turn_count = 0
+
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            self.turn_count += 1
+            if self.turn_count == 1:
+                return ModelTurn(
+                    turn_id,
+                    tool_calls=(ToolCallProposal.create(
+                        "status", {}, mission_id=mission_id, run_id=run_id, turn_id=turn_id,
+                        plan_version=plan_version, step_id="observe", tool_call_id="call_list_result",
+                    ),),
+                )
+            assert any(
+                message.role == "tool" and "fixture-list-result" in message.content
+                for message in messages
+            )
+            return ModelTurn(turn_id, content="list result observed")
+
+    class Verified:
+        verified = True
+        missing_criteria = ()
+        evidence = ()
+
+    runtime = MissionRuntime(
+        MissionStore(Path(tmp_path) / "missions.sqlite3"),
+        executor=lambda *_: {},
+        verifier=lambda _mission: Verified(),
+        authorization_snapshot_factory=make_test_snapshot,
+    )
+    plan = Plan.initial("check system status").replan(
+        steps=(PlanStep("observe", "observe", action="status"),),
+        reason="list result regression",
+    )
+    mission = runtime.create("check system status", "check system status", plan)
+    model = ListResultModel()
+
+    result = runtime.run_model_loop(
+        mission.mission_id,
+        model,
+        tools=mission_model_tools("status"),
+        max_turns=2,
+    )
+
+    assert result.status is MissionStatus.GOAL_COMPLETED
+    assert model.turn_count == 2
+    assert result.progress["model_loop"]["tool_results"][0]["result"]["items"] == items
+    assert result.failures == []
+
+
 def test_native_loop_rejects_cross_mission_call_without_execution(tmp_path, monkeypatch):
     import tools.registry
 

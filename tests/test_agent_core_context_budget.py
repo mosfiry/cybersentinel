@@ -114,6 +114,59 @@ def test_initial_planning_uses_provider_context_window_token_budget(tmp_path: Pa
     assert captured["include_tool_schema_tokens"] is True
 
 
+def test_explicit_status_mission_uses_only_status_schema_and_keeps_owner_policy(tmp_path: Path):
+    router = CapturingRouter()
+    router.schemas = []
+
+    def tool_calling(messages, schemas, **_kwargs):
+        router.messages = list(messages)
+        router.schemas = list(schemas)
+        return {"tool_calls": [{"name": "status", "arguments": {}, "id": "status-call"}]}
+
+    router.tool_calling = tool_calling
+    core = AgentCore(router, store=MissionStore(tmp_path / "missions.sqlite3"))
+
+    class EmptyMemory:
+        def available(self):
+            return False
+
+        def retrieve_relevant(self, *_args, **_kwargs):
+            return []
+
+    plan = core._plan(
+        "Return the current system status using the status tool.",
+        policy_context="CAPTURED OWNER POLICY SNAPSHOT: active policy",
+        conversation_id="owner-status-budget-test",
+        memory_provider=EmptyMemory(),
+    )
+
+    assert [step.action for step in plan.steps] == ["status"]
+    assert [item["function"]["name"] for item in router.schemas] == ["status"]
+    serialized = "\n".join(str(item.get("content", "")) for item in router.messages)
+    assert "CAPTURED OWNER POLICY SNAPSHOT: active policy" in serialized
+    assert "Return the current system status" in serialized
+
+
+def test_intent_tool_selection_is_intersected_with_owner_scope_and_supports_multiple_intents(tmp_path: Path):
+    core = AgentCore(CapturingRouter(), store=MissionStore(tmp_path / "missions.sqlite3"))
+
+    assert core._eligible_planning_tools(
+        "Check system status, local TCP listeners, and run the project tests.", None
+    ) == {"status", "local_security_check", "run_project_tests"}
+    assert core._eligible_planning_tools(
+        "Run the authorized local project tests and verify their result", None
+    ) == {"status", "run_project_tests"}
+    assert core._eligible_planning_tools(
+        "Use exactly these two tools: status and latest_intel. Read current status and the latest locally available intelligence snapshot.",
+        None,
+    ) == {"status", "latest_intel"}
+    assert core._eligible_planning_tools(
+        "Read the latest locally available intelligence snapshot.", None
+    ) == {"latest_intel"}
+    assert core._eligible_planning_tools("Return the current status.", {"search"}) == set()
+    assert core._eligible_planning_tools("Analyze this project.", {"search"}) == {"search"}
+
+
 def test_initial_planning_sends_and_budgets_only_scope_permitted_tools(tmp_path: Path, monkeypatch):
     import agent.agent_core as agent_core_module
     from tools.registry import model_tool_definitions

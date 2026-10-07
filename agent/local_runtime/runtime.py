@@ -25,9 +25,22 @@ class RuntimeAdapter(Protocol):
 
 
 class LlamaCppRuntime:
-    def __init__(self, runtime_dir: str | Path, *, startup_timeout: float = 180.0):
+    def __init__(
+        self,
+        runtime_dir: str | Path,
+        *,
+        startup_timeout: float = 180.0,
+        inference_timeout_seconds: float = 240.0,
+    ):
+        if (
+            isinstance(inference_timeout_seconds, bool)
+            or not isinstance(inference_timeout_seconds, (int, float))
+            or not 1 <= inference_timeout_seconds <= 600
+        ):
+            raise ValueError("local inference timeout must be between 1 and 600 seconds")
         self.runtime_dir = Path(runtime_dir).expanduser().resolve()
         self.startup_timeout = startup_timeout
+        self.inference_timeout_seconds = float(inference_timeout_seconds)
         self.process: subprocess.Popen | None = None
         self.provider: OpenAICompatibleProvider | None = None
         self.port: int | None = None
@@ -122,6 +135,8 @@ class LlamaCppRuntime:
                 min_cpu_cores=spec.min_cpu_cores,
                 min_disk_gib=(spec.size_bytes + 2 * (1024**3) - 1) // (1024**3),
             ),
+            request_timeout_seconds=self.inference_timeout_seconds,
+            disable_qwen_thinking=spec.model_id.startswith("qwen3-"),
         )
         self.provider.capabilities = ProviderCapabilities(
             generate=True,

@@ -70,7 +70,7 @@ def test_release_bundle_contains_versioned_image_and_verified_payload(tmp_path: 
         "RELEASE_NOTES.md",
         "release-metadata.json",
         "SHA256SUMS",
-        "images/cybersentinel-runtime-5.0.0.tar",
+        f"images/cybersentinel-runtime-{APPLICATION_VERSION}.tar",
         "scripts/install_compose.sh",
         "scripts/backup_state.sh",
         "scripts/restore_state.sh",

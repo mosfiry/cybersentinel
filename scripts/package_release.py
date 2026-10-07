@@ -50,7 +50,7 @@ EXCLUDED_FILES = {
 }
 FORBIDDEN_PATH_SUFFIXES = (".pem", ".key", ".db", ".sqlite", ".sqlite3")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 CHUNK_SIZE = 1024 * 1024
 
 
@@ -132,13 +132,7 @@ def _read_version(root: Path) -> str:
     _regular_file(version_path, description="VERSION")
     version = version_path.read_text(encoding="ascii").strip()
     if not VERSION_PATTERN.fullmatch(version):
-        raise ReleaseArtifactError("VERSION must contain a stable numeric MAJOR.MINOR.PATCH value")
-    version_module = root / "core" / "version.py"
-    if version_module.exists():
-        source = version_module.read_text(encoding="utf-8")
-        match = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']\s*$', source, re.MULTILINE)
-        if not match or match.group(1) != version:
-            raise ReleaseArtifactError("VERSION does not match core/version.py")
+        raise ReleaseArtifactError("VERSION must contain semantic MAJOR.MINOR.PATCH with optional prerelease")
     return version
 
 

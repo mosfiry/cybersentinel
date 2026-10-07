@@ -129,7 +129,9 @@ def test_versioned_runtime_image_and_release_bundle_share_the_version_source() -
     assert version == VERSION
     assert f"CYBERSENTINEL_VERSION={version}" in env_example
     assert f"CYBERSENTINEL_IMAGE=cybersentinel-runtime:{version}" in env_example
-    assert "${CYBERSENTINEL_IMAGE:-cybersentinel-runtime:5.0.0}" in COMPOSE
+    assert f"${{CYBERSENTINEL_IMAGE:-cybersentinel-runtime:{version}}}" in COMPOSE
+    assert f"CYBERSENTINEL_VERSION: ${{CYBERSENTINEL_VERSION:-{version}}}" in COMPOSE
+    assert f"ARG CYBERSENTINEL_VERSION={version}" in DOCKERFILE
     assert 'org.opencontainers.image.version="${CYBERSENTINEL_VERSION}"' in DOCKERFILE
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
     for host_only in (

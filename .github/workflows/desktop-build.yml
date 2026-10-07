@@ -4,6 +4,12 @@ on:
   push:
     branches: [work/windows-native-local-llm, work/hermes-level-agent-intelligence, work/v5.2-final-completion]
     paths:
+      - "VERSION"
+      - ".env.example"
+      - "Dockerfile"
+      - "compose.yaml"
+      - "README.md"
+      - "RELEASE_NOTES.md"
       - "desktop/**"
       - "web/**"
       - "bridge.py"
@@ -44,6 +50,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+      - name: Read canonical candidate version
+        id: candidate-version
+        run: |
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw "VERSION is not a supported release version: $version" }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -62,7 +74,7 @@ jobs:
         run: python -m playwright install chromium
       # The full suite (including POSIX process/signal and /proc tests) runs in tests.yml on Ubuntu.
       - name: Windows-portable API, project, model, and security tests
-        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py
+        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py
       - name: Install locked Electron toolchain
         working-directory: desktop
         run: npm ci --no-audit --no-fund
@@ -103,17 +115,16 @@ jobs:
           CYBERSENTINEL_WINDOWS_RUNNER_ACCEPTANCE: "NOT_RUN"
         run: >-
           python scripts/write_installer_manifest.py desktop/dist
-          --version 5.2.0-rc1
+          --version '${{ steps.candidate-version.outputs.version }}'
           --source-commit $env:GITHUB_SHA
-          --parent-tested-commit 103516c9b58cc37eaacda40c8d11ba6878ba64e9
-          --installer-name CyberSentinel-v5.2.0-rc1.exe
+          --installer-name "CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe"
       - name: Upload RC installer, checksum, and provenance as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CyberSentinel-v5.2.0-rc1-${{ github.sha }}
+          name: CyberSentinel-v${{ steps.candidate-version.outputs.version }}-${{ github.sha }}
           path: |
-            desktop/dist/CyberSentinel-v5.2.0-rc1.exe
-            desktop/dist/CyberSentinel-v5.2.0-rc1.exe.sha256
+            desktop/dist/CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe
+            desktop/dist/CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe.sha256
             desktop/dist/installer-manifest.json
           if-no-files-found: error
           compression-level: 0

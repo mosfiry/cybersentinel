@@ -22,6 +22,8 @@ import sys
 import tempfile
 import time
 
+MAX_SANDBOX_PROCESS_SECONDS = 300.0
+
 
 class WorkspaceBoundaryError(PermissionError):
     """Raised when an operation attempts to leave the configured workspace."""
@@ -39,8 +41,8 @@ class WorkspacePolicy:
     max_processes: int = 4
     max_output_bytes: int = 64_000
     default_timeout: float = 30.0
-    max_timeout_seconds: float = 60.0
-    max_cpu_seconds: int = 60
+    max_timeout_seconds: float = MAX_SANDBOX_PROCESS_SECONDS
+    max_cpu_seconds: int = int(MAX_SANDBOX_PROCESS_SECONDS)
     max_memory_bytes: int = 1_073_741_824
     max_file_bytes: int = 16_777_216
     max_open_files: int = 128
@@ -68,6 +70,8 @@ class WorkspacePolicy:
                 raise ValueError("workspace timeouts must be positive finite numbers")
         if self.default_timeout > self.max_timeout_seconds:
             raise ValueError("default timeout cannot exceed the maximum timeout")
+        if self.max_timeout_seconds > MAX_SANDBOX_PROCESS_SECONDS or self.max_cpu_seconds > int(MAX_SANDBOX_PROCESS_SECONDS):
+            raise ValueError("workspace process limits exceed the hard 300-second maximum")
         if self.max_artifact_bytes > 4 * 1024 * 1024:
             raise ValueError("single artifact limit exceeds ArtifactStore's hard cap")
         if self.max_total_artifact_bytes < self.max_artifact_bytes:
@@ -765,7 +769,11 @@ class Workspace:
             ):
                 args.extend(("--setenv", key, value))
 
-            cpu_limit = min(self.policy.max_cpu_seconds, max(2, math.ceil(timeout) + 1))
+            cpu_limit = min(
+                self.policy.max_cpu_seconds,
+                int(MAX_SANDBOX_PROCESS_SECONDS),
+                max(2, math.ceil(timeout)),
+            )
             limit_argv = (
                 prlimit,
                 f"--cpu={cpu_limit}:{cpu_limit}",
@@ -1067,7 +1075,7 @@ class ProcessResult:
 class ProcessHandle:
     """Controlled asynchronous process handle with bounded output and termination."""
 
-    def __init__(self, process: Popen[bytes], command: tuple[str, ...], max_output_bytes: int, *, temporary_directory: Any = None, max_timeout_seconds: float = 60.0, cancellation_event: Any = None):
+    def __init__(self, process: Popen[bytes], command: tuple[str, ...], max_output_bytes: int, *, temporary_directory: Any = None, max_timeout_seconds: float = MAX_SANDBOX_PROCESS_SECONDS, cancellation_event: Any = None):
         self.process = process
         self.command = command
         self.max_output_bytes = max_output_bytes
@@ -1198,4 +1206,4 @@ class ProcessManager:
         return handle
 
 
-__all__ = ["ProcessHandle", "ProcessManager", "ProcessResult", "Workspace", "WorkspaceAuditEvent", "WorkspaceBoundaryError", "WorkspacePolicy", "WorkspacePolicyError"]
+__all__ = ["MAX_SANDBOX_PROCESS_SECONDS", "ProcessHandle", "ProcessManager", "ProcessResult", "Workspace", "WorkspaceAuditEvent", "WorkspaceBoundaryError", "WorkspacePolicy", "WorkspacePolicyError"]

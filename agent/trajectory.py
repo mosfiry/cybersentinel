@@ -29,6 +29,7 @@ class EventType(str, Enum):
     GOAL_VERIFICATION_STARTED = "GoalVerificationStarted"
     GOAL_VERIFIED = "GoalVerified"
     MISSION_COMPLETED = "MissionCompleted"
+    FINAL_REPORT_APPROVED = "FinalReportApproved"
     RECOVERY_REQUIRED = "RecoveryRequired"
     MODEL_TURN = "ModelTurn"
 

@@ -1,6 +1,6 @@
-# CyberSentinel X 5.0.0 — Unpublished Release Candidate
+# CyberSentinel X 5.2.0-rc1 — Unpublished Release Candidate
 
-**Status:** Candidate artifacts only. No final Git tag, public release, or production deployment has been created.
+**Status:** Candidate artifacts only. No final v5.2.0 Git tag, public release, or production deployment has been created.
 
 ## Scope
 
@@ -17,10 +17,10 @@ The supported deployment target is a single-host Linux Docker Compose installati
 
 ## Verification and limits
 
-The release candidate is generated from an exact source commit and its Docker image, bundle, and checksums are verified by CI before upload as an unpublished workflow artifact. CI runs the complete test suite, Docker build/smoke checks, and the isolated M3 lifecycle, migration, backup, restore, and cleanup rehearsal. The live-provider long-horizon test is skipped when no provider credential/factory is configured; no live provider is contacted. The Linux Docker target is validated in hosted CI, not on the local development computer.
+The release candidate is generated from an exact source commit and its Docker image, bundle, checksums, and installer manifest are verified before candidate artifacts are retained. The project CI includes the complete Python suite, Docker build/smoke checks, and the isolated M3 lifecycle, migration, backup, restore, and cleanup rehearsal. The live-provider long-horizon test is skipped when no provider credential/factory is configured; no live provider is contacted. The Linux Docker target is validated in hosted CI, not on the local development computer.
 
-The Windows x64 Desktop installer and portable executable are built by a separate branch-scoped workflow. The local Linux smoke package validates the Electron archive contents, but it is not a native Windows runtime rehearsal; no Windows GUI execution is claimed.
+The Windows x64 Desktop installer and portable executable are built by a separate branch-scoped workflow. Linux-side packaging and static checks are not Windows interactive acceptance. Installation, GUI launch/close/reopen, local model inference, and the full desktop Owner flow are only claimed when they are actually exercised in a Windows interactive environment.
 
 The workflow disables signing-identity auto-discovery and supplies no code-signing identity; the Windows executables are unsigned candidates. Windows may show publisher or SmartScreen warnings.
 
-The V14 gate assessment records 33 of 34 conditions passing; `provider works` remains **PARTIAL** because no live-provider key/router factory is configured in this session. Gate evidence is SHA-bound, so verify the hosted checks for the exact artifact source commit. No final tag (`v5.0.0`), public release, registry publication, or production deployment has been created. Do not treat these files as a public release or as publication approval.
+Acceptance status is determined only by the fresh evidence package bound to the exact candidate source commit. Historical audits do not establish current results, and a test Owner fixture is not the user's final Owner approval. No final tag `v5.2.0`, public release, registry publication, or production deployment has been created. Do not treat these files as a public release or as publication approval.

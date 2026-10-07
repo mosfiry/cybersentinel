@@ -2,7 +2,7 @@
 
 ## استخدام Installer
 
-حزمة Windows x64 المثبتة من هذا الفرع تحتوي على Electron وPython backend المجمّع وruntime CPU لـ`llama.cpp`. على المستخدم تشغيل ملف `CyberSentinel-Setup-5.1.0.exe` واتباع معالج التثبيت، ثم إنشاء كلمة مرور Owner عند أول تشغيل. لا يحتاج الاستخدام المثبت إلى Python أو Node.js أو Docker أو WSL أو Termux أو Terminal أو إعداد `.env` أو تشغيل bridge يدويًا.
+حزمة Windows x64 المثبتة من مرشح هذا الفرع تحتوي على Electron وPython backend المجمّع وruntime CPU لـ`llama.cpp`. اسم الملف المرشح هو `CyberSentinel-v5.2.0-rc1.exe`. شغّله واتبع معالج التثبيت، ثم أنشئ كلمة مرور Owner عند أول تشغيل. لا يحتاج الاستخدام المثبت إلى Python أو Node.js أو Docker أو WSL أو Termux أو Terminal أو إعداد `.env` أو تشغيل bridge يدويًا.
 
 من **الإعدادات** اختر نموذجًا ملائمًا للجهاز، ثم نزّله وفعّله. يتطلب تنزيل النموذج اتصال إنترنت ومساحة قرص بحسب الحجم المعروض؛ بعد اكتمال التنزيل والتحقق من SHA-256 يمكن تشغيل الاستدلال المحلي دون الإنترنت. النماذج المتاحة في كتالوج هذا البناء: Qwen3 4B، Qwen3 8B، وDeepSeek-R1-Distill-Qwen 7B، جميعها GGUF Q4_K_M. التطبيق يعرض حدود الذاكرة والمساحة، ولا يسمح بالتفعيل إن كان الجهاز غير ملائم.
 
@@ -10,7 +10,7 @@
 
 ## حالة النشر والتوقيع
 
-هذا بناء تطويري لفرع `work/windows-native-local-llm` وإصدار Desktop المرشح `5.1.0` فوق Core `5.0.0`. يُرفع Installer كـGitHub Actions artifact مرتبط بالـworkflow وcommit SHA لمدة 90 يومًا؛ اسم artifact و`source_commit` داخل manifest يحددان commit البناء، إلى جانب SHA-256 للملف. المستودع عام؛ تعامل مع الفرع وسجل التشغيل والـartifact على أنها مرئية/قابلة للتنزيل وفق أذونات GitHub للمستودع. لا ينشئ هذا المسار tag أو GitHub Release أو نشرًا في registry/خدمة إنتاجية. الـInstaller غير موقّع رقميًا؛ قد يعرض Windows SmartScreen تحذير ناشر غير معروف. تحقق من SHA-256 للملف الذي استلمته قبل التثبيت.
+هذا بناء تطويري لفرع `work/v5.2-final-completion` وإصدار Desktop المرشح `5.2.0-rc1` فوق Core `5.2.0-rc1`. يُرفع Installer كـGitHub Actions artifact مرتبط بالـworkflow وcommit SHA لمدة 90 يومًا؛ اسم artifact و`source_commit` داخل manifest يحددان commit البناء، إلى جانب SHA-256 للملف. المستودع عام؛ تعامل مع الفرع وسجل التشغيل والـartifact على أنها مرئية/قابلة للتنزيل وفق أذونات GitHub للمستودع. لا ينشئ هذا المسار tag نهائيًا أو GitHub Release أو نشرًا في registry/خدمة إنتاجية. الـInstaller غير موقّع رقميًا؛ قد يعرض Windows SmartScreen تحذير ناشر غير معروف. تحقق من SHA-256 للملف الذي استلمته قبل التثبيت. يجب أن يبقى tag وRelease وinstaller المنشور لـ`v5.1.0` كما هي دون تعديل.
 
 ## بناء Installer من المصدر
 
@@ -26,10 +26,11 @@ npm run icon
 npm run dist
 cd ..
 $sourceCommit = git rev-parse HEAD
-python scripts/write_installer_manifest.py desktop/dist --version 5.1.0 --source-commit $sourceCommit
+$version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+python scripts/write_installer_manifest.py desktop/dist --version $version --source-commit $sourceCommit --installer-name "CyberSentinel-v$version.exe"
 ```
 
-الناتج: `desktop/dist/CyberSentinel-Setup-5.1.0.exe` وملف `.sha256` و`installer-manifest.json`. يفشل سكربت runtime إذا لم يطابق ملف llama.cpp الحجم والـSHA المثبتين؛ ويفحص build سكربت backend تشغيل `--desktop-self-test` والـweb assets. سجل المصدر والإصدارات والحجوم وSHA-256 للنماذج وruntime في [`docs/LOCAL_MODEL_ARTIFACTS.md`](../docs/LOCAL_MODEL_ARTIFACTS.md).
+الناتج المرشح من هذا الإصدار هو `desktop/dist/CyberSentinel-v5.2.0-rc1.exe` وملف `.sha256` و`installer-manifest.json`. يفشل سكربت runtime إذا لم يطابق ملف llama.cpp الحجم والـSHA المثبتين؛ ويفحص build سكربت backend تشغيل `--desktop-self-test` والـweb assets. سجل المصدر والإصدارات والحجوم وSHA-256 للنماذج وruntime في [`docs/LOCAL_MODEL_ARTIFACTS.md`](../docs/LOCAL_MODEL_ARTIFACTS.md).
 
 ## تطوير التطبيق من المصدر
 

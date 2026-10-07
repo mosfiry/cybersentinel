@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import agent.agent_core as agent_core_module
+import agent.mission_runtime as mission_runtime_module
 import security.owner_policy as owner_policy
 import security.scope_store as scope_store
 from agent.agent_core import AgentCore
@@ -274,6 +275,117 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
         receipt["evidence_id"] == process_record["evidence_id"]
         for receipt in store.load(mission.mission_id).progress["execution_evidence_refs"]
     )
+
+
+def test_native_model_serializes_tool_calls_when_provider_disables_parallel_calls(tmp_path, monkeypatch):
+    allow_owner_sessions(monkeypatch, "native-serial-owner-session")
+    authorized_root = tmp_path / "authorized-serial-project"
+    authorized_root.mkdir()
+    (authorized_root / "test_ok.py").write_text(
+        "def test_ok():\n    assert 2 + 2 == 4\n",
+        encoding="utf-8",
+    )
+    scope_snapshot = persist_canonical_scope(
+        monkeypatch, tmp_path, owner_session_token="native-serial-owner-session",
+        target_id="native-serial-workspace",
+    )
+    provider = _NativeWorkspaceProvider([
+        ToolCall("run_project_tests", {"query": "."}, "native-serial-tests"),
+        ToolCall("status", {}, "native-serial-status"),
+    ])
+    provider.capabilities = ProviderCapabilities(
+        generate=True,
+        tool_calling=True,
+        native_chat=True,
+        parallel_tool_calls=False,
+    )
+    observed_worker_limits = []
+    real_execute_bounded_parallel = mission_runtime_module.execute_bounded_parallel
+
+    def record_worker_limit(proposals, execute_one, *, max_workers=4):
+        observed_worker_limits.append(max_workers)
+        return real_execute_bounded_parallel(proposals, execute_one, max_workers=max_workers)
+
+    monkeypatch.setattr(
+        mission_runtime_module, "execute_bounded_parallel", record_worker_limit
+    )
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    core = AgentCore(
+        ModelRouter([provider]),
+        store=store,
+        max_iterations=5,
+        knowledge_retriever=_EmptyKnowledge(),
+    )
+
+    mission = core.run_owner_mission(
+        "Run the authorized local project tests and read system status, then verify the results",
+        owner_session_token="native-serial-owner-session",
+        request_id="native-serial-workspace-request",
+        scope_context=workspace_scope_context(scope_snapshot, authorized_root),
+    )
+
+    assert provider.calls == 3
+    assert observed_worker_limits == [1]
+    assert mission.status is MissionStatus.GOAL_COMPLETED
+    completed_tools = {
+        item.get("name")
+        for item in mission.progress["model_loop"]["tool_results"]
+        if item.get("ok") is True
+    }
+    assert {"run_project_tests", "status"}.issubset(completed_tools)
+
+
+def test_native_owner_mission_preserves_latest_intel_list_result(tmp_path, monkeypatch):
+    import json
+    import core.db as core_db
+
+    session = "native-latest-intel-owner-session"
+    marker = "V52_LOCAL_INTEL_FIXTURE_CVE"
+    monkeypatch.setattr(core_db, "DB_PATH", tmp_path / "core.sqlite3")
+    monkeypatch.setattr(agent_core_module, "DB_PATH", tmp_path / "application.sqlite3")
+    with core_db.connect():
+        pass
+    assert core_db.add_intel(
+        marker, "acceptance-fixture", "Local test advisory",
+        "Read-only synthetic record; no network request.", "high", {"fixture": True},
+    )
+    allow_owner_sessions(monkeypatch, session)
+    provider = _NativeWorkspaceProvider([
+        ToolCall("status", {}, "native-latest-intel-status"),
+        ToolCall("latest_intel", {}, "native-latest-intel-list"),
+    ])
+    provider.capabilities = ProviderCapabilities(
+        generate=True,
+        tool_calling=True,
+        native_chat=True,
+        parallel_tool_calls=False,
+    )
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    core = AgentCore(
+        ModelRouter([provider]),
+        store=store,
+        max_iterations=5,
+        knowledge_retriever=_EmptyKnowledge(),
+    )
+
+    mission = core.run_owner_mission(
+        "Read current local system status and latest locally available intelligence, then report only observed facts.",
+        owner_session_token=session,
+        request_id="native-latest-intel-list-request",
+    )
+
+    assert mission.status is MissionStatus.GOAL_COMPLETED
+    successful_tools = {
+        item.get("name"): item
+        for item in mission.progress["model_loop"]["tool_results"]
+        if item.get("ok") is True
+    }
+    assert {"status", "latest_intel"}.issubset(successful_tools)
+    intel_result = successful_tools["latest_intel"].get("result")
+    assert isinstance(intel_result, dict)
+    assert isinstance(intel_result.get("items"), list)
+    assert marker in json.dumps(intel_result, ensure_ascii=False)
+    assert mission.checkpoint.get("status") != "in_flight_parallel"
 
 
 def test_stale_owner_cannot_enqueue_or_reach_worker_effect_boundary(tmp_path, monkeypatch):

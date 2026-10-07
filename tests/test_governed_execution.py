@@ -691,6 +691,14 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
                 assert body["report"]["schema_version"] == "cybersentinel.mission-report.v1"
                 assert body["report"]["mission_summary"]["outcome"] == "UNKNOWN"
                 assert report_chain.read_bytes() == chain_before
+        report_code, report_body = request("GET", f"/api/missions/{mission_id}/report")
+        assert report_code == 200 and report_body["report"]["final_report_approval"]["status"] == "PENDING"
+        approval_code, approval_body = request(
+            "POST",
+            f"/api/missions/{mission_id}/approve-report",
+            {"report_sha256": report_body["report"]["report_sha256"]},
+        )
+        assert approval_code == 409 and approval_body["error"] == "report_not_eligible_for_approval"
         code, start_result = request("POST", f"/api/missions/{mission_id}/start")
         assert code == 200, start_result
         code, _ = request("POST", f"/api/missions/{mission_id}/pause")

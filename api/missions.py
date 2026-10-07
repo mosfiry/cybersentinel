@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -19,11 +23,16 @@ from agent.mission_worker import MissionQueue, MissionScheduler, WorkerMissionSt
 from agent.planning import Plan
 from agent.evidence import EvidenceChainStore
 from agent.reporting import build_mission_report
+from agent.trajectory import EventType
 from security.mission_authorization import MissionAuthorizationSnapshot
 from security.owner_policy import OwnerAuthenticationEvidence
 from security.session_reference import session_reference
 
 MAX_OBSERVABILITY_MISSION_BYTES = 16 * 1024 * 1024
+
+
+class MissionReportApprovalConflict(ValueError):
+    """The report or Mission state is not eligible for the requested approval."""
 
 
 class MissionService:
@@ -829,14 +838,6 @@ class MissionService:
                         "SELECT payload FROM evidence_chain ORDER BY sequence"
                     ).fetchall()
                 records = [json.loads(row[0]) for row in rows]
-                chain_integrity = (
-                    "VALID"
-                    if EvidenceChainStore.verify_records(
-                        records,
-                        mission_store=self.runtime.store,
-                    )
-                    else "INVALID"
-                )
                 mission_records = [
                     item
                     for item in records
@@ -850,14 +851,172 @@ class MissionService:
                         )
                     )
                 ]
+                if not records:
+                    chain_integrity = "NOT_PRESENT"
+                elif not EvidenceChainStore.verify_records(
+                    records,
+                    mission_store=self.runtime.store,
+                ):
+                    chain_integrity = "INVALID"
+                elif not mission_records:
+                    chain_integrity = "NOT_PRESENT"
+                else:
+                    chain_integrity = "VALID"
             except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
                 chain_integrity = "UNREADABLE"
                 mission_records = []
-        return build_mission_report(
+        report = build_mission_report(
             mission,
             execution_evidence=mission_records,
             evidence_chain_integrity=chain_integrity,
         )
+
+        limitations = report.get("limitations")
+        if not isinstance(limitations, list):
+            limitations = []
+        else:
+            limitations = list(limitations)
+        limitations.append(
+            "Final report approval is a separate Owner decision bound to this report digest; it does not authorize actions or replace action-level approvals."
+        )
+        report["limitations"] = limitations
+        report_body = json.dumps(
+            report,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        report_sha256 = hashlib.sha256(report_body).hexdigest()
+        report["report_sha256"] = report_sha256
+        report["report_digest_scope"] = (
+            "SHA-256 over canonical sorted compact UTF-8 JSON report content before the digest and approval envelope."
+        )
+
+        stored_approval = mission.progress.get("final_report_approval")
+        if not isinstance(stored_approval, dict):
+            approval_view = {"status": "PENDING", "report_sha256": report_sha256}
+        elif (
+            stored_approval.get("decision") == "APPROVED"
+            and stored_approval.get("report_sha256") == report_sha256
+            and stored_approval.get("owner_identity_ref") == mission.owner_identity_ref
+        ):
+            approval_view = {
+                "status": "APPROVED",
+                "report_sha256": report_sha256,
+                "approved_at": str(stored_approval.get("approved_at", "")),
+            }
+        else:
+            approval_view = {
+                "status": "STALE",
+                "report_sha256": str(stored_approval.get("report_sha256", "")),
+                "current_report_sha256": report_sha256,
+                "approved_at": str(stored_approval.get("approved_at", "")),
+            }
+        report["final_report_approval"] = approval_view
+        return report
+
+    def approve_report(
+        self,
+        mission_id: str,
+        *,
+        owner_session_token: str,
+        report_sha256: str,
+    ) -> dict[str, Any]:
+        """Record the authenticated Owner's approval of one exact completed report."""
+        if not isinstance(report_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", report_sha256) is None:
+            raise ValueError("invalid_report_sha256")
+
+        mission, owner_ref = self._authorized_mission(mission_id, owner_session_token)
+        if mission.status is not MissionStatus.GOAL_COMPLETED:
+            raise MissionReportApprovalConflict("report_not_eligible_for_approval")
+        if not isinstance(mission.authorization_snapshot, dict):
+            raise PermissionError("mission_owner_authorization_snapshot_unavailable")
+        try:
+            snapshot = MissionAuthorizationSnapshot.from_dict(mission.authorization_snapshot)
+        except (KeyError, TypeError, ValueError, PermissionError) as exc:
+            raise PermissionError("mission_owner_authorization_snapshot_invalid") from exc
+        if (
+            snapshot.owner_identity != owner_ref
+            or snapshot.mission_id != mission_id
+            or not snapshot.owner_approval
+        ):
+            raise PermissionError("mission_owner_authorization_binding_invalid")
+
+        self._assert_unleased(mission_id)
+        report = self.report(mission_id, owner_session_token=owner_session_token)
+        summary = report.get("mission_summary", {})
+        evidence = report.get("evidence", {})
+        if (
+            summary.get("mission_status") != MissionStatus.GOAL_COMPLETED.value
+            or summary.get("outcome") not in {"VERIFIED", "PARTIALLY_VERIFIED"}
+            or evidence.get("execution_chain_integrity") != "VALID"
+        ):
+            raise MissionReportApprovalConflict("report_not_eligible_for_approval")
+        current_digest = str(report.get("report_sha256", ""))
+        if not hmac.compare_digest(report_sha256, current_digest):
+            raise MissionReportApprovalConflict("report_sha256_mismatch")
+
+        latest, _ = self._authorized_mission(mission_id, owner_session_token)
+        if latest.integrity_hash != mission.integrity_hash:
+            raise MissionReportApprovalConflict("report_changed_during_approval")
+        latest_report = self.report(mission_id, owner_session_token=owner_session_token)
+        if not hmac.compare_digest(
+            report_sha256, str(latest_report.get("report_sha256", ""))
+        ):
+            raise MissionReportApprovalConflict("report_changed_during_approval")
+        self._assert_unleased(mission_id)
+
+        existing = latest.progress.get("final_report_approval")
+        if (
+            isinstance(existing, dict)
+            and existing.get("decision") == "APPROVED"
+            and existing.get("report_sha256") == report_sha256
+            and existing.get("owner_identity_ref") == owner_ref
+        ):
+            return {
+                "mission_id": mission_id,
+                "report_sha256": report_sha256,
+                "approval": {
+                    "status": "APPROVED",
+                    "approved_at": str(existing.get("approved_at", "")),
+                    "owner_identity_ref": owner_ref,
+                    "approval_scope": "report_only",
+                },
+                "mission_integrity_hash": latest.integrity_hash,
+            }
+
+        approved_at = datetime.now(timezone.utc).isoformat()
+        approval_record = {
+            "decision": "APPROVED",
+            "report_sha256": report_sha256,
+            "owner_identity_ref": owner_ref,
+            "approved_at": approved_at,
+            "approval_scope": "report_only",
+        }
+        latest.progress["final_report_approval"] = approval_record
+        latest.emit(
+            EventType.FINAL_REPORT_APPROVED,
+            data={
+                "report_sha256": report_sha256,
+                "owner_identity_ref": owner_ref,
+                "decision": "APPROVED",
+                "approval_scope": "report_only",
+                "approved_at": approved_at,
+            },
+        )
+        saved = self.runtime.store.save(latest)
+        return {
+            "mission_id": mission_id,
+            "report_sha256": report_sha256,
+            "approval": {
+                "status": "APPROVED",
+                "approved_at": approved_at,
+                "owner_identity_ref": owner_ref,
+                "approval_scope": "report_only",
+            },
+            "mission_integrity_hash": saved.integrity_hash,
+        }
 
     def _load(self, mission_id: str) -> Mission:
         mission = self.runtime.store.load(mission_id)
@@ -866,4 +1025,4 @@ class MissionService:
         return mission
 
 
-__all__ = ["MissionService"]
+__all__ = ["MissionReportApprovalConflict", "MissionService"]

@@ -111,6 +111,7 @@ def test_local_model_catalog_downloader_and_runtime_are_pinned_and_loopback_only
     assert "قد تكون أكبر من ذاكرة هذا الجهاز" in APP
     assert "اختبار الاستدلال المحلي الحقيقي" in APP
     assert 'f"{ROOT / \'agent\' / \'local_runtime\' / \'catalog.json\'}{separator}agent/local_runtime"' in Path("scripts/build_desktop_backend.py").read_text(encoding="utf-8")
+    assert 'f"{ROOT / \'VERSION\'}{separator}."' in Path("scripts/build_desktop_backend.py").read_text(encoding="utf-8")
 
 
 def test_installer_and_exact_sha_workflow_build_a_private_artifact_not_a_release():
@@ -129,7 +130,10 @@ def test_installer_and_exact_sha_workflow_build_a_private_artifact_not_a_release
     assert "scripts/download_llama_runtime.py" in WORKFLOW
     assert "scripts/build_desktop_backend.py" in WORKFLOW
     assert "scripts/write_installer_manifest.py" in WORKFLOW
-    assert "CyberSentinel-v5.2.0-rc1.exe" in WORKFLOW
+    assert "Get-Content -LiteralPath VERSION -Raw" in WORKFLOW
+    assert "steps.candidate-version.outputs.version" in WORKFLOW
+    assert "CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe" in WORKFLOW
+    assert "--parent-tested-commit" not in WORKFLOW
     assert "actions/upload-artifact@v4" in WORKFLOW
     assert "contents: read" in WORKFLOW
     assert "release:" not in WORKFLOW

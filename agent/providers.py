@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import urllib.error
 import io
 from typing import Any
@@ -47,6 +48,8 @@ class OpenAICompatibleProvider:
         quantization: str | None = None,
         deployment: ProviderDeployment | str = ProviderDeployment.UNKNOWN,
         hardware_requirements: HardwareRequirements | None = None,
+        request_timeout_seconds: int | float = 90,
+        disable_qwen_thinking: bool = False,
     ):
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -55,6 +58,14 @@ class OpenAICompatibleProvider:
             raise ValueError("provider base_url must not contain credentials, query parameters, or a fragment")
         self.model = model
         self.api_key = api_key
+        if (
+            isinstance(request_timeout_seconds, bool)
+            or not isinstance(request_timeout_seconds, (int, float))
+            or not math.isfinite(request_timeout_seconds)
+            or not 1 <= request_timeout_seconds <= 600
+        ):
+            raise ValueError("provider request timeout must be between 1 and 600 seconds")
+        self.request_timeout_seconds = float(request_timeout_seconds)
         if context_length is not None and (isinstance(context_length, bool) or not isinstance(context_length, int) or context_length < 1):
             raise ValueError("context_length must be a positive integer")
         self.context_length = context_length
@@ -65,6 +76,15 @@ class OpenAICompatibleProvider:
         self.model_version = model_version
         self.quantization = quantization
         self.deployment = ProviderDeployment(deployment)
+        if not isinstance(disable_qwen_thinking, bool):
+            raise ValueError("disable_qwen_thinking must be a boolean")
+        if disable_qwen_thinking and (
+            self.name != "local_llama_cpp"
+            or not self.model.startswith("qwen3-")
+            or self.deployment is not ProviderDeployment.LOCAL
+        ):
+            raise ValueError("Qwen thinking override is restricted to the managed local Qwen provider")
+        self.disable_qwen_thinking = disable_qwen_thinking
         self.hardware_requirements = (
             hardware_requirements if hardware_requirements is not None else HardwareRequirements()
         )
@@ -96,7 +116,9 @@ class OpenAICompatibleProvider:
             "metadata": self.metadata.public(),
         }
 
-    def _request(self, payload: dict[str, Any], timeout: int = 90) -> dict[str, Any]:
+    def _request(self, payload: dict[str, Any], timeout: int | float | None = None) -> dict[str, Any]:
+        if timeout is None:
+            timeout = self.request_timeout_seconds
         url = self.base_url + "/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -226,15 +248,21 @@ class OpenAICompatibleProvider:
             capability=capability,
         ), provider=self.name, model=self.model)
 
-    def generate(self, messages: list[dict], temperature: float = 0, timeout: int = 90, **kwargs: Any) -> ProviderResponse:
-        payload = {"model": self.model, "messages": messages, "temperature": temperature, **kwargs}
+    def generate(self, messages: list[dict], temperature: float = 0, timeout: int | float | None = None, **kwargs: Any) -> ProviderResponse:
+        payload = {"model": self.model, "messages": messages, "temperature": temperature}
+        if self.disable_qwen_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload.update(kwargs)
         return self._normalize(self._request(payload, timeout=timeout), "generate")
 
-    def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float = 0, timeout: int = 90, **kwargs: Any) -> ProviderResponse:
+    def tool_calling(self, messages: list[dict], tools: list[dict], temperature: float = 0, timeout: int | float | None = None, **kwargs: Any) -> ProviderResponse:
         if not self.capabilities.tool_calling:
             raise NotImplementedError("native tool calling unavailable")
-        payload = {"model": self.model, "messages": messages, "temperature": temperature, "tools": tools, **kwargs}
+        payload = {"model": self.model, "messages": messages, "temperature": temperature, "tools": tools}
+        if self.disable_qwen_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload.update(kwargs)
         return self._normalize(self._request(payload, timeout=timeout), "tool_calling")
 
-    def chat(self, messages: list[dict], temperature: float = 0, timeout: int = 90) -> dict:
+    def chat(self, messages: list[dict], temperature: float = 0, timeout: int | float | None = None) -> dict:
         return self.generate(messages, temperature=temperature, timeout=timeout).public()

@@ -216,10 +216,12 @@ def main() -> int:
         "fixture": {"bind": "127.0.0.1", "port": 443, "public_exposure": False},
         "checks": {},
         "mission": {},
+        "research": {},
         "memory": {},
         "browser": {},
         "mcp": {},
         "multiagent": {},
+        "bounded_test": {},
         "persistence": {},
         "report": {},
         "evidence": {},
@@ -278,7 +280,7 @@ def main() -> int:
         from tools.mcp_client import MCPRemoteClient, MCPServerStore, MCPToolService
 
         class FullE2EAgentCore(AgentCore):
-            """Keep Qwen as planner; add only the mandatory post-approval invoke if omitted."""
+            """Keep Qwen as planner; add only the approved invoke and bounded test guardrails if omitted."""
 
             def _plan(self, objective, observation=None, **kwargs):
                 candidate = super()._plan(objective, observation, **kwargs)
@@ -302,6 +304,23 @@ def main() -> int:
                         steps=(*candidate.steps, invoke),
                         assumptions=candidate.assumptions,
                         reason="complete the Owner-requested invoke only after the runtime's schema-approval barrier",
+                    )
+                    actions.append("mcp.invoke")
+                if "run_project_tests" not in actions:
+                    bounded_test = PlanStep(
+                        step_id="e2e-bounded-project-tests-" + uuid.uuid4().hex[:8],
+                        objective="Run the single bounded pytest project under the Owner-authorized workspace root.",
+                        action="run_project_tests",
+                        expected_observation="sandboxed bounded pytest process exits successfully",
+                        authorization_requirement="owner",
+                        scope_requirement="workspace",
+                        retry_policy={"arguments": {"query": "bounded-test-project"}},
+                        verification=("project-tests-pass",),
+                    )
+                    candidate = candidate.replan(
+                        steps=(*candidate.steps, bounded_test),
+                        assumptions=candidate.assumptions,
+                        reason="include one bounded, network-isolated project test inside the authenticated workspace scope",
                     )
                 return candidate
 
@@ -400,7 +419,7 @@ def main() -> int:
             "workspace_root": str(run_dir),
             "allowed_networks": ["127.0.0.1"],
             "allowed_credentials": [],
-            "allowed_tools": ["status", "latest_intel", "browser", "mcp.discover", "mcp.invoke"],
+            "allowed_tools": ["status", "latest_intel", "browser", "mcp.discover", "mcp.invoke", "run_project_tests"],
         }
         owner_ref = "owner:" + str(owner_session["owner_id"])
         scope_ref = memory_scope_ref(owner_ref, snapshot.snapshot_id)
@@ -551,7 +570,9 @@ def main() -> int:
         core = make_core(router, store, FullE2EAgentCore, AgentGraphPolicy)
 
         objective = (
-            "Use the prior scoped e2e research memory. Run status and latest_intel as independent checks. "
+            "Investigate whether the prior scoped e2e research memory and local read-only fixture meet the acceptance criteria. "
+            "Run exactly one bounded project test with run_project_tests on bounded-test-project. "
+            "Run status and latest_intel as independent checks. "
             f"Use browser.open on {research_url}, then browser.links to create an extracted artifact. "
             "Discover the Mission-bound MCP server and its read_acceptance_record tool; only after the Owner "
             "approves that exact discovered schema, invoke read_acceptance_record with query full-e2e. "
@@ -563,6 +584,7 @@ def main() -> int:
             {"criterion_id": "browser-page", "description": "scoped browser observes the fixture page", "check": "browser_extraction", "expected_title": "CyberSentinel E2E Research Fixture", "expected_text": "Observed test finding: the scoped acceptance fixture is read-only.", "required": True},
             {"criterion_id": "mcp-discovery", "description": "exact local MCP tool schema is discovered while untrusted", "check": "mcp_discovery", "expected_tool_name": TOOL_NAME, "expected_trust_level": "UNTRUSTED", "required": True},
             {"criterion_id": "mcp-invocation", "description": "owner-approved schema-pinned MCP result is evidence-bound", "check": "mcp_invoke", "expected_tool_name": TOOL_NAME, "required": True},
+            {"criterion_id": "project-tests-pass", "description": "bounded project test process exits successfully", "check": "pytest_success", "required": True},
         ]
         failure_phase = "qwen_owner_mission_planning"
         mission = core.run_owner_mission(
@@ -582,7 +604,7 @@ def main() -> int:
         ]
         qwen_plan_actions = [step.action for step in mission.plan.steps]
         mission.progress["full_e2e_qwen_proposed_actions"] = list(qwen_proposed_actions)
-        required_actions = {"status", "latest_intel", "browser", "mcp.discover", "mcp.invoke"}
+        required_actions = {"status", "latest_intel", "browser", "mcp.discover", "mcp.invoke", "run_project_tests"}
         required_qwen_actions = {"status", "latest_intel", "browser", "mcp.discover"}
         if not required_qwen_actions.issubset(set(qwen_proposed_actions)):
             raise RuntimeError("real_qwen_plan_missing_required_integrated_actions")
@@ -590,8 +612,16 @@ def main() -> int:
             raise RuntimeError("owner_gated_mcp_invoke_continuation_missing")
         if qwen_plan_actions.index("mcp.discover") > qwen_plan_actions.index("mcp.invoke"):
             raise RuntimeError("real_qwen_plan_orders_mcp_invoke_before_discovery")
+        bounded_test_dir = run_dir / "bounded-test-project"
+        bounded_test_dir.mkdir(mode=0o700)
+        bounded_test_file = bounded_test_dir / "test_bounded_acceptance.py"
+        bounded_test_file.write_text(
+            "def test_owner_scoped_bounded_acceptance():\n    assert 2 + 2 == 4\n",
+            encoding="utf-8",
+        )
         open_steps = []
         link_steps = []
+        bounded_test_steps = []
         browser_session_id = "bs_" + uuid.uuid4().hex
         updated_steps = []
         for step in mission.plan.steps:
@@ -614,8 +644,13 @@ def main() -> int:
                 else:
                     arguments["tool_name"] = TOOL_NAME
                     arguments["arguments"] = {"query": "full-e2e"}
+            if step.action == "run_project_tests":
+                arguments["query"] = "bounded-test-project"
+                bounded_test_steps.append(step.step_id)
             policy["arguments"] = arguments
             updated_steps.append(replace(step, retry_policy=policy))
+        if len(bounded_test_steps) != 1:
+            raise RuntimeError("full_e2e_must_run_exactly_one_bounded_project_test")
         if len(open_steps) != 1:
             raise RuntimeError("real_qwen_plan_must_open_exactly_one_scoped_browser_page")
         if not link_steps:
@@ -900,6 +935,16 @@ def main() -> int:
             "task_id": row["task_id"],
         } for row in browser_artifacts]
         result["checks"]["real_scoped_chromium_and_extracted_artifact"] = True
+        result["research"].update({
+            "status": "PASS",
+            "operation": "real scoped Browser open plus links extraction",
+            "page_title": browser_observation.get("title"),
+            "page_url_sha256": sha256(research_url),
+            "artifact_id": browser_observation.get("artifact_id"),
+            "scope_enforced": browser_observation.get("scope_enforced"),
+            "fixture_only_not_public_web": True,
+        })
+        result["checks"]["research_task_executed"] = True
 
         # Verify MCP identity/schema approval, remote invocation, evidence chain,
         # and no follow-up invocation triggered by adversarial remote content.
@@ -927,6 +972,73 @@ def main() -> int:
             "no_followup_or_unapproved_call": len(tools_call_rows) == 1,
         })
         result["checks"]["mcp_discovery_approved_invoke_and_injection_fenced"] = True
+
+        # Confirm the model-generated Mission retains its first-class hypothesis
+        # after the close/reopen checkpoint and actual bounded test execution.
+        mission = store.load(mission.mission_id)
+        hypotheses = [
+            item for item in (mission.hypotheses if mission is not None else [])
+            if isinstance(item, dict) and item.get("hypothesis_id") and item.get("statement")
+        ]
+        owner_hypothesis = next(
+            (item for item in hypotheses if (item.get("provenance") or {}).get("source") == "owner_objective"),
+            None,
+        )
+        if owner_hypothesis is None:
+            raise RuntimeError("mission_linked_owner_hypothesis_missing_after_reopen")
+        result["mission"]["hypotheses"] = [{
+            "hypothesis_id": str(item["hypothesis_id"]),
+            "status": str(item.get("status", "UNRESOLVED")),
+            "confidence": item.get("confidence"),
+            "statement_sha256": sha256(str(item["statement"])),
+            "provenance_source": (item.get("provenance") or {}).get("source"),
+        } for item in hypotheses]
+        result["checks"]["mission_hypothesis_created_and_persisted"] = True
+
+        bounded_result = next((
+            node for node in walk(mission.to_dict())
+            if "returncode" in node
+            and node.get("sandbox_backend")
+            and node.get("network") == "disabled"
+            and node.get("workspace_mode") == "read_only"
+            and isinstance(node.get("artifact_refs"), list)
+            and isinstance(node.get("evidence_ref"), dict)
+        ), None)
+        bounded_evidence = [
+            item for item in mission.evidence
+            if isinstance(item, dict)
+            and item.get("criterion_id") == "project-tests-pass"
+            and item.get("passed") is True
+            and item.get("source") == "run_project_tests"
+        ]
+        bounded_output = str(bounded_result.get("output", "")) if isinstance(bounded_result, dict) else ""
+        if (
+            not isinstance(bounded_result, dict)
+            or bounded_result.get("ok") is not True
+            or bounded_result.get("returncode") != 0
+            or bounded_result.get("timed_out") is not False
+            or bounded_result.get("cancelled") is not False
+            or "1 passed" not in bounded_output
+            or not bounded_result.get("artifact_refs")
+            or not bounded_evidence
+        ):
+            raise RuntimeError("bounded_test_registry_execution_or_deterministic_evidence_failed")
+        result["bounded_test"].update({
+            "status": "PASS",
+            "tool": "run_project_tests",
+            "relative_project": "bounded-test-project",
+            "returncode": bounded_result["returncode"],
+            "timed_out": bounded_result["timed_out"],
+            "cancelled": bounded_result["cancelled"],
+            "sandbox_backend": bounded_result.get("sandbox_backend"),
+            "network": bounded_result.get("network"),
+            "workspace_mode": bounded_result.get("workspace_mode"),
+            "pytest_summary": "1 passed",
+            "artifact_count": len(bounded_result.get("artifact_refs", [])),
+            "evidence_id": bounded_evidence[0].get("evidence_id"),
+            "test_output_sha256": sha256(bounded_output),
+        })
+        result["checks"]["bounded_project_test_completed_in_mission"] = True
 
         # Validate a real local-Qwen final report against observed page/MCP evidence.
         failure_phase = "qwen_final_report"
@@ -1020,7 +1132,7 @@ def main() -> int:
             for item in mission.evidence
             if isinstance(item, dict) and item.get("passed") is True
         }
-        required_criterion_ids = {"validated-status", "browser-page", "mcp-discovery", "mcp-invocation"}
+        required_criterion_ids = {"validated-status", "browser-page", "mcp-discovery", "mcp-invocation", "project-tests-pass"}
         if not required_criterion_ids.issubset(criterion_ids) or mission.verification_state.get("verified") is not True:
             raise RuntimeError("mission_final_validator_did_not_aggregate_all_required_evidence")
         evidence_path = store_path.with_name("evidence_chain.db")
@@ -1034,6 +1146,150 @@ def main() -> int:
             "verified_criteria": sorted(required_criterion_ids),
             "mission_evidence_records": len(mission.evidence),
         })
+
+        # Exercise the production digest-bound final-report approval path with
+        # this isolated Owner fixture. This is acceptance evidence only, not the
+        # real user's final approval.
+        failure_phase = "final_owner_report_approval"
+        from http.client import HTTPConnection
+        import bridge
+
+        bridge.DB_PATH = core_db.DB_PATH
+        bridge.RUNTIME.router = router
+        bridge.BRIDGE_TOKEN = secrets.token_urlsafe(32)
+        approval_http_server = bridge.BridgeHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        approval_http_thread = threading.Thread(
+            target=approval_http_server.serve_forever,
+            name="full-e2e-owner-api",
+            daemon=True,
+        )
+        approval_http_thread.start()
+
+        def approval_api_request(method: str, path: str, payload: dict | None = None):
+            connection = HTTPConnection("127.0.0.1", approval_http_server.server_port, timeout=15)
+            headers = {
+                "X-CyberSentinel-Token": bridge.BRIDGE_TOKEN,
+                "X-CyberSentinel-Owner-Session": owner_token,
+            }
+            body = None
+            if payload is not None:
+                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            try:
+                connection.request(method, path, body=body, headers=headers)
+                response = connection.getresponse()
+                raw = response.read()
+                try:
+                    parsed = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    parsed = {}
+                return response.status, parsed, raw
+            finally:
+                connection.close()
+
+        report_path = f"/api/missions/{mission.mission_id}/report"
+        approval_path = f"/api/missions/{mission.mission_id}/approve-report"
+        timeline_path = f"/api/missions/{mission.mission_id}/timeline"
+        try:
+            report_code, report_body, report_raw = approval_api_request("GET", report_path)
+            report_before_approval = report_body.get("report", {})
+            if (
+                report_code != 200
+                or report_body.get("ok") is not True
+                or report_before_approval.get("mission_summary", {}).get("mission_status") != "GOAL_COMPLETED"
+                or report_before_approval.get("mission_summary", {}).get("outcome") != "VERIFIED"
+                or report_before_approval.get("evidence", {}).get("execution_chain_integrity") != "VALID"
+                or report_before_approval.get("final_report_approval", {}).get("status") != "PENDING"
+                or not any(item.get("status") == "PASS" for item in report_before_approval.get("findings", []) if isinstance(item, dict))
+            ):
+                raise RuntimeError("integrated_mission_report_not_eligible_for_owner_approval")
+
+            report_digest = str(report_before_approval.get("report_sha256", ""))
+            if len(report_digest) != 64 or any(char not in "0123456789abcdef" for char in report_digest):
+                raise RuntimeError("integrated_mission_report_digest_invalid")
+            wrong_digest = ("0" if report_digest[0] != "0" else "1") + report_digest[1:]
+            wrong_code, wrong_body, wrong_raw = approval_api_request(
+                "POST", approval_path, {"report_sha256": wrong_digest}
+            )
+            if wrong_code != 409 or wrong_body.get("error") != "report_sha256_mismatch":
+                raise RuntimeError("integrated_mission_wrong_digest_was_not_rejected")
+
+            approval_code, approval_body, approval_raw = approval_api_request(
+                "POST", approval_path, {"report_sha256": report_digest}
+            )
+            report_approval = approval_body
+            approved = approval_body.get("approval", {})
+            replay_code, replay_body, replay_raw = approval_api_request(
+                "POST", approval_path, {"report_sha256": report_digest}
+            )
+            replay_approval = replay_body.get("approval", {})
+            after_code, after_body, after_raw = approval_api_request("GET", report_path)
+            report_after_approval = after_body.get("report", {})
+            timeline_code, timeline_body, timeline_raw = approval_api_request("GET", timeline_path)
+            timeline = timeline_body.get("timeline", timeline_body.get("events", []))
+            approval_event_count = sum(
+                1 for event in timeline
+                if isinstance(event, dict) and event.get("event") == "FinalReportApproved"
+            ) if isinstance(timeline, list) else 0
+            if (
+                approval_code != 200
+                or approval_body.get("ok") is not True
+                or approved.get("status") != "APPROVED"
+                or approved.get("approval_scope") != "report_only"
+                or replay_code != 200
+                or replay_approval.get("approved_at") != approved.get("approved_at")
+                or after_code != 200
+                or report_after_approval.get("report_sha256") != report_digest
+                or report_after_approval.get("final_report_approval", {}).get("status") != "APPROVED"
+                or timeline_code != 200
+                or approval_event_count != 1
+            ):
+                raise RuntimeError("integrated_mission_final_owner_report_approval_failed")
+        finally:
+            approval_http_server.shutdown()
+            approval_http_server.server_close()
+            approval_http_thread.join(timeout=5)
+
+        mission = store.load(mission.mission_id)
+        if (
+            mission is None
+            or not mission.verify_integrity()
+            or mission.status is not MissionStatus.GOAL_COMPLETED
+            or report_approval.get("approval", {}).get("status") != "APPROVED"
+            or report_approval.get("approval", {}).get("approval_scope") != "report_only"
+            or report_after_approval.get("report_sha256") != report_before_approval.get("report_sha256")
+            or report_after_approval.get("final_report_approval", {}).get("status") != "APPROVED"
+            or mission.trajectory[-1].get("event") != "FinalReportApproved"
+        ):
+            raise RuntimeError("integrated_mission_final_owner_report_approval_failed")
+        result["report"].update({
+            "mission_report_sha256": report_before_approval["report_sha256"],
+            "mission_report_outcome": report_before_approval["mission_summary"]["outcome"],
+            "mission_report_approval_status": report_after_approval["final_report_approval"]["status"],
+            "mission_report_approval_scope": report_approval["approval"]["approval_scope"],
+            "mission_report_approval_route": "POST /api/missions/{id}/approve-report",
+            "mission_report_approval_http_status": approval_code,
+            "mission_report_wrong_digest_http_status": wrong_code,
+            "mission_report_idempotent_replay_http_status": replay_code,
+            "mission_report_timeline_http_status": timeline_code,
+            "mission_report_approval_response_sha256": sha256(approval_raw),
+            "mission_report_report_before_response_sha256": sha256(report_raw),
+            "mission_report_wrong_digest_response_sha256": sha256(wrong_raw),
+            "mission_report_replay_response_sha256": sha256(replay_raw),
+            "mission_report_after_response_sha256": sha256(after_raw),
+            "mission_report_timeline_response_sha256": sha256(timeline_raw),
+            "mission_report_approval_audit_event": mission.trajectory[-1]["event"],
+            "mission_report_finding_count": len(report_before_approval.get("findings", [])),
+            "mission_report_verified_findings": [
+                {"criterion_id": item.get("criterion_id"), "status": item.get("status")}
+                for item in report_before_approval.get("findings", [])
+                if isinstance(item, dict) and item.get("status") == "PASS"
+            ],
+            "owner_fixture_is_not_final_user_approval": True,
+        })
+        result["checks"]["digest_bound_final_owner_report_approval"] = True
+        result["checks"]["finding_created_and_validated"] = True
+
         result["mission"].update({
             "status_final": mission.status.value,
             "current_step": mission.current_step,

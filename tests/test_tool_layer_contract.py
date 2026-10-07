@@ -10,6 +10,7 @@ from tools.registry import (
     model_tool_definitions,
     tool_definitions,
 )
+from workspace import WorkspacePolicy
 
 
 def _handler(_argument):
@@ -67,7 +68,9 @@ def test_canonical_registry_is_single_source_with_complete_access_contracts():
     assert pytest_tool.filesystem_access == "workspace_read_only_artifact_write"
     assert pytest_tool.process_access == "workspace_process_sandboxed"
     assert pytest_tool.credential_access == "none"
-    assert pytest_tool.timeout == 65
+    assert pytest_tool.timeout == 310
+    assert WorkspacePolicy().max_timeout_seconds == 300
+    assert WorkspacePolicy().max_cpu_seconds == 300
     assert "git.status" not in REGISTRY and "archive.inspect" not in REGISTRY
 
 
@@ -101,4 +104,4 @@ def test_tool_timeout_is_the_effective_canonical_dispatch_limit():
 
     assert callable(execute)
     assert REGISTRY["refresh_intel"].timeout == 30
-    assert REGISTRY["run_project_tests"].timeout == 65
+    assert REGISTRY["run_project_tests"].timeout == 310
