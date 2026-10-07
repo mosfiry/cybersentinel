@@ -50,3 +50,30 @@ def test_compacted_mission_context_uses_hashes_for_authority_and_omits_duplicate
     assert assembled.sections["tool"][0]["record_type"] == "LIVE_TOOL_RESULT_REFERENCE"
     assert assembled.sections["tool"][0]["trust"] == "untrusted_data"
     assert assembled.sections["observation"][0]["raw_data_omitted"] is True
+
+
+
+def test_context_compaction_counts_system_message_overhead_against_cap():
+    owner_instruction = "Inspect owner-authorized status"
+    mission = Mission.create(
+        owner_instruction,
+        owner_instruction,
+        Plan.initial(owner_instruction),
+        mission_id="mission-context-system-overhead",
+        owner_instruction=owner_instruction,
+        policy_snapshot={"snapshot_payload": "POLICY_SENTINEL" + "p" * 4000},
+    )
+    mission.status = MissionStatus.RUNNING
+
+    assembled = ContextAssembler().build(mission, tools=[], max_chars=8192)
+    provider_text = "\n".join(message.content for message in assembled.messages)
+
+    assert assembled.context_chars <= 8192
+    assert assembled.compacted is True
+    assert assembled.sections["compaction"]["budget_compacted"] is True
+    policy = assembled.sections["owner"]["policy_snapshot"]
+    assert policy["record_type"] == "POLICY_FINGERPRINT_ONLY"
+    assert len(policy["fingerprint"]) == 64
+    assert "POLICY_SENTINEL" not in provider_text
+    assert assembled.sections["owner"]["instruction"] == owner_instruction
+    assert assembled.sections["mission"]["objective"] == owner_instruction
