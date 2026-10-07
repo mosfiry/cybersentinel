@@ -140,6 +140,32 @@ def test_expired_snapshot_blocks_mission_runtime_execution(tmp_path):
     assert result.status is MissionStatus.AUTHORIZATION_BLOCKED
 
 
+def test_reconciliation_after_authorization_expiry_cannot_restore_execution_authority(tmp_path):
+    valid = auth(str(tmp_path), actions=["status"], tools=["status"])
+    store = MissionStore(tmp_path / "reconcile-expiry.sqlite3")
+    runtime = MissionRuntime(store, executor=lambda *_args: pytest.fail("expired mission executed"), require_authorization_snapshot=True, authorization_snapshot_factory=make_test_snapshot)
+    plan = Plan.initial("objective").replan(steps=(PlanStep("s1", "status", action="status"),), reason="test")
+    mission = runtime.create("request", "objective", plan, owner_identity_ref="owner-proof", authorization_snapshot=valid.to_dict(), max_iterations=1)
+    mission.checkpoint = {"status": "in_flight", "action_id": "a1", "step_id": "s1"}
+    mission.status = MissionStatus.RECOVERY_REQUIRED
+    store.save(mission)
+
+    expired = MissionAuthorizationSnapshot.from_dict(mission.authorization_snapshot)
+    mission.authorization_snapshot = {**expired.to_dict(), "expires_at": "2000-01-01T00:00:00+00:00"}
+    store.save(mission)
+
+    reconciled = runtime.reconcile_in_flight(
+        mission.mission_id,
+        executed=True,
+        observation={"success": True, "source": "receipt-after-expiry"},
+    )
+    assert reconciled.status is MissionStatus.READY
+    assert reconciled.checkpoint.get("reconciled") is True
+
+    blocked = runtime.run_slice(mission.mission_id)
+    assert blocked.status is MissionStatus.AUTHORIZATION_BLOCKED
+
+
 @pytest.mark.parametrize("mutation", [
     "missing", "expired", "tampered", "wrong_mission", "wrong_owner", "wrong_target",
     "wrong_action", "wrong_tool", "wrong_workspace", "wrong_network", "wrong_credential", "wrong_version",
