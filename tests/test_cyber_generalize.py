@@ -78,6 +78,16 @@ class TestGeneralization:
         assert result["hypotheses"] == []
         assert any("refusing to force a match" in u for u in result["unknowns"])
 
+    def test_features_infer_first_known_tactic_when_not_supplied(self, seeded):
+        graph, _ = seeded
+        matcher = UnseenTechniqueMatcher(graph)
+
+        features = matcher.extract_features(
+            "persistence behavior followed by execution activity"
+        )
+
+        assert features.tactic == "execution"
+
     def test_similarity_alone_never_produces_supported(self, seeded):
         graph, _ = seeded
         matcher = UnseenTechniqueMatcher(graph)
