@@ -213,6 +213,12 @@ def main() -> int:
         "model_file": str(model_path),
         "model_runtime": "local_llama_cpp_loopback",
         "state_dir": str(run_dir),
+        "isolated_state_paths": {
+            "owner_db": str(run_dir / "owner.sqlite3"),
+            "memory_db": str(run_dir / "memory.sqlite3"),
+            "owner_policy_state": str(run_dir / "owner-policy-state.json"),
+            "scope_db": str(run_dir / "scope.sqlite3"),
+        },
         "fixture": {"bind": "127.0.0.1", "port": 443, "public_exposure": False},
         "checks": {},
         "mission": {},
@@ -240,10 +246,16 @@ def main() -> int:
     failure_phase = "initialization"
     try:
         # Set isolated persistence before importing modules with DB globals.
+        owner_db = run_dir / "owner.sqlite3"
         memory_db = run_dir / "memory.sqlite3"
+        owner_policy_state = run_dir / "owner-policy-state.json"
+        scope_db = run_dir / "scope.sqlite3"
+        os.environ["DB_PATH"] = str(owner_db)
         os.environ["MEMORY_DB_PATH"] = str(memory_db)
+        os.environ["OWNER_POLICY_STATE_PATH"] = str(owner_policy_state)
+        os.environ["SCOPE_DB_PATH"] = str(scope_db)
         import core.db as core_db
-        core_db.DB_PATH = run_dir / "owner.sqlite3"
+        core_db.DB_PATH = owner_db
         with core_db.connect():
             pass
 
