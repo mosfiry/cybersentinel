@@ -525,6 +525,29 @@ def main() -> int:
                     raise RuntimeError("qwen3_4b_install_not_persisted")
                 card = page.locator("#setupModelList .model-card").filter(has_text="Qwen3").filter(has_text="4B").first
                 if not qwen.get("active"):
+                    try:
+                        page.wait_for_function(
+                            """modelId => Array.from(document.querySelectorAll(
+                                '#setupModelList button[data-model-action="activate"]'
+                            )).some(button => button.dataset.modelId === modelId && !button.disabled)""",
+                            arg=model_id,
+                            timeout=60_000,
+                        )
+                    except Exception:
+                        report["model_manager"]["activate_action_ui_state"] = page.evaluate(
+                            """modelId => {
+                                const buttons = Array.from(document.querySelectorAll(
+                                    '#setupModelList button[data-model-action="activate"]'
+                                )).filter(button => button.dataset.modelId === modelId);
+                                return {
+                                    matching_button_count: buttons.length,
+                                    matching_buttons_disabled: buttons.map(button => button.disabled),
+                                    model_card_count: document.querySelectorAll('#setupModelList .model-card').length
+                                };
+                            }""",
+                            model_id,
+                        )
+                        raise RuntimeError("qwen3_4b_activate_action_not_rendered_after_install")
                     activate = card.locator('button[data-model-action="activate"]')
                     if activate.count() != 1 or activate.is_disabled():
                         raise RuntimeError("qwen3_4b_activate_action_unavailable")
