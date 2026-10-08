@@ -244,6 +244,45 @@ def test_concurrent_reconciliation_accepts_one_writer_and_preserves_ready_state(
     assert len(persisted.evidence) == 1
 
 
+def test_crash_after_reconciliation_save_resumes_without_replay(tmp_path, monkeypatch):
+    import tools.registry
+
+    runtime, mission, result, _ = _ambiguous_execution_runtime(tmp_path, monkeypatch, RuntimeError("crash"))
+    assert result.status is MissionStatus.RECOVERY_REQUIRED
+    db = Path(tmp_path) / "missions.sqlite3"
+
+    class CrashAfterReconciliationSave(MissionStore):
+        def save(self, candidate):
+            saved = super().save(candidate)
+            if (candidate.checkpoint or {}).get("reconciled") is True:
+                raise RuntimeError("crash after reconciliation save")
+            return saved
+
+    crashing = MissionRuntime(CrashAfterReconciliationSave(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    with pytest.raises(RuntimeError, match="after reconciliation save"):
+        crashing.reconcile_in_flight(
+            mission.mission_id,
+            executed=True,
+            observation={"success": True, "source": "durable-receipt"},
+        )
+
+    replayed = []
+    monkeypatch.setattr(tools.registry, "execute", lambda *args, **kwargs: replayed.append(args) or {"ok": True})
+    restarted = MissionRuntime(MissionStore(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+
+    class FinalModel:
+        def complete(self, messages, tools, *, mission_id, run_id, turn_id, plan_version):
+            return ModelTurn(turn_id, content="resume after durable reconciliation", finish_reason="stop")
+
+    loaded = restarted.store.load(mission.mission_id)
+    assert loaded.status is MissionStatus.READY
+    assert loaded.checkpoint.get("reconciled") is True
+    assert len(loaded.action_history) == 1
+    resumed = restarted.run_model_loop(mission.mission_id, FinalModel(), tools=[{"name": "status"}], max_turns=2)
+    assert replayed == []
+    assert resumed.status is MissionStatus.READY
+
+
 def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_path, monkeypatch):
     import tools.registry
 
