@@ -1966,12 +1966,14 @@ $("#loginForm").onsubmit = async (event) => {
 
 $("#logoutButton").onclick = async () => {
   try {
-    await api("/api/public/auth/logout", { method: "POST", body: "{}" });
-    updateAuthUI({ authenticated: false });
+    const auth = await api("/api/public/auth/logout", { method: "POST", body: "{}" });
+    if (auth.authenticated !== false) throw new Error("owner_logout_not_confirmed");
+    updateAuthUI(auth);
     resetWorkspaceState();
     renderMissions();
     activityPlaceholder("لا يوجد نشاط حالي من الخادم.");
-    await status();
+    // The successful logout response is authoritative. Avoid an immediate
+    // auth/session refresh racing cookie deletion and restoring stale UI state.
   } catch (error) {
     $("#authMessage").textContent = errorText(error);
   }

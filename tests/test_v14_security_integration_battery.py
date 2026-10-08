@@ -580,6 +580,35 @@ class _ReadOnlyToolCycleProvider:
         raise AssertionError("native repeat guard test must use real tool calling")
 
 
+class _RepeatedSingleReadOnlyToolProvider:
+    name = "repeated-single-read-only-fixture"
+    model = "repeated-single-read-only-fixture-1"
+    capabilities = ProviderCapabilities(
+        generate=True,
+        tool_calling=True,
+        native_chat=True,
+        parallel_tool_calls=True,
+    )
+
+    def __init__(self):
+        self.responses = [
+            ProviderResponse(tool_calls=[
+                ToolCall("status", {}, "single-repeat-planning-status"),
+                ToolCall("latest_intel", {}, "single-repeat-planning-intel"),
+            ]),
+            ProviderResponse(tool_calls=[ToolCall("latest_intel", {}, "single-first-intel")]),
+            ProviderResponse(tool_calls=[ToolCall("latest_intel", {}, "single-repeat-intel")]),
+        ]
+        self.calls = 0
+
+    def tool_calling(self, *_args, **_kwargs):
+        self.calls += 1
+        return self.responses.pop(0)
+
+    def generate(self, *_args, **_kwargs):
+        raise AssertionError("single read-tool repeat guard test must use real tool calling")
+
+
 class _ReadOnlyAbaCycleProvider:
     name = "read-only-aba-cycle-fixture"
     model = "read-only-aba-cycle-fixture-1"
@@ -678,6 +707,57 @@ def test_native_model_blocks_repeated_read_only_tool_cycle_before_dispatch(tmp_p
         "intel",
     }
     assert all("cycle-repeat" not in record["evidence"]["tool_call_id"] for record in native_records)
+
+
+def test_native_model_blocks_repeated_identical_single_read_tool_before_dispatch(tmp_path, monkeypatch):
+    session = "native-single-read-repeat-owner-session"
+    allow_owner_sessions(monkeypatch, session)
+    provider = _RepeatedSingleReadOnlyToolProvider()
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    core = AgentCore(
+        ModelRouter([provider]),
+        store=store,
+        max_iterations=5,
+        knowledge_retriever=_EmptyKnowledge(),
+    )
+    monkeypatch.setattr(
+        core,
+        "_context_runtime_limits",
+        lambda: RuntimeLimits(max_tool_calls=10, max_same_tool_calls=10),
+    )
+
+    mission = core.run_owner_mission(
+        "Read the latest locally available intelligence once and report observed facts.",
+        owner_session_token=session,
+        request_id="native-single-read-repeat-request",
+    )
+
+    assert provider.calls == 3
+    assert mission.status is MissionStatus.RESOURCE_BLOCKED
+    assert mission.is_terminal
+    loop = mission.progress["model_loop"]
+    assert len(loop["turns"]) == 2
+    assert [(item["name"], item["ok"]) for item in loop["tool_results"]] == [
+        ("latest_intel", True),
+        ("latest_intel", False),
+    ]
+    repeat_guard = loop["semantic_read_only_cycle_guard"]
+    assert repeat_guard["tool_name"] == "latest_intel"
+    assert repeat_guard["blocked_tool_call_id"] == "single-repeat-intel"
+    assert repeat_guard["duplicate_of_tool_call_id"] == "single-first-intel"
+    assert repeat_guard["duplicate_kind"] == "repeated_read_only_tool_call"
+    assert repeat_guard["cycle_length"] == 1
+    assert repeat_guard["dispatch_attempted"] is False
+    assert mission.checkpoint["status"] == "not_dispatched"
+    assert mission.failures[-1]["budget"] == "repeated_read_only_tool_call"
+
+    evidence_store = EvidenceChainStore(tmp_path / "evidence_chain.db", mission_store=store)
+    records = evidence_store.list(request_id=mission.request_id)
+    native_records = [record for record in records if str(record.get("source", "")).startswith("native-tool:")]
+    assert evidence_store.verify()
+    assert len(native_records) == 1
+    assert native_records[0]["evidence"]["tool_call_id"] == "single-first-intel"
+    assert all(record["evidence"]["tool_call_id"] != "single-repeat-intel" for record in native_records)
 
 
 def test_native_read_only_cycle_guard_allows_first_aba_batch_and_blocks_its_repeat(tmp_path, monkeypatch):

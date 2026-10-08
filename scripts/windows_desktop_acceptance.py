@@ -615,16 +615,43 @@ def main() -> int:
                 ) as initial_logout_response_info:
                     page.locator("#logoutButton").click(timeout=30_000)
                 initial_logout_response = initial_logout_response_info.value
+                initial_logout_body = initial_logout_response.json()
                 report["owner_authentication"]["initial_logout_http_status"] = initial_logout_response.status
-                if initial_logout_response.status != 200:
+                report["owner_authentication"]["initial_logout_authenticated"] = initial_logout_body.get("authenticated")
+                if initial_logout_response.status != 200 or initial_logout_body.get("authenticated") is not False:
                     raise RuntimeError("owner_logout_after_first_run_not_verified")
                 stage = "owner_logout_renderer_state"
-                page.wait_for_function(
-                    "() => document.querySelector('#loginForm')?.classList.contains('hidden') === false "
-                    "&& document.querySelector('#logoutButton')?.classList.contains('hidden') === true",
-                    timeout=30_000,
-                )
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const label = (document.querySelector('#authStateSide')?.textContent || '').trim();
+                            const loginForm = document.querySelector('#loginForm');
+                            const logoutButton = document.querySelector('#logoutButton');
+                            return label === 'غير مسجل الدخول'
+                                && loginForm !== null && !loginForm.classList.contains('hidden')
+                                && logoutButton !== null && logoutButton.classList.contains('hidden');
+                        }""",
+                        timeout=30_000,
+                    )
+                except Exception:
+                    report["owner_authentication"]["renderer_state_after_initial_logout"] = page.evaluate(
+                        """() => ({
+                            auth_state: document.querySelector('#authStateSide')?.textContent || null,
+                            login_form_hidden: document.querySelector('#loginForm')?.classList.contains('hidden') ?? null,
+                            logout_button_hidden: document.querySelector('#logoutButton')?.classList.contains('hidden') ?? null,
+                            auth_message: document.querySelector('#authMessage')?.textContent || null
+                        })"""
+                    )
+                    try:
+                        page.screenshot(path=str(args.output.with_suffix(".initial-logout-failure.png")), full_page=True)
+                    except Exception:
+                        pass
+                    raise
                 report["owner_authentication"]["initial_logout_renderer_state_verified"] = True
+                page.screenshot(path=str(args.output.with_suffix(".first-run-logged-out.png")), full_page=True)
+                report["owner_authentication"]["initial_logout_screenshot"] = str(
+                    args.output.with_suffix(".first-run-logged-out.png")
+                )
                 stage = "invalid_owner_login_request"
                 page.locator("#loginUsername").fill(username)
                 page.locator("#loginPassword").fill("intentionally-invalid-windows-acceptance-password")

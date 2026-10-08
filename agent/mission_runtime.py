@@ -1055,11 +1055,12 @@ class MissionRuntime:
         recent_calls: list[tuple[tuple[str, str, str], str]],
         candidate: tuple[str, str, str],
     ) -> list[tuple[tuple[str, str, str], str]] | None:
-        """Detect a return to a multi-tool read cycle within one server-bound plan step."""
-        for cycle_length in range(2, min(MAX_READ_ONLY_TOOL_CYCLE_LENGTH, len(recent_calls)) + 1):
+        """Detect an identical read call or a multi-tool read cycle within one plan step."""
+        max_cycle_length = min(MAX_READ_ONLY_TOOL_CYCLE_LENGTH, len(recent_calls))
+        for cycle_length in range(max_cycle_length, 0, -1):
             cycle = recent_calls[-cycle_length:]
             signatures = [item[0] for item in cycle]
-            if len({signature[0] for signature in signatures}) < 2:
+            if cycle_length > 1 and len({signature[0] for signature in signatures}) < 2:
                 continue
             if len({signature[2] for signature in signatures + [candidate]}) != 1:
                 continue
@@ -2069,11 +2070,16 @@ class MissionRuntime:
                 cycle = self._read_only_tool_cycle_start(recent_read_only_calls, signature)
                 if cycle is not None:
                     cycle_call_ids = [call_id for _cycle_signature, call_id in cycle]
+                    single_tool_repeat = len(cycle) == 1
                     repeated_call = {
                         "tool_name": proposal.name,
                         "blocked_tool_call_id": proposal.tool_call_id,
                         "duplicate_of_tool_call_id": cycle_call_ids[0] if cycle_call_ids else "",
-                        "duplicate_kind": "repeated_read_only_tool_cycle",
+                        "duplicate_kind": (
+                            "repeated_read_only_tool_call"
+                            if single_tool_repeat
+                            else "repeated_read_only_tool_cycle"
+                        ),
                         "cycle_length": len(cycle),
                         "cycle_tool_call_ids": cycle_call_ids,
                         "step_id": proposal.step_id,
@@ -2098,11 +2104,14 @@ class MissionRuntime:
                         seen.add(proposal.tool_call_id)
                         progress["seen_call_ids"].append(proposal.tool_call_id)
                     mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
-                    error = (
-                        "repeated_read_only_tool_cycle_suppressed"
-                        if proposal.tool_call_id == repeated_call["blocked_tool_call_id"]
-                        else "turn_blocked_before_dispatch_due_to_repeated_read_only_tool_cycle"
-                    )
+                    if proposal.tool_call_id == repeated_call["blocked_tool_call_id"]:
+                        error = (
+                            "repeated_read_only_tool_call_suppressed"
+                            if repeated_call["duplicate_kind"] == "repeated_read_only_tool_call"
+                            else "repeated_read_only_tool_cycle_suppressed"
+                        )
+                    else:
+                        error = "turn_blocked_before_dispatch_due_to_repeated_read_only_tool_cycle"
                     progress["tool_results"].append(
                         ToolCallResult(proposal, False, error=error).to_dict()
                     )
@@ -2111,19 +2120,23 @@ class MissionRuntime:
                     "arguments_sha256": repeated_signature[1],
                     "dispatch_attempted": False,
                     "execution_context_id": repeated_signature[2],
-                    "guard": "repeated_multi_tool_read_cycle_within_one_plan_step",
+                    "guard": (
+                        "repeated_identical_read_tool_within_one_plan_step"
+                        if repeated_call["duplicate_kind"] == "repeated_read_only_tool_call"
+                        else "repeated_multi_tool_read_cycle_within_one_plan_step"
+                    ),
                 }
                 progress["semantic_read_only_cycle_guard"] = repeat_details
                 mission.checkpoint = {
                     "status": "not_dispatched",
-                    "reason_code": "repeated_read_only_tool_cycle",
+                    "reason_code": repeated_call["duplicate_kind"],
                     "run_id": run_id,
                     "turn_id": turn.turn_id,
                     "blocked_tool_call_ids": [proposal.tool_call_id for proposal in turn.tool_calls],
                 }
                 return self._block_on_budget(
                     mission,
-                    "repeated_read_only_tool_cycle",
+                    repeated_call["duplicate_kind"],
                     int(repeated_call["cycle_length"]),
                     details=repeat_details,
                 )
