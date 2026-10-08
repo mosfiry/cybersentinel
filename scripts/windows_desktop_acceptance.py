@@ -95,6 +95,14 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     project_body = project_response.json()
     project = project_body.get("project") if isinstance(project_body, dict) else None
     project_id = str(project.get("project_id", "")) if isinstance(project, dict) else ""
+    response_error = project_body.get("error") if isinstance(project_body, dict) else None
+    progress.append({
+        "phase": "installed_app_project_creation_response",
+        "http_status": project_response.status,
+        "response_ok": project_body.get("ok") is True if isinstance(project_body, dict) else False,
+        "project_id_present": bool(project_id),
+        "error_code": str(response_error)[:96] if response_error is not None else "",
+    })
     if project_response.status != 201 or not project_id:
         raise RuntimeError("installed_app_disposable_project_creation_failed")
 
