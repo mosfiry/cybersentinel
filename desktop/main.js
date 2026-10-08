@@ -20,6 +20,12 @@ const HEALTH_POLL_INTERVAL_MS = 600;
 const REQUEST_TIMEOUT_MS = 1500;
 const OWNER_SETUP_TIMEOUT_MS = 30000;
 
+const testUserDataDir = process.env.CYBERSENTINEL_TEST_USER_DATA_DIR?.trim();
+if (testUserDataDir) {
+  if (!path.isAbsolute(testUserDataDir)) throw new Error("invalid_test_user_data_dir");
+  app.setPath("userData", path.resolve(testUserDataDir));
+}
+
 let mainWindow = null;
 let backgroundTray = null;
 let bridgeProcess = null;

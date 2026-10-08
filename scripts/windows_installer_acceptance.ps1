@@ -46,6 +46,7 @@ $exePath = Join-Path $installDirectory "CyberSentinel.exe"
 $applicationProcess = $null
 $originalAppData = $env:APPDATA
 $originalLocalAppData = $env:LOCALAPPDATA
+$originalTestUserDataDir = $env:CYBERSENTINEL_TEST_USER_DATA_DIR
 
 function Save-Report {
     param([string]$Path, [object]$Value)
@@ -183,11 +184,13 @@ try {
     $cdpUrl = "http://127.0.0.1:$cdpPort"
     $env:APPDATA = $profileRoot
     $env:LOCALAPPDATA = Join-Path $profileRoot "Local"
+    $env:CYBERSENTINEL_TEST_USER_DATA_DIR = Join-Path $profileRoot "userData"
     $applicationProcess = Start-Process -FilePath $exePath -ArgumentList @(
         "--disable-gpu", "--remote-debugging-port=$cdpPort", "--remote-allow-origins=*"
     ) -PassThru
     $env:APPDATA = $originalAppData
     $env:LOCALAPPDATA = $originalLocalAppData
+    $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
 
     $debugEndpointReady = $false
     $debugVersion = $null
@@ -337,6 +340,7 @@ catch {
 finally {
     $env:APPDATA = $originalAppData
     $env:LOCALAPPDATA = $originalLocalAppData
+    $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
     $processStopped = Stop-ApplicationTree -Process $applicationProcess
     $report.cleanup.application_process_tree_stopped = $processStopped
     if ($report.installation.installed_executable_exists -and (Test-Path -LiteralPath $installDirectory)) {

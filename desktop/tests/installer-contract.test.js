@@ -26,6 +26,11 @@ test("packaged launch uses bundled executables and durable userData, not Python 
   assert.ok(pkg.build.files.includes("background-lifecycle.js"));
 });
 
+test("Windows acceptance can isolate packaged userData without changing the default", () => {
+  assert.match(main, /process\.env\.CYBERSENTINEL_TEST_USER_DATA_DIR/);
+  assert.match(main, /app\.setPath\("userData"/);
+});
+
 test("closing the window hides to tray while authorized background Missions keep running", () => {
   assert.match(main, /new Tray\(path\.join\(__dirname, "build", "icon\.png"\)\)/);
   assert.match(main, /hideWindowOnClose\(event/);
