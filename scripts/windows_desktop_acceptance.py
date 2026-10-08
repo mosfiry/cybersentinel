@@ -16,6 +16,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# This is only the harness's HTTP-response wait; AgentCore remains bounded by the
+# 300-second Owner mission limit, with a 30-second response-finalization margin.
+OWNER_MISSION_RUNTIME_LIMIT_SECONDS = 300
+OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS = 30
+INSTALLED_APP_MISSION_RESPONSE_TIMEOUT_MS = (
+    OWNER_MISSION_RUNTIME_LIMIT_SECONDS + OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS
+) * 1000
+
 
 def _sha256(value: bytes | str) -> str:
     if isinstance(value, str):
@@ -135,7 +143,7 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     started_at = time.monotonic()
     with page.expect_response(
         lambda response: response.request.method == "POST" and response.url.rstrip("/").endswith("/api/public/missions"),
-        timeout=30_000,
+        timeout=INSTALLED_APP_MISSION_RESPONSE_TIMEOUT_MS,
     ) as mission_response_info:
         page.locator("#createMission").click(timeout=30_000)
     create_response = mission_response_info.value

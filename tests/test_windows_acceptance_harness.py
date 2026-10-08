@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from scripts.run_full_e2e_gate_acceptance import find_llama_server_binary
+from scripts.windows_desktop_acceptance import (
+    INSTALLED_APP_MISSION_RESPONSE_TIMEOUT_MS,
+    OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS,
+    OWNER_MISSION_RUNTIME_LIMIT_SECONDS,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_installed_mission_http_wait_matches_bounded_policy_budget() -> None:
+    policy = json.loads((ROOT / "security" / "owner_policy.json").read_text(encoding="utf-8"))
+    runtime_limit = int(policy["runtime_limits"]["max_execution_time_seconds"])
+
+    assert runtime_limit == OWNER_MISSION_RUNTIME_LIMIT_SECONDS == 300
+    assert OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS == 30
+    assert INSTALLED_APP_MISSION_RESPONSE_TIMEOUT_MS == (runtime_limit + 30) * 1000
+
+
+def test_full_e2e_runtime_preflight_accepts_native_windows_server_name(tmp_path: Path) -> None:
+    executable = tmp_path / "llama-server.exe"
+    executable.write_bytes(b"test fixture")
+
+    assert find_llama_server_binary(tmp_path, is_windows=True) == executable
+
+
+def test_full_e2e_runtime_preflight_accepts_posix_server_name(tmp_path: Path) -> None:
+    executable = tmp_path / "llama-server"
+    executable.write_bytes(b"test fixture")
+
+    assert find_llama_server_binary(tmp_path, is_windows=False) == executable

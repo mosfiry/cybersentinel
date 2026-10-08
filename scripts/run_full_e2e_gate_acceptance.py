@@ -104,6 +104,12 @@ def free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def find_llama_server_binary(runtime_dir: Path, *, is_windows: bool | None = None) -> Path | None:
+    windows = os.name == "nt" if is_windows is None else is_windows
+    names = ("llama-server.exe", "llama-server") if windows else ("llama-server",)
+    return next((runtime_dir / name for name in names if (runtime_dir / name).is_file()), None)
+
+
 def emit(path: Path, payload: dict[str, object], *, code: int = 0) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
@@ -201,13 +207,17 @@ def main() -> int:
     model_path = args.model_file.expanduser().resolve()
     state_root = args.state_dir.expanduser().resolve()
     artifact_path = args.artifact.expanduser().resolve()
-    if not (runtime_dir / "llama-server").is_file() or not model_path.is_file():
+    runtime_binary = find_llama_server_binary(runtime_dir)
+    if runtime_binary is None or not model_path.is_file():
         return emit(artifact_path, {
             "schema": "cybersentinel-v5.2-full-e2e-gate-v1",
             "status": "BLOCKED",
             "reason": "local_qwen_runtime_or_model_missing",
             "runtime_dir": str(runtime_dir),
+            "runtime_binary_name": runtime_binary.name if runtime_binary else None,
+            "runtime_binary_present": runtime_binary is not None,
             "model_file": str(model_path),
+            "model_file_present": model_path.is_file(),
         }, code=2)
 
     state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
