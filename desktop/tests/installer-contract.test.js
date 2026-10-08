@@ -68,6 +68,16 @@ test("packaged Browser includes pinned Chromium and verifies the bundled runtime
   assert.match(dockerfile, /playwright install --with-deps chromium/);
 });
 
+test("packaged backend includes and verifies the canonical Owner policy", () => {
+  const builder = read("scripts/build_desktop_backend.py");
+  assert.ok(builder.includes("ROOT / 'security' / 'owner_policy.json'"));
+  assert.ok(builder.includes("{separator}security"));
+  const backend = read("bridge.py");
+  assert.match(backend, /load_policy\(\)/);
+  assert.match(backend, /policy_fingerprint\(\)/);
+  assert.match(backend, /owner_policy_sha256/);
+});
+
 test("renderer only receives narrow bootstrap and native-folder IPC methods", () => {
   assert.match(main, /contextIsolation: true/);
   assert.match(preload, /createOwner:/);

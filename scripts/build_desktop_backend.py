@@ -97,6 +97,8 @@ def main() -> int:
         "--add-data",
         f"{ROOT / 'VERSION'}{separator}.",
         "--add-data",
+        f"{ROOT / 'security' / 'owner_policy.json'}{separator}security",
+        "--add-data",
         f"{ROOT / 'web'}{separator}web",
         "--add-data",
         f"{ROOT / 'agent' / 'local_runtime' / 'catalog.json'}{separator}agent/local_runtime",

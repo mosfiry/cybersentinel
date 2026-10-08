@@ -1918,7 +1918,16 @@ def main():
         missing = [path.name for path in required if not path.is_file()]
         if missing:
             raise SystemExit("desktop_bundle_missing:" + ",".join(missing))
-        print(json.dumps({"ok": True, "version": VERSION, "web_assets": len(required)}), flush=True)
+        from security.owner_policy import load_policy, policy_fingerprint
+
+        owner_policy = load_policy()
+        print(json.dumps({
+            "ok": True,
+            "version": VERSION,
+            "web_assets": len(required),
+            "owner_policy_version": owner_policy.version,
+            "owner_policy_sha256": policy_fingerprint(),
+        }), flush=True)
         return
     if not BRIDGE_TOKEN:
         raise SystemExit("BRIDGE_TOKEN is required in .env")
