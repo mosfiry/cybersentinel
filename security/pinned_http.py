@@ -5,6 +5,8 @@ import ipaddress
 import json
 import socket
 import ssl
+import threading
+import time
 from dataclasses import dataclass
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -190,17 +192,21 @@ def pinned_http_request(
     if port == 0:
         raise PinnedRequestError("URL port is invalid")
     port = port if port is not None else (443 if scheme == "https" else 80)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 600:
+        raise PinnedRequestError("request timeout is outside the allowed range")
+    if not isinstance(max_response_bytes, int) or isinstance(max_response_bytes, bool) or max_response_bytes < 0:
+        raise PinnedRequestError("response size limit is invalid")
+    deadline = time.monotonic() + float(timeout)
     addresses = resolve_public_addresses(host, port, allow_loopback=allow_loopback)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise socket.timeout("HTTP request exceeded its total wall-clock deadline")
     local_override = allow_loopback and _is_explicit_loopback(host, addresses)
     expected_port = 443 if scheme == "https" else 80
     if not local_override and port != expected_port:
         raise PinnedRequestError("non-standard public HTTP port is not allowed")
     if scheme == "http" and not local_override:
         raise PinnedRequestError("clear-text HTTP is allowed only for explicit loopback endpoints")
-    if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 600:
-        raise PinnedRequestError("request timeout is outside the allowed range")
-    if not isinstance(max_response_bytes, int) or max_response_bytes < 0:
-        raise PinnedRequestError("response size limit is invalid")
     method = str(method).upper()
     if method not in {"GET", "POST", "PUT", "DELETE", "HEAD"}:
         raise PinnedRequestError("HTTP method is not allowed")
@@ -213,14 +219,39 @@ def pinned_http_request(
     if parsed.query:
         target += "?" + parsed.query
     connection_class = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
-    connection = connection_class(host, port, addresses[0], timeout=float(timeout))
+    connection = connection_class(host, port, addresses[0], timeout=remaining)
+    deadline_expired = threading.Event()
+
+    def abort_request() -> None:
+        deadline_expired.set()
+        sock = connection.sock
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    timeout_timer = threading.Timer(max(0.0, deadline - time.monotonic()), abort_request)
+    timeout_timer.daemon = True
+    timeout_timer.start()
     try:
+        if deadline_expired.is_set() or time.monotonic() >= deadline:
+            raise socket.timeout("HTTP request exceeded its total wall-clock deadline")
         connection.request(method, target, body=body, headers=request_headers)
+        if deadline_expired.is_set() or time.monotonic() >= deadline:
+            raise socket.timeout("HTTP request exceeded its total wall-clock deadline")
         response = connection.getresponse()
         if 300 <= response.status < 400 and not allow_redirect_response:
             response.close()
             raise PinnedRequestError("HTTP redirects are not allowed")
         content = response.read(max_response_bytes + 1)
+        if deadline_expired.is_set() or time.monotonic() >= deadline:
+            raise socket.timeout("HTTP request exceeded its total wall-clock deadline")
         if len(content) > max_response_bytes:
             raise PinnedRequestError("HTTP response exceeds the configured size limit")
         return PinnedHTTPResponse(
@@ -228,7 +259,12 @@ def pinned_http_request(
             {str(key).lower(): str(value) for key, value in response.getheaders()},
             content,
         )
+    except Exception as exc:
+        if deadline_expired.is_set() or time.monotonic() >= deadline:
+            raise socket.timeout("HTTP request exceeded its total wall-clock deadline") from exc
+        raise
     finally:
+        timeout_timer.cancel()
         connection.close()
 
 

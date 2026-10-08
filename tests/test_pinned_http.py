@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -124,6 +125,49 @@ def test_loopback_http_works_for_local_provider_but_redirect_is_not_followed():
         assert redirect.status == 302
         assert redirect.headers["location"] == "http://169.254.169.254/latest/meta-data/"
         assert redirect.body == b"local-model"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_slow_drip_response_obeys_total_wall_clock_deadline():
+    class SlowHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for _ in range(20):
+                try:
+                    self.wfile.write(b"1\r\nx\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                time.sleep(0.05)
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), SlowHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(socket.timeout, match="total wall-clock deadline"):
+            pinned_http_request(
+                f"http://127.0.0.1:{server.server_port}/slow",
+                timeout=0.25,
+                max_response_bytes=64,
+                allow_loopback=True,
+            )
+        assert time.monotonic() - started < 0.8
     finally:
         server.shutdown()
         server.server_close()

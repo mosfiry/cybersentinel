@@ -127,6 +127,8 @@ jobs:
           $baseline | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence "preserved-rc1-baseline.json") -Encoding utf8
       # The full suite (including POSIX process/signal and /proc tests) runs in tests.yml on Ubuntu.
       - name: Windows-portable API, project, model, and security tests
+        id: windows-portable-tests
+        continue-on-error: true
         run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py tests/test_mission_native_auth_preflight.py tests/test_mission_report_approval.py tests/test_scope_firewall_battery.py tests/test_mission_graph_runtime.py tests/test_v14_security_integration_battery.py
       - name: Install locked Electron toolchain
         working-directory: desktop
@@ -171,6 +173,7 @@ jobs:
           --installer-name "CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe"
       - name: Install candidate and run native Windows UI, Qwen, Owner, and full Mission acceptance
         id: installed-candidate
+        continue-on-error: true
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP "cybersentinel-acceptance-evidence/new"
           $installer = Join-Path $env:GITHUB_WORKSPACE "desktop/dist/CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe"
@@ -194,15 +197,20 @@ jobs:
       - name: Summarize all Windows acceptance gates
         id: acceptance-summary
         run: |
+          $portableTests = if ('${{ steps.windows-portable-tests.outcome }}' -eq 'success') { 'PASS' } else { 'FAIL' }
+          $installedRunner = if ('${{ steps.installed-candidate.outcome }}' -eq 'success') { 'PASS' } else { 'FAIL' }
           $values = @(
+            $portableTests,
             '${{ steps.installed-candidate.outputs.status }}',
-            '${{ steps.installed-candidate.outputs.full_mission }}'
+            '${{ steps.installed-candidate.outputs.full_mission }}',
+            $installedRunner
           )
           $failed = @($values | Where-Object { $_ -ne 'PASS' })
-          $status = if ($values.Count -eq 2 -and $failed.Count -eq 0) { 'PASS' } else { 'FAIL' }
+          $status = if ($values.Count -eq 4 -and $failed.Count -eq 0) { 'PASS' } else { 'FAIL' }
           "status=$status" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           Write-Host "Windows acceptance summary: $status ($($values -join ', '))"
       - name: Hash and describe RC installer with provenance
+        id: candidate-manifest
         env:
           CYBERSENTINEL_WINDOWS_RUNNER_ACCEPTANCE: ${{ steps.acceptance-summary.outputs.status }}
           CYBERSENTINEL_WINDOWS_PRESERVED_CANDIDATE_ACCEPTANCE: ${{ steps.original-candidate.outputs.status }}
@@ -223,11 +231,11 @@ jobs:
           path: ${{ runner.temp }}/cybersentinel-acceptance-evidence/**
           if-no-files-found: warn
           retention-days: 90
-      - name: Upload RC installer, checksum, and provenance as a workflow artifact
-        if: steps.acceptance-summary.outputs.status == 'PASS'
+      - name: Upload RC candidate installer, checksum, and provenance as a workflow artifact
+        if: always() && steps.candidate-manifest.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: CyberSentinel-v${{ steps.candidate-version.outputs.version }}-${{ github.sha }}
+          name: CyberSentinel-v${{ steps.candidate-version.outputs.version }}-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             desktop/dist/CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe
             desktop/dist/CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe.sha256

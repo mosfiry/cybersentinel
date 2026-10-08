@@ -344,7 +344,10 @@ class ModelRouter:
                 call_kwargs["timeout"] = remaining
             try:
                 fn = getattr(provider, "generate", None) or getattr(provider, "chat", None)
-                response = self._trusted(self._normalize(fn(messages, temperature=temperature, **call_kwargs), provider, "generate"), provider, "generate")
+                raw_response = fn(messages, temperature=temperature, **call_kwargs)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("provider response arrived after its total deadline")
+                response = self._trusted(self._normalize(raw_response, provider, "generate"), provider, "generate")
                 self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return response
             except Exception as exc:
@@ -443,7 +446,10 @@ class ModelRouter:
                     break
                 call_kwargs["timeout"] = remaining
             try:
-                response = provider.tool_calling(messages, tools, temperature=temperature, **call_kwargs)
+                raw_response = provider.tool_calling(messages, tools, temperature=temperature, **call_kwargs)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("provider response arrived after its total deadline")
+                response = raw_response
                 result = self._trusted(self._normalize(response, provider, "tool_calling"), provider, "tool_calling")
                 self.last_trace.append({"provider": provider.name, "model": provider.model, "status": "success", "capabilities": self._caps(provider).__dict__.copy()})
                 return result

@@ -111,6 +111,23 @@ def _core(tmp_path: Path, monkeypatch, *, response: ProviderResponse):
     return core, store, provider
 
 
+def _external_effect_count(db_path: str | Path) -> int:
+    connection = sqlite3.connect(str(db_path))
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "external_effects" not in tables:
+            return 0
+        return int(connection.execute("SELECT COUNT(*) FROM external_effects").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _process_sandbox_unavailable_reason() -> str | None:
+    from workspace import Workspace
+
+    return Workspace.process_sandbox_unavailable_reason()
+
+
 def _run_project_tests_proposal() -> ProviderResponse:
     return ProviderResponse(
         tool_calls=[ToolCall("run_project_tests", {"query": "."}, "v14-test-project")]
@@ -178,6 +195,14 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
 
     assert completed is not None
     persisted = MissionStore(tmp_path / "missions.sqlite3").load(mission.mission_id)
+    sandbox_unavailable = _process_sandbox_unavailable_reason()
+    if sandbox_unavailable:
+        assert completed.state is WorkerMissionState.FAILED
+        assert persisted.status is MissionStatus.RESOURCE_BLOCKED
+        assert persisted.action_history[-1]["observation"].get("error") == sandbox_unavailable
+        assert queue.get(mission.mission_id).state is WorkerMissionState.FAILED
+        assert _external_effect_count(store.db_path) == 0
+        return
     from security.owner_password import authenticated_owner
     persisted_session = (persisted.authorization_context or {}).get("session_id")
     persisted_evidence = (persisted.authorization_context or {}).get("owner_evidence", {})
@@ -259,6 +284,21 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
         request_id=f"native-workspace-{parallel}",
         scope_context=workspace_scope_context(scope_snapshot, authorized_root),
     )
+
+    sandbox_unavailable = _process_sandbox_unavailable_reason()
+    if sandbox_unavailable:
+        expected_calls = 2 if parallel else 1
+        assert provider.calls == 2
+        assert mission.status is MissionStatus.RESOURCE_BLOCKED
+        assert mission.checkpoint["status"] == "not_dispatched"
+        assert mission.checkpoint["reason_code"] == "process_sandbox_unavailable"
+        assert mission.failures[-1]["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
+        assert mission.failures[-1]["dispatch_attempted"] is False
+        results = mission.progress["model_loop"]["tool_results"]
+        assert len(results) == expected_calls
+        assert all(result.get("ok") is False for result in results)
+        assert _external_effect_count(store.db_path) == 0
+        return
 
     assert provider.calls == 3
     assert mission.status is MissionStatus.GOAL_COMPLETED
@@ -350,6 +390,20 @@ def test_native_model_serializes_tool_calls_when_provider_disables_parallel_call
         request_id="native-serial-workspace-request",
         scope_context=workspace_scope_context(scope_snapshot, authorized_root),
     )
+
+    if _process_sandbox_unavailable_reason():
+        assert provider.calls == 2
+        assert observed_worker_limits == []
+        assert mission.status is MissionStatus.RESOURCE_BLOCKED
+        assert mission.checkpoint["status"] == "not_dispatched"
+        assert mission.checkpoint["reason_code"] == "process_sandbox_unavailable"
+        assert mission.failures[-1]["dispatch_attempted"] is False
+        assert all(
+            result.get("ok") is False
+            for result in mission.progress["model_loop"]["tool_results"]
+        )
+        assert _external_effect_count(store.db_path) == 0
+        return
 
     assert provider.calls == 3
     assert observed_worker_limits == [1]

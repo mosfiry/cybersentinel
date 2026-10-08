@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from agent.agent_core import AgentCore
 from agent.mission import MissionStore
@@ -13,9 +14,11 @@ class CapturingRouter:
 
     def __init__(self):
         self.messages = []
+        self.kwargs = {}
 
-    def generate(self, messages, **_kwargs):
+    def generate(self, messages, **kwargs):
         self.messages = list(messages)
+        self.kwargs = dict(kwargs)
         return {"content": '{"summary":"model proposal"}'}
 
 
@@ -55,6 +58,25 @@ def test_observation_proposal_omits_full_mission_snapshots_and_respects_local_bu
     assert "MISSION_HISTORY_SENTINEL" not in serialized
     assert "SCOPE_SNAPSHOT_SENTINEL" not in serialized
     assert sum(len(str(item.get("content", ""))) for item in router.messages) <= 4096 * 2
+
+
+def test_observation_proposal_passes_owner_deadline_to_router(tmp_path: Path):
+    router = CapturingRouter()
+    core = AgentCore(router, store=MissionStore(tmp_path / "missions.sqlite3"))
+    deadline = time.monotonic() + 5.0
+
+    core._observation_proposal({
+        "_owner_deadline_monotonic": deadline,
+        "mission": {"mission_id": "bounded-observation-proposal", "request_id": "bounded-observation-request"},
+        "plan": {},
+        "current_step": {"objective": "interpret bounded local evidence"},
+        "action": "latest_intel",
+        "observation": {"success": True, "summary": "bounded observation"},
+        "evidence": [],
+        "hypothesis_state": [],
+    })
+
+    assert 0 < router.kwargs["timeout"] <= 5.0
 
 
 def test_observation_fallback_keeps_typed_provider_error_provenance():

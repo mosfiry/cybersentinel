@@ -1171,6 +1171,11 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         authorized_root = str(dict(snapshot.workspace_boundary).get("root", "")).strip()
         if not authorized_root or Path(workspace.root).resolve() != Path(authorized_root).expanduser().resolve():
             raise PermissionError("Workspace root differs from the Owner-authorized Mission boundary")
+        if name == "run_project_tests":
+            sandbox_unavailable = workspace.process_sandbox_unavailable_reason()
+            if sandbox_unavailable:
+                from workspace.environment import ProcessSandboxUnavailable
+                raise ProcessSandboxUnavailable(sandbox_unavailable)
     if execution_fence is not None:
         execution_fence.assert_dispatch(
             mission_id=str(mission_id or ""),

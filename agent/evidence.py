@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +99,15 @@ class EvidenceChainStore:
 
     _mission_append_lock = threading.RLock()
 
+    @contextmanager
+    def _connection(self, *, timeout: float = 5.0):
+        connection = sqlite3.connect(self.db_path, timeout=timeout)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def __init__(
         self,
         db_path: str | Path,
@@ -114,7 +124,7 @@ class EvidenceChainStore:
         self.require_execution_fence = bool(require_execution_fence)
         if self.require_execution_fence and (self.mission_store is None or self.mission is None):
             raise ExecutionFenceError("strict evidence store requires its MissionStore and live mission")
-        with sqlite3.connect(self.db_path) as db:
+        with self._connection() as db:
             db.execute("CREATE TABLE IF NOT EXISTS evidence_chain (sequence INTEGER PRIMARY KEY AUTOINCREMENT, current_hash TEXT UNIQUE NOT NULL, payload TEXT NOT NULL)")
 
     @staticmethod
@@ -198,7 +208,7 @@ class EvidenceChainStore:
         if str(getattr(self.mission, "mission_id", "")) != str(fence.mission_id):
             raise ExecutionFenceError("evidence live mission does not match execution fence")
 
-        with sqlite3.connect(self.db_path, timeout=30) as db:
+        with self._connection(timeout=30) as db:
             mission_schema = self._attach_atomic_stores(db, fence)
             db.execute("BEGIN IMMEDIATE")
             # This single transaction holds the evidence chain, mission payload,
@@ -263,7 +273,7 @@ class EvidenceChainStore:
         return record.to_dict()
 
     def _append_legacy(self, payload: dict[str, Any], fence: ExecutionFence | None) -> dict[str, Any]:
-        with sqlite3.connect(self.db_path, timeout=30) as db:
+        with self._connection(timeout=30) as db:
             db.execute("BEGIN IMMEDIATE")
             if fence is not None:
                 payload = fence.assert_evidence(payload)
@@ -320,7 +330,7 @@ class EvidenceChainStore:
         )
 
     def list(self, *, request_id: str | None = None) -> list[dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as db:
+        with self._connection() as db:
             if request_id:
                 rows = db.execute("SELECT payload FROM evidence_chain WHERE json_extract(payload,'$.request_id')=? ORDER BY sequence", (request_id,)).fetchall()
             else:

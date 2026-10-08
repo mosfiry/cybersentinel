@@ -69,6 +69,14 @@ function Stop-ApplicationTree {
     catch { return $false }
 }
 
+function Get-NormalizedWindowsProductVersion {
+    param([string]$Version)
+    $baseVersion = [string](($Version -split '-', 2)[0])
+    $segments = $baseVersion.Split('.')
+    if ($segments.Count -eq 3) { return "$baseVersion.0" }
+    return $baseVersion
+}
+
 try {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         throw "This acceptance path requires a native Windows runner."
@@ -143,7 +151,12 @@ try {
     }
     $installed = Test-Path -LiteralPath $exePath -PathType Leaf
     $fileVersion = if ($installed) { (Get-Item -LiteralPath $exePath).VersionInfo } else { $null }
-    $productVersionMatches = $null -ne $fileVersion -and $fileVersion.ProductVersion -eq $expectedVersion
+    $expectedWindowsProductVersion = Get-NormalizedWindowsProductVersion $expectedVersion
+    $fileVersionMatches = $null -ne $fileVersion -and [string]$fileVersion.FileVersion -eq $expectedVersion
+    $productVersionMatches = $null -ne $fileVersion -and
+        ([string]$fileVersion.ProductVersion -eq $expectedVersion -or
+         [string]$fileVersion.ProductVersion -eq $expectedWindowsProductVersion) -and
+        $fileVersionMatches
     $report.installation = [ordered]@{
         silent_installer_exit_code = $installerExitCode
         install_directory = $installDirectory
@@ -151,9 +164,12 @@ try {
         executable_size_bytes = if ($installed) { (Get-Item -LiteralPath $exePath).Length } else { 0 }
         product_version = if ($fileVersion) { $fileVersion.ProductVersion } else { $null }
         file_version = if ($fileVersion) { $fileVersion.FileVersion } else { $null }
+        expected_file_version = $expectedVersion
+        expected_normalized_windows_product_version = $expectedWindowsProductVersion
+        file_version_matches_expected = $fileVersionMatches
         product_version_matches_expected = $productVersionMatches
     }
-    if ($installerExitCode -ne 0 -or -not $installed -or -not $productVersionMatches) { throw "Silent installation or installed ProductVersion check failed." }
+    if ($installerExitCode -ne 0 -or -not $installed -or -not $productVersionMatches) { throw "Silent installation or normalized ProductVersion/FileVersion consistency check failed." }
 
     Get-CimInstance Win32_Process -Filter "Name = 'CyberSentinel.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installDirectory, [StringComparison]::OrdinalIgnoreCase) } |
@@ -223,7 +239,9 @@ try {
         $report.installed_desktop_ui = [ordered]@{ status = "FAIL"; python_exit_code = $uiExitCode; error = "UI acceptance report was not created." }
     }
 
-    if ($Mode -eq "full" -and $report.installed_desktop_ui.status -eq "PASS") {
+    $installedModelInferencePassed = $report.installed_desktop_ui.model_manager.real_inference_completed -eq $true
+    $installedOwnerAuthenticationPassed = $report.installed_desktop_ui.owner_authentication.first_run_authenticated -eq $true
+    if ($Mode -eq "full" -and $installedModelInferencePassed -and $installedOwnerAuthenticationPassed) {
         $modelId = [string]$report.installed_desktop_ui.model_manager.qwen3_4b.model_id
         $modelFiles = @(Get-ChildItem -LiteralPath $profileRoot -Filter "Qwen3-4B-Q4_K_M.gguf" -File -Recurse -ErrorAction SilentlyContinue)
         if ($modelFiles.Count -ne 1) {

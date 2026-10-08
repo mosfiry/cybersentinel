@@ -1186,6 +1186,10 @@ class MissionRuntime:
         if not should_interpret_observation(observation, previous=previous):
             return None
         interpreted_observation = {**observation, "success": bool(success)}
+        try:
+            observation_deadline, _ = self._owner_execution_deadline(mission)
+        except _MissionBudgetExceeded:
+            observation_deadline = time.monotonic()
         proposal = self.interpreter.interpret(
             mission=mission.to_dict(),
             plan=mission.plan.to_dict(),
@@ -1196,6 +1200,7 @@ class MissionRuntime:
             hypothesis_state=mission.hypotheses,
             knowledge_context=mission.knowledge_context,
             conversation_context=(),
+            deadline_monotonic=observation_deadline,
         )
         engine = HypothesisEngine(HypothesisState.from_dict(item) for item in mission.hypotheses)
         hypothesis_updates = engine.apply(proposal, goal_verified=False, deterministic_validation=False)
@@ -1426,6 +1431,83 @@ class MissionRuntime:
             "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
         })
         mission.transition(MissionStatus.RESOURCE_BLOCKED, mission.error)
+        return self._save(mission)
+
+    def _block_on_process_sandbox_unavailable(
+        self,
+        mission: Mission,
+        proposals: tuple[Any, ...],
+        *,
+        reason: str,
+        run_id: str,
+        turn_id: str,
+        progress: dict[str, Any],
+        seen: set[str],
+        skill_context: Any = None,
+        already_proposed_ids: set[str] | None = None,
+    ) -> Mission:
+        already_proposed = already_proposed_ids or set()
+        blocked_ids: list[str] = []
+        for proposal in proposals:
+            call_id = str(proposal.tool_call_id)
+            if call_id not in seen:
+                seen.add(call_id)
+                progress["seen_call_ids"].append(call_id)
+            blocked_ids.append(call_id)
+            if call_id not in already_proposed:
+                mission.emit(EventType.TOOL_PROPOSED, step_id=proposal.step_id, data=proposal.to_dict())
+            error = (
+                "process_sandbox_unavailable"
+                if proposal.name == "run_project_tests"
+                else "turn_blocked_before_dispatch_due_to_process_sandbox_unavailable"
+            )
+            progress["tool_results"].append(ToolCallResult(proposal, False, error=error).to_dict())
+
+        reason = self._bounded_tool_error(reason) or "required process sandbox is unavailable"
+        failure = {
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "class": FailureClass.RESOURCE.value,
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason": reason,
+            "blocked_tool_call_ids": blocked_ids,
+            "dispatch_attempted": False,
+            "retry_policy": {
+                "action": RecoveryAction.RESOURCE_BLOCKED.value,
+                "retryable": False,
+                "attempts": 0,
+            },
+        }
+        mission.error = "required bounded process sandbox is unavailable"
+        mission.failures.append(failure)
+        mission.progress.setdefault("resource_failures", []).append(failure)
+        mission.checkpoint = {
+            "status": "not_dispatched",
+            "reason_code": "process_sandbox_unavailable",
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "plan_version": mission.plan.version,
+            "blocked_tool_call_ids": blocked_ids,
+        }
+        if skill_context is not None:
+            mission.checkpoint["skill_reference"] = skill_context.reference
+        mission.emit(EventType.FAILURE_DETECTED, data=failure)
+        mission.emit(EventType.FAILURE_DIAGNOSED, data={
+            "class": FailureClass.RESOURCE.value,
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
+            "dispatch_attempted": False,
+        })
+        mission.transition(
+            MissionStatus.RESOURCE_BLOCKED,
+            mission.error,
+            run_id=run_id,
+            turn_id=turn_id,
+            reason_code="process_sandbox_unavailable",
+            dispatch_attempted=False,
+        )
         return self._save(mission)
 
     def _bounded_verified_final_turn(
@@ -2047,6 +2129,30 @@ class MissionRuntime:
                 )
             progress["turns"].append(turn.to_dict())
             mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
+            if any(proposal.name == "run_project_tests" for proposal in turn.tool_calls):
+                from security.authorization import authorize_tool
+                from workspace import Workspace
+
+                sandbox_required = any(
+                    proposal.name == "run_project_tests"
+                    and authorize_tool(
+                        [proposal.name, proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None],
+                        context=auth_context,
+                    ).allowed
+                    for proposal in turn.tool_calls
+                )
+                sandbox_unavailable = Workspace.process_sandbox_unavailable_reason() if sandbox_required else None
+                if sandbox_unavailable:
+                    return self._block_on_process_sandbox_unavailable(
+                        mission,
+                        turn.tool_calls,
+                        reason=sandbox_unavailable,
+                        run_id=run_id,
+                        turn_id=turn.turn_id,
+                        progress=progress,
+                        seen=seen,
+                        skill_context=skill_context,
+                    )
             if not turn.tool_calls:
                 progress["last_model_content"] = turn.content
                 progress["last_model_finish_reason"] = turn.finish_reason
@@ -2221,6 +2327,19 @@ class MissionRuntime:
                         )
                         return self._save(mission)
                     except Exception as exc:
+                        from workspace.environment import ProcessSandboxUnavailable
+                        if isinstance(exc, ProcessSandboxUnavailable):
+                            return self._block_on_process_sandbox_unavailable(
+                                mission,
+                                (proposal,),
+                                reason=str(exc),
+                                run_id=run_id,
+                                turn_id=turn_id,
+                                progress=progress,
+                                seen=seen,
+                                skill_context=dispatch_skill_context,
+                                already_proposed_ids={proposal.tool_call_id},
+                            )
                         error_detail = self._bounded_tool_error(str(exc)) or "no exception detail"
                         reason = f"native tool outcome is ambiguous: {type(exc).__name__}"
                         failure = {

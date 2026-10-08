@@ -33,6 +33,10 @@ class WorkspacePolicyError(PermissionError):
     """Raised when an operation is not allowed by the deterministic policy."""
 
 
+class ProcessSandboxUnavailable(WorkspacePolicyError):
+    """Raised when bounded process execution has no approved OS sandbox backend."""
+
+
 @dataclass(frozen=True)
 class WorkspacePolicy:
     allowed_shell_commands: tuple[str, ...] = ("pytest", "python", "python3", "ruff", "mypy", "git")
@@ -210,6 +214,17 @@ class Workspace:
     def supports_secure_public_git_access(self) -> bool:
         """Whether Git can use the already-open cwd without a path fallback."""
         return self.supports_secure_public_workspace_access and os.path.isdir("/proc/self/fd")
+
+    @staticmethod
+    def process_sandbox_unavailable_reason() -> str | None:
+        if sys.platform != "linux" or os.name != "posix" or os.geteuid() == 0:
+            return "required rootless Linux process sandbox is unavailable"
+        if not shutil.which("bwrap", path="/usr/bin:/bin"):
+            return "bubblewrap sandbox is unavailable; process dispatch denied"
+        safe_path = os.pathsep.join((str(Path(sys.prefix) / "bin"), "/usr/local/bin", "/usr/bin", "/bin"))
+        if not shutil.which("prlimit", path=safe_path):
+            return "resource-limit launcher is unavailable; process dispatch denied"
+        return None
 
     def resolve(self, relative: str | Path = ".") -> Path:
         candidate = Path(relative)
@@ -708,8 +723,9 @@ class Workspace:
         timeout: float,
     ) -> Popen[bytes]:
         self._require_process_authority()
-        if sys.platform != "linux" or os.name != "posix" or os.geteuid() == 0:
-            raise WorkspacePolicyError("required rootless Linux process sandbox is unavailable")
+        unavailable_reason = self.process_sandbox_unavailable_reason()
+        if unavailable_reason is not None:
+            raise ProcessSandboxUnavailable(unavailable_reason)
         bwrap = shutil.which("bwrap", path="/usr/bin:/bin")
         if not bwrap:
             raise WorkspacePolicyError("bubblewrap sandbox is unavailable; process dispatch denied")

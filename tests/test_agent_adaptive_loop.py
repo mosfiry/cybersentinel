@@ -4,6 +4,7 @@ from runtime_authorization import make_test_snapshot
 from pathlib import Path
 import json
 import hashlib
+import time
 
 import pytest
 
@@ -147,6 +148,25 @@ def test_model_proposal_cannot_change_authority_fields():
     assert not hasattr(result, "owner_instruction")
 
 
+def test_observation_interpreter_skips_model_after_owner_deadline():
+    calls = []
+    interpreter = ObservationInterpreter(proposer=lambda payload: calls.append(payload) or {"summary": "late"})
+    result = interpreter.interpret(
+        mission={"mission_id": "expired-observation"},
+        plan={},
+        current_step={},
+        action="latest_intel",
+        observation={"success": True, "summary": "deterministic fallback"},
+        evidence=(),
+        hypothesis_state=(),
+        deadline_monotonic=time.monotonic() - 0.01,
+    )
+
+    assert calls == []
+    assert result.summary == "deterministic fallback"
+    assert result.provenance["model_status"] == "skipped_owner_deadline"
+
+
 def test_successful_status_observation_skips_only_optional_model_proposal():
     calls = []
 
@@ -186,9 +206,11 @@ def test_successful_status_observation_skips_only_optional_model_proposal():
 
 def test_runtime_passes_trusted_status_success_into_observation_interpreter(tmp_path):
     calls = []
+    deadlines = []
 
     def proposer(payload):
         calls.append(payload["action"])
+        deadlines.append(payload.get("_owner_deadline_monotonic"))
         return {"summary": "provider proposal"}
 
     interpreter = ObservationInterpreter(
@@ -217,6 +239,7 @@ def test_runtime_passes_trusted_status_success_into_observation_interpreter(tmp_
     assert mission.interpretations[0]["summary"] == "ready"
     assert mission.interpretations[0]["provenance"]["source"] == "deterministic_observation_interpreter"
     assert mission.interpretations[1]["provenance"]["proposal_origin"] == "model"
+    assert len(deadlines) == 1 and deadlines[0] > time.monotonic()
 
 
 def test_crash_after_action_requires_recovery_without_replay(tmp_path):

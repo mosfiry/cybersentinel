@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
 import json
+import math
+import time
 from typing import Any, Callable, Iterable
 
 
@@ -158,7 +160,13 @@ class ObservationInterpreter:
             str(action).strip() for action in model_skip_success_actions if str(action).strip()
         )
 
-    def interpret(self, *, mission: dict[str, Any], plan: dict[str, Any], current_step: dict[str, Any] | None, action: str, observation: dict[str, Any], evidence: Iterable[dict[str, Any]], hypothesis_state: dict[str, Any], knowledge_context: Iterable[dict[str, Any]] = (), conversation_context: Iterable[dict[str, Any]] = ()) -> ObservationInterpretationProposal:
+    def interpret(self, *, mission: dict[str, Any], plan: dict[str, Any], current_step: dict[str, Any] | None, action: str, observation: dict[str, Any], evidence: Iterable[dict[str, Any]], hypothesis_state: dict[str, Any], knowledge_context: Iterable[dict[str, Any]] = (), conversation_context: Iterable[dict[str, Any]] = (), deadline_monotonic: float | None = None) -> ObservationInterpretationProposal:
+        if deadline_monotonic is not None and (
+            isinstance(deadline_monotonic, bool)
+            or not isinstance(deadline_monotonic, (int, float))
+            or not math.isfinite(float(deadline_monotonic))
+        ):
+            raise ValueError("observation deadline must be a finite monotonic timestamp")
         obs_id = observation_id(str(observation.get("action_id", action)), observation)
         base = self._deterministic(mission, plan, current_step, action, observation, obs_id)
         if self.proposer is None or (
@@ -166,8 +174,13 @@ class ObservationInterpreter:
             and bool(observation.get("success", observation.get("ok", False)))
         ):
             return base
+        if deadline_monotonic is not None and time.monotonic() >= float(deadline_monotonic):
+            return replace(
+                base,
+                provenance={**base.provenance, "model_status": "skipped_owner_deadline"},
+            )
         try:
-            proposal = dict(self.proposer({
+            proposal_context = {
                 "mission": mission,
                 "plan": plan,
                 "current_step": current_step,
@@ -177,7 +190,10 @@ class ObservationInterpreter:
                 "hypothesis_state": hypothesis_state,
                 "knowledge_context": list(knowledge_context),
                 "conversation_context": list(conversation_context),
-            }) or {})
+            }
+            if deadline_monotonic is not None:
+                proposal_context["_owner_deadline_monotonic"] = float(deadline_monotonic)
+            proposal = dict(self.proposer(proposal_context) or {})
         except Exception as exc:
             provenance = {**base.provenance, "model_status": "unavailable_or_malformed", "model_error": type(exc).__name__}
             error_kind = getattr(getattr(exc, "kind", None), "value", getattr(exc, "kind", None))

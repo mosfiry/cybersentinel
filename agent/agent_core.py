@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -363,7 +365,24 @@ class AgentCore:
             knowledge_provider=KnowledgeProvider(self.knowledge_retriever),
             include_tool_schema_tokens=False,
         )
-        response = self.router.generate(context.provider_messages(), reasoning_profile=select_reasoning_profile(prompt))
+        timeout_kwargs: dict[str, float] = {}
+        if "_owner_deadline_monotonic" in payload:
+            deadline = payload.get("_owner_deadline_monotonic")
+            if (
+                isinstance(deadline, bool)
+                or not isinstance(deadline, (int, float))
+                or not math.isfinite(float(deadline))
+            ):
+                raise TimeoutError("invalid Owner deadline for observation analysis")
+            timeout_seconds = float(deadline) - time.monotonic()
+            if timeout_seconds <= 0:
+                raise TimeoutError("Owner deadline expired before observation analysis")
+            timeout_kwargs["timeout"] = timeout_seconds
+        response = self.router.generate(
+            context.provider_messages(),
+            reasoning_profile=select_reasoning_profile(prompt),
+            **timeout_kwargs,
+        )
         content = str(response.get("content", "") or "").strip()
         try:
             return json.loads(content)
@@ -481,6 +500,16 @@ class AgentCore:
                     tool_id=step.action,
                     evidence_store=evidence_store,
                 )
+                if step.action == "run_project_tests":
+                    sandbox_unavailable = workspace.process_sandbox_unavailable_reason()
+                    if sandbox_unavailable:
+                        return {
+                            "success": False,
+                            "failure_class": "RESOURCE",
+                            "reason_code": "process_sandbox_unavailable",
+                            "error": sandbox_unavailable,
+                            "execution_id": action_id,
+                        }
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
             if selected_skill_context is not None:
                 # Last live Skill approval/revocation/expiry check immediately before canonical dispatch.
