@@ -111,6 +111,7 @@ def test_first_run_bootstrap_to_login_uses_canonical_username(tmp_db, monkeypatc
         op.login("owner", TEST_PASSWORD)
     session = op.login(op.OWNER_USERNAME, TEST_PASSWORD)
     assert session["auth_method"] == "username_password"
+    assert session["username"] == op.OWNER_USERNAME
     assert session["session_id"]
 
 

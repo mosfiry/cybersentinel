@@ -95,6 +95,7 @@ def _owner_session(server):
     )
     assert status == 200
     assert payload["authenticated"] is True
+    assert payload["username"] == "release-owner"
     owner_set_cookie = headers.get("Set-Cookie")
     assert owner_set_cookie and "HttpOnly" in owner_set_cookie and "Secure" in owner_set_cookie
     assert "Path=/api/public" in owner_set_cookie

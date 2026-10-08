@@ -161,7 +161,9 @@ def login(username: str, password: str) -> dict:
         raise PermissionError("invalid_credentials")
     if not _verify(password, row["password_hash"], row["kdf_algorithm"], row["kdf_params_json"]):
         raise PermissionError("invalid_credentials")
-    return _create_session(int(row["owner_id"]))
+    session = _create_session(int(row["owner_id"]))
+    session["username"] = str(row["username"])
+    return session
 
 
 def _resolve_session_reference(session_ref: str) -> dict | None:
