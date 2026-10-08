@@ -404,6 +404,7 @@ def main() -> int:
     }
     browser = None
     inference_api_result: dict | None = None
+    stage = "initialize_acceptance"
     try:
         from playwright.sync_api import sync_playwright
 
@@ -606,12 +607,25 @@ def main() -> int:
                     "owner_username": username,
                     "first_run_authenticated": True,
                 }
-                page.locator("#logoutButton").click(timeout=30_000)
+                stage = "owner_logout_request"
+                with page.expect_response(
+                    lambda response: response.request.method == "POST"
+                    and response.url.rstrip("/").endswith("/api/public/auth/logout"),
+                    timeout=30_000,
+                ) as initial_logout_response_info:
+                    page.locator("#logoutButton").click(timeout=30_000)
+                initial_logout_response = initial_logout_response_info.value
+                report["owner_authentication"]["initial_logout_http_status"] = initial_logout_response.status
+                if initial_logout_response.status != 200:
+                    raise RuntimeError("owner_logout_after_first_run_not_verified")
+                stage = "owner_logout_renderer_state"
                 page.wait_for_function(
                     "() => document.querySelector('#loginForm')?.classList.contains('hidden') === false "
                     "&& document.querySelector('#logoutButton')?.classList.contains('hidden') === true",
                     timeout=30_000,
                 )
+                report["owner_authentication"]["initial_logout_renderer_state_verified"] = True
+                stage = "invalid_owner_login_request"
                 page.locator("#loginUsername").fill(username)
                 page.locator("#loginPassword").fill("intentionally-invalid-windows-acceptance-password")
                 with page.expect_response(
@@ -621,6 +635,7 @@ def main() -> int:
                     page.locator("#loginButton").click(timeout=30_000)
                 invalid_response = invalid_response_info.value
                 invalid_body = invalid_response.json()
+                stage = "invalid_owner_login_renderer_state"
                 page.wait_for_function(
                     "() => document.querySelector('#authStateSide')?.textContent.trim() === 'غير مسجل الدخول'",
                     timeout=30_000,
@@ -664,6 +679,7 @@ def main() -> int:
                 if not valid_login:
                     raise RuntimeError("valid_owner_credentials_were_not_accepted")
 
+                stage = "installed_app_full_mission"
                 installed_mission = _installed_app_mission(page, args.profile_root, progress)
                 report["installed_app_mission"] = installed_mission
                 if installed_mission.get("status") != "PASS":
@@ -721,6 +737,7 @@ def main() -> int:
                     "runtime_shutdown": report["model_manager"].get("runtime_shutdown_verified") is True,
                 }
                 report["status"] = "PASS" if all(report["checks"].values()) else "FAIL"
+                stage = "acceptance_complete"
                 return_code = 0 if report["status"] == "PASS" else 2
             report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
             report["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -728,6 +745,7 @@ def main() -> int:
             args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             return return_code
     except Exception as exc:
+        report["failure_stage"] = stage
         report["error_type"] = type(exc).__name__
         report["error"] = str(exc)[:500]
         report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
