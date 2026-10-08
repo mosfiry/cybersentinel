@@ -47,6 +47,7 @@ $applicationProcess = $null
 $originalAppData = $env:APPDATA
 $originalLocalAppData = $env:LOCALAPPDATA
 $originalTestUserDataDir = $env:CYBERSENTINEL_TEST_USER_DATA_DIR
+$originalAcceptanceDiagnostics = $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS
 
 function Save-Report {
     param([string]$Path, [object]$Value)
@@ -185,12 +186,14 @@ try {
     $env:APPDATA = $profileRoot
     $env:LOCALAPPDATA = Join-Path $profileRoot "Local"
     $env:CYBERSENTINEL_TEST_USER_DATA_DIR = Join-Path $profileRoot "userData"
+    $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = "1"
     $applicationProcess = Start-Process -FilePath $exePath -ArgumentList @(
         "--disable-gpu", "--remote-debugging-port=$cdpPort", "--remote-allow-origins=*"
     ) -PassThru
     $env:APPDATA = $originalAppData
     $env:LOCALAPPDATA = $originalLocalAppData
     $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
+    $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = $originalAcceptanceDiagnostics
 
     $debugEndpointReady = $false
     $debugVersion = $null
@@ -341,6 +344,7 @@ finally {
     $env:APPDATA = $originalAppData
     $env:LOCALAPPDATA = $originalLocalAppData
     $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
+    $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = $originalAcceptanceDiagnostics
     $processStopped = Stop-ApplicationTree -Process $applicationProcess
     $report.cleanup.application_process_tree_stopped = $processStopped
     if ($report.installation.installed_executable_exists -and (Test-Path -LiteralPath $installDirectory)) {

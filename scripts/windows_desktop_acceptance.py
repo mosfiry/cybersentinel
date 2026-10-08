@@ -142,12 +142,21 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     create_body = create_response.json()
     mission_id = str(create_body.get("mission_id", "")) if isinstance(create_body, dict) else ""
     create_error = create_body.get("error") if isinstance(create_body, dict) else None
+    create_diagnostic = create_body.get("acceptance_diagnostic", {}) if isinstance(create_body, dict) else {}
+    if not isinstance(create_diagnostic, dict):
+        create_diagnostic = {}
+    diagnostic_stage = create_diagnostic.get("stage", "")
+    exception_type = create_diagnostic.get("exception_type", "")
+    diagnostic_stage = diagnostic_stage if isinstance(diagnostic_stage, str) and diagnostic_stage.isidentifier() else ""
+    exception_type = exception_type if isinstance(exception_type, str) and exception_type.isidentifier() else ""
     progress.append({
         "phase": "installed_app_mission_creation_response",
         "http_status": create_response.status,
         "response_ok": create_body.get("ok") is True if isinstance(create_body, dict) else False,
         "mission_id_present": bool(mission_id),
         "error_code": str(create_error)[:96] if create_error is not None else "",
+        "diagnostic_stage": diagnostic_stage,
+        "exception_type": exception_type,
     })
     if create_response.status != 201 or not mission_id:
         raise RuntimeError("installed_app_real_mission_creation_failed")

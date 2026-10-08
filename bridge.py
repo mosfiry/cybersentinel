@@ -1373,6 +1373,7 @@ class Handler(BaseHTTPRequestHandler):
             owner = self._public_mission_owner(csrf=True)
             if owner is None:
                 return
+            diagnostic_stage = "request_validation"
             try:
                 payload = self._read_json()
                 if not isinstance(payload, dict):
@@ -1382,6 +1383,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("objective_required")
                 if len(objective) > 12_000:
                     raise ValueError("objective_too_long")
+                diagnostic_stage = "project_lookup"
                 store = _project_store()
                 requested_project_id = str(payload.get("project_id", "") or "")
                 project = (
@@ -1389,15 +1391,18 @@ class Handler(BaseHTTPRequestHandler):
                     if requested_project_id
                     else store.ensure_default(int(owner["owner_id"]))
                 )
+                diagnostic_stage = "scope_context"
                 scope_context = self._public_scope_context(project, objective)
                 selected_skill = payload.get("skill_id")
                 if selected_skill is not None and (not isinstance(selected_skill, str) or not selected_skill.strip() or len(selected_skill) > 128):
                     raise ValueError("invalid_skill_selection")
+                diagnostic_stage = "agent_core_initialization"
                 core = AgentCore(
                     RUNTIME.router,
                     db_path=DB_PATH.with_name("missions.sqlite3"),
                     skill_registry=_skill_registry(),
                 )
+                diagnostic_stage = "owner_mission_creation"
                 mission = core.run_owner_mission(
                     objective,
                     owner_session_token=owner["session_token"],
@@ -1406,9 +1411,13 @@ class Handler(BaseHTTPRequestHandler):
                     run=False,
                     skill_id=selected_skill,
                 )
+                diagnostic_stage = "project_mission_assignment"
                 store.assign_mission(int(owner["owner_id"]), mission.mission_id, project.project_id)
+                diagnostic_stage = "mission_service_initialization"
                 service = self._mission_service()
+                diagnostic_stage = "mission_start"
                 service.start_mission(mission.mission_id, owner_session_token=owner["session_token"])
+                diagnostic_stage = "mission_status"
                 current = service.status(mission.mission_id, owner_session_token=owner["session_token"])
                 return self._send(201, {
                     "ok": True,
@@ -1427,8 +1436,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(status, {"ok": False, "error": str(exc)})
             except RuntimeError as exc:
                 return self._send(409, {"ok": False, "error": str(exc)})
-            except Exception:
-                return self._send(502, {"ok": False, "error": "mission_creation_failed"})
+            except Exception as exc:
+                response = {"ok": False, "error": "mission_creation_failed"}
+                if os.environ.get("CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS") == "1":
+                    response["acceptance_diagnostic"] = {
+                        "stage": diagnostic_stage,
+                        "exception_type": type(exc).__name__,
+                    }
+                return self._send(502, response)
         if path.startswith("/api/public/missions/"):
             owner = self._public_mission_owner(csrf=True)
             if owner is None:

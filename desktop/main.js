@@ -122,6 +122,9 @@ function bridgeEnvironment() {
   env.PUBLIC_WEB_ENABLED = "true";
   env.PUBLIC_WEB_ORIGIN = "";
   env.CYBERSENTINEL_DESKTOP_MODE = "true";
+  if (process.env.CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS === "1") {
+    env.CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = "1";
+  }
   env.CYBERSENTINEL_DESKTOP_SETUP_TOKEN = desktopSetupToken;
   env.CYBERSENTINEL_MODEL_ROOT = path.join(root, "local-model-manager");
   env.CYBERSENTINEL_LLM_RUNTIME_DIR = app.isPackaged

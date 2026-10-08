@@ -614,6 +614,54 @@ def test_public_mission_create_uses_server_project_scope_and_queues_owner_missio
     assert "authorization_snapshot" not in payload["mission"]
 
 
+def test_public_mission_creation_diagnostics_are_acceptance_only(public_server, monkeypatch, tmp_path):
+    cookie, csrf = _owner_session(public_server)
+    project_id = "b" * 32
+
+    class FakeProject:
+        def __init__(self):
+            self.project_id = project_id
+            self.root_path = tmp_path
+
+    class FakeProjects:
+        def get(self, owner_id, selected_id, *, include_archived):
+            assert (owner_id, selected_id, include_archived) == (7, project_id, False)
+            return FakeProject()
+
+    class FailingCore:
+        def __init__(self, router, *, db_path, skill_registry):
+            pass
+
+        def run_owner_mission(self, objective, **kwargs):
+            raise TypeError("private acceptance detail must not be returned")
+
+    monkeypatch.setattr(bridge, "AgentCore", FailingCore)
+    monkeypatch.setattr(bridge, "_project_store", lambda: FakeProjects())
+
+    def create_mission():
+        return _request(
+            public_server,
+            "POST",
+            "/api/public/missions",
+            body={"objective": "Review the local test fixture", "project_id": project_id},
+            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+        )
+
+    monkeypatch.delenv("CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS", raising=False)
+    status, payload, _headers = create_mission()
+    assert status == 502
+    assert payload == {"ok": False, "error": "mission_creation_failed"}
+
+    monkeypatch.setenv("CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS", "1")
+    status, payload, _headers = create_mission()
+    assert status == 502
+    assert payload["acceptance_diagnostic"] == {
+        "stage": "owner_mission_creation",
+        "exception_type": "TypeError",
+    }
+    assert "private acceptance detail" not in str(payload)
+
+
 def test_public_project_tool_scope_is_local_and_owner_intent_bounded():
     base = {"latest_intel", "local_security_check", "local_system_info", "status"}
     assert set(bridge._public_project_owner_tool_scope("Review this local project")) == base
