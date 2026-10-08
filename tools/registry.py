@@ -265,6 +265,9 @@ class ToolSpec:
     scope_rate_deferred: bool = False
     allow_custom_input_schema: bool = False
     workspace_scope_required: bool = False
+    # Dynamic read tools such as status may be sampled repeatedly; opt in only
+    # when identical reads within a plan step cannot add new evidence.
+    block_identical_read_repeats: bool = False
 
     def __post_init__(self) -> None:
         if not self.input_schema:
@@ -821,7 +824,15 @@ def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
 
 REGISTRY = build_registry([
     ToolSpec("status", "قراءة حالة الخدمة والأحداث التدقيقية الأخيرة", "read", True, None, _status),
-    ToolSpec("latest_intel", "قراءة استخبارات التهديدات المجمعة", "read", True, None, _latest_intel),
+    ToolSpec(
+        "latest_intel",
+        "قراءة استخبارات التهديدات المجمعة",
+        "read",
+        True,
+        None,
+        _latest_intel,
+        block_identical_read_repeats=True,
+    ),
     ToolSpec("refresh_intel", "جمع استخبارات دفاعية ضد التهديدات", "network-read", True, None, _refresh_intel, network_access="allowlisted_intel_providers", effect_provider="cybersentinel.intel-collectors"),
     ToolSpec("local_security_check", "فحص مستمعي TCP المحلية", "read", True, None, _local_security),
     ToolSpec("local_system_info", "قراءة معلومات النظام المحلي", "read", True, None, _system_info),

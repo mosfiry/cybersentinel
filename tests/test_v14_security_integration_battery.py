@@ -710,6 +710,10 @@ def test_native_model_blocks_repeated_read_only_tool_cycle_before_dispatch(tmp_p
 
 
 def test_native_model_blocks_repeated_identical_single_read_tool_before_dispatch(tmp_path, monkeypatch):
+    from tools.registry import get_tool
+
+    assert get_tool("latest_intel").block_identical_read_repeats is True
+    assert get_tool("status").block_identical_read_repeats is False
     session = "native-single-read-repeat-owner-session"
     allow_owner_sessions(monkeypatch, session)
     provider = _RepeatedSingleReadOnlyToolProvider()

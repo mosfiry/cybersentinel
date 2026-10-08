@@ -1062,6 +1062,12 @@ class MissionRuntime:
             signatures = [item[0] for item in cycle]
             if cycle_length > 1 and len({signature[0] for signature in signatures}) < 2:
                 continue
+            if cycle_length == 1:
+                from tools.registry import get_tool
+
+                spec = get_tool(candidate[0])
+                if spec is None or not spec.block_identical_read_repeats:
+                    continue
             if len({signature[2] for signature in signatures + [candidate]}) != 1:
                 continue
             if candidate == signatures[0]:
