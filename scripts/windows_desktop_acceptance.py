@@ -602,6 +602,29 @@ def main() -> int:
                 runtime = (state.get("manager") or {}).get("runtime") or {}
                 if not qwen or not qwen.get("active") or runtime.get("status") != "ready":
                     raise RuntimeError("qwen3_4b_runtime_not_ready")
+                try:
+                    page.wait_for_function(
+                        """modelId => Array.from(document.querySelectorAll(
+                            '#setupModelList button[data-model-action="test"]'
+                        )).some(button => button.dataset.modelId === modelId && !button.disabled)""",
+                        arg=model_id,
+                        timeout=60_000,
+                    )
+                except Exception:
+                    report["model_manager"]["test_action_ui_state"] = page.evaluate(
+                        """modelId => {
+                            const buttons = Array.from(document.querySelectorAll(
+                                '#setupModelList button[data-model-action="test"]'
+                            )).filter(button => button.dataset.modelId === modelId);
+                            return {
+                                matching_button_count: buttons.length,
+                                matching_buttons_disabled: buttons.map(button => button.disabled),
+                                model_card_count: document.querySelectorAll('#setupModelList .model-card').length
+                            };
+                        }""",
+                        model_id,
+                    )
+                    raise RuntimeError("qwen3_4b_local_inference_test_action_not_rendered_after_activation")
                 card = page.locator("#setupModelList .model-card").filter(has_text="Qwen3").filter(has_text="4B").first
                 test_button = card.locator('button[data-model-action="test"]')
                 if test_button.count() != 1 or test_button.is_disabled():
