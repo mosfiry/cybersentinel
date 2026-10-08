@@ -149,6 +149,25 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     exception_type = create_diagnostic.get("exception_type", "")
     diagnostic_stage = diagnostic_stage if isinstance(diagnostic_stage, str) and diagnostic_stage.isidentifier() else ""
     exception_type = exception_type if isinstance(exception_type, str) and exception_type.isidentifier() else ""
+    diagnostic_frames = []
+    raw_frames = create_diagnostic.get("traceback_frames", [])
+    if isinstance(raw_frames, list):
+        for frame in raw_frames[-6:]:
+            if not isinstance(frame, dict):
+                continue
+            filename = frame.get("file", "")
+            function = frame.get("function", "")
+            line = frame.get("line")
+            if (
+                isinstance(filename, str)
+                and Path(filename).name == filename
+                and isinstance(function, str)
+                and function.isidentifier()
+                and isinstance(line, int)
+                and not isinstance(line, bool)
+                and line > 0
+            ):
+                diagnostic_frames.append({"file": filename, "function": function, "line": line})
     progress.append({
         "phase": "installed_app_mission_creation_response",
         "http_status": create_response.status,
@@ -157,6 +176,7 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         "error_code": str(create_error)[:96] if create_error is not None else "",
         "diagnostic_stage": diagnostic_stage,
         "exception_type": exception_type,
+        "diagnostic_traceback_frames": diagnostic_frames,
     })
     if create_response.status != 201 or not mission_id:
         raise RuntimeError("installed_app_real_mission_creation_failed")

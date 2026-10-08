@@ -6,6 +6,7 @@ import os
 import signal
 import re
 import sys
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1442,6 +1443,15 @@ class Handler(BaseHTTPRequestHandler):
                     response["acceptance_diagnostic"] = {
                         "stage": diagnostic_stage,
                         "exception_type": type(exc).__name__,
+                        "traceback_frames": [
+                            {
+                                "file": Path(frame.filename).name,
+                                "function": frame.name,
+                                "line": frame.lineno,
+                            }
+                            for frame in traceback.extract_tb(exc.__traceback__)[-6:]
+                            if frame.name.isidentifier() and frame.lineno > 0
+                        ],
                     }
                 return self._send(502, response)
         if path.startswith("/api/public/missions/"):

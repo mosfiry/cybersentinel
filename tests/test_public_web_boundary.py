@@ -655,10 +655,11 @@ def test_public_mission_creation_diagnostics_are_acceptance_only(public_server, 
     monkeypatch.setenv("CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS", "1")
     status, payload, _headers = create_mission()
     assert status == 502
-    assert payload["acceptance_diagnostic"] == {
-        "stage": "owner_mission_creation",
-        "exception_type": "TypeError",
-    }
+    diagnostic = payload["acceptance_diagnostic"]
+    assert diagnostic["stage"] == "owner_mission_creation"
+    assert diagnostic["exception_type"] == "TypeError"
+    assert diagnostic["traceback_frames"]
+    assert all(set(frame) == {"file", "function", "line"} for frame in diagnostic["traceback_frames"])
     assert "private acceptance detail" not in str(payload)
 
 
