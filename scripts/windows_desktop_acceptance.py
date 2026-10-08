@@ -141,6 +141,14 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     create_response = mission_response_info.value
     create_body = create_response.json()
     mission_id = str(create_body.get("mission_id", "")) if isinstance(create_body, dict) else ""
+    create_error = create_body.get("error") if isinstance(create_body, dict) else None
+    progress.append({
+        "phase": "installed_app_mission_creation_response",
+        "http_status": create_response.status,
+        "response_ok": create_body.get("ok") is True if isinstance(create_body, dict) else False,
+        "mission_id_present": bool(mission_id),
+        "error_code": str(create_error)[:96] if create_error is not None else "",
+    })
     if create_response.status != 201 or not mission_id:
         raise RuntimeError("installed_app_real_mission_creation_failed")
     mission_path = "/api/public/missions/" + mission_id
