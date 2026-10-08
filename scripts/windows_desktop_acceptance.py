@@ -420,6 +420,8 @@ def main() -> int:
     }
     browser = None
     inference_api_result: dict | None = None
+    inference_response_status: int | None = None
+    inference_response_fields: list[str] = []
     stage = "initialize_acceptance"
     try:
         from playwright.sync_api import sync_playwright
@@ -575,18 +577,24 @@ def main() -> int:
                 test_button = card.locator('button[data-model-action="test"]')
                 if test_button.count() != 1 or test_button.is_disabled():
                     raise RuntimeError("qwen3_4b_local_inference_test_action_unavailable")
-                def capture_inference_response(response) -> None:
-                    nonlocal inference_api_result
-                    if response.request.method != "POST" or "/test" not in response.url:
-                        return
-                    try:
-                        value = response.json()
-                        if isinstance(value, dict):
-                            inference_api_result = value
-                    except Exception:
-                        return
-                page.on("response", capture_inference_response)
-                test_button.click(timeout=30_000)
+                expected_test_path = f"/api/public/desktop/models/{model_id}/test"
+                def is_expected_inference_response(response) -> bool:
+                    response_path = response.url.split("?", 1)[0].rstrip("/")
+                    return (
+                        response.request.method == "POST"
+                        and response_path.endswith(expected_test_path)
+                    )
+                with page.expect_response(is_expected_inference_response, timeout=120_000) as inference_response_info:
+                    test_button.click(timeout=30_000)
+                inference_response = inference_response_info.value
+                inference_response_status = inference_response.status
+                try:
+                    value = inference_response.json()
+                    if isinstance(value, dict):
+                        inference_api_result = value
+                        inference_response_fields = sorted(str(key) for key in value)[:16]
+                except Exception:
+                    inference_api_result = None
                 state = _wait_for_model(
                     page, lambda current, model, operation: bool(
                         operation.get("kind") == "inference_test"
@@ -596,7 +604,6 @@ def main() -> int:
                     ),
                     timeout=300, phase="real_local_inference", progress=progress,
                 )
-                page.remove_listener("response", capture_inference_response)
                 qwen = _find_qwen(state)
                 operation = (state.get("manager") or {}).get("operation") or {}
                 runtime = (state.get("manager") or {}).get("runtime") or {}
@@ -612,6 +619,10 @@ def main() -> int:
                     "runtime_binary_sha256": runtime.get("binary_sha256"),
                     "provider": provider,
                     "model": model_name,
+                    "inference_response_http_status": inference_response_status,
+                    "inference_response_fields": inference_response_fields,
+                    "inference_provider_matches_expected": provider == "local_llama_cpp",
+                    "inference_model_matches_expected": model_name == model_id,
                     "expected_model_size_bytes": (qwen or {}).get("size_bytes"),
                     "real_inference_completed": True,
                     "real_inference_flag": (inference_api_result or {}).get("real_inference"),
