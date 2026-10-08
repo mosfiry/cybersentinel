@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.context import RuntimeLimits
 import agent.agent_core as agent_core_module
 import agent.mission_runtime as mission_runtime_module
 import security.owner_policy as owner_policy
@@ -15,7 +16,8 @@ from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.mission_worker import MissionQueue, MissionWorker, WorkerMissionState
 from agent.model_router import ModelRouter
-from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
+from agent.planning import Plan, PlanStep
+from agent.provider_api import ProviderCapabilities, ProviderFailure, ProviderResponse, ToolCall
 from api.missions import MissionService
 from owner_session_testutils import allow_owner_sessions, persist_canonical_scope, workspace_scope_context
 from security.scope_store import init_scope_store
@@ -36,6 +38,22 @@ class _StaticMissionProvider:
 
     def generate(self, *_args, **_kwargs):
         raise AssertionError("the V14 fixture does not require an additional provider call")
+
+
+class _AlwaysFailingPlanningProvider:
+    name = "owner-retry-cap-fixture"
+    model = "owner-retry-cap-fixture-1"
+    capabilities = ProviderCapabilities(generate=True, tool_calling=True)
+
+    def __init__(self):
+        self.calls = 0
+
+    def tool_calling(self, *_args, **_kwargs):
+        self.calls += 1
+        raise ProviderFailure("private planning failure", provider=self.name, model=self.model)
+
+    def generate(self, *_args, **_kwargs):
+        raise AssertionError("planning retry-cap test must use tool calling")
 
 
 class _NativeWorkspaceProvider:
@@ -255,8 +273,17 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
         mission_store=store,
     )
     records = evidence_store.list(request_id=mission.request_id)
-    assert len(records) == 2
+    assert len(records) == (4 if parallel else 3)
     assert evidence_store.verify()
+    native_tool_records = [record for record in records if str(record.get("source", "")).startswith("native-tool:")]
+    assert len(native_tool_records) == (2 if parallel else 1)
+    expected_native_call_ids = {("run_project_tests", "native-native-workspace-call")}
+    if parallel:
+        expected_native_call_ids.add(("status", "native-native-status-call"))
+    assert {
+        (record["evidence"]["tool_name"], record["evidence"]["tool_call_id"])
+        for record in native_tool_records
+    } == expected_native_call_ids
     process_records = [record for record in records if record.get("source") == "sandboxed-process:run_project_tests"]
     workspace_events = [
         record for record in records
@@ -386,6 +413,271 @@ def test_native_owner_mission_preserves_latest_intel_list_result(tmp_path, monke
     assert isinstance(intel_result.get("items"), list)
     assert marker in json.dumps(intel_result, ensure_ascii=False)
     assert mission.checkpoint.get("status") != "in_flight_parallel"
+    evidence_store = EvidenceChainStore(
+        Path(store.db_path).with_name("evidence_chain.db"),
+        mission_store=store,
+    )
+    records = evidence_store.list(request_id=mission.request_id)
+    native_records = [record for record in records if str(record.get("source", "")).startswith("native-tool:")]
+    assert evidence_store.verify()
+    assert {record["evidence"]["tool_name"] for record in native_records} == {"status", "latest_intel"}
+    assert {
+        (record["evidence"]["tool_name"], record["evidence"]["tool_call_id"])
+        for record in native_records
+    } == {
+        ("status", "native-native-latest-intel-status"),
+        ("latest_intel", "native-native-latest-intel-list"),
+    }
+    assert all(record.get("fence_id") and record.get("authorization_hash") for record in native_records)
+    assert all(record["evidence"]["trust_classification"] == "untrusted_data" for record in native_records)
+    assert all(record["evidence"]["authority"] == "none" for record in native_records)
+    assert all(record["evidence"]["authorized_tool"] is True for record in native_records)
+    assert all(len(record["evidence"]["result_sha256"]) == 64 for record in native_records)
+    assert all(len(record["evidence"]["scope_sha256"]) == 64 for record in native_records)
+    evidence_refs = store.load(mission.mission_id).progress["execution_evidence_refs"]
+    assert all(any(receipt["evidence_id"] == record["evidence_id"] for receipt in evidence_refs) for record in native_records)
+
+
+def test_model_planner_cannot_self_authorize_tool_outside_owner_scope(tmp_path, monkeypatch):
+    session = "owner-plan-scope-session"
+    allow_owner_sessions(monkeypatch, session)
+    core, _store, provider = _core(
+        tmp_path,
+        monkeypatch,
+        response=ProviderResponse(text="provider should not be called"),
+    )
+    unauthorized_plan = Plan.initial("Read current status").replan(
+        steps=(PlanStep("unauthorized-step", "run outside the Owner allowlist", action="run_project_tests"),),
+        reason="hostile-model-proposal",
+    )
+    monkeypatch.setattr(core, "_plan", lambda *_args, **_kwargs: unauthorized_plan)
+
+    with pytest.raises(PermissionError, match="model_plan_exceeds_owner_tool_scope"):
+        core.run_owner_mission(
+            "Read current status.",
+            owner_session_token=session,
+            request_id="owner-plan-scope-rejection",
+            scope_context={"scope": ["workspace"], "target_id": "owner-scope", "allowed_tools": ["status"]},
+            run=False,
+        )
+
+    assert provider.calls == 0
+
+
+def test_initial_planning_retry_count_uses_owner_runtime_limit(tmp_path, monkeypatch):
+    session = "owner-planning-retry-cap-session"
+    allow_owner_sessions(monkeypatch, session)
+    monkeypatch.setattr(owner_policy, "STATE_PATH", tmp_path / "owner-policy.json")
+    monkeypatch.setattr(agent_core_module, "DB_PATH", tmp_path / "application.sqlite3")
+    provider = _AlwaysFailingPlanningProvider()
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    core = AgentCore(
+        ModelRouter([provider]),
+        store=store,
+        max_iterations=5,
+        knowledge_retriever=_EmptyKnowledge(),
+    )
+    monkeypatch.setattr(core, "_context_runtime_limits", lambda: RuntimeLimits(max_retries=0))
+
+    mission = core.run_owner_mission(
+        "Read current status and report observed facts.",
+        owner_session_token=session,
+        request_id="owner-planning-retry-cap",
+        run=False,
+    )
+
+    assert provider.calls == 1
+    assert mission.failures[0]["retry_policy"]["max_retries"] == 0
+    assert mission.failures[0]["retry_policy"]["retry_scheduled"] is False
+
+
+class _ReadOnlyToolCycleProvider:
+    name = "read-only-cycle-fixture"
+    model = "read-only-cycle-fixture-1"
+    capabilities = ProviderCapabilities(
+        generate=True,
+        tool_calling=True,
+        native_chat=True,
+        parallel_tool_calls=True,
+    )
+
+    def __init__(self):
+        self.responses = [
+            ProviderResponse(tool_calls=[
+                ToolCall("status", {}, "cycle-planning-status"),
+                ToolCall("latest_intel", {}, "cycle-planning-intel"),
+            ]),
+            ProviderResponse(tool_calls=[
+                ToolCall("status", {}, "cycle-first-status"),
+                ToolCall("latest_intel", {}, "cycle-first-intel"),
+            ]),
+            ProviderResponse(tool_calls=[
+                ToolCall("status", {}, "cycle-repeat-status"),
+                ToolCall("latest_intel", {}, "cycle-repeat-intel"),
+            ]),
+        ]
+        self.calls = 0
+
+    def tool_calling(self, *_args, **_kwargs):
+        self.calls += 1
+        return self.responses.pop(0)
+
+    def generate(self, *_args, **_kwargs):
+        raise AssertionError("native repeat guard test must use real tool calling")
+
+
+class _ReadOnlyAbaCycleProvider:
+    name = "read-only-aba-cycle-fixture"
+    model = "read-only-aba-cycle-fixture-1"
+    capabilities = ProviderCapabilities(
+        generate=True,
+        tool_calling=True,
+        native_chat=True,
+        parallel_tool_calls=True,
+    )
+
+    def __init__(self):
+        first_batch = [
+            ToolCall("status", {}, "cycle-first-status-a"),
+            ToolCall("latest_intel", {}, "cycle-first-intel"),
+            ToolCall("status", {}, "cycle-first-status-b"),
+        ]
+        repeated_batch = [
+            ToolCall("status", {}, "cycle-repeat-status-a"),
+            ToolCall("latest_intel", {}, "cycle-repeat-intel"),
+            ToolCall("status", {}, "cycle-repeat-status-b"),
+        ]
+        self.responses = [
+            ProviderResponse(tool_calls=[
+                ToolCall("status", {}, "cycle-planning-status"),
+                ToolCall("latest_intel", {}, "cycle-planning-intel"),
+            ]),
+            ProviderResponse(tool_calls=first_batch),
+            ProviderResponse(tool_calls=repeated_batch),
+        ]
+        self.calls = 0
+
+    def tool_calling(self, *_args, **_kwargs):
+        self.calls += 1
+        return self.responses.pop(0)
+
+    def generate(self, *_args, **_kwargs):
+        raise AssertionError("native A,B,A repeat guard test must use real tool calling")
+
+
+def test_native_model_blocks_repeated_read_only_tool_cycle_before_dispatch(tmp_path, monkeypatch):
+    session = "native-cycle-owner-session"
+    allow_owner_sessions(monkeypatch, session)
+    provider = _ReadOnlyToolCycleProvider()
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    core = AgentCore(
+        ModelRouter([provider]),
+        store=store,
+        max_iterations=5,
+        knowledge_retriever=_EmptyKnowledge(),
+    )
+    monkeypatch.setattr(core, "_context_runtime_limits", lambda: RuntimeLimits(max_same_tool_calls=10))
+
+    mission = core.run_owner_mission(
+        "Read current local system status and latest locally available intelligence, then report only observed facts.",
+        owner_session_token=session,
+        request_id="native-read-only-cycle-request",
+    )
+
+    assert provider.calls == 3
+    assert mission.status is MissionStatus.RESOURCE_BLOCKED
+    assert mission.is_terminal
+    loop = mission.progress["model_loop"]
+    assert len(loop["turns"]) == 2
+    assert len(loop["tool_results"]) == 4
+    assert [(item["name"], item["ok"]) for item in loop["tool_results"]] == [
+        ("status", True),
+        ("latest_intel", True),
+        ("status", False),
+        ("latest_intel", False),
+    ]
+    cycle_guard = loop["semantic_read_only_cycle_guard"]
+    assert cycle_guard["tool_name"] == "status"
+    assert cycle_guard["blocked_tool_call_id"].endswith("cycle-repeat-status")
+    assert cycle_guard["duplicate_of_tool_call_id"].endswith("cycle-first-status")
+    assert cycle_guard["duplicate_kind"] == "repeated_read_only_tool_cycle"
+    assert cycle_guard["cycle_length"] == 2
+    assert [call_id.rsplit("-", 1)[-1] for call_id in cycle_guard["cycle_tool_call_ids"]] == [
+        "status",
+        "intel",
+    ]
+    assert cycle_guard["arguments_sha256"].startswith("44136fa355b3")
+    assert len(cycle_guard["arguments_sha256"]) == 64
+    assert cycle_guard["dispatch_attempted"] is False
+    assert mission.checkpoint["status"] == "not_dispatched"
+    assert mission.failures[-1]["budget"] == "repeated_read_only_tool_cycle"
+    assert mission.failures[-1]["details"]["dispatch_attempted"] is False
+
+    evidence_store = EvidenceChainStore(tmp_path / "evidence_chain.db", mission_store=store)
+    records = evidence_store.list(request_id=mission.request_id)
+    native_records = [record for record in records if str(record.get("source", "")).startswith("native-tool:")]
+    assert evidence_store.verify()
+    assert len(native_records) == 2
+    assert {record["evidence"]["tool_name"] for record in native_records} == {"status", "latest_intel"}
+    assert {record["evidence"]["tool_call_id"].rsplit("-", 1)[-1] for record in native_records} == {
+        "status",
+        "intel",
+    }
+    assert all("cycle-repeat" not in record["evidence"]["tool_call_id"] for record in native_records)
+
+
+def test_native_read_only_cycle_guard_allows_first_aba_batch_and_blocks_its_repeat(tmp_path, monkeypatch):
+    session = "native-aba-cycle-owner-session"
+    allow_owner_sessions(monkeypatch, session)
+    provider = _ReadOnlyAbaCycleProvider()
+    store = MissionStore(tmp_path / "missions.sqlite3")
+    core = AgentCore(
+        ModelRouter([provider]),
+        store=store,
+        max_iterations=5,
+        knowledge_retriever=_EmptyKnowledge(),
+    )
+    monkeypatch.setattr(
+        core,
+        "_context_runtime_limits",
+        lambda: RuntimeLimits(max_tool_calls=10, max_same_tool_calls=10),
+    )
+
+    mission = core.run_owner_mission(
+        "Read current local system status and latest locally available intelligence, then report only observed facts.",
+        owner_session_token=session,
+        request_id="native-read-only-aba-cycle-request",
+    )
+
+    assert provider.calls == 3
+    assert mission.status is MissionStatus.RESOURCE_BLOCKED
+    assert mission.is_terminal
+    loop = mission.progress["model_loop"]
+    assert len(loop["turns"]) == 2
+    assert [(item["name"], item["ok"]) for item in loop["tool_results"]] == [
+        ("status", True),
+        ("latest_intel", True),
+        ("status", True),
+        ("status", False),
+        ("latest_intel", False),
+        ("status", False),
+    ]
+    cycle_guard = loop["semantic_read_only_cycle_guard"]
+    assert cycle_guard["tool_name"] == "status"
+    assert cycle_guard["blocked_tool_call_id"] == "cycle-repeat-status-a"
+    assert cycle_guard["duplicate_of_tool_call_id"] == "cycle-first-status-a"
+    assert cycle_guard["cycle_length"] == 3
+    assert cycle_guard["dispatch_attempted"] is False
+    assert mission.checkpoint["status"] == "not_dispatched"
+
+    evidence_store = EvidenceChainStore(tmp_path / "evidence_chain.db", mission_store=store)
+    records = evidence_store.list(request_id=mission.request_id)
+    native_records = [record for record in records if str(record.get("source", "")).startswith("native-tool:")]
+    assert evidence_store.verify()
+    assert {
+        record["evidence"]["tool_call_id"] for record in native_records
+    } == {"cycle-first-status-a", "cycle-first-intel", "cycle-first-status-b"}
+    assert all("cycle-repeat" not in record["evidence"]["tool_call_id"] for record in native_records)
 
 
 def test_stale_owner_cannot_enqueue_or_reach_worker_effect_boundary(tmp_path, monkeypatch):

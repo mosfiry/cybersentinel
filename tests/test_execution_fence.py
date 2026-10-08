@@ -522,7 +522,8 @@ def test_run_slice_rechecks_active_checkpoint_immediately_before_executor(tmp_pa
     store, mission, _snapshot, _queue, _identity, _claim, fence = _leased_fence(tmp_path)
     effects: list[str] = []
 
-    def executor(_mission, _step, _action_id, *, execution_fence):
+    def executor(_mission, _step, _action_id, *, execution_fence, timeout_seconds):
+        assert timeout_seconds > 0
         effects.append(execution_fence.execution_id)
         return {"success": True}
 

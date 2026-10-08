@@ -41,7 +41,7 @@ from agent.mission_worker import MissionQueue, MissionWorker
 from agent.mission_series_scheduler import MissionSeriesScheduler
 from agent.mission_runtime import MissionRuntime
 from agent.mission import MissionStore
-from agent.agent_core import AgentCore
+from agent.agent_core import AgentCore, OWNER_UI_CONTROL_PLANE_CAPABILITIES
 from agent.planning import Plan, PlanStep
 from security.mission_authorization import MissionAuthorizationSnapshot
 from security.public_session import PublicSessionManager
@@ -53,6 +53,73 @@ from agent.local_runtime.runtime import LlamaCppRuntime
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
+PUBLIC_PROJECT_READ_ONLY_TOOLS = frozenset({
+    "status",
+    "latest_intel",
+    "local_security_check",
+    "local_system_info",
+})
+
+
+def _public_project_owner_tool_scope(owner_instruction: str) -> list[str]:
+    """Grant local tools by default; add bounded actions only on explicit positive Owner requests."""
+    text = " ".join(str(owner_instruction or "").casefold().split())[:12_000]
+    allowed = set(PUBLIC_PROJECT_READ_ONLY_TOOLS)
+
+    clauses = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?;])\s+|,\s+|\s+\b(?:but|however|instead)\b\s+", text)
+        if item.strip()
+    ]
+    run_tests_positive = re.compile(
+        r"^\s*(?:please\s+)?(?:run|execute|rerun|re-run|start|launch|invoke)\b.{0,64}\b(?:pytest|tests?|test suite)\b"
+        r"|^\s*(?:شغّل|شغلي|نفّذ|نفذي|أعد تشغيل)\s*(?:مجموعة\s*)?(?:الاختبارات|اختبارات|pytest)"
+    )
+    run_tests_negative = re.compile(
+        r"\b(?:do not|don't|never|must not|should not|not to|avoid|without)\b.{0,48}\b(?:run|running|execute|executing|rerun|re-run|use|invoke|pytest|tests?|test suite)\b"
+        r"|\b(?:pytest|tests?|test suite)\b.{0,32}\b(?:must not|should not|are not to be|not allowed)\b"
+        r"|(?:لا|لن)\s*(?:تقم\s*ب)?\s*(?:تشغيل|تشغّل|تنفّذ)\s*(?:مجموعة\s*)?(?:الاختبارات|اختبارات|pytest)"
+    )
+    run_tests_requested = any(
+        "?" not in clause and run_tests_positive.search(clause)
+        for clause in clauses
+    )
+    run_tests_negated = any(run_tests_negative.search(clause) for clause in clauses)
+    if run_tests_requested and not run_tests_negated:
+        allowed.add("run_project_tests")
+
+    watch_positive = re.compile(
+        r"^\s*(?:please\s+)?(?:add|create|register|start|enable)\s+(?:a\s+)?watch\b"
+        r"|^\s*(?:please\s+)?(?:watch|monitor)\s+(?:this|the|that|current)\b"
+        r"|^\s*(?:أضف|أنشئ|ابدأ|فعّل)\s*.{0,24}(?:مراقبة|watch)"
+        r"|^\s*(?:راقب|راقبي)\s+\S+"
+    )
+    watch_negative = re.compile(
+        r"\b(?:do not|don't|never|must not|should not|not to|avoid)\b.{0,40}\b(?:watch|monitor(?:ing)?)\b"
+        r"|\b(?:watch|monitor(?:ing)?)\b.{0,32}\b(?:must not|should not|not allowed)\b"
+        r"|(?:لا|لن)\s*.{0,16}(?:تراقب|تراقبوا|مراقبة)"
+    )
+    watch_requested = any("?" not in clause and watch_positive.search(clause) for clause in clauses)
+    watch_negated = any(watch_negative.search(clause) for clause in clauses)
+    if watch_requested and not watch_negated:
+        allowed.add("watch")
+
+    unwatch_positive = re.compile(
+        r"^\s*(?:please\s+)?unwatch\s+(?:this|that|the|current|[a-z0-9_-]+)\b"
+        r"|^\s*(?:please\s+)?(?:stop|remove|disable|delete)\b.{0,36}\b(?:watch(?:ing)?|monitor(?:ing)?|watchlist)\b"
+        r"|^\s*(?:أوقف|ألغِ|الغِ|احذف|أزل)\s*.{0,24}(?:المراقبة|مراقبة|watch)"
+    )
+    unwatch_negative = re.compile(
+        r"\b(?:do not|don't|never|must not|should not|not to|avoid)\b.{0,40}\b(?:unwatch|stop|remove|disable|delete|watch|monitor)\b"
+        r"|\b(?:unwatch|watch|monitor)\b.{0,32}\b(?:must not|should not|not allowed)\b"
+        r"|(?:لا|لن)\s*.{0,16}(?:توقف|تلغ|تحذف|تزل)"
+    )
+    unwatch_requested = any("?" not in clause and unwatch_positive.search(clause) for clause in clauses)
+    unwatch_negated = any(unwatch_negative.search(clause) for clause in clauses)
+    if unwatch_requested and not unwatch_negated:
+        allowed.add("unwatch")
+
+    return sorted(allowed)
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
 PUBLIC_SESSIONS = PublicSessionManager(ttl_seconds=PUBLIC_SESSION_TTL_SECONDS)
 PUBLIC_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -359,11 +426,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def _mission_snapshot_factory(self, owner_identity: str, scope_context: dict | None = None):
         scope_context = scope_context or {}
+        raw_allowed_tools = scope_context.get("allowed_tools")
+        if raw_allowed_tools is None:
+            raise PermissionError("explicit_owner_tool_scope_required")
+        if not isinstance(raw_allowed_tools, (list, tuple, set, frozenset)) or any(
+            not isinstance(item, str) for item in raw_allowed_tools
+        ):
+            raise ValueError("invalid_allowed_tools")
+        owner_model_tools = AgentCore._planning_tool_allowlist(scope_context)
+        if owner_model_tools is None:
+            raise PermissionError("explicit_owner_tool_scope_required")
         target = str(scope_context.get("target_id") or "api-target")
         root = str(scope_context.get("workspace_root") or Path.cwd().resolve())
         def factory(mission):
             actions = tuple(step.action for step in mission.plan.steps if step.action != "__planning_failure__")
-            return MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity=target, scope=("workspace",), allowed_actions=actions, forbidden_actions=tuple(scope_context.get("forbidden_actions", ())), allowed_tools=actions, time_window={"timezone": "UTC"}, max_duration=max(300, mission.max_iterations * 60), rate_limits={action: 10 for action in actions}, network_boundary={"allowed": tuple(scope_context.get("allowed_networks", ()))}, data_boundary={"allowed": (target,)}, credential_boundary={"allowed": tuple(scope_context.get("allowed_credentials", ()))}, workspace_boundary={"root": root}, policy_version="api-owner-policy", owner_approval=owner_identity)
+            if not set(actions).issubset(owner_model_tools):
+                raise PermissionError("plan_action_outside_owner_scope")
+            allowed_tools = tuple(dict.fromkeys((
+                *sorted(owner_model_tools),
+                *OWNER_UI_CONTROL_PLANE_CAPABILITIES,
+            )))
+            rate_limits = {tool: 10 for tool in owner_model_tools}
+            rate_limits.update({"workspace_read": 100, "git_read": 40})
+            return MissionAuthorizationSnapshot.create(owner_identity=owner_identity, mission_id=mission.mission_id, target_identity=target, scope=("workspace",), allowed_actions=allowed_tools, forbidden_actions=tuple(scope_context.get("forbidden_actions", ())), allowed_tools=allowed_tools, time_window={"timezone": "UTC"}, max_duration=max(300, mission.max_iterations * 60), rate_limits=rate_limits, network_boundary={"allowed": tuple(scope_context.get("allowed_networks", ()))}, data_boundary={"allowed": (target,)}, credential_boundary={"allowed": tuple(scope_context.get("allowed_credentials", ()))}, workspace_boundary={"root": root}, policy_version="api-owner-policy", owner_approval=owner_identity)
         return factory
 
     def _public_enabled(self):
@@ -441,11 +526,15 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return owner
 
-    def _public_scope_context(self, project) -> dict[str, object]:
+    def _public_scope_context(self, project, owner_instruction: str = "") -> dict[str, object]:
+        # Public project Missions are local-only by default.  This policy is
+        # derived from the authenticated Owner request, never a model plan,
+        # tool result, skill, or other untrusted Mission content.
         return {
             "target_id": f"local-project:{project.project_id}",
             "workspace_root": str(project.root_path.resolve()),
             "scope": ["workspace"],
+            "allowed_tools": _public_project_owner_tool_scope(owner_instruction),
             "allowed_networks": [],
             "allowed_credentials": [],
         }
@@ -1253,7 +1342,17 @@ class Handler(BaseHTTPRequestHandler):
                     if requested_project_id
                     else store.ensure_default(int(owner["owner_id"]))
                 )
-                safe_payload["scope_context"] = self._public_scope_context(project)
+                owner_instruction = next((
+                    safe_payload[key]
+                    for key in ("objective", "message", "text", "prompt")
+                    if isinstance(safe_payload.get(key), str) and safe_payload[key].strip()
+                ), "")
+                if not owner_instruction and isinstance(safe_payload.get("messages"), list):
+                    for item in reversed(safe_payload["messages"]):
+                        if isinstance(item, dict) and item.get("role") == "user" and isinstance(item.get("content"), str):
+                            owner_instruction = item["content"]
+                            break
+                safe_payload["scope_context"] = self._public_scope_context(project, owner_instruction)
                 result = chat(safe_payload, owner_session_token=owner["session_token"])
                 mission_id = str(result.get("mission_id", ""))
                 if not mission_id and isinstance(result.get("mission"), dict):
@@ -1290,7 +1389,7 @@ class Handler(BaseHTTPRequestHandler):
                     if requested_project_id
                     else store.ensure_default(int(owner["owner_id"]))
                 )
-                scope_context = self._public_scope_context(project)
+                scope_context = self._public_scope_context(project, objective)
                 selected_skill = payload.get("skill_id")
                 if selected_skill is not None and (not isinstance(selected_skill, str) or not selected_skill.strip() or len(selected_skill) > 128):
                     raise ValueError("invalid_skill_selection")

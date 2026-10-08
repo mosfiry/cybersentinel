@@ -276,6 +276,7 @@ class RehearsalRunner:
             "scope_context": {
                 "target_id": self.project,
                 "workspace_root": str(STATE_ROOT / "workspace"),
+                "allowed_tools": ["status", "watch"],
                 "allowed_networks": [],
                 "allowed_credentials": [],
             },

@@ -114,6 +114,28 @@ def test_initial_planning_uses_provider_context_window_token_budget(tmp_path: Pa
     assert captured["include_tool_schema_tokens"] is True
 
 
+def test_agent_core_runtime_limits_are_loaded_from_owner_policy(tmp_path: Path, monkeypatch):
+    import json
+
+    import security.owner_policy as owner_policy
+
+    policy = json.loads(owner_policy.POLICY_PATH.read_text(encoding="utf-8"))
+    policy["runtime_limits"]["max_same_tool_calls"] = 2
+    policy["runtime_limits"]["max_execution_time_seconds"] = 120
+    policy_path = tmp_path / "owner_policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    monkeypatch.setattr(owner_policy, "POLICY_PATH", policy_path)
+
+    router = CapturingRouter()
+    core = AgentCore(router, store=MissionStore(tmp_path / "missions.sqlite3"))
+    limits = core._context_runtime_limits()
+
+    assert limits.max_same_tool_calls == 2
+    assert limits.max_execution_time_seconds == 120
+    assert limits.max_context_chars == min(policy["runtime_limits"]["max_context_chars"], router.context_length * 2)
+    assert limits.max_context_tokens == router.context_length * 4 // 5
+
+
 def test_explicit_status_mission_uses_only_status_schema_and_keeps_owner_policy(tmp_path: Path):
     router = CapturingRouter()
     router.schemas = []

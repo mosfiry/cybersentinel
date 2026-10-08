@@ -38,6 +38,8 @@ from .hypotheses import HypothesisState, HypothesisStatus
 from .strategy import StrategyState
 from .model_intelligence.conversation import MissionIntent, NaturalLanguageUnderstanding
 
+OWNER_UI_CONTROL_PLANE_CAPABILITIES = ("workspace_read", "git_read")
+
 
 class AgentCore:
     """CyberSentinel-native long-horizon facade over the durable MissionRuntime."""
@@ -133,7 +135,7 @@ class AgentCore:
         ]
 
     def _context_runtime_limits(self) -> RuntimeLimits:
-        limits = RuntimeLimits()
+        limits = RuntimeLimits.from_owner_policy()
         context_length = getattr(self.router, "context_length", None)
         if isinstance(context_length, int) and not isinstance(context_length, bool) and context_length > 0:
             limits = replace(
@@ -163,6 +165,18 @@ class AgentCore:
                 raise ValueError(f"invalid_{label}")
         allowed = registered if allowed_raw is None else registered.intersection(allowed_raw)
         return allowed.difference(forbidden_raw or ())
+
+    @staticmethod
+    def _validate_plan_tool_scope(plan: Plan, permitted_tool_names: set[str] | None) -> None:
+        if permitted_tool_names is None:
+            return
+        proposed = {
+            str(step.action)
+            for step in plan.steps
+            if str(step.action) and str(step.action) != "__planning_failure__"
+        }
+        if not proposed.issubset(permitted_tool_names):
+            raise PermissionError("model_plan_exceeds_owner_tool_scope")
 
     @staticmethod
     def _intent_tool_allowlist(objective: str) -> set[str] | None:
@@ -414,7 +428,7 @@ class AgentCore:
             canonical_owner_identity_ref=canonical_owner,
         )
 
-    def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None, delegation_scope: Any = None) -> dict[str, Any]:
+    def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None, delegation_scope: Any = None, timeout_seconds: float | None = None) -> dict[str, Any]:
         from .execution_fence import ExecutionFenceError
         from .external_effects import EffectRecoveryRequired
         if execution_fence is None:
@@ -472,7 +486,7 @@ class AgentCore:
                 # Last live Skill approval/revocation/expiry check immediately before canonical dispatch.
                 selected_skill_context = self._resolve_mission_skill_context(mission)
                 delegation_scope = selected_skill_context.narrow_task_scope(delegation_scope, tool_name=step.action)
-            value = execute_tool(step.action, argument, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, mission_authorization_version=int(mission.provenance.get("authorization_snapshot_version", 1)), owner_authorization=context, owner_authorization_record=dict(raw), workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
+            value = execute_tool(step.action, argument, timeout=timeout_seconds, authorization_decision=decision.decision, scope_context=mission.scope_snapshot, request_id=mission.request_id, mission_authorization=snapshot, mission_authorization_version=int(mission.provenance.get("authorization_snapshot_version", 1)), owner_authorization=context, owner_authorization_record=dict(raw), workspace=workspace, evidence_store=evidence_store, mission_id=mission.mission_id, target_identity=target_identity, execution_fence=execution_fence, execution_id=action_id, event_bus=self.event_bus, hook_registry=self.hook_registry, delegation_scope=delegation_scope, scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None))
             return {"success": True, "source": step.action, "criterion_id": "mission-goal", "result": value, "execution_id": action_id}
         except EffectRecoveryRequired as exc:
             return {
@@ -589,8 +603,9 @@ class AgentCore:
             if skill_binding.allowed_scope and not set(skill_binding.allowed_scope).issubset(set(effective_scope)):
                 raise SkillAuthorizationError("selected Skill scope exceeds the Owner-requested Mission scope")
             skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
+        runtime_limits = self._context_runtime_limits()
         planning_tool_names = self._planning_tool_allowlist(scope_context)
-        planning_policy = RecoveryPolicy()
+        planning_policy = RecoveryPolicy(max_retries=runtime_limits.max_retries)
         planning_run_id = uuid.uuid4().hex
         planning_failures: list[dict[str, Any]] = []
         planning_exhausted = False
@@ -668,6 +683,7 @@ class AgentCore:
                 planning_exhausted = True
                 break
 
+            self._validate_plan_tool_scope(candidate_plan, planning_tool_names)
             if skill_binding is not None:
                 proposed_tools = {str(step.action) for step in candidate_plan.steps if step.action != "__planning_failure__"}
                 if not proposed_tools.issubset(set(skill_binding.required_tools)):
@@ -714,6 +730,13 @@ class AgentCore:
             persisted_authorization = MissionAuthorizationSnapshot.from_dict(
                 dict(current.authorization_snapshot or {})
             )
+            persisted_tools = set(persisted_authorization.allowed_tools)
+            registered_tools = {
+                str(item.get("function", {}).get("name", ""))
+                for item in self._schemas()
+                if isinstance(item, dict) and isinstance(item.get("function"), dict)
+            }
+            authorized_model_tools = persisted_tools.intersection(registered_tools)
             selected_context = self._resolve_mission_skill_context(current) if current.skill_binding else None
             selected_payload = selected_context.to_untrusted_context() if selected_context is not None else None
             new_plan = self._plan(
@@ -724,8 +747,9 @@ class AgentCore:
                 conversation_id=current.mission_id,
                 skill_context=selected_payload,
                 memory_provider=memory_provider,
-                available_tool_names=set(persisted_authorization.allowed_tools),
+                available_tool_names=authorized_model_tools,
             )
+            self._validate_plan_tool_scope(new_plan, authorized_model_tools)
             if selected_context is not None:
                 proposed_tools = {str(step.action) for step in new_plan.steps if step.action != "__planning_failure__"}
                 if not proposed_tools.issubset(set(selected_context.binding.required_tools)):
@@ -738,6 +762,7 @@ class AgentCore:
             executor=self._executor,
             replanner=replan_with_selected_skill,
             recovery_policy=RecoveryPolicy(),
+            runtime_limits=runtime_limits,
             interpreter=ObservationInterpreter(
                 proposer=self._observation_proposal,
                 model_skip_success_actions=("status",),
@@ -756,7 +781,7 @@ class AgentCore:
         planned_tools = tuple(step.action for step in plan.steps if step.action != "__planning_failure__")
         # These are control-plane capabilities for the authenticated Owner UI,
         # not registered model tools and not execution steps.
-        ui_read_capabilities = ("workspace_read", "git_read")
+        ui_read_capabilities = OWNER_UI_CONTROL_PLANE_CAPABILITIES
         allowed_tools = tuple(dict.fromkeys((*planned_tools, *ui_read_capabilities)))
 
         def authorization_snapshot_factory(created_mission: Mission) -> MissionAuthorizationSnapshot:
@@ -816,6 +841,10 @@ class AgentCore:
                 "component": "AgentCore",
                 "planner": "model_proposal",
                 "task_profile": task_profile.to_dict(),
+                "owner_runtime_limits": {
+                    "max_execution_steps": runtime_limits.max_execution_steps,
+                    "max_execution_time_seconds": runtime_limits.max_execution_time_seconds,
+                },
                 **({"mission_memory_scope_ref": memory_scope_key} if memory_scope_key else {}),
             },
             authorization_snapshot_factory=authorization_snapshot_factory,
@@ -986,9 +1015,18 @@ class AgentCore:
         mission, _, fresh_snapshot = self._reauthorize_mission(mission_id, owner_session_token=owner_session_token)
         policy_context = policy_context_from_snapshot(fresh_snapshot)
         def replan_resumed(current: Mission, observation: dict[str, Any]) -> Plan:
+            snapshot = MissionAuthorizationSnapshot.from_dict(dict(current.authorization_snapshot or {}))
+            allowed = set(snapshot.allowed_tools)
+            registered = {
+                str(item.get("function", {}).get("name", ""))
+                for item in self._schemas()
+                if isinstance(item, dict) and isinstance(item.get("function"), dict)
+            }
+            authorized_model_tools = allowed.intersection(registered)
             selected = self._resolve_mission_skill_context(current) if current.skill_binding else None
             payload = selected.to_untrusted_context() if selected is not None else None
-            proposed = self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id, skill_context=payload)
+            proposed = self._plan(current.objective, observation, policy_context=policy_context, request_id=current.request_id, conversation_id=current.mission_id, skill_context=payload, available_tool_names=authorized_model_tools)
+            self._validate_plan_tool_scope(proposed, authorized_model_tools)
             if selected is not None:
                 tools = {str(step.action) for step in proposed.steps if step.action != "__planning_failure__"}
                 if not tools.issubset(set(selected.binding.required_tools)):
@@ -1001,6 +1039,7 @@ class AgentCore:
             executor=self._executor,
             replanner=replan_resumed,
             recovery_policy=RecoveryPolicy(),
+            runtime_limits=self._context_runtime_limits(),
             interpreter=ObservationInterpreter(
                 proposer=self._observation_proposal,
                 model_skip_success_actions=("status",),

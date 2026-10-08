@@ -6,8 +6,10 @@ from typing import Any, Callable
 import hashlib
 import inspect
 import json
+import math
 import re
 import time
+from time import time as _wall_clock_time
 
 from .mission import Mission, MissionClaimBinding, MissionStatus, MissionStore
 from .execution_fence import ExecutionFence, ExecutionFenceError
@@ -28,6 +30,7 @@ from security.mission_authorization import MissionAuthorizationError
 
 MAX_TOOL_ERROR_CHARS = 128
 MAX_TOOL_ERROR_OUTPUT_CHARS = MAX_TOOL_ERROR_CHARS + 2
+MAX_READ_ONLY_TOOL_CYCLE_LENGTH = 4
 MAX_VERIFIED_FINAL_INPUT_CHARS = 4096
 MAX_VERIFIED_FINAL_OUTPUT_CHARS = 2048
 VERIFIED_FINAL_MAX_TOKENS = 128
@@ -49,7 +52,6 @@ class MissionRuntime:
         self.authorizer = authorizer or self._default_authorizer
         self.replanner = replanner or self._default_replanner
         self.verifier = verifier or self._default_verifier
-        self.recovery_policy = recovery_policy or RecoveryPolicy()
         self.interpreter = interpreter or ObservationInterpreter()
         self.require_authorization_snapshot = require_authorization_snapshot
         self.authorization_snapshot_factory = authorization_snapshot_factory
@@ -58,6 +60,13 @@ class MissionRuntime:
         self.runtime_limits = runtime_limits if runtime_limits is not None else RuntimeLimits.from_owner_policy()
         if not isinstance(self.runtime_limits, RuntimeLimits):
             raise TypeError("MissionRuntime requires RuntimeLimits")
+        configured_recovery = recovery_policy or RecoveryPolicy()
+        owner_retry_cap = self._limit_value(self.runtime_limits.max_retries)
+        configured_retry_cap = self._limit_value(configured_recovery.max_retries)
+        self.recovery_policy = replace(
+            configured_recovery,
+            max_retries=min(owner_retry_cap, configured_retry_cap),
+        )
         if event_bus is not None or hook_registry is not None:
             from .intelligence_layer.events import EventBus, HookRegistry
             if event_bus is not None and not isinstance(event_bus, EventBus):
@@ -73,7 +82,18 @@ class MissionRuntime:
         self.mission_memory_writer = mission_memory_writer
         if task_graph_policy is not None and not isinstance(task_graph_policy, AgentGraphPolicy):
             raise TypeError("MissionRuntime task_graph_policy must be an AgentGraphPolicy")
-        self.task_graph_adapter = MissionTaskGraphAdapter(task_graph_policy) if task_graph_policy is not None else None
+        effective_task_graph_policy = (
+            replace(
+                task_graph_policy,
+                max_retries=min(
+                    self._limit_value(task_graph_policy.max_retries),
+                    owner_retry_cap,
+                ),
+            )
+            if task_graph_policy is not None
+            else None
+        )
+        self.task_graph_adapter = MissionTaskGraphAdapter(effective_task_graph_policy) if effective_task_graph_policy is not None else None
 
     @staticmethod
     def _limit_value(value: Any) -> int:
@@ -103,6 +123,54 @@ class MissionRuntime:
             mission.provenance["owner_runtime_limits"] = snapshots
             self._save(mission)
         return effective_limit
+
+    def _owner_execution_time_limit(self, mission: Mission) -> int:
+        current_limit = self._limit_value(self.runtime_limits.max_execution_time_seconds)
+        if not isinstance(mission.provenance, dict):
+            raise _MissionBudgetExceeded("owner_execution_time_policy", 0)
+        snapshots = mission.provenance.get("owner_runtime_limits")
+        if snapshots is None:
+            snapshots = {}
+        if not isinstance(snapshots, dict):
+            raise _MissionBudgetExceeded("owner_execution_time_policy", 0)
+        if "max_execution_time_seconds" not in snapshots:
+            saved_limit = current_limit
+        else:
+            saved_limit = snapshots["max_execution_time_seconds"]
+            if isinstance(saved_limit, bool) or not isinstance(saved_limit, int) or saved_limit < 0:
+                raise _MissionBudgetExceeded("owner_execution_time_policy", 0)
+        effective_limit = min(saved_limit, current_limit)
+        if snapshots.get("max_execution_time_seconds") != effective_limit:
+            snapshots = dict(snapshots)
+            snapshots["max_execution_time_seconds"] = effective_limit
+            mission.provenance["owner_runtime_limits"] = snapshots
+            self._save(mission)
+        return effective_limit
+
+    def _owner_execution_deadline(self, mission: Mission) -> tuple[float, int]:
+        """Return a process-local deadline derived from the durable first-dispatch time."""
+        limit = self._owner_execution_time_limit(mission)
+        progress = mission.progress
+        key = "owner_execution_started_at_epoch"
+        started_at = progress.get(key)
+        if started_at is None:
+            started_at = _wall_clock_time()
+            progress[key] = started_at
+            self._save(mission)
+        if (
+            isinstance(started_at, bool)
+            or not isinstance(started_at, (int, float))
+            or not math.isfinite(float(started_at))
+            or float(started_at) < 0
+        ):
+            raise _MissionBudgetExceeded("owner_execution_time_policy", 0)
+        elapsed = max(0.0, _wall_clock_time() - float(started_at))
+        remaining = max(0.0, float(limit) - elapsed)
+        return time.monotonic() + remaining, limit
+
+    def _owner_execution_remaining_seconds(self, mission: Mission) -> float:
+        deadline, _limit = self._owner_execution_deadline(mission)
+        return self._remaining_seconds(deadline)
 
     def _context_limits(self, model: Any = None) -> tuple[int, int]:
         # This is the model-input budget. MAX_PROVIDER_TEXT_CHARS separately
@@ -249,7 +317,7 @@ class MissionRuntime:
         return max(0.0, deadline - time.monotonic())
 
     @staticmethod
-    def _complete_with_timeout(model: Any, messages: Any, tools: Any, *, mission_id: str, run_id: str, turn_id: str, plan_version: int, timeout_seconds: float) -> Any:
+    def _complete_with_timeout(model: Any, messages: Any, tools: Any, *, mission_id: str, run_id: str, turn_id: str, plan_version: int, timeout_seconds: float, require_timeout: bool = False) -> Any:
         complete = model.complete
         kwargs = {
             "mission_id": mission_id,
@@ -257,12 +325,19 @@ class MissionRuntime:
             "turn_id": turn_id,
             "plan_version": plan_version,
         }
+        accepts_timeout = False
         try:
             parameters = inspect.signature(complete).parameters.values()
-            if any(parameter.name == "timeout_seconds" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
-                kwargs["timeout_seconds"] = timeout_seconds
+            accepts_timeout = any(
+                parameter.name == "timeout_seconds" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
         except (TypeError, ValueError):
             pass
+        if require_timeout and not accepts_timeout:
+            raise InvalidModelResponse("strict model adapter does not accept the Owner execution timeout")
+        if accepts_timeout:
+            kwargs["timeout_seconds"] = timeout_seconds
         return complete(messages, tools, **kwargs)
 
     @staticmethod
@@ -530,6 +605,17 @@ class MissionRuntime:
         )
         function = getattr(executor, "__func__", executor)
         return accepts and getattr(function, "task_delegation_scope_enforced", False) is True
+
+    @staticmethod
+    def _executor_accepts_timeout(executor: Callable[..., Any]) -> bool:
+        try:
+            parameters = inspect.signature(executor).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == "timeout_seconds" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
 
     def persist_execution_state(self, mission: Mission) -> Mission:
         """Persist execution-owned metadata before the worker releases its lease."""
@@ -928,6 +1014,59 @@ class MissionRuntime:
             "mcp.invoke": "owner_approved_schema_pinned_mcp_invocation_evidence",
         }.get(tool_name, "")
 
+    @staticmethod
+    def _native_read_only_call_signature(
+        tool_name: Any,
+        arguments: Any,
+        *,
+        step_id: Any = "",
+        action_id: Any = "",
+    ) -> tuple[str, str, str] | None:
+        """Identify identical local reads within one server-bound plan step/action."""
+        if not isinstance(tool_name, str) or not tool_name or not isinstance(arguments, dict):
+            return None
+        from tools.registry import get_tool
+
+        spec = get_tool(tool_name)
+        if spec is None or (
+            spec.risk_class != "read"
+            or bool(spec.effect_provider)
+            or spec.network_access != "none"
+            or spec.filesystem_access != "none"
+            or spec.process_access != "none"
+            or spec.credential_access != "none"
+        ):
+            return None
+        try:
+            encoded = json.dumps(
+                arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError):
+            return None
+        execution_context = str(step_id or action_id or "mission")
+        return tool_name, hashlib.sha256(encoded).hexdigest(), execution_context
+
+    @staticmethod
+    def _read_only_tool_cycle_start(
+        recent_calls: list[tuple[tuple[str, str, str], str]],
+        candidate: tuple[str, str, str],
+    ) -> list[tuple[tuple[str, str, str], str]] | None:
+        """Detect a return to a multi-tool read cycle within one server-bound plan step."""
+        for cycle_length in range(2, min(MAX_READ_ONLY_TOOL_CYCLE_LENGTH, len(recent_calls)) + 1):
+            cycle = recent_calls[-cycle_length:]
+            signatures = [item[0] for item in cycle]
+            if len({signature[0] for signature in signatures}) < 2:
+                continue
+            if len({signature[2] for signature in signatures + [candidate]}) != 1:
+                continue
+            if candidate == signatures[0]:
+                return cycle
+        return None
+
     def create(self, owner_request: str, objective: str, plan: Plan, **kwargs: Any) -> Mission:
         snapshot_factory = kwargs.pop("authorization_snapshot_factory", None) or self.authorization_snapshot_factory
         planning_failures = kwargs.pop("planning_failures", None)
@@ -1117,6 +1256,7 @@ class MissionRuntime:
         execution_fence: ExecutionFence | None,
         execution_id: str,
         *,
+        tool_call_id: str = "",
         timeout_seconds: float | None = None,
         max_result_chars: int | None = None,
         delegation_scope: Any = None,
@@ -1138,14 +1278,16 @@ class MissionRuntime:
         target_identity = None
         mission_authorization = mission.authorization_snapshot
         owner_authorization = None
+        strict_execution = bool(
+            execution_fence is not None
+            and execution_fence.queue.require_execution_fence
+        )
+        if strict_execution and execution_fence.queue.mission_store is not self.store:
+            raise ExecutionFenceError("native Mission tool dispatch requires its strict queue and MissionStore")
         if name == "run_project_tests" or spec.execution_context_required:
-            if execution_fence is None:
-                raise ExecutionFenceError("native Mission tool dispatch requires an execution fence")
-            if (
-                not execution_fence.queue.require_execution_fence
-                or execution_fence.queue.mission_store is not self.store
-            ):
+            if not strict_execution:
                 raise ExecutionFenceError("native Mission tool dispatch requires its strict queue and MissionStore")
+        if strict_execution:
             execution_fence.assert_active_execution(mission)
             from security.mission_authorization import MissionAuthorizationSnapshot
             from .evidence import EvidenceChainStore
@@ -1185,7 +1327,7 @@ class MissionRuntime:
                 else snapshot.target_identity
             )
 
-        return execute_tool(
+        raw = execute_tool(
             name,
             argument,
             authorization_decision=authorization_decision,
@@ -1208,8 +1350,65 @@ class MissionRuntime:
             delegation_scope=delegation_scope,
             scope_ref=(delegation_scope.scope[0] if delegation_scope is not None and delegation_scope.scope else None),
         )
+        if evidence_store is not None:
+            encoded_result = json.dumps(
+                raw,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+            scope_snapshot = mission.scope_snapshot if isinstance(mission.scope_snapshot, dict) else {}
+            encoded_scope = json.dumps(
+                scope_snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+            evidence_store.append(
+                {
+                    "claim": f"native Mission tool {name} returned an observed result",
+                    "source": f"native-tool:{name}",
+                    "evidence": {
+                        "record_type": "NATIVE_TOOL_RESULT",
+                        "tool_name": name,
+                        "tool_call_id": tool_call_id or execution_id,
+                        "result_sha256": hashlib.sha256(encoded_result).hexdigest(),
+                        "result_bytes": len(encoded_result),
+                        "result_type": type(raw).__name__,
+                        "trust_classification": "untrusted_data",
+                        "authority": "none",
+                        "authorized_tool": name in snapshot.allowed_tools,
+                        "authorization_snapshot_sha256": execution_fence.authorization_hash,
+                        "scope_snapshot_id": str(scope_snapshot.get("scope_snapshot_id", "")),
+                        "scope_sha256": hashlib.sha256(encoded_scope).hexdigest(),
+                        "target_id": target_identity or "",
+                    },
+                    "verification": "observed",
+                    "confidence": 0,
+                    "request_id": mission.request_id,
+                    "mission_id": mission.mission_id,
+                    "chain": (
+                        f"mission:{mission.mission_id}",
+                        f"tool:{name}",
+                        f"call:{tool_call_id or execution_id}",
+                    ),
+                },
+                execution_fence=execution_fence,
+            )
+        return raw
 
-    def _block_on_budget(self, mission: Mission, budget: str, limit: int) -> Mission:
+    def _block_on_budget(
+        self,
+        mission: Mission,
+        budget: str,
+        limit: int,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> Mission:
         mission.error = f"mission runtime budget exceeded: {budget}"
         failure = {
             "class": FailureClass.RESOURCE.value,
@@ -1217,6 +1416,8 @@ class MissionRuntime:
             "budget": budget,
             "limit": limit,
         }
+        if details:
+            failure["details"] = dict(details)
         mission.failures.append(failure)
         mission.emit(EventType.FAILURE_DETECTED, data=failure)
         mission.emit(EventType.FAILURE_DIAGNOSED, data={
@@ -1526,10 +1727,14 @@ class MissionRuntime:
         context_char_limit, context_message_limit = self._context_limits(model)
         if context_char_limit < 1:
             return self._block_on_budget(mission, "max_context_chars", context_char_limit)
-        execution_time_limit = self._limit_value(self.runtime_limits.max_execution_time_seconds)
+        try:
+            deadline, execution_time_limit = self._owner_execution_deadline(mission)
+        except _MissionBudgetExceeded as exc:
+            return self._block_on_budget(mission, exc.budget, exc.limit)
         if execution_time_limit < 1:
             return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
-        deadline = time.monotonic() + execution_time_limit
+        if self._remaining_seconds(deadline) <= 0:
+            return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
         auth_context = None
         if mission.authorization_context:
             try:
@@ -1638,6 +1843,7 @@ class MissionRuntime:
                     turn_id=turn_id,
                     plan_version=mission.plan.version,
                     timeout_seconds=remaining_seconds,
+                    require_timeout=self.require_execution_fence,
                 )
                 if self._remaining_seconds(deadline) <= 0:
                     raise _MissionBudgetExceeded("max_execution_time_seconds", execution_time_limit)
@@ -1749,6 +1955,96 @@ class MissionRuntime:
                     return mission
                 continue
             retryable_provider_failure = False
+            recent_read_only_calls: list[tuple[tuple[str, str, str], str]] = []
+            for prior_result in progress["tool_results"]:
+                if not isinstance(prior_result, dict) or prior_result.get("ok") is not True:
+                    recent_read_only_calls = []
+                    continue
+                signature = self._native_read_only_call_signature(
+                    prior_result.get("name"),
+                    prior_result.get("arguments"),
+                    step_id=prior_result.get("step_id"),
+                    action_id=prior_result.get("action_id"),
+                )
+                if signature is None:
+                    recent_read_only_calls = []
+                else:
+                    recent_read_only_calls.append(
+                        (signature, str(prior_result.get("tool_call_id", "")))
+                    )
+            repeated_call: dict[str, Any] | None = None
+            repeated_signature: tuple[str, str, str] | None = None
+            for proposal in turn.tool_calls:
+                signature = self._native_read_only_call_signature(
+                    proposal.name,
+                    proposal.arguments,
+                    step_id=proposal.step_id,
+                    action_id=proposal.action_id,
+                )
+                if signature is None:
+                    recent_read_only_calls = []
+                    continue
+                cycle = self._read_only_tool_cycle_start(recent_read_only_calls, signature)
+                if cycle is not None:
+                    cycle_call_ids = [call_id for _cycle_signature, call_id in cycle]
+                    repeated_call = {
+                        "tool_name": proposal.name,
+                        "blocked_tool_call_id": proposal.tool_call_id,
+                        "duplicate_of_tool_call_id": cycle_call_ids[0] if cycle_call_ids else "",
+                        "duplicate_kind": "repeated_read_only_tool_cycle",
+                        "cycle_length": len(cycle),
+                        "cycle_tool_call_ids": cycle_call_ids,
+                        "step_id": proposal.step_id,
+                        "action_id": proposal.action_id,
+                    }
+                    repeated_signature = signature
+                    break
+                # Proposals in this provider turn have not executed yet. Only
+                # completed successful calls may establish a cycle history;
+                # otherwise the first finite A,B,A batch is falsely blocked.
+            if repeated_call is not None and repeated_signature is not None:
+                progress["turns"].append(turn.to_dict())
+                mission.emit(EventType.MODEL_TURN, data={
+                    "turn_id": turn.turn_id,
+                    "provider": turn.provider,
+                    "model": turn.model,
+                    "tool_call_count": len(turn.tool_calls),
+                    "finish_reason": turn.finish_reason,
+                })
+                for proposal in turn.tool_calls:
+                    if proposal.tool_call_id not in seen:
+                        seen.add(proposal.tool_call_id)
+                        progress["seen_call_ids"].append(proposal.tool_call_id)
+                    mission.emit(EventType.TOOL_PROPOSED, data=proposal.to_dict())
+                    error = (
+                        "repeated_read_only_tool_cycle_suppressed"
+                        if proposal.tool_call_id == repeated_call["blocked_tool_call_id"]
+                        else "turn_blocked_before_dispatch_due_to_repeated_read_only_tool_cycle"
+                    )
+                    progress["tool_results"].append(
+                        ToolCallResult(proposal, False, error=error).to_dict()
+                    )
+                repeat_details = {
+                    **repeated_call,
+                    "arguments_sha256": repeated_signature[1],
+                    "dispatch_attempted": False,
+                    "execution_context_id": repeated_signature[2],
+                    "guard": "repeated_multi_tool_read_cycle_within_one_plan_step",
+                }
+                progress["semantic_read_only_cycle_guard"] = repeat_details
+                mission.checkpoint = {
+                    "status": "not_dispatched",
+                    "reason_code": "repeated_read_only_tool_cycle",
+                    "run_id": run_id,
+                    "turn_id": turn.turn_id,
+                    "blocked_tool_call_ids": [proposal.tool_call_id for proposal in turn.tool_calls],
+                }
+                return self._block_on_budget(
+                    mission,
+                    "repeated_read_only_tool_cycle",
+                    int(repeated_call["cycle_length"]),
+                    details=repeat_details,
+                )
             progress["turns"].append(turn.to_dict())
             mission.emit(EventType.MODEL_TURN, data={"turn_id": turn.turn_id, "provider": turn.provider, "model": turn.model, "tool_call_count": len(turn.tool_calls), "finish_reason": turn.finish_reason})
             if not turn.tool_calls:
@@ -1839,6 +2135,7 @@ class MissionRuntime:
                             mission,
                             dispatch_fence,
                             execution_id,
+                            tool_call_id=proposal.tool_call_id,
                             timeout_seconds=remaining_seconds,
                             max_result_chars=result_caps[index],
                             delegation_scope=delegation_scope,
@@ -2074,6 +2371,7 @@ class MissionRuntime:
                     mission,
                     dispatch_fence,
                     execution_id,
+                    tool_call_id=proposal.tool_call_id,
                     timeout_seconds=remaining_seconds,
                     max_result_chars=result_caps[proposal.tool_call_id],
                     delegation_scope=delegation_scope,
@@ -2221,14 +2519,19 @@ class MissionRuntime:
                 mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, action_id=action_id)
             return self._save(mission)
         try:
+            deadline, owner_time_limit = self._owner_execution_deadline(mission)
+            owner_step_limit = self._owner_execution_step_limit(mission)
+        except _MissionBudgetExceeded as exc:
+            return self._block_on_budget(mission, exc.budget, exc.limit)
+        if self._remaining_seconds(deadline) <= 0:
+            return self._block_on_budget(mission, "max_execution_time_seconds", owner_time_limit)
+        effective_step_limit = min(owner_step_limit, mission.max_iterations)
+        if effective_step_limit < 1 or mission.iteration_count >= effective_step_limit:
+            return self._block_on_budget(mission, "max_execution_steps", owner_step_limit)
+        try:
             skill_context = self._skill_context_for(mission)
         except Exception:
             return self._block_on_skill_context(mission)
-        if mission.iteration_count >= mission.max_iterations:
-            mission.error = "iteration budget exhausted"
-            mission.emit(EventType.FAILURE_DETECTED, data={"class": FailureClass.RESOURCE.value, "reason": mission.error})
-            mission.transition(MissionStatus.FAILED_RETRY_EXHAUSTED, mission.error)
-            return self._save(mission)
         mission.iteration_count += 1
         if mission.current_step >= len(mission.plan.steps):
             mission.transition(MissionStatus.VERIFYING, "all plan steps observed")
@@ -2256,11 +2559,18 @@ class MissionRuntime:
             if self.specialist_generate is not None:
                 try:
                     from .intelligence_layer.specialist_dispatch import run_ready_specialist_batch
-                    specialist_result = run_ready_specialist_batch(self, mission, graph_snapshot)
+                    specialist_result = run_ready_specialist_batch(
+                        self,
+                        mission,
+                        graph_snapshot,
+                        timeout_seconds=self._remaining_seconds(deadline),
+                    )
                 except Exception as exc:
                     return self._block_on_task_graph(mission, exc)
                 if specialist_result is not None:
                     return specialist_result
+            if self._remaining_seconds(deadline) <= 0:
+                return self._block_on_budget(mission, "max_execution_time_seconds", owner_time_limit)
             from .intelligence_layer.parallel_dispatch import run_parallel_graph_steps
 
             parallel_result = run_parallel_graph_steps(self, mission, graph_snapshot, skill_context=skill_context)
@@ -2322,21 +2632,32 @@ class MissionRuntime:
         if skill_context is not None:
             mission.checkpoint["skill_reference"] = skill_context.reference
         self._save(mission)
+        remaining_seconds = self._remaining_seconds(deadline)
+        if remaining_seconds <= 0:
+            mission.checkpoint = {**dict(mission.checkpoint or {}), "status": "not_dispatched", "reason_code": "owner_execution_deadline_expired"}
+            self._save(mission)
+            return self._block_on_budget(mission, "max_execution_time_seconds", owner_time_limit)
+        accepts_timeout = self._executor_accepts_timeout(self.executor)
+        if self.require_execution_fence and not accepts_timeout:
+            mission.checkpoint = {**dict(mission.checkpoint or {}), "status": "not_dispatched", "reason_code": "timeout_aware_executor_required"}
+            self._save(mission)
+            return self._block_on_budget(mission, "timeout_aware_executor_required", owner_time_limit)
+        timeout_kwargs = {"timeout_seconds": remaining_seconds} if accepts_timeout else {}
         dispatch_fence = self._fence_for(mission, task_id=step.step_id, execution_id=action_id)
         if dispatch_fence is not None:
             dispatch_fence.assert_active_execution(mission)
         try:
             if dispatch_fence is None:
-                result = self.executor(mission, step, action_id)
+                result = self.executor(mission, step, action_id, **timeout_kwargs)
             elif self._executor_accepts_fence(self.executor):
                 if delegation_scope is not None:
-                    result = self.executor(mission, step, action_id, execution_fence=dispatch_fence, delegation_scope=delegation_scope)
+                    result = self.executor(mission, step, action_id, execution_fence=dispatch_fence, delegation_scope=delegation_scope, **timeout_kwargs)
                 else:
-                    result = self.executor(mission, step, action_id, execution_fence=dispatch_fence)
+                    result = self.executor(mission, step, action_id, execution_fence=dispatch_fence, **timeout_kwargs)
             elif self.require_execution_fence:
                 raise ExecutionFenceError("strict runtime executor does not accept execution fences")
             else:
-                result = self.executor(mission, step, action_id)
+                result = self.executor(mission, step, action_id, **timeout_kwargs)
         except ExecutionFenceError:
             raise
         except Exception as exc:
@@ -2480,14 +2801,58 @@ class MissionRuntime:
         return self._save(mission)
 
     def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:
-        limit = max_slices or self._load(mission_id).max_iterations
-        for _ in range(limit):
+        mission = self._load(mission_id)
+        if mission.is_terminal:
+            return mission
+        try:
+            step_limit = self._owner_execution_step_limit(mission)
+            time_limit = self._owner_execution_time_limit(mission)
+        except _MissionBudgetExceeded as exc:
+            return self._block_on_budget(mission, exc.budget, exc.limit)
+        if step_limit < 1:
+            return self._block_on_budget(mission, "max_execution_steps", step_limit)
+        if time_limit < 1:
+            return self._block_on_budget(mission, "max_execution_time_seconds", time_limit)
+
+        if max_slices is None:
+            requested_slices = mission.max_iterations
+        elif isinstance(max_slices, bool) or not isinstance(max_slices, int) or max_slices < 0:
+            return self._block_on_budget(mission, "max_execution_steps", step_limit)
+        else:
+            requested_slices = max_slices
+        if isinstance(requested_slices, bool) or not isinstance(requested_slices, int) or requested_slices < 0:
+            return self._block_on_budget(mission, "max_execution_steps", step_limit)
+        if requested_slices == 0:
+            return mission
+
+        try:
+            deadline, time_limit = self._owner_execution_deadline(mission)
+        except _MissionBudgetExceeded as exc:
+            return self._block_on_budget(mission, exc.budget, exc.limit)
+        if self._remaining_seconds(deadline) <= 0:
+            return self._block_on_budget(mission, "max_execution_time_seconds", time_limit)
+        remaining_owner_steps = max(0, step_limit - mission.iteration_count)
+        slice_count = min(requested_slices, remaining_owner_steps)
+        for _ in range(slice_count):
+            mission = self._load(mission_id)
+            if mission.is_terminal:
+                return mission
+            if mission.iteration_count >= step_limit:
+                return self._block_on_budget(mission, "max_execution_steps", step_limit)
+            if self._remaining_seconds(deadline) <= 0:
+                return self._block_on_budget(mission, "max_execution_time_seconds", time_limit)
             if heartbeat is not None:
                 heartbeat()
             mission = self.run_slice(mission_id)
             if mission.is_terminal:
                 return mission
-        return self._load(mission_id)
+            if self._remaining_seconds(deadline) <= 0:
+                return self._block_on_budget(mission, "max_execution_time_seconds", time_limit)
+
+        mission = self._load(mission_id)
+        if not mission.is_terminal and mission.iteration_count >= step_limit:
+            return self._block_on_budget(mission, "max_execution_steps", step_limit)
+        return mission
 
 
 __all__ = ["MissionRuntime"]

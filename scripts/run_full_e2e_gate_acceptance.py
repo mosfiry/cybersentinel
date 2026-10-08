@@ -4,9 +4,10 @@ Chromium Browser, and an owner-approved local MCP server, then writes a validate
 report artifact and verifies persistence/reopen/resume.
 
 All databases, certificates, and logs are isolated under --state-dir. The HTTPS
-fixture binds only to 127.0.0.1:443 and drops root privileges after bind. The
-real local Qwen3 model is the sole model provider; Browser and MCP test exceptions
-are restricted to the exact local fixture origin.
+fixture binds only to 127.0.0.1; POSIX uses port 443 and drops root privileges
+after bind, while Windows uses a dynamically allocated loopback port without
+sudo. The real local Qwen3 model is the sole provider; Browser and MCP test
+exceptions are restricted to the exact local fixture origin.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import socket
 import sqlite3
 import ssl
 import subprocess
@@ -94,6 +96,12 @@ class E2ERecordingRouter:
 
 def progress(message: str) -> None:
     print(f"[full-e2e] {message}", flush=True)
+
+
+def free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
 
 
 def emit(path: Path, payload: dict[str, object], *, code: int = 0) -> int:
@@ -338,19 +346,31 @@ def main() -> int:
 
         # TLS certificate is valid for the exact loopback IP used by both tools.
         failure_phase = "local_tls_fixture"
+        fixture_port = free_loopback_port() if os.name == "nt" else 443
+        result["fixture"]["port"] = fixture_port
         cert = run_dir / "fixture-cert.pem"
         key = run_dir / "fixture-key.pem"
         request_log = run_dir / "fixture-requests.jsonl"
+        openssl = shutil.which("openssl")
+        if openssl is None and os.name == "nt":
+            candidates = [
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "usr" / "bin" / "openssl.exe",
+                Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "usr" / "bin" / "openssl.exe",
+            ]
+            openssl = next((str(candidate) for candidate in candidates if candidate.is_file()), None)
+        if openssl is None:
+            raise RuntimeError("openssl_cli_unavailable_for_local_tls_fixture")
         subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+            openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
             "-days", "1", "-keyout", str(key), "-out", str(cert),
             "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         key.chmod(0o600)
         cert.chmod(0o644)
         endpoint_path = "/mcp/" + secrets.token_hex(20)
-        endpoint = "https://127.0.0.1" + endpoint_path
-        research_url = "https://127.0.0.1/research"
+        port_suffix = "" if fixture_port == 443 else f":{fixture_port}"
+        endpoint = f"https://127.0.0.1{port_suffix}{endpoint_path}"
+        research_url = f"https://127.0.0.1{port_suffix}/research"
         from scripts.run_mcp_mission_acceptance import _start_fixture, _stop_fixture, _read_jsonl, _evidence_chain_records
         fixture_process, fixture_ready, ready_payload = _start_fixture(
             script=ROOT / "scripts" / "mcp_streamable_fixture_server.py",
@@ -359,12 +379,19 @@ def main() -> int:
             cert=cert,
             key=key,
             request_log=request_log,
+            port=fixture_port,
         )
-        if ready_payload.get("bind") != "127.0.0.1" or ready_payload.get("effective_uid") != os.getuid():
+        expected_uid = os.getuid() if hasattr(os, "getuid") else None
+        if (
+            ready_payload.get("bind") != "127.0.0.1"
+            or ready_payload.get("effective_uid") != expected_uid
+            or ready_payload.get("port") != fixture_port
+            or (os.name == "nt" and ready_payload.get("was_root") != 0)
+        ):
             raise RuntimeError("fixture_loopback_or_privilege_check_failed")
         tls_context = ssl.create_default_context(cafile=str(cert))
         with __import__("urllib.request", fromlist=["urlopen"]).urlopen(
-            "https://127.0.0.1/health", context=tls_context, timeout=3.0
+            f"https://127.0.0.1{port_suffix}/health", context=tls_context, timeout=3.0
         ) as response:
             if response.status != 200:
                 raise RuntimeError("fixture_tls_health_failed")
@@ -373,7 +400,12 @@ def main() -> int:
             "endpoint_sha256": sha256(endpoint),
             "research_url_sha256": sha256(research_url),
             "certificate_sha256": sha256(cert.read_bytes()),
-            "effective_uid": int(ready_payload["effective_uid"]),
+            "effective_uid": ready_payload.get("effective_uid"),
+            "effective_gid": ready_payload.get("effective_gid"),
+            "identity_model": (
+                "same Windows runner process identity; no POSIX UID or privilege drop"
+                if os.name == "nt" else "POSIX UID checked after fixture privilege drop"
+            ),
             "fixture_pid": int(ready_payload["pid"]),
             "tls_health": "PASS",
         })
@@ -392,7 +424,7 @@ def main() -> int:
             in_scope_assets=({
                 "host": "127.0.0.1",
                 "schemes": ["https"],
-                "ports": [443],
+                "ports": [fixture_port],
                 "paths": list(in_scope_paths),
             },),
             allowed_methods=("GET", "POST"),
@@ -406,7 +438,7 @@ def main() -> int:
             host="127.0.0.1",
             asset_type="local_https_browser_mcp_fixture",
             environment="test",
-            allowed_ports=(443,),
+            allowed_ports=(fixture_port,),
             allowed_paths=in_scope_paths,
         )
         snapshot = make_snapshot(

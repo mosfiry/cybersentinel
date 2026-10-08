@@ -14,6 +14,7 @@ import math
 import mimetypes
 import re
 import threading
+import time
 import uuid
 from urllib.parse import urlsplit
 
@@ -1078,6 +1079,10 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+    spec_timeout = float(spec.timeout)
+    if not math.isfinite(spec_timeout) or spec_timeout <= 0:
+        raise ValueError("tool timeout must be a positive finite number")
+    limit = spec_timeout if timeout is None else min(float(timeout), spec_timeout)
     valid, reason, argument = spec.validate_input(argument)
     if not valid:
         raise ValueError(reason)
@@ -1225,6 +1230,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             evidence_store=evidence_store,
             artifact_store=artifact_store,
             cancellation_event=cancellation_event,
+            deadline_monotonic=time.monotonic() + limit,
             delegation_scope=delegated_scope,
         )
         tool_execution_context.assert_active()
@@ -1395,6 +1401,8 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             handler_kwargs["execution_context"] = tool_execution_context
         try:
             result = spec.handler(argument, **handler_kwargs)
+            if tool_execution_context is not None:
+                tool_execution_context.assert_active()
         except ExecutionFenceError:
             raise
         except Exception as exc:
@@ -1476,7 +1484,6 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 ) from exc
         return result
 
-    limit = timeout if timeout is not None else spec.timeout
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
     if spec.workspace_scope_required:
         workspace_authorization = mission_authorization

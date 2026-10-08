@@ -72,8 +72,9 @@ def test_recurring_series_persists_restarts_retries_dispatch_and_cancels_future_
     occurrence_ids = [item.mission_id for item in missions[:3]]
     retry_id = missions[3].mission_id
 
-    def execute(_mission, step, _action_id, *, execution_fence=None):
+    def execute(_mission, step, _action_id, *, execution_fence=None, timeout_seconds=None):
         assert execution_fence is not None
+        assert timeout_seconds is not None and timeout_seconds > 0
         executions.append(step.step_id)
         if _mission.mission_id == occurrence_ids[1]:
             return {"success": False, "failure_class": "UNKNOWN", "error": "injected_worker_failure"}

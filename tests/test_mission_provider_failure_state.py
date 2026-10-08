@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
+import pytest
+
 from agent.context import RuntimeLimits
+from agent.intelligence_layer.graph import AgentGraphPolicy
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
-from agent.planning import Plan, RecoveryPolicy
-from agent.provider_api import ProviderAuthenticationFailure, ProviderFailure, ProviderRequestRejected
+from agent.planning import Plan, PlanStep, RecoveryPolicy
+from agent.provider_api import InvalidModelResponse, ProviderAuthenticationFailure, ProviderFailure, ProviderRequestRejected
 from runtime_authorization import make_test_snapshot
 
 
@@ -21,12 +25,44 @@ class AlwaysFailingModel:
         raise self.error_factory()
 
 
-def _runtime(tmp_path: Path, *, max_retries: int = 2) -> MissionRuntime:
+def test_strict_model_adapter_must_accept_owner_timeout_before_call():
+    calls = []
+
+    class UnboundedModel:
+        def complete(self, _messages, _tools, *, mission_id, run_id, turn_id, plan_version):
+            calls.append((mission_id, run_id, turn_id, plan_version))
+            raise AssertionError("unbounded model must not be called by strict runtime")
+
+    with pytest.raises(InvalidModelResponse, match="does not accept the Owner execution timeout"):
+        MissionRuntime._complete_with_timeout(
+            UnboundedModel(),
+            [],
+            [],
+            mission_id="bounded-mission",
+            run_id="bounded-run",
+            turn_id="bounded-turn",
+            plan_version=1,
+            timeout_seconds=1.0,
+            require_timeout=True,
+        )
+
+    assert calls == []
+
+
+def _runtime(
+    tmp_path: Path,
+    *,
+    max_retries: int = 2,
+    runtime_limits: RuntimeLimits | None = None,
+    task_graph_policy: AgentGraphPolicy | None = None,
+) -> MissionRuntime:
     return MissionRuntime(
         MissionStore(tmp_path / "missions.sqlite3"),
         executor=lambda *_args: {},
         recovery_policy=RecoveryPolicy(max_retries=max_retries),
         authorization_snapshot_factory=make_test_snapshot,
+        runtime_limits=runtime_limits,
+        task_graph_policy=task_graph_policy,
     )
 
 
@@ -53,6 +89,15 @@ def _ready_mission(runtime: MissionRuntime):
     )
     runtime.store.save(mission)
     return mission
+
+
+def _two_step_status_mission(runtime: MissionRuntime, request_id: str):
+    objective = "collect and independently confirm two local status observations"
+    plan = Plan.initial(objective).replan(steps=(
+        PlanStep("status-1", "collect the first local status observation", action="status"),
+        PlanStep("status-2", "collect the second local status observation", action="status"),
+    ))
+    return runtime.create("run two local status checks", objective, plan, request_id=request_id)
 
 
 def test_retryable_provider_failures_are_correlated_and_exhaust_to_failed(tmp_path):
@@ -133,6 +178,162 @@ def test_retryable_provider_failures_are_correlated_and_exhaust_to_failed(tmp_pa
     assert persisted.evidence == result.evidence
     assert persisted.retry_count == 3
     assert private_error_body not in json.dumps(persisted.to_dict(), sort_keys=True)
+
+
+def test_owner_runtime_retry_limit_caps_execution_and_task_graph_retries(tmp_path):
+    runtime = _runtime(
+        tmp_path,
+        max_retries=5,
+        runtime_limits=RuntimeLimits(max_retries=1),
+        task_graph_policy=AgentGraphPolicy(max_retries=5),
+    )
+    assert runtime.recovery_policy.max_retries == 1
+    assert runtime.task_graph_adapter is not None
+    assert runtime.task_graph_adapter.policy.max_retries == 1
+    mission = _ready_mission(runtime)
+    model = AlwaysFailingModel(
+        lambda: ProviderFailure(
+            "private provider detail",
+            provider="local_llama_cpp",
+            model="qwen3-4b-q4-k-m",
+        )
+    )
+
+    result = runtime.run_model_loop(
+        mission.mission_id,
+        model,
+        tools=[],
+        run_id="owner-retry-cap-regression",
+        max_turns=8,
+    )
+
+    assert result.status is MissionStatus.FAILED_RETRY_EXHAUSTED
+    assert result.retry_count == 2  # one initial attempt plus exactly one Owner-authorized retry
+    assert len(model.calls) == 2
+    assert len(result.failures) == 2
+    assert len([item for item in result.transitions if item["reason"] == "provider failure; bounded retry selected"]) == 1
+
+
+def test_compatibility_run_to_completion_stops_at_owner_execution_step_limit(tmp_path):
+    runtime = _runtime(
+        tmp_path,
+        runtime_limits=RuntimeLimits(max_execution_steps=1, max_execution_time_seconds=300),
+    )
+    dispatched = []
+    runtime.executor = lambda _mission, step, _action_id: dispatched.append(step.step_id) or {
+        "success": True,
+        "result": {"online": True},
+    }
+    mission = _two_step_status_mission(runtime, "compatibility-owner-step-cap")
+
+    result = runtime.run_to_completion(mission.mission_id, max_slices=10)
+
+    assert result.status is MissionStatus.RESOURCE_BLOCKED
+    assert result.failures[-1]["budget"] == "max_execution_steps"
+    assert result.failures[-1]["limit"] == 1
+    assert dispatched == ["status-1"]
+    assert result.iteration_count == 1
+    assert result.provenance["owner_runtime_limits"] == {
+        "max_execution_steps": 1,
+        "max_execution_time_seconds": 300,
+    }
+
+
+def test_compatibility_run_to_completion_stops_after_owner_wall_clock_budget(tmp_path):
+    runtime = _runtime(
+        tmp_path,
+        runtime_limits=RuntimeLimits(max_execution_steps=5, max_execution_time_seconds=1),
+    )
+    dispatched = []
+    observed_timeouts = []
+
+    def slow_local_tool(_mission, step, _action_id, *, timeout_seconds):
+        dispatched.append(step.step_id)
+        observed_timeouts.append(timeout_seconds)
+        time.sleep(timeout_seconds)
+        return {"success": True, "result": {"online": True}}
+
+    runtime.executor = slow_local_tool
+    mission = _two_step_status_mission(runtime, "compatibility-owner-time-cap")
+
+    result = runtime.run_to_completion(mission.mission_id, max_slices=10)
+
+    assert result.status is MissionStatus.RESOURCE_BLOCKED
+    assert result.failures[-1]["budget"] == "max_execution_time_seconds"
+    assert result.failures[-1]["limit"] == 1
+    assert dispatched == ["status-1"]
+    assert len(observed_timeouts) == 1
+    assert 0 < observed_timeouts[0] <= 1
+
+
+def test_owner_wall_clock_deadline_persists_across_compatibility_resumption(tmp_path):
+    runtime = _runtime(
+        tmp_path,
+        runtime_limits=RuntimeLimits(max_execution_steps=5, max_execution_time_seconds=1),
+    )
+    dispatched = []
+
+    def quick_local_tool(_mission, step, _action_id, *, timeout_seconds):
+        assert 0 < timeout_seconds <= 1
+        dispatched.append(step.step_id)
+        time.sleep(0.05)
+        return {"success": True, "result": {"online": True}}
+
+    runtime.executor = quick_local_tool
+    mission = _two_step_status_mission(runtime, "compatibility-owner-resume-time-cap")
+
+    first = runtime.run_to_completion(mission.mission_id, max_slices=1)
+    assert not first.is_terminal
+    assert first.progress.get("owner_execution_started_at_epoch") is not None
+    assert dispatched == ["status-1"]
+
+    time.sleep(1.05)
+    resumed = runtime.run_to_completion(mission.mission_id, max_slices=1)
+
+    assert resumed.status is MissionStatus.RESOURCE_BLOCKED
+    assert resumed.failures[-1]["budget"] == "max_execution_time_seconds"
+    assert dispatched == ["status-1"]
+
+
+def test_owner_wall_clock_deadline_persists_across_native_model_loop_calls(tmp_path):
+    runtime = _runtime(
+        tmp_path,
+        max_retries=5,
+        runtime_limits=RuntimeLimits(max_execution_steps=5, max_execution_time_seconds=1),
+    )
+    mission = _ready_mission(runtime)
+    model = AlwaysFailingModel(
+        lambda: ProviderFailure(
+            "temporary provider failure",
+            provider="local_llama_cpp",
+            model="qwen3-4b-q4-k-m",
+            attempts=[{"provider": "local_llama_cpp", "model": "qwen3-4b-q4-k-m", "kind": "PROVIDER_FAILURE"}],
+        )
+    )
+
+    first = runtime.run_model_loop(
+        mission.mission_id,
+        model,
+        tools=[],
+        run_id="owner-time-budget-first-call",
+        max_turns=1,
+    )
+    assert not first.is_terminal
+    assert len(model.calls) == 1
+    assert first.progress.get("owner_execution_started_at_epoch") is not None
+
+    time.sleep(1.05)
+    resumed = runtime.run_model_loop(
+        mission.mission_id,
+        model,
+        tools=[],
+        run_id="owner-time-budget-resumed-call",
+        max_turns=1,
+    )
+
+    assert resumed.status is MissionStatus.RESOURCE_BLOCKED
+    assert resumed.failures[-1]["budget"] == "max_execution_time_seconds"
+    assert len(model.calls) == 1
 
 
 def test_nonretryable_provider_authentication_failure_is_not_retried(tmp_path):

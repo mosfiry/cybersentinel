@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
+import time
 from typing import Any
 
 
@@ -47,6 +48,7 @@ class ExecutionContext:
     evidence_store: Any = field(default=None, repr=False, compare=False)
     artifact_store: Any = field(default=None, repr=False, compare=False)
     cancellation_event: Event | None = field(default=None, repr=False, compare=False)
+    deadline_monotonic: float | None = field(default=None, repr=False, compare=False)
     delegation_scope: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,6 +90,10 @@ class ExecutionContext:
 
         if self.cancellation_event is not None and self.cancellation_event.is_set():
             raise PermissionError("tool execution cancelled")
+        if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
+            if self.cancellation_event is not None:
+                self.cancellation_event.set()
+            raise PermissionError("tool execution deadline exceeded")
         if not self.owner_authenticated or not self.request_id or not self.mission_id or not self.execution_id or not self.tool_id:
             raise PermissionError("a fully bound Owner/Mission execution context is required")
         if not isinstance(self.owner_authorization, AuthorizationContext):

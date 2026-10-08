@@ -382,7 +382,8 @@ def test_bounded_graph_fanout_uses_task_scoped_context_and_real_fences(tmp_path,
     max_active = 0
     worker_views = []
 
-    def execute(mission, step, action_id, *, execution_fence, delegation_scope):
+    def execute(mission, step, action_id, *, execution_fence, delegation_scope, timeout_seconds):
+        assert timeout_seconds > 0
         nonlocal active, max_active
         execution_fence.assert_active_execution(mission)
         assert delegation_scope.allowed_tools == (step.action,)
@@ -449,7 +450,8 @@ def test_parallel_partial_failure_is_fanned_in_deterministically_and_blocks_depe
     barrier = threading.Barrier(2)
     calls = []
 
-    def execute(mission, step, action_id, *, execution_fence, delegation_scope):
+    def execute(mission, step, action_id, *, execution_fence, delegation_scope, timeout_seconds):
+        assert timeout_seconds > 0
         execution_fence.assert_active_execution(mission)
         calls.append(step.step_id)
         barrier.wait(timeout=5)
@@ -491,7 +493,8 @@ def test_crash_during_graph_fanout_quarantines_all_claims_and_never_replays(tmp_
     calls = []
     lock = threading.Lock()
 
-    def crash_one(mission, step, action_id, *, execution_fence, delegation_scope):
+    def crash_one(mission, step, action_id, *, execution_fence, delegation_scope, timeout_seconds):
+        assert timeout_seconds > 0
         execution_fence.assert_active_execution(mission)
         with lock:
             calls.append(action_id)

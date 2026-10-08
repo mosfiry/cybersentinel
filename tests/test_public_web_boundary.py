@@ -603,11 +603,46 @@ def test_public_mission_create_uses_server_project_scope_and_queues_owner_missio
     assert captured["run"] is False
     assert captured["scope_context"]["workspace_root"] == str(project_root.resolve())
     assert captured["scope_context"]["target_id"] == f"local-project:{project_id}"
+    assert captured["scope_context"]["allowed_tools"] == [
+        "latest_intel", "local_security_check", "local_system_info", "status"
+    ]
     assert captured["scope_context"]["allowed_networks"] == []
     assert captured["skill_registry"] is registry_sentinel
     assert captured["skill_id"] == "approved-guide"
     assert captured["project_assignment"] == (7, "mission-abc", project_id)
     assert "authorization_snapshot" not in payload["mission"]
+
+
+def test_public_project_tool_scope_is_local_and_owner_intent_bounded():
+    base = {"latest_intel", "local_security_check", "local_system_info", "status"}
+    assert set(bridge._public_project_owner_tool_scope("Review this local project")) == base
+    assert set(bridge._public_project_owner_tool_scope("Run the project test suite once")) == base | {"run_project_tests"}
+    assert set(bridge._public_project_owner_tool_scope("Do not run the project tests")) == base
+    assert set(bridge._public_project_owner_tool_scope("Do not use pytest")) == base
+    assert set(bridge._public_project_owner_tool_scope("Can I run the project test suite?")) == base
+    assert set(bridge._public_project_owner_tool_scope("Can you run tests?")) == base
+    assert set(bridge._public_project_owner_tool_scope("Could you explain how to run pytest?")) == base
+    assert set(bridge._public_project_owner_tool_scope("What does pytest do?")) == base
+    assert set(bridge._public_project_owner_tool_scope("Please execute pytest -q")) == base | {"run_project_tests"}
+    assert set(bridge._public_project_owner_tool_scope("Run tests but do not use pytest")) == base
+    assert set(bridge._public_project_owner_tool_scope("Add a watch on this indicator")) == base | {"watch"}
+    assert set(bridge._public_project_owner_tool_scope("Can you add a watch on this indicator?")) == base
+    assert set(bridge._public_project_owner_tool_scope("What does watch do?")) == base
+    assert set(bridge._public_project_owner_tool_scope("Do not watch this indicator")) == base
+    assert set(bridge._public_project_owner_tool_scope("Unwatch this indicator")) == base | {"unwatch"}
+    assert set(bridge._public_project_owner_tool_scope("What does unwatch do?")) == base
+    assert set(bridge._public_project_owner_tool_scope("Do not unwatch this indicator")) == base
+    assert set(bridge._public_project_owner_tool_scope("Could you stop watching this indicator?")) == base
+    assert set(bridge._public_project_owner_tool_scope("Stop watching this indicator")) == base | {"unwatch"}
+    assert set(bridge._public_project_owner_tool_scope("لا تشغّل الاختبارات")) == base
+    assert set(bridge._public_project_owner_tool_scope("شغّل الاختبارات")) == base | {"run_project_tests"}
+    for objective in ("Review this local project", "Run the project test suite once"):
+        allowed = set(bridge._public_project_owner_tool_scope(objective))
+        assert not allowed.intersection({
+            "browser", "browser.fill", "search", "web_research", "refresh_intel",
+            "mcp.discover", "mcp.invoke", "red_team_assess", "scoped_http_probe",
+            "watch", "unwatch",
+        })
 
 
 def test_public_skill_routes_require_owner_and_csrf_and_forward_narrow_requests(public_server, monkeypatch):

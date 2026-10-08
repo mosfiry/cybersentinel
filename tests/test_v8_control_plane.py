@@ -182,8 +182,9 @@ def _effect_recovery_fixture(tmp_path: Path):
 
     dispatches: list[str] = []
 
-    def execute(_mission, _step, action_id, *, execution_fence):
+    def execute(_mission, _step, action_id, *, execution_fence, timeout_seconds):
         assert execution_fence is not None
+        assert timeout_seconds > 0
         dispatches.append(action_id)
         return {"success": True, "criterion_id": "effect-probe", "source": "fixture"}
 
@@ -448,8 +449,9 @@ def _parallel_effect_recovery_fixture(tmp_path: Path):
             expires_at=(now + timedelta(hours=1)).isoformat(),
         )
 
-    def execute(_mission, _step, action_id, *, execution_fence):
+    def execute(_mission, _step, action_id, *, execution_fence, timeout_seconds):
         assert execution_fence is not None
+        assert timeout_seconds > 0
         dispatches.append(action_id)
         return {"success": True, "criterion_id": "parallel-effect-probe", "source": "fixture"}
 

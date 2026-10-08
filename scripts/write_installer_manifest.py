@@ -126,6 +126,21 @@ def main() -> int:
         "platform": platform.platform(),
     }
     acceptance = normalize_acceptance_status(os.getenv("CYBERSENTINEL_WINDOWS_RUNNER_ACCEPTANCE"))
+    preserved_candidate_acceptance = normalize_acceptance_status(
+        os.getenv("CYBERSENTINEL_WINDOWS_PRESERVED_CANDIDATE_ACCEPTANCE")
+    )
+    preserved_candidate_full_mission = normalize_acceptance_status(
+        os.getenv("CYBERSENTINEL_WINDOWS_PRESERVED_CANDIDATE_FULL_MISSION")
+    )
+    installed_ui_acceptance = normalize_acceptance_status(
+        os.getenv("CYBERSENTINEL_WINDOWS_INSTALLED_UI_ACCEPTANCE")
+    )
+    full_mission_acceptance = normalize_acceptance_status(
+        os.getenv("CYBERSENTINEL_WINDOWS_FULL_MISSION_E2E_ACCEPTANCE")
+    )
+    source_tree_e2e_supplemental = normalize_acceptance_status(
+        os.getenv("CYBERSENTINEL_WINDOWS_SOURCE_TREE_E2E_SUPPLEMENTAL")
+    )
 
     manifest: dict[str, Any] = {
         "manifest_schema_version": 1,
@@ -153,9 +168,24 @@ def main() -> int:
             "package_lock_sha256": sha256(lock_path) if lock_path.is_file() else None,
         },
         "acceptance": {
-            "windows_runner_backend_core_real_model": acceptance,
-            "windows_runner_scope": "scripts/windows_acceptance.ps1: pinned local Qwen3 inference, Owner mission, persistence/evidence reload, and runtime shutdown; not an installed-Electron GUI test",
-            "manual_windows_installer_gui_close_reopen": "NOT TESTED — NO WINDOWS INTERACTIVE ENVIRONMENT",
+            "windows_runner_acceptance_overall": acceptance,
+            "windows_runner_backend_core_real_model": full_mission_acceptance,
+            "windows_runner_preserved_candidate_installed_ui_qwen_owner_full_mission_baseline": preserved_candidate_acceptance,
+            "windows_runner_preserved_candidate_full_mission": preserved_candidate_full_mission,
+            "windows_runner_installed_desktop_ui_qwen_owner_auth": installed_ui_acceptance,
+            "windows_runner_full_local_qwen_mission_e2e": full_mission_acceptance,
+            "windows_runner_source_tree_full_e2e_supplemental_not_installed_backend": source_tree_e2e_supplemental,
+            "windows_runner_scope": (
+                "Native windows-latest runner: scripts/windows_installer_acceptance.ps1 installs and launches the exact installer; "
+                "scripts/windows_desktop_acceptance.py drives the installed Electron first-run hardware/model manager, Qwen3 4B "
+                "download/activation/real local inference, disposable Owner creation/login and invalid-password rejection, and a bounded "
+                "Mission through the installed app's public UI/API and bundled backend (local project test, Research/Hypothesis, "
+                "Evidence, Validator, Finding, Report, persisted pause/reload/resume, and a 300-second wall-clock guard). "
+                "The separate scripts/run_full_e2e_gate_acceptance.py is checkout-source supplemental coverage for loopback Browser/MCP "
+                "and Multi-Agent; it is not evidence that those advanced paths ran inside the installed backend. "
+                "Hosted Windows UI is automated/non-human-interactive."
+            ),
+            "manual_windows_installer_gui_close_reopen": "NOT TESTED — hosted runner has no human interactive desktop session; installed UI is inspected with Playwright CDP",
         },
         "distribution": "GitHub Actions workflow artifact; no GitHub Release or tag created",
         "release_state": {

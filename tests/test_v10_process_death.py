@@ -1111,7 +1111,8 @@ def test_concurrent_fenced_evidence_append_rejects_stale_writer_without_chain_co
     mission, _keyword = v10_env.create_mission(action="status")
     race_results: list[dict] = []
 
-    def executor(live_mission, _step, _action_id, *, execution_fence):
+    def executor(live_mission, _step, _action_id, *, execution_fence, timeout_seconds):
+        assert timeout_seconds > 0
         context = multiprocessing.get_context("fork")
         gate = context.Barrier(3)
         results = context.Queue()

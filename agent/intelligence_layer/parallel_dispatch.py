@@ -147,6 +147,7 @@ def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any, *, s
         or runtime.hook_registry is not None
         or not _accepts_keyword(runtime.executor, "execution_fence")
         or not _accepts_keyword(runtime.executor, "delegation_scope")
+        or not _accepts_keyword(runtime.executor, "timeout_seconds")
         or not _scope_enforcement_declared(runtime.executor)
     ):
         return None
@@ -164,7 +165,11 @@ def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any, *, s
 
     # The current step and every following member must be ready and safe. A
     # dependency gap ends the batch rather than skipping over plan order.
-    available_iterations = max(0, mission.max_iterations - (mission.iteration_count - 1))
+    owner_step_limit = runtime._owner_execution_step_limit(mission)
+    available_iterations = max(
+        0,
+        min(mission.max_iterations, owner_step_limit) - (mission.iteration_count - 1),
+    )
     limit = min(adapter.policy.max_parallel_tasks, available_iterations)
     if limit <= 1:
         return None
@@ -287,12 +292,16 @@ def run_parallel_graph_steps(runtime: Any, mission: Mission, snapshot: Any, *, s
             raise RuntimeError("parallel worker lost its execution fence")
         task_fence.assert_active_execution(mission)
         worker_mission = _task_mission_copy(mission, step, item["delegation_scope"])
+        timeout_seconds = runtime._owner_execution_remaining_seconds(mission)
+        if timeout_seconds <= 0:
+            raise TimeoutError("owner_execution_deadline_expired")
         return runtime.executor(
             worker_mission,
             step,
             action_id,
             execution_fence=task_fence,
             delegation_scope=item["delegation_scope"],
+            timeout_seconds=timeout_seconds,
         )
 
     raw_by_action: dict[str, Any] = {}

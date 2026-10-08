@@ -672,6 +672,7 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
                     "scope": ["workspace"],
                     "target_id": "api-target",
                     "workspace_root": str(Path.cwd().resolve()),
+                    "allowed_tools": ["status"],
                     "allowed_networks": [],
                     "allowed_credentials": [],
                     "forbidden_actions": [],
@@ -679,6 +680,50 @@ def test_mission_http_api_routes_use_bridge_auth_and_mission_service(tmp_path, m
             },
         )
         assert status == 201
+        assert set(created["mission"]["authorization_snapshot"]["allowed_tools"]) == {
+            "status", "workspace_read", "git_read"
+        }
+        rejected_status, rejected_plan = request(
+            "POST",
+            "/api/missions",
+            {
+                "objective": "api mission outside owner scope",
+                "plan": {
+                    "version": 1,
+                    "objective": "api mission outside owner scope",
+                    "steps": [{"step_id": "s1", "objective": "unauthorized action", "action": "shell_exec"}],
+                },
+                "scope_context": {
+                    "scope": ["workspace"],
+                    "target_id": "api-target",
+                    "workspace_root": str(Path.cwd().resolve()),
+                    "allowed_tools": ["status"],
+                    "allowed_networks": [],
+                    "allowed_credentials": [],
+                    "forbidden_actions": [],
+                },
+            },
+        )
+        assert rejected_status == 403
+        assert rejected_plan["error"] == "plan_action_outside_owner_scope"
+        missing_scope_status, missing_scope = request(
+            "POST",
+            "/api/missions",
+            {
+                "objective": "api mission without owner tool scope",
+                "plan": plan,
+                "scope_context": {
+                    "scope": ["workspace"],
+                    "target_id": "api-target",
+                    "workspace_root": str(Path.cwd().resolve()),
+                    "allowed_networks": [],
+                    "allowed_credentials": [],
+                    "forbidden_actions": [],
+                },
+            },
+        )
+        assert missing_scope_status == 403
+        assert missing_scope["error"] == "explicit_owner_tool_scope_required"
         mission_id = created["mission_id"]
         report_chain = tmp_path / "evidence_chain.db"
         if not report_chain.exists():

@@ -63,6 +63,7 @@ def _local_workspace_scope_context(snapshot, workspace_root: Path) -> dict[str, 
         "method": "GET",
         "workspace_root": str(workspace_root.resolve()),
         "scope": ["workspace"],
+        "allowed_tools": ["run_project_tests", "watch"],
         "allowed_networks": [],
         "allowed_credentials": [],
     }

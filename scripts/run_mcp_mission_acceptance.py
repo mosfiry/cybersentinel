@@ -120,12 +120,13 @@ def _record_type(record: dict) -> str:
     return str(payload.get("record_type", ""))
 
 
-def _start_fixture(*, script: Path, run_dir: Path, path: str, cert: Path, key: Path, request_log: Path):
+def _start_fixture(*, script: Path, run_dir: Path, path: str, cert: Path, key: Path, request_log: Path, port: int = 443):
     ready = run_dir / "fixture-ready.json"
     server_log = run_dir / "fixture-server.log"
+    prefix = ["sudo", "-n"] if os.name != "nt" and port < 1024 else []
     command = [
-        "sudo", "-n", sys.executable, str(script),
-        "--port", "443", "--path", path,
+        *prefix, sys.executable, str(script),
+        "--port", str(port), "--path", path,
         "--cert", str(cert), "--key", str(key),
         "--request-log", str(request_log), "--ready-file", str(ready),
     ]
@@ -160,6 +161,11 @@ def _stop_fixture(process, ready: Path) -> bool:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=3.0)
+    if process.poll() is not None and ready.exists():
+        try:
+            ready.unlink()
+        except OSError:
+            pass
     return process.poll() is not None and not ready.exists()
 
 
@@ -254,10 +260,20 @@ def main() -> int:
             key=key,
             request_log=request_log,
         )
-        if ready_payload.get("bind") != "127.0.0.1" or ready_payload.get("effective_uid") != os.getuid():
+        expected_uid = os.getuid() if hasattr(os, "getuid") else None
+        if (
+            ready_payload.get("bind") != "127.0.0.1"
+            or ready_payload.get("effective_uid") != expected_uid
+            or (os.name == "nt" and ready_payload.get("was_root") != 0)
+        ):
             raise RuntimeError("fixture_privilege_drop_or_bind_check_failed")
-        result["checks"]["fixture_loopback_only_and_unprivileged"] = True
-        result["transport"]["fixture_effective_uid"] = int(ready_payload["effective_uid"])
+        result["checks"]["fixture_loopback_only_and_process_identity_verified"] = True
+        result["transport"]["fixture_effective_uid"] = ready_payload.get("effective_uid")
+        result["transport"]["fixture_effective_gid"] = ready_payload.get("effective_gid")
+        result["transport"]["fixture_identity_model"] = (
+            "same Windows runner process identity; no POSIX UID or privilege drop"
+            if os.name == "nt" else "POSIX UID checked after fixture privilege drop"
+        )
         result["transport"]["fixture_pid"] = int(ready_payload["pid"])
         tls_context = ssl.create_default_context(cafile=str(cert))
         with urllib.request.urlopen("https://127.0.0.1/health", context=tls_context, timeout=3.0) as response:

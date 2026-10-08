@@ -544,7 +544,8 @@ def test_strict_mission_runtime_persists_effect_recovery_without_reexecution(tmp
     leased_worker_fence = worker_fence.with_lease(claim)
     calls: list[str] = []
 
-    def executor(_mission, _step, action_id, *, execution_fence):
+    def executor(_mission, _step, action_id, *, execution_fence, timeout_seconds):
+        assert timeout_seconds > 0
         calls.append(action_id)
         assert action_id == expected_action_id
         assert execution_fence.execution_id == expected_action_id

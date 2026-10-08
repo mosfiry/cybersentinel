@@ -9,7 +9,7 @@ import pytest
 
 from agent.hypotheses import HypothesisState, HypothesisStatus
 from agent.knowledge_context import TypedKnowledgeRetriever
-from agent.context import ContextEngine, ExecutionState, KnowledgeProvider
+from agent.context import ContextEngine, ExecutionState, KnowledgeProvider, RuntimeLimits
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.observation_intelligence import InformationGain, ObservationInterpreter
@@ -18,12 +18,15 @@ from agent.strategy import StrategyDecisionType, classify_information_gain
 from knowledge.foundation import KnowledgeKind, KnowledgeObject, TransformationPolicy, TrustClass
 
 
-def make_runtime(tmp_path, executor, *, replanner=None, interpreter=None):
+def make_runtime(tmp_path, executor, *, replanner=None, interpreter=None, runtime_limits=None):
     return MissionRuntime(
         MissionStore(Path(tmp_path) / "missions.sqlite3"),
         executor=executor,
         replanner=replanner,
-        interpreter=interpreter, authorization_snapshot_factory=make_test_snapshot)
+        interpreter=interpreter,
+        authorization_snapshot_factory=make_test_snapshot,
+        runtime_limits=runtime_limits,
+    )
 
 
 def initial_plan(objective="investigate"):
@@ -274,7 +277,11 @@ def test_twenty_one_turn_trajectory_retains_observations_and_events(tmp_path):
     def execute(mission, step, action_id):
         return {"success": True, "source": "retention-fixture", "criterion_id": step.step_id, "turn": mission.current_step}
 
-    rt = make_runtime(tmp_path, execute)
+    rt = make_runtime(
+        tmp_path,
+        execute,
+        runtime_limits=RuntimeLimits(max_execution_steps=turn_count + 5),
+    )
     mission = rt.create(
         "retain trajectory",
         "retain trajectory",

@@ -288,6 +288,7 @@ def _invoke_one(
     step: Any,
     provider_name: str,
     model_name: str,
+    timeout_seconds: float = SPECIALIST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     base = {
         "step_id": step_id,
@@ -319,7 +320,7 @@ def _invoke_one(
             model_name,
             messages,
             temperature=0,
-            timeout=SPECIALIST_TIMEOUT_SECONDS,
+            timeout=min(float(SPECIALIST_TIMEOUT_SECONDS), float(timeout_seconds)),
             max_tokens=MAX_SPECIALIST_OUTPUT_TOKENS,
         )
         proposal = _parse_proposal(response)
@@ -363,10 +364,14 @@ def _invoke_one(
         return {**base, "success": False, "failure_code": "provider_outcome_unknown", "validation_state": "QUARANTINED_PROVIDER_OUTCOME_UNKNOWN"}
 
 
-def run_ready_specialist_batch(runtime: Any, mission: Any, snapshot: Any):
+def run_ready_specialist_batch(runtime: Any, mission: Any, snapshot: Any, *, timeout_seconds: float | None = None):
     """Run at most two dependency-ready tool-less tasks, or return None."""
     adapter = runtime.task_graph_adapter
     if adapter is None or runtime.specialist_generate is None:
+        return None
+    if timeout_seconds is None:
+        timeout_seconds = runtime._owner_execution_remaining_seconds(mission)
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         return None
     ready = adapter.ready_specialist_steps(mission, snapshot)
     if len(ready) < 2:
@@ -443,6 +448,7 @@ def run_ready_specialist_batch(runtime: Any, mission: Any, snapshot: Any):
                 step=steps[step_id],
                 provider_name=provider_name,
                 model_name=model_name,
+                timeout_seconds=float(timeout_seconds),
             )
             futures[future] = step_id
         for future in as_completed(futures):

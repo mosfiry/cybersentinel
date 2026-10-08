@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Bounded local Streamable HTTP MCP fixture for end-to-end acceptance.
 
-The fixture binds only to 127.0.0.1. When started through sudo to claim the
-standard HTTPS port, it drops root privileges before it accepts any request.
-It exposes one read-only test tool and records protocol method names only.
+The fixture binds only to 127.0.0.1 on the caller-selected HTTPS port. When
+started through sudo to claim the standard POSIX HTTPS port, it drops root
+privileges before it accepts any request. It exposes one read-only test tool and
+records protocol method names only.
 """
 from __future__ import annotations
 
@@ -169,7 +170,9 @@ def _handler_for(*, endpoint_path: str, request_log: Path, log_lock: threading.L
     return Handler
 
 
-def _drop_privileges() -> dict[str, int]:
+def _drop_privileges() -> dict[str, int | None]:
+    if os.name == "nt":
+        return {"was_root": 0, "effective_uid": None, "effective_gid": None}
     was_root = os.geteuid() == 0
     if not was_root:
         return {"was_root": 0, "effective_uid": os.geteuid(), "effective_gid": os.getegid()}
@@ -190,8 +193,8 @@ def main() -> int:
     parser.add_argument("--request-log", required=True, type=Path)
     parser.add_argument("--ready-file", required=True, type=Path)
     args = parser.parse_args()
-    if args.port != 443 or not args.path.startswith("/mcp/") or "?" in args.path or "#" in args.path:
-        raise SystemExit("fixture requires loopback HTTPS/443 and one bounded /mcp path")
+    if not 1 <= args.port <= 65535 or not args.path.startswith("/mcp/") or "?" in args.path or "#" in args.path:
+        raise SystemExit("fixture requires one valid TCP port and one bounded /mcp path")
     args.cert = args.cert.resolve()
     args.key = args.key.resolve()
     args.request_log = args.request_log.resolve()

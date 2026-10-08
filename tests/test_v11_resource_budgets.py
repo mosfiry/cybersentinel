@@ -247,18 +247,20 @@ def test_monotonic_deadline_expiry_after_provider_response_prevents_tool_dispatc
         tmp_path,
         RuntimeLimits(max_execution_time_seconds=60, max_tool_calls=1, max_execution_steps=1),
     )
-    clock_values = iter((100.0, 100.0, 100.0, 161.0))
+    clock = {"now": 100.0}
     monkeypatch.setattr(
         mission_runtime_module,
         "time",
-        SimpleNamespace(monotonic=lambda: next(clock_values)),
+        SimpleNamespace(monotonic=lambda: clock["now"]),
     )
 
     class OneCallModel:
         calls = 0
 
-        def complete(self, _messages, _tools, *, mission_id, run_id, turn_id, plan_version):
+        def complete(self, _messages, _tools, *, mission_id, run_id, turn_id, plan_version, timeout_seconds):
+            assert timeout_seconds > 0
             self.calls += 1
+            clock["now"] = 161.0
             return ModelTurn(turn_id, tool_calls=(_proposal(mission, run_id, turn_id, "expired"),))
 
     model = OneCallModel()

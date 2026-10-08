@@ -22,6 +22,11 @@ on:
       - "scripts/build_desktop_backend.py"
       - "scripts/download_llama_runtime.py"
       - "scripts/write_installer_manifest.py"
+      - "scripts/run_full_e2e_gate_acceptance.py"
+      - "scripts/run_mcp_mission_acceptance.py"
+      - "scripts/mcp_streamable_fixture_server.py"
+      - "scripts/windows_desktop_acceptance.py"
+      - "scripts/windows_installer_acceptance.ps1"
       - "requirements*.txt"
       - "tests/**"
       - ".github/workflows/desktop-build.yml"
@@ -29,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 defaults:
   run:
@@ -41,11 +47,12 @@ concurrency:
 jobs:
   windows-installer:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/desktop/build/browser/ms-playwright
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,6 +63,16 @@ jobs:
           $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
           if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw "VERSION is not a supported release version: $version" }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Optionally download the preserved original RC1 artifact for baseline comparison
+        id: preserved-original-artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: CyberSentinel-v5.2.0-rc1-dcb0d9a72e188421dafe95adba33153269b71349
+          repository: ${{ github.repository }}
+          run-id: 37646170779
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/preserved-original-rc1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -72,9 +89,45 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-desktop-build.txt
       - name: Install pinned Playwright Chromium
         run: python -m playwright install chromium
+      - name: Install and launch the preserved original RC1 on native Windows
+        id: original-candidate
+        if: steps.preserved-original-artifact.outcome == 'success'
+        continue-on-error: true
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP "cybersentinel-acceptance-evidence/original"
+          $installer = Join-Path $env:RUNNER_TEMP "preserved-original-rc1/CyberSentinel-v5.2.0-rc1.exe"
+          & scripts/windows_installer_acceptance.ps1 `
+            -InstallerPath $installer `
+            -InstallRoot (Join-Path $env:RUNNER_TEMP "cybersentinel-original-install") `
+            -EvidenceDirectory $evidence `
+            -Mode full `
+            -ExpectedSha256 "43ddacd592acc6f838866d5812845a257e6cd2845033d8361bbea7e6f5d1bf57" `
+            -ExpectedSizeBytes 388692176 `
+            -ExpectedSourceCommit "dcb0d9a72e188421dafe95adba33153269b71349"
+          $report = Get-Content -LiteralPath (Join-Path $evidence "installer-acceptance.json") -Raw | ConvertFrom-Json
+          "status=$($report.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "full_mission=$($report.full_mission_e2e.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Original RC1 native Windows installed UI/Qwen/Owner/full-Mission baseline: $($report.status) / $($report.full_mission_e2e.status)"
+          if ($report.status -ne "PASS") { Write-Warning "Original RC1 baseline failed; continue to test the repaired candidate and retain both reports." }
+      - name: Record preserved RC1 baseline download and acceptance outcomes
+        if: always()
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP "cybersentinel-acceptance-evidence"
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $baseline = [ordered]@{
+            schema = "cybersentinel-preserved-rc1-baseline-v1"
+            artifact_name = "CyberSentinel-v5.2.0-rc1-dcb0d9a72e188421dafe95adba33153269b71349"
+            expected_sha256 = "43ddacd592acc6f838866d5812845a257e6cd2845033d8361bbea7e6f5d1bf57"
+            expected_size_bytes = 388692176
+            download_step_outcome = '${{ steps.preserved-original-artifact.outcome }}'
+            windows_acceptance_step_outcome = '${{ steps.original-candidate.outcome }}'
+            windows_acceptance_status = '${{ steps.original-candidate.outputs.status }}'
+            comparison_is_optional = $true
+          }
+          $baseline | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence "preserved-rc1-baseline.json") -Encoding utf8
       # The full suite (including POSIX process/signal and /proc tests) runs in tests.yml on Ubuntu.
       - name: Windows-portable API, project, model, and security tests
-        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py
+        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py tests/test_mission_native_auth_preflight.py tests/test_mission_report_approval.py tests/test_scope_firewall_battery.py tests/test_mission_graph_runtime.py tests/test_v14_security_integration_battery.py
       - name: Install locked Electron toolchain
         working-directory: desktop
         run: npm ci --no-audit --no-fund
@@ -110,15 +163,68 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist
-      - name: Hash and describe RC installer with provenance
-        env:
-          CYBERSENTINEL_WINDOWS_RUNNER_ACCEPTANCE: "NOT_RUN"
+      - name: Create candidate integrity manifest before native installation test
         run: >-
           python scripts/write_installer_manifest.py desktop/dist
           --version '${{ steps.candidate-version.outputs.version }}'
           --source-commit $env:GITHUB_SHA
           --installer-name "CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe"
+      - name: Install candidate and run native Windows UI, Qwen, Owner, and full Mission acceptance
+        id: installed-candidate
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP "cybersentinel-acceptance-evidence/new"
+          $installer = Join-Path $env:GITHUB_WORKSPACE "desktop/dist/CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe"
+          $manifest = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "desktop/dist/installer-manifest.json") -Raw | ConvertFrom-Json
+          & scripts/windows_installer_acceptance.ps1 `
+            -InstallerPath $installer `
+            -InstallRoot (Join-Path $env:RUNNER_TEMP "cybersentinel-new-install") `
+            -EvidenceDirectory $evidence `
+            -Mode full `
+            -RunSourceTreeE2ESupplemental `
+            -ExpectedSha256 ([string]$manifest.sha256) `
+            -ExpectedSizeBytes ([long]$manifest.size_bytes) `
+            -ExpectedSourceCommit $env:GITHUB_SHA
+          $report = Get-Content -LiteralPath (Join-Path $evidence "installer-acceptance.json") -Raw | ConvertFrom-Json
+          "status=$($report.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "full_mission=$($report.full_mission_e2e.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "source_supplemental=$($report.source_tree_e2e_supplemental.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "New RC native Windows installed UI/Qwen/Owner acceptance: $($report.status)"
+          Write-Host "New RC native Windows full local-Qwen Mission acceptance: $($report.full_mission_e2e.status)"
+          if ($report.status -ne "PASS") { Write-Warning "Candidate Windows acceptance did not fully pass; evidence will be retained and the installer will not be published." }
+      - name: Summarize all Windows acceptance gates
+        id: acceptance-summary
+        run: |
+          $values = @(
+            '${{ steps.installed-candidate.outputs.status }}',
+            '${{ steps.installed-candidate.outputs.full_mission }}'
+          )
+          $failed = @($values | Where-Object { $_ -ne 'PASS' })
+          $status = if ($values.Count -eq 2 -and $failed.Count -eq 0) { 'PASS' } else { 'FAIL' }
+          "status=$status" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Windows acceptance summary: $status ($($values -join ', '))"
+      - name: Hash and describe RC installer with provenance
+        env:
+          CYBERSENTINEL_WINDOWS_RUNNER_ACCEPTANCE: ${{ steps.acceptance-summary.outputs.status }}
+          CYBERSENTINEL_WINDOWS_PRESERVED_CANDIDATE_ACCEPTANCE: ${{ steps.original-candidate.outputs.status }}
+          CYBERSENTINEL_WINDOWS_PRESERVED_CANDIDATE_FULL_MISSION: ${{ steps.original-candidate.outputs.full_mission }}
+          CYBERSENTINEL_WINDOWS_INSTALLED_UI_ACCEPTANCE: ${{ steps.installed-candidate.outputs.status }}
+          CYBERSENTINEL_WINDOWS_FULL_MISSION_E2E_ACCEPTANCE: ${{ steps.installed-candidate.outputs.full_mission }}
+          CYBERSENTINEL_WINDOWS_SOURCE_TREE_E2E_SUPPLEMENTAL: ${{ steps.installed-candidate.outputs.source_supplemental }}
+        run: >-
+          python scripts/write_installer_manifest.py desktop/dist
+          --version '${{ steps.candidate-version.outputs.version }}'
+          --source-commit $env:GITHUB_SHA
+          --installer-name "CyberSentinel-v${{ steps.candidate-version.outputs.version }}.exe"
+      - name: Upload native Windows acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CyberSentinel-Windows-acceptance-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/cybersentinel-acceptance-evidence/**
+          if-no-files-found: warn
+          retention-days: 90
       - name: Upload RC installer, checksum, and provenance as a workflow artifact
+        if: steps.acceptance-summary.outputs.status == 'PASS'
         uses: actions/upload-artifact@v4
         with:
           name: CyberSentinel-v${{ steps.candidate-version.outputs.version }}-${{ github.sha }}
@@ -129,3 +235,6 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 90
+      - name: Fail the workflow if any Windows acceptance gate failed
+        if: always() && steps.acceptance-summary.outcome == 'success' && steps.acceptance-summary.outputs.status != 'PASS'
+        run: throw "Native Windows acceptance did not pass; see the uploaded evidence artifact."
