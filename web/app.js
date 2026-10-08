@@ -248,7 +248,7 @@ function resetWorkspaceState() {
   $("#missionTools").classList.add("hidden");
   $("#missionList").innerHTML = '<p class="muted">سجّل الدخول لعرض المهام.</p>';
   renderMissionView("overview");
-  $("#missionTabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === "overview"));
+  $$("#missionTabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === "overview"));
   state.activeView = "overview";
   updateSideLinks();
   renderProjects();
@@ -1987,7 +1987,7 @@ setInterval(refreshConnection, 15000);
 
 /* Keep sidebar project shortcuts enabled only when a mission is selected. */
 function updateSideLinks() {
-  $("[data-side-view]").forEach((button) => { button.disabled = !state.selectedMissionId; });
+  $$("[data-side-view]").forEach((button) => { button.disabled = !state.selectedMissionId; });
 }
 
 status().then(() => { if (state.ownerAuthenticated) loadMissions(); });
