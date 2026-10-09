@@ -1468,9 +1468,17 @@ class MissionRuntime:
                 if proposal.name == "run_project_tests"
                 else "turn_blocked_before_dispatch_due_to_process_sandbox_unavailable"
             )
-            progress["tool_results"].append(ToolCallResult(proposal, False, error=error).to_dict())
+            tool_result = ToolCallResult(proposal, False, error=error).to_dict()
+            tool_result.update({
+                "status": "BLOCKED_BEFORE_DISPATCH",
+                "reason_code": "process_sandbox_unavailable",
+                "dispatch_attempted": False,
+            })
+            progress["tool_results"].append(tool_result)
 
         reason = self._bounded_tool_error(reason) or "required process sandbox is unavailable"
+        stage = "pre_dispatch_sandbox_preflight"
+        error_type = "ProcessSandboxUnavailable"
         failure = {
             "mission_id": mission.mission_id,
             "request_id": mission.request_id,
@@ -1478,6 +1486,9 @@ class MissionRuntime:
             "turn_id": turn_id,
             "class": FailureClass.RESOURCE.value,
             "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "process_sandbox_unavailable",
+            "stage": stage,
+            "error_type": error_type,
             "reason": reason,
             "blocked_tool_call_ids": blocked_ids,
             "dispatch_attempted": False,
@@ -1493,6 +1504,12 @@ class MissionRuntime:
         mission.checkpoint = {
             "status": "not_dispatched",
             "reason_code": "process_sandbox_unavailable",
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "stage": stage,
+            "error_type": error_type,
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+            "dispatch_attempted": False,
             "run_id": run_id,
             "turn_id": turn_id,
             "plan_version": mission.plan.version,
@@ -1504,6 +1521,10 @@ class MissionRuntime:
         mission.emit(EventType.FAILURE_DIAGNOSED, data={
             "class": FailureClass.RESOURCE.value,
             "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "process_sandbox_unavailable",
+            "stage": stage,
+            "error_type": error_type,
+            "mission_id": mission.mission_id,
             "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
             "dispatch_attempted": False,
         })
@@ -1513,6 +1534,84 @@ class MissionRuntime:
             run_id=run_id,
             turn_id=turn_id,
             reason_code="process_sandbox_unavailable",
+            kind="PROCESS_SANDBOX_UNAVAILABLE",
+            stage=stage,
+            error_type=error_type,
+            mission_id=mission.mission_id,
+            dispatch_attempted=False,
+        )
+        return self._save(mission)
+
+    def _block_on_process_sandbox_unavailable_step(
+        self,
+        mission: Mission,
+        step: PlanStep,
+        *,
+        action_id: str,
+        reason: str,
+    ) -> Mission:
+        """Persist a pre-dispatch process-isolation denial for a planned step."""
+        reason = self._bounded_tool_error(reason) or "required process sandbox is unavailable"
+        stage = "pre_dispatch_sandbox_check"
+        failure = {
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+            "class": FailureClass.RESOURCE.value,
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "process_sandbox_unavailable",
+            "stage": stage,
+            "error_type": "ProcessSandboxUnavailable",
+            "reason": reason,
+            "step_id": step.step_id,
+            "action_id": action_id,
+            "tool_name": step.action,
+            "plan_version": mission.plan.version,
+            "dispatch_attempted": False,
+            "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
+            "retry_policy": {
+                "action": RecoveryAction.RESOURCE_BLOCKED.value,
+                "retryable": False,
+                "attempts": 0,
+            },
+        }
+        mission.error = "required bounded process sandbox is unavailable"
+        mission.failures.append(failure)
+        mission.progress.setdefault("resource_failures", []).append(failure)
+        mission.checkpoint = {
+            "status": "not_dispatched",
+            "reason_code": "process_sandbox_unavailable",
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "stage": stage,
+            "error_type": "ProcessSandboxUnavailable",
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+            "step_id": step.step_id,
+            "action_id": action_id,
+            "tool_name": step.action,
+            "plan_version": mission.plan.version,
+            "dispatch_attempted": False,
+        }
+        mission.emit(EventType.FAILURE_DETECTED, step_id=step.step_id, data=failure)
+        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=step.step_id, data={
+            "class": FailureClass.RESOURCE.value,
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "process_sandbox_unavailable",
+            "stage": stage,
+            "error_type": "ProcessSandboxUnavailable",
+            "mission_id": mission.mission_id,
+            "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
+            "dispatch_attempted": False,
+        })
+        mission.transition(
+            MissionStatus.RESOURCE_BLOCKED,
+            mission.error,
+            reason_code="process_sandbox_unavailable",
+            kind="PROCESS_SANDBOX_UNAVAILABLE",
+            stage=stage,
+            error_type="ProcessSandboxUnavailable",
+            mission_id=mission.mission_id,
+            step_id=step.step_id,
+            action_id=action_id,
             dispatch_attempted=False,
         )
         return self._save(mission)
@@ -2803,6 +2902,14 @@ class MissionRuntime:
             if isinstance(exc, SkillAuthorizationError):
                 mission.checkpoint = {**dict(mission.checkpoint or {}), "status": "not_dispatched"}
                 return self._block_on_skill_context(mission)
+            from workspace.environment import ProcessSandboxUnavailable
+            if isinstance(exc, ProcessSandboxUnavailable):
+                return self._block_on_process_sandbox_unavailable_step(
+                    mission,
+                    step,
+                    action_id=action_id,
+                    reason=str(exc),
+                )
             # Keep the in-flight checkpoint durable. A new runtime can safely resume it.
             mission.error = type(exc).__name__
             mission.record_observation({"type": "execution_exception", "success": False, "error": str(exc), "action_id": action_id})

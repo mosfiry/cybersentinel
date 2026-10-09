@@ -38,7 +38,32 @@ def _sha256(value: bytes | str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+_SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)(\b(?:authorization|x-cybersentinel-token|x-cybersentinel-owner-session|"
+    r"owner[_ -]?password|owner[_ -]?token|(?:access|refresh|session)[_ -]?token|api[_ -]?key|secret)\b\s*[:=]\s*)"
+    r"(?:bearer\s+)?[^\s,;\"']+"
+)
+_BEARER_TOKEN_PATTERN = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{12,}")
+
+
+def _redact_diagnostic_text(value: object, secret_values=()) -> str:
+    text = str(value)
+    for secret in secret_values:
+        if isinstance(secret, str) and secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = _SECRET_FIELD_PATTERN.sub(r"\1[REDACTED]", text)
+    return _BEARER_TOKEN_PATTERN.sub(r"\1[REDACTED]", text)
+
+
 _SAFE_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
+
+
+def _safe_operation_error(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value):
+        return value
+    return "redacted_unstructured_error"
 
 
 def _safe_failure_reason_code(value: object) -> str | None:
@@ -79,6 +104,13 @@ def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
         raw_name = item.get("name")
         name = raw_name if isinstance(raw_name, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(raw_name) else "<invalid_action_name>"
         safe_item = {"name": name, "ok": item.get("ok") if isinstance(item.get("ok"), bool) else None}
+        for key in ("status", "reason_code"):
+            value = item.get(key)
+            if isinstance(value, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value):
+                safe_item[key] = value
+        dispatch_attempted = item.get("dispatch_attempted")
+        if isinstance(dispatch_attempted, bool):
+            safe_item["dispatch_attempted"] = dispatch_attempted
         call_id = item.get("tool_call_id")
         if isinstance(call_id, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(call_id):
             safe_item["tool_call_id"] = call_id
@@ -119,10 +151,16 @@ def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
             continue
         item = {
             key: value
-            for key in ("class", "budget", "kind", "reason_code", "recovery")
+            for key in ("class", "budget", "kind", "reason_code", "recovery", "stage", "error_type")
             if isinstance((value := failure.get(key)), str)
             and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value)
         }
+        mission_id = failure.get("mission_id")
+        if isinstance(mission_id, str) and re.fullmatch(r"[0-9a-f]{32}", mission_id):
+            item["mission_id"] = mission_id
+        dispatch_attempted = failure.get("dispatch_attempted")
+        if isinstance(dispatch_attempted, bool):
+            item["dispatch_attempted"] = dispatch_attempted
         limit = failure.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= 1_000_000_000:
             item["limit"] = limit
@@ -143,10 +181,16 @@ def _safe_checkpoint_diagnostics(mission_state: dict) -> dict:
         return {}
     summary = {
         key: value
-        for key in ("status", "budget", "reason_code", "recovery")
+        for key in ("status", "budget", "reason_code", "recovery", "kind", "stage", "error_type", "tool_name")
         if isinstance((value := checkpoint.get(key)), str)
         and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value)
     }
+    mission_id = checkpoint.get("mission_id")
+    if isinstance(mission_id, str) and re.fullmatch(r"[0-9a-f]{32}", mission_id):
+        summary["mission_id"] = mission_id
+    dispatch_attempted = checkpoint.get("dispatch_attempted")
+    if isinstance(dispatch_attempted, bool):
+        summary["dispatch_attempted"] = dispatch_attempted
     limit = checkpoint.get("limit")
     if isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= 1_000_000_000:
         summary["limit"] = limit
@@ -588,7 +632,7 @@ def _wait_for_model(page, predicate, *, timeout: float, phase: str, progress: li
                 "model_installed": bool(model and model.get("installed")),
                 "model_active": bool(model and model.get("active")),
                 "runtime_status": ((state.get("manager") or {}).get("runtime") or {}).get("status"),
-                "error": operation.get("error"),
+                "error": _safe_operation_error(operation.get("error")),
             })
             last = marker
         if operation.get("status") == "failed":
@@ -631,6 +675,7 @@ def main() -> int:
     inference_api_result: dict | None = None
     inference_response_status: int | None = None
     inference_response_fields: list[str] = []
+    diagnostic_secret_values: list[str] = []
     stage = "initialize_acceptance"
     try:
         from playwright.sync_api import sync_playwright
@@ -873,6 +918,7 @@ def main() -> int:
 
                 username = page.locator("#setupOwnerUsername").inner_text().strip()
                 owner_password = secrets.token_urlsafe(24)
+                diagnostic_secret_values.append(owner_password)
                 page.locator("#ownerSetupPassword").fill(owner_password)
                 page.locator("#ownerSetupConfirm").fill(owner_password)
                 page.locator("#ownerSetupSubmit").click(timeout=30_000)
@@ -936,7 +982,9 @@ def main() -> int:
                 )
                 stage = "invalid_owner_login_request"
                 page.locator("#loginUsername").fill(username)
-                page.locator("#loginPassword").fill("intentionally-invalid-windows-acceptance-password")
+                invalid_owner_password = "intentionally-invalid-windows-acceptance-password"
+                diagnostic_secret_values.append(invalid_owner_password)
+                page.locator("#loginPassword").fill(invalid_owner_password)
                 with page.expect_response(
                     lambda response: response.request.method == "POST" and "/api/public/auth/login" in response.url,
                     timeout=30_000,
@@ -956,7 +1004,7 @@ def main() -> int:
                 report["owner_authentication"].update({
                     "invalid_credentials_rejected": invalid_rejected,
                     "invalid_login_http_status": invalid_response.status,
-                    "invalid_login_error": invalid_body.get("error"),
+                    "invalid_login_error": _safe_operation_error(invalid_body.get("error")),
                     "invalid_login_left_owner_unauthenticated": "غير مسجل الدخول" in page.locator("#authStateSide").inner_text(),
                 })
                 if not invalid_rejected:
@@ -1056,7 +1104,7 @@ def main() -> int:
     except Exception as exc:
         report["failure_stage"] = stage
         report["error_type"] = type(exc).__name__
-        report["error"] = str(exc)[:500]
+        report["error"] = _redact_diagnostic_text(exc, diagnostic_secret_values)[:500]
         report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         report["status"] = "FAIL"
         args.output.parent.mkdir(parents=True, exist_ok=True)

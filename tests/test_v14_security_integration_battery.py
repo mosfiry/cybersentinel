@@ -199,7 +199,11 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     if sandbox_unavailable:
         assert completed.state is WorkerMissionState.FAILED
         assert persisted.status is MissionStatus.RESOURCE_BLOCKED
-        assert persisted.action_history[-1]["observation"].get("error") == sandbox_unavailable
+        assert persisted.checkpoint["status"] == "not_dispatched"
+        assert persisted.checkpoint["reason_code"] == "process_sandbox_unavailable"
+        assert persisted.failures[-1]["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
+        assert persisted.failures[-1]["dispatch_attempted"] is False
+        assert persisted.action_history == []
         assert queue.get(mission.mission_id).state is WorkerMissionState.FAILED
         assert _external_effect_count(store.db_path) == 0
         return
@@ -243,6 +247,71 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     assert provenance["authorization_snapshot_hash"] == persisted.authorization_snapshot[
         "authorization_hash"
     ]
+
+
+def test_planned_run_project_tests_sandbox_denial_is_not_recorded_as_execution(tmp_path, monkeypatch):
+    from agent.trajectory import EventType
+    from workspace import Workspace
+
+    owner_session = "planned-sandbox-denial-owner"
+    allow_owner_sessions(monkeypatch, owner_session)
+    project_root = tmp_path / "authorized-denial-project"
+    project_root.mkdir()
+    sentinel = project_root / "test_was_dispatched.txt"
+    (project_root / "test_side_effect.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('unexpected dispatch', encoding='utf-8')\n"
+        "def test_should_not_run_without_isolation():\n    assert True\n",
+        encoding="utf-8",
+    )
+    scope_snapshot = persist_canonical_scope(
+        monkeypatch,
+        tmp_path,
+        owner_session_token=owner_session,
+        target_id="planned-sandbox-denial",
+    )
+    monkeypatch.setattr(
+        Workspace,
+        "process_sandbox_unavailable_reason",
+        staticmethod(lambda: "required rootless Linux process sandbox is unavailable"),
+    )
+    core, store, provider = _core(
+        tmp_path,
+        monkeypatch,
+        response=_run_project_tests_proposal(),
+    )
+
+    mission = core.run_owner_mission(
+        "Run one bounded local project test and report its observed result",
+        owner_session_token=owner_session,
+        request_id="planned-sandbox-denial-request",
+        scope_context=workspace_scope_context(scope_snapshot, project_root),
+        run=True,
+    )
+    persisted = store.load(mission.mission_id)
+
+    assert provider.calls >= 1
+    assert persisted is not None and persisted.verify_integrity()
+    assert persisted.status is MissionStatus.RESOURCE_BLOCKED
+    assert persisted.checkpoint["status"] == "not_dispatched"
+    assert persisted.checkpoint["reason_code"] == "process_sandbox_unavailable"
+    assert persisted.checkpoint["stage"] == "pre_dispatch_sandbox_check"
+    assert persisted.checkpoint["dispatch_attempted"] is False
+    failure = persisted.failures[-1]
+    assert failure["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
+    assert failure["reason_code"] == "process_sandbox_unavailable"
+    assert failure["stage"] == "pre_dispatch_sandbox_check"
+    assert failure["error_type"] == "ProcessSandboxUnavailable"
+    assert failure["mission_id"] == persisted.mission_id
+    assert failure["dispatch_attempted"] is False
+    assert persisted.action_history == []
+    assert all(
+        event.get("event") != EventType.TOOL_EXECUTED.value
+        for event in persisted.trajectory
+    )
+    assert persisted.evidence == []
+    assert _external_effect_count(store.db_path) == 0
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize("parallel", [False, True])

@@ -2,7 +2,7 @@ name: cybersentinel-windows-rc-installer
 
 on:
   push:
-    branches: [work/windows-native-local-llm, work/hermes-level-agent-intelligence, work/v5.2-final-completion]
+    branches: [work/windows-native-local-llm, work/hermes-level-agent-intelligence, work/v5.2-final-completion, work/v5.2-mission-acceptance-repair-20261009]
     paths:
       - "VERSION"
       - ".env.example"
@@ -45,6 +45,131 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  source-tree-e2e:
+    name: Linux source-tree Qwen Owner Mission acceptance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      E2E_ARTIFACT: ${{ runner.temp }}/cybersentinel-full-e2e-acceptance.json
+      E2E_STATE: ${{ runner.temp }}/cybersentinel-full-e2e-state
+      E2E_RUNTIME: ${{ runner.temp }}/cybersentinel-llama-runtime
+      E2E_MODEL: ${{ runner.temp }}/qwen3-4b-q4-k-m.gguf
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install Python and browser dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Build and verify pinned rootless Bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes build-essential meson ninja-build libcap-dev pkg-config util-linux
+          archive="$RUNNER_TEMP/bubblewrap-0.10.0.tar.xz"
+          source_dir="$RUNNER_TEMP/bubblewrap-0.10.0"
+          build_dir="$RUNNER_TEMP/bubblewrap-build"
+          stage_dir="$RUNNER_TEMP/bubblewrap-stage"
+          curl --fail --location --silent --show-error \
+            https://github.com/containers/bubblewrap/releases/download/v0.10.0/bubblewrap-0.10.0.tar.xz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            65d92cf44a63a51e1b7771f70c05013dce5bd6b0b2841c4b4be54b0c45565471 \
+            "$archive" | sha256sum --check -
+          mkdir -p "$source_dir"
+          tar -xJf "$archive" --strip-components=1 -C "$source_dir"
+          meson setup "$build_dir" "$source_dir" \
+            --prefix=/opt/bubblewrap-0.10.0 \
+            -Dtests=true \
+            -Dselinux=disabled \
+            -Dman=disabled \
+            -Dbash_completion=disabled \
+            -Dzsh_completion=disabled
+          meson compile -C "$build_dir"
+          meson test -C "$build_dir" --print-errorlogs
+          DESTDIR="$stage_dir" meson install -C "$build_dir"
+          bwrap_bin="$stage_dir/opt/bubblewrap-0.10.0/bin/bwrap"
+          test "$("$bwrap_bin" --version)" = "bubblewrap 0.10.0"
+          sudo install -m 0755 "$bwrap_bin" /usr/bin/bwrap
+          test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.10.0"
+          cmp --silent "$bwrap_bin" /usr/bin/bwrap
+          command -v prlimit
+          prlimit --cpu=60 --as=8589934592 -- /usr/bin/true
+      - name: Verify rootless network-isolated process preflight
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          bwrap --unshare-user --unshare-net --ro-bind / / --proc /proc --dev /dev /usr/bin/true
+      - name: Run affected security and plan-review regression tests
+        run: python -m pytest -q tests/test_full_e2e_plan_revisions.py tests/test_v14_security_integration_battery.py
+      - name: Download and verify pinned llama.cpp Linux runtime
+        run: python scripts/download_llama_runtime.py --output "$E2E_RUNTIME" --platform linux-x64
+      - name: Download Qwen model at pinned revision and verify size and SHA-256
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from agent.local_runtime.catalog import get_model
+          from agent.local_runtime.downloader import download_verified_file
+
+          spec = get_model("qwen3-4b-q4-k-m")
+          destination = Path(os.environ["E2E_MODEL"])
+          last_reported = 0
+
+          def report_progress(downloaded, total):
+              global last_reported
+              if downloaded == total or downloaded - last_reported >= 268_435_456:
+                  print(f"Pinned Qwen download progress: {downloaded}/{total} bytes", flush=True)
+                  last_reported = downloaded
+
+          verified = download_verified_file(
+              spec.download_url,
+              destination,
+              expected_size=spec.size_bytes,
+              expected_sha256=spec.sha256,
+              progress=report_progress,
+          )
+          print(f"Verified Qwen model {spec.model_id} at pinned revision {spec.revision}: {verified.stat().st_size} bytes", flush=True)
+          PY
+      - name: Run real source-tree Owner Mission acceptance using local Qwen
+        run: |
+          set -euo pipefail
+          cleanup() {
+            status=$?
+            rm -rf -- "$E2E_STATE" "$E2E_RUNTIME"
+            rm -f -- "$E2E_MODEL"
+            exit "$status"
+          }
+          trap cleanup EXIT
+          python scripts/run_full_e2e_gate_acceptance.py \
+            --runtime-dir "$E2E_RUNTIME" \
+            --model-file "$E2E_MODEL" \
+            --artifact "$E2E_ARTIFACT" \
+            --state-dir "$E2E_STATE"
+      - name: Upload sanitized source-tree Mission evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CyberSentinel-Linux-source-tree-Mission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cybersentinel-full-e2e-acceptance.json
+          if-no-files-found: warn
+          retention-days: 90
+
   windows-installer:
     runs-on: windows-latest
     timeout-minutes: 180
@@ -65,6 +190,7 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Optionally download the preserved original RC1 artifact for baseline comparison
         id: preserved-original-artifact
+        if: github.ref != 'refs/heads/work/v5.2-mission-acceptance-repair-20261009'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -129,7 +255,7 @@ jobs:
       - name: Windows-portable API, project, model, and security tests
         id: windows-portable-tests
         continue-on-error: true
-        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py tests/test_mission_native_auth_preflight.py tests/test_mission_report_approval.py tests/test_scope_firewall_battery.py tests/test_mission_graph_runtime.py tests/test_v14_security_integration_battery.py
+        run: python -m pytest -q tests/test_full_e2e_plan_revisions.py tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py tests/test_mission_native_auth_preflight.py tests/test_mission_report_approval.py tests/test_scope_firewall_battery.py tests/test_mission_graph_runtime.py tests/test_v14_security_integration_battery.py
       - name: Install locked Electron toolchain
         working-directory: desktop
         run: npm ci --no-audit --no-fund
@@ -183,14 +309,12 @@ jobs:
             -InstallRoot (Join-Path $env:RUNNER_TEMP "cybersentinel-new-install") `
             -EvidenceDirectory $evidence `
             -Mode full `
-            -RunSourceTreeE2ESupplemental `
             -ExpectedSha256 ([string]$manifest.sha256) `
             -ExpectedSizeBytes ([long]$manifest.size_bytes) `
             -ExpectedSourceCommit $env:GITHUB_SHA
           $report = Get-Content -LiteralPath (Join-Path $evidence "installer-acceptance.json") -Raw | ConvertFrom-Json
           "status=$($report.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "full_mission=$($report.full_mission_e2e.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "source_supplemental=$($report.source_tree_e2e_supplemental.status)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           Write-Host "New RC native Windows installed UI/Qwen/Owner acceptance: $($report.status)"
           Write-Host "New RC native Windows full local-Qwen Mission acceptance: $($report.full_mission_e2e.status)"
           if ($report.status -ne "PASS") { Write-Warning "Candidate Windows acceptance did not fully pass; evidence will be retained and the installer will not be published." }
@@ -217,7 +341,6 @@ jobs:
           CYBERSENTINEL_WINDOWS_PRESERVED_CANDIDATE_FULL_MISSION: ${{ steps.original-candidate.outputs.full_mission }}
           CYBERSENTINEL_WINDOWS_INSTALLED_UI_ACCEPTANCE: ${{ steps.installed-candidate.outputs.status }}
           CYBERSENTINEL_WINDOWS_FULL_MISSION_E2E_ACCEPTANCE: ${{ steps.installed-candidate.outputs.full_mission }}
-          CYBERSENTINEL_WINDOWS_SOURCE_TREE_E2E_SUPPLEMENTAL: ${{ steps.installed-candidate.outputs.source_supplemental }}
         run: >-
           python scripts/write_installer_manifest.py desktop/dist
           --version '${{ steps.candidate-version.outputs.version }}'

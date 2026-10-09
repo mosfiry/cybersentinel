@@ -450,6 +450,7 @@ class AgentCore:
     def _executor(self, mission: Mission, step: PlanStep, action_id: str, *, execution_fence: Any = None, delegation_scope: Any = None, timeout_seconds: float | None = None) -> dict[str, Any]:
         from .execution_fence import ExecutionFenceError
         from .external_effects import EffectRecoveryRequired
+        from workspace.environment import ProcessSandboxUnavailable
         if execution_fence is None:
             raise ExecutionFenceError("AgentCore tool dispatch requires an execution fence")
         execution_fence.assert_active_execution(mission)
@@ -503,13 +504,7 @@ class AgentCore:
                 if step.action == "run_project_tests":
                     sandbox_unavailable = workspace.process_sandbox_unavailable_reason()
                     if sandbox_unavailable:
-                        return {
-                            "success": False,
-                            "failure_class": "RESOURCE",
-                            "reason_code": "process_sandbox_unavailable",
-                            "error": sandbox_unavailable,
-                            "execution_id": action_id,
-                        }
+                        raise ProcessSandboxUnavailable(sandbox_unavailable)
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity
             if selected_skill_context is not None:
                 # Last live Skill approval/revocation/expiry check immediately before canonical dispatch.
@@ -530,6 +525,8 @@ class AgentCore:
         except SkillAuthorizationError:
             raise
         except ExecutionFenceError:
+            raise
+        except ProcessSandboxUnavailable:
             raise
         except Exception as exc:
             return {"success": False, "failure_class": "TOOL", "error": f"{type(exc).__name__}: {exc}", "execution_id": action_id}
