@@ -283,6 +283,40 @@ def test_crash_after_reconciliation_save_resumes_without_replay(tmp_path, monkey
     assert resumed.status is MissionStatus.READY
 
 
+def test_reconciliation_save_failure_before_commit_preserves_in_flight_checkpoint(tmp_path, monkeypatch):
+    runtime, mission, result, _ = _ambiguous_execution_runtime(tmp_path, monkeypatch, RuntimeError("crash"))
+    assert result.status is MissionStatus.RECOVERY_REQUIRED
+    db = Path(tmp_path) / "missions.sqlite3"
+
+    class FailBeforeReconciliationSave(MissionStore):
+        def save(self, candidate):
+            if (candidate.checkpoint or {}).get("reconciled") is True:
+                raise RuntimeError("storage unavailable before commit")
+            return super().save(candidate)
+
+    failing = MissionRuntime(FailBeforeReconciliationSave(db), executor=lambda *_: {}, authorization_snapshot_factory=make_test_snapshot)
+    with pytest.raises(RuntimeError, match="before commit"):
+        failing.reconcile_in_flight(
+            mission.mission_id,
+            executed=True,
+            observation={"success": True, "source": "receipt-not-committed"},
+        )
+
+    persisted = MissionStore(db).load(mission.mission_id)
+    assert persisted.status is MissionStatus.RECOVERY_REQUIRED
+    assert persisted.checkpoint.get("status") == "in_flight"
+    assert persisted.checkpoint.get("reconciled") is not True
+
+    recovered = _runtime(tmp_path)
+    reconciled = recovered.reconcile_in_flight(
+        mission.mission_id,
+        executed=True,
+        observation={"success": True, "source": "receipt-retry"},
+    )
+    assert reconciled.status is MissionStatus.READY
+    assert reconciled.checkpoint.get("reconciled") is True
+
+
 def test_deterministic_failed_result_is_failure_observation_not_evidence(tmp_path, monkeypatch):
     import tools.registry
 
