@@ -157,12 +157,12 @@ def download_verified_file(
 
     with response:
         status = int(getattr(response, "status", response.getcode()))
+        if status not in {200, 206}:
+            raise DownloadError(f"download_http_{status}")
         append = bool(offset and status == 206)
         if offset and not append:
             # Some mirrors ignore Range. Restart instead of appending duplicate bytes.
             offset = 0
-        elif status not in {200, 206}:
-            raise DownloadError(f"download_http_{status}")
         written = offset
         try:
             with _open_partial(part, append=append) as output:
@@ -180,6 +180,8 @@ def download_verified_file(
                 output.flush()
                 os.fsync(output.fileno())
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled("download_cancelled") from exc
             raise DownloadError("download_interrupted") from exc
 
     actual_size = part.stat().st_size if part.exists() else 0

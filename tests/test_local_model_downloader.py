@@ -61,6 +61,26 @@ class CancelOpener(FakeOpener):
         self.request = None
 
 
+class CancelOnTimeoutResponse(FakeResponse):
+    def __init__(self, content: bytes, event: threading.Event):
+        super().__init__(content, 206)
+        self.event = event
+        self.calls = 0
+
+    def read(self, _size=-1):
+        if self.calls == 0:
+            self.calls += 1
+            return super().read(min(_size, 4))
+        self.event.set()
+        raise TimeoutError("network read timed out while cancellation was pending")
+
+
+class CancelTimeoutOpener(FakeOpener):
+    def __init__(self, content: bytes, event: threading.Event):
+        self.response = CancelOnTimeoutResponse(content, event)
+        self.request = None
+
+
 def _url():
     return "https://huggingface.co/test/model/resolve/revision/model.gguf"
 
@@ -92,6 +112,25 @@ def test_downloader_restarts_when_server_ignores_range(tmp_path):
     assert target.read_bytes() == content
 
 
+def test_downloader_preserves_partial_and_reports_http_error_when_resume_fails(tmp_path):
+    target = tmp_path / "model.gguf"
+    partial = target.with_name("model.gguf.part")
+    partial_data = b"resume"
+    partial.write_bytes(partial_data)
+    expected = b"complete-model-content"
+    opener = FakeOpener(b"not-found", 404)
+
+    with pytest.raises(DownloadError, match="download_http_404"):
+        download_verified_file(
+            _url(), target, expected_size=len(expected), expected_sha256=hashlib.sha256(expected).hexdigest(),
+            opener=opener,
+        )
+
+    assert opener.request.get_header("Range") == f"bytes={len(partial_data)}-"
+    assert partial.read_bytes() == partial_data
+    assert not target.exists()
+
+
 def test_downloader_rejects_hash_mismatch_and_cleans_partial(tmp_path):
     target = tmp_path / "model.gguf"
     with pytest.raises(DownloadError, match="download_integrity_check_failed"):
@@ -116,6 +155,25 @@ def test_downloader_cancels_cooperatively_and_keeps_only_uninstalled_partial(tmp
         download_verified_file(_url(), target, expected_size=16, expected_sha256=hashlib.sha256(b"abcdefgh12345678").hexdigest(), opener=opener, cancel_event=event)
     assert not target.exists()
     assert target.with_name("model.gguf.part").read_bytes() == b"abcd"
+
+
+def test_downloader_classifies_read_timeout_as_cancellation_when_cancel_is_set(tmp_path):
+    content = b"trusted-file-content"
+    target = tmp_path / "model.gguf"
+    partial = target.with_name("model.gguf.part")
+    partial.write_bytes(content[:5])
+    event = threading.Event()
+    opener = CancelTimeoutOpener(content[5:], event)
+
+    with pytest.raises(DownloadCancelled, match="download_cancelled"):
+        download_verified_file(
+            _url(), target, expected_size=len(content), expected_sha256=hashlib.sha256(content).hexdigest(),
+            opener=opener, cancel_event=event,
+        )
+
+    assert opener.request.get_header("Range") == f"bytes={5}-"
+    assert partial.read_bytes() == content[:9]
+    assert not target.exists()
 
 
 def test_downloader_rejects_symlinked_partial_without_following_it(tmp_path):
