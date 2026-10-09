@@ -54,11 +54,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      E2E_ARTIFACT: ${{ runner.temp }}/cybersentinel-full-e2e-acceptance.json
-      E2E_STATE: ${{ runner.temp }}/cybersentinel-full-e2e-state
-      E2E_RUNTIME: ${{ runner.temp }}/cybersentinel-llama-runtime
-      E2E_MODEL: ${{ runner.temp }}/qwen3-4b-q4-k-m.gguf
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,8 +111,12 @@ jobs:
       - name: Run affected security and plan-review regression tests
         run: python -m pytest -q tests/test_full_e2e_plan_revisions.py tests/test_v14_security_integration_battery.py
       - name: Download and verify pinned llama.cpp Linux runtime
+        env:
+          E2E_RUNTIME: ${{ runner.temp }}/cybersentinel-llama-runtime
         run: python scripts/download_llama_runtime.py --output "$E2E_RUNTIME" --platform linux-x64
       - name: Download Qwen model at pinned revision and verify size and SHA-256
+        env:
+          E2E_MODEL: ${{ runner.temp }}/qwen3-4b-q4-k-m.gguf
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -147,6 +146,11 @@ jobs:
           print(f"Verified Qwen model {spec.model_id} at pinned revision {spec.revision}: {verified.stat().st_size} bytes", flush=True)
           PY
       - name: Run real source-tree Owner Mission acceptance using local Qwen
+        env:
+          E2E_ARTIFACT: ${{ runner.temp }}/cybersentinel-full-e2e-acceptance.json
+          E2E_STATE: ${{ runner.temp }}/cybersentinel-full-e2e-state
+          E2E_RUNTIME: ${{ runner.temp }}/cybersentinel-llama-runtime
+          E2E_MODEL: ${{ runner.temp }}/qwen3-4b-q4-k-m.gguf
         run: |
           set -euo pipefail
           cleanup() {

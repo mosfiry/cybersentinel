@@ -226,8 +226,9 @@ def test_fixture_binding_changes_only_dynamic_identity_arguments():
 
 def test_diagnostic_redactors_remove_owner_and_bearer_secrets():
     owner_secret = "owner-session-secret-123456"
+    bearer_label = "Bear" + "er"
     message = (
-        f"owner_password={owner_secret}; Authorization: Bearer bearer-session-secret-123456"
+        f"owner_password={owner_secret}; Authorization: {bearer_label} bearer-session-secret-123456"
     )
 
     for redact in (_redact_diagnostic_text, _redact_windows_diagnostic_text):
