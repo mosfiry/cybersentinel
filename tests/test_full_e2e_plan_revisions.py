@@ -183,6 +183,47 @@ def test_mission_execution_diagnostics_locate_inflight_failure_without_raw_tool_
     assert marker not in repr(malformed_summary)
 
 
+def test_effect_recovery_diagnostics_include_only_safe_state_and_reason_code():
+    marker = "RAW-EFFECT-IDENTIFIER-OR-DETAIL"
+    mission = SimpleNamespace(
+        status=SimpleNamespace(value="RECOVERY_REQUIRED"),
+        current_step=0,
+        plan=_plan([("browser", {"operation": "links"})]),
+        checkpoint={"status": "in_flight", "step_id": "model-step-1-browser", "effect_id": marker},
+        action_history=[],
+        observations=[{
+            "type": "external_effect_recovery_required",
+            "success": False,
+            "effect_id": marker,
+            "effect_state": "RECOVERY_REQUIRED",
+            "reason_code": "HANDLER_MISSION_ARTIFACT_STORE_UNAVAILABLE",
+            "error": marker,
+        }],
+        failures=[{"class": "UNKNOWN", "effect_id": marker, "reason": marker}],
+        error=marker,
+        evidence=[],
+        verification_state={},
+        verify_integrity=lambda: True,
+    )
+
+    summary = _safe_mission_execution_diagnostics(mission)
+
+    assert summary["mission_status"] == "RECOVERY_REQUIRED"
+    assert summary["last_effect_state"] == "RECOVERY_REQUIRED"
+    assert summary["last_effect_reason_code"] == "HANDLER_MISSION_ARTIFACT_STORE_UNAVAILABLE"
+    assert marker not in repr(summary)
+
+    mission.observations = [{
+        "type": "external_effect_recovery_required",
+        "effect_state": marker,
+        "reason_code": marker,
+    }]
+    malformed_summary = _safe_mission_execution_diagnostics(mission)
+    assert malformed_summary["last_effect_state"] is None
+    assert malformed_summary["last_effect_reason_code"] is None
+    assert marker not in repr(malformed_summary)
+
+
 def test_plan_validator_feedback_reaches_model_and_only_model_revision_supplies_steps():
     incomplete = _plan(_complete_entries()[:-3])
     revised = _plan(_complete_entries())

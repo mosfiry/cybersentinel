@@ -552,6 +552,14 @@ _SAFE_MISSION_ACTION_RESULTS = frozenset({"completed", "failed", "running", "pen
 _SAFE_MISSION_OBSERVATION_TYPES = frozenset({
     "execution_exception", "tool_observation", "external_effect_recovery_required",
 })
+_SAFE_MISSION_EFFECT_STATES = frozenset({
+    "PLANNED", "RESERVED", "DISPATCHED", "SUCCEEDED", "FAILED", "AMBIGUOUS",
+    "RECOVERY_REQUIRED", "UNKNOWN",
+})
+_SAFE_MISSION_EFFECT_REASON_CODES = frozenset({
+    "OUTCOME_PERSISTENCE_FAILED", "RESULT_BOUNDARY_FAILED", "TOOL_TIMEOUT",
+    "DUPLICATE_DISPATCH_BLOCKED", "EFFECT_IDENTITY_CONFLICT", "REMOTE_TOOL_ERROR",
+})
 _SAFE_MISSION_FAILURE_CLASSES = frozenset({
     "PROVIDER", "LOGIC", "RESOURCE", "SECURITY", "UNKNOWN", "AUTHORIZATION", "SCOPE",
 })
@@ -621,6 +629,25 @@ def _safe_mission_execution_diagnostics(mission) -> dict[str, object]:
     observation_success = last_observation.get("success")
     if not isinstance(observation_success, bool):
         observation_success = None
+    effect_state = last_observation.get("effect_state")
+    if (
+        observation_type != "external_effect_recovery_required"
+        or not isinstance(effect_state, str)
+        or effect_state not in _SAFE_MISSION_EFFECT_STATES
+    ):
+        effect_state = None
+    effect_reason_code = last_observation.get("reason_code")
+    if (
+        observation_type != "external_effect_recovery_required"
+        or not isinstance(effect_reason_code, str)
+        or len(effect_reason_code) > 64
+        or re.fullmatch(r"[A-Z0-9_]{1,64}", effect_reason_code) is None
+        or (
+            effect_reason_code not in _SAFE_MISSION_EFFECT_REASON_CODES
+            and not effect_reason_code.startswith("HANDLER_")
+        )
+    ):
+        effect_reason_code = None
 
     failures = getattr(mission, "failures", ())
     failures = list(failures) if isinstance(failures, (list, tuple)) else []
@@ -666,6 +693,8 @@ def _safe_mission_execution_diagnostics(mission) -> dict[str, object]:
         "last_failure_action_name": last_failure_action,
         "last_observation_type": observation_type,
         "last_observation_success": observation_success,
+        "last_effect_state": effect_state,
+        "last_effect_reason_code": effect_reason_code,
         "execution_exception_type": error_type,
         "evidence_count": min(evidence_count, 64),
         "verification_verified": verification_state.get("verified") if isinstance(verification_state.get("verified"), bool) else None,

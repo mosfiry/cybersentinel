@@ -1424,12 +1424,20 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         except Exception as exc:
             if effect is None:
                 raise
+            handler_code = getattr(exc, "code", None)
+            if isinstance(handler_code, str) and re.fullmatch(r"[A-Za-z0-9_]{1,56}", handler_code):
+                reason_code = f"HANDLER_{handler_code.upper()}"[:64]
+            else:
+                exception_type = type(exc).__name__.upper()
+                if re.fullmatch(r"[A-Z0-9_]{1,48}", exception_type) is None:
+                    exception_type = "UNCLASSIFIED"
+                reason_code = f"HANDLER_EXCEPTION_{exception_type}"[:64]
             try:
                 effect_ledger.mark_recovery_required(
                     effect.effect_id,
                     execution_fence,
                     dispatch_id=dispatch_id,
-                    reason_code=type(exc).__name__.upper()[:64],
+                    reason_code=reason_code,
                     authorization_snapshot=mission_authorization,
                 )
             except ExecutionFenceError:
@@ -1443,7 +1451,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             raise EffectRecoveryRequired(
                 effect.effect_id,
                 EffectState.RECOVERY_REQUIRED,
-                "HANDLER_EXCEPTION",
+                reason_code,
             ) from None
         if max_result_chars is not None:
             try:

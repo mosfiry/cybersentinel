@@ -383,16 +383,39 @@ def test_dispatch_exception_is_quarantined_and_not_retried(tmp_path, monkeypatch
         raise RuntimeError("provider response contained a private detail")
 
     spec = _effect_spec("effect_probe", handler)
-    with pytest.raises(EffectRecoveryRequired):
+    with pytest.raises(EffectRecoveryRequired) as recovery:
         _execute(monkeypatch, spec, mission, snapshot, fence, "payload")
+    assert recovery.value.reason_code == "HANDLER_EXCEPTION_RUNTIMEERROR"
+    assert "provider response contained a private detail" not in str(recovery.value)
 
     ledger = ExternalEffectLedger(queue.db_path)
     effect = ledger.list_effects(mission_id=mission.mission_id)[0]
     assert effect.state == EffectState.RECOVERY_REQUIRED
-    assert effect.error_code == "RUNTIMEERROR"
+    assert effect.error_code == "HANDLER_EXCEPTION_RUNTIMEERROR"
     with pytest.raises(EffectDispatchBlocked):
         _execute(monkeypatch, spec, mission, snapshot, fence, "payload")
     assert calls == ["payload"]
+
+
+def test_browser_error_code_survives_effect_recovery_without_raw_message(tmp_path, monkeypatch):
+    from tools.browser import BrowserOperationError
+
+    _store, mission, snapshot, queue, _identity, _claim, fence = _leased_fence(tmp_path)
+
+    def handler(_value):
+        raise BrowserOperationError("mission_artifact_store_unavailable")
+
+    spec = _effect_spec("effect_probe", handler)
+    with pytest.raises(EffectRecoveryRequired) as recovery:
+        _execute(monkeypatch, spec, mission, snapshot, fence, "payload")
+
+    expected = "HANDLER_MISSION_ARTIFACT_STORE_UNAVAILABLE"
+    assert recovery.value.reason_code == expected
+    assert expected not in str(recovery.value)
+    ledger = ExternalEffectLedger(queue.db_path)
+    effect = ledger.list_effects(mission_id=mission.mission_id)[0]
+    assert effect.state == EffectState.RECOVERY_REQUIRED
+    assert effect.error_code == expected
 
 
 def test_process_death_after_dispatch_leaves_durable_intent_and_forbids_replay(
