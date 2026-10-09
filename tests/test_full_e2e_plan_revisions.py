@@ -116,7 +116,7 @@ def test_qwen_preflight_diagnostics_distinguish_state_and_exclude_raw_model_cont
     assert summary["qwen_planning"]["required_tool_schemas_visible"] is True
     assert set(summary["qwen_planning"]["visible_required_tool_names"]) == set(REQUIRED_QWEN_ACTION_NAMES)
     assert summary["qwen_planning"]["missing_final_model_tool_names"]
-    assert "<unrecognized_action>" in summary["qwen_planning"]["final_model_tool_names"]
+    assert "<invalid_action_name>" in summary["qwen_planning"]["final_model_tool_names"]
     assert marker not in repr(summary)
 
 

@@ -69,7 +69,7 @@ def _redact_diagnostic_text(value: object, secret_values=()) -> str:
 def _safe_action_names(values: list[str]) -> list[str]:
     allowed = REQUIRED_QWEN_ACTION_NAMES | {"__planning_failure__"}
     return [
-        value if isinstance(value, str) and value in allowed else "<unrecognized_action>"
+        value if isinstance(value, str) and value in allowed else "<invalid_action_name>"
         for value in values[:32]
     ]
 
