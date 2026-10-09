@@ -398,6 +398,38 @@ class AgentCore:
         snapshot = capture_policy_snapshot(request_id, evidence)
         return AuthorizationContext(request_id=request_id, owner_evidence=evidence, policy_snapshot=snapshot, session_id=evidence.session_id), policy_context_from_snapshot(snapshot)
 
+    def _refresh_owner_authorization_after_planning(
+        self,
+        *,
+        instruction: str,
+        owner_session_token: str,
+        request_id: str,
+        previous_context: AuthorizationContext,
+    ) -> tuple[AuthorizationContext, str]:
+        refreshed, policy_context = self._auth(instruction, owner_session_token, request_id)
+        if refreshed.session_id != previous_context.session_id:
+            raise PermissionError("Owner session changed during Mission planning")
+        if (
+            refreshed.policy_fingerprint != previous_context.policy_fingerprint
+            or refreshed.instruction_fingerprint != previous_context.instruction_fingerprint
+        ):
+            raise PermissionError("Owner policy changed during Mission planning; a new plan is required")
+        previous_scope = previous_context.scope_snapshot
+        if previous_scope is not None:
+            current_scope = get_snapshot(previous_scope.snapshot_id)
+            if current_scope is None:
+                raise PermissionError("invalid_scope_context")
+            refreshed = AuthorizationContext(
+                request_id=refreshed.request_id,
+                owner_evidence=refreshed.owner_evidence,
+                policy_snapshot=refreshed.policy_snapshot,
+                scope_snapshot=current_scope,
+                session_id=refreshed.session_id,
+            )
+            if refreshed.scope_fingerprint != previous_context.scope_fingerprint:
+                raise PermissionError("Owner scope changed during Mission planning; a new plan is required")
+        return refreshed, policy_context
+
     @staticmethod
     def _canonical_owner_ref_from_context(context: AuthorizationContext) -> str:
         from security.owner_password import authenticated_owner
@@ -751,6 +783,12 @@ class AgentCore:
             break
         if plan is None:
             raise RuntimeError("owner mission planning ended without a plan or recorded failure")
+        authorization_context, policy_context = self._refresh_owner_authorization_after_planning(
+            instruction=instruction,
+            owner_session_token=owner_session_token,
+            request_id=request_id,
+            previous_context=authorization_context,
+        )
         task_profile = TaskProfile.from_proposal(instruction, {"task_type": "owner_mission", "horizon": "long_horizon", "complexity": "multi_step", "likely_tools": [step.action for step in plan.steps if step.action != "__planning_failure__"]})
         def replan_with_selected_skill(current: Mission, observation: dict[str, Any]) -> Plan:
             persisted_authorization = MissionAuthorizationSnapshot.from_dict(

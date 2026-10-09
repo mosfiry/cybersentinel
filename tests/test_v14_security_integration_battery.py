@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -120,6 +122,54 @@ def _external_effect_count(db_path: str | Path) -> int:
         return int(connection.execute("SELECT COUNT(*) FROM external_effects").fetchone()[0])
     finally:
         connection.close()
+
+
+def test_owner_evidence_is_refreshed_after_slow_mission_planning(tmp_path, monkeypatch):
+    allow_owner_sessions(monkeypatch, "owner-session")
+    monkeypatch.setattr(owner_policy, "_EVIDENCE_TTL_SECONDS", 1)
+    core, _store, provider = _core(
+        tmp_path,
+        monkeypatch,
+        response=ProviderResponse(
+            tool_calls=[ToolCall("status", {}, "slow-owner-planning")]
+        ),
+    )
+    issued_evidence = []
+    original_authenticate = agent_core_module.authenticate_owner
+
+    def record_authentication(session_token, request_id):
+        evidence = original_authenticate(session_token, request_id)
+        issued_evidence.append(evidence)
+        return evidence
+
+    monkeypatch.setattr(agent_core_module, "authenticate_owner", record_authentication)
+    original_plan = core._plan
+
+    def slow_plan(*args, **kwargs):
+        plan = original_plan(*args, **kwargs)
+        time.sleep(1.1)
+        monkeypatch.setattr(owner_policy, "_EVIDENCE_TTL_SECONDS", 300)
+        return plan
+
+    monkeypatch.setattr(core, "_plan", slow_plan)
+    request_id = "owner-evidence-expiry-during-planning"
+    mission = core.run_owner_mission(
+        "Read current local system status and report observed facts.",
+        owner_session_token="owner-session",
+        request_id=request_id,
+        run=False,
+    )
+
+    assert provider.calls == 1
+    assert len(issued_evidence) == 2
+    assert datetime.fromisoformat(issued_evidence[1].authenticated_at) > datetime.fromisoformat(
+        issued_evidence[0].expires_at
+    )
+    assert mission.status is MissionStatus.READY
+    assert mission.authorization_context["owner_evidence"]["authenticated_at"] == issued_evidence[1].authenticated_at
+    assert datetime.fromisoformat(mission.authorization_snapshot["expires_at"]) > datetime.fromisoformat(
+        mission.authorization_snapshot["created_at"]
+    )
 
 
 def _process_sandbox_unavailable_reason() -> str | None:
