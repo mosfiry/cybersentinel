@@ -16,6 +16,9 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, build_opener
 
 # This is only the harness's HTTP-response wait; AgentCore remains bounded by the
 # 300-second Owner mission limit, with a 30-second response-finalization margin.
@@ -24,6 +27,9 @@ OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS = 30
 INSTALLED_APP_MISSION_RESPONSE_TIMEOUT_MS = (
     OWNER_MISSION_RUNTIME_LIMIT_SECONDS + OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS
 ) * 1000
+MODEL_STATE_API_RETRY_DELAY_SECONDS = 2
+MODEL_STATE_API_MAX_CONSECUTIVE_FAILURES = 5
+MODEL_STATE_API_MAX_TOTAL_FAILURES = 10
 
 
 def _sha256(value: bytes | str) -> str:
@@ -55,6 +61,21 @@ def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
         if item:
             summary.append(item)
     return summary
+
+
+def _local_health_status(page) -> int | None:
+    try:
+        parsed = urlsplit(str(page.url))
+        if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
+            return None
+        health_url = f"http://127.0.0.1:{parsed.port}/api/public/health"
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(health_url, timeout=2) as response:
+            return int(response.status)
+    except HTTPError as exc:
+        return int(exc.code)
+    except Exception:
+        return None
 
 
 def _model_state(page) -> dict:
@@ -423,8 +444,41 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
 def _wait_for_model(page, predicate, *, timeout: float, phase: str, progress: list[dict]) -> dict:
     deadline = time.monotonic() + timeout
     last = None
+    consecutive_fetch_failures = 0
+    total_fetch_failures = 0
     while time.monotonic() < deadline:
-        state = _model_state(page)
+        try:
+            state = _model_state(page)
+        except Exception as exc:
+            consecutive_fetch_failures += 1
+            total_fetch_failures += 1
+            exception_type = type(exc).__name__
+            if not _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(exception_type):
+                exception_type = "Error"
+            progress.append({
+                "phase": phase + "_api_fetch_retry",
+                "at_utc": datetime.now(timezone.utc).isoformat(),
+                "api_fetch_error_type": exception_type,
+                "local_health_status": _local_health_status(page),
+                "consecutive_failures": consecutive_fetch_failures,
+                "total_failures": total_fetch_failures,
+            })
+            if (
+                consecutive_fetch_failures >= MODEL_STATE_API_MAX_CONSECUTIVE_FAILURES
+                or total_fetch_failures >= MODEL_STATE_API_MAX_TOTAL_FAILURES
+            ):
+                raise RuntimeError("desktop_model_manager_api_unavailable_after_bounded_retries") from None
+            time.sleep(min(MODEL_STATE_API_RETRY_DELAY_SECONDS, max(0, deadline - time.monotonic())))
+            continue
+        if consecutive_fetch_failures:
+            progress.append({
+                "phase": phase + "_api_fetch_recovered",
+                "at_utc": datetime.now(timezone.utc).isoformat(),
+                "status_api_recovered": True,
+                "consecutive_failures": consecutive_fetch_failures,
+                "total_failures": total_fetch_failures,
+            })
+            consecutive_fetch_failures = 0
         model = _find_qwen(state)
         operation = (state.get("manager") or {}).get("operation") or {}
         marker = (operation.get("status"), operation.get("kind"), operation.get("progress"),
