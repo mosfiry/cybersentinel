@@ -374,15 +374,59 @@ def test_browser_sessions_are_owner_mission_and_scope_bound(browser_fixture):
 
 def test_current_page_scope_is_revalidated_before_each_session_read(browser_fixture, monkeypatch):
     service, ctx = browser_fixture.service, browser_fixture.context
-    opened = service.open({"url": browser_fixture.origin + "/"}, ctx)
     from security.scope import ScopeDecision
+    from tools.browser import _BrowserSession
+
+    session_id = "bs_" + "a" * 32
+    page = SimpleNamespace(url=browser_fixture.origin + "/", closed=False, locator_called=False)
+    page.is_closed = lambda: page.closed
+
+    def close_page(*, run_before_unload=False):
+        page.closed = True
+
+    def deny_dom_read(*_args, **_kwargs):
+        page.locator_called = True
+        raise AssertionError("DOM must not be read after current-page scope denial")
+
+    page.close = close_page
+    page.locator = deny_dom_read
+    page_context = SimpleNamespace(closed=False)
+    page_context.close = lambda: setattr(page_context, "closed", True)
+    session = _BrowserSession(
+        session_id=session_id,
+        owner_identity=ctx.owner_identity,
+        owner_session_id=ctx.owner_session_id,
+        mission_id=ctx.mission_id,
+        scope_snapshot_id=ctx.scope_snapshot["scope_snapshot_id"],
+        target_id=ctx.scope_snapshot["target_id"],
+        context=page_context,
+        page=page,
+    )
+    service._sessions[session_id] = session
+
+    scope_checks = []
+
+    def deny_current_scope(snapshot_id, target_id, url, **kwargs):
+        scope_checks.append((snapshot_id, target_id, url, kwargs))
+        return ScopeDecision(False, "scope_expired", target_id="target-fixture")
+
     monkeypatch.setattr(
         "security.scope_resolver.resolve",
-        lambda *args, **kwargs: ScopeDecision(False, "scope_expired", target_id="target-fixture"),
+        deny_current_scope,
     )
     ctx.tool_id = "browser"
     with pytest.raises(BrowserOperationError, match="browser_session_scope_mismatch"):
-        service.extract({"session_id": opened["session_id"]}, ctx)
+        service.extract({"session_id": session_id}, ctx)
+
+    assert len(scope_checks) == 1
+    assert scope_checks[0][2] == page.url
+    assert scope_checks[0][3]["method"] == "GET"
+    assert scope_checks[0][3]["consume_rate"] is False
+    assert page.locator_called is False
+    assert page.closed is True
+    assert page_context.closed is True
+    assert session_id not in service._sessions
+    assert browser_fixture.evidence.records == []
 
 
 def test_sensitive_url_inputs_and_forbidden_form_values_fail_closed(browser_fixture):
