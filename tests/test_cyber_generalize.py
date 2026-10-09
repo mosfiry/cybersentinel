@@ -13,7 +13,13 @@ import pytest
 
 from cyber.generalize import SIMILARITY_THRESHOLD, UnseenTechniqueMatcher
 from cyber.knowledge_model import SourceClass
-from cyber.seed_corpus import build_seed_graph, corpus_size, corpus_technique_ids, corpus_cve_ids
+from cyber.seed_corpus import (
+    build_seed_graph,
+    corpus_cve_ids,
+    corpus_size,
+    cve_corpus_size,
+    corpus_technique_ids,
+)
 
 
 @pytest.fixture(scope="module")
@@ -25,7 +31,8 @@ def seeded():
 class TestBreadth:
     def test_corpus_is_broad(self):
         assert corpus_size() >= 30
-        assert len(corpus_cve_ids()) >= 6
+        assert cve_corpus_size() == len(corpus_cve_ids())
+        assert cve_corpus_size() >= 6
         ids = corpus_technique_ids()
         assert "T1059" in ids and "T1566.001" in ids
 
