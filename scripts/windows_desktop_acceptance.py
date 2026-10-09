@@ -41,10 +41,78 @@ def _sha256(value: bytes | str) -> str:
 _SAFE_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
 
 
+def _safe_failure_reason_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if value in {"repeated_read_only_tool_call", "repeated read-only tool call"}:
+        return "repeated_read_only_tool_call"
+    if value == "parallel task result exceeded the durable result bound":
+        return "parallel_task_result_exceeded_durable_result_bound"
+    if value.startswith("mission runtime budget exceeded: "):
+        return "mission_runtime_budget_exceeded"
+    return None
+
+
+def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
+    progress = mission_state.get("progress")
+    if not isinstance(progress, dict):
+        return [], "unavailable"
+    model_loop = progress.get("model_loop")
+    nested_results = model_loop.get("tool_results") if isinstance(model_loop, dict) else None
+    candidates = (("model_loop", nested_results), ("top_level", progress.get("tool_results")))
+    raw_results: list = []
+    source = "unavailable"
+    for candidate_source, candidate in candidates:
+        if not isinstance(candidate, list):
+            continue
+        if candidate:
+            raw_results = candidate
+            source = candidate_source
+            break
+        if source == "unavailable":
+            source = "empty"
+
+    summary = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        raw_name = item.get("name")
+        name = raw_name if isinstance(raw_name, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(raw_name) else "<invalid_action_name>"
+        safe_item = {"name": name, "ok": item.get("ok") if isinstance(item.get("ok"), bool) else None}
+        call_id = item.get("tool_call_id")
+        if isinstance(call_id, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(call_id):
+            safe_item["tool_call_id"] = call_id
+        error_code = _safe_failure_reason_code(item.get("error"))
+        if error_code:
+            safe_item["error_code"] = error_code
+        result = item.get("result")
+        if isinstance(result, dict):
+            for key in ("failure_class", "reason_code", "code", "kind"):
+                value = result.get(key)
+                if isinstance(value, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value):
+                    safe_item[key] = value
+            exception_type = result.get("exception")
+            if isinstance(exception_type, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(exception_type):
+                safe_item["exception_type"] = exception_type
+        summary.append(safe_item)
+    return summary, source
+
+
 def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
     failures = mission_state.get("failures")
     if not isinstance(failures, list):
         return []
+    plan = mission_state.get("plan")
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    step_actions = {}
+    if isinstance(steps, list):
+        for index, step in enumerate(steps[:100], start=1):
+            if not isinstance(step, dict):
+                continue
+            step_id = step.get("step_id")
+            action = step.get("action")
+            if isinstance(step_id, str) and step_id and isinstance(action, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(action):
+                step_actions[step_id] = (index, action)
     summary = []
     for failure in failures[-5:]:
         if not isinstance(failure, dict):
@@ -58,9 +126,37 @@ def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
         limit = failure.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= 1_000_000_000:
             item["limit"] = limit
+        reason_code = _safe_failure_reason_code(failure.get("reason"))
+        if reason_code:
+            item.setdefault("reason_code", reason_code)
+        step_info = step_actions.get(failure.get("step_id"))
+        if step_info:
+            item["plan_step_index"], item["step_action"] = step_info
         if item:
             summary.append(item)
     return summary
+
+
+def _safe_checkpoint_diagnostics(mission_state: dict) -> dict:
+    checkpoint = mission_state.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        return {}
+    summary = {
+        key: value
+        for key in ("status", "budget", "reason_code", "recovery")
+        if isinstance((value := checkpoint.get(key)), str)
+        and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value)
+    }
+    limit = checkpoint.get("limit")
+    if isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= 1_000_000_000:
+        summary["limit"] = limit
+    return summary
+
+
+def _tools_within_authorized_allowlist(tool_summary: list[dict], allowed_tools: object) -> bool:
+    if not tool_summary or not isinstance(allowed_tools, list):
+        return False
+    return all(isinstance(item, dict) and item.get("name") in allowed_tools for item in tool_summary)
 
 
 def _local_health_status(page) -> int | None:
@@ -310,14 +406,7 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     report = report_result["body"].get("report", {})
     if not isinstance(timeline, list) or not isinstance(evidence, list) or not isinstance(report, dict):
         raise RuntimeError("installed_app_mission_audit_payload_invalid")
-    mission_progress = mission_state.get("progress", {})
-    if not isinstance(mission_progress, dict):
-        mission_progress = {}
-    tool_results = mission_progress.get("tool_results", [])
-    tool_summary = [
-        {"name": item.get("name"), "ok": item.get("ok"), "tool_call_id": item.get("tool_call_id")}
-        for item in tool_results if isinstance(item, dict)
-    ]
+    tool_summary, tool_results_source = _safe_tool_result_summary(mission_state)
     report_summary = report.get("mission_summary", {})
     if not isinstance(report_summary, dict):
         report_summary = {}
@@ -369,7 +458,7 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         and len(allowed_networks) == 0
         and workspace_root_matches
     )
-    tool_authorization_verified = all(item.get("name") in allowed_tools for item in tool_summary)
+    tool_authorization_verified = _tools_within_authorized_allowlist(tool_summary, allowed_tools)
     report_outcome = str(report_summary.get("outcome", ""))
     chain_integrity = str(report_evidence.get("execution_chain_integrity", ""))
     test_tool_pass = any(item.get("name") == "run_project_tests" and item.get("ok") is True for item in tool_summary)
@@ -415,7 +504,9 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         "mission_status": mission_state.get("status"),
         "queue_state": queue_state.get("state"),
         "resource_failure_diagnostics": _safe_failure_diagnostics(mission_state),
+        "resource_checkpoint_diagnostics": _safe_checkpoint_diagnostics(mission_state),
         "tool_calls": tool_summary,
+        "tool_results_source": tool_results_source,
         "research_stage": research_stage,
         "hypothesis_stage": hypothesis_stage,
         "bounded_project_test_pass": test_tool_pass,

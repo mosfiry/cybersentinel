@@ -14,7 +14,10 @@ from scripts.windows_desktop_acceptance import (
     OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS,
     OWNER_MISSION_RUNTIME_LIMIT_SECONDS,
     _local_health_status,
+    _safe_checkpoint_diagnostics,
     _safe_failure_diagnostics,
+    _safe_tool_result_summary,
+    _tools_within_authorized_allowlist,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,22 +48,104 @@ def test_full_e2e_runtime_preflight_accepts_posix_server_name(tmp_path: Path) ->
 
 def test_failure_diagnostics_keep_only_safe_codes_and_bounded_limits() -> None:
     result = _safe_failure_diagnostics({
+        "plan": {"steps": [
+            {"step_id": "step-1-browser", "action": "browser", "objective": "private objective"},
+            {"step_id": "step-2-status", "action": "status", "objective": "another private objective"},
+        ]},
         "failures": [{
             "class": "resource",
             "budget": "model_loop_state",
             "reason_code": "repeated_read_only_tool_call",
             "limit": 0,
             "reason": "untrusted arbitrary mission text",
+            "step_id": "step-1-browser",
             "details": {"prompt": "must not be serialized"},
-        }]
+        }, {
+            "class": "RESOURCE",
+            "reason": "repeated read-only tool call",
+            "step_id": "step-2-status",
+        }],
     })
 
-    assert result == [{
-        "class": "resource",
-        "budget": "model_loop_state",
-        "reason_code": "repeated_read_only_tool_call",
-        "limit": 0,
+    assert result == [
+        {
+            "class": "resource",
+            "budget": "model_loop_state",
+            "reason_code": "repeated_read_only_tool_call",
+            "limit": 0,
+            "plan_step_index": 1,
+            "step_action": "browser",
+        },
+        {
+            "class": "RESOURCE",
+            "reason_code": "repeated_read_only_tool_call",
+            "plan_step_index": 2,
+            "step_action": "status",
+        },
+    ]
+    assert "private objective" not in repr(result)
+    assert "untrusted arbitrary mission text" not in repr(result)
+
+
+def test_tool_result_summary_reads_nested_model_loop_and_redacts_payloads() -> None:
+    summary, source = _safe_tool_result_summary({
+        "progress": {"model_loop": {"tool_results": [{
+            "name": "browser",
+            "arguments": {"url": "secret.example"},
+            "tool_call_id": "call_123",
+            "ok": False,
+            "error": "repeated_read_only_tool_call",
+            "result": {
+                "failure_class": "RESOURCE",
+                "exception": "RuntimeError",
+                "error": "untrusted observation text",
+            },
+        }]}}
+    })
+
+    assert source == "model_loop"
+    assert summary == [{
+        "name": "browser",
+        "ok": False,
+        "tool_call_id": "call_123",
+        "error_code": "repeated_read_only_tool_call",
+        "failure_class": "RESOURCE",
+        "exception_type": "RuntimeError",
     }]
+    assert "secret.example" not in repr(summary)
+    assert "untrusted observation text" not in repr(summary)
+
+
+def test_tool_result_summary_falls_back_to_top_level_results() -> None:
+    summary, source = _safe_tool_result_summary({
+        "progress": {
+            "model_loop": {"tool_results": []},
+            "tool_results": [{"name": "run_project_tests", "ok": True}],
+        }
+    })
+
+    assert source == "top_level"
+    assert summary == [{"name": "run_project_tests", "ok": True}]
+
+
+def test_empty_tool_results_do_not_vacuously_pass_authorization_gate() -> None:
+    assert not _tools_within_authorized_allowlist([], ["browser"])
+    assert _tools_within_authorized_allowlist([{"name": "browser"}], ["browser"])
+    assert not _tools_within_authorized_allowlist([{"name": "mcp.invoke"}], ["browser"])
+
+
+def test_checkpoint_diagnostics_expose_only_safe_budget_metadata() -> None:
+    result = _safe_checkpoint_diagnostics({
+        "checkpoint": {
+            "status": "budget_blocked",
+            "budget": "max_execution_steps",
+            "limit": 18,
+            "run_id": "private-run-id",
+        }
+    })
+
+    assert result == {"status": "budget_blocked", "budget": "max_execution_steps", "limit": 18}
+    assert "private-run-id" not in repr(result)
 
 
 def test_qwen_action_diagnostics_reject_non_identifier_model_text() -> None:
