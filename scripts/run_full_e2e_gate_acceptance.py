@@ -111,6 +111,8 @@ def _safe_plan_validation_attempts(attempts) -> list[dict]:
                 name: item.get(name) is True
                 for name in (
                     "browser_open_target_matches",
+                    "browser_open_arguments_match",
+                    "browser_links_arguments_match",
                     "browser_order_valid",
                     "browser_session_id_is_harness_bound",
                     "mcp_discovery_before_invoke",
@@ -260,6 +262,18 @@ def _validate_full_e2e_plan(plan, *, expected_browser_url: str) -> dict:
     )
     if len(browser_open) == 1 and not open_target_matches:
         issues.append("browser_open_target_mismatch")
+    browser_open_arguments_match = (
+        len(browser_open) == 1
+        and browser_open[0][1] == {"operation": "open", "url": expected_browser_url}
+    )
+    if len(browser_open) == 1 and not browser_open_arguments_match:
+        issues.append("browser_open_arguments_mismatch")
+    browser_links_arguments_match = (
+        len(browser_links) == 1
+        and browser_links[0][1] == {"operation": "links"}
+    )
+    if len(browser_links) == 1 and not browser_links_arguments_match:
+        issues.append("browser_links_arguments_mismatch")
     browser_order_valid = (
         len(browser_open) == 1
         and len(browser_links) == 1
@@ -329,6 +343,8 @@ def _validate_full_e2e_plan(plan, *, expected_browser_url: str) -> dict:
         "browser_open_count": len(browser_open),
         "browser_links_count": len(browser_links),
         "browser_open_target_matches": open_target_matches,
+        "browser_open_arguments_match": browser_open_arguments_match,
+        "browser_links_arguments_match": browser_links_arguments_match,
         "browser_order_valid": browser_order_valid,
         "browser_session_id_is_harness_bound": browser_session_id_is_harness_bound,
         "mcp_discovery_before_invoke": mcp_discovery_before_invoke,
@@ -385,9 +401,12 @@ def _plan_with_validator_feedback(
                 "browser_session_id_is_harness_bound": True,
                 "project_test_query": "bounded-test-project",
                 "browser_open_must_match_owner_objective": True,
+                "browser_open_arguments_exact": {"operation": "open", "url": expected_browser_url},
+                "browser_links_arguments_exact": {"operation": "links"},
             },
             "instruction": (
                 "Review and revise your own previous plan to satisfy this validator feedback. "
+                "Use exactly the requested Browser arguments: open has only operation and the exact URL; links has only operation. "
                 "Return only actions you are proposing. The acceptance harness will not add actions; "
                 "Owner authorization, scope checks, the MCP approval barrier, and execution remain separate."
             ),

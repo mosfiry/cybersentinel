@@ -324,6 +324,39 @@ def test_plan_revision_rejects_required_action_present_but_outside_allowlist():
     assert "required_actions_not_authorized" in attempts[0]["validation_issues"]
 
 
+def test_plan_revision_rejects_extra_browser_links_arguments_before_execution():
+    invalid_entries = _complete_entries()
+    invalid_entries[3] = ("browser", {"operation": "links", "url": BROWSER_URL})
+    invalid_plan = _plan(invalid_entries)
+    valid_plan = _plan(_complete_entries())
+    calls = []
+
+    def planner(_objective, feedback):
+        calls.append(feedback)
+        return invalid_plan if len(calls) == 1 else valid_plan
+
+    returned, attempts = _plan_with_validator_feedback(
+        planner,
+        "Owner-scoped full E2E acceptance",
+        available_tool_names=REQUIRED_QWEN_ACTION_NAMES,
+        expected_browser_url=BROWSER_URL,
+    )
+
+    assert returned is valid_plan
+    assert len(calls) == 2
+    assert attempts[0]["valid"] is False
+    assert "browser_links_arguments_mismatch" in attempts[0]["validation_issues"]
+    assert attempts[0]["browser_open_arguments_match"] is True
+    assert attempts[0]["browser_links_arguments_match"] is False
+    assert calls[1]["requirements"]["browser_open_arguments_exact"] == {
+        "operation": "open",
+        "url": BROWSER_URL,
+    }
+    assert calls[1]["requirements"]["browser_links_arguments_exact"] == {"operation": "links"}
+    assert attempts[1]["valid"] is True
+    assert attempts[1]["browser_links_arguments_match"] is True
+
+
 def test_plan_validator_rejects_extra_mcp_invocation_arguments():
     entries = _complete_entries()
     entries[-2] = (
