@@ -538,6 +538,140 @@ def completed_action_count(mission) -> int:
     )
 
 
+_SAFE_MISSION_STATUSES = frozenset({
+    "CREATED", "PLANNING", "READY", "RUNNING", "OBSERVING", "VERIFYING",
+    "REPLANNING", "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+    "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED", "RECOVERY_REQUIRED",
+    "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
+})
+_SAFE_MISSION_CHECKPOINT_STATUSES = frozenset({
+    "in_flight", "in_flight_parallel", "completed", "not_dispatched",
+    "not_dispatched_parallel", "completed_parallel", "specialists_quarantined",
+})
+_SAFE_MISSION_ACTION_RESULTS = frozenset({"completed", "failed", "running", "pending", "skipped"})
+_SAFE_MISSION_OBSERVATION_TYPES = frozenset({
+    "execution_exception", "tool_observation", "external_effect_recovery_required",
+})
+_SAFE_MISSION_FAILURE_CLASSES = frozenset({
+    "PROVIDER", "LOGIC", "RESOURCE", "SECURITY", "UNKNOWN", "AUTHORIZATION", "SCOPE",
+})
+_SAFE_EXECUTION_EXCEPTION_TYPES = frozenset({
+    "AssertionError", "BrokenPipeError", "ConnectionError", "ConnectionRefusedError",
+    "ConnectionResetError", "ExecutionFenceError", "FileNotFoundError", "ImportError",
+    "IndexError", "IntegrityError", "KeyError", "MemoryError", "ModuleNotFoundError",
+    "NotADirectoryError", "OperationalError", "OSError", "PermissionError",
+    "ProcessSandboxUnavailable", "RuntimeError", "TimeoutError", "TimeoutExpired",
+    "TypeError", "ValueError", "JSONDecodeError",
+})
+
+
+def _safe_mission_execution_diagnostics(mission) -> dict[str, object]:
+    plan = getattr(mission, "plan", None)
+    steps = list(getattr(plan, "steps", ()) or ())[:32]
+    allowed_actions = REQUIRED_QWEN_ACTION_NAMES | {"__planning_failure__"}
+    action_by_step_id = {}
+    for step in steps:
+        step_id = getattr(step, "step_id", None)
+        action = getattr(step, "action", None)
+        if isinstance(step_id, str) and step_id:
+            action_by_step_id[step_id] = (
+                action if isinstance(action, str) and action in allowed_actions else "<invalid_action_name>"
+            )
+
+    def action_for_step(step_id):
+        return action_by_step_id.get(step_id) if isinstance(step_id, str) else None
+
+    status = getattr(mission, "status", "")
+    status = str(getattr(status, "value", status))
+    if status not in _SAFE_MISSION_STATUSES:
+        status = "UNKNOWN"
+    current_step = getattr(mission, "current_step", None)
+    if isinstance(current_step, bool) or not isinstance(current_step, int) or not 0 <= current_step <= 32:
+        current_step = None
+    current_action = None
+    if current_step is not None and current_step < len(steps):
+        current_action = action_for_step(getattr(steps[current_step], "step_id", None)) or "<invalid_action_name>"
+
+    checkpoint = getattr(mission, "checkpoint", {})
+    checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+    checkpoint_status = checkpoint.get("status")
+    if not isinstance(checkpoint_status, str) or checkpoint_status not in _SAFE_MISSION_CHECKPOINT_STATUSES:
+        checkpoint_status = "unknown"
+    checkpoint_action = action_for_step(checkpoint.get("step_id"))
+
+    history = getattr(mission, "action_history", ())
+    history = list(history) if isinstance(history, (list, tuple)) else []
+    safe_history = []
+    for item in history[:32]:
+        if not isinstance(item, dict):
+            continue
+        action = action_for_step(item.get("step_id"))
+        result_status = item.get("status")
+        if not isinstance(result_status, str) or result_status not in _SAFE_MISSION_ACTION_RESULTS:
+            result_status = "unknown"
+        if action is not None:
+            safe_history.append({"action_name": action, "result_status": result_status})
+
+    observations = getattr(mission, "observations", ())
+    observations = list(observations) if isinstance(observations, (list, tuple)) else []
+    last_observation = observations[-1] if observations and isinstance(observations[-1], dict) else {}
+    observation_type = last_observation.get("type")
+    if not isinstance(observation_type, str) or observation_type not in _SAFE_MISSION_OBSERVATION_TYPES:
+        observation_type = "other" if last_observation else None
+    observation_success = last_observation.get("success")
+    if not isinstance(observation_success, bool):
+        observation_success = None
+
+    failures = getattr(mission, "failures", ())
+    failures = list(failures) if isinstance(failures, (list, tuple)) else []
+    failure_classes = sorted({
+        item.get("class") for item in failures
+        if isinstance(item, dict)
+        and isinstance(item.get("class"), str)
+        and item.get("class") in _SAFE_MISSION_FAILURE_CLASSES
+    })
+    last_failure = failures[-1] if failures and isinstance(failures[-1], dict) else {}
+    last_failure_action = action_for_step(last_failure.get("step_id") or checkpoint.get("step_id"))
+
+    error_type = getattr(mission, "error", None)
+    if (
+        observation_type != "execution_exception"
+        or not isinstance(error_type, str)
+        or error_type not in _SAFE_EXECUTION_EXCEPTION_TYPES
+    ):
+        error_type = None
+    evidence = getattr(mission, "evidence", ())
+    evidence_count = len(evidence) if isinstance(evidence, (list, tuple)) else 0
+    verification_state = getattr(mission, "verification_state", {})
+    verification_state = verification_state if isinstance(verification_state, dict) else {}
+    integrity_check = getattr(mission, "verify_integrity", None)
+    try:
+        integrity_valid = bool(integrity_check()) if callable(integrity_check) else False
+    except Exception:
+        integrity_valid = False
+
+    return {
+        "mission_status": status,
+        "mission_integrity_valid": integrity_valid,
+        "current_step_index": current_step,
+        "current_step_action_name": current_action,
+        "plan_step_count": len(getattr(plan, "steps", ()) or ()),
+        "checkpoint_status": checkpoint_status,
+        "checkpoint_action_name": checkpoint_action,
+        "checkpoint_outcome_ambiguous": checkpoint_status in {"in_flight", "in_flight_parallel"},
+        "action_results": safe_history,
+        "completed_action_count": min(sum(item["result_status"] == "completed" for item in safe_history), 32),
+        "failure_count": min(len(failures), 32),
+        "failure_classes": failure_classes,
+        "last_failure_action_name": last_failure_action,
+        "last_observation_type": observation_type,
+        "last_observation_success": observation_success,
+        "execution_exception_type": error_type,
+        "evidence_count": min(evidence_count, 64),
+        "verification_verified": verification_state.get("verified") if isinstance(verification_state.get("verified"), bool) else None,
+    }
+
+
 def parse_report_json(text: str) -> dict[str, object]:
     candidate = text.strip()
     if candidate.startswith("```"):
@@ -620,6 +754,7 @@ def main() -> int:
         "fixture": {"bind": "127.0.0.1", "port": 443, "public_exposure": False},
         "checks": {},
         "mission": {},
+        "mission_execution_diagnostics": {"slices": [], "final": {}},
         "research": {},
         "memory": {},
         "browser": {},
@@ -1331,8 +1466,12 @@ def main() -> int:
                 owner_session_token=owner_token,
                 max_slices=1,
             )
+            result["mission_execution_diagnostics"]["slices"].append(
+                _safe_mission_execution_diagnostics(mission)
+            )
             if mission.is_terminal:
                 break
+        result["mission_execution_diagnostics"]["final"] = _safe_mission_execution_diagnostics(mission)
         if mission.status is not MissionStatus.GOAL_COMPLETED:
             raise RuntimeError("integrated_mission_did_not_reach_goal_completed:" + mission.status.value)
         if approval_record is None or not reopened:

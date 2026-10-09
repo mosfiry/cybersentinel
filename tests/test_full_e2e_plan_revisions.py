@@ -12,6 +12,7 @@ from scripts.run_full_e2e_gate_acceptance import (
     _qwen_acceptance_planning_schemas,
     _qwen_preflight_diagnostics,
     _redact_diagnostic_text,
+    _safe_mission_execution_diagnostics,
     _validate_full_e2e_plan,
 )
 from scripts.windows_desktop_acceptance import _redact_diagnostic_text as _redact_windows_diagnostic_text
@@ -118,6 +119,68 @@ def test_qwen_preflight_diagnostics_distinguish_state_and_exclude_raw_model_cont
     assert summary["qwen_planning"]["missing_final_model_tool_names"]
     assert "<invalid_action_name>" in summary["qwen_planning"]["final_model_tool_names"]
     assert marker not in repr(summary)
+
+
+def test_mission_execution_diagnostics_locate_inflight_failure_without_raw_tool_data():
+    marker = "RAW-OWNER-OR-TOOL-CONTENT"
+    plan = _plan([
+        ("status", {}),
+        ("run_project_tests", {"query": marker}),
+    ])
+    mission = SimpleNamespace(
+        status=SimpleNamespace(value="RUNNING"),
+        current_step=1,
+        plan=plan,
+        checkpoint={"status": "in_flight", "step_id": "model-step-2-run_project_tests", "action_id": marker},
+        action_history=[{
+            "action_id": marker,
+            "step_id": "model-step-1-status",
+            "status": "completed",
+            "observation": {"success": True, "private": marker},
+        }],
+        observations=[{"type": "execution_exception", "success": False, "error": marker}],
+        failures=[{"class": "RESOURCE", "step_id": "model-step-2-run_project_tests", "reason": marker}],
+        error="TimeoutError",
+        evidence=[{"result": marker}],
+        verification_state={},
+        verify_integrity=lambda: True,
+    )
+
+    summary = _safe_mission_execution_diagnostics(mission)
+
+    assert summary["mission_status"] == "RUNNING"
+    assert summary["mission_integrity_valid"] is True
+    assert summary["current_step_action_name"] == "run_project_tests"
+    assert summary["checkpoint_status"] == "in_flight"
+    assert summary["checkpoint_action_name"] == "run_project_tests"
+    assert summary["checkpoint_outcome_ambiguous"] is True
+    assert summary["action_results"] == [{"action_name": "status", "result_status": "completed"}]
+    assert summary["failure_classes"] == ["RESOURCE"]
+    assert summary["last_failure_action_name"] == "run_project_tests"
+    assert summary["last_observation_type"] == "execution_exception"
+    assert summary["execution_exception_type"] == "TimeoutError"
+    assert marker not in repr(summary)
+
+    malformed = SimpleNamespace(
+        status=SimpleNamespace(value="RUNNING"),
+        current_step=1,
+        plan=plan,
+        checkpoint={"status": [marker], "step_id": "model-step-2-run_project_tests"},
+        action_history=[{"step_id": "model-step-2-run_project_tests", "status": [marker]}],
+        observations=[{"type": [marker], "success": False}],
+        failures=[{"class": [marker], "step_id": "model-step-2-run_project_tests"}],
+        error=[marker],
+        evidence=[],
+        verification_state={},
+        verify_integrity=lambda: True,
+    )
+    malformed_summary = _safe_mission_execution_diagnostics(malformed)
+
+    assert malformed_summary["checkpoint_status"] == "unknown"
+    assert malformed_summary["last_observation_type"] == "other"
+    assert malformed_summary["failure_classes"] == []
+    assert malformed_summary["execution_exception_type"] is None
+    assert marker not in repr(malformed_summary)
 
 
 def test_plan_validator_feedback_reaches_model_and_only_model_revision_supplies_steps():
