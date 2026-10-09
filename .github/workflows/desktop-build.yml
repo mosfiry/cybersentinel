@@ -129,7 +129,7 @@ jobs:
       - name: Windows-portable API, project, model, and security tests
         id: windows-portable-tests
         continue-on-error: true
-        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py tests/test_mission_native_auth_preflight.py tests/test_mission_report_approval.py tests/test_scope_firewall_battery.py tests/test_mission_graph_runtime.py tests/test_v14_security_integration_battery.py
+        run: python -m pytest -q tests/test_workspace_projects.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_model_hardware.py tests/test_local_model_catalog_review.py tests/test_local_defense.py tests/test_installer_manifest.py tests/test_desktop_client.py tests/test_owner_password_auth.py tests/test_public_web_boundary.py tests/test_browser_tools.py tests/test_pinned_http.py tests/test_mission_native_auth_preflight.py tests/test_mission_report_approval.py tests/test_scope_firewall_battery.py tests/test_mission_graph_runtime.py tests/test_v14_security_integration_battery.py
       - name: Install locked Electron toolchain
         working-directory: desktop
         run: npm ci --no-audit --no-fund

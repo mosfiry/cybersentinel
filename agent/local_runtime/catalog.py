@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 CATALOG_FORMAT_VERSION = 1
 DEFAULT_CATALOG_PATH = Path(__file__).with_name("catalog.json")
@@ -15,6 +15,7 @@ _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FILENAME = re.compile(r"^[A-Za-z0-9_.-]{1,180}\.gguf$")
 _ALLOWED_DOWNLOAD_SOURCES = {"huggingface.co"}
+_ALLOWED_ADVISOR_CAPABILITIES = {"coding", "reasoning", "tool_use", "multilingual"}
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,8 @@ class ModelSpec:
     backend_compatibility: tuple[str, ...] = ("llama.cpp-cpu",)
     download_source: str = "huggingface.co"
     license_url: str = ""
+    capability_evidence_url: str = ""
+    advisor_capabilities: tuple[str, ...] = ()
 
     @property
     def download_url(self) -> str:
@@ -72,6 +75,8 @@ class ModelSpec:
             "min_cpu_cores": self.min_cpu_cores,
             "backend_compatibility": list(self.backend_compatibility),
             "context_length": self.context_length,
+            "capability_evidence_url": self.capability_evidence_url,
+            "advisor_capabilities": list(self.advisor_capabilities),
         }
 
 
@@ -93,6 +98,12 @@ def _model_spec(raw: Any) -> ModelSpec:
             for item in backend_values
         ):
             raise ValueError("invalid_catalog_backend_compatibility")
+        advisor_values = raw.get("advisor_capabilities", [])
+        if not isinstance(advisor_values, list) or any(
+            not isinstance(item, str) or item not in _ALLOWED_ADVISOR_CAPABILITIES
+            for item in advisor_values
+        ) or len(set(advisor_values)) != len(advisor_values):
+            raise ValueError("invalid_catalog_advisor_capabilities")
         model = ModelSpec(
             model_id=str(raw["model_id"]),
             family=str(raw["family"]),
@@ -119,6 +130,8 @@ def _model_spec(raw: Any) -> ModelSpec:
             backend_compatibility=tuple(backend_values),
             download_source=str(raw.get("download_source", "huggingface.co")),
             license_url=str(raw.get("license_url", "")),
+            capability_evidence_url=str(raw.get("capability_evidence_url", "")),
+            advisor_capabilities=tuple(advisor_values),
         )
     except KeyError as exc:
         raise ValueError(f"catalog_field_missing:{exc.args[0]}") from exc
@@ -147,6 +160,10 @@ def _model_spec(raw: Any) -> ModelSpec:
         raise ValueError("invalid_catalog_license_metadata")
     if model.license_url and not model.license_url.startswith("https://"):
         raise ValueError("invalid_catalog_license_url")
+    if model.capability_evidence_url:
+        parsed_evidence = urlsplit(model.capability_evidence_url)
+        if parsed_evidence.scheme != "https" or parsed_evidence.hostname != "huggingface.co" or parsed_evidence.username or parsed_evidence.password:
+            raise ValueError("invalid_catalog_capability_evidence_url")
     return model
 
 

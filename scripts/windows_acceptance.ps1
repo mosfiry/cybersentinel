@@ -13,7 +13,7 @@ $runtimeDir = Join-Path $env:TEMP ("CyberSentinel-llama-b11146-" + [Guid]::NewGu
 Push-Location $repoRoot
 try {
     Write-Host "Running focused Python regressions..."
-    python -m pytest -q tests/test_local_model_catalog.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_model_acceptance_harness.py tests/test_desktop_client.py
+    python -m pytest -q tests/test_local_model_catalog.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_model_hardware.py tests/test_local_model_catalog_review.py tests/test_local_model_acceptance_harness.py tests/test_desktop_client.py
     if ($LASTEXITCODE -ne 0) { throw "Focused Python regression suite failed ($LASTEXITCODE)." }
 
     Write-Host "Running Desktop syntax and contract tests..."

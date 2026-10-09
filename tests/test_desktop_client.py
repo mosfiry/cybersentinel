@@ -97,18 +97,34 @@ def test_local_model_catalog_downloader_and_runtime_are_pinned_and_loopback_only
     assert "local_llama_cpp" in manager
     assert "def test_inference" in manager
     assert "def deactivate" in manager
-    assert 'parts[1] not in {"install", "activate", "test", "stop"}' in BRIDGE
+    assert 'parts[1] not in {"install", "activate", "test", "stop", "cancel"}' in BRIDGE
+    assert '_desktop_model_manager().cancel_download(parts[0])' in BRIDGE
+    assert '"download_cancelled"' in Path("agent/local_runtime/manager.py").read_text(encoding="utf-8")
+    assert 'path == "/api/public/desktop/models/review"' in BRIDGE
+    assert 'review_huggingface_candidate(payload.get("repository"), payload.get("revision"))' in BRIDGE
+    assert "CatalogReviewError" in BRIDGE
+    assert '"/api/public/desktop/models"' in APP
+    assert 'download_arbitrary_urls' not in BRIDGE
     assert 'self._public_guard(csrf=True)' in BRIDGE
     assert 'owner_password.owner_account_exists() and owner is None' in BRIDGE
-    assert 'action != "install" and owner is not None' in BRIDGE
+    assert 'action not in {"install", "cancel"} and owner is not None' in BRIDGE
     assert 'model_switch_blocked_by_active_mission' in BRIDGE
     assert '_desktop_model_manager().test_inference()' in BRIDGE
     assert '_desktop_model_manager().deactivate()' in BRIDGE
     assert "renderModelCards" in APP
     assert "تنزيل وتثبيت" in APP
     assert "تشغيل / تبديل إلى هذا النموذج" in APP
-    assert "النماذج الموصى بها لهذا الجهاز" in APP
-    assert "قد تكون أكبر من ذاكرة هذا الجهاز" in APP
+    assert "التوصيات الثلاث لهذا الجهاز" in APP
+    assert "غير ملائم حاليًا" in APP
+    assert "settingsHardwareScan" in APP
+    assert "settingsModelSearch" in APP
+    assert "window.confirm(consent)" in APP
+    assert "مستودعات والروابط العشوائية غير قابلة للتثبيت" in APP
+    assert "settingsAlternativeReviewForm" in APP
+    assert '"/api/public/desktop/models/review"' in APP
+    assert "license_evidence_url" in APP
+    assert 'evidenceUrl.hostname === "huggingface.co"' in APP
+    assert "لا يمكن تثبيت هذا النموذج من هذه النتيجة" in APP
     assert "اختبار الاستدلال المحلي الحقيقي" in APP
     assert 'f"{ROOT / \'agent\' / \'local_runtime\' / \'catalog.json\'}{separator}agent/local_runtime"' in Path("scripts/build_desktop_backend.py").read_text(encoding="utf-8")
     assert 'f"{ROOT / \'VERSION\'}{separator}."' in Path("scripts/build_desktop_backend.py").read_text(encoding="utf-8")

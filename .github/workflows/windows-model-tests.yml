@@ -35,8 +35,8 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - name: Install Python test/runtime dependencies
         run: python -m pip install -r requirements.txt -r requirements-runtime.txt
-      - name: Run model catalog, manager, downloader, and desktop API contracts
-        run: python -m pytest -q tests/test_local_model_catalog.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_desktop_client.py
+      - name: Run model catalog, manager, downloader, hardware advisor, metadata review, and desktop API contracts
+        run: python -m pytest -q tests/test_local_model_catalog.py tests/test_local_model_manager.py tests/test_local_model_downloader.py tests/test_local_model_hardware.py tests/test_local_model_catalog_review.py tests/test_desktop_client.py
       - name: Install Desktop dependencies
         working-directory: desktop
         run: npm ci --no-audit --no-fund

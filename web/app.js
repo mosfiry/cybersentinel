@@ -153,6 +153,12 @@ function errorText(error) {
     local_inference_empty_response: "لم يُرجع النموذج المحلي استجابة نصية.",
     local_inference_identity_mismatch: "توقّف الاختبار لأن هوية الاستجابة لم تطابق runtime المحلي.",
     model_switch_blocked_by_active_mission: "أوقف المهمة أو انتظر انتهاءها قبل تبديل النموذج.",
+    invalid_huggingface_repository_id: "أدخل معرّف مستودع بصيغة namespace/model فقط، لا رابطًا.",
+    immutable_40_character_commit_sha_required: "أدخل معرّف commit كاملًا من 40 حرفًا سداسيًا صغيرًا؛ لا تستخدم فرعًا أو وسمًا متغيرًا.",
+    hub_repository_or_revision_not_found_or_private: "لم يُعثر على المستودع أو النسخة؛ قد يكون خاصًا.",
+    hub_repository_is_private_or_gated: "المستودعات الخاصة أو المقيدة غير مدعومة في مراجعة البيانات العامة.",
+    hub_metadata_unavailable: "تعذر جلب بيانات Hugging Face العامة الآن.",
+    hub_metadata_rate_limited_retry_later: "قيّد Hugging Face عدد الطلبات؛ حاول لاحقًا.",
     owner_account_already_exists: "حساب المالك موجود بالفعل؛ سجّل الدخول بدل إنشاء حساب آخر.",
     project_folder_must_be_a_specific_directory: "اختر مجلد مشروع محددًا وليس جذر القرص.",
     project_folder_overlaps_application_data: "لا يمكن استخدام مجلد بيانات التطبيق كمجلد مشروع.",
@@ -273,6 +279,7 @@ function formatBytes(value) {
 function modelOperationLabel(operation) {
   const labels = {
     downloading: "جارٍ التنزيل",
+    cancelling: "جارٍ إلغاء التنزيل بأمان؛ سيبقى الجزء القابل للاستئناف محليًا",
     verifying: "جارٍ التحقق من SHA-256",
     activating: "جارٍ تشغيل النموذج",
     testing: "جارٍ التحقق باستدلال محلي حقيقي",
@@ -280,6 +287,7 @@ function modelOperationLabel(operation) {
     complete: "اكتمل",
     failed: `فشل: ${operation.error || "خطأ غير محدد"}`,
     interrupted: "توقف عند إغلاق التطبيق؛ يمكن إعادة المحاولة",
+    cancelled: "أُلغي التنزيل؛ يمكن استئنافه لاحقًا",
   };
   return labels[operation.status] || "لا توجد عملية جارية";
 }
@@ -293,53 +301,121 @@ function renderModelCards(target) {
     return;
   }
   const hardware = manager.hardware || {};
-  const ram = hardware.ram_gib == null ? "غير متاح" : `${hardware.ram_gib} GiB RAM`;
-  const disk = hardware.free_disk_gib == null ? "مساحة القرص غير متاحة" : `${hardware.free_disk_gib} GiB متاح على القرص`;
-  const gpuNames = Array.isArray(hardware.gpu_devices) ? hardware.gpu_devices.map((device) => device.name).filter(Boolean).join(", ") : "";
-  const vram = hardware.vram_gib == null ? "VRAM غير مكتشفة" : `${hardware.vram_gib} GiB VRAM`;
-  const hardwareLine = `الجهاز: ${hardware.os || "غير معروف"} · ${hardware.architecture || "بنية غير معروفة"} · ${hardware.cpu_model || "CPU غير معروف"} (${hardware.cpu_count || "?"} نواة) · ${ram} · ${gpuNames || "GPU غير مكتشف"} · ${vram} · ${disk} · ${hardware.gpu_acceleration_available ? "تسريع GPU متاح" : "استدلال CPU"}`;
+  const totalRam = hardware.ram_gib == null ? "RAM الكلية غير متاحة" : `${hardware.ram_gib} GiB كلية`;
+  const availableRam = hardware.available_ram_gib == null ? "RAM المتاحة غير معروفة" : `${hardware.available_ram_gib} GiB متاحة`;
+  const safeBudget = hardware.inference_memory_budget_gib == null ? "ميزانية الاستدلال غير متاحة" : `${hardware.inference_memory_budget_gib} GiB ميزانية آمنة للاستدلال`;
+  const disk = hardware.free_disk_gib == null ? `مساحة القرص غير متاحة (${hardware.disk_detection_status || "unknown"})` : `${hardware.free_disk_gib} GiB متاح على القرص`;
+  const gpuDevices = Array.isArray(hardware.gpu_devices) ? hardware.gpu_devices : [];
+  const gpuNames = gpuDevices.map((device) => `${device.name || "GPU"}${device.driver_version ? ` driver ${device.driver_version}` : ""}${device.vram_bytes == null ? " · VRAM غير معروفة" : ` · VRAM ${formatBytes(device.vram_bytes)}`}`).join("; ");
+  const gpu = gpuNames || `GPU غير مكتشف/غير متاح (${hardware.gpu_detection_status || "unknown"})`;
+  const physical = hardware.physical_core_count == null ? "?" : hardware.physical_core_count;
+  const logical = hardware.logical_cpu_count ?? hardware.cpu_count ?? "?";
+  const instructions = Array.isArray(hardware.cpu_instruction_sets) && hardware.cpu_instruction_sets.length ? ` · ISA ${hardware.cpu_instruction_sets.join(", ")}` : " · تعليمات CPU غير مكتشفة";
+  const hardwareLine = `الجهاز: ${hardware.os || "غير معروف"} · ${hardware.architecture || "بنية غير معروفة"} · ${hardware.cpu_model || "CPU غير معروف"} · ${physical} مادي/${logical} منطقي${instructions} · ${totalRam} · ${availableRam} · ${safeBudget} · ${gpu} · ${disk} · llama.cpp CPU فقط؛ لا يوجد تسريع GPU`;
   if ($("#setupHardware")) $("#setupHardware").textContent = hardwareLine;
   if ($("#settingsHardware")) $("#settingsHardware").textContent = hardwareLine;
   const operation = manager.manager?.operation || { status: "idle", model_id: "" };
   const runtime = manager.manager?.runtime || {};
 
-  const groups = [
-    { title: "النماذج الموصى بها لهذا الجهاز", items: manager.models.filter((model) => model.recommended) },
-    { title: "متوافقة لكن دون توصية كاملة", items: manager.models.filter((model) => model.compatible && !model.recommended) },
-    { title: "قد تكون أكبر من ذاكرة هذا الجهاز", items: manager.models.filter((model) => model.too_large) },
-    { title: "غير متاحة بسبب النظام أو مساحة القرص", items: manager.models.filter((model) => !model.compatible && !model.too_large) },
-  ].filter((group) => group.items.length);
+  const query = target.id === "settingsModelList" ? String($("#settingsModelSearch")?.value || "").trim().toLowerCase() : "";
+  const searchableText = (model) => `${model.display_name || ""} ${model.family || ""} ${model.parameter_size || ""} ${model.quantization || ""} ${model.repository || ""} ${model.filename || ""} ${model.license || ""}`.toLowerCase();
+  const visibleModels = manager.models.filter((model) => !query || searchableText(model).includes(query));
+  const byId = new Map(manager.models.map((model) => [model.model_id, model]));
+  const recommendationRows = Array.isArray(manager.advisor?.recommendations) ? manager.advisor.recommendations : [];
+  const recommendationIds = new Set(recommendationRows.map((item) => item.model_id));
+  const visibleRecommendations = recommendationRows
+    .filter((item) => visibleModels.some((model) => model.model_id === item.model_id))
+    .map((item) => ({ model: byId.get(item.model_id), recommendation: item }))
+    .filter((item) => item.model);
+  const otherModels = visibleModels.filter((model) => !recommendationIds.has(model.model_id));
 
   const reasonLabels = {
     insufficient_system_memory: "ذاكرة RAM أقل من الحد الأدنى",
+    system_memory_unavailable: "تعذر قياس RAM المحلية",
     insufficient_free_disk: "مساحة القرص غير كافية",
+    disk_space_unavailable: "تعذر قياس المساحة الحرة على القرص",
     insufficient_vram: "ذاكرة VRAM أقل من الحد الأدنى",
     unsupported_windows_architecture: "بنية Windows غير مدعومة",
+    unsupported_runtime_architecture: "بنية المعالج غير مدعومة",
     unsupported_runtime_platform: "نظام التشغيل غير مدعوم",
+    unsupported_runtime_backend: "محرك الاستدلال غير مدعوم",
   };
-  const busy = ["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status);
+  const busy = ["downloading", "cancelling", "verifying", "activating", "testing", "stopping"].includes(operation.status);
 
-  const renderModel = (model) => {
+  if (manager.advisor?.explanation) {
+    const explanation = document.createElement("p");
+    explanation.className = "advisor-explanation";
+    explanation.textContent = `${manager.advisor.explanation} الترتيب استدلالي وليس نتيجة benchmark محلي.`;
+    target.appendChild(explanation);
+  }
+  if (manager.advisor?.alternative_search?.unlisted_model_status) {
+    const policy = document.createElement("p");
+    policy.className = "model-catalog-note";
+    policy.textContent = `البحث محصور في الكتالوج المثبّت والموثّق؛ لا تُقبل روابط نماذج عشوائية. النماذج غير المدرجة: ${manager.advisor.alternative_search.unlisted_model_status}.`;
+    target.appendChild(policy);
+  }
+
+  const appendVerifiedLink = (parent, url, label, hosts = ["huggingface.co"]) => {
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "https:" || !hosts.includes(parsed.hostname) || parsed.username || parsed.password) return;
+      const link = document.createElement("a");
+      link.href = parsed.href;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = label;
+      parent.appendChild(link);
+    } catch (_error) { /* invalid URLs are omitted rather than rendered as links */ }
+  };
+
+  const renderModel = (model, advisorRecommendation = null) => {
     const article = document.createElement("article");
     article.className = "model-card";
     const title = document.createElement("h3");
     title.textContent = `${model.display_name || model.family} · ${model.parameter_size || ""}`;
     const description = document.createElement("p");
-    description.textContent = `${model.family} ${model.model_version || ""} · ${model.quantization} · ${model.license} · سياق ${model.context_length || 4096}`;
+    description.textContent = `${model.family} ${model.model_version || ""} · ${model.quantization} · ${model.license} · سياق التطبيق ${model.context_length || 4096} token`;
     const meta = document.createElement("p");
     meta.className = "model-meta";
-    meta.textContent = `GGUF ${formatBytes(model.size_bytes)} · RAM ${model.min_ram_gib}–${model.recommended_ram_gib} GiB · VRAM ${model.min_vram_gib || 0} GiB+ · backend ${(model.backend_compatibility || []).join(", ") || "غير محدد"}`;
+    meta.textContent = `GGUF ${formatBytes(model.size_bytes)} · مساحة مطلوبة ${formatBytes(model.required_disk_bytes || (Number(model.size_bytes) + 1024 ** 3))} · RAM تقديرية ${model.min_ram_gib}–${model.recommended_ram_gib} GiB · backend ${(model.backend_compatibility || []).join(", ") || "غير محدد"}`;
+    const source = document.createElement("p");
+    source.className = "model-meta model-source";
+    source.append(`المستودع المثبّت: ${model.repository}@${model.revision} · `);
+    appendVerifiedLink(source, `https://huggingface.co/${model.repository}/tree/${model.revision}`, "تحقق من المصدر والنسخة");
+    const digest = document.createElement("p");
+    digest.className = "model-meta model-digest";
+    digest.textContent = `SHA-256 المثبّت: ${model.sha256}`;
+    const license = document.createElement("p");
+    license.className = "model-meta";
+    license.append(`الرخصة كما تعرضها بيانات المحوّل: ${model.license} · `);
+    appendVerifiedLink(license, model.license_url, "اقرأ بيانات الرخصة", ["huggingface.co", "www.apache.org", "apache.org"]);
+    const capability = document.createElement("p");
+    capability.className = "model-meta";
+    if (model.capability_evidence_url) {
+      capability.append("مصدر قدرات النموذج: ");
+      appendVerifiedLink(capability, model.capability_evidence_url, "بطاقة النموذج الأصلية");
+    }
     const recommendation = document.createElement("p");
-    recommendation.className = model.compatible ? "model-recommendation" : "model-warning";
-    if (model.recommended) recommendation.textContent = "موصى به لهذا الجهاز وفق فحص RAM/CPU/VRAM والمساحة.";
+    recommendation.className = advisorRecommendation ? "model-recommendation" : model.compatible ? "model-recommendation" : "model-warning";
+    if (advisorRecommendation) recommendation.textContent = `#${advisorRecommendation.rank} — ${advisorRecommendation.role_label}: ${advisorRecommendation.why_recommended} الثقة: ${advisorRecommendation.confidence}`;
+    else if (model.recommended) recommendation.textContent = "متوافق وفق الحد الموصى به في الكتالوج؛ ليس بالضرورة ضمن أدوار التوصية الثلاثة.";
     else if (model.compatible) recommendation.textContent = `متوافق، لكن ليس ضمن التوصية الكاملة: ${(model.warnings || []).join(", ") || "المتطلبات الموصى بها أعلى من موارد الجهاز"}.`;
     else recommendation.textContent = `غير ملائم حاليًا: ${(model.compatibility_reasons || []).map((reason) => reasonLabels[reason] || reason).join("، ") || "سبب غير محدد"}`;
+    const evidence = document.createElement("p");
+    evidence.className = "model-evidence";
+    evidence.textContent = advisorRecommendation ? `${advisorRecommendation.evidence_basis} ${advisorRecommendation.known_limitations.join(" ")}` : "الأوزان لا تُنزّل أو تُشغّل تلقائيًا. يجب أن يختار المستخدم التنزيل صراحةً؛ بعدها يتحقق التطبيق من الحجم وSHA-256.";
 
     const actions = document.createElement("div");
     actions.className = "model-actions";
     const button = document.createElement("button");
     button.type = "button";
-    if (model.active && runtime.status === "ready") {
+    if (operation.kind === "install" && operation.model_id === model.model_id && ["downloading", "cancelling"].includes(operation.status)) {
+      button.textContent = operation.status === "cancelling" ? "جارٍ الإلغاء…" : "إلغاء التنزيل";
+      button.dataset.modelAction = "cancel";
+      button.dataset.modelId = model.model_id;
+      button.disabled = operation.status === "cancelling";
+      actions.append(button);
+    } else if (model.active && runtime.status === "ready") {
       button.textContent = "اختبار الاستدلال المحلي الحقيقي";
       button.dataset.modelAction = "test";
       button.dataset.modelId = model.model_id;
@@ -366,7 +442,7 @@ function renderModelCards(target) {
     }
     const progress = document.createElement("div");
     progress.className = "model-progress";
-    if (operation.model_id === model.model_id && ["downloading", "verifying", "activating", "testing", "stopping", "failed", "interrupted"].includes(operation.status)) {
+    if (operation.model_id === model.model_id && ["downloading", "cancelling", "verifying", "activating", "testing", "stopping", "failed", "interrupted", "cancelled"].includes(operation.status)) {
       const amount = operation.total_bytes ? `${formatBytes(operation.bytes_downloaded)} / ${formatBytes(operation.total_bytes)} (${operation.progress || 0}%)` : "";
       progress.textContent = `${modelOperationLabel(operation)}${amount ? ` · ${amount}` : ""}`;
     } else if (operation.kind === "inference_test" && operation.model_id === model.model_id && operation.result) {
@@ -374,17 +450,32 @@ function renderModelCards(target) {
     } else if (model.active) {
       progress.textContent = `Runtime: ${runtime.status || "غير معروف"}${runtime.error ? ` · ${runtime.error}` : ""}`;
     }
-    article.append(title, description, meta, recommendation, actions, progress);
+    article.append(title, description, meta, source, digest, license);
+    if (capability.childNodes.length) article.appendChild(capability);
+    article.append(recommendation, evidence, actions, progress);
     return article;
   };
 
-  groups.forEach((group) => {
+  if (visibleRecommendations.length) {
     const heading = document.createElement("h4");
     heading.className = "model-group-title";
-    heading.textContent = group.title;
+    heading.textContent = "التوصيات الثلاث لهذا الجهاز";
     target.appendChild(heading);
-    group.items.forEach((model) => target.appendChild(renderModel(model)));
-  });
+    visibleRecommendations.forEach(({ model, recommendation }) => target.appendChild(renderModel(model, recommendation)));
+  }
+  if (otherModels.length) {
+    const heading = document.createElement("h4");
+    heading.className = "model-group-title";
+    heading.textContent = query ? "نتائج أخرى من الكتالوج المثبّت" : "بدائل أخرى من الكتالوج المثبّت";
+    target.appendChild(heading);
+    otherModels.forEach((model) => target.appendChild(renderModel(model)));
+  }
+  if (!visibleModels.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "لا توجد نتائج في الكتالوج المثبّت. النماذج غير المدرجة لا تُثبّت عبر رابط اعتباطي.";
+    target.appendChild(empty);
+  }
   target.querySelectorAll("[data-model-action]").forEach((button) => {
     button.addEventListener("click", () => runModelAction(button.dataset.modelId, button.dataset.modelAction));
   });
@@ -405,7 +496,7 @@ async function refreshDesktopSetup() {
   state.onboardingVisible = show;
   overlay?.classList.toggle("hidden", !show);
   const operation = state.modelManager?.manager?.operation || {};
-  if (["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status)) scheduleModelPoll();
+  if (["downloading", "cancelling", "verifying", "activating", "testing", "stopping"].includes(operation.status)) scheduleModelPoll();
 }
 
 let modelPollTimer = null;
@@ -420,9 +511,11 @@ function scheduleModelPoll() {
       renderModelCards($("#settingsModelList"));
       const operation = data.manager?.operation || {};
       if (operation.status === "failed") setModelNotice(modelOperationLabel(operation), "error");
-      else if (["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status)) {
+      else if (["downloading", "cancelling", "verifying", "activating", "testing", "stopping"].includes(operation.status)) {
         setModelNotice(modelOperationLabel(operation), "warn");
         scheduleModelPoll();
+      } else if (operation.status === "cancelled") {
+        setModelNotice("أُلغي التنزيل بأمان؛ الملف الجزئي يبقى محليًا للاستئناف، ولا يمكن تفعيله قبل اكتمال SHA-256.", "warn");
       } else if (operation.status === "complete") {
         if (operation.kind === "inference_test" && operation.result) {
           setModelNotice(`نجح الاستدلال المحلي الحقيقي عبر llama.cpp: ${operation.result}`, "ok");
@@ -439,9 +532,16 @@ function scheduleModelPoll() {
 }
 
 async function runModelAction(modelId, action) {
-  if (!modelId || !["install", "activate", "test", "stop"].includes(action)) return;
+  if (!modelId || !["install", "activate", "test", "stop", "cancel"].includes(action)) return;
+  if (action === "install") {
+    const selected = state.modelManager?.models?.find((item) => item.model_id === modelId);
+    if (!selected) return;
+    const consent = `تنزيل هذا الملف إلى جهازك؟\n\n${selected.display_name} · ${selected.quantization}\n${selected.repository}@${selected.revision}\n${selected.filename} · ${formatBytes(selected.size_bytes)}\nالرخصة في بطاقة التحويل: ${selected.license}\nSHA-256: ${selected.sha256}\n\nسيُستخدم llama.cpp محليًا بعد التحقق. لا يبدأ التنزيل إلا بموافقتك.`;
+    if (!window.confirm(consent)) return;
+  }
   const pathModelId = action === "stop" ? "active" : modelId;
   if (action === "install") setModelNotice("بدأ التنزيل؛ سيُستأنف من الملف الجزئي ويتحقق SHA-256 قبل التثبيت.", "warn");
+  else if (action === "cancel") setModelNotice("جارٍ طلب إلغاء آمن للتنزيل النشط.", "warn");
   else if (action === "activate") setModelNotice("جارٍ إيقاف runtime السابق والتحقق من النموذج قبل التبديل.", "warn");
   else if (action === "test") setModelNotice("يرسل التطبيق طلبًا مباشرًا إلى النموذج المحلي المفعّل؛ لا يوجد تحويل إلى مزود خارجي.", "warn");
   else setModelNotice("جارٍ إيقاف runtime المحلي وتحرير موارده.", "warn");
@@ -1819,7 +1919,7 @@ async function settingsPanel() {
   managerTitle.textContent = "إدارة النماذج المحلية";
   const helper = document.createElement("p");
   helper.className = "muted";
-  helper.textContent = "اختر عائلة/حجم/quantization من الكتالوج المثبت. يفحص التطبيق RAM والمساحة قبل التنزيل، ويتحقق من SHA-256 قبل التثبيت. لا يتم التبديل أثناء وجود mission فعالة.";
+  helper.textContent = "افحص الجهاز محليًا، ثم قارن ثلاثة أدوار توصية وبدائل الكتالوج الموثّق. التنزيل اختياري ويتطلب موافقتك، مع فحص الذاكرة والمساحة وSHA-256. الاستدلال المحلي CPU-only؛ لا يوجد تحويل إلى API مدفوع أو مستضاف.";
   const hardwareSummary = document.createElement("p");
   hardwareSummary.id = "settingsHardware";
   hardwareSummary.className = "muted";
@@ -1827,6 +1927,24 @@ async function settingsPanel() {
   notice.id = "modelManagerNotice";
   notice.className = "notice";
   notice.setAttribute("role", "status");
+  const scanButton = document.createElement("button");
+  scanButton.id = "settingsHardwareScan";
+  scanButton.type = "button";
+  scanButton.textContent = "فحص جهازي واقتراح النماذج";
+  const scanResult = document.createElement("p");
+  scanResult.id = "settingsAdvisorSummary";
+  scanResult.className = "advisor-explanation";
+  scanResult.setAttribute("role", "status");
+  const searchLabel = document.createElement("label");
+  searchLabel.className = "model-search-label";
+  searchLabel.textContent = "ابحث أو اختر بديلًا من الكتالوج الموثّق";
+  const search = document.createElement("input");
+  search.id = "settingsModelSearch";
+  search.type = "search";
+  search.autocomplete = "off";
+  search.placeholder = "الاسم، العائلة، الحجم، quantization، المستودع…";
+  search.setAttribute("aria-label", searchLabel.textContent);
+  searchLabel.appendChild(search);
   const list = document.createElement("div");
   list.id = "settingsModelList";
   list.className = "model-list";
@@ -1845,14 +1963,129 @@ async function settingsPanel() {
   providerNote.textContent = `مزودو النموذج المهيّؤون (قراءة فقط؛ لا تُعرض مفاتيح أو عناوين):\n${providersText}`;
   const note = document.createElement("p");
   note.className = "muted";
-  note.textContent = "كتالوج هذه النسخة يدعم Qwen3 4B/8B وDeepSeek R1 Distill Qwen 7B بملفات GGUF Q4_K_M. حزم المحرك والنماذج تُجلب من المصادر المثبتة وتُحفظ تحت بيانات المستخدم.";
-  panel.append(summary, managerTitle, helper, hardwareSummary, notice, list, providerNote, note);
+  note.textContent = "البحث يشمل كامل الكتالوج الموقّع داخل التطبيق لا أفضل ثلاثة فقط، لتختار نموذجًا آخر. المستودعات والروابط العشوائية غير قابلة للتثبيت حتى تُراجع نسخة immutable والملف والرخصة والـbackend وبصمة SHA-256 وتُضاف إلى الكتالوج.";
+  const reviewTitle = document.createElement("h3");
+  reviewTitle.textContent = "مراجعة بيانات نموذج بديل (من دون تنزيل)";
+  const reviewExplain = document.createElement("p");
+  reviewExplain.className = "muted";
+  reviewExplain.textContent = "أدخل معرّف مستودع Hugging Face وcommit immutable فقط. يُقرأ JSON الوصف العام من huggingface.co؛ لا تُنزّل الأوزان ولا تُنفّذ ملفات. المراجعة لا تضيف النموذج إلى قائمة التثبيت، وتعرض ما ينقص لمراجعة بشرية واختبار backend.";
+  const reviewForm = document.createElement("form");
+  reviewForm.id = "settingsAlternativeReviewForm";
+  reviewForm.className = "alternative-review-form";
+  const repositoryLabel = document.createElement("label");
+  repositoryLabel.textContent = "معرّف المستودع: namespace/model";
+  const repositoryInput = document.createElement("input");
+  repositoryInput.id = "settingsAlternativeRepository";
+  repositoryInput.name = "repository";
+  repositoryInput.type = "text";
+  repositoryInput.required = true;
+  repositoryInput.maxLength = 193;
+  repositoryInput.autocomplete = "off";
+  repositoryInput.pattern = "[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}";
+  repositoryInput.placeholder = "owner/model-name";
+  repositoryLabel.appendChild(repositoryInput);
+  const revisionLabel = document.createElement("label");
+  revisionLabel.textContent = "نسخة commit كاملة (40 حرفًا hex صغيرًا)";
+  const revisionInput = document.createElement("input");
+  revisionInput.id = "settingsAlternativeRevision";
+  revisionInput.name = "revision";
+  revisionInput.type = "text";
+  revisionInput.required = true;
+  revisionInput.minLength = 40;
+  revisionInput.maxLength = 40;
+  revisionInput.pattern = "[0-9a-f]{40}";
+  revisionInput.autocomplete = "off";
+  revisionInput.placeholder = "0123456789abcdef0123456789abcdef01234567";
+  revisionLabel.appendChild(revisionInput);
+  const reviewButton = document.createElement("button");
+  reviewButton.id = "settingsAlternativeReview";
+  reviewButton.type = "submit";
+  reviewButton.textContent = "تحقق من بيانات النسخة";
+  reviewForm.append(repositoryLabel, revisionLabel, reviewButton);
+  const reviewResult = document.createElement("div");
+  reviewResult.id = "settingsAlternativeReviewResult";
+  reviewResult.className = "candidate-review-result";
+  reviewResult.setAttribute("role", "status");
+  reviewResult.setAttribute("aria-live", "polite");
+  panel.append(summary, managerTitle, helper, hardwareSummary, scanButton, scanResult, searchLabel, notice, list, providerNote, note, reviewTitle, reviewExplain, reviewForm, reviewResult);
   showInfoPanel(panel);
+  search.addEventListener("input", () => renderModelCards(list));
+  scanButton.addEventListener("click", async () => {
+    scanButton.disabled = true;
+    scanResult.textContent = "جارٍ قراءة مواصفات الجهاز المحلية فقط… لن يبدأ تنزيل أو تفعيل.";
+    try {
+      state.modelManager = await api("/api/public/desktop/models");
+      renderModelCards(list);
+      scanResult.textContent = state.modelManager.advisor?.explanation || "اكتمل فحص الجهاز.";
+    } catch (error) {
+      scanResult.textContent = `تعذر إكمال الفحص: ${errorText(error)}`;
+    } finally {
+      scanButton.disabled = false;
+    }
+  });
+  reviewForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const repository = repositoryInput.value.trim();
+    const revision = revisionInput.value.trim();
+    if (!reviewForm.reportValidity()) return;
+    reviewButton.disabled = true;
+    reviewButton.textContent = "جارٍ فحص البيانات العامة فقط…";
+    reviewResult.replaceChildren();
+    try {
+      const result = await api("/api/public/desktop/models/review", {
+        method: "POST",
+        body: JSON.stringify({ repository, revision }),
+      });
+      const resultSummary = document.createElement("p");
+      resultSummary.className = "model-warning";
+      resultSummary.textContent = `نتيجة المراجعة: ${result.status} — ${result.repository}@${result.resolved_revision}. الرخصة المعلنة: ${result.declared_license || "غير معلنة"}. لا يمكن تثبيت هذا النموذج من هذه النتيجة.`;
+      reviewResult.appendChild(resultSummary);
+      try {
+        const evidenceUrl = new URL(result.license_evidence_url);
+        if (evidenceUrl.protocol === "https:" && evidenceUrl.hostname === "huggingface.co" && !evidenceUrl.username && !evidenceUrl.password) {
+          const evidenceLink = document.createElement("a");
+          evidenceLink.href = evidenceUrl.href;
+          evidenceLink.target = "_blank";
+          evidenceLink.rel = "noopener noreferrer";
+          evidenceLink.textContent = "افتح بطاقة المصدر عند النسخة المثبتة";
+          reviewResult.appendChild(evidenceLink);
+        }
+      } catch (_error) { /* omit any invalid evidence URL */ }
+      if (Array.isArray(result.gguf_files) && result.gguf_files.length) {
+        const fileHeading = document.createElement("p");
+        fileHeading.textContent = "ملفات GGUF وبياناتها المنشورة (لم تُنزّل):";
+        reviewResult.appendChild(fileHeading);
+        const files = document.createElement("ul");
+        result.gguf_files.forEach((file) => {
+          const row = document.createElement("li");
+          const size = file.size_bytes == null ? "الحجم غير منشور" : formatBytes(file.size_bytes);
+          const hash = file.hub_declared_sha256 || "SHA-256 غير منشور";
+          row.textContent = `${file.filename} · ${file.quantization || "quantization غير محسوم"} · ${size} · Hub SHA-256: ${hash}${file.blockers?.length ? ` · النواقص: ${file.blockers.join(", ")}` : ""}`;
+          files.appendChild(row);
+        });
+        reviewResult.appendChild(files);
+      }
+      const blockers = document.createElement("p");
+      blockers.className = "model-catalog-note";
+      blockers.textContent = `يلزم قبل أي تثبيت: ${(result.blockers || []).join("؛ ")}`;
+      reviewResult.appendChild(blockers);
+      const limits = document.createElement("p");
+      limits.className = "muted";
+      limits.textContent = (result.review_limits || []).join(" ");
+      reviewResult.appendChild(limits);
+    } catch (error) {
+      reviewResult.textContent = `تعذرت مراجعة البيانات: ${errorText(error)}`;
+    } finally {
+      reviewButton.disabled = false;
+      reviewButton.textContent = "تحقق من بيانات النسخة";
+    }
+  });
   try {
     state.modelManager = await api("/api/public/desktop/models");
     renderModelCards(list);
+    scanResult.textContent = state.modelManager.advisor?.explanation || "اختر فحص الجهاز للحصول على تقييم جديد.";
     const operation = state.modelManager.manager?.operation || {};
-    if (["downloading", "verifying", "activating", "testing", "stopping"].includes(operation.status)) scheduleModelPoll();
+    if (["downloading", "cancelling", "verifying", "activating", "testing", "stopping"].includes(operation.status)) scheduleModelPoll();
   } catch (error) {
     list.textContent = errorText(error);
   }

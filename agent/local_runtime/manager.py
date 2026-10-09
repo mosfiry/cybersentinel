@@ -12,12 +12,13 @@ from typing import Any, Callable
 from agent.model_router import ModelRouter
 from agent.provider_api import ProviderError
 
+from .advisor import build_advisor
 from .catalog import CATALOG_VERSION, MODEL_CATALOG, ModelSpec, get_model
-from .downloader import DownloadError, _hash_file, download_verified_file
+from .downloader import DownloadCancelled, DownloadError, _hash_file, download_verified_file
 from .hardware import assess_compatibility, detect_hardware
 from .runtime import RuntimeAdapter
 
-_BUSY_OPERATION_STATUSES = frozenset({"downloading", "verifying", "activating", "testing", "stopping"})
+_BUSY_OPERATION_STATUSES = frozenset({"downloading", "cancelling", "verifying", "activating", "testing", "stopping"})
 
 
 def _utc_now() -> str:
@@ -50,6 +51,7 @@ class LocalModelManager:
         self._downloader = downloader
         self._lock = threading.RLock()
         self._operation_thread: threading.Thread | None = None
+        self._download_cancel_event: threading.Event | None = None
         self._active_provider: Any | None = None
         self._state: dict[str, Any] = {
             "active_model_id": "",
@@ -124,8 +126,9 @@ class LocalModelManager:
     def _installed_by_metadata(self, spec: ModelSpec) -> bool:
         model_path = self._model_path(spec)
         manifest_path = self._manifest_path(spec)
+        model_directory = self._model_directory(spec)
         try:
-            if model_path.is_symlink() or manifest_path.is_symlink():
+            if model_directory.is_symlink() or model_path.is_symlink() or manifest_path.is_symlink():
                 return False
             if model_path.stat().st_size != spec.size_bytes:
                 return False
@@ -150,7 +153,23 @@ class LocalModelManager:
         return path
 
     def _hardware(self) -> dict[str, Any]:
-        return self._hardware_provider(self.models_root)
+        hardware = dict(self._hardware_provider(self.models_root))
+        binary_available: bool | None = None
+        binary_probe = getattr(self._runtime, "_binary", None)
+        if callable(binary_probe):
+            try:
+                binary_available = Path(binary_probe()).is_file()
+            except (OSError, RuntimeError, FileNotFoundError):
+                binary_available = False
+        hardware["runtime_binary_available"] = binary_available
+        hardware["runtime_capabilities"] = {
+            "backend": "llama.cpp-cpu",
+            "model_formats": ["GGUF"],
+            "local_inference": True,
+            "gpu_acceleration": False,
+            "binary_available": binary_available,
+        }
+        return hardware
 
     def _catalog_rows(self, hardware: dict[str, Any]) -> list[dict[str, Any]]:
         rows = []
@@ -164,6 +183,12 @@ class LocalModelManager:
                 "compatibility_reasons": compatibility["reasons"],
                 "warnings": compatibility["warnings"],
                 "required_disk_bytes": compatibility["required_disk_bytes"],
+                "estimated_runtime_memory": {
+                    "minimum_gib": spec.min_ram_gib,
+                    "recommended_gib": spec.recommended_ram_gib,
+                    "evidence_type": "catalog estimate; not a measured benchmark",
+                },
+                "memory_estimates_are_benchmarks": False,
                 "installed": self._installed_by_metadata(spec),
                 "active": self._state.get("active_model_id") == spec.model_id,
             })
@@ -171,13 +196,27 @@ class LocalModelManager:
 
     def public_state(self, hardware: dict[str, Any] | None = None) -> dict[str, Any]:
         hardware = hardware if hardware is not None else self._hardware()
+        advisor = build_advisor(self._catalog, hardware)
         with self._lock:
+            model_rows = self._catalog_rows(hardware)
+            roles_by_id: dict[str, list[dict[str, Any]]] = {}
+            for recommendation in advisor["recommendations"]:
+                roles_by_id.setdefault(recommendation["model_id"], []).append({
+                    "rank": recommendation["rank"],
+                    "role": recommendation["role"],
+                    "role_label": recommendation["role_label"],
+                    "why_recommended": recommendation["why_recommended"],
+                    "confidence": recommendation["confidence"],
+                })
+            for row in model_rows:
+                row["advisor_recommendations"] = roles_by_id.get(row["model_id"], [])
             return {
                 "ok": True,
                 "catalog_version": CATALOG_VERSION,
                 "catalog_source": "bundled-pinned-manifest",
                 "hardware": hardware,
-                "models": self._catalog_rows(hardware),
+                "models": model_rows,
+                "advisor": advisor,
                 "manager": json.loads(json.dumps(self._state)),
             }
 
@@ -209,12 +248,15 @@ class LocalModelManager:
         if self._installed_by_metadata(spec):
             return self.public_state(hardware)
         self._begin_operation("install", spec, "downloading", total=spec.size_bytes)
-        thread = threading.Thread(target=self._install_worker, args=(spec,), name="model-download", daemon=True)
+        cancel_event = threading.Event()
+        with self._lock:
+            self._download_cancel_event = cancel_event
+        thread = threading.Thread(target=self._install_worker, args=(spec, cancel_event), name="model-download", daemon=True)
         self._operation_thread = thread
         thread.start()
         return self.public_state(hardware)
 
-    def _install_worker(self, spec: ModelSpec) -> None:
+    def _install_worker(self, spec: ModelSpec, cancel_event: threading.Event) -> None:
         destination = self._model_path(spec)
         destination.parent.mkdir(parents=True, exist_ok=True)
         last_update = 0.0
@@ -228,11 +270,12 @@ class LocalModelManager:
             with self._lock:
                 operation = self._state["operation"]
                 operation.update(
-                    status="downloading",
                     bytes_downloaded=int(downloaded),
                     total_bytes=int(total),
                     progress=max(0, min(100, int(downloaded * 100 / max(1, total)))),
                 )
+                if operation.get("status") not in {"cancelling", "interrupted"}:
+                    operation["status"] = "verifying" if total > 0 and downloaded >= total else "downloading"
                 self._save_locked()
 
         try:
@@ -242,8 +285,13 @@ class LocalModelManager:
                 expected_size=spec.size_bytes,
                 expected_sha256=spec.sha256,
                 progress=on_progress,
+                cancel_event=cancel_event,
             )
             with self._lock:
+                if cancel_event.is_set():
+                    self._state["operation"].update(status="cancelled", error="download_cancelled")
+                    self._save_locked()
+                    return
                 self._state["operation"].update(status="verifying", progress=99)
                 self._save_locked()
             if path.stat().st_size != spec.size_bytes or _hash_file(path) != spec.sha256:
@@ -262,20 +310,55 @@ class LocalModelManager:
                 "verified": True,
                 "verified_at": _utc_now(),
             }
-            temporary = self._manifest_path(spec).with_suffix(".tmp")
-            temporary.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-            os.replace(temporary, self._manifest_path(spec))
+            manifest = self._manifest_path(spec)
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".manifest-", suffix=".tmp", dir=manifest.parent)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(metadata, stream, ensure_ascii=False, sort_keys=True)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_name, manifest)
+            finally:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
             with self._lock:
                 self._state["operation"].update(
                     status="complete", bytes_downloaded=spec.size_bytes,
                     total_bytes=spec.size_bytes, progress=100, error="",
                 )
                 self._save_locked()
+        except DownloadCancelled:
+            with self._lock:
+                if self._state["operation"].get("status") != "interrupted":
+                    self._state["operation"].update(status="cancelled", error="download_cancelled")
+                self._save_locked()
         except Exception as exc:
             code = str(exc) if isinstance(exc, (DownloadError, ValueError, FileNotFoundError)) else type(exc).__name__
             with self._lock:
                 self._state["operation"].update(status="failed", error=code[:160])
                 self._save_locked()
+        finally:
+            with self._lock:
+                if self._download_cancel_event is cancel_event:
+                    self._download_cancel_event = None
+
+    def cancel_download(self, model_id: str) -> dict[str, Any]:
+        """Request cancellation of the active model transfer; never activates a model."""
+        spec = self._spec(model_id)
+        with self._lock:
+            operation = self._state["operation"]
+            if operation.get("kind") != "install" or operation.get("model_id") != spec.model_id:
+                raise RuntimeError("model_operation_not_cancellable")
+            if operation.get("status") == "cancelling":
+                return self.public_state()
+            if operation.get("status") != "downloading" or self._download_cancel_event is None:
+                raise RuntimeError("model_operation_not_cancellable")
+            self._download_cancel_event.set()
+            operation.update(status="cancelling", error="")
+            self._save_locked()
+        return self.public_state()
 
     def activate(self, model_id: str) -> dict[str, Any]:
         spec = self._spec(model_id)
@@ -455,6 +538,9 @@ class LocalModelManager:
         thread.start()
 
     def shutdown(self) -> None:
+        with self._lock:
+            if self._download_cancel_event is not None:
+                self._download_cancel_event.set()
         try:
             self._runtime.stop()
         finally:

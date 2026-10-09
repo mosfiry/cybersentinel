@@ -69,7 +69,7 @@ class FakeRuntime:
 
 
 def make_manager(tmp_path, specs, payloads, *, ram_gib=8, runtime=None, router=None):
-    def downloader(_url, destination, *, expected_size, expected_sha256, progress=None):
+    def downloader(_url, destination, *, expected_size, expected_sha256, progress=None, cancel_event=None):
         payload = payloads[Path(destination).name]
         assert len(payload) == expected_size
         assert hashlib.sha256(payload).hexdigest() == expected_sha256
@@ -108,10 +108,11 @@ def test_models_download_verify_install_activate_switch_and_restore(tmp_path):
     payloads = {"small.gguf": b"small-model-bits", "next.gguf": b"second-model-bits"}
     specs = [make_spec(name.removesuffix(".gguf"), data) for name, data in payloads.items()]
     manager, runtime, router = make_manager(tmp_path, specs, payloads)
+    assert manager.public_state()["manager"]["operation"]["status"] == "idle"
 
     for spec in specs:
         state = manager.install(spec.model_id)
-        assert state["manager"]["operation"]["status"] == "downloading"
+        assert state["manager"]["operation"]["status"] in {"downloading", "verifying", "complete"}
         wait_operation(manager, "complete")
         row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
         assert row["installed"] is True
@@ -321,3 +322,81 @@ def test_local_inference_failure_is_visible_and_never_falls_back(tmp_path):
     assert manager.public_state()["manager"]["operation"]["status"] == "failed"
     assert local_provider.calls == 1
     assert external_provider.calls == 0
+
+
+def test_cancel_download_keeps_partial_file_uninstalled_and_reports_cancelled(tmp_path):
+    import threading
+
+    from agent.local_runtime.downloader import DownloadCancelled
+
+    payload = b"a verified test model payload"
+    spec = make_spec("cancel-me", payload)
+    entered = threading.Event()
+
+    def cancelable_downloader(_url, destination, *, expected_size, expected_sha256, progress=None, cancel_event=None):
+        assert cancel_event is not None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(destination.name + ".part")
+        partial.write_bytes(payload[:7])
+        entered.set()
+        while not cancel_event.wait(0.01):
+            pass
+        raise DownloadCancelled("download_cancelled")
+
+    manager = LocalModelManager(
+        tmp_path / "cancel-state",
+        runtime=FakeRuntime(),
+        router=ModelRouter([]),
+        catalog=(spec,),
+        hardware_provider=lambda _path: hardware(),
+        downloader=cancelable_downloader,
+    )
+    manager.install(spec.model_id)
+    assert entered.wait(2)
+    state = manager.cancel_download(spec.model_id)
+    assert state["manager"]["operation"]["status"] in {"cancelling", "cancelled"}
+    final = wait_operation(manager, "cancelled")
+    model_path = manager.models_root / spec.model_id / spec.filename
+    assert model_path.with_name(model_path.name + ".part").read_bytes() == payload[:7]
+    assert model_path.exists() is False
+    assert (manager.models_root / spec.model_id / "manifest.json").exists() is False
+    assert final["operation"]["error"] == "download_cancelled"
+
+
+def test_non_top_three_pinned_candidate_remains_in_full_manager_catalog(tmp_path):
+    import hashlib
+    from dataclasses import replace
+
+    from agent.local_runtime.catalog import MODEL_CATALOG
+
+    payload = b"user-selected-curated-model"
+    extra = replace(
+        MODEL_CATALOG[0],
+        model_id="extra-curated-model",
+        family="Extra",
+        display_name="Extra eligible model",
+        parameter_size="1B",
+        repository="tests/pinned-fixture",
+        revision="b" * 40,
+        filename="extra-curated-model.gguf",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        min_ram_gib=1,
+        recommended_ram_gib=1000,
+        min_cpu_cores=64,
+        context_length=1,
+        capability_evidence_url="",
+        advisor_capabilities=(),
+    )
+    payloads = {extra.filename: payload}
+    manager, _runtime, _router = make_manager(tmp_path, (*MODEL_CATALOG, extra), payloads, ram_gib=64)
+    state = manager.public_state()
+    rows = {item["model_id"]: item for item in state["models"]}
+    top_ids = {item["model_id"] for item in state["advisor"]["recommendations"]}
+    assert extra.model_id in rows
+    assert rows[extra.model_id]["compatible"] is True
+    assert extra.model_id not in top_ids
+
+    started = manager.install(extra.model_id)
+    assert started["manager"]["operation"]["kind"] == "install"
+    assert wait_operation(manager, "complete")["operation"]["model_id"] == extra.model_id

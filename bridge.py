@@ -51,6 +51,7 @@ from workspace.environment import Workspace, WorkspaceBoundaryError, WorkspacePo
 from workspace.projects import WorkspaceProjectStore
 from agent.local_runtime.manager import LocalModelManager
 from agent.local_runtime.runtime import LlamaCppRuntime
+from agent.local_runtime.catalog_review import CatalogReviewError, review_huggingface_candidate
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -1202,12 +1203,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"ok": False, "error": "unknown_project"})
             except ValueError as exc:
                 return self._send(400, {"ok": False, "error": str(exc)})
+        if path == "/api/public/desktop/models/review":
+            if self._public_guard(csrf=True) is None:
+                return
+            owner = self._public_owner_session()
+            if owner_password.owner_account_exists() and owner is None:
+                return self._send(403, {"ok": False, "error": "owner_authorization_required"})
+            try:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_candidate_review_payload")
+                result = review_huggingface_candidate(payload.get("repository"), payload.get("revision"))
+                return self._send(200, result)
+            except CatalogReviewError as exc:
+                return self._send(exc.status_code, {"ok": False, "error": exc.code})
+            except ValueError as exc:
+                return self._send(400, {"ok": False, "error": str(exc)})
         if path.startswith("/api/public/desktop/models/"):
             session = self._public_guard(csrf=True)
             if session is None:
                 return
             parts = [unquote(item) for item in path[len("/api/public/desktop/models/"):].split("/")]
-            if len(parts) != 2 or parts[1] not in {"install", "activate", "test", "stop"}:
+            if len(parts) != 2 or parts[1] not in {"install", "activate", "test", "stop", "cancel"}:
                 return self._send(404, {"ok": False, "error": "not_found"})
             action = parts[1]
             if action == "stop" and parts[0] != "active":
@@ -1216,7 +1233,7 @@ class Handler(BaseHTTPRequestHandler):
             if owner_password.owner_account_exists() and owner is None:
                 return self._send(403, {"ok": False, "error": "owner_authorization_required"})
             try:
-                if action != "install" and owner is not None:
+                if action not in {"install", "cancel"} and owner is not None:
                     missions = self._mission_service().list_missions(
                         owner_session_token=owner["session_token"], limit=100
                     )
@@ -1236,6 +1253,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(409, {"ok": False, "error": "model_switch_blocked_by_active_mission"})
                 if action == "install":
                     result = _desktop_model_manager().install(parts[0])
+                elif action == "cancel":
+                    result = _desktop_model_manager().cancel_download(parts[0])
                 elif action == "activate":
                     result = _desktop_model_manager().activate(parts[0])
                 elif action == "test":
