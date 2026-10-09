@@ -123,7 +123,7 @@ class LocalModelManager:
     def _manifest_path(self, spec: ModelSpec) -> Path:
         return self._model_directory(spec) / "manifest.json"
 
-    def _installed_by_metadata(self, spec: ModelSpec) -> bool:
+    def _manifest_matches(self, spec: ModelSpec) -> bool:
         model_path = self._model_path(spec)
         manifest_path = self._manifest_path(spec)
         model_directory = self._model_directory(spec)
@@ -143,9 +143,17 @@ class LocalModelManager:
         except (OSError, json.JSONDecodeError, AttributeError):
             return False
 
+    def _installed_by_metadata(self, spec: ModelSpec) -> bool:
+        if not self._manifest_matches(spec):
+            return False
+        try:
+            return _hash_file(self._model_path(spec)) == spec.sha256
+        except OSError:
+            return False
+
     def _verify_installed(self, spec: ModelSpec) -> Path:
         path = self._model_path(spec)
-        if not self._installed_by_metadata(spec):
+        if not self._manifest_matches(spec):
             raise FileNotFoundError("model_not_installed_or_manifest_invalid")
         if _hash_file(path) != spec.sha256:
             self._manifest_path(spec).unlink(missing_ok=True)
@@ -258,7 +266,6 @@ class LocalModelManager:
 
     def _install_worker(self, spec: ModelSpec, cancel_event: threading.Event) -> None:
         destination = self._model_path(spec)
-        destination.parent.mkdir(parents=True, exist_ok=True)
         last_update = 0.0
 
         def on_progress(downloaded: int, total: int) -> None:
@@ -279,6 +286,7 @@ class LocalModelManager:
                 self._save_locked()
 
         try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
             path = self._downloader(
                 spec.download_url,
                 destination,
@@ -365,7 +373,7 @@ class LocalModelManager:
         compatibility = assess_compatibility(spec, self._hardware())
         if not compatibility["compatible"]:
             raise ValueError("model_not_compatible:" + ",".join(compatibility["reasons"]))
-        if not self._installed_by_metadata(spec):
+        if not self._manifest_matches(spec):
             raise FileNotFoundError("model_not_installed")
         self._begin_operation("activate", spec, "activating")
         thread = threading.Thread(target=self._activate_worker, args=(spec,), name="model-activation", daemon=True)
@@ -522,7 +530,7 @@ class LocalModelManager:
             if not model_id or model_id not in self._by_id:
                 return
             spec = self._by_id[model_id]
-            if not self._installed_by_metadata(spec):
+            if not self._manifest_matches(spec):
                 self._state["active_model_id"] = ""
                 self._state["runtime"] = {"status": "error", "model_id": "", "error": "active_model_missing"}
                 self._save_locked()

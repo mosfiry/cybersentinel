@@ -144,6 +144,49 @@ def test_models_download_verify_install_activate_switch_and_restore(tmp_path):
     assert restarted_runtime.active == specs[1].model_id
 
 
+def test_install_directory_creation_failure_is_recorded_and_cleaned_up(tmp_path):
+    payload = b"model-bits"
+    spec = make_spec("blocked", payload)
+    manager, _runtime, _router = make_manager(tmp_path, [spec], {spec.filename: payload})
+    model_directory = manager.models_root / spec.model_id
+    model_directory.write_bytes(b"not-a-directory")
+
+    manager.install(spec.model_id)
+    operation = wait_operation(manager, "failed")["operation"]
+    manager._operation_thread.join(timeout=5)
+
+    assert operation["error"] == "FileExistsError"
+    assert not manager._operation_thread.is_alive()
+    assert manager._download_cancel_event is None
+
+
+def test_install_rechecks_catalog_sha_before_treating_model_as_installed(tmp_path):
+    payload = b"trusted model bytes"
+    spec = make_spec("integrity", payload)
+    manager, _runtime, _router = make_manager(tmp_path, [spec], {spec.filename: payload})
+    original_downloader = manager._downloader
+    download_count = 0
+
+    def tracked_downloader(*args, **kwargs):
+        nonlocal download_count
+        download_count += 1
+        return original_downloader(*args, **kwargs)
+
+    manager._downloader = tracked_downloader
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+    model_path = manager.models_root / spec.model_id / spec.filename
+    model_path.write_bytes(b"x" * spec.size_bytes)
+
+    row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
+    assert row["installed"] is False
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+
+    assert download_count == 2
+    assert model_path.read_bytes() == payload
+
+
 def test_failed_runtime_switch_restores_previous_model(tmp_path):
     payloads = {"safe.gguf": b"safe", "broken.gguf": b"broken"}
     specs = [make_spec(name.removesuffix(".gguf"), data) for name, data in payloads.items()]
