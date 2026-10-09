@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 from agent.planning import Plan, PlanStep
 from scripts.run_full_e2e_gate_acceptance import (
@@ -8,6 +9,7 @@ from scripts.run_full_e2e_gate_acceptance import (
     TOOL_NAME,
     _fixture_binding_preserves_model_arguments,
     _plan_with_validator_feedback,
+    _qwen_preflight_diagnostics,
     _redact_diagnostic_text,
     _validate_full_e2e_plan,
 )
@@ -44,6 +46,38 @@ def _complete_entries():
         ("mcp.invoke", {"server_id": PLACEHOLDER_SERVER_ID, "tool_name": TOOL_NAME, "arguments": {"query": "full-e2e"}}),
         ("run_project_tests", {"query": "bounded-test-project"}),
     ]
+
+
+def test_qwen_preflight_diagnostics_distinguish_state_and_exclude_raw_model_content():
+    marker = "UNTRUSTED-PLAN-CONTENT"
+    mission = SimpleNamespace(
+        mission_id="mission-fixture",
+        status=SimpleNamespace(value="FAILED_RETRY_EXHAUSTED"),
+        plan=_plan([("status", {"note": marker}), (marker, {})]),
+        failures=[{"reason": marker}],
+        authorization_snapshot={},
+        verify_integrity=lambda: True,
+    )
+    model_attempts = [{"model_tool_names": ["status", marker], "planned_action_names": ["status", marker]}]
+    validation_attempts = [{
+        "attempt": 1,
+        "valid": False,
+        "planned_action_names": ["status", marker],
+        "missing_required_action_names": ["latest_intel"],
+        "unexpected_action_names": [marker],
+        "validation_issues": ["missing_required_actions"],
+        "action_counts": {"status": 1, marker: 1},
+    }]
+
+    summary = _qwen_preflight_diagnostics(mission, model_attempts, validation_attempts)
+
+    assert summary["mission"]["status_before_fixture_binding"] == "FAILED_RETRY_EXHAUSTED"
+    assert summary["mission"]["integrity_valid_before_fixture_binding"] is True
+    assert summary["mission"]["planning_failure_count"] == 1
+    assert summary["qwen_planning"]["final_validation_valid"] is False
+    assert summary["qwen_planning"]["missing_final_model_tool_names"]
+    assert "<unrecognized_action>" in summary["qwen_planning"]["final_model_tool_names"]
+    assert marker not in repr(summary)
 
 
 def test_plan_validator_feedback_reaches_model_and_only_model_revision_supplies_steps():

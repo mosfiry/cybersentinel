@@ -43,9 +43,12 @@ DEFAULT_MODEL_PATH = Path(
 TOOL_NAME = "read_acceptance_record"
 PLACEHOLDER_SERVER_ID = "mcp_" + "0" * 32
 CANARY = "MCP_INJECTION_CANARY_V52"
+REQUIRED_QWEN_ACTION_NAMES = frozenset({
+    "status", "latest_intel", "browser", "mcp.discover", "mcp.invoke", "run_project_tests",
+})
+MAX_QWEN_PLAN_REVISIONS = 2
 
 
-_SAFE_ACTION_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
 _SECRET_FIELD_PATTERN = re.compile(
     r"(?i)(\b(?:authorization|x-cybersentinel-token|x-cybersentinel-owner-session|"
     r"owner[_ -]?password|owner[_ -]?token|(?:access|refresh|session)[_ -]?token|api[_ -]?key|secret)\b\s*[:=]\s*)"
@@ -64,17 +67,108 @@ def _redact_diagnostic_text(value: object, secret_values=()) -> str:
 
 
 def _safe_action_names(values: list[str]) -> list[str]:
+    allowed = REQUIRED_QWEN_ACTION_NAMES | {"__planning_failure__"}
     return [
-        value if isinstance(value, str) and _SAFE_ACTION_IDENTIFIER.fullmatch(value)
-        else "<invalid_action_name>"
+        value if isinstance(value, str) and value in allowed else "<unrecognized_action>"
         for value in values[:32]
     ]
 
 
-REQUIRED_QWEN_ACTION_NAMES = frozenset({
-    "status", "latest_intel", "browser", "mcp.discover", "mcp.invoke", "run_project_tests",
-})
-MAX_QWEN_PLAN_REVISIONS = 2
+def _safe_plan_validation_attempts(attempts) -> list[dict]:
+    safe_attempts = []
+    for item in attempts if isinstance(attempts, (list, tuple)) else ():
+        if not isinstance(item, dict):
+            continue
+        issues = item.get("validation_issues", ())
+        unexpected = item.get("unexpected_action_names", ())
+        counts = item.get("action_counts", {})
+        counts = counts if isinstance(counts, dict) else {}
+        blocked_actions = item.get("authorization_ceiling_blocked_action_names", ())
+        blocked_actions = blocked_actions if isinstance(blocked_actions, (list, tuple)) else ()
+
+        def bounded_count(value):
+            return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 32 else 0
+
+        attempt = item.get("attempt")
+        safe_attempts.append({
+            "attempt": attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else len(safe_attempts) + 1,
+            "valid": item.get("valid") is True,
+            "planned_action_names": _safe_action_names(item.get("planned_action_names", [])),
+            "missing_required_action_names": _safe_action_names(item.get("missing_required_action_names", [])),
+            "unexpected_action_count": len(unexpected) if isinstance(unexpected, (list, tuple)) else 0,
+            "validation_issue_count": len(issues) if isinstance(issues, (list, tuple)) else 0,
+            "action_counts": {
+                name: bounded_count(counts.get(name, 0))
+                for name in sorted(REQUIRED_QWEN_ACTION_NAMES)
+            },
+            "authorization_ceiling_blocked_action_names": _safe_action_names(list(blocked_actions)),
+            "step_counts": {
+                "browser_open": bounded_count(item.get("browser_open_count", 0)),
+                "browser_links": bounded_count(item.get("browser_links_count", 0)),
+                "project_tests": bounded_count(item.get("project_test_step_count", 0)),
+            },
+            "checks": {
+                name: item.get(name) is True
+                for name in (
+                    "browser_open_target_matches",
+                    "browser_order_valid",
+                    "browser_session_id_is_harness_bound",
+                    "mcp_discovery_before_invoke",
+                    "mcp_tool_names_match",
+                    "mcp_discover_arguments_match",
+                    "mcp_invoke_arguments_match",
+                    "project_test_query_matches",
+                )
+            },
+        })
+    return safe_attempts
+
+
+def _qwen_preflight_diagnostics(mission, model_attempts, validation_attempts) -> dict:
+    safe_model_attempts = [item for item in model_attempts if isinstance(item, dict)] if isinstance(model_attempts, (list, tuple)) else []
+    steps = list(getattr(getattr(mission, "plan", None), "steps", ()) or ())
+    plan_actions = [str(getattr(step, "action", "")) for step in steps]
+    initial_model_tools = safe_model_attempts[0].get("model_tool_names", []) if safe_model_attempts else []
+    final_model_tools = safe_model_attempts[-1].get("model_tool_names", []) if safe_model_attempts else []
+    final_validation = validation_attempts[-1] if isinstance(validation_attempts, (list, tuple)) and validation_attempts and isinstance(validation_attempts[-1], dict) else {}
+    try:
+        integrity_valid = bool(mission.verify_integrity())
+    except Exception:
+        integrity_valid = False
+    status = getattr(mission, "status", "")
+    status = str(getattr(status, "value", status))
+    failures = getattr(mission, "failures", ())
+    failures = failures if isinstance(failures, (list, tuple)) else ()
+    failure_classes = sorted({
+        item.get("class") for item in failures
+        if isinstance(item, dict)
+        and isinstance(item.get("class"), str)
+        and item.get("class") in {"PROVIDER", "LOGIC", "RESOURCE", "SECURITY"}
+    })
+    return {
+        "mission": {
+            "mission_id": str(getattr(mission, "mission_id", "")),
+            "status_before_fixture_binding": status,
+            "integrity_valid_before_fixture_binding": integrity_valid,
+            "authorization_snapshot_present": bool(getattr(mission, "authorization_snapshot", None)),
+            "planning_failure_count": len(failures),
+            "planning_failure_classes": failure_classes,
+            "planned_action_names_before_fixture_binding": _safe_action_names(plan_actions),
+        },
+        "qwen_planning": {
+            "planning_attempt_count": len(safe_model_attempts),
+            "model_replan_count": max(0, len(safe_model_attempts) - 1),
+            "max_model_replans": MAX_QWEN_PLAN_REVISIONS,
+            "initial_model_tool_names": _safe_action_names(initial_model_tools if isinstance(initial_model_tools, list) else []),
+            "final_model_tool_names": _safe_action_names(final_model_tools if isinstance(final_model_tools, list) else []),
+            "planned_action_names": _safe_action_names(plan_actions),
+            "missing_final_model_tool_names": sorted(REQUIRED_QWEN_ACTION_NAMES - set(final_model_tools if isinstance(final_model_tools, list) else [])),
+            "missing_planned_action_names": sorted(REQUIRED_QWEN_ACTION_NAMES - set(plan_actions)),
+            "final_validation_valid": final_validation.get("valid") is True,
+            "final_validation_issue_count": len(final_validation.get("validation_issues", ())) if isinstance(final_validation.get("validation_issues", ()), (list, tuple)) else 0,
+            "validator_attempts": _safe_plan_validation_attempts(validation_attempts),
+        },
+    }
 
 
 def _plan_step_arguments(step) -> dict:
@@ -899,10 +993,13 @@ def main() -> int:
             completion_criteria=criteria,
             run=False,
         )
-        if mission.status is not MissionStatus.READY or not mission.verify_integrity():
-            raise RuntimeError("qwen_owner_mission_not_ready_or_integrity_invalid")
         model_attempts = getattr(core, "_e2e_model_plan_attempts", [])
         validator_attempts = getattr(core, "_e2e_plan_validation_attempts", [])
+        preflight_diagnostics = _qwen_preflight_diagnostics(mission, model_attempts, validator_attempts)
+        result["mission"].update(preflight_diagnostics["mission"])
+        result["qwen_planning_diagnostics"] = preflight_diagnostics["qwen_planning"]
+        if mission.status is not MissionStatus.READY or not preflight_diagnostics["mission"]["integrity_valid_before_fixture_binding"]:
+            raise RuntimeError("qwen_owner_mission_not_ready_or_integrity_invalid")
         initial_model_tool_names = (
             list(model_attempts[0].get("model_tool_names", [])) if model_attempts else []
         )
@@ -937,7 +1034,7 @@ def main() -> int:
             "planning_attempt_count": len(model_attempts),
             "model_replan_count": max(0, len(model_attempts) - 1),
             "max_model_replans": MAX_QWEN_PLAN_REVISIONS,
-            "validator_attempts": validator_attempts,
+            "validator_attempts": _safe_plan_validation_attempts(validator_attempts),
             "model_attempts": model_attempts,
             "model_plan_matches_final_qwen_plan": model_plan_matches_final,
             "plan_steps_added_by_acceptance_harness": 0,
@@ -946,7 +1043,7 @@ def main() -> int:
         mission.progress["full_e2e_qwen_plan_review"] = {
             "max_model_replans": MAX_QWEN_PLAN_REVISIONS,
             "model_replan_count": max(0, len(model_attempts) - 1),
-            "validator_attempts": validator_attempts,
+            "validator_attempts": _safe_plan_validation_attempts(validator_attempts),
             "model_attempts": model_attempts,
             "plan_steps_added_by_acceptance_harness": 0,
         }

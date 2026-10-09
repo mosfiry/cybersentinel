@@ -166,6 +166,7 @@ def test_owner_evidence_is_refreshed_after_slow_mission_planning(tmp_path, monke
         issued_evidence[0].expires_at
     )
     assert mission.status is MissionStatus.READY
+    assert mission.verify_integrity()
     assert mission.authorization_context["owner_evidence"]["authenticated_at"] == issued_evidence[1].authenticated_at
     assert datetime.fromisoformat(mission.authorization_snapshot["expires_at"]) > datetime.fromisoformat(
         mission.authorization_snapshot["created_at"]
