@@ -5,19 +5,25 @@ from pathlib import Path
 
 import pytest
 
+from agent.local_runtime.catalog import get_model
 from scripts.run_full_e2e_gate_acceptance import _safe_action_names, find_llama_server_binary
 import scripts.windows_desktop_acceptance as windows_acceptance
 from scripts.windows_desktop_acceptance import (
+    EXPECTED_QWEN3_4B_INSTALL_IDENTITY,
     INSTALLED_APP_MISSION_RESPONSE_TIMEOUT_MS,
     MODEL_STATE_API_MAX_CONSECUTIVE_FAILURES,
     MODEL_STATE_API_MAX_TOTAL_FAILURES,
     OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS,
     OWNER_MISSION_RUNTIME_LIMIT_SECONDS,
+    _build_expected_qwen_install_consent,
+    _handle_qwen_install_dialog,
     _local_health_status,
+    _require_qwen_install_consent,
     _safe_checkpoint_diagnostics,
     _safe_failure_diagnostics,
     _safe_tool_result_summary,
     _tools_within_authorized_allowlist,
+    _validate_qwen_install_post_response,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -216,3 +222,115 @@ def test_health_probe_refuses_non_loopback_url() -> None:
         url = "http://example.com:1234/"
 
     assert _local_health_status(Page()) is None
+
+
+def _qwen_model_payload() -> dict:
+    model = get_model("qwen3-4b-q4-k-m")
+    return {key: getattr(model, key) for key in EXPECTED_QWEN3_4B_INSTALL_IDENTITY}
+
+
+class _FakeDialog:
+    def __init__(self, message: str, *, dialog_type: str = "confirm") -> None:
+        self.message = message
+        self.type = dialog_type
+        self.accepted = False
+        self.dismissed = False
+
+    def accept(self) -> None:
+        self.accepted = True
+
+    def dismiss(self) -> None:
+        self.dismissed = True
+
+
+def test_qwen_install_consent_is_pinned_to_curated_model_identity() -> None:
+    model = get_model("qwen3-4b-q4-k-m")
+    catalog_identity = {
+        key: getattr(model, key)
+        for key in EXPECTED_QWEN3_4B_INSTALL_IDENTITY
+    }
+
+    assert EXPECTED_QWEN3_4B_INSTALL_IDENTITY == catalog_identity
+    assert _build_expected_qwen_install_consent(_qwen_model_payload()) == (
+        "تنزيل هذا الملف إلى جهازك؟\n\n"
+        "Qwen3 4B · Q4_K_M\n"
+        "unsloth/Qwen3-4B-GGUF@22c9fc8a8c7700b76a1789366280a6a5a1ad1120\n"
+        "Qwen3-4B-Q4_K_M.gguf · 2.3 GiB\n"
+        "الرخصة في بطاقة التحويل: Apache-2.0\n"
+        "SHA-256: f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a\n\n"
+        "سيُستخدم llama.cpp محليًا بعد التحقق. لا يبدأ التنزيل إلا بموافقتك."
+    )
+
+
+def test_matching_qwen_install_consent_is_accepted() -> None:
+    expected = _build_expected_qwen_install_consent(_qwen_model_payload())
+    dialog = _FakeDialog(expected)
+    consent = {"seen": False, "accepted": False, "mismatch": False}
+
+    _handle_qwen_install_dialog(dialog, expected, consent)
+    _require_qwen_install_consent(consent)
+
+    assert dialog.accepted and not dialog.dismissed
+    assert consent == {"seen": True, "accepted": True, "mismatch": False}
+
+
+def test_mismatched_qwen_install_consent_is_dismissed_and_fails_closed() -> None:
+    expected = _build_expected_qwen_install_consent(_qwen_model_payload())
+    dialog = _FakeDialog(expected.replace("2.3 GiB", "2.4 GiB"))
+    consent = {"seen": False, "accepted": False, "mismatch": False}
+
+    _handle_qwen_install_dialog(dialog, expected, consent)
+
+    assert dialog.dismissed and not dialog.accepted
+    with pytest.raises(RuntimeError, match="qwen3_4b_install_consent_mismatch"):
+        _require_qwen_install_consent(consent)
+
+
+def test_missing_qwen_install_consent_fails_closed() -> None:
+    with pytest.raises(RuntimeError, match="qwen3_4b_install_consent_missing"):
+        _require_qwen_install_consent({"seen": False, "accepted": False, "mismatch": False})
+
+
+def test_qwen_install_consent_refuses_catalog_identity_drift() -> None:
+    model = _qwen_model_payload()
+    model["revision"] = "0" * 40
+
+    assert _build_expected_qwen_install_consent(model) is None
+
+
+class _FakeInstallRequest:
+    method = "POST"
+
+
+class _FakeInstallResponse:
+    request = _FakeInstallRequest()
+    url = "http://127.0.0.1:4312/api/public/desktop/models/qwen3-4b-q4-k-m/install"
+
+    def __init__(self, status: int, body: dict) -> None:
+        self.status = status
+        self._body = body
+
+    def json(self) -> dict:
+        return self._body
+
+
+def test_qwen_install_post_rejects_unexpected_http_status() -> None:
+    response = _FakeInstallResponse(409, {"ok": False, "error": "model_manager_busy"})
+
+    with pytest.raises(RuntimeError, match="qwen3_4b_install_post_unexpected_http_status"):
+        _validate_qwen_install_post_response(response, "qwen3-4b-q4-k-m")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": True, "manager": {"operation": {"kind": "install", "model_id": "qwen3-4b-q4-k-m", "status": "idle"}}},
+        {"ok": True, "manager": {"operation": {"kind": "install", "model_id": "qwen3-4b-q4-k-m"}}},
+        {"ok": True, "manager": {"operation": {"kind": "activate", "model_id": "qwen3-4b-q4-k-m", "status": "downloading"}}},
+    ],
+)
+def test_qwen_install_post_without_started_install_operation_fails_immediately(body: dict) -> None:
+    response = _FakeInstallResponse(202, body)
+
+    with pytest.raises(RuntimeError, match="qwen3_4b_install_operation_not_started"):
+        _validate_qwen_install_post_response(response, "qwen3-4b-q4-k-m")

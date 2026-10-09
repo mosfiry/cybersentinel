@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from urllib.request import ProxyHandler, build_opener
 
 # This is only the harness's HTTP-response wait; AgentCore remains bounded by the
@@ -30,6 +30,18 @@ INSTALLED_APP_MISSION_RESPONSE_TIMEOUT_MS = (
 MODEL_STATE_API_RETRY_DELAY_SECONDS = 2
 MODEL_STATE_API_MAX_CONSECUTIVE_FAILURES = 5
 MODEL_STATE_API_MAX_TOTAL_FAILURES = 10
+QWEN_INSTALL_POST_RESPONSE_TIMEOUT_MS = 15_000
+EXPECTED_QWEN3_4B_INSTALL_IDENTITY = {
+    "model_id": "qwen3-4b-q4-k-m",
+    "display_name": "Qwen3 4B",
+    "repository": "unsloth/Qwen3-4B-GGUF",
+    "revision": "22c9fc8a8c7700b76a1789366280a6a5a1ad1120",
+    "filename": "Qwen3-4B-Q4_K_M.gguf",
+    "size_bytes": 2497281312,
+    "sha256": "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a",
+    "quantization": "Q4_K_M",
+    "license": "Apache-2.0",
+}
 
 
 def _sha256(value: bytes | str) -> str:
@@ -192,6 +204,91 @@ def _find_qwen(state: dict) -> dict | None:
     return next((item for item in models if isinstance(item, dict)
                  and "qwen3" in str(item.get("model_id", "")).casefold()
                  and "4b" in str(item.get("model_id", "")).casefold()), None)
+
+
+def _format_consent_bytes(value: int) -> str:
+    size = max(0, float(value))
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    unit = 0
+    while size >= 1024 and unit < len(units) - 1:
+        size /= 1024
+        unit += 1
+    precision = 1 if unit >= 2 else 0
+    return f"{size:.{precision}f} {units[unit]}"
+
+
+def _build_expected_qwen_install_consent(model: object) -> str | None:
+    if not isinstance(model, dict) or any(
+        model.get(key) != value for key, value in EXPECTED_QWEN3_4B_INSTALL_IDENTITY.items()
+    ):
+        return None
+    return (
+        "تنزيل هذا الملف إلى جهازك؟\n\n"
+        f"{model['display_name']} · {model['quantization']}\n"
+        f"{model['repository']}@{model['revision']}\n"
+        f"{model['filename']} · {_format_consent_bytes(model['size_bytes'])}\n"
+        f"الرخصة في بطاقة التحويل: {model['license']}\n"
+        f"SHA-256: {model['sha256']}\n\n"
+        "سيُستخدم llama.cpp محليًا بعد التحقق. لا يبدأ التنزيل إلا بموافقتك."
+    )
+
+
+def _handle_qwen_install_dialog(dialog, expected_message: str | None, consent: dict) -> None:
+    consent["seen"] = True
+    if (
+        expected_message is None
+        or getattr(dialog, "type", "") != "confirm"
+        or getattr(dialog, "message", None) != expected_message
+    ):
+        consent["mismatch"] = True
+        dialog.dismiss()
+        return
+    dialog.accept()
+    consent["accepted"] = True
+
+
+def _require_qwen_install_consent(consent: dict) -> None:
+    if not consent.get("seen"):
+        raise RuntimeError("qwen3_4b_install_consent_missing")
+    if not consent.get("accepted") or consent.get("mismatch"):
+        raise RuntimeError("qwen3_4b_install_consent_mismatch")
+
+
+def _is_qwen_install_post_response(response) -> bool:
+    if str(getattr(getattr(response, "request", None), "method", "")).upper() != "POST":
+        return False
+    path = unquote(urlsplit(str(getattr(response, "url", ""))).path).rstrip("/")
+    prefix = "/api/public/desktop/models/"
+    suffix = "/install"
+    model_id = path[len(prefix):-len(suffix)] if path.startswith(prefix) and path.endswith(suffix) else ""
+    return bool(model_id) and "/" not in model_id
+
+
+def _validate_qwen_install_post_response(response, expected_model_id: str) -> dict:
+    request_method = str(getattr(getattr(response, "request", None), "method", "")).upper()
+    response_path = unquote(urlsplit(str(getattr(response, "url", ""))).path).rstrip("/")
+    expected_path = f"/api/public/desktop/models/{expected_model_id}/install"
+    if request_method != "POST" or response_path != expected_path:
+        raise RuntimeError("qwen3_4b_install_post_unexpected_path")
+    if getattr(response, "status", None) != 202:
+        raise RuntimeError("qwen3_4b_install_post_unexpected_http_status")
+    try:
+        body = response.json()
+    except Exception:
+        raise RuntimeError("qwen3_4b_install_post_response_invalid") from None
+    if not isinstance(body, dict):
+        raise RuntimeError("qwen3_4b_install_post_response_invalid")
+    manager = body.get("manager")
+    operation = manager.get("operation") if isinstance(manager, dict) else None
+    started_statuses = {"downloading", "verifying", "complete", "failed", "interrupted", "cancelling", "cancelled"}
+    if (
+        not isinstance(operation, dict)
+        or operation.get("kind") != "install"
+        or operation.get("model_id") != expected_model_id
+        or operation.get("status") not in started_statuses
+    ):
+        raise RuntimeError("qwen3_4b_install_operation_not_started")
+    return body
 
 
 def _new_csrf_token(page) -> str:
@@ -633,7 +730,7 @@ def main() -> int:
     inference_response_fields: list[str] = []
     stage = "initialize_acceptance"
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
         with sync_playwright() as playwright:
             browser = playwright.chromium.connect_over_cdp(
@@ -734,7 +831,46 @@ def main() -> int:
                 if not qwen.get("installed"):
                     if install_button.count() != 1 or install_button.is_disabled():
                         raise RuntimeError("qwen3_4b_install_action_unavailable")
-                    install_button.click(timeout=30_000)
+                    expected_model_id = EXPECTED_QWEN3_4B_INSTALL_IDENTITY["model_id"]
+                    if model_id != expected_model_id or install_button.get_attribute("data-model-id") != expected_model_id:
+                        raise RuntimeError("qwen3_4b_install_action_model_identity_mismatch")
+                    expected_consent = _build_expected_qwen_install_consent(qwen)
+                    if expected_consent is None:
+                        raise RuntimeError("qwen3_4b_catalog_identity_mismatch")
+                    consent = {"seen": False, "accepted": False, "mismatch": False}
+
+                    def handle_install_dialog(dialog) -> None:
+                        _handle_qwen_install_dialog(dialog, expected_consent, consent)
+
+                    page.on("dialog", handle_install_dialog)
+                    try:
+                        try:
+                            with page.expect_response(
+                                _is_qwen_install_post_response,
+                                timeout=QWEN_INSTALL_POST_RESPONSE_TIMEOUT_MS,
+                            ) as install_response_info:
+                                install_button.click(timeout=30_000)
+                        except PlaywrightTimeoutError:
+                            _require_qwen_install_consent(consent)
+                            raise RuntimeError("qwen3_4b_install_post_not_observed") from None
+                    finally:
+                        page.remove_listener("dialog", handle_install_dialog)
+                    _require_qwen_install_consent(consent)
+                    install_response = install_response_info.value
+                    progress.append({
+                        "phase": "qwen_install_post_response",
+                        "at_utc": datetime.now(timezone.utc).isoformat(),
+                        "http_status": install_response.status,
+                        "consent_accepted": True,
+                    })
+                    state = _validate_qwen_install_post_response(install_response, expected_model_id)
+                    operation = ((state.get("manager") or {}).get("operation") or {})
+                    progress.append({
+                        "phase": "qwen_install_operation_started",
+                        "at_utc": datetime.now(timezone.utc).isoformat(),
+                        "operation_status": operation.get("status"),
+                        "operation_kind": operation.get("kind"),
+                    })
                     state = _wait_for_model(
                         page, lambda current, model, operation: bool(model and model.get("installed")),
                         timeout=args.model_timeout_seconds, phase="qwen_download_and_verify", progress=progress,
