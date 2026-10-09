@@ -9,6 +9,7 @@ from scripts.run_full_e2e_gate_acceptance import (
     TOOL_NAME,
     _fixture_binding_preserves_model_arguments,
     _plan_with_validator_feedback,
+    _qwen_acceptance_planning_schemas,
     _qwen_preflight_diagnostics,
     _redact_diagnostic_text,
     _validate_full_e2e_plan,
@@ -17,6 +18,39 @@ from scripts.windows_desktop_acceptance import _redact_diagnostic_text as _redac
 
 
 BROWSER_URL = "http://127.0.0.1:443/research-fixture"
+
+
+def test_intent_selection_exposes_canonical_project_test_tool_only_within_owner_scope():
+    from agent.agent_core import AgentCore
+
+    class AcceptancePlanningCore(AgentCore):
+        def _schemas(self):
+            return _qwen_acceptance_planning_schemas(super()._schemas())
+
+    core = AcceptancePlanningCore.__new__(AcceptancePlanningCore)
+    objective = "Propose exactly one run_project_tests call with query bounded-test-project."
+
+    assert AgentCore._eligible_planning_tools(core, objective, {"run_project_tests"}) == {"run_project_tests"}
+    assert AgentCore._eligible_planning_tools(core, objective, {"status"}) == set()
+
+
+def test_acceptance_browser_schema_hides_runtime_identity_and_limits_fixture_operations():
+    from tools.registry import model_tool_definitions
+
+    source_schemas = model_tool_definitions()
+    original = next(item for item in source_schemas if item["function"]["name"] == "browser")
+    planned_schemas = _qwen_acceptance_planning_schemas(source_schemas)
+    planned = next(item for item in planned_schemas if item["function"]["name"] == "browser")
+    original_parameters = original["function"]["parameters"]
+    planned_parameters = planned["function"]["parameters"]
+
+    assert "session_id" in original_parameters["properties"]
+    assert set(planned_parameters["properties"]) == {"operation", "url"}
+    assert planned_parameters["properties"]["operation"]["enum"] == ["open", "links"]
+    assert planned_parameters["required"] == ["operation"]
+    assert planned_parameters["additionalProperties"] is False
+    assert "session_id" in original_parameters["properties"]
+    assert "navigate" in original_parameters["properties"]["operation"]["enum"]
 
 
 def _plan(entries):
@@ -58,7 +92,11 @@ def test_qwen_preflight_diagnostics_distinguish_state_and_exclude_raw_model_cont
         authorization_snapshot={},
         verify_integrity=lambda: True,
     )
-    model_attempts = [{"model_tool_names": ["status", marker], "planned_action_names": ["status", marker]}]
+    model_attempts = [{
+        "visible_tool_names": list(REQUIRED_QWEN_ACTION_NAMES),
+        "model_tool_names": ["status", marker],
+        "planned_action_names": ["status", marker],
+    }]
     validation_attempts = [{
         "attempt": 1,
         "valid": False,
@@ -75,6 +113,8 @@ def test_qwen_preflight_diagnostics_distinguish_state_and_exclude_raw_model_cont
     assert summary["mission"]["integrity_valid_before_fixture_binding"] is True
     assert summary["mission"]["planning_failure_count"] == 1
     assert summary["qwen_planning"]["final_validation_valid"] is False
+    assert summary["qwen_planning"]["required_tool_schemas_visible"] is True
+    assert set(summary["qwen_planning"]["visible_required_tool_names"]) == set(REQUIRED_QWEN_ACTION_NAMES)
     assert summary["qwen_planning"]["missing_final_model_tool_names"]
     assert "<unrecognized_action>" in summary["qwen_planning"]["final_model_tool_names"]
     assert marker not in repr(summary)

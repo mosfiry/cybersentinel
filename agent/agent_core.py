@@ -196,7 +196,7 @@ class AgentCore:
             (r"\b(?:research|search|look up|lookup|investigate|cve(?:s)?|vulnerability advisory)\b|ابحث|استقص", {"search", "web_research"}),
             (r"\b(?:watch|monitor)\b|\b(?:add|create)\b.{0,16}\bwatch\b", {"watch"}),
             (r"\b(?:unwatch|stop watching|remove monitoring)\b", {"unwatch"}),
-            (r"\bpytest\b|\btest suite\b|\bproject tests\b|\b(?:run|execute|rerun|re-run)\b.{0,24}\btests?\b|تشغيل الاختبارات", {"run_project_tests"}),
+            (r"\brun_project_tests\b|\bpytest\b|\btest suite\b|\bproject tests\b|\b(?:run|execute|rerun|re-run)\b.{0,24}\btests?\b|تشغيل الاختبارات", {"run_project_tests"}),
             (r"\b(?:red[- ]team|adversarial security assessment)\b", {"red_team_assess"}),
             (r"\b(?:http probe|scoped http probe|probe the endpoint)\b", {"scoped_http_probe"}),
             (r"\b(?:browser|navigate to|open (?:the )?website|webpage)\b", {"browser"}),

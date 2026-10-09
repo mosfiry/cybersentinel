@@ -130,6 +130,8 @@ def _qwen_preflight_diagnostics(mission, model_attempts, validation_attempts) ->
     plan_actions = [str(getattr(step, "action", "")) for step in steps]
     initial_model_tools = safe_model_attempts[0].get("model_tool_names", []) if safe_model_attempts else []
     final_model_tools = safe_model_attempts[-1].get("model_tool_names", []) if safe_model_attempts else []
+    visible_tools = safe_model_attempts[0].get("visible_tool_names", []) if safe_model_attempts else []
+    visible_tools = visible_tools if isinstance(visible_tools, list) else []
     final_validation = validation_attempts[-1] if isinstance(validation_attempts, (list, tuple)) and validation_attempts and isinstance(validation_attempts[-1], dict) else {}
     try:
         integrity_valid = bool(mission.verify_integrity())
@@ -159,6 +161,8 @@ def _qwen_preflight_diagnostics(mission, model_attempts, validation_attempts) ->
             "planning_attempt_count": len(safe_model_attempts),
             "model_replan_count": max(0, len(safe_model_attempts) - 1),
             "max_model_replans": MAX_QWEN_PLAN_REVISIONS,
+            "visible_required_tool_names": sorted(REQUIRED_QWEN_ACTION_NAMES.intersection(visible_tools)),
+            "required_tool_schemas_visible": REQUIRED_QWEN_ACTION_NAMES.issubset(set(visible_tools)),
             "initial_model_tool_names": _safe_action_names(initial_model_tools if isinstance(initial_model_tools, list) else []),
             "final_model_tool_names": _safe_action_names(final_model_tools if isinstance(final_model_tools, list) else []),
             "planned_action_names": _safe_action_names(plan_actions),
@@ -169,6 +173,45 @@ def _qwen_preflight_diagnostics(mission, model_attempts, validation_attempts) ->
             "validator_attempts": _safe_plan_validation_attempts(validation_attempts),
         },
     }
+
+
+def _qwen_acceptance_planning_schemas(schemas: list[dict]) -> list[dict]:
+    """Limit fixture planning choices and hide the runtime-owned Browser identity."""
+    result = []
+    for item in schemas:
+        function = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(function, dict) or function.get("name") != "browser":
+            result.append(item)
+            continue
+        schema_copy = dict(item)
+        function_copy = dict(function)
+        parameters = function.get("parameters", {})
+        parameters_copy = dict(parameters) if isinstance(parameters, dict) else {}
+        original_properties = parameters_copy.get("properties", {})
+        original_properties = original_properties if isinstance(original_properties, dict) else {}
+        properties = {}
+        operation = original_properties.get("operation")
+        if isinstance(operation, dict):
+            operation_copy = dict(operation)
+            operation_copy["enum"] = ["open", "links"]
+            properties["operation"] = operation_copy
+        url = original_properties.get("url")
+        if isinstance(url, dict):
+            properties["url"] = dict(url)
+        parameters_copy["properties"] = properties
+        required = parameters_copy.get("required", ())
+        required = required if isinstance(required, (list, tuple)) else ()
+        parameters_copy["required"] = [name for name in required if name in properties] or ["operation"]
+        parameters_copy["additionalProperties"] = False
+        function_copy["parameters"] = parameters_copy
+        description = function_copy.get("description", "")
+        function_copy["description"] = (
+            f"{description} Mission-planning constraint: propose only open or links; do not include session_id. "
+            "The authenticated runtime binds the live session after validating the model plan."
+        ).strip()
+        schema_copy["function"] = function_copy
+        result.append(schema_copy)
+    return result
 
 
 def _plan_step_arguments(step) -> dict:
@@ -651,8 +694,18 @@ def main() -> int:
         class FullE2EAgentCore(AgentCore):
             """Keep every action model-proposed and request bounded model review on plan gaps."""
 
+            def _schemas(self):
+                return _qwen_acceptance_planning_schemas(super()._schemas())
+
             def _plan(self, objective, observation=None, **kwargs):
                 model_attempts: list[dict] = []
+                visible_tool_names = self._eligible_planning_tools(
+                    objective,
+                    kwargs.get("available_tool_names"),
+                )
+                if not REQUIRED_QWEN_ACTION_NAMES.issubset(visible_tool_names):
+                    raise RuntimeError("qwen_required_planning_tool_schema_unavailable")
+                safe_visible_tool_names = _safe_action_names(sorted(visible_tool_names))
 
                 def ask_qwen(accepted_objective, validator_feedback):
                     candidate = super(FullE2EAgentCore, self)._plan(
@@ -670,6 +723,7 @@ def main() -> int:
                             if isinstance(name, str):
                                 proposed.append(name)
                     model_attempts.append({
+                        "visible_tool_names": safe_visible_tool_names,
                         "model_tool_names": _safe_action_names(proposed),
                         "planned_action_names": _safe_action_names([
                             str(step.action) for step in candidate.steps
@@ -1034,7 +1088,18 @@ def main() -> int:
             "planning_attempt_count": len(model_attempts),
             "model_replan_count": max(0, len(model_attempts) - 1),
             "max_model_replans": MAX_QWEN_PLAN_REVISIONS,
+            "visible_required_tool_names": sorted(required_actions.intersection(
+                model_attempts[0].get("visible_tool_names", []) if model_attempts else []
+            )),
+            "required_tool_schemas_visible": required_actions.issubset(
+                set(model_attempts[0].get("visible_tool_names", [])) if model_attempts else set()
+            ),
             "validator_attempts": _safe_plan_validation_attempts(validator_attempts),
+            "final_validation_valid": final_validation.get("valid") is True,
+            "final_validation_issue_count": len(final_validation.get("validation_issues", ()))
+            if isinstance(final_validation.get("validation_issues", ()), (list, tuple))
+            else 0,
+            "replan_used_after_incomplete_validation": replan_used_after_incomplete_validation,
             "model_attempts": model_attempts,
             "model_plan_matches_final_qwen_plan": model_plan_matches_final,
             "plan_steps_added_by_acceptance_harness": 0,
