@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import secrets
 import sys
 import time
@@ -29,6 +30,31 @@ def _sha256(value: bytes | str) -> str:
     if isinstance(value, str):
         value = value.encode("utf-8")
     return hashlib.sha256(value).hexdigest()
+
+
+_SAFE_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
+
+
+def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
+    failures = mission_state.get("failures")
+    if not isinstance(failures, list):
+        return []
+    summary = []
+    for failure in failures[-5:]:
+        if not isinstance(failure, dict):
+            continue
+        item = {
+            key: value
+            for key in ("class", "budget", "kind", "reason_code", "recovery")
+            if isinstance((value := failure.get(key)), str)
+            and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value)
+        }
+        limit = failure.get("limit")
+        if isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= 1_000_000_000:
+            item["limit"] = limit
+        if item:
+            summary.append(item)
+    return summary
 
 
 def _model_state(page) -> dict:
@@ -367,6 +393,7 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         "target_identity": authorization_snapshot.get("target_identity"),
         "mission_status": mission_state.get("status"),
         "queue_state": queue_state.get("state"),
+        "resource_failure_diagnostics": _safe_failure_diagnostics(mission_state),
         "tool_calls": tool_summary,
         "research_stage": research_stage,
         "hypothesis_stage": hypothesis_stage,

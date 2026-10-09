@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -42,6 +43,17 @@ DEFAULT_MODEL_PATH = Path(
 TOOL_NAME = "read_acceptance_record"
 PLACEHOLDER_SERVER_ID = "mcp_" + "0" * 32
 CANARY = "MCP_INJECTION_CANARY_V52"
+
+
+_SAFE_ACTION_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
+
+
+def _safe_action_names(values: list[str]) -> list[str]:
+    return [
+        value if isinstance(value, str) and _SAFE_ACTION_IDENTIFIER.fullmatch(value)
+        else "<invalid_action_name>"
+        for value in values[:32]
+    ]
 
 
 class E2ERecordingRouter:
@@ -660,6 +672,12 @@ def main() -> int:
         mission.progress["full_e2e_qwen_proposed_actions"] = list(qwen_proposed_actions)
         required_actions = {"status", "latest_intel", "browser", "mcp.discover", "mcp.invoke", "run_project_tests"}
         required_qwen_actions = {"status", "latest_intel", "browser", "mcp.discover"}
+        result["qwen_planning_diagnostics"] = {
+            "initial_model_tool_names": _safe_action_names(qwen_proposed_actions),
+            "planned_action_names": _safe_action_names(qwen_plan_actions),
+            "missing_initial_model_tool_names": sorted(required_qwen_actions - set(qwen_proposed_actions)),
+            "missing_planned_action_names": sorted(required_actions - set(qwen_plan_actions)),
+        }
         if not required_qwen_actions.issubset(set(qwen_proposed_actions)):
             raise RuntimeError("real_qwen_plan_missing_required_integrated_actions")
         if not required_actions.issubset(set(qwen_plan_actions)):
