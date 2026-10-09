@@ -233,8 +233,15 @@ def _build_expected_qwen_install_consent(model: object) -> str | None:
     )
 
 
-def _handle_qwen_install_dialog(dialog, expected_message: str | None, consent: dict) -> None:
+def _handle_qwen_install_dialog(
+    dialog,
+    expected_message: str | None,
+    consent: dict,
+    *,
+    authorize_test_download: bool = False,
+) -> None:
     consent["seen"] = True
+    consent["authorized"] = authorize_test_download
     if (
         expected_message is None
         or getattr(dialog, "type", "") != "confirm"
@@ -243,11 +250,17 @@ def _handle_qwen_install_dialog(dialog, expected_message: str | None, consent: d
         consent["mismatch"] = True
         dialog.dismiss()
         return
+    if not authorize_test_download:
+        consent["unauthorized"] = True
+        dialog.dismiss()
+        return
     dialog.accept()
     consent["accepted"] = True
 
 
 def _require_qwen_install_consent(consent: dict) -> None:
+    if consent.get("authorized") is not True:
+        raise RuntimeError("qwen3_4b_test_download_explicit_opt_in_required")
     if not consent.get("seen"):
         raise RuntimeError("qwen3_4b_install_consent_missing")
     if not consent.get("accepted") or consent.get("mismatch"):
@@ -262,6 +275,30 @@ def _is_qwen_install_post_response(response) -> bool:
     suffix = "/install"
     model_id = path[len(prefix):-len(suffix)] if path.startswith(prefix) and path.endswith(suffix) else ""
     return bool(model_id) and "/" not in model_id
+
+
+def _is_expected_qwen_install_post_request(request, expected_model_id: str, expected_origin: str) -> bool:
+    if str(getattr(request, "method", "")).upper() != "POST":
+        return False
+    parsed = urlsplit(str(getattr(request, "url", "")))
+    request_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    expected_path = f"/api/public/desktop/models/{expected_model_id}/install"
+    return request_origin == expected_origin and unquote(parsed.path).rstrip("/") == expected_path
+
+
+def _may_continue_qwen_install_post(
+    request,
+    expected_model_id: str,
+    expected_origin: str,
+    consent: dict,
+) -> bool:
+    return (
+        consent.get("authorized") is True
+        and consent.get("seen") is True
+        and consent.get("accepted") is True
+        and consent.get("mismatch") is not True
+        and _is_expected_qwen_install_post_request(request, expected_model_id, expected_origin)
+    )
 
 
 def _validate_qwen_install_post_response(response, expected_model_id: str) -> dict:
@@ -706,13 +743,21 @@ def main() -> int:
     parser.add_argument("--mode", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--model-timeout-seconds", type=int, default=2400)
+    parser.add_argument(
+        "--authorize-qwen3-4b-test-download",
+        action="store_true",
+        help="explicitly authorize only the curated Qwen3 4B test-model download in full mode",
+    )
     args = parser.parse_args()
+    if args.authorize_qwen3_4b_test_download and args.mode != "full":
+        parser.error("--authorize-qwen3-4b-test-download requires --mode full")
     started = time.monotonic()
 
     report: dict[str, object] = {
         "schema": "cybersentinel-windows-installed-desktop-acceptance-v1",
         "status": "FAIL",
         "mode": args.mode,
+        "qwen3_4b_test_download_authorized": args.authorize_qwen3_4b_test_download,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "expected_version": args.expected_version,
         "version_endpoint": {},
@@ -837,31 +882,93 @@ def main() -> int:
                     expected_consent = _build_expected_qwen_install_consent(qwen)
                     if expected_consent is None:
                         raise RuntimeError("qwen3_4b_catalog_identity_mismatch")
-                    consent = {"seen": False, "accepted": False, "mismatch": False}
+                    page_url = urlsplit(str(page.url))
+                    if (
+                        page_url.scheme != "http"
+                        or page_url.hostname not in {"127.0.0.1", "localhost"}
+                        or page_url.port is None
+                    ):
+                        raise RuntimeError("qwen3_4b_install_origin_not_loopback")
+                    expected_origin = f"http://{page_url.netloc}"
+                    consent = {
+                        "seen": False,
+                        "accepted": False,
+                        "mismatch": False,
+                        "authorized": args.authorize_qwen3_4b_test_download,
+                        "post_seen": False,
+                        "post_allowed": False,
+                        "post_blocked": False,
+                    }
 
                     def handle_install_dialog(dialog) -> None:
-                        _handle_qwen_install_dialog(dialog, expected_consent, consent)
+                        _handle_qwen_install_dialog(
+                            dialog,
+                            expected_consent,
+                            consent,
+                            authorize_test_download=args.authorize_qwen3_4b_test_download,
+                        )
 
+                    install_route_pattern = "**/api/public/desktop/models/*/install"
+
+                    def guard_install_post(route) -> None:
+                        consent["post_seen"] = True
+                        if _may_continue_qwen_install_post(
+                            route.request,
+                            expected_model_id,
+                            expected_origin,
+                            consent,
+                        ):
+                            consent["post_allowed"] = True
+                            route.continue_()
+                        else:
+                            consent["post_blocked"] = True
+                            route.abort("blockedbyclient")
+
+                    page.route(install_route_pattern, guard_install_post)
                     page.on("dialog", handle_install_dialog)
                     try:
                         try:
                             with page.expect_response(
-                                _is_qwen_install_post_response,
+                                lambda response: (
+                                    _is_qwen_install_post_response(response)
+                                    and _is_expected_qwen_install_post_request(
+                                        response.request,
+                                        expected_model_id,
+                                        expected_origin,
+                                    )
+                                ),
                                 timeout=QWEN_INSTALL_POST_RESPONSE_TIMEOUT_MS,
                             ) as install_response_info:
                                 install_button.click(timeout=30_000)
                         except PlaywrightTimeoutError:
+                            if consent.get("post_blocked") is True:
+                                raise RuntimeError("qwen3_4b_install_post_blocked_by_guard") from None
                             _require_qwen_install_consent(consent)
                             raise RuntimeError("qwen3_4b_install_post_not_observed") from None
                     finally:
                         page.remove_listener("dialog", handle_install_dialog)
+                        page.unroute(install_route_pattern, guard_install_post)
+                        progress.append({
+                            "phase": "qwen_install_authorization",
+                            "at_utc": datetime.now(timezone.utc).isoformat(),
+                            "explicit_opt_in": args.authorize_qwen3_4b_test_download,
+                            "dialog_seen": consent.get("seen") is True,
+                            "dialog_accepted": consent.get("accepted") is True,
+                            "dialog_mismatched": consent.get("mismatch") is True,
+                            "install_post_observed": consent.get("post_seen") is True,
+                            "install_post_allowed": consent.get("post_allowed") is True,
+                            "install_post_blocked": consent.get("post_blocked") is True,
+                        })
                     _require_qwen_install_consent(consent)
+                    if consent.get("post_allowed") is not True:
+                        raise RuntimeError("qwen3_4b_install_post_not_authorized_by_guard")
                     install_response = install_response_info.value
                     progress.append({
                         "phase": "qwen_install_post_response",
                         "at_utc": datetime.now(timezone.utc).isoformat(),
                         "http_status": install_response.status,
-                        "consent_accepted": True,
+                        "consent_accepted": consent.get("accepted") is True,
+                        "post_guard_allowed": consent.get("post_allowed") is True,
                     })
                     state = _validate_qwen_install_post_response(install_response, expected_model_id)
                     operation = ((state.get("manager") or {}).get("operation") or {})

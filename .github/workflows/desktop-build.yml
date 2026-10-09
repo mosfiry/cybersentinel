@@ -184,6 +184,7 @@ jobs:
             -EvidenceDirectory $evidence `
             -Mode full `
             -RunSourceTreeE2ESupplemental `
+            -AuthorizeQwen3_4BTestDownload `
             -ExpectedSha256 ([string]$manifest.sha256) `
             -ExpectedSizeBytes ([long]$manifest.size_bytes) `
             -ExpectedSourceCommit $env:GITHUB_SHA

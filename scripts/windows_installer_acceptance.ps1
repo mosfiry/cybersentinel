@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
     [ValidateSet("smoke", "full")][string]$Mode = "smoke",
     [switch]$RunSourceTreeE2ESupplemental,
+    [switch]$AuthorizeQwen3_4BTestDownload,
     [string]$ExpectedSha256 = "",
     [long]$ExpectedSizeBytes = 0,
     [string]$ExpectedSourceCommit = ""
@@ -16,6 +17,11 @@ $report = [ordered]@{
     schema = "cybersentinel-windows-native-installer-acceptance-v1"
     status = "FAIL"
     mode = $Mode
+    qwen3_4b_test_download_authorization = [ordered]@{
+        configured = [bool]$AuthorizeQwen3_4BTestDownload
+        scope = if ($AuthorizeQwen3_4BTestDownload) { "qwen3-4b-test-model-only" } else { "none" }
+        passed_to_harness = $false
+    }
     started_at_utc = $started.ToString("o")
     environment = [ordered]@{
         os = [Environment]::OSVersion.VersionString
@@ -80,6 +86,9 @@ function Get-NormalizedWindowsProductVersion {
 }
 
 try {
+    if ($AuthorizeQwen3_4BTestDownload -and $Mode -ne "full") {
+        throw "Qwen test-download authorization is only valid for full acceptance mode."
+    }
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         throw "This acceptance path requires a native Windows runner."
     }
@@ -234,6 +243,10 @@ try {
         "--output", $uiJson
     )
     if ($Mode -eq "full") { $uiArgs += @("--model-timeout-seconds", "2400") }
+    if ($AuthorizeQwen3_4BTestDownload) {
+        $uiArgs += "--authorize-qwen3-4b-test-download"
+        $report.qwen3_4b_test_download_authorization.passed_to_harness = $true
+    }
     & $python @uiArgs
     $uiExitCode = $LASTEXITCODE
     if (Test-Path -LiteralPath $uiJson -PathType Leaf) {

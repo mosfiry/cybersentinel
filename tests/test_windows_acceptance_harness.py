@@ -18,6 +18,8 @@ from scripts.windows_desktop_acceptance import (
     _build_expected_qwen_install_consent,
     _handle_qwen_install_dialog,
     _local_health_status,
+    _is_expected_qwen_install_post_request,
+    _may_continue_qwen_install_post,
     _require_qwen_install_consent,
     _safe_checkpoint_diagnostics,
     _safe_failure_diagnostics,
@@ -267,11 +269,24 @@ def test_matching_qwen_install_consent_is_accepted() -> None:
     dialog = _FakeDialog(expected)
     consent = {"seen": False, "accepted": False, "mismatch": False}
 
-    _handle_qwen_install_dialog(dialog, expected, consent)
+    _handle_qwen_install_dialog(dialog, expected, consent, authorize_test_download=True)
     _require_qwen_install_consent(consent)
 
     assert dialog.accepted and not dialog.dismissed
-    assert consent == {"seen": True, "accepted": True, "mismatch": False}
+    assert consent == {"seen": True, "accepted": True, "mismatch": False, "authorized": True}
+
+
+def test_matching_qwen_install_consent_is_dismissed_without_explicit_opt_in() -> None:
+    expected = _build_expected_qwen_install_consent(_qwen_model_payload())
+    dialog = _FakeDialog(expected)
+    consent = {"seen": False, "accepted": False, "mismatch": False}
+
+    _handle_qwen_install_dialog(dialog, expected, consent)
+
+    assert dialog.dismissed and not dialog.accepted
+    assert consent["authorized"] is False
+    with pytest.raises(RuntimeError, match="qwen3_4b_test_download_explicit_opt_in_required"):
+        _require_qwen_install_consent(consent)
 
 
 def test_mismatched_qwen_install_consent_is_dismissed_and_fails_closed() -> None:
@@ -279,7 +294,7 @@ def test_mismatched_qwen_install_consent_is_dismissed_and_fails_closed() -> None
     dialog = _FakeDialog(expected.replace("2.3 GiB", "2.4 GiB"))
     consent = {"seen": False, "accepted": False, "mismatch": False}
 
-    _handle_qwen_install_dialog(dialog, expected, consent)
+    _handle_qwen_install_dialog(dialog, expected, consent, authorize_test_download=True)
 
     assert dialog.dismissed and not dialog.accepted
     with pytest.raises(RuntimeError, match="qwen3_4b_install_consent_mismatch"):
@@ -288,7 +303,7 @@ def test_mismatched_qwen_install_consent_is_dismissed_and_fails_closed() -> None
 
 def test_missing_qwen_install_consent_fails_closed() -> None:
     with pytest.raises(RuntimeError, match="qwen3_4b_install_consent_missing"):
-        _require_qwen_install_consent({"seen": False, "accepted": False, "mismatch": False})
+        _require_qwen_install_consent({"seen": False, "accepted": False, "mismatch": False, "authorized": True})
 
 
 def test_qwen_install_consent_refuses_catalog_identity_drift() -> None:
@@ -298,8 +313,42 @@ def test_qwen_install_consent_refuses_catalog_identity_drift() -> None:
     assert _build_expected_qwen_install_consent(model) is None
 
 
+def test_qwen_install_post_guard_requires_exact_explicit_authorization_and_loopback_route() -> None:
+    origin = "http://127.0.0.1:4312"
+    expected_id = "qwen3-4b-q4-k-m"
+    consent = {"authorized": True, "seen": True, "accepted": True, "mismatch": False}
+    request = _FakeInstallRequest(f"{origin}/api/public/desktop/models/{expected_id}/install")
+
+    assert _is_expected_qwen_install_post_request(request, expected_id, origin)
+    assert _may_continue_qwen_install_post(request, expected_id, origin, consent)
+    assert not _may_continue_qwen_install_post(request, expected_id, origin, {**consent, "authorized": False})
+    assert not _may_continue_qwen_install_post(request, expected_id, origin, {**consent, "accepted": False})
+    assert not _may_continue_qwen_install_post(request, expected_id, origin, {**consent, "mismatch": True})
+    assert not _is_expected_qwen_install_post_request(
+        _FakeInstallRequest(f"https://127.0.0.1:4312/api/public/desktop/models/{expected_id}/install"),
+        expected_id,
+        origin,
+    )
+    assert not _is_expected_qwen_install_post_request(
+        _FakeInstallRequest(f"{origin}/api/public/desktop/models/other-model/install"),
+        expected_id,
+        origin,
+    )
+    assert not _is_expected_qwen_install_post_request(
+        _FakeInstallRequest(f"{origin}/api/public/desktop/models/{expected_id}/install", method="GET"),
+        expected_id,
+        origin,
+    )
+
+
 class _FakeInstallRequest:
-    method = "POST"
+    def __init__(
+        self,
+        url: str = "http://127.0.0.1:4312/api/public/desktop/models/qwen3-4b-q4-k-m/install",
+        method: str = "POST",
+    ) -> None:
+        self.url = url
+        self.method = method
 
 
 class _FakeInstallResponse:
