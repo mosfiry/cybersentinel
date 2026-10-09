@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.local_runtime.catalog import ModelSpec
+from agent.local_runtime import manager as manager_module
 from agent.local_runtime.manager import LocalModelManager
 from agent.model_router import ModelRouter
 
@@ -178,13 +179,50 @@ def test_install_rechecks_catalog_sha_before_treating_model_as_installed(tmp_pat
     model_path = manager.models_root / spec.model_id / spec.filename
     model_path.write_bytes(b"x" * spec.size_bytes)
 
+    # Model a display-cache identity collision; install must still hash afresh.
+    stat = model_path.stat()
+    fingerprint = (
+        spec.sha256,
+        spec.size_bytes,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    manager._display_integrity_cache[spec.model_id] = (fingerprint, True)
+
     row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
-    assert row["installed"] is False
+    assert row["installed"] is True  # cached status is informational, not a trust decision
     manager.install(spec.model_id)
     wait_operation(manager, "complete")
 
     assert download_count == 2
     assert model_path.read_bytes() == payload
+
+
+def test_public_state_hashes_unchanged_installed_model_once(tmp_path, monkeypatch):
+    payload = b"stable model bytes"
+    spec = make_spec("polling", payload)
+    manager, _runtime, _router = make_manager(tmp_path, [spec], {spec.filename: payload})
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+
+    manager._display_integrity_cache.clear()
+    original_hash = manager_module._hash_file
+    hash_calls = 0
+
+    def tracked_hash(*args, **kwargs):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(*args, **kwargs)
+
+    monkeypatch.setattr(manager_module, "_hash_file", tracked_hash)
+    for _ in range(6):
+        row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
+        assert row["installed"] is True
+
+    assert hash_calls == 1
 
 
 def test_failed_runtime_switch_restores_previous_model(tmp_path):
@@ -216,19 +254,49 @@ def test_manager_rejects_models_incompatible_with_available_ram(tmp_path):
         manager.activate("large")
 
 
-def test_activation_rechecks_file_hash_and_removes_invalid_manifest(tmp_path):
+def test_activation_rechecks_file_hash_and_removes_invalid_manifest(tmp_path, monkeypatch):
     payloads = {"guarded.gguf": b"expected model"}
     spec = make_spec("guarded", payloads["guarded.gguf"])
-    manager, _runtime, _router = make_manager(tmp_path, [spec], payloads)
+    manager, runtime, _router = make_manager(tmp_path, [spec], payloads)
     manager.install(spec.model_id)
     wait_operation(manager, "complete")
     model_path = manager.models_root / spec.model_id / spec.filename
+    original_hash = manager_module._hash_file
+    hash_calls = 0
+
+    def tracked_hash(*args, **kwargs):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(*args, **kwargs)
+
+    manager._display_integrity_cache.clear()
+    monkeypatch.setattr(manager_module, "_hash_file", tracked_hash)
+    assert next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)["installed"]
     model_path.write_bytes(b"x" * spec.size_bytes)
     assert model_path.stat().st_size == spec.size_bytes
+    assert next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)["installed"] is False
     manager.activate(spec.model_id)
     state = wait_operation(manager, "failed")
     assert state["runtime"]["status"] == "error"
     assert not (manager.models_root / spec.model_id / "manifest.json").exists()
+    assert runtime.started == []
+    assert hash_calls >= 3  # display validation before/after tampering and fresh activation verification
+
+
+def test_partial_model_artifact_is_never_activated(tmp_path):
+    payload = b"expected complete model payload"
+    spec = make_spec("partial", payload)
+    manager, runtime, _router = make_manager(tmp_path, [spec], {spec.filename: payload})
+    partial_path = manager._model_path(spec).with_name(spec.filename + ".part")
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path.write_bytes(payload[:8])
+
+    with pytest.raises(FileNotFoundError, match="model_not_installed"):
+        manager.activate(spec.model_id)
+
+    assert runtime.started == []
+    assert partial_path.read_bytes() == payload[:8]
+    assert next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)["installed"] is False
 
 
 class FakeLocalInferenceProvider:

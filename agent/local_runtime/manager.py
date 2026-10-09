@@ -47,6 +47,8 @@ class LocalModelManager:
         self._external_providers = list(router.providers)
         self._catalog = tuple(catalog)
         self._by_id = {item.model_id: item for item in self._catalog}
+        # Display-only integrity observations; never use this cache to authorize activation or inference.
+        self._display_integrity_cache: dict[str, tuple[tuple[Any, ...], bool]] = {}
         self._hardware_provider = hardware_provider
         self._downloader = downloader
         self._lock = threading.RLock()
@@ -144,6 +146,56 @@ class LocalModelManager:
             return False
 
     def _installed_by_metadata(self, spec: ModelSpec) -> bool:
+        with self._lock:
+            if not self._manifest_matches(spec):
+                self._display_integrity_cache.pop(spec.model_id, None)
+                return False
+            path = self._model_path(spec)
+            try:
+                stat = path.stat()
+            except OSError:
+                self._display_integrity_cache.pop(spec.model_id, None)
+                return False
+            if stat.st_size != spec.size_bytes:
+                self._display_integrity_cache.pop(spec.model_id, None)
+                return False
+
+            fingerprint = (
+                spec.sha256,
+                spec.size_bytes,
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+            cached = self._display_integrity_cache.get(spec.model_id)
+            if cached is not None and cached[0] == fingerprint:
+                return cached[1]
+
+            try:
+                installed = _hash_file(path) == spec.sha256
+                after = path.stat()
+            except OSError:
+                self._display_integrity_cache.pop(spec.model_id, None)
+                return False
+            after_fingerprint = (
+                spec.sha256,
+                spec.size_bytes,
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if after_fingerprint != fingerprint:
+                self._display_integrity_cache.pop(spec.model_id, None)
+                return False
+            self._display_integrity_cache[spec.model_id] = (fingerprint, installed)
+            return installed
+
+    def _installed_by_fresh_hash(self, spec: ModelSpec) -> bool:
+        """Check idempotent installation without trusting display-only observations."""
         if not self._manifest_matches(spec):
             return False
         try:
@@ -253,8 +305,10 @@ class LocalModelManager:
         compatibility = assess_compatibility(spec, hardware)
         if not compatibility["compatible"]:
             raise ValueError("model_not_compatible:" + ",".join(compatibility["reasons"]))
-        if self._installed_by_metadata(spec):
+        if self._installed_by_fresh_hash(spec):
             return self.public_state(hardware)
+        with self._lock:
+            self._display_integrity_cache.pop(spec.model_id, None)
         self._begin_operation("install", spec, "downloading", total=spec.size_bytes)
         cancel_event = threading.Event()
         with self._lock:
