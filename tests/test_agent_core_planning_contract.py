@@ -159,11 +159,42 @@ def test_one_incomplete_plan_gets_one_feedback_repair_and_preserves_attempts(tmp
     assert mission.evidence == []
 
 
+def test_explicit_required_actions_get_a_second_bounded_repair(tmp_path, monkeypatch):
+    allow_owner_sessions(monkeypatch, "valid-owner")
+    core, provider = make_core(tmp_path, [
+        ProviderResponse(tool_calls=[ToolCall("status", {}, "first-status")]),
+        ProviderResponse(tool_calls=[ToolCall("status", {}, "second-status")]),
+        ProviderResponse(tool_calls=[
+            ToolCall("status", {}, "repaired-status"),
+            ToolCall("latest_intel", {}, "repaired-intel"),
+        ]),
+    ])
+
+    mission = core.run_owner_mission(
+        "Check status and latest intelligence",
+        owner_session_token="valid-owner",
+        planning_requirements=("status", "latest_intel"),
+        run=False,
+    )
+
+    assert mission.status is MissionStatus.READY
+    assert [step.action for step in mission.plan.steps] == ["status", "latest_intel"]
+    assert provider.calls == 3
+    attempts = mission.progress["planning_attempts"]
+    assert len(attempts) == 3
+    assert attempts[0]["repair_requested"] is True
+    assert attempts[1]["repair_requested"] is True
+    assert attempts[2]["plan_valid"] is True
+    assert "missing required tools=latest_intel" in str(provider.requests[1]["messages"])
+    assert "missing required tools=latest_intel" in str(provider.requests[2]["messages"])
+
+
 def test_required_action_omission_after_bounded_repair_is_terminal_not_success(tmp_path, monkeypatch):
     allow_owner_sessions(monkeypatch, "valid-owner")
     core, provider = make_core(tmp_path, [
         ProviderResponse(text="Everything is done."),
         ProviderResponse(text="Still done."),
+        ProviderResponse(text="No action was taken."),
     ])
 
     mission = core.run_owner_mission(
@@ -173,10 +204,16 @@ def test_required_action_omission_after_bounded_repair_is_terminal_not_success(t
         run=False,
     )
 
-    assert provider.calls == 2
+    assert provider.calls == 3
     assert mission.status is MissionStatus.FAILED_RETRY_EXHAUSTED
     assert mission.error == "model planning failure: INVALID_MODEL_PLAN (MISSING_REQUIRED_TOOLS)"
     assert mission.progress["planning_attempts"][0]["missing_required_tools"] == ["status"]
+    attempts = mission.progress["planning_attempts"]
+    assert len(attempts) == 3
+    assert attempts[0]["repair_requested"] is True
+    assert attempts[1]["repair_requested"] is True
+    assert attempts[2]["plan_valid"] is False
     assert mission.failures[-1]["retry_policy"]["retry_scheduled"] is False
+    assert mission.failures[-1]["retry_policy"]["max_retries"] == 2
     assert mission.action_history == []
     assert mission.evidence == []

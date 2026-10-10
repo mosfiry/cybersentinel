@@ -854,7 +854,11 @@ class AgentCore:
         initial_model_response: dict[str, Any] | None = None
         planning_attempt_summaries: list[dict[str, Any]] = []
         planning_feedback = ""
-        planning_repair_used = False
+        planning_repair_limit = min(
+            2 if required_planning_tools else 1,
+            planning_policy.max_retries,
+        )
+        planning_repair_count = 0
         for attempt_index in range(planning_policy.max_retries + 1):
             provider_attempt = attempt_index + 1
             self._last_model_response = {}
@@ -994,7 +998,7 @@ class AgentCore:
                     )
                     planning_attempt_summaries[-1]["accepted_text_final"] = True
                     break
-                retry_planning = not planning_repair_used
+                retry_planning = planning_repair_count < planning_repair_limit
                 recovery = RecoveryAction.REPLAN if retry_planning else RecoveryAction.FAIL
                 missing_tools = list(failure_details.get("missing_required_tools", ()))
                 validation_issues = list(failure_details.get("validation_issues", ()))
@@ -1014,14 +1018,14 @@ class AgentCore:
                     "run_id": planning_run_id,
                     "turn_id": f"{planning_run_id}:planning:{provider_attempt}",
                     "retry_policy": {
-                        "max_retries": 1,
+                        "max_retries": planning_repair_limit,
                         "action": recovery.value,
                         "retryable": retry_planning,
                         "retry_scheduled": retry_planning,
                     },
                 })
                 if retry_planning:
-                    planning_repair_used = True
+                    planning_repair_count += 1
                     planning_attempt_summaries[-1]["repair_requested"] = True
                     feedback_parts = [f"reason_code={failure_code}"]
                     if missing_tools:

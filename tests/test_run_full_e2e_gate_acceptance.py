@@ -1,6 +1,11 @@
+from types import SimpleNamespace
+
 import pytest
 
-from scripts.run_full_e2e_gate_acceptance import _scoped_acceptance_mcp_endpoint_canonicalizer
+from scripts.run_full_e2e_gate_acceptance import (
+    _qwen_planning_diagnostics,
+    _scoped_acceptance_mcp_endpoint_canonicalizer,
+)
 import tools.mcp_client as mcp_client
 from tools.mcp_client import canonical_mcp_endpoint
 
@@ -83,3 +88,55 @@ def test_mcp_registry_accepts_only_the_scoped_acceptance_endpoint(
             mission_id=mission_id,
             endpoint=f"https://example.invalid:53127{endpoint_path}",
         )
+
+
+def test_qwen_diagnostics_capture_safe_attempt_codes_without_internal_failure_step() -> None:
+    mission = SimpleNamespace(
+        progress={
+            "initial_model_response": {"tool_calls": [{"name": "status"}]},
+            "planning_attempts": [
+                {
+                    "attempt_number": 1,
+                    "proposed_tool_names": ["status"],
+                    "plan_valid": False,
+                    "failure_code": "MISSING_REQUIRED_TOOLS",
+                    "missing_required_tools": ["latest_intel"],
+                    "repair_requested": True,
+                    "untrusted_error": "not a safe code to report",
+                },
+                {
+                    "attempt_number": 2,
+                    "proposed_tool_names": ["latest_intel", "invalid name"],
+                    "plan_valid": False,
+                    "failure_code": "external error with private text",
+                    "missing_required_tools": ["status"],
+                    "repair_requested": False,
+                },
+            ],
+        },
+        plan=SimpleNamespace(steps=[SimpleNamespace(action="__planning_failure__")]),
+    )
+
+    result = _qwen_planning_diagnostics(mission, ("status", "latest_intel"))["diagnostics"]
+
+    assert result["planned_action_names"] == []
+    assert result["planning_attempts"] == [
+        {
+            "attempt_number": 1,
+            "proposed_tool_names": ["status"],
+            "plan_valid": False,
+            "failure_code": "MISSING_REQUIRED_TOOLS",
+            "missing_required_tools": ["latest_intel"],
+            "repair_requested": True,
+        },
+        {
+            "attempt_number": 2,
+            "proposed_tool_names": ["latest_intel", "<invalid_action_name>"],
+            "plan_valid": False,
+            "failure_code": None,
+            "missing_required_tools": ["status"],
+            "repair_requested": False,
+        },
+    ]
+    assert "not a safe code to report" not in repr(result)
+    assert "external error with private text" not in repr(result)

@@ -99,8 +99,29 @@ def _qwen_planning_diagnostics(mission, required_action_names):
     final_actions = [str(name) for name in raw_final_actions if isinstance(name, str)]
     if not final_actions:
         final_actions = list(initial_actions)
-    plan_actions = [step.action for step in mission.plan.steps]
+    plan_actions = [step.action for step in mission.plan.steps if step.action != "__planning_failure__"]
     required_actions = set(required_action_names)
+    attempt_diagnostics = []
+    if isinstance(planning_attempts, list):
+        for index, item in enumerate(planning_attempts[:8], start=1):
+            if not isinstance(item, dict):
+                continue
+            proposed = item.get("proposed_tool_names", [])
+            missing = item.get("missing_required_tools", [])
+            proposed = proposed if isinstance(proposed, list) else []
+            missing = missing if isinstance(missing, list) else []
+            failure_code = item.get("failure_code")
+            attempt_number = item.get("attempt_number")
+            attempt_diagnostics.append({
+                "attempt_number": attempt_number if type(attempt_number) is int else index,
+                "proposed_tool_names": _safe_action_names(proposed),
+                "plan_valid": item.get("plan_valid") is True,
+                "failure_code": failure_code
+                if isinstance(failure_code, str) and re.fullmatch(r"[A-Z0-9_.-]{1,80}", failure_code)
+                else None,
+                "missing_required_tools": _safe_action_names(missing),
+                "repair_requested": item.get("repair_requested") is True,
+            })
 
     def mcp_dependency_order_valid(proposed: list[str]) -> bool:
         if "mcp.discover" not in proposed or "mcp.invoke" not in proposed:
@@ -129,6 +150,7 @@ def _qwen_planning_diagnostics(mission, required_action_names):
             "final_plan_mcp_discovery_before_invocation": mcp_dependency_order_valid(plan_actions),
             "planning_attempt_count": len(planning_attempts) if isinstance(planning_attempts, list) else 0,
             "repair_attempt_count": repair_attempt_count,
+            "planning_attempts": attempt_diagnostics,
         },
     }
 
