@@ -16,10 +16,16 @@ from scripts.windows_desktop_acceptance import (
     OWNER_MISSION_RESPONSE_FINALIZATION_MARGIN_SECONDS,
     OWNER_MISSION_RUNTIME_LIMIT_SECONDS,
     _build_expected_qwen_install_consent,
+    _canonical_sha256,
+    _effect_ledger_projection,
     _handle_qwen_install_dialog,
     _local_health_status,
     _is_expected_qwen_install_post_request,
     _may_continue_qwen_install_post,
+    _may_resume_after_application_restart,
+    _mission_audit_projection,
+    _model_runtime_after_restart,
+    _owner_auth_after_restart,
     _qwen_installed_digest_report,
     _require_qwen_installed_digest,
     _require_qwen_install_consent,
@@ -27,6 +33,7 @@ from scripts.windows_desktop_acceptance import (
     _safe_checkpoint_diagnostics,
     _safe_failure_diagnostics,
     _safe_tool_result_summary,
+    _tool_execution_projection,
     _tools_within_authorized_allowlist,
     _validate_qwen_install_post_response,
 )
@@ -143,6 +150,254 @@ def test_empty_tool_results_do_not_vacuously_pass_authorization_gate() -> None:
     assert not _tools_within_authorized_allowlist([], ["browser"])
     assert _tools_within_authorized_allowlist([{"name": "browser"}], ["browser"])
     assert not _tools_within_authorized_allowlist([{"name": "mcp.invoke"}], ["browser"])
+
+
+def test_restart_resume_requires_persisted_pause_authorization_and_unchanged_execution_history() -> None:
+    accepted = {
+        "mission_status": "RUNNING",
+        "queue_state": "paused",
+        "pause_requested": True,
+        "owner_authorized": True,
+        "runtime_ready": True,
+        "execution_history_unchanged": True,
+    }
+    assert _may_resume_after_application_restart(**accepted)
+    for key, value in (
+        ("queue_state", "running"),
+        ("pause_requested", False),
+        ("owner_authorized", False),
+        ("runtime_ready", False),
+        ("execution_history_unchanged", False),
+        ("mission_status", "RESOURCE_BLOCKED"),
+    ):
+        candidate = {**accepted, key: value}
+        assert not _may_resume_after_application_restart(**candidate), key
+
+
+def test_owner_reauthentication_after_restart_rejects_invalid_password_and_restores_same_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id = "mission-acceptance-1"
+    identity = "owner:0123456789abcdef"
+    responses = [
+        {"http_status": 403, "body": {"error": "owner_authentication_required"}},
+        {"http_status": 403, "body": {"error": "invalid_credentials", "authenticated": False}},
+        {"http_status": 403, "body": {"error": "owner_authentication_required"}},
+        {"http_status": 200, "body": {"status": {"mission_id": mission_id, "owner_identity_ref": identity}}},
+    ]
+
+    def fake_api(_page, _method, _path, *, csrf="", payload=None):
+        if payload is not None and payload.get("password") == "correct-test-only-password":
+            assert csrf == "csrf-test-token"
+        return responses.pop(0)
+
+    monkeypatch.setattr(windows_acceptance, "_public_api", fake_api)
+    monkeypatch.setattr(windows_acceptance, "_new_csrf_token", lambda _page: "csrf-test-token")
+    monkeypatch.setattr(
+        windows_acceptance, "_login_owner_after_restart",
+        lambda *_args: {"http_status": 200, "authenticated": True, "username": "mosfiry"},
+    )
+    monkeypatch.setattr(
+        windows_acceptance, "_renderer_owner_auth_state",
+        lambda _page: {"authenticated": True, "login_form_hidden": True, "logout_button_visible": True},
+    )
+
+    result = _owner_auth_after_restart(
+        object(), f"/api/public/missions/{mission_id}", "mosfiry",
+        "correct-test-only-password", identity,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["invalid_credentials_rejected"] is True
+    assert result["invalid_login_preserved_existing_owner"] is False
+    assert result["invalid_login_did_not_create_owner_session"] is True
+    assert result["invalid_login_authorization_state_unchanged"] is True
+    assert result["valid_login_after_restart"] is True
+    assert result["owner_identity_matches"] is True
+    assert result["mission_read_authorized"] is True
+    assert "correct-test-only-password" not in repr(result)
+
+
+def test_owner_session_survives_restart_but_invalid_login_does_not_replace_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id = "mission-acceptance-1"
+    identity = "owner:0123456789abcdef"
+    status_body = {"status": {"mission_id": mission_id, "owner_identity_ref": identity}}
+    responses = [
+        {"http_status": 200, "body": status_body},
+        {"http_status": 403, "body": {"error": "invalid_credentials", "authenticated": False}},
+        {"http_status": 200, "body": status_body},
+        {"http_status": 200, "body": status_body},
+    ]
+
+    monkeypatch.setattr(windows_acceptance, "_public_api", lambda *_args, **_kwargs: responses.pop(0))
+    monkeypatch.setattr(windows_acceptance, "_new_csrf_token", lambda _page: "csrf-test-token")
+    monkeypatch.setattr(
+        windows_acceptance, "_renderer_owner_auth_state",
+        lambda _page: {"authenticated": True, "login_form_hidden": True, "logout_button_visible": True},
+    )
+
+    result = _owner_auth_after_restart(
+        object(), f"/api/public/missions/{mission_id}", "mosfiry", "test-only-password", identity
+    )
+
+    assert result["status"] == "PASS"
+    assert result["owner_session_restored"] is True
+    assert result["valid_login_after_restart"] is True
+    assert result["invalid_login_preserved_existing_owner"] is True
+    assert result["invalid_login_did_not_create_owner_session"] is False
+    assert result["invalid_login_authorization_state_unchanged"] is True
+    assert "test-only-password" not in repr(result)
+
+
+def test_post_restart_model_gate_reports_unrestored_selection_and_runtime_truthfully(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    digest = EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"]
+    state = {
+        "models": [{
+            **_qwen_model_payload(), "installed": True, "installed_sha256": digest,
+            "selected": False, "active": False,
+        }],
+        "manager": {"runtime": {"status": "stopped", "model_id": None}, "operation": {"status": "complete"}},
+    }
+    monkeypatch.setattr(windows_acceptance, "_model_state", lambda _page: state)
+    monkeypatch.setattr(windows_acceptance, "_wait_for_model", lambda _page, _predicate, **_kwargs: state)
+    monkeypatch.setattr(
+        windows_acceptance, "_installed_runtime_binary_evidence",
+        lambda _executable: {"exists": True, "sha256": "c" * 64, "version": "test-version"},
+    )
+
+    result = _model_runtime_after_restart(object(), tmp_path / "CyberSentinel.exe", [], verify_inference=False)
+
+    assert result["status"] == "FAIL"
+    assert result["selected_after_restart"] is False
+    assert result["active_after_restart"] is False
+    assert result["runtime_ready_after_restart"] is False
+    assert result["runtime_binary"]["version"] == "test-version"
+
+
+def test_tool_execution_projection_detects_replayed_call_ids_without_payloads() -> None:
+    mission = {
+        "progress": {"model_loop": {"tool_results": [
+            {"name": "run_project_tests", "tool_call_id": "call_once", "ok": True,
+             "arguments": {"workspace": "private-path", "secret": "must-not-appear"}},
+            {"name": "run_project_tests", "tool_call_id": "call_once", "ok": True,
+             "arguments": {"workspace": "private-path", "secret": "must-not-appear"}},
+        ]}}
+    }
+
+    projection = _tool_execution_projection(mission)
+
+    assert projection["count"] == 2
+    assert projection["run_project_tests_count"] == 2
+    assert projection["duplicate_tool_call_ids"] is True
+    assert "private-path" not in repr(projection)
+    assert "must-not-appear" not in repr(projection)
+
+
+def test_effect_ledger_projection_detects_duplicate_or_misbound_effects_without_payloads() -> None:
+    mission_id = "mission-acceptance-1"
+    records = [
+        {
+            "effect_id": "effect-1", "mission_id": mission_id, "task_id": "step-1",
+            "execution_id": "execution-1", "provider": "local", "operation": "inspect",
+            "state": "completed", "requires_reconciliation": False, "owner_binding_status": "bound",
+            "updated_at": "2026-10-10T00:00:00Z", "private_payload": "must-not-appear",
+        },
+        {
+            "effect_id": "effect-1", "mission_id": mission_id, "task_id": "step-1",
+            "execution_id": "execution-1", "provider": "local", "operation": "inspect",
+            "state": "completed", "requires_reconciliation": False, "owner_binding_status": "bound",
+            "updated_at": "2026-10-11T00:00:00Z", "private_payload": "must-not-appear",
+        },
+    ]
+
+    projection = _effect_ledger_projection(records, mission_id)
+    misbound = _effect_ledger_projection([{**records[0], "mission_id": "another-mission"}], mission_id)
+    timestamp_only_change = _effect_ledger_projection(
+        [{**records[0], "updated_at": "2026-10-12T00:00:00Z"},
+         {**records[1], "updated_at": "2026-10-13T00:00:00Z"}], mission_id
+    )
+
+    assert projection["available"] is True
+    assert projection["count"] == 2
+    assert projection["duplicate_effect_ids"] is True
+    assert projection["mission_binding_verified"] is True
+    assert projection["sha256"] == timestamp_only_change["sha256"]
+    assert misbound["mission_binding_verified"] is False
+    assert "must-not-appear" not in repr(projection)
+
+
+def test_mission_audit_projection_requires_mission_bound_validation_evidence_and_report() -> None:
+    mission_id = "mission-acceptance-1"
+    report_sha = "a" * 64
+    snapshot = {
+        "status": {
+            "mission_id": mission_id,
+            "status": "GOAL_COMPLETED",
+            "queue": {"state": "completed"},
+            "progress": {"pause_requested": False, "model_loop": {"tool_results": [
+                {"name": "run_project_tests", "tool_call_id": "call_once", "ok": True}
+            ]}},
+        },
+        "timeline": [{"event": "ToolExecuted"}],
+        "evidence": [{"evidence_id": "evidence-1", "provenance": {"mission_id": mission_id}}],
+        "effects": [],
+        "report": {
+            "mission_summary": {
+                "mission_id": mission_id,
+                "mission_status": "GOAL_COMPLETED",
+                "outcome": "VERIFIED",
+                "verification": {"verified": True, "evidence_count": 1},
+            },
+            "provenance": {"mission_id": mission_id, "execution_chain": []},
+            "evidence": {
+                "execution_chain": [{"mission_id": mission_id, "current_hash": "b" * 64}],
+                "execution_chain_integrity": "VALID",
+            },
+            "report_sha256": report_sha,
+            "final_report_approval": {"status": "PENDING"},
+        },
+    }
+
+    projection = _mission_audit_projection(snapshot, mission_id)
+
+    assert projection["evidence_and_chain_bound_to_mission"] is True
+    assert projection["report_projection_valid"] is True
+    assert projection["completed_mission_inspectable"] is True
+    assert projection["evidence_records_bound_to_mission"] is True
+    assert projection["validation_record_bound_to_mission"] is True
+    assert projection["report_sha256"] == report_sha
+    assert projection["validation_sha256"] == _canonical_sha256({"verified": True, "evidence_count": 1})
+
+    snapshot["report"]["mission_summary"]["mission_id"] = "another-mission"
+    wrong_mission_projection = _mission_audit_projection(snapshot, mission_id)
+    assert wrong_mission_projection["evidence_and_chain_bound_to_mission"] is False
+    assert wrong_mission_projection["completed_mission_inspectable"] is False
+
+    snapshot["report"]["mission_summary"]["mission_id"] = mission_id
+    snapshot["evidence"][0]["provenance"]["mission_id"] = "another-mission"
+    unbound_evidence_projection = _mission_audit_projection(snapshot, mission_id)
+    assert unbound_evidence_projection["evidence_records_bound_to_mission"] is False
+    assert unbound_evidence_projection["completed_mission_inspectable"] is False
+
+
+def test_native_acceptance_restart_is_not_a_renderer_reload_or_in_process_refresh() -> None:
+    driver = (ROOT / "scripts" / "windows_desktop_acceptance.py").read_text(encoding="utf-8")
+    powershell = (ROOT / "scripts" / "windows_installer_acceptance.ps1").read_text(encoding="utf-8")
+
+    assert "taskkill.exe\", \"/PID\", str(process_id), \"/T\", \"/F\"" in driver
+    assert "--installed-executable" in powershell
+    assert "--application-pid" in powershell
+    assert "process_tree_termination_verified" in driver
+    assert "initial_application_process_not_running_from_installed_path" in driver
+    assert "--mode full requires --installed-executable and --application-pid" in driver
+    assert '"renderer_reload_used": False' in driver
+    assert "page.reload(" not in driver
+    assert "Stop-InstalledProcessTrees" in powershell
+    assert "remaining_process_ids" in powershell
 
 
 def test_checkpoint_diagnostics_expose_only_safe_budget_metadata() -> None:

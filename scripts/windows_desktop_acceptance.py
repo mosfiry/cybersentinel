@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -31,6 +33,9 @@ MODEL_STATE_API_RETRY_DELAY_SECONDS = 2
 MODEL_STATE_API_MAX_CONSECUTIVE_FAILURES = 5
 MODEL_STATE_API_MAX_TOTAL_FAILURES = 10
 QWEN_INSTALL_POST_RESPONSE_TIMEOUT_MS = 15_000
+APPLICATION_RESTART_TIMEOUT_SECONDS = 180
+APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS = 30
+MODEL_RESTORE_TIMEOUT_SECONDS = 600
 EXPECTED_QWEN3_4B_INSTALL_IDENTITY = {
     "model_id": "qwen3-4b-q4-k-m",
     "display_name": "Qwen3 4B",
@@ -409,6 +414,664 @@ def _public_api(page, method: str, path: str, *, csrf: str = "", payload: dict |
     return value
 
 
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return _sha256(encoded)
+
+
+def _tool_execution_projection(mission_state: dict) -> dict:
+    summary, source = _safe_tool_result_summary(mission_state)
+    return {
+        "source": source,
+        "count": len(summary),
+        "summary_sha256": _canonical_sha256(summary),
+        "run_project_tests_count": sum(item.get("name") == "run_project_tests" for item in summary),
+        "duplicate_tool_call_ids": len({item.get("tool_call_id") for item in summary if item.get("tool_call_id")})
+        != sum(bool(item.get("tool_call_id")) for item in summary),
+    }
+
+
+def _effect_ledger_projection(records: object, mission_id: str) -> dict:
+    if not isinstance(records, list):
+        return {
+            "available": False,
+            "count": 0,
+            "sha256": None,
+            "mission_binding_verified": False,
+            "duplicate_effect_ids": False,
+        }
+    stable_records = []
+    effect_ids = []
+    mission_binding_verified = True
+    for item in records:
+        if not isinstance(item, dict):
+            mission_binding_verified = False
+            stable_records.append({"record_type": "invalid"})
+            continue
+        effect_id = item.get("effect_id")
+        effect_mission_id = item.get("mission_id")
+        if isinstance(effect_id, str) and effect_id:
+            effect_ids.append(effect_id)
+        if effect_mission_id != mission_id or not isinstance(effect_id, str) or not effect_id:
+            mission_binding_verified = False
+        stable = {}
+        for key in (
+            "effect_id", "mission_id", "task_id", "execution_id", "provider",
+            "operation", "state", "requires_reconciliation", "owner_binding_status",
+        ):
+            value = item.get(key)
+            if hasattr(value, "value"):
+                value = value.value
+            if isinstance(value, (str, int, bool)) or value is None:
+                stable[key] = value
+        stable_records.append(stable)
+    return {
+        "available": True,
+        "count": len(records),
+        "sha256": _canonical_sha256(stable_records),
+        "mission_binding_verified": mission_binding_verified,
+        "duplicate_effect_ids": len(effect_ids) != len(set(effect_ids)),
+    }
+
+
+def _may_resume_after_application_restart(
+    *,
+    mission_status: object,
+    queue_state: object,
+    pause_requested: object,
+    owner_authorized: bool,
+    runtime_ready: bool,
+    execution_history_unchanged: bool,
+) -> bool:
+    terminal = {
+        "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+        "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
+        "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
+    }
+    return (
+        queue_state == "paused"
+        and pause_requested is True
+        and mission_status not in terminal
+        and owner_authorized
+        and runtime_ready
+        and execution_history_unchanged
+    )
+
+
+def _windows_process_alive(process_id: int) -> bool | None:
+    if os.name != "nt" or process_id <= 0:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, process_id)
+    if not handle:
+        return False if ctypes.get_last_error() in {87, 1168} else None
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == 258:
+            return True
+        if result == 0:
+            return False
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_process_image_path(process_id: int) -> str | None:
+    if os.name != "nt" or process_id <= 0:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(0x1000, False, process_id)
+    if not handle:
+        return None
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
+            return None
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _cdp_version(port: int) -> dict | None:
+    try:
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/json/version", timeout=2) as response:
+            value = json.loads(response.read(64_000).decode("utf-8"))
+        return value if isinstance(value, dict) and isinstance(value.get("Browser"), str) else None
+    except Exception:
+        return None
+
+
+def _terminate_installed_process_tree(process_id: int, cdp_port: int) -> dict:
+    if os.name != "nt":
+        raise RuntimeError("native_windows_process_restart_required")
+    result = subprocess.run(
+        ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    deadline = time.monotonic() + APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS
+    process_stopped = False
+    while time.monotonic() < deadline:
+        process_stopped = _windows_process_alive(process_id) is False
+        endpoint_stopped = _cdp_version(cdp_port) is None
+        if process_stopped and endpoint_stopped:
+            return {
+                "taskkill_exit_code": result.returncode,
+                "process_id_stopped": True,
+                "old_cdp_endpoint_unavailable": True,
+                "process_tree_termination_verified": True,
+            }
+        time.sleep(0.5)
+    return {
+        "taskkill_exit_code": result.returncode,
+        "process_id_stopped": process_stopped,
+        "old_cdp_endpoint_unavailable": _cdp_version(cdp_port) is None,
+        "process_tree_termination_verified": False,
+    }
+
+
+def _launch_installed_application(executable: Path, profile_root: Path, cdp_port: int) -> subprocess.Popen:
+    if os.name != "nt":
+        raise RuntimeError("native_windows_process_restart_required")
+    executable = executable.expanduser().resolve(strict=True)
+    user_data = profile_root.expanduser().resolve() / "userData"
+    appdata = profile_root.expanduser().resolve()
+    local_appdata = appdata / "Local"
+    user_data.mkdir(parents=True, exist_ok=True)
+    local_appdata.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment.update({
+        "APPDATA": str(appdata),
+        "LOCALAPPDATA": str(local_appdata),
+        "CYBERSENTINEL_TEST_USER_DATA_DIR": str(user_data),
+        "CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS": "1",
+    })
+    creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return subprocess.Popen(
+        [
+            str(executable),
+            "--disable-gpu",
+            f"--remote-debugging-port={cdp_port}",
+            "--remote-allow-origins=*",
+        ],
+        cwd=str(executable.parent),
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creation_flags,
+    )
+
+
+def _connect_to_relaunched_application(playwright, cdp_port: int, expected_version: str):
+    deadline = time.monotonic() + APPLICATION_RESTART_TIMEOUT_SECONDS
+    last_error = ""
+    while time.monotonic() < deadline:
+        cdp = _cdp_version(cdp_port)
+        if cdp is not None:
+            browser = None
+            try:
+                browser = playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{cdp_port}", timeout=10_000
+                )
+                pages = [page for context in browser.contexts for page in context.pages]
+                if pages:
+                    page = pages[0]
+                    health = page.evaluate("""async () => {
+                      const response = await fetch('/api/public/health', {credentials: 'include'});
+                      const body = await response.json().catch(() => ({}));
+                      return {http_status: response.status, body};
+                    }""")
+                    version = health.get("body", {}).get("version") if isinstance(health, dict) else None
+                    if (
+                        isinstance(health, dict)
+                        and health.get("http_status") == 200
+                        and version == expected_version
+                    ):
+                        return browser, page, cdp, health
+                    last_error = "relaunch_health_or_version_mismatch"
+            except Exception as exc:
+                last_error = type(exc).__name__
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+        time.sleep(1)
+    raise TimeoutError("installed_application_relaunch_timeout:" + (last_error or "cdp_unavailable"))
+
+
+def _installed_runtime_binary_evidence(executable: Path) -> dict:
+    runtime_binary = executable.expanduser().resolve().parent / "resources" / "llama" / "llama-server.exe"
+    if not runtime_binary.is_file():
+        return {"exists": False, "sha256": None, "version": None}
+    digest = hashlib.sha256()
+    with runtime_binary.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    result = {
+        "exists": True,
+        "path": str(runtime_binary),
+        "sha256": digest.hexdigest(),
+        "version": None,
+        "version_command_exit_code": None,
+    }
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        version = subprocess.run(
+            [str(runtime_binary), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=15,
+            check=False,
+            creationflags=flags,
+        )
+        output = version.stdout or ""
+        result["version_command_exit_code"] = version.returncode
+        result["version_output_sha256"] = _sha256(output)
+        match = re.search(r"(?i)(?:llama(?:-server)?|version)\s*[:= ]\s*([A-Za-z0-9_.+-]{1,64})", output)
+        if match:
+            result["version"] = match.group(1)
+    except Exception as exc:
+        result["version_command_error_type"] = type(exc).__name__
+    return result
+
+
+def _owner_auth_after_restart(
+    page, mission_path: str, username: str, password: str, expected_owner_identity_ref: str | None
+) -> dict:
+    result = {
+        "invalid_credentials_rejected": False,
+        "invalid_login_preserved_existing_owner": None,
+        "owner_session_restored": False,
+        "valid_login_after_restart": False,
+        "owner_identity_matches": False,
+        "mission_read_authorized": False,
+        "renderer_authenticated_after_restart": False,
+    }
+    try:
+        before = _public_api(page, "GET", mission_path + "/status")
+        before_status = before["http_status"]
+        before_body = before["body"].get("status", {})
+        before_identity = before_body.get("owner_identity_ref") if isinstance(before_body, dict) else None
+        csrf = _new_csrf_token(page)
+        invalid = _public_api(
+            page, "POST", "/api/public/auth/login", csrf=csrf,
+            payload={"username": username, "password": "invalid-after-application-restart"},
+        )
+        invalid_rejected = (
+            invalid["http_status"] == 403
+            and invalid["body"].get("authenticated") is not True
+            and invalid["body"].get("error") == "invalid_credentials"
+        )
+        after_invalid = _public_api(page, "GET", mission_path + "/status")
+        after_invalid_state = after_invalid["body"].get("status", {})
+        before_owner_authenticated = before_status == 200
+        invalid_preserved = before_owner_authenticated and (
+            after_invalid["http_status"] == 200
+            and isinstance(after_invalid_state, dict)
+            and after_invalid_state.get("owner_identity_ref") == before_identity
+        )
+        invalid_did_not_create_session = (
+            before_status in (401, 403)
+            and after_invalid["http_status"] in (401, 403)
+        )
+        invalid_auth_state_unchanged = invalid_preserved or invalid_did_not_create_session
+        reauthenticated = False
+        ui_login = {"http_status": None, "authenticated": False}
+        if after_invalid["http_status"] != 200:
+            ui_login = _login_owner_after_restart(page, username, password)
+            reauthenticated = (
+                ui_login.get("http_status") == 200
+                and ui_login.get("authenticated") is True
+                and ui_login.get("username") == username
+            )
+        final = _public_api(page, "GET", mission_path + "/status")
+        final_state = final["body"].get("status", {})
+        renderer_state = _renderer_owner_auth_state(page)
+        owner_identity_matches = bool(
+            isinstance(final_state, dict)
+            and isinstance(expected_owner_identity_ref, str)
+            and final_state.get("owner_identity_ref") == expected_owner_identity_ref
+        )
+        mission_read_authorized = (
+            final["http_status"] == 200
+            and isinstance(final_state, dict)
+            and final_state.get("mission_id") == mission_path.rsplit("/", 1)[-1]
+        )
+        result.update({
+            "invalid_credentials_rejected": invalid_rejected,
+            "invalid_login_http_status": invalid["http_status"],
+            "invalid_login_preserved_existing_owner": invalid_preserved,
+            "invalid_login_did_not_create_owner_session": invalid_did_not_create_session,
+            "invalid_login_authorization_state_unchanged": invalid_auth_state_unchanged,
+            "owner_session_restored": before_owner_authenticated and invalid_preserved,
+            "valid_login_after_restart": reauthenticated or (before_owner_authenticated and invalid_preserved),
+            "owner_identity_matches": owner_identity_matches,
+            "owner_identity_sha256": _sha256(str(final_state.get("owner_identity_ref", "")))
+            if isinstance(final_state, dict) and final_state.get("owner_identity_ref") else None,
+            "mission_read_authorized": mission_read_authorized,
+            "mission_read_http_status": final["http_status"],
+            "renderer_authenticated_after_restart": renderer_state.get("authenticated") is True,
+            "renderer_login_form_hidden": renderer_state.get("login_form_hidden") is True,
+            "renderer_logout_button_visible": renderer_state.get("logout_button_visible") is True,
+            "valid_login_http_status": ui_login.get("http_status"),
+        })
+    except Exception as exc:
+        result["error_type"] = type(exc).__name__
+    result["status"] = "PASS" if all(
+        result.get(key) is True for key in (
+            "invalid_credentials_rejected", "invalid_login_authorization_state_unchanged",
+            "valid_login_after_restart", "owner_identity_matches", "mission_read_authorized",
+            "renderer_authenticated_after_restart", "renderer_login_form_hidden",
+            "renderer_logout_button_visible",
+        )
+    ) else "FAIL"
+    return result
+
+
+def _renderer_owner_auth_state(page) -> dict:
+    try:
+        page.wait_for_function(
+            """() => {
+                const label = (document.querySelector('#authStateSide')?.textContent || '').trim();
+                const login = document.querySelector('#loginForm');
+                const logout = document.querySelector('#logoutButton');
+                return label.includes('مسجل الدخول') && !label.includes('غير مسجل الدخول')
+                    && login !== null && login.classList.contains('hidden')
+                    && logout !== null && !logout.classList.contains('hidden');
+            }""",
+            timeout=15_000,
+        )
+    except Exception:
+        pass
+    try:
+        return page.evaluate("""() => {
+            const label = (document.querySelector('#authStateSide')?.textContent || '').trim();
+            const login = document.querySelector('#loginForm');
+            const logout = document.querySelector('#logoutButton');
+            return {
+                authenticated: label.includes('مسجل الدخول') && !label.includes('غير مسجل الدخول'),
+                login_form_hidden: login !== null && login.classList.contains('hidden'),
+                logout_button_visible: logout !== null && !logout.classList.contains('hidden'),
+            };
+        }""") or {}
+    except Exception:
+        return {}
+
+
+def _login_owner_after_restart(page, username: str, password: str) -> dict:
+    try:
+        page.locator("#loginUsername").fill(username)
+        page.locator("#loginPassword").fill(password)
+        with page.expect_response(
+            lambda response: response.request.method == "POST"
+            and "/api/public/auth/login" in response.url,
+            timeout=30_000,
+        ) as response_info:
+            page.locator("#loginButton").click(timeout=30_000)
+        response = response_info.value
+        body = response.json()
+        if response.status == 200 and isinstance(body, dict):
+            state = _renderer_owner_auth_state(page)
+            return {
+                "http_status": response.status,
+                "authenticated": body.get("authenticated") is True,
+                "username": body.get("username"),
+                "renderer_authenticated": state.get("authenticated") is True,
+            }
+        return {"http_status": response.status, "authenticated": False}
+    except Exception as exc:
+        return {"http_status": None, "authenticated": False, "error_type": type(exc).__name__}
+
+
+def _model_runtime_after_restart(page, executable: Path, progress: list[dict], *, verify_inference: bool) -> dict:
+    result: dict = {"status": "FAIL", "inference_after_restart": {"status": "NOT_RUN"}}
+    try:
+        state = _model_state(page)
+        qwen = _find_qwen(state)
+        if not qwen:
+            raise RuntimeError("qwen3_4b_missing_after_application_restart")
+        try:
+            state = _wait_for_model(
+                page,
+                lambda current, model, operation: bool(
+                    model
+                    and model.get("model_id") == EXPECTED_QWEN3_4B_INSTALL_IDENTITY["model_id"]
+                    and model.get("installed") is True
+                    and model.get("selected") is True
+                    and model.get("active") is True
+                    and ((current.get("manager") or {}).get("runtime") or {}).get("status") == "ready"
+                    and ((current.get("manager") or {}).get("runtime") or {}).get("model_id")
+                    == EXPECTED_QWEN3_4B_INSTALL_IDENTITY["model_id"]
+                    and operation.get("status") not in {"failed", "interrupted"}
+                ),
+                timeout=MODEL_RESTORE_TIMEOUT_SECONDS,
+                phase="post_restart_model_runtime_restore",
+                progress=progress,
+            )
+        except Exception as exc:
+            result["restore_error_type"] = type(exc).__name__
+            state = _model_state(page)
+        qwen = _find_qwen(state)
+        manager = state.get("manager") if isinstance(state.get("manager"), dict) else {}
+        runtime = manager.get("runtime") if isinstance(manager.get("runtime"), dict) else {}
+        operation = manager.get("operation") if isinstance(manager.get("operation"), dict) else {}
+        digest = _qwen_installed_digest_report(qwen)
+        runtime_binary = _installed_runtime_binary_evidence(executable)
+        ready = bool(
+            qwen
+            and qwen.get("model_id") == EXPECTED_QWEN3_4B_INSTALL_IDENTITY["model_id"]
+            and qwen.get("installed") is True
+            and qwen.get("selected") is True
+            and qwen.get("active") is True
+            and runtime.get("status") == "ready"
+            and runtime.get("model_id") == EXPECTED_QWEN3_4B_INSTALL_IDENTITY["model_id"]
+            and digest.get("verified") is True
+        )
+        result.update({
+            "model_id": qwen.get("model_id") if qwen else None,
+            "catalog_sha256": qwen.get("sha256") if qwen else None,
+            "installed_sha256": qwen.get("installed_sha256") if qwen else None,
+            "installed_digest_verification": digest,
+            "selected_after_restart": qwen.get("selected") is True if qwen else False,
+            "active_after_restart": qwen.get("active") is True if qwen else False,
+            "runtime_status_after_restart": runtime.get("status"),
+            "runtime_model_id_after_restart": runtime.get("model_id"),
+            "runtime_operation_after_restart": operation.get("status"),
+            "runtime_binary": runtime_binary,
+            "runtime_ready_after_restart": ready,
+        })
+        if verify_inference and ready:
+            model_id = EXPECTED_QWEN3_4B_INSTALL_IDENTITY["model_id"]
+            response = _public_api(
+                page, "POST", f"/api/public/desktop/models/{model_id}/test",
+                csrf=_new_csrf_token(page), payload={},
+            )
+            inference = response["body"]
+            state = _wait_for_model(
+                page,
+                lambda current, model, op: bool(
+                    op.get("kind") == "inference_test"
+                    and op.get("model_id") == model_id
+                    and op.get("status") == "complete"
+                    and isinstance(op.get("result"), str)
+                    and op.get("result")
+                ),
+                timeout=300,
+                phase="post_restart_real_local_inference",
+                progress=progress,
+            )
+            operation = ((state.get("manager") or {}).get("operation") or {})
+            inference_text = str(inference.get("response", operation.get("result", "")))
+            inference_pass = (
+                response["http_status"] == 200
+                and inference.get("ok") is True
+                and inference.get("provider") == "local_llama_cpp"
+                and inference.get("model") == model_id
+                and inference.get("real_inference") is True
+                and bool(inference_text.strip())
+            )
+            result["inference_after_restart"] = {
+                "status": "PASS" if inference_pass else "FAIL",
+                "http_status": response["http_status"],
+                "provider": inference.get("provider"),
+                "model": inference.get("model"),
+                "real_inference": inference.get("real_inference"),
+                "response_bytes": len(inference_text.encode("utf-8")),
+                "response_sha256": _sha256(inference_text),
+            }
+        elif verify_inference:
+            result["inference_after_restart"] = {"status": "BLOCKED", "reason": "runtime_not_ready"}
+        else:
+            result["inference_after_restart"] = {"status": "NOT_RUN", "reason": "verified_on_first_restart_cycle"}
+        result["status"] = "PASS" if ready and result["inference_after_restart"]["status"] in ("PASS", "NOT_RUN") else "FAIL"
+    except Exception as exc:
+        result["error_type"] = type(exc).__name__
+        result["status"] = "FAIL"
+    return result
+
+
+def _mission_audit_snapshot(page, mission_id: str) -> dict:
+    mission_path = "/api/public/missions/" + mission_id
+    results = {
+        "status": _public_api(page, "GET", mission_path + "/status"),
+        "timeline": _public_api(page, "GET", mission_path + "/timeline"),
+        "evidence": _public_api(page, "GET", mission_path + "/evidence"),
+        "report": _public_api(page, "GET", mission_path + "/report"),
+        "effects": _public_api(page, "GET", mission_path + "/effects"),
+    }
+    if any(item["http_status"] != 200 for item in results.values()):
+        raise RuntimeError("installed_app_mission_audit_endpoints_unavailable_after_restart")
+    status = results["status"]["body"].get("status")
+    timeline = results["timeline"]["body"].get("timeline")
+    evidence = results["evidence"]["body"].get("evidence")
+    report = results["report"]["body"].get("report")
+    effects = results["effects"]["body"].get("effects")
+    if (
+        not isinstance(status, dict)
+        or not isinstance(timeline, list)
+        or not isinstance(evidence, list)
+        or not isinstance(report, dict)
+        or not isinstance(effects, list)
+    ):
+        raise RuntimeError("installed_app_mission_audit_payload_invalid_after_restart")
+    return {"status": status, "timeline": timeline, "evidence": evidence, "report": report, "effects": effects}
+
+
+def _mission_audit_projection(snapshot: dict, mission_id: str) -> dict:
+    status = snapshot.get("status") if isinstance(snapshot.get("status"), dict) else {}
+    timeline = snapshot.get("timeline") if isinstance(snapshot.get("timeline"), list) else []
+    evidence = snapshot.get("evidence") if isinstance(snapshot.get("evidence"), list) else []
+    report = snapshot.get("report") if isinstance(snapshot.get("report"), dict) else {}
+    summary = report.get("mission_summary") if isinstance(report.get("mission_summary"), dict) else {}
+    verification = summary.get("verification") if isinstance(summary.get("verification"), dict) else {}
+    report_evidence = report.get("evidence") if isinstance(report.get("evidence"), dict) else {}
+    chain = report_evidence.get("execution_chain") if isinstance(report_evidence.get("execution_chain"), list) else []
+    provenance = report.get("provenance") if isinstance(report.get("provenance"), dict) else {}
+    effects = _effect_ledger_projection(snapshot.get("effects", []), mission_id)
+    evidence_mission_ids = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            evidence_mission_ids.append(None)
+            continue
+        evidence_provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+        evidence_mission_ids.append(item.get("mission_id") or evidence_provenance.get("mission_id"))
+    evidence_records_bound = all(item == mission_id for item in evidence_mission_ids)
+    tool_execution_count = sum(
+        isinstance(item, dict) and item.get("event") == "ToolExecuted" for item in timeline
+    )
+    binding_verified = (
+        status.get("mission_id") == mission_id
+        and summary.get("mission_id") == mission_id
+        and provenance.get("mission_id") == mission_id
+        and all(isinstance(item, dict) and item.get("mission_id") == mission_id for item in chain)
+        and evidence_records_bound
+        and effects.get("mission_binding_verified") is True
+    )
+    report_sha256 = report.get("report_sha256")
+    validation_sha256 = _canonical_sha256(verification)
+    report_verified = (
+        summary.get("mission_status") == status.get("status")
+        and isinstance(report_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", report_sha256) is not None
+        and isinstance(report_evidence.get("execution_chain_integrity"), str)
+    )
+    return {
+        "mission_id": mission_id,
+        "status_mission_id_matches": status.get("mission_id") == mission_id,
+        "report_mission_id_matches": summary.get("mission_id") == mission_id,
+        "provenance_mission_id_matches": provenance.get("mission_id") == mission_id,
+        "evidence_and_chain_bound_to_mission": binding_verified,
+        "evidence_records_bound_to_mission": evidence_records_bound,
+        "evidence_record_count": len(evidence),
+        "validation_record_mission_id": summary.get("mission_id"),
+        "validation_record_bound_to_mission": (
+            summary.get("mission_id") == mission_id
+            and summary.get("mission_status") == status.get("status")
+            and isinstance(verification.get("verified"), bool)
+        ),
+        "effect_ledger": effects,
+        "mission_status": status.get("status"),
+        "queue_state": (status.get("queue") or {}).get("state") if isinstance(status.get("queue"), dict) else None,
+        "pause_requested": (status.get("progress") or {}).get("pause_requested") is True
+        if isinstance(status.get("progress"), dict) else False,
+        "tool_execution_count": tool_execution_count,
+        "tool_projection": _tool_execution_projection(status),
+        "timeline_event_count": len(timeline),
+        "timeline_sha256": _canonical_sha256(timeline),
+        "evidence_item_count": len(evidence),
+        "evidence_sha256": _canonical_sha256(evidence),
+        "validation_sha256": validation_sha256,
+        "report_sha256": report_sha256,
+        "report_outcome": summary.get("outcome"),
+        "report_verified": verification.get("verified"),
+        "execution_chain_integrity": report_evidence.get("execution_chain_integrity"),
+        "final_report_approval_status": (report.get("final_report_approval") or {}).get("status")
+        if isinstance(report.get("final_report_approval"), dict) else None,
+        "report_projection_valid": report_verified,
+        "completed_mission_inspectable": (
+            status.get("status") == "GOAL_COMPLETED"
+            and summary.get("mission_status") == "GOAL_COMPLETED"
+            and summary.get("outcome") == "VERIFIED"
+            and verification.get("verified") is True
+            and report_evidence.get("execution_chain_integrity") == "VALID"
+            and len(evidence) > 0
+            and bool(chain)
+            and evidence_records_bound
+            and effects.get("duplicate_effect_ids") is False
+            and binding_verified
+            and report_verified
+        ),
+    }
+
+
 def _find_state_directory(profile_root: Path) -> Path:
     root = profile_root.expanduser().resolve(strict=True)
     for database in root.rglob("intel.sqlite3"):
@@ -418,7 +1081,9 @@ def _find_state_directory(profile_root: Path) -> Path:
     raise RuntimeError("installed_app_disposable_state_directory_not_found")
 
 
-def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> dict:
+def _installed_app_mission(
+    page, profile_root: Path, progress: list[dict], restart_callback, report: dict
+) -> tuple[dict, object]:
     project_name = "Windows Acceptance " + secrets.token_hex(4)
     page.locator("#newProjectToggle").click(timeout=30_000)
     page.locator("#projectName").fill(project_name)
@@ -518,6 +1183,15 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     if create_response.status != 201 or not mission_id:
         raise RuntimeError("installed_app_real_mission_creation_failed")
     mission_path = "/api/public/missions/" + mission_id
+    report["installed_app_mission"] = {
+        "status": "IN_PROGRESS",
+        "provenance": "installed_CyberSentinel_Desktop_public_API_and_bundled_backend",
+        "mission_id": mission_id,
+        "project_id": project_id,
+        "project_name": project_name,
+        "project_fixture_sha256": fixture_digest,
+        "incomplete_operation_reported_truthfully": True,
+    }
 
     def read_status() -> dict:
         result = _public_api(page, "GET", mission_path + "/status")
@@ -543,24 +1217,138 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         "persisted_queue_state": pause_state.get("queue", {}).get("state"),
         "pause_requested": pause_state.get("progress", {}).get("pause_requested") is True,
     })
+    paused_restart_cycle: dict = {"status": "NOT_RUN", "reason": "pause_not_verified"}
+    paused_restart_snapshot: dict | None = None
+    page_after_restart = page
+    resume_response = {"http_status": 0, "body": {"error": "resume_not_authorized_by_restart_state"}}
+    resume_queue_state = None
+    resume_pause_requested = None
+    resume_mission_status = None
+    resume_attempted = False
+    resume_verified = False
+    persistence_verified = False
+    no_automatic_resume_verified = False
+    execution_history_unchanged = False
+    resume_gate_verified = False
     if pause_verified:
-        page.reload(wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_function(
-            "() => (document.querySelector('#authStateSide')?.textContent || '').includes('مسجل الدخول')",
-            timeout=60_000,
+        before_restart_snapshot = _mission_audit_snapshot(page, mission_id)
+        page_after_restart, paused_restart_cycle, paused_restart_snapshot = restart_callback(
+            "paused_mission", mission_id, before_restart_snapshot, True
         )
-        persisted = read_status()
-        persistence_verified = (
-            persisted.get("queue", {}).get("state") == "paused"
-            and persisted.get("progress", {}).get("pause_requested") is True
-        )
+        if page_after_restart is None or paused_restart_snapshot is None:
+            failed_result = {
+                "status": "FAIL",
+                "provenance": "installed_CyberSentinel_Desktop_public_API_and_bundled_backend",
+                "mission_id": mission_id,
+                "project_id": project_id,
+                "project_name": project_name,
+                "project_fixture_sha256": fixture_digest,
+                "project_fixture_size_bytes": len(fixture_source.encode("utf-8")),
+                "mission_status": pause_state.get("status"),
+                "queue_state": (pause_state.get("queue") or {}).get("state"),
+                "pause_http_status": pause_response["http_status"],
+                "application_restart": paused_restart_cycle,
+                "resume_attempted": False,
+                "incomplete_operation_reported_truthfully": True,
+            }
+            report["installed_app_mission"] = failed_result
+            return failed_result, page_after_restart
+        page = page_after_restart
         csrf = _new_csrf_token(page)
-        resume_response = _public_api(page, "POST", mission_path + "/resume", csrf=csrf, payload={})
-        resume_verified = resume_response["http_status"] == 200
+        persisted_status = paused_restart_snapshot.get("status", {})
+        persisted_queue = persisted_status.get("queue", {}) if isinstance(persisted_status.get("queue"), dict) else {}
+        before_tool = _tool_execution_projection(before_restart_snapshot.get("status", {}))
+        after_tool = _tool_execution_projection(persisted_status)
+        before_projection = _mission_audit_projection(before_restart_snapshot, mission_id)
+        after_projection = _mission_audit_projection(paused_restart_snapshot, mission_id)
+        persistence_verified = (
+            persisted_queue.get("state") == "paused"
+            and (persisted_status.get("progress") or {}).get("pause_requested") is True
+        )
+        no_automatic_resume_verified = persistence_verified
+        execution_history_unchanged = (
+            before_tool["summary_sha256"] == after_tool["summary_sha256"]
+            and before_tool["count"] == after_tool["count"]
+            and before_tool["duplicate_tool_call_ids"] is False
+            and after_tool["duplicate_tool_call_ids"] is False
+            and before_projection["tool_execution_count"] == after_projection["tool_execution_count"]
+            and before_projection["timeline_sha256"] == after_projection["timeline_sha256"]
+            and before_projection["evidence_sha256"] == after_projection["evidence_sha256"]
+            and before_projection["validation_sha256"] == after_projection["validation_sha256"]
+            and before_projection["report_sha256"] == after_projection["report_sha256"]
+            and before_projection["effect_ledger"].get("sha256") == after_projection["effect_ledger"].get("sha256")
+            and before_projection["effect_ledger"].get("duplicate_effect_ids") is False
+            and after_projection["effect_ledger"].get("duplicate_effect_ids") is False
+        )
+        owner_authorized = paused_restart_cycle.get("owner_authentication", {}).get("status") == "PASS"
+        runtime_ready = (
+            paused_restart_cycle.get("model_runtime", {}).get("runtime_ready_after_restart") is True
+            and paused_restart_cycle.get("model_runtime", {}).get("inference_after_restart", {}).get("status") == "PASS"
+        )
+        resume_eligible = _may_resume_after_application_restart(
+            mission_status=persisted_status.get("status"),
+            queue_state=persisted_queue.get("state"),
+            pause_requested=(persisted_status.get("progress") or {}).get("pause_requested"),
+            owner_authorized=owner_authorized,
+            runtime_ready=runtime_ready,
+            execution_history_unchanged=execution_history_unchanged,
+        )
+        if resume_eligible:
+            resume_attempted = True
+            resume_response = _public_api(
+                page_after_restart, "POST", mission_path + "/resume",
+                csrf=_new_csrf_token(page_after_restart), payload={},
+            )
+            resume_state = read_status()
+            resume_queue = resume_state.get("queue", {}) if isinstance(resume_state.get("queue"), dict) else {}
+            resume_mission_status = resume_state.get("status")
+            resume_verified = (
+                resume_response["http_status"] == 200
+                and resume_queue.get("state") in {"queued", "executing"}
+                and (resume_state.get("progress") or {}).get("pause_requested") is not True
+                and resume_state.get("status") not in {
+                    "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+                    "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
+                    "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
+                }
+            )
+            resume_gate_verified = resume_verified
+            resume_queue_state = resume_queue.get("state")
+            resume_pause_requested = (resume_state.get("progress") or {}).get("pause_requested") is True
+        else:
+            terminal_status = persisted_status.get("status") in {
+                "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+                "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
+                "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
+            }
+            resume_gate_verified = terminal_status and not resume_attempted
+        paused_restart_cycle["mission"] = {
+            "mission_id": mission_id,
+            "before_restart": before_projection,
+            "after_restart": after_projection,
+            "paused_state_persisted": persistence_verified,
+            "no_automatic_resume": no_automatic_resume_verified,
+            "tool_history_unchanged_before_explicit_resume": execution_history_unchanged,
+            "resume_eligibility_verified": resume_eligible,
+            "resume_attempted": resume_attempted,
+            "resume_http_status": resume_response["http_status"],
+            "post_resume_queue_state": resume_queue_state,
+            "post_resume_mission_status": resume_mission_status,
+            "post_resume_pause_requested": resume_pause_requested,
+            "resume_authorized_by_persisted_state_and_owner": resume_eligible and resume_attempted,
+        }
+        paused_restart_cycle["status"] = "PASS" if (
+            paused_restart_cycle.get("process_restart_verified") is True
+            and owner_authorized
+            and runtime_ready
+            and persistence_verified
+            and no_automatic_resume_verified
+            and execution_history_unchanged
+            and resume_gate_verified
+        ) else "FAIL"
     else:
-        persistence_verified = False
-        resume_response = {"http_status": 0, "body": {"error": "pause_not_verified"}}
-        resume_verified = False
+        paused_restart_cycle["pause_http_status"] = pause_response["http_status"]
+        paused_restart_cycle["persisted_queue_state"] = (pause_state.get("queue") or {}).get("state")
 
     deadline = started_at + 300.0
     mission_state: dict = {}
@@ -569,18 +1357,32 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
         "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
     }
-    while time.monotonic() < deadline:
-        mission_state = read_status()
-        status = str(mission_state.get("status", ""))
-        if status in terminal:
-            break
-        time.sleep(2)
+    persisted_status = paused_restart_snapshot.get("status", {}) if paused_restart_snapshot else {}
+    persisted_queue = persisted_status.get("queue", {}) if isinstance(persisted_status.get("queue"), dict) else {}
+    wait_skipped_for_safety = bool(
+        paused_restart_snapshot
+        and persisted_queue.get("state") == "paused"
+        and persisted_status.get("status") not in terminal
+        and (
+            not resume_attempted
+            or (resume_queue_state == "paused" and not resume_verified)
+        )
+    )
+    if wait_skipped_for_safety:
+        mission_state = persisted_status
     else:
-        try:
-            _public_api(page, "POST", mission_path + "/cancel", csrf=csrf, payload={})
-        except Exception:
-            pass
-        raise TimeoutError("installed_app_mission_exceeded_300_second_wall_clock_bound")
+        while time.monotonic() < deadline:
+            mission_state = read_status()
+            status = str(mission_state.get("status", ""))
+            if status in terminal:
+                break
+            time.sleep(2)
+        else:
+            try:
+                _public_api(page, "POST", mission_path + "/cancel", csrf=csrf, payload={})
+            except Exception:
+                pass
+            raise TimeoutError("installed_app_mission_exceeded_300_second_wall_clock_bound")
 
     timeline_result = _public_api(page, "GET", mission_path + "/timeline")
     evidence_result = _public_api(page, "GET", mission_path + "/evidence")
@@ -655,6 +1457,58 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
     finding_count = len(report.get("findings", [])) if isinstance(report.get("findings"), list) else 0
     report_stage = bool(report.get("report_sha256")) and bool(report_summary)
     approval_pending = final_report_approval.get("status") == "PENDING"
+    terminal_restart_cycle: dict = {"status": "NOT_RUN", "reason": "mission_not_terminal_or_restart_unavailable"}
+    terminal_restart_snapshot: dict | None = None
+    terminal_restart_eligible = mission_state.get("status") in terminal and (
+        paused_restart_cycle.get("status") in {"PASS", "NOT_RUN"}
+    )
+    if terminal_restart_eligible:
+        before_terminal_snapshot = _mission_audit_snapshot(page, mission_id)
+        page_after_terminal_restart, terminal_restart_cycle, terminal_restart_snapshot = restart_callback(
+            "terminal_mission", mission_id, before_terminal_snapshot, False
+        )
+        if page_after_terminal_restart is not None:
+            page = page_after_terminal_restart
+        if terminal_restart_snapshot is not None:
+            before_terminal_projection = _mission_audit_projection(before_terminal_snapshot, mission_id)
+            after_terminal_projection = _mission_audit_projection(terminal_restart_snapshot, mission_id)
+            stable_fields = (
+                "status_mission_id_matches", "report_mission_id_matches", "provenance_mission_id_matches",
+                "evidence_and_chain_bound_to_mission", "evidence_records_bound_to_mission",
+                "validation_record_bound_to_mission", "mission_status", "queue_state", "tool_execution_count",
+                "evidence_sha256", "validation_sha256", "report_sha256", "report_outcome", "report_verified",
+                "effect_ledger",
+                "execution_chain_integrity", "final_report_approval_status",
+            )
+            terminal_records_unchanged = all(
+                before_terminal_projection.get(key) == after_terminal_projection.get(key)
+                for key in stable_fields
+            )
+            terminal_restart_cycle["mission"] = {
+                "mission_id": mission_id,
+                "before_restart": before_terminal_projection,
+                "after_restart": after_terminal_projection,
+                "terminal_state_and_records_unchanged": terminal_records_unchanged,
+                "completed_mission_inspectable_after_restart": after_terminal_projection[
+                    "completed_mission_inspectable"
+                ],
+            }
+            terminal_restart_cycle["status"] = "PASS" if (
+                terminal_restart_cycle.get("process_restart_verified") is True
+                and terminal_restart_cycle.get("owner_authentication", {}).get("status") == "PASS"
+                and terminal_restart_cycle.get("model_runtime", {}).get("status") == "PASS"
+                and terminal_records_unchanged
+                and after_terminal_projection.get("evidence_and_chain_bound_to_mission") is True
+                and after_terminal_projection.get("report_projection_valid") is True
+            ) else "FAIL"
+    completed_mission_inspectable_after_restart = bool(
+        terminal_restart_snapshot
+        and _mission_audit_projection(terminal_restart_snapshot, mission_id)["completed_mission_inspectable"]
+    )
+    run_project_tests_calls = [item for item in tool_summary if item.get("name") == "run_project_tests"]
+    no_duplicate_tool_call_ids = not _tool_execution_projection(mission_state)["duplicate_tool_call_ids"]
+    paused_restart_pass = paused_restart_cycle.get("status") == "PASS"
+    terminal_restart_pass = terminal_restart_cycle.get("status") == "PASS"
     mission_pass = (
         mission_state.get("status") == "GOAL_COMPLETED"
         and authorization_binding
@@ -670,10 +1524,20 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         and finding_count > 0
         and report_stage
         and approval_pending
+        and pause_verified is True
+        and paused_restart_pass
         and persistence_verified is True
+        and no_automatic_resume_verified is True
+        and execution_history_unchanged is True
+        and resume_gate_verified is True
         and resume_verified is True
+        and not wait_skipped_for_safety
+        and no_duplicate_tool_call_ids
+        and len(run_project_tests_calls) == 1
+        and terminal_restart_pass
+        and completed_mission_inspectable_after_restart
     )
-    return {
+    result = {
         "status": "PASS" if mission_pass else "FAIL",
         "provenance": "installed_CyberSentinel_Desktop_public_API_and_bundled_backend",
         "mission_id": mission_id,
@@ -688,10 +1552,13 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         "mission_tools_within_authorized_allowlist": tool_authorization_verified,
         "target_identity": authorization_snapshot.get("target_identity"),
         "mission_status": mission_state.get("status"),
+        "mission_id_matches_readback": mission_state.get("mission_id") == mission_id,
         "queue_state": queue_state.get("state"),
         "resource_failure_diagnostics": _safe_failure_diagnostics(mission_state),
         "resource_checkpoint_diagnostics": _safe_checkpoint_diagnostics(mission_state),
         "tool_calls": tool_summary,
+        "run_project_tests_invocation_count": len(run_project_tests_calls),
+        "duplicate_tool_call_ids": not no_duplicate_tool_call_ids,
         "tool_results_source": tool_results_source,
         "research_stage": research_stage,
         "hypothesis_stage": hypothesis_stage,
@@ -703,19 +1570,38 @@ def _installed_app_mission(page, profile_root: Path, progress: list[dict]) -> di
         "timeline_event_count": len(timeline),
         "timeline_event_types": event_types,
         "evidence_item_count": len(evidence),
+        "evidence_records_bound_to_mission": after_projection.get("evidence_records_bound_to_mission"),
+        "validation_record_bound_to_mission": after_projection.get("validation_record_bound_to_mission"),
         "execution_chain_integrity": chain_integrity,
         "report_outcome": report_outcome,
         "report_verified": report_verification.get("verified"),
         "report_sha256": report.get("report_sha256"),
+        "effect_ledger": after_projection.get("effect_ledger"),
         "mission_authorization_owner_status": owner_approval.get("status"),
         "final_report_approval_status": final_report_approval.get("status"),
         "human_release_approval": "PENDING",
-        "persistence_after_renderer_reload": persistence_verified,
+        "persistence_after_application_restart": persistence_verified,
+        "no_automatic_resume_after_restart": no_automatic_resume_verified,
+        "tool_history_unchanged_before_explicit_resume": execution_history_unchanged,
+        "effect_history_unchanged_before_explicit_resume": execution_history_unchanged,
+        "no_duplicate_effect_ids": after_projection.get("effect_ledger", {}).get("duplicate_effect_ids") is False,
+        "resume_eligibility_verified": paused_restart_cycle.get("mission", {}).get("resume_eligibility_verified"),
+        "resume_attempted": resume_attempted,
         "resume_after_persisted_pause": resume_verified,
+        "resume_guard_verified": resume_gate_verified,
+        "wait_skipped_to_preserve_paused_mission": wait_skipped_for_safety,
+        "paused_application_restart_status": paused_restart_cycle.get("status"),
+        "terminal_application_restart_status": terminal_restart_cycle.get("status"),
+        "terminal_mission_persisted_after_restart": terminal_restart_cycle.get("mission", {}).get(
+            "terminal_state_and_records_unchanged"
+        ),
+        "completed_mission_inspectable_after_restart": completed_mission_inspectable_after_restart,
         "elapsed_seconds": round(time.monotonic() - started_at, 3),
         "pause_http_status": pause_response["http_status"],
         "resume_http_status": resume_response["http_status"],
     }
+    report["installed_app_mission"] = result
+    return result, page
 
 
 def _wait_for_model(page, predicate, *, timeout: float, phase: str, progress: list[dict]) -> dict:
@@ -792,6 +1678,8 @@ def main() -> int:
     parser.add_argument("--cdp-port", required=True, type=int)
     parser.add_argument("--expected-version", required=True)
     parser.add_argument("--profile-root", required=True, type=Path)
+    parser.add_argument("--installed-executable", type=Path)
+    parser.add_argument("--application-pid", type=int)
     parser.add_argument("--mode", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--model-timeout-seconds", type=int, default=2400)
@@ -803,10 +1691,12 @@ def main() -> int:
     args = parser.parse_args()
     if args.authorize_qwen3_4b_test_download and args.mode != "full":
         parser.error("--authorize-qwen3-4b-test-download requires --mode full")
+    if args.mode == "full" and (args.installed_executable is None or not args.application_pid):
+        parser.error("--mode full requires --installed-executable and --application-pid for real process restart coverage")
     started = time.monotonic()
 
     report: dict[str, object] = {
-        "schema": "cybersentinel-windows-installed-desktop-acceptance-v1",
+        "schema": "cybersentinel-windows-installed-desktop-acceptance-v2",
         "status": "FAIL",
         "mode": args.mode,
         "qwen3_4b_test_download_authorized": args.authorize_qwen3_4b_test_download,
@@ -814,6 +1704,16 @@ def main() -> int:
         "expected_version": args.expected_version,
         "version_endpoint": {},
         "cdp_port": args.cdp_port,
+        "installed_executable": str(args.installed_executable) if args.installed_executable else None,
+        "initial_application_pid": args.application_pid,
+        "installed_executable_launch": {"status": "NOT_RUN"},
+        "application_restart": {
+            "status": "NOT_RUN",
+            "close_method": "taskkill.exe /PID <pid> /T /F",
+            "graceful_quit_claimed": False,
+            "renderer_reload_used": False,
+            "cycles": [],
+        },
         "first_run": {},
         "hardware": {},
         "model_manager": {},
@@ -838,6 +1738,22 @@ def main() -> int:
             if not pages:
                 raise RuntimeError("installed_desktop_has_no_renderer_page")
             page = pages[0]
+            if args.mode == "full":
+                actual_image = _windows_process_image_path(args.application_pid)
+                expected_image = str(args.installed_executable.expanduser().resolve(strict=True))
+                image_matches = bool(
+                    actual_image
+                    and os.path.normcase(actual_image) == os.path.normcase(expected_image)
+                )
+                report["installed_executable_launch"] = {
+                    "status": "PASS" if image_matches else "FAIL",
+                    "process_id": args.application_pid,
+                    "expected_image_path": expected_image,
+                    "actual_image_path": actual_image,
+                    "matches_installed_path": image_matches,
+                }
+                if not image_matches:
+                    raise RuntimeError("initial_application_process_not_running_from_installed_path")
             version_endpoint = page.evaluate("""async () => {
               const response = await fetch('/api/public/health', {credentials: 'include'});
               const body = await response.json().catch(() => ({}));
@@ -1279,9 +2195,161 @@ def main() -> int:
                 if not valid_login:
                     raise RuntimeError("valid_owner_credentials_were_not_accepted")
 
+                active_application_pid = args.application_pid
+                relaunched_application_process = None
+                report["application_restart"]["status"] = "IN_PROGRESS"
+
+                def restart_installed_application(cycle_name: str, mission_id: str, before_snapshot: dict, verify_inference: bool):
+                    nonlocal browser, page, active_application_pid, relaunched_application_process
+                    cycle = {
+                        "cycle": cycle_name,
+                        "status": "FAIL",
+                        "close_method": "taskkill.exe /PID <pid> /T /F",
+                        "graceful_quit_claimed": False,
+                        "renderer_reload_used": False,
+                        "installed_executable": str(args.installed_executable),
+                        "old_process_id": active_application_pid,
+                        "same_disposable_profile_root": True,
+                        "post_restart_inference_requested": verify_inference,
+                    }
+                    after_snapshot = None
+                    try:
+                        if browser is not None:
+                            try:
+                                browser.close()
+                            except Exception as exc:
+                                cycle["browser_detach_error_type"] = type(exc).__name__
+                            finally:
+                                browser = None
+                                page = None
+                        termination = _terminate_installed_process_tree(active_application_pid, args.cdp_port)
+                        cycle.update(termination)
+                        if termination.get("process_tree_termination_verified") is not True:
+                            raise RuntimeError("installed_application_process_tree_did_not_stop")
+
+                        relaunched_application_process = _launch_installed_application(
+                            args.installed_executable, args.profile_root, args.cdp_port
+                        )
+                        active_application_pid = relaunched_application_process.pid
+                        cycle["new_process_id"] = active_application_pid
+                        actual_image = _windows_process_image_path(active_application_pid)
+                        expected_image = str(args.installed_executable.expanduser().resolve(strict=True))
+                        image_matches = bool(
+                            actual_image
+                            and os.path.normcase(actual_image) == os.path.normcase(expected_image)
+                        )
+                        cycle["new_process_image_path"] = actual_image
+                        cycle["relaunch_from_installed_path_verified"] = image_matches
+                        cycle["same_profile_user_data_dir"] = str(
+                            (args.profile_root.expanduser().resolve() / "userData")
+                        )
+
+                        browser, page, cdp_info, health = _connect_to_relaunched_application(
+                            playwright, args.cdp_port, args.expected_version
+                        )
+                        cycle["cdp_browser_after_restart"] = cdp_info.get("Browser")
+                        cycle["health_http_status_after_restart"] = health.get("http_status")
+                        cycle["application_version_after_restart"] = health.get("body", {}).get("version")
+                        cycle["application_version_matches_expected"] = (
+                            health.get("body", {}).get("version") == args.expected_version
+                        )
+                        cycle["renderer_page_present_after_restart"] = bool(page)
+
+                        pre_restart_status = before_snapshot.get("status", {})
+                        expected_owner_identity_ref = (
+                            pre_restart_status.get("owner_identity_ref")
+                            if isinstance(pre_restart_status, dict) else None
+                        )
+                        cycle["owner_authentication"] = _owner_auth_after_restart(
+                            page,
+                            "/api/public/missions/" + mission_id,
+                            username,
+                            owner_password,
+                            expected_owner_identity_ref,
+                        )
+                        cycle["model_runtime"] = _model_runtime_after_restart(
+                            page, args.installed_executable, progress, verify_inference=verify_inference
+                        )
+                        if cycle["owner_authentication"].get("status") == "PASS":
+                            after_snapshot = _mission_audit_snapshot(page, mission_id)
+                            before_projection = _mission_audit_projection(before_snapshot, mission_id)
+                            after_projection = _mission_audit_projection(after_snapshot, mission_id)
+                            cycle["mission"] = {
+                                "mission_id": mission_id,
+                                "before_restart": before_projection,
+                                "after_restart": after_projection,
+                                "mission_id_and_report_binding_verified": (
+                                    before_projection.get("evidence_and_chain_bound_to_mission") is True
+                                    and after_projection.get("evidence_and_chain_bound_to_mission") is True
+                                ),
+                            }
+                        cycle["process_restart_verified"] = bool(
+                            cycle.get("process_tree_termination_verified") is True
+                            and cycle.get("relaunch_from_installed_path_verified") is True
+                            and cycle.get("application_version_matches_expected") is True
+                            and cycle.get("renderer_page_present_after_restart") is True
+                            and _windows_process_alive(active_application_pid) is True
+                        )
+                        cycle["status"] = "PASS" if (
+                            cycle["process_restart_verified"]
+                            and cycle["owner_authentication"].get("status") == "PASS"
+                            and cycle["model_runtime"].get("status") == "PASS"
+                            and cycle.get("mission", {}).get("mission_id_and_report_binding_verified") is True
+                        ) else "FAIL"
+                        if cycle_name == "terminal_mission" and after_snapshot is not None:
+                            try:
+                                screenshot_path = args.output.with_suffix(".mission-after-application-restart.png")
+                                page.screenshot(path=str(screenshot_path), full_page=True)
+                                cycle["final_state_screenshot"] = str(screenshot_path)
+                            except Exception:
+                                cycle["final_state_screenshot"] = None
+                    except Exception as exc:
+                        cycle["status"] = "FAIL"
+                        cycle["restart_error_type"] = type(exc).__name__
+                        cycle["restart_error_code"] = "installed_application_restart_validation_failed"
+                    cycle["current_process_id_after_cycle"] = active_application_pid
+                    report["application_restart"]["cycles"].append(cycle)
+                    report["application_restart"]["current_process_id"] = active_application_pid
+                    report["owner_authentication"].setdefault("after_application_restart", []).append({
+                        "cycle": cycle_name,
+                        **cycle.get("owner_authentication", {}),
+                    })
+                    progress.append({
+                        "phase": "installed_application_process_restart",
+                        "cycle": cycle_name,
+                        "process_restart_verified": cycle.get("process_restart_verified") is True,
+                        "owner_authentication_status": cycle.get("owner_authentication", {}).get("status"),
+                        "model_runtime_status": cycle.get("model_runtime", {}).get("status"),
+                        "status": cycle.get("status"),
+                    })
+                    return page, cycle, after_snapshot
+
                 stage = "installed_app_full_mission"
-                installed_mission = _installed_app_mission(page, args.profile_root, progress)
+                installed_mission, page = _installed_app_mission(
+                    page, args.profile_root, progress, restart_installed_application, report
+                )
                 report["installed_app_mission"] = installed_mission
+                restart_cycles = report["application_restart"].get("cycles", [])
+                paused_cycle = next((item for item in restart_cycles if item.get("cycle") == "paused_mission"), {})
+                terminal_cycle = next((item for item in restart_cycles if item.get("cycle") == "terminal_mission"), {})
+                recovery_cycle = paused_cycle if paused_cycle else terminal_cycle
+                terminal_mission_inspectable = (
+                    terminal_cycle.get("mission", {}).get("completed_mission_inspectable_after_restart") is True
+                )
+                report["application_restart"]["gates"] = {
+                    "paused_mission_restart_and_authorized_resume": paused_cycle.get("status", "NOT_RUN"),
+                    "terminal_mission_records_persisted": terminal_cycle.get("status", "NOT_RUN"),
+                    "previously_completed_mission_inspectable": "PASS" if terminal_mission_inspectable else (
+                        "NOT_RUN" if installed_mission.get("mission_status") != "GOAL_COMPLETED" else "FAIL"
+                    ),
+                    "post_restart_owner_authentication": recovery_cycle.get("owner_authentication", {}).get("status", "NOT_RUN"),
+                    "post_restart_model_and_runtime": recovery_cycle.get("model_runtime", {}).get("status", "NOT_RUN"),
+                }
+                report["application_restart"]["status"] = "PASS" if (
+                    paused_cycle.get("status") == "PASS"
+                    and terminal_cycle.get("status") == "PASS"
+                    and terminal_mission_inspectable
+                ) else "FAIL"
                 if installed_mission.get("status") != "PASS":
                     raise RuntimeError("installed_candidate_full_mission_acceptance_failed")
 
@@ -1340,6 +2408,8 @@ def main() -> int:
                     "owner_valid_login": report["owner_authentication"].get("valid_credentials_accepted") is True,
                     "owner_invalid_login_rejected": report["owner_authentication"].get("invalid_credentials_rejected") is True,
                     "installed_app_full_mission": report["installed_app_mission"].get("status") == "PASS",
+                    "installed_executable_launch_from_installed_path": report["installed_executable_launch"].get("status") == "PASS",
+                    "application_restart_and_durable_mission_recovery": report["application_restart"].get("status") == "PASS",
                     "runtime_shutdown": report["model_manager"].get("runtime_shutdown_verified") is True,
                 }
                 report["status"] = "PASS" if all(report["checks"].values()) else "FAIL"
@@ -1356,6 +2426,12 @@ def main() -> int:
         report["error"] = str(exc)[:500]
         report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         report["status"] = "FAIL"
+        if report.get("application_restart", {}).get("status") == "IN_PROGRESS":
+            report["application_restart"]["status"] = "FAIL"
+        mission_report = report.get("installed_app_mission")
+        if isinstance(mission_report, dict) and mission_report.get("status") == "IN_PROGRESS":
+            mission_report["status"] = "FAIL"
+            mission_report["incomplete_operation_reported_truthfully"] = True
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(json.dumps({"status": report["status"], "error_type": report["error_type"], "error": report["error"]}, ensure_ascii=False), file=sys.stderr)

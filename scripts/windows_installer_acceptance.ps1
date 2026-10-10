@@ -77,6 +77,51 @@ function Stop-ApplicationTree {
     catch { return $false }
 }
 
+function Get-InstalledProcessIds {
+    param([string]$Directory)
+    try {
+        $prefix = [IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
+        $processIds = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { [int]$_.ProcessId })
+        return ,$processIds
+    }
+    catch { return $null }
+}
+
+function Stop-InstalledProcessTrees {
+    param([string]$Directory, [int[]]$SeedProcessIds)
+    $initial = Get-InstalledProcessIds -Directory $Directory
+    if ($null -eq $initial) {
+        return [ordered]@{ verified = $false; process_ids_found = @(); remaining_process_ids = @(); query_failed = $true }
+    }
+    $targets = @()
+    foreach ($processId in (@($SeedProcessIds) + @($initial))) {
+        if ($processId -gt 0 -and $targets -notcontains $processId) { $targets += $processId }
+    }
+    foreach ($processId in $targets) {
+        & taskkill.exe /PID $processId /T /F 2>$null | Out-Null
+    }
+    $remaining = $initial
+    for ($attempt = 0; $attempt -lt 4 -and $remaining.Count -gt 0; $attempt++) {
+        Start-Sleep -Seconds 2
+        $remaining = Get-InstalledProcessIds -Directory $Directory
+        if ($null -eq $remaining) { break }
+        foreach ($processId in $remaining) {
+            & taskkill.exe /PID $processId /T /F 2>$null | Out-Null
+        }
+    }
+    if ($null -eq $remaining) {
+        return [ordered]@{ verified = $false; process_ids_found = @($targets); remaining_process_ids = @(); query_failed = $true }
+    }
+    return [ordered]@{
+        verified = ($remaining.Count -eq 0)
+        process_ids_found = @($targets)
+        remaining_process_ids = @($remaining)
+        query_failed = $false
+    }
+}
+
 function Get-NormalizedWindowsProductVersion {
     param([string]$Version)
     $baseVersion = [string](($Version -split '-', 2)[0])
@@ -239,6 +284,8 @@ try {
         "--cdp-port", [string]$cdpPort,
         "--expected-version", $expectedVersion,
         "--profile-root", $profileRoot,
+        "--installed-executable", $exePath,
+        "--application-pid", [string]$applicationProcess.Id,
         "--mode", $Mode,
         "--output", $uiJson
     )
@@ -358,8 +405,28 @@ finally {
     $env:LOCALAPPDATA = $originalLocalAppData
     $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
     $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = $originalAcceptanceDiagnostics
-    $processStopped = Stop-ApplicationTree -Process $applicationProcess
-    $report.cleanup.application_process_tree_stopped = $processStopped
+    $initialProcessStopped = Stop-ApplicationTree -Process $applicationProcess
+    $restartProcessId = 0
+    if ($report.installed_desktop_ui.application_restart.current_process_id) {
+        $restartProcessId = [int]$report.installed_desktop_ui.application_restart.current_process_id
+    }
+    $restartProcessStillRunning = $false
+    if ($restartProcessId -gt 0) {
+        $restartProcessStillRunning = $null -ne (Get-Process -Id $restartProcessId -ErrorAction SilentlyContinue)
+    }
+    $seedProcessIds = @()
+    if ($applicationProcess) { $seedProcessIds += [int]$applicationProcess.Id }
+    if ($restartProcessId -gt 0) { $seedProcessIds += $restartProcessId }
+    $installedProcessCleanup = Stop-InstalledProcessTrees -Directory $installDirectory -SeedProcessIds $seedProcessIds
+    $report.cleanup.initial_application_process_stopped = $initialProcessStopped
+    $report.cleanup.restarted_application_process_stopped = -not $restartProcessStillRunning
+    $report.cleanup.installed_path_processes_stopped = $installedProcessCleanup.verified
+    $report.cleanup.installed_path_process_ids = $installedProcessCleanup.process_ids_found
+    $report.cleanup.remaining_installed_process_ids = $installedProcessCleanup.remaining_process_ids
+    $report.cleanup.application_process_tree_stopped = (
+        $initialProcessStopped -and -not $restartProcessStillRunning -and
+        $installedProcessCleanup.verified -and $installedProcessCleanup.query_failed -ne $true
+    )
     if ($report.installation.installed_executable_exists -and (Test-Path -LiteralPath $installDirectory)) {
         try {
             Remove-Item -LiteralPath $installDirectory -Recurse -Force
