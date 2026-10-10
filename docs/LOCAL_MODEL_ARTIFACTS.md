@@ -23,6 +23,15 @@ The latest stable release API returned [`llama.cpp v0.5.0`](https://github.com/g
 
 The second archive is used for Linux-hosted local-inference acceptance; the Windows installer bundles the first archive's CPU runtime. Both archives are pinned by exact size and SHA-256 in `scripts/download_llama_runtime.py` and fetched from HTTPS GitHub Releases URLs. Extraction rejects archive path escapes, ZIP links, and unsafe TAR special files. The runtime-archive downloader refuses any existing output that does not match the verified manifest without deleting it and uses private unique temporary files before atomic replacement. The model-weight downloader uses a resumable `.part` file, rejects symlinked output/partial paths (and uses no-follow file opening where supported), verifies exact size and SHA-256, preserves an old target until verification succeeds, and atomically promotes only the verified artifact.
 
+## Model-manager state contract
+
+The `/api/public/desktop/models` catalog row distinguishes a saved preference from live runtime state:
+
+- `selected` is the persisted model preference. It can remain true while the runtime is stopped or being restored; it does not imply readiness.
+- `active` is true only when the manager runtime is `ready` and both the runtime model ID and active provider/model ID match that row's `model_id`. A persisted selection alone is insufficient; starting, stopping, stopped, failed, or mismatched runtime state is not active.
+- `installed_sha256` is a display observation of the on-disk artifact digest, exposed only after the pinned manifest and expected size match and the actual file hash matches the catalog digest. A successful observation may be cached against the verified artifact fingerprint and pinned identity for status display; it is not authorization or inference authority. Install and activation perform their own fresh verification.
+- Missing, partial, tampered, manifest-invalid, or failed-verification artifacts report `installed: false` and `installed_sha256: null`. Failed runtime verification/startup does not leave the model ready or active.
+
 ## Real local-model acceptance harness
 
 `scripts/local_model_acceptance.py` uses an isolated temporary database/model root and a disposable Owner session. It requires the pinned llama.cpp `b11146` runtime manifest and verifies the runtime archive digest, server-binary digest, Qwen3 catalog file digest, real-inference marker, and exact `local_llama_cpp`/Qwen model identity. The Mission runs through AgentCore/MissionRuntime with a one-provider router, empty network/credential boundaries, and all registered tools except read-only `status` explicitly forbidden. AgentCore passes only canonical schemas named by the persisted Mission authorization snapshot to MissionRuntime; replanning remains restricted to that same authorized tool set. These are the schemas sent to the provider and counted in the token budget. Qwen3's bounded local inference smoke check disables reasoning mode so the short verification marker can complete within its fixed output cap; ordinary model generation settings are unchanged.
