@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import traceback
+from urllib.parse import urlsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,36 @@ def _safe_action_names(values: list[str]) -> list[str]:
         else "<invalid_action_name>"
         for value in values[:32]
     ]
+
+
+def _scoped_acceptance_mcp_endpoint_canonicalizer(
+    original, *, expected_endpoint: str, fixture_port: int, endpoint_path: str
+):
+    """Allow only this acceptance run's exact loopback TLS fixture endpoint."""
+
+    def canonicalize(value):
+        if isinstance(value, str) and value == expected_endpoint:
+            try:
+                parts = urlsplit(value)
+                effective_port = parts.port if parts.port is not None else 443
+            except ValueError:
+                parts = None
+                effective_port = None
+            if (
+                parts is not None
+                and parts.scheme.casefold() == "https"
+                and parts.hostname == "127.0.0.1"
+                and effective_port == fixture_port
+                and parts.path == endpoint_path
+                and parts.username is None
+                and parts.password is None
+                and not parts.query
+                and not parts.fragment
+            ):
+                return expected_endpoint
+        return original(value)
+
+    return canonicalize
 
 
 def _qwen_planning_diagnostics(mission, required_action_names):
@@ -316,6 +347,7 @@ def main() -> int:
     patcher = None
     mcp_module = None
     previous_mcp_service = None
+    previous_mcp_endpoint_canonicalizer = None
     browser_module = None
     previous_browser_service = None
     original_ssl_cert_file = os.environ.get("SSL_CERT_FILE")
@@ -669,6 +701,15 @@ def main() -> int:
 
         mcp_module = __import__("tools.mcp_client", fromlist=["MCPToolService"])
         previous_mcp_service = mcp_module._DEFAULT_SERVICE
+        previous_mcp_endpoint_canonicalizer = mcp_module.canonical_mcp_endpoint
+        if fixture_port != 443:
+            mcp_module.canonical_mcp_endpoint = _scoped_acceptance_mcp_endpoint_canonicalizer(
+                previous_mcp_endpoint_canonicalizer,
+                expected_endpoint=endpoint,
+                fixture_port=fixture_port,
+                endpoint_path=endpoint_path,
+            )
+            result["fixture"]["exact_loopback_nonstandard_mcp_port_exception"] = True
         mcp_module._DEFAULT_SERVICE = MCPToolService(client_factory=test_client_factory)
 
         spec = get_model("qwen3-4b-q4-k-m")
@@ -731,6 +772,7 @@ def main() -> int:
             raise RuntimeError("owner_gated_mcp_invoke_continuation_missing")
         if qwen_plan_actions.index("mcp.discover") > qwen_plan_actions.index("mcp.invoke"):
             raise RuntimeError("real_qwen_plan_orders_mcp_invoke_before_discovery")
+        failure_phase = "owner_mission_fixture_binding"
         bounded_test_dir = run_dir / "bounded-test-project"
         bounded_test_dir.mkdir(mode=0o700)
         bounded_test_file = bounded_test_dir / "test_bounded_acceptance.py"
@@ -1498,6 +1540,8 @@ def main() -> int:
             browser_module._DEFAULT_SERVICE = previous_browser_service
         if mcp_module is not None:
             mcp_module._DEFAULT_SERVICE = previous_mcp_service
+            if previous_mcp_endpoint_canonicalizer is not None:
+                mcp_module.canonical_mcp_endpoint = previous_mcp_endpoint_canonicalizer
         if fixture_process is not None:
             try:
                 result["cleanup"]["fixture_stopped"] = bool(_stop_fixture(fixture_process, fixture_ready))
