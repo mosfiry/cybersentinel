@@ -524,7 +524,14 @@ def test_local_inference_failure_is_visible_and_never_falls_back(tmp_path):
 
     with pytest.raises(RuntimeError, match="local_inference_failed:local_model_timeout"):
         manager.test_inference()
-    assert manager.public_state()["manager"]["operation"]["status"] == "failed"
+    state = manager.public_state()
+    assert state["manager"]["operation"]["status"] == "failed"
+    # The request timed out, but the manager still has a ready, matching runtime.
+    assert state["manager"]["runtime"]["status"] == "ready"
+    assert state["manager"]["runtime"]["model_id"] == spec.model_id
+    row = next(item for item in state["models"] if item["model_id"] == spec.model_id)
+    assert row["active"] is True
+    assert row["selected"] is True
     assert local_provider.calls == 1
     assert external_provider.calls == 0
 
