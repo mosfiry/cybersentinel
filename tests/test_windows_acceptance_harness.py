@@ -457,6 +457,17 @@ def test_native_acceptance_restart_is_not_a_renderer_reload_or_in_process_refres
     assert "page.reload(" not in driver
     assert "Stop-InstalledProcessTrees" in powershell
     assert "remaining_process_ids" in powershell
+    cleanup_call = powershell.index("$installedProcessCleanup = Stop-InstalledProcessTrees")
+    post_cleanup_check = powershell.index(
+        "$restartProcessStillRunning = $installedProcessCleanup.query_failed -eq $true",
+        cleanup_call,
+    )
+    cleanup_gate = powershell.index(
+        "$report.cleanup.restarted_application_process_stopped = -not $restartProcessStillRunning",
+        cleanup_call,
+    )
+    assert cleanup_call < post_cleanup_check < cleanup_gate
+    assert "$installedProcessCleanup.remaining_process_ids" in powershell[post_cleanup_check:cleanup_gate]
 
 
 def test_checkpoint_diagnostics_expose_only_safe_budget_metadata() -> None:

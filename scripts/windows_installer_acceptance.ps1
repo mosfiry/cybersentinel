@@ -410,14 +410,17 @@ finally {
     if ($report.installed_desktop_ui.application_restart.current_process_id) {
         $restartProcessId = [int]$report.installed_desktop_ui.application_restart.current_process_id
     }
-    $restartProcessStillRunning = $false
-    if ($restartProcessId -gt 0) {
-        $restartProcessStillRunning = $null -ne (Get-Process -Id $restartProcessId -ErrorAction SilentlyContinue)
-    }
     $seedProcessIds = @()
     if ($applicationProcess) { $seedProcessIds += [int]$applicationProcess.Id }
     if ($restartProcessId -gt 0) { $seedProcessIds += $restartProcessId }
     $installedProcessCleanup = Stop-InstalledProcessTrees -Directory $installDirectory -SeedProcessIds $seedProcessIds
+    $restartProcessStillRunning = $false
+    if ($restartProcessId -gt 0) {
+        $restartProcessStillRunning = $installedProcessCleanup.query_failed -eq $true
+        if (-not $restartProcessStillRunning) {
+            $restartProcessStillRunning = @($installedProcessCleanup.remaining_process_ids) -contains $restartProcessId
+        }
+    }
     $report.cleanup.initial_application_process_stopped = $initialProcessStopped
     $report.cleanup.restarted_application_process_stopped = -not $restartProcessStillRunning
     $report.cleanup.installed_path_processes_stopped = $installedProcessCleanup.verified
