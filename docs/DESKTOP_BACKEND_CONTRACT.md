@@ -45,7 +45,6 @@ Public write routes validate same-origin/Origin and CSRF and require Owner autho
 
 - The ModelRouter remains Core's provider abstraction. The local manager owns pinned model acquisition, integrity verification, activation, status persistence, and `RuntimeAdapter` lifecycle. `llama.cpp` binds loopback only with a random API key; CPU is the supported backend in this installer.
 - Switching models cannot happen while a mission is active. A model download is resumable from a partial file and installation requires exact size and SHA-256.
-
 - Mission status controls, checkpoint/recovery, evidence chain, provenance, deterministic validation, findings, reports, scope firewall, target identity, tool registry, and bounded execution remain backend-owned.
 - The inspected source stores mission plan steps, queue/worker data, and tool results, but does not define a persistent independent sub-agent identity/run schema. The UI does not invent one; per-agent tracking requires a future Core data model with authorization, budget, checkpoint, and evidence lineage.
 - Filesystem and Git viewer routes keep their platform-specific fail-closed boundary; the app does not replace it with insecure path-based reads to make the UI appear more capable.
