@@ -10,10 +10,10 @@ These tests fail if a boundary is removed:
 import pytest
 
 from cyber.case_engine import CyberCase, EvidenceStatus, Provenance
-from cyber.hunting import HuntHypothesis, ThreatHunter
+from cyber.hunting import HuntHypothesis, HuntResult, ThreatHunter
 from cyber.incident_response import IRPlaybook
-from cyber.knowledge_model import CyberKnowledgeGraph, SourceClass
-from cyber.malware import triage_sample, record_triage_in_graph
+from cyber.knowledge_model import ClaimEdge, CyberKnowledgeGraph, EdgeStatus, Entity, Provenance as GraphProvenance, SourceClass
+from cyber.malware import CapabilityClaim, MalwareTriage, triage_sample, record_triage_in_graph
 
 
 def _malicious_sample():
@@ -40,11 +40,27 @@ class TestMalwareTriage:
         assert ("ipv4", "203.0.113.7") in iocs
         assert all(i["field"] for i in t.iocs)
 
+    def test_hash_iocs_are_normalized_and_keep_field_provenance(self):
+        t = triage_sample({
+            "sample_id": "hash-sample",
+            "strings": ["A" * 32, "B" * 64],
+        })
+        iocs = {(item["type"], item["value"], item["field"]) for item in t.iocs}
+        assert ("md5", "a" * 32, "strings") in iocs
+        assert ("sha256", "b" * 64, "strings") in iocs
+
     def test_benign_sample_is_un_determined_or_benign_never_malicious(self):
         t = triage_sample({"sample_id": "synth-benign", "strings": ["hello world"]})
         assert t.verdict in ("UNDETERMINED", "BENIGN")
         assert t.verdict != "MALICIOUS"
         assert any("UNDETERMINED" in u for u in t.unknowns)
+
+        trusted = triage_sample({
+            "sample_id": "trusted-benign",
+            "classification": "benign-lab-utility",
+            "strings": ["hello world"],
+        })
+        assert trusted.verdict == "BENIGN"
 
     def test_family_attribution_below_threshold_is_tentative_not_supported(self):
         t = triage_sample(
@@ -100,6 +116,20 @@ class TestMalwareTriage:
         with pytest.raises(ValueError, match="provenance source"):
             record_triage_in_graph(g, t, source="  ", source_class=SourceClass.REAL)
 
+    def test_record_refuses_undetermined_capabilities_as_graph_claims(self):
+        g = CyberKnowledgeGraph()
+        t = MalwareTriage(sample_id="uncertain-sample")
+        t.capabilities.append(CapabilityClaim(
+            capability="unknown_behavior",
+            evidence_fields=("strings",),
+            status="UNDETERMINED",
+        ))
+
+        record_triage_in_graph(g, t, source="static-triage", source_class=SourceClass.REAL)
+
+        assert g.entity("uncertain-sample") is not None
+        assert g.to_dict()["edges"] == []
+
 
 class TestIRPlaybook:
     def _case_with_evidence(self):
@@ -123,12 +153,18 @@ class TestIRPlaybook:
         assert action.evidence_ids == [strong]
         assert "security.authorization" in action.authority
 
+        ioc_action = IRPlaybook(case).recommend_block_ioc("203.0.113.7", evidence_ids=[strong])
+        assert ioc_action.to_dict()["kind"] == "BLOCK_IOC"
+        assert ioc_action.to_dict()["authority"].startswith("NONE")
+
     def test_evidence_less_containment_is_refused(self):
         case, strong, weak, _ = self._case_with_evidence()
         with pytest.raises(ValueError, match="evidence-less"):
             IRPlaybook(case).recommend_contain_host("synth-web-1", evidence_ids=[])
         with pytest.raises(ValueError, match="SUPPORTED"):
             IRPlaybook(case).recommend_contain_host("synth-web-1", evidence_ids=[weak])
+        with pytest.raises(ValueError, match="SUPPORTED"):
+            IRPlaybook(case).recommend_block_ioc("203.0.113.7", evidence_ids=[weak])
 
     def test_contradicted_evidence_is_refused_for_actions(self):
         case, _, _, contradicted = self._case_with_evidence()
@@ -147,8 +183,30 @@ class TestIRPlaybook:
         with pytest.raises(ValueError, match="unknown evidence"):
             IRPlaybook(case).recommend_contain_host("synth-web-1", evidence_ids=["ev-999"])
 
+    def test_plan_is_recommendation_only_and_has_no_implicit_actions(self):
+        case, _, _, _ = self._case_with_evidence()
+        playbook = IRPlaybook(case)
+
+        assert playbook.plan() == []
+        assert case.next_actions == []
+
 
 class TestThreatHunting:
+    def test_hunt_result_serializes_without_aliasing_lists(self):
+        result = HuntResult(
+            hunt_id="hunt-serialization",
+            status="NO_DETECTIONS",
+            findings=["finding-1"],
+            unknowns=["unknown-1"],
+        )
+
+        dumped = result.to_dict()
+        dumped["findings"].append("mutated")
+        dumped["unknowns"].append("mutated")
+
+        assert result.findings == ["finding-1"]
+        assert result.unknowns == ["unknown-1"]
+
     def _graph(self):
         g = CyberKnowledgeGraph()
         from cyber.intel_ingest import IntelIngest
@@ -193,3 +251,51 @@ class TestThreatHunting:
         ))
         assert res.status == "NO_DETECTIONS"
         assert any("not in the graph" in u for u in res.unknowns)
+
+    def test_cycle_does_not_repeat_entities_during_traversal(self):
+        g = CyberKnowledgeGraph()
+        g.add_entity(Entity(entity_id="M1", entity_type="MALWARE"))
+        g.add_entity(Entity(entity_id="T1", entity_type="TTP"))
+        provenance = GraphProvenance(source="sensor", source_class=SourceClass.REAL)
+        g.add_claim(ClaimEdge("USES", "M1", "T1", provenance, status=EdgeStatus.WEAK))
+        g.add_claim(ClaimEdge("USES", "T1", "M1", provenance, status=EdgeStatus.WEAK))
+
+        result = ThreatHunter(g).run(HuntHypothesis(
+            hunt_id="hunt-cycle",
+            statement="find TTPs",
+            entry_entity="M1",
+            traverse_relations=("USES",),
+            target_type="TTP",
+        ))
+
+        assert result.status == "DETECTED"
+        assert result.findings == ["T1"]
+
+    def test_missing_traversal_entity_is_reported_as_no_detection(self):
+        class HidesTargetGraph(CyberKnowledgeGraph):
+            def entity(self, entity_id):
+                if entity_id == "hidden-target":
+                    return None
+                return super().entity(entity_id)
+
+        g = HidesTargetGraph()
+        g.add_entity(Entity(entity_id="M1", entity_type="MALWARE"))
+        g.add_entity(Entity(entity_id="hidden-target", entity_type="TTP"))
+        g.add_claim(ClaimEdge(
+            "USES",
+            "M1",
+            "hidden-target",
+            GraphProvenance(source="sensor", source_class=SourceClass.REAL),
+            status=EdgeStatus.WEAK,
+        ))
+
+        result = ThreatHunter(g).run(HuntHypothesis(
+            hunt_id="hunt-hidden-target",
+            statement="find hidden targets",
+            entry_entity="M1",
+            traverse_relations=("USES",),
+            target_type="TTP",
+        ))
+
+        assert result.status == "NO_DETECTIONS"
+        assert result.findings == []

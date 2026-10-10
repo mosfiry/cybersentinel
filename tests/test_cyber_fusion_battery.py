@@ -107,3 +107,24 @@ class TestFusionHonesty:
     def test_empty_source_label_is_refused(self):
         with pytest.raises(ValueError, match="provenance source"):
             FusionPipeline(source="   ")
+
+    def test_triage_unknowns_are_preserved_in_case_audit(self):
+        report = FusionPipeline().run(FusionInput(
+            malware_samples=[{"sample_id": "silent-sample", "strings": ["ordinary text"]}],
+            hunts=[],
+        ))
+
+        assert any("triage[silent-sample]" in unknown for unknown in report["case"]["unknowns"])
+        assert report["audit"]["unknowns_total"] == len(report["case"]["unknowns"])
+
+    def test_ir_recommendation_refusal_is_recorded_as_unknown(self, monkeypatch):
+        def refuse(self, ioc_value, *, evidence_ids):
+            raise ValueError("synthetic IR refusal")
+
+        monkeypatch.setattr("cyber.fusion.IRPlaybook.recommend_block_ioc", refuse)
+        report = FusionPipeline().run(FusionInput(
+            intel_items=_clean_intel(), malware_samples=[_clean_sample()], hunts=[_hunts()[0]],
+        ))
+
+        assert report["recommendations"] == []
+        assert any("no SUPPORTED evidence ties it to activity" in unknown for unknown in report["case"]["unknowns"])

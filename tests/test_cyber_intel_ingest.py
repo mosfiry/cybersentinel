@@ -9,7 +9,7 @@ These tests fail if an ingestion gate is removed:
 
 import pytest
 
-from cyber.intel_ingest import IntelIngest, _capped_confidence
+from cyber.intel_ingest import IngestReport, IntelIngest, _capped_confidence
 from cyber.knowledge_model import (
     CyberKnowledgeGraph,
     EdgeStatus,
@@ -101,6 +101,50 @@ class TestAttackStixIngest:
         with pytest.raises(ValueError, match="provenance source"):
             IntelIngest(g).ingest_attack_stix(_stix_bundle(), source="  ", source_class=SourceClass.REAL)
 
+    def test_malformed_bundle_shapes_are_refused_without_graph_writes(self):
+        g = CyberKnowledgeGraph()
+        ingest = IntelIngest(g)
+
+        not_a_list = ingest.ingest_attack_stix(
+            {"objects": {"unexpected": True}}, source="fixture", source_class=SourceClass.FIXTURE
+        )
+        mixed_objects = ingest.ingest_attack_stix(
+            {"objects": ["not-an-object", {"type": "note"}]},
+            source="fixture",
+            source_class=SourceClass.FIXTURE,
+        )
+
+        assert not_a_list.refused == [{"reason": "bundle without an objects list", "item": "dict"}]
+        assert mixed_objects.refused == [{"reason": "non-dict bundle object", "item": "'not-an-object'"}]
+        assert g.to_dict()["entities"] == {}
+
+    def test_authority_sanitization_is_counted(self):
+        bundle = _stix_bundle()
+        bundle["scope"] = {"targets": ["outside"]}
+
+        report = IntelIngest(CyberKnowledgeGraph()).ingest_attack_stix(
+            bundle, source="fixture", source_class=SourceClass.FIXTURE
+        )
+
+        assert report.sanitized_keys == 1
+
+    def test_non_list_behavior_keywords_are_ignored(self):
+        bundle = _stix_bundle()
+        bundle["objects"][1]["x_synth_behavior_keywords"] = "not-a-list"
+
+        graph = CyberKnowledgeGraph()
+        IntelIngest(graph).ingest_attack_stix(bundle, source="fixture", source_class=SourceClass.FIXTURE)
+        assert graph.entity("T1059").attributes["keywords"] == []
+
+    def test_behavior_keywords_keep_only_non_empty_strings(self):
+        bundle = _stix_bundle()
+        bundle["objects"][1]["x_synth_behavior_keywords"] = ["beacon", 7, ""]
+
+        graph = CyberKnowledgeGraph()
+        IntelIngest(graph).ingest_attack_stix(bundle, source="fixture", source_class=SourceClass.FIXTURE)
+
+        assert graph.entity("T1059").attributes["keywords"] == ["beacon"]
+
 
 class TestNvdIngest:
     def test_valid_cve_is_ingested_and_traversable(self):
@@ -126,6 +170,49 @@ class TestNvdIngest:
         report = IntelIngest(g).ingest_nvd_item(item, source="nvd", source_class=SourceClass.REAL)
         assert g.has_entity("CVE-2026-1234")
         assert g.entity("CVE-2026-1234").attributes["cvss"] is None
+
+    def test_malformed_nvd_shapes_are_refused_and_missing_source_is_rejected(self):
+        g = CyberKnowledgeGraph()
+        ingest = IntelIngest(g)
+
+        no_cve = ingest.ingest_nvd_item(
+            {"cve": "not-an-object"}, source="fixture", source_class=SourceClass.FIXTURE
+        )
+        bad_affected = ingest.ingest_nvd_item(
+            {"cve": {"id": "CVE-2026-1234"}, "affected": {"product": "x"}},
+            source="fixture",
+            source_class=SourceClass.FIXTURE,
+        )
+        partial_affected = ingest.ingest_nvd_item(
+            {
+                "authorization": {"owner": "attacker"},
+                "cve": {"id": "CVE-2026-1235"},
+                "affected": ["not-an-object", {"vendor": "fixture"}],
+            },
+            source="fixture",
+            source_class=SourceClass.FIXTURE,
+        )
+
+        with pytest.raises(ValueError, match="provenance source"):
+            ingest.ingest_nvd_item(_nvd_item(), source="", source_class=SourceClass.REAL)
+
+        assert no_cve.refused[0]["reason"] == "nvd item without a cve object"
+        assert bad_affected.refused[0]["reason"] == "nvd item with non-list affected field"
+        assert partial_affected.sanitized_keys == 1
+        assert [item["reason"] for item in partial_affected.refused] == ["non-dict affected entry"]
+        assert g.has_entity("CVE-2026-1234")
+
+
+def test_ingest_report_serializes_refusals_and_sanitization_count():
+    report = IngestReport(ingested_entities=1, ingested_claims=2, sanitized_keys=3)
+    report.refuse("invalid record", "withheld")
+
+    assert report.to_dict() == {
+        "ingested_entities": 1,
+        "ingested_claims": 2,
+        "refused": [{"reason": "invalid record", "item": "withheld"}],
+        "sanitized_keys": 3,
+    }
 
 
 class TestPoisonResistance:

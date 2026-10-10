@@ -13,7 +13,13 @@ import pytest
 
 from cyber.generalize import SIMILARITY_THRESHOLD, UnseenTechniqueMatcher
 from cyber.knowledge_model import SourceClass
-from cyber.seed_corpus import build_seed_graph, corpus_size, corpus_technique_ids, corpus_cve_ids
+from cyber.seed_corpus import (
+    build_seed_graph,
+    corpus_cve_ids,
+    corpus_size,
+    cve_corpus_size,
+    corpus_technique_ids,
+)
 
 
 @pytest.fixture(scope="module")
@@ -25,7 +31,8 @@ def seeded():
 class TestBreadth:
     def test_corpus_is_broad(self):
         assert corpus_size() >= 30
-        assert len(corpus_cve_ids()) >= 6
+        assert cve_corpus_size() == len(corpus_cve_ids())
+        assert cve_corpus_size() >= 6
         ids = corpus_technique_ids()
         assert "T1059" in ids and "T1566.001" in ids
 
@@ -77,6 +84,16 @@ class TestGeneralization:
         assert result["status"] == "UNKNOWN"
         assert result["hypotheses"] == []
         assert any("refusing to force a match" in u for u in result["unknowns"])
+
+    def test_features_infer_first_known_tactic_when_not_supplied(self, seeded):
+        graph, _ = seeded
+        matcher = UnseenTechniqueMatcher(graph)
+
+        features = matcher.extract_features(
+            "persistence behavior followed by execution activity"
+        )
+
+        assert features.tactic == "execution"
 
     def test_similarity_alone_never_produces_supported(self, seeded):
         graph, _ = seeded

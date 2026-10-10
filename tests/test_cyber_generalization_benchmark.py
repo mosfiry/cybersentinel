@@ -7,6 +7,8 @@ The benchmark must stay honest:
 * the result carries its scoped-no-claims disclaimer
 """
 
+import cyber.generalization_benchmark as benchmark
+
 from cyber.generalization_benchmark import run_generalization_benchmark
 
 
@@ -36,3 +38,17 @@ class TestGeneralizationBenchmark:
         result = run_generalization_benchmark()
         # fixture-scoped expectation, hand-verified for these probes only
         assert result.top5_hits >= 10
+
+    def test_unknown_probe_is_counted_separately_from_tentative(self, monkeypatch):
+        monkeypatch.setattr(
+            benchmark,
+            "_PROBES",
+            benchmark._PROBES + [("the office plants were watered", "", "T9999")],
+        )
+
+        result = run_generalization_benchmark()
+
+        assert result.probe_count == 13
+        assert result.unknown_probes == 1
+        assert result.tentative_probes == 12
+        assert result.per_probe[12]["status"] == "UNKNOWN"
