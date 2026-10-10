@@ -411,6 +411,7 @@ class AgentCore:
         calls = self._calls(response)
         issues: list[dict[str, str]] = []
         valid_calls: list[tuple[int, ToolCall, Any, Any]] = []
+        suppressed_tool_names: list[str] = []
         seen_signatures: set[tuple[str, str]] = set()
         steps: list[PlanStep] = []
         skill_ceiling: set[str] | None = None
@@ -435,7 +436,7 @@ class AgentCore:
                 if skill_context is not None:
                     from .intelligence_layer.skills import SkillAuthorizationError
                     raise SkillAuthorizationError("model proposal exceeds the explicitly selected Skill tool ceiling")
-                issues.append({"code": "UNAUTHORIZED_TOOL", "tool": name})
+                suppressed_tool_names.append(name)
                 continue
             if skill_ceiling is not None and name not in skill_ceiling:
                 from .intelligence_layer.skills import SkillAuthorizationError
@@ -508,6 +509,13 @@ class AgentCore:
                 missing_required_tools=missing_required,
             )
         if not steps:
+            if suppressed_tool_names:
+                return self._planning_failure_plan(
+                    objective,
+                    reason_code="UNAUTHORIZED_TOOL",
+                    issues=[{"code": "UNAUTHORIZED_TOOL", "tool": suppressed_tool_names[0]}],
+                    missing_required_tools=planning_requirements,
+                )
             if observation is not None:
                 # A textual continuation after an observed action means that
                 # durable evidence should be verified; it is not a new step.
