@@ -192,7 +192,7 @@ def test_install_rechecks_catalog_sha_before_treating_model_as_installed(tmp_pat
     model_path = manager.models_root / spec.model_id / spec.filename
     model_path.write_bytes(b"x" * spec.size_bytes)
 
-    # Model a display-cache identity collision; install must still hash afresh.
+    # A positive cache without a verified digest must be re-hashed for display.
     stat = model_path.stat()
     fingerprint = (
         spec.sha256,
@@ -206,8 +206,8 @@ def test_install_rechecks_catalog_sha_before_treating_model_as_installed(tmp_pat
     manager._display_integrity_cache[spec.model_id] = (fingerprint, True, None)
 
     row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
-    assert row["installed"] is True  # cached status is informational, not a trust decision
-    assert row["installed_sha256"] is None  # a cached boolean is not an artifact digest
+    assert row["installed"] is False
+    assert row["installed_sha256"] is None
     manager.install(spec.model_id)
     wait_operation(manager, "complete")
 
@@ -238,6 +238,58 @@ def test_public_state_hashes_unchanged_installed_model_once(tmp_path, monkeypatc
         assert row["installed_sha256"] == hashlib.sha256(payload).hexdigest()
 
     assert hash_calls == 1
+
+
+@pytest.mark.parametrize(
+    "tampered,cached_fields,expected_installed",
+    [
+        (False, (True,), True),
+        (False, (True, None), True),
+        (False, (True, "0" * 64), True),
+        (True, (True,), False),
+        (True, (True, None), False),
+        (True, (True, "0" * 64), False),
+    ],
+)
+def test_positive_legacy_or_malformed_integrity_cache_rehashes_artifact(
+    tmp_path, monkeypatch, tampered, cached_fields, expected_installed
+):
+    payload = b"verified cache fixture"
+    spec = make_spec("cache-rehash", payload)
+    manager, _runtime, _router = make_manager(tmp_path, [spec], {spec.filename: payload})
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+    model_path = manager._model_path(spec)
+    if tampered:
+        model_path.write_bytes(b"x" * len(payload))
+
+    stat = model_path.stat()
+    fingerprint = (
+        spec.sha256,
+        spec.size_bytes,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    manager._display_integrity_cache[spec.model_id] = (fingerprint, *cached_fields)
+
+    original_hash = manager_module._hash_file
+    hash_calls = 0
+
+    def tracked_hash(path):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(path)
+
+    monkeypatch.setattr(manager_module, "_hash_file", tracked_hash)
+    row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
+
+    expected_digest = hashlib.sha256(payload).hexdigest() if expected_installed else None
+    assert hash_calls == 1
+    assert row["installed"] is expected_installed
+    assert row["installed_sha256"] == expected_digest
 
 
 def test_public_state_exposes_installed_sha_only_for_a_verified_complete_artifact(tmp_path):

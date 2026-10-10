@@ -20,6 +20,8 @@ from scripts.windows_desktop_acceptance import (
     _local_health_status,
     _is_expected_qwen_install_post_request,
     _may_continue_qwen_install_post,
+    _qwen_installed_digest_report,
+    _require_qwen_installed_digest,
     _require_qwen_install_consent,
     _refresh_qwen_model_snapshot,
     _safe_checkpoint_diagnostics,
@@ -232,6 +234,47 @@ def _qwen_model_payload() -> dict:
     return {key: getattr(model, key) for key in EXPECTED_QWEN3_4B_INSTALL_IDENTITY}
 
 
+@pytest.mark.parametrize(
+    "installed,installed_sha256,catalog_sha256",
+    [
+        (True, None, EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"]),
+        (True, "0" * 64, EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"]),
+        (False, EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"], EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"]),
+        (True, EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"], "0" * 64),
+    ],
+)
+def test_final_qwen_digest_gate_rejects_missing_or_mismatched_digest(
+    installed, installed_sha256, catalog_sha256
+) -> None:
+    model = {
+        **_qwen_model_payload(),
+        "installed": installed,
+        "installed_sha256": installed_sha256,
+        "sha256": catalog_sha256,
+    }
+
+    digest_report = _qwen_installed_digest_report(model)
+    assert digest_report["installed"] is installed
+    assert digest_report["verified"] is False
+    with pytest.raises(RuntimeError, match="qwen3_4b_installed_digest_missing_or_mismatched"):
+        _require_qwen_installed_digest(digest_report)
+
+
+def test_final_qwen_digest_gate_accepts_only_pinned_installed_digest() -> None:
+    digest = EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"]
+    model = {
+        **_qwen_model_payload(),
+        "installed": True,
+        "installed_sha256": digest,
+    }
+
+    digest_report = _qwen_installed_digest_report(model)
+    assert digest_report["matches_catalog"] is True
+    assert digest_report["matches_pinned"] is True
+    assert digest_report["verified"] is True
+    _require_qwen_installed_digest(digest_report)
+
+
 def test_qwen_snapshot_refreshes_from_final_post_activation_poll_state() -> None:
     initial_model = {
         **_qwen_model_payload(),
@@ -294,6 +337,11 @@ def test_qwen_snapshot_refreshes_from_final_post_activation_poll_state() -> None
     phase_positions = [source.index(phase) for phase in snapshot_phases]
     assert phase_positions == sorted(phase_positions)
     assert source.index('timeout=300, phase="real_local_inference"') < phase_positions[-1]
+    assert phase_positions[-1] < source.index("_require_qwen_installed_digest(digest_verification)")
+    assert '"qwen3_4b_model_manager":' in source
+    assert '"qwen3_4b_installed_digest_matches_catalog_and_pin":' in source
+    assert '"qwen3_4b_runtime_active":' in source
+    assert '"real_qwen_local_inference":' in source
 
 
 class _FakeDialog:

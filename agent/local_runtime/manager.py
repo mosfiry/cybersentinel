@@ -171,13 +171,14 @@ class LocalModelManager:
             )
             cached = self._display_integrity_cache.get(spec.model_id)
             if cached is not None and cached[0] == fingerprint:
-                installed = cached[1] is True
-                installed_sha256 = cached[2] if len(cached) > 2 else None
-                if not installed:
-                    installed_sha256 = None
-                elif installed_sha256 != spec.sha256:
-                    installed_sha256 = None
-                return installed, installed_sha256
+                if cached[1] is not True:
+                    return False, None
+                cached_sha256 = cached[2] if len(cached) > 2 else None
+                if cached_sha256 == spec.sha256:
+                    return True, cached_sha256
+                # A legacy/malformed positive observation is not sufficient to
+                # report installation; re-hash the actual artifact below.
+                self._display_integrity_cache.pop(spec.model_id, None)
 
             try:
                 actual_sha256 = _hash_file(path)

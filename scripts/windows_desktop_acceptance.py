@@ -235,6 +235,29 @@ def _refresh_qwen_model_snapshot(report: dict, state: dict, *, phase: str) -> di
     return qwen
 
 
+def _qwen_installed_digest_report(model: dict | None) -> dict:
+    catalog_sha256 = model.get("sha256") if isinstance(model, dict) else None
+    installed_sha256 = model.get("installed_sha256") if isinstance(model, dict) else None
+    pinned_sha256 = EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"]
+    installed = isinstance(model, dict) and model.get("installed") is True
+    matches_catalog = isinstance(installed_sha256, str) and installed_sha256 == catalog_sha256
+    matches_pinned = isinstance(installed_sha256, str) and installed_sha256 == pinned_sha256
+    return {
+        "installed": installed,
+        "catalog_sha256": catalog_sha256,
+        "pinned_sha256": pinned_sha256,
+        "installed_sha256": installed_sha256 if isinstance(installed_sha256, str) else None,
+        "matches_catalog": matches_catalog,
+        "matches_pinned": matches_pinned,
+        "verified": installed and matches_catalog and matches_pinned,
+    }
+
+
+def _require_qwen_installed_digest(digest_report: dict) -> None:
+    if digest_report.get("verified") is not True:
+        raise RuntimeError("qwen3_4b_installed_digest_missing_or_mismatched")
+
+
 def _format_consent_bytes(value: int) -> str:
     size = max(0, float(value))
     units = ("B", "KiB", "MiB", "GiB", "TiB")
@@ -1102,6 +1125,9 @@ def main() -> int:
                 qwen = _refresh_qwen_model_snapshot(
                     report, state, phase="post_activation_inference_poll"
                 )
+                digest_verification = _qwen_installed_digest_report(qwen)
+                report["model_manager"]["installed_digest_verification"] = digest_verification
+                _require_qwen_installed_digest(digest_verification)
                 operation = (state.get("manager") or {}).get("operation") or {}
                 runtime = (state.get("manager") or {}).get("runtime") or {}
                 inference_text = str((inference_api_result or {}).get("response", operation.get("result", "")))
@@ -1302,7 +1328,13 @@ def main() -> int:
                 report["checks"] = {
                     "fresh_first_run": overlay_visible,
                     "hardware_detection": bool(hardware_text),
-                    "qwen3_4b_model_manager": bool(qwen and qwen.get("installed")),
+                    "qwen3_4b_model_manager": bool(qwen and qwen.get("installed") is True),
+                    "qwen3_4b_installed_digest_matches_catalog_and_pin": digest_verification["verified"] is True,
+                    "qwen3_4b_runtime_active": bool(
+                        qwen and qwen.get("active") is True
+                        and runtime.get("status") == "ready"
+                        and runtime.get("model_id") == model_id
+                    ),
                     "local_runtime_initialization": runtime.get("status") == "ready",
                     "real_qwen_local_inference": provider == "local_llama_cpp" and model_name == model_id and bool(inference_text.strip()),
                     "owner_valid_login": report["owner_authentication"].get("valid_credentials_accepted") is True,
