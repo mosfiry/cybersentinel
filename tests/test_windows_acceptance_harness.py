@@ -5,8 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from agent.mission import Mission, MissionStore
 from agent.local_runtime.catalog import get_model
-from scripts.run_full_e2e_gate_acceptance import _safe_action_names, find_llama_server_binary
+from agent.planning import Plan, PlanStep
+from scripts.run_full_e2e_gate_acceptance import (
+    _qwen_planning_diagnostics,
+    _safe_action_names,
+    find_llama_server_binary,
+)
 import scripts.windows_desktop_acceptance as windows_acceptance
 from scripts.windows_desktop_acceptance import (
     EXPECTED_QWEN3_4B_INSTALL_IDENTITY,
@@ -172,6 +178,16 @@ def test_restart_resume_requires_persisted_pause_authorization_and_unchanged_exe
     ):
         candidate = {**accepted, key: value}
         assert not _may_resume_after_application_restart(**candidate), key
+
+    reauth_checkpoint = {
+        **accepted,
+        "mission_status": "OWNER_REAUTH_REQUIRED",
+        "queue_state": "needs_input",
+    }
+    assert _may_resume_after_application_restart(**reauth_checkpoint)
+    assert not _may_resume_after_application_restart(**{**reauth_checkpoint, "owner_authorized": False})
+    assert not _may_resume_after_application_restart(**{**reauth_checkpoint, "queue_state": "paused"})
+    assert not _may_resume_after_application_restart(**{**accepted, "queue_state": "needs_input"})
 
 
 def test_owner_reauthentication_after_restart_rejects_invalid_password_and_restores_same_identity(
@@ -439,6 +455,36 @@ def test_qwen_action_diagnostics_reject_non_identifier_model_text() -> None:
         "mcp.discover",
         "<invalid_action_name>",
     ]
+
+
+def test_qwen_planning_diagnostics_do_not_mutate_integrity_covered_progress(tmp_path: Path) -> None:
+    actions = ["status", "mcp.discover", "mcp.invoke"]
+    plan = Plan.initial("diagnostic fixture").replan(
+        steps=tuple(
+            PlanStep(f"step-{index}", action, action=action)
+            for index, action in enumerate(actions, start=1)
+        ),
+        reason="test fixture",
+    )
+    mission = Mission.create(
+        "diagnostic fixture", "diagnostic fixture", plan,
+        request_id="qwen-diagnostic-integrity", owner_identity_ref="owner:1",
+    )
+    mission.progress["initial_model_response"] = {
+        "tool_calls": [{"name": action} for action in actions]
+    }
+    mission.progress["planning_attempts"] = [{
+        "proposed_tool_names": list(actions), "repair_requested": False,
+    }]
+    mission = MissionStore(tmp_path / "missions.sqlite3").save(mission)
+    progress_before = json.loads(json.dumps(mission.progress))
+
+    snapshot = _qwen_planning_diagnostics(mission, tuple(actions))
+
+    assert mission.verify_integrity()
+    assert mission.progress == progress_before
+    assert snapshot["diagnostics"]["final_plan_complete"] is True
+    assert snapshot["diagnostics"]["final_plan_mcp_discovery_before_invocation"] is True
 
 
 def test_model_state_fetch_retries_are_bounded_and_auditable(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -108,6 +108,52 @@ def test_resume_requires_fresh_owner_proof_and_only_then_clears_pause(
     assert renewed.iteration_count == mission.iteration_count
 
 
+def test_restarted_paused_mission_resumes_only_after_fresh_owner_reauthorization(
+    tmp_path, monkeypatch
+):
+    allow_owner_sessions(monkeypatch, "fresh-owner")
+    store, runtime, queue, mission = _setup(tmp_path)
+    mission.progress["pause_requested"] = True
+    mission.checkpoint = {**mission.checkpoint, "status": "paused"}
+    mission.transition(
+        MissionStatus.OWNER_REAUTH_REQUIRED,
+        "Owner reauthorization required after worker restart",
+        restart_recovery=True,
+    )
+    store.save(mission)
+    queue.enqueue(mission.mission_id, state=WorkerMissionState.NEEDS_INPUT)
+
+    core = AgentCore(ModelRouter([]), store=store)
+    service = MissionService(
+        runtime,
+        queue,
+        owner_revalidator=core.prepare_mission_for_queue,
+    )
+    with pytest.raises(PermissionError, match="owner authentication required"):
+        service.resume_mission(
+            mission.mission_id,
+            owner_session_token="stale-owner",
+        )
+
+    quarantined = store.load(mission.mission_id)
+    assert quarantined is not None
+    assert quarantined.status is MissionStatus.OWNER_REAUTH_REQUIRED
+    assert quarantined.progress["pause_requested"] is True
+    assert queue.get(mission.mission_id).state is WorkerMissionState.NEEDS_INPUT
+
+    resumed = service.resume_mission(
+        mission.mission_id,
+        owner_session_token="fresh-owner",
+    )
+    assert resumed["status"] == MissionStatus.READY.value
+    assert "pause_requested" not in resumed["progress"]
+    assert queue.get(mission.mission_id).state is WorkerMissionState.QUEUED
+    persisted = store.load(mission.mission_id)
+    assert persisted is not None
+    assert persisted.status is MissionStatus.READY
+    assert persisted.recovery_events[-1]["event"] == "owner_revalidated"
+
+
 def test_recovery_required_mission_is_not_reauthorized_or_enqueued(tmp_path, monkeypatch):
     allow_owner_sessions(monkeypatch, "fresh-owner")
     store, runtime, queue, mission = _setup(tmp_path)

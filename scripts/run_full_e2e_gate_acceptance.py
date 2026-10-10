@@ -56,6 +56,52 @@ def _safe_action_names(values: list[str]) -> list[str]:
     ]
 
 
+def _qwen_planning_diagnostics(mission, required_action_names):
+    """Build a read-only acceptance snapshot without mutating the signed Mission."""
+    progress = mission.progress if isinstance(mission.progress, dict) else {}
+    initial_response = progress.get("initial_model_response", {})
+    initial_calls = initial_response.get("tool_calls", []) if isinstance(initial_response, dict) else []
+    initial_actions = [str(call.get("name", "")) for call in initial_calls if isinstance(call, dict)]
+    planning_attempts = progress.get("planning_attempts", [])
+    final_attempt = planning_attempts[-1] if isinstance(planning_attempts, list) and planning_attempts else {}
+    raw_final_actions = final_attempt.get("proposed_tool_names", []) if isinstance(final_attempt, dict) else []
+    final_actions = [str(name) for name in raw_final_actions if isinstance(name, str)]
+    if not final_actions:
+        final_actions = list(initial_actions)
+    plan_actions = [step.action for step in mission.plan.steps]
+    required_actions = set(required_action_names)
+
+    def mcp_dependency_order_valid(proposed: list[str]) -> bool:
+        if "mcp.discover" not in proposed or "mcp.invoke" not in proposed:
+            return False
+        return proposed.index("mcp.discover") < proposed.index("mcp.invoke")
+
+    repair_attempt_count = sum(
+        1 for item in planning_attempts
+        if isinstance(item, dict) and item.get("repair_requested") is True
+    ) if isinstance(planning_attempts, list) else 0
+    return {
+        "initial_actions": initial_actions,
+        "final_actions": final_actions,
+        "plan_actions": plan_actions,
+        "diagnostics": {
+            "initial_model_tool_names": _safe_action_names(initial_actions),
+            "final_model_tool_names": _safe_action_names(final_actions),
+            "planned_action_names": _safe_action_names(plan_actions),
+            "missing_initial_model_tool_names": sorted(required_actions - set(initial_actions)),
+            "missing_final_model_tool_names": sorted(required_actions - set(final_actions)),
+            "missing_planned_action_names": sorted(required_actions - set(plan_actions)),
+            "initial_turn_complete": required_actions.issubset(set(initial_actions)),
+            "final_turn_complete": required_actions.issubset(set(final_actions)),
+            "final_plan_complete": required_actions.issubset(set(plan_actions)),
+            "final_model_mcp_discovery_before_invocation": mcp_dependency_order_valid(final_actions),
+            "final_plan_mcp_discovery_before_invocation": mcp_dependency_order_valid(plan_actions),
+            "planning_attempt_count": len(planning_attempts) if isinstance(planning_attempts, list) else 0,
+            "repair_attempt_count": repair_attempt_count,
+        },
+    }
+
+
 class E2ERecordingRouter:
     """Privacy-preserving trace proxy; model execution always reaches local Qwen."""
 
@@ -665,53 +711,18 @@ def main() -> int:
             run=False,
             planning_requirements=required_action_names,
         )
-        initial_response = mission.progress.get("initial_model_response", {})
-        initial_calls = initial_response.get("tool_calls", []) if isinstance(initial_response, dict) else []
-        qwen_initial_actions = [
-            str(call.get("name", "")) for call in initial_calls if isinstance(call, dict)
-        ]
-        planning_attempts = mission.progress.get("planning_attempts", [])
-        final_attempt = planning_attempts[-1] if isinstance(planning_attempts, list) and planning_attempts else {}
-        raw_final_actions = final_attempt.get("proposed_tool_names", []) if isinstance(final_attempt, dict) else []
-        qwen_final_actions = [str(name) for name in raw_final_actions if isinstance(name, str)]
-        if not qwen_final_actions:
-            qwen_final_actions = list(qwen_initial_actions)
-        qwen_plan_actions = [step.action for step in mission.plan.steps]
-        mission.progress["full_e2e_qwen_initial_tool_names"] = list(qwen_initial_actions)
-        mission.progress["full_e2e_qwen_final_tool_names"] = list(qwen_final_actions)
-        mission.progress["full_e2e_qwen_proposed_actions"] = list(qwen_final_actions)
+        qwen_snapshot = _qwen_planning_diagnostics(mission, required_action_names)
+        qwen_initial_actions = qwen_snapshot["initial_actions"]
+        qwen_final_actions = qwen_snapshot["final_actions"]
+        qwen_plan_actions = qwen_snapshot["plan_actions"]
         qwen_proposed_actions = list(qwen_final_actions)
         required_actions = set(required_action_names)
-
-        def mcp_dependency_order_valid(proposed: list[str]) -> bool:
-            if "mcp.discover" not in proposed or "mcp.invoke" not in proposed:
-                return False
-            return proposed.index("mcp.discover") < proposed.index("mcp.invoke")
-
-        initial_complete = required_actions.issubset(set(qwen_initial_actions))
-        final_complete = required_actions.issubset(set(qwen_final_actions))
-        plan_complete = required_actions.issubset(set(qwen_plan_actions))
-        final_mcp_order_valid = mcp_dependency_order_valid(qwen_final_actions)
-        plan_mcp_order_valid = mcp_dependency_order_valid(qwen_plan_actions)
-        repair_attempt_count = sum(
-            1 for item in planning_attempts
-            if isinstance(item, dict) and item.get("repair_requested") is True
-        ) if isinstance(planning_attempts, list) else 0
-        result["qwen_planning_diagnostics"] = {
-            "initial_model_tool_names": _safe_action_names(qwen_initial_actions),
-            "final_model_tool_names": _safe_action_names(qwen_final_actions),
-            "planned_action_names": _safe_action_names(qwen_plan_actions),
-            "missing_initial_model_tool_names": sorted(required_actions - set(qwen_initial_actions)),
-            "missing_final_model_tool_names": sorted(required_actions - set(qwen_final_actions)),
-            "missing_planned_action_names": sorted(required_actions - set(qwen_plan_actions)),
-            "initial_turn_complete": initial_complete,
-            "final_turn_complete": final_complete,
-            "final_plan_complete": plan_complete,
-            "final_model_mcp_discovery_before_invocation": final_mcp_order_valid,
-            "final_plan_mcp_discovery_before_invocation": plan_mcp_order_valid,
-            "planning_attempt_count": len(planning_attempts) if isinstance(planning_attempts, list) else 0,
-            "repair_attempt_count": repair_attempt_count,
-        }
+        qwen_planning_report = qwen_snapshot["diagnostics"]
+        final_complete = qwen_planning_report["final_turn_complete"]
+        plan_complete = qwen_planning_report["final_plan_complete"]
+        final_mcp_order_valid = qwen_planning_report["final_model_mcp_discovery_before_invocation"]
+        plan_mcp_order_valid = qwen_planning_report["final_plan_mcp_discovery_before_invocation"]
+        result["qwen_planning_diagnostics"] = qwen_planning_report
         if mission.status is not MissionStatus.READY or not mission.verify_integrity():
             raise RuntimeError("qwen_owner_mission_not_ready_or_integrity_invalid")
         if not final_complete or not final_mcp_order_valid:

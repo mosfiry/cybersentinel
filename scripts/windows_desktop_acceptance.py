@@ -498,12 +498,18 @@ def _may_resume_after_application_restart(
     execution_history_unchanged: bool,
 ) -> bool:
     terminal = {
-        "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+        "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED",
         "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
         "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
     }
+    reauth_quarantine = mission_status == "OWNER_REAUTH_REQUIRED" and queue_state == "needs_input"
+    persisted_pause = (
+        reauth_quarantine
+        if mission_status == "OWNER_REAUTH_REQUIRED"
+        else queue_state == "paused"
+    )
     return (
-        queue_state == "paused"
+        persisted_pause
         and pause_requested is True
         and mission_status not in terminal
         and owner_authorized
@@ -1275,25 +1281,32 @@ def _installed_app_mission(
         after_tool = _tool_execution_projection(persisted_status)
         before_projection = _mission_audit_projection(before_restart_snapshot, mission_id)
         after_projection = _mission_audit_projection(paused_restart_snapshot, mission_id)
+        reauth_quarantine = (
+            persisted_status.get("status") == "OWNER_REAUTH_REQUIRED"
+            and persisted_queue.get("state") == "needs_input"
+        )
         persistence_verified = (
-            persisted_queue.get("state") == "paused"
+            (persisted_queue.get("state") == "paused" or reauth_quarantine)
             and (persisted_status.get("progress") or {}).get("pause_requested") is True
         )
-        no_automatic_resume_verified = persistence_verified
+        no_automatic_resume_verified = False
         execution_history_unchanged = (
             before_tool["summary_sha256"] == after_tool["summary_sha256"]
             and before_tool["count"] == after_tool["count"]
+            and before_tool["records_sha256"] == after_tool["records_sha256"]
+            and before_tool["records_count"] == after_tool["records_count"]
             and before_tool["duplicate_tool_call_ids"] is False
             and after_tool["duplicate_tool_call_ids"] is False
             and before_projection["tool_execution_count"] == after_projection["tool_execution_count"]
-            and before_projection["timeline_sha256"] == after_projection["timeline_sha256"]
             and before_projection["evidence_sha256"] == after_projection["evidence_sha256"]
             and before_projection["validation_sha256"] == after_projection["validation_sha256"]
-            and before_projection["report_sha256"] == after_projection["report_sha256"]
             and before_projection["effect_ledger"].get("sha256") == after_projection["effect_ledger"].get("sha256")
+            and before_projection["effect_ledger"].get("full_records_sha256")
+            == after_projection["effect_ledger"].get("full_records_sha256")
             and before_projection["effect_ledger"].get("duplicate_effect_ids") is False
             and after_projection["effect_ledger"].get("duplicate_effect_ids") is False
         )
+        no_automatic_resume_verified = persistence_verified and execution_history_unchanged
         owner_authorized = paused_restart_cycle.get("owner_authentication", {}).get("status") == "PASS"
         runtime_ready = (
             paused_restart_cycle.get("model_runtime", {}).get("runtime_ready_after_restart") is True
@@ -1331,7 +1344,7 @@ def _installed_app_mission(
             resume_pause_requested = (resume_state.get("progress") or {}).get("pause_requested") is True
         else:
             terminal_status = persisted_status.get("status") in {
-                "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+                "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED",
                 "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
                 "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
             }
