@@ -21,6 +21,7 @@ from scripts.windows_desktop_acceptance import (
     _is_expected_qwen_install_post_request,
     _may_continue_qwen_install_post,
     _require_qwen_install_consent,
+    _refresh_qwen_model_snapshot,
     _safe_checkpoint_diagnostics,
     _safe_failure_diagnostics,
     _safe_tool_result_summary,
@@ -229,6 +230,70 @@ def test_health_probe_refuses_non_loopback_url() -> None:
 def _qwen_model_payload() -> dict:
     model = get_model("qwen3-4b-q4-k-m")
     return {key: getattr(model, key) for key in EXPECTED_QWEN3_4B_INSTALL_IDENTITY}
+
+
+def test_qwen_snapshot_refreshes_from_final_post_activation_poll_state() -> None:
+    initial_model = {
+        **_qwen_model_payload(),
+        "family": "Qwen3",
+        "parameter_size": "4B",
+        "compatible": True,
+        "recommended": True,
+        "installed": False,
+        "installed_sha256": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"],
+        "selected": False,
+        "active": False,
+    }
+    report = {"model_manager": {"catalog_loaded": True}}
+
+    _refresh_qwen_model_snapshot(
+        report, {"models": [initial_model]}, phase="initial_catalog_state"
+    )
+    assert report["model_manager"]["qwen3_4b"]["installed"] is False
+    assert report["model_manager"]["qwen3_4b"]["installed_sha256"] is None
+
+    final_model = {
+        **initial_model,
+        "installed": True,
+        "installed_sha256": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"],
+        "selected": True,
+        "active": True,
+    }
+    returned_model = _refresh_qwen_model_snapshot(
+        report, {"models": [final_model]}, phase="post_activation_inference_poll"
+    )
+
+    assert returned_model is final_model
+    assert report["model_manager"]["qwen3_4b_snapshot_phase"] == "post_activation_inference_poll"
+    assert report["model_manager"]["qwen3_4b"] == {
+        "model_id": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["model_id"],
+        "display_name": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["display_name"],
+        "family": "Qwen3",
+        "parameter_size": "4B",
+        "repository": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["repository"],
+        "revision": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["revision"],
+        "filename": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["filename"],
+        "quantization": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["quantization"],
+        "size_bytes": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["size_bytes"],
+        "sha256": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"],
+        "compatible": True,
+        "recommended": True,
+        "installed": True,
+        "installed_sha256": EXPECTED_QWEN3_4B_INSTALL_IDENTITY["sha256"],
+        "selected": True,
+        "active": True,
+    }
+
+    source = (ROOT / "scripts" / "windows_desktop_acceptance.py").read_text(encoding="utf-8")
+    snapshot_phases = [
+        'phase="post_install_verification_poll"',
+        'phase="post_activation_poll"',
+        'phase="post_install_activation_poll"',
+        'phase="post_activation_inference_poll"',
+    ]
+    phase_positions = [source.index(phase) for phase in snapshot_phases]
+    assert phase_positions == sorted(phase_positions)
+    assert source.index('timeout=300, phase="real_local_inference"') < phase_positions[-1]
 
 
 class _FakeDialog:

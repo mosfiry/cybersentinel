@@ -384,7 +384,13 @@ function renderModelCards(target) {
     appendVerifiedLink(source, `https://huggingface.co/${model.repository}/tree/${model.revision}`, "تحقق من المصدر والنسخة");
     const digest = document.createElement("p");
     digest.className = "model-meta model-digest";
-    digest.textContent = `SHA-256 المثبّت: ${model.sha256}`;
+    const installedDigestVerified = model.installed === true
+      && typeof model.installed_sha256 === "string"
+      && model.installed_sha256 === model.sha256
+      && /^[a-f0-9]{64}$/i.test(model.installed_sha256);
+    digest.textContent = installedDigestVerified
+      ? `SHA-256 الملف المثبّت بعد التحقق: ${model.installed_sha256}`
+      : `SHA-256 المتوقع في الكتالوج: ${model.sha256}`;
     const license = document.createElement("p");
     license.className = "model-meta";
     license.append(`الرخصة كما تعرضها بيانات المحوّل: ${model.license} · `);
@@ -415,7 +421,7 @@ function renderModelCards(target) {
       button.dataset.modelId = model.model_id;
       button.disabled = operation.status === "cancelling";
       actions.append(button);
-    } else if (model.active && runtime.status === "ready") {
+    } else if (model.active && runtime.status === "ready" && runtime.model_id === model.model_id) {
       button.textContent = "اختبار الاستدلال المحلي الحقيقي";
       button.dataset.modelAction = "test";
       button.dataset.modelId = model.model_id;
@@ -428,7 +434,7 @@ function renderModelCards(target) {
       stopButton.disabled = busy;
       actions.append(button, stopButton);
     } else if (model.installed) {
-      button.textContent = model.active ? "إعادة تشغيل النموذج" : "تشغيل / تبديل إلى هذا النموذج";
+      button.textContent = model.selected ? "إعادة تشغيل النموذج المحدد" : "تشغيل / تبديل إلى هذا النموذج";
       button.dataset.modelAction = "activate";
       button.dataset.modelId = model.model_id;
       button.disabled = busy || !model.compatible;
@@ -447,8 +453,9 @@ function renderModelCards(target) {
       progress.textContent = `${modelOperationLabel(operation)}${amount ? ` · ${amount}` : ""}`;
     } else if (operation.kind === "inference_test" && operation.model_id === model.model_id && operation.result) {
       progress.textContent = `نتيجة الاستدلال المحلي: ${operation.result}`;
-    } else if (model.active) {
-      progress.textContent = `Runtime: ${runtime.status || "غير معروف"}${runtime.error ? ` · ${runtime.error}` : ""}`;
+    } else if (model.selected) {
+      const runtimeModel = runtime.model_id && runtime.model_id !== model.model_id ? ` · النموذج الفعلي ${runtime.model_id}` : "";
+      progress.textContent = `Runtime: ${runtime.status || "غير معروف"}${runtimeModel}${runtime.error ? ` · ${runtime.error}` : ""}`;
     }
     article.append(title, description, meta, source, digest, license);
     if (capability.childNodes.length) article.appendChild(capability);

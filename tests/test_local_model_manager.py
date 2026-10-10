@@ -117,6 +117,7 @@ def test_models_download_verify_install_activate_switch_and_restore(tmp_path):
         wait_operation(manager, "complete")
         row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
         assert row["installed"] is True
+        assert row["installed_sha256"] == hashlib.sha256(payloads[spec.filename]).hexdigest()
 
     manager.activate(specs[0].model_id)
     wait_operation(manager, "complete")
@@ -128,6 +129,9 @@ def test_models_download_verify_install_activate_switch_and_restore(tmp_path):
     assert runtime.active == specs[1].model_id
     assert state["active_model_id"] == specs[1].model_id
     assert runtime.started[-2:] == [specs[0].model_id, specs[1].model_id]
+    active_row = next(item for item in manager.public_state()["models"] if item["model_id"] == specs[1].model_id)
+    assert active_row["active"] is True
+    assert active_row["selected"] is True
 
     restarted_runtime = FakeRuntime()
     restarted = LocalModelManager(
@@ -139,10 +143,19 @@ def test_models_download_verify_install_activate_switch_and_restore(tmp_path):
         downloader=lambda *_args, **_kwargs: pytest.fail("restore must not download"),
     )
     assert restarted.public_state()["manager"]["active_model_id"] == specs[1].model_id
+    restarted_row = next(item for item in restarted.public_state()["models"] if item["model_id"] == specs[1].model_id)
+    assert restarted_row["active"] is False
+    assert restarted_row["selected"] is True
+    assert restarted_row["installed"] is True
+    assert restarted_row["installed_sha256"] == specs[1].sha256
     restarted.restore_active()
     restored = wait_operation(restarted, "complete")
     assert restored["runtime"]["status"] == "ready"
     assert restarted_runtime.active == specs[1].model_id
+    restored_row = next(item for item in restarted.public_state()["models"] if item["model_id"] == specs[1].model_id)
+    assert restored_row["active"] is True
+    assert restored_row["selected"] is True
+    assert restored_row["installed_sha256"] == specs[1].sha256
 
 
 def test_install_directory_creation_failure_is_recorded_and_cleaned_up(tmp_path):
@@ -190,10 +203,11 @@ def test_install_rechecks_catalog_sha_before_treating_model_as_installed(tmp_pat
         stat.st_mtime_ns,
         stat.st_ctime_ns,
     )
-    manager._display_integrity_cache[spec.model_id] = (fingerprint, True)
+    manager._display_integrity_cache[spec.model_id] = (fingerprint, True, None)
 
     row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
     assert row["installed"] is True  # cached status is informational, not a trust decision
+    assert row["installed_sha256"] is None  # a cached boolean is not an artifact digest
     manager.install(spec.model_id)
     wait_operation(manager, "complete")
 
@@ -221,8 +235,84 @@ def test_public_state_hashes_unchanged_installed_model_once(tmp_path, monkeypatc
     for _ in range(6):
         row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
         assert row["installed"] is True
+        assert row["installed_sha256"] == hashlib.sha256(payload).hexdigest()
 
     assert hash_calls == 1
+
+
+def test_public_state_exposes_installed_sha_only_for_a_verified_complete_artifact(tmp_path):
+    payload = b"complete pinned model artifact"
+    spec = make_spec("verified-digest", payload)
+    manager, _runtime, _router = make_manager(tmp_path, [spec], {spec.filename: payload})
+
+    def model_row():
+        return next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
+
+    row = model_row()
+    assert row["installed"] is False
+    assert row["installed_sha256"] is None
+
+    partial_path = manager._model_path(spec).with_name(spec.filename + ".part")
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path.write_bytes(payload[:8])
+    row = model_row()
+    assert row["installed"] is False
+    assert row["installed_sha256"] is None
+
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+    model_path = manager._model_path(spec)
+    row = model_row()
+    assert row["installed"] is True
+    assert row["installed_sha256"] == hashlib.sha256(model_path.read_bytes()).hexdigest()
+
+    model_path.write_bytes(b"x" * spec.size_bytes)
+    row = model_row()
+    assert row["installed"] is False
+    assert row["installed_sha256"] is None
+
+    manager._manifest_path(spec).unlink()
+    row = model_row()
+    assert row["installed"] is False
+    assert row["installed_sha256"] is None
+
+    model_path.unlink()
+    row = model_row()
+    assert row["installed"] is False
+    assert row["installed_sha256"] is None
+
+
+@pytest.mark.parametrize(
+    "runtime_status,runtime_model_id,provider_model_id,expected_active",
+    [
+        ("stopped", "selected", "selected", False),
+        ("starting", "selected", "selected", False),
+        ("stopping", "selected", "selected", False),
+        ("ready", "other", "other", False),
+        ("ready", "selected", "other", False),
+        ("ready", "selected", "selected", True),
+    ],
+)
+def test_model_row_active_requires_ready_runtime_with_matching_identity(
+    tmp_path, runtime_status, runtime_model_id, provider_model_id, expected_active
+):
+    payload = b"active model identity"
+    spec = make_spec("selected", payload)
+    manager, _runtime, _router = make_manager(tmp_path, [spec], {spec.filename: payload})
+    manager.install(spec.model_id)
+    wait_operation(manager, "complete")
+
+    manager._state["active_model_id"] = spec.model_id
+    manager._state["runtime"] = {
+        "status": runtime_status,
+        "model_id": runtime_model_id,
+        "error": "",
+    }
+    manager._active_provider = SimpleNamespace(model=provider_model_id)
+
+    row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
+    assert row["selected"] is True
+    assert row["active"] is expected_active
 
 
 def test_failed_runtime_switch_restores_previous_model(tmp_path):
@@ -281,6 +371,10 @@ def test_activation_rechecks_file_hash_and_removes_invalid_manifest(tmp_path, mo
     assert not (manager.models_root / spec.model_id / "manifest.json").exists()
     assert runtime.started == []
     assert hash_calls >= 3  # display validation before/after tampering and fresh activation verification
+    row = next(item for item in manager.public_state()["models"] if item["model_id"] == spec.model_id)
+    assert row["installed"] is False
+    assert row["installed_sha256"] is None
+    assert row["active"] is False
 
 
 def test_partial_model_artifact_is_never_activated(tmp_path):

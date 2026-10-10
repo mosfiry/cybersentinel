@@ -206,6 +206,35 @@ def _find_qwen(state: dict) -> dict | None:
                  and "4b" in str(item.get("model_id", "")).casefold()), None)
 
 
+def _refresh_qwen_model_snapshot(report: dict, state: dict, *, phase: str) -> dict | None:
+    qwen = _find_qwen(state)
+    model_manager = report.setdefault("model_manager", {})
+    if not isinstance(model_manager, dict):
+        model_manager = {}
+        report["model_manager"] = model_manager
+    model_manager["qwen3_4b_present"] = qwen is not None
+    model_manager["qwen3_4b_snapshot_phase"] = phase
+    model_manager["qwen3_4b"] = ({
+        "model_id": qwen.get("model_id"),
+        "display_name": qwen.get("display_name"),
+        "family": qwen.get("family"),
+        "parameter_size": qwen.get("parameter_size"),
+        "repository": qwen.get("repository"),
+        "revision": qwen.get("revision"),
+        "filename": qwen.get("filename"),
+        "quantization": qwen.get("quantization"),
+        "size_bytes": qwen.get("size_bytes"),
+        "sha256": qwen.get("sha256"),
+        "compatible": qwen.get("compatible"),
+        "recommended": qwen.get("recommended"),
+        "installed": qwen.get("installed"),
+        "installed_sha256": qwen.get("installed_sha256") if qwen.get("installed") is True else None,
+        "selected": qwen.get("selected"),
+        "active": qwen.get("active"),
+    } if qwen else None)
+    return qwen
+
+
 def _format_consent_bytes(value: int) -> str:
     size = max(0, float(value))
     units = ("B", "KiB", "MiB", "GiB", "TiB")
@@ -839,25 +868,8 @@ def main() -> int:
                 "sha256": _sha256(hardware_text),
             }
             state = _model_state(page)
-            qwen = _find_qwen(state)
-            report["model_manager"] = {
-                "catalog_loaded": bool(model_cards > 0),
-                "qwen3_4b_present": qwen is not None,
-                "qwen3_4b": ({
-                    "model_id": qwen.get("model_id"),
-                    "display_name": qwen.get("display_name"),
-                    "family": qwen.get("family"),
-                    "parameter_size": qwen.get("parameter_size"),
-                    "quantization": qwen.get("quantization"),
-                    "size_bytes": qwen.get("size_bytes"),
-                    "sha256": qwen.get("sha256"),
-                    "compatible": qwen.get("compatible"),
-                    "recommended": qwen.get("recommended"),
-                    "installed": qwen.get("installed"),
-                    "active": qwen.get("active"),
-                    "installed_sha256": qwen.get("installed_sha256"),
-                } if qwen else None),
-            }
+            report["model_manager"] = {"catalog_loaded": bool(model_cards > 0)}
+            qwen = _refresh_qwen_model_snapshot(report, state, phase="initial_catalog_state")
             smoke_pass = overlay_visible and owner_form_visible and model_cards > 0 and qwen is not None and bool(hardware_text)
             if args.mode == "smoke":
                 report["status"] = "PASS" if smoke_pass else "FAIL"
@@ -982,6 +994,9 @@ def main() -> int:
                         page, lambda current, model, operation: bool(model and model.get("installed")),
                         timeout=args.model_timeout_seconds, phase="qwen_download_and_verify", progress=progress,
                     )
+                    _refresh_qwen_model_snapshot(
+                        report, state, phase="post_install_verification_poll"
+                    )
                 qwen = _find_qwen(state)
                 if not qwen or not qwen.get("installed"):
                     raise RuntimeError("qwen3_4b_install_not_persisted")
@@ -1021,7 +1036,12 @@ def main() -> int:
                         ),
                         timeout=600, phase="qwen_runtime_initialization", progress=progress,
                     )
-                qwen = _find_qwen(state)
+                    _refresh_qwen_model_snapshot(
+                        report, state, phase="post_activation_poll"
+                    )
+                qwen = _refresh_qwen_model_snapshot(
+                    report, state, phase="post_install_activation_poll"
+                )
                 runtime = (state.get("manager") or {}).get("runtime") or {}
                 if not qwen or not qwen.get("active") or runtime.get("status") != "ready":
                     raise RuntimeError("qwen3_4b_runtime_not_ready")
@@ -1079,7 +1099,9 @@ def main() -> int:
                     ),
                     timeout=300, phase="real_local_inference", progress=progress,
                 )
-                qwen = _find_qwen(state)
+                qwen = _refresh_qwen_model_snapshot(
+                    report, state, phase="post_activation_inference_poll"
+                )
                 operation = (state.get("manager") or {}).get("operation") or {}
                 runtime = (state.get("manager") or {}).get("runtime") or {}
                 inference_text = str((inference_api_result or {}).get("response", operation.get("result", "")))

@@ -48,7 +48,7 @@ class LocalModelManager:
         self._catalog = tuple(catalog)
         self._by_id = {item.model_id: item for item in self._catalog}
         # Display-only integrity observations; never use this cache to authorize activation or inference.
-        self._display_integrity_cache: dict[str, tuple[tuple[Any, ...], bool]] = {}
+        self._display_integrity_cache: dict[str, tuple[tuple[Any, ...], bool, str | None]] = {}
         self._hardware_provider = hardware_provider
         self._downloader = downloader
         self._lock = threading.RLock()
@@ -145,20 +145,20 @@ class LocalModelManager:
         except (OSError, json.JSONDecodeError, AttributeError):
             return False
 
-    def _installed_by_metadata(self, spec: ModelSpec) -> bool:
+    def _installed_observation(self, spec: ModelSpec) -> tuple[bool, str | None]:
         with self._lock:
             if not self._manifest_matches(spec):
                 self._display_integrity_cache.pop(spec.model_id, None)
-                return False
+                return False, None
             path = self._model_path(spec)
             try:
                 stat = path.stat()
             except OSError:
                 self._display_integrity_cache.pop(spec.model_id, None)
-                return False
+                return False, None
             if stat.st_size != spec.size_bytes:
                 self._display_integrity_cache.pop(spec.model_id, None)
-                return False
+                return False, None
 
             fingerprint = (
                 spec.sha256,
@@ -171,14 +171,20 @@ class LocalModelManager:
             )
             cached = self._display_integrity_cache.get(spec.model_id)
             if cached is not None and cached[0] == fingerprint:
-                return cached[1]
+                installed = cached[1] is True
+                installed_sha256 = cached[2] if len(cached) > 2 else None
+                if not installed:
+                    installed_sha256 = None
+                elif installed_sha256 != spec.sha256:
+                    installed_sha256 = None
+                return installed, installed_sha256
 
             try:
-                installed = _hash_file(path) == spec.sha256
+                actual_sha256 = _hash_file(path)
                 after = path.stat()
             except OSError:
                 self._display_integrity_cache.pop(spec.model_id, None)
-                return False
+                return False, None
             after_fingerprint = (
                 spec.sha256,
                 spec.size_bytes,
@@ -190,9 +196,14 @@ class LocalModelManager:
             )
             if after_fingerprint != fingerprint:
                 self._display_integrity_cache.pop(spec.model_id, None)
-                return False
-            self._display_integrity_cache[spec.model_id] = (fingerprint, installed)
-            return installed
+                return False, None
+            installed = actual_sha256 == spec.sha256
+            installed_sha256 = actual_sha256 if installed else None
+            self._display_integrity_cache[spec.model_id] = (fingerprint, installed, installed_sha256)
+            return installed, installed_sha256
+
+    def _installed_by_metadata(self, spec: ModelSpec) -> bool:
+        return self._installed_observation(spec)[0]
 
     def _installed_by_fresh_hash(self, spec: ModelSpec) -> bool:
         """Check idempotent installation without trusting display-only observations."""
@@ -233,8 +244,14 @@ class LocalModelManager:
 
     def _catalog_rows(self, hardware: dict[str, Any]) -> list[dict[str, Any]]:
         rows = []
+        selected_model_id = str(self._state.get("active_model_id", ""))
+        runtime = self._state.get("runtime") if isinstance(self._state.get("runtime"), dict) else {}
+        runtime_model_id = str(runtime.get("model_id", ""))
+        runtime_ready = runtime.get("status") == "ready"
+        runtime_provider_model_id = str(getattr(self._active_provider, "model", ""))
         for spec in self._catalog:
             compatibility = assess_compatibility(spec, hardware)
+            installed, installed_sha256 = self._installed_observation(spec)
             rows.append({
                 **spec.public(),
                 "compatible": compatibility["compatible"],
@@ -249,8 +266,14 @@ class LocalModelManager:
                     "evidence_type": "catalog estimate; not a measured benchmark",
                 },
                 "memory_estimates_are_benchmarks": False,
-                "installed": self._installed_by_metadata(spec),
-                "active": self._state.get("active_model_id") == spec.model_id,
+                "installed": installed,
+                "installed_sha256": installed_sha256,
+                "selected": selected_model_id == spec.model_id,
+                "active": (
+                    runtime_ready
+                    and runtime_model_id == spec.model_id
+                    and runtime_provider_model_id == spec.model_id
+                ),
             })
         return rows
 
@@ -549,7 +572,9 @@ class LocalModelManager:
             if not model_id:
                 return self.public_state()
             spec = self._spec(model_id)
-        self._begin_operation("stop", spec, "stopping")
+            self._begin_operation("stop", spec, "stopping")
+            self._state["runtime"] = {"status": "stopping", "model_id": model_id, "error": ""}
+            self._save_locked()
         thread = threading.Thread(
             target=self._deactivate_worker,
             args=(model_id,),

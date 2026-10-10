@@ -130,6 +130,20 @@ def test_local_model_catalog_downloader_and_runtime_are_pinned_and_loopback_only
     assert 'f"{ROOT / \'VERSION\'}{separator}."' in Path("scripts/build_desktop_backend.py").read_text(encoding="utf-8")
 
 
+def test_model_cards_distinguish_runtime_activity_selection_and_verified_digest():
+    manager = Path("agent/local_runtime/manager.py").read_text(encoding="utf-8")
+
+    assert '"selected": selected_model_id == spec.model_id' in manager
+    assert '"active": (' in manager
+    assert "runtime_ready" in manager
+    assert "runtime_model_id == spec.model_id" in manager
+    assert "runtime_provider_model_id == spec.model_id" in manager
+    assert 'model.selected ? "إعادة تشغيل النموذج المحدد"' in APP
+    assert "model.installed_sha256" in APP
+    assert "SHA-256 الملف المثبّت بعد التحقق" in APP
+    assert "SHA-256 المتوقع في الكتالوج" in APP
+
+
 def test_installer_and_exact_sha_workflow_build_a_private_artifact_not_a_release():
     build = PACKAGE["build"]
     targets = [item["target"] for item in build["win"]["target"]]
