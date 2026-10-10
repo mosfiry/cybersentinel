@@ -740,15 +740,13 @@ def _owner_auth_after_restart(
         before_status = before["http_status"]
         before_body = before["body"].get("status", {})
         before_identity = before_body.get("owner_identity_ref") if isinstance(before_body, dict) else None
-        csrf = _new_csrf_token(page)
-        invalid = _public_api(
-            page, "POST", "/api/public/auth/login", csrf=csrf,
-            payload={"username": username, "password": "invalid-after-application-restart"},
-        )
+        invalid = _login_owner_after_restart(page, username, "invalid-after-application-restart")
+        invalid_http_status = invalid.get("http_status")
+        invalid_error_code = invalid.get("error_code")
         invalid_rejected = (
-            invalid["http_status"] == 403
-            and invalid["body"].get("authenticated") is not True
-            and invalid["body"].get("error") == "invalid_credentials"
+            invalid_http_status == 403
+            and invalid.get("authenticated") is not True
+            and invalid_error_code == "invalid_credentials"
         )
         after_invalid = _public_api(page, "GET", mission_path + "/status")
         after_invalid_state = after_invalid["body"].get("status", {})
@@ -765,6 +763,8 @@ def _owner_auth_after_restart(
         invalid_auth_state_unchanged = invalid_preserved or invalid_did_not_create_session
         reauthenticated = False
         ui_login = {"http_status": None, "authenticated": False}
+        if before_owner_authenticated:
+            page.locator("#loginForm").evaluate("(form) => form.classList.add('hidden')")
         if after_invalid["http_status"] != 200:
             ui_login = _login_owner_after_restart(page, username, password)
             reauthenticated = (
@@ -787,7 +787,8 @@ def _owner_auth_after_restart(
         )
         result.update({
             "invalid_credentials_rejected": invalid_rejected,
-            "invalid_login_http_status": invalid["http_status"],
+            "invalid_login_http_status": invalid_http_status,
+            "invalid_login_error_code": invalid_error_code,
             "invalid_login_preserved_existing_owner": invalid_preserved,
             "invalid_login_did_not_create_owner_session": invalid_did_not_create_session,
             "invalid_login_authorization_state_unchanged": invalid_auth_state_unchanged,
@@ -802,6 +803,7 @@ def _owner_auth_after_restart(
             "renderer_login_form_hidden": renderer_state.get("login_form_hidden") is True,
             "renderer_logout_button_visible": renderer_state.get("logout_button_visible") is True,
             "valid_login_http_status": ui_login.get("http_status"),
+            "valid_login_error_code": ui_login.get("error_code"),
         })
     except Exception as exc:
         result["error_type"] = type(exc).__name__
@@ -848,6 +850,7 @@ def _renderer_owner_auth_state(page) -> dict:
 
 def _login_owner_after_restart(page, username: str, password: str) -> dict:
     try:
+        page.locator("#loginForm").evaluate("(form) => form.classList.remove('hidden')")
         page.locator("#loginUsername").fill(username)
         page.locator("#loginPassword").fill(password)
         with page.expect_response(
@@ -866,7 +869,14 @@ def _login_owner_after_restart(page, username: str, password: str) -> dict:
                 "username": body.get("username"),
                 "renderer_authenticated": state.get("authenticated") is True,
             }
-        return {"http_status": response.status, "authenticated": False}
+        error_code = body.get("error") if isinstance(body, dict) else None
+        return {
+            "http_status": response.status,
+            "authenticated": False,
+            "error_code": error_code
+            if isinstance(error_code, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,79}", error_code)
+            else None,
+        }
     except Exception as exc:
         return {"http_status": None, "authenticated": False, "error_type": type(exc).__name__}
 

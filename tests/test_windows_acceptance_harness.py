@@ -197,22 +197,26 @@ def test_owner_reauthentication_after_restart_rejects_invalid_password_and_resto
     identity = "owner:0123456789abcdef"
     responses = [
         {"http_status": 403, "body": {"error": "owner_authentication_required"}},
-        {"http_status": 403, "body": {"error": "invalid_credentials", "authenticated": False}},
         {"http_status": 403, "body": {"error": "owner_authentication_required"}},
         {"http_status": 200, "body": {"status": {"mission_id": mission_id, "owner_identity_ref": identity}}},
     ]
+    login_attempts = []
+
+    def fake_login(_page, _username, password):
+        login_attempts.append(password)
+        if password == "correct-test-only-password":
+            return {"http_status": 200, "authenticated": True, "username": "mosfiry"}
+        return {"http_status": 403, "authenticated": False, "error_code": "invalid_credentials"}
+
+    def forbidden_csrf_rotation(_page):
+        raise AssertionError("restart authentication must use the renderer-managed CSRF session")
 
     def fake_api(_page, _method, _path, *, csrf="", payload=None):
-        if payload is not None and payload.get("password") == "correct-test-only-password":
-            assert csrf == "csrf-test-token"
         return responses.pop(0)
 
     monkeypatch.setattr(windows_acceptance, "_public_api", fake_api)
-    monkeypatch.setattr(windows_acceptance, "_new_csrf_token", lambda _page: "csrf-test-token")
-    monkeypatch.setattr(
-        windows_acceptance, "_login_owner_after_restart",
-        lambda *_args: {"http_status": 200, "authenticated": True, "username": "mosfiry"},
-    )
+    monkeypatch.setattr(windows_acceptance, "_new_csrf_token", forbidden_csrf_rotation)
+    monkeypatch.setattr(windows_acceptance, "_login_owner_after_restart", fake_login)
     monkeypatch.setattr(
         windows_acceptance, "_renderer_owner_auth_state",
         lambda _page: {"authenticated": True, "login_form_hidden": True, "logout_button_visible": True},
@@ -228,9 +232,12 @@ def test_owner_reauthentication_after_restart_rejects_invalid_password_and_resto
     assert result["invalid_login_preserved_existing_owner"] is False
     assert result["invalid_login_did_not_create_owner_session"] is True
     assert result["invalid_login_authorization_state_unchanged"] is True
+    assert result["invalid_login_error_code"] == "invalid_credentials"
     assert result["valid_login_after_restart"] is True
+    assert result["valid_login_error_code"] is None
     assert result["owner_identity_matches"] is True
     assert result["mission_read_authorized"] is True
+    assert login_attempts == ["invalid-after-application-restart", "correct-test-only-password"]
     assert "correct-test-only-password" not in repr(result)
 
 
@@ -242,20 +249,36 @@ def test_owner_session_survives_restart_but_invalid_login_does_not_replace_it(
     status_body = {"status": {"mission_id": mission_id, "owner_identity_ref": identity}}
     responses = [
         {"http_status": 200, "body": status_body},
-        {"http_status": 403, "body": {"error": "invalid_credentials", "authenticated": False}},
         {"http_status": 200, "body": status_body},
         {"http_status": 200, "body": status_body},
     ]
 
     monkeypatch.setattr(windows_acceptance, "_public_api", lambda *_args, **_kwargs: responses.pop(0))
-    monkeypatch.setattr(windows_acceptance, "_new_csrf_token", lambda _page: "csrf-test-token")
+    monkeypatch.setattr(
+        windows_acceptance, "_new_csrf_token",
+        lambda _page: (_ for _ in ()).throw(AssertionError("unexpected CSRF session rotation")),
+    )
+    monkeypatch.setattr(
+        windows_acceptance, "_login_owner_after_restart",
+        lambda *_args: {"http_status": 403, "authenticated": False, "error_code": "invalid_credentials"},
+    )
     monkeypatch.setattr(
         windows_acceptance, "_renderer_owner_auth_state",
         lambda _page: {"authenticated": True, "login_form_hidden": True, "logout_button_visible": True},
     )
 
+    class FakePage:
+        class FakeLocator:
+            @staticmethod
+            def evaluate(_script):
+                return None
+
+        @staticmethod
+        def locator(_selector):
+            return FakePage.FakeLocator()
+
     result = _owner_auth_after_restart(
-        object(), f"/api/public/missions/{mission_id}", "mosfiry", "test-only-password", identity
+        FakePage(), f"/api/public/missions/{mission_id}", "mosfiry", "test-only-password", identity
     )
 
     assert result["status"] == "PASS"
