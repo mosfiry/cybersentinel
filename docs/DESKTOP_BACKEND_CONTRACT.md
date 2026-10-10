@@ -45,6 +45,16 @@ Public write routes validate same-origin/Origin and CSRF and require Owner autho
 
 - The ModelRouter remains Core's provider abstraction. The local manager owns pinned model acquisition, integrity verification, activation, status persistence, and `RuntimeAdapter` lifecycle. `llama.cpp` binds loopback only with a random API key; CPU is the supported backend in this installer.
 - Switching models cannot happen while a mission is active. A model download is resumable from a partial file and installation requires exact size and SHA-256.
+
+### Public model-row state contract
+
+The `/api/public/desktop/models` catalog row distinguishes a saved preference from live runtime state:
+
+- `selected` is the persisted model preference. It can remain true while the runtime is stopped or being restored; it does not imply readiness.
+- `active` is true only when the manager runtime is `ready` and both the runtime model ID and active provider/model ID match that row's `model_id`. A persisted selection alone is insufficient; starting, stopping, stopped, failed, or mismatched runtime state is not active.
+- `installed_sha256` is a display observation of the on-disk artifact digest, exposed only after the pinned manifest and expected size match and the actual file hash matches the catalog digest. A successful observation may be cached against the verified artifact fingerprint and pinned identity for status display; it is not authorization or inference authority. Install and activation perform their own fresh verification.
+- Missing, partial, tampered, manifest-invalid, or failed-verification artifacts report `installed: false` and `installed_sha256: null`. Failed runtime verification/startup does not leave the model ready or active.
+
 - Mission status controls, checkpoint/recovery, evidence chain, provenance, deterministic validation, findings, reports, scope firewall, target identity, tool registry, and bounded execution remain backend-owned.
 - The inspected source stores mission plan steps, queue/worker data, and tool results, but does not define a persistent independent sub-agent identity/run schema. The UI does not invent one; per-agent tracking requires a future Core data model with authorization, budget, checkpoint, and evidence lineage.
 - Filesystem and Git viewer routes keep their platform-specific fail-closed boundary; the app does not replace it with insecure path-based reads to make the UI appear more capable.
