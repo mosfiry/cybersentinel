@@ -70,7 +70,7 @@ def _safe_failure_reason_code(value: object) -> str | None:
     return None
 
 
-def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
+def _durable_tool_result_records(mission_state: dict) -> tuple[list, str]:
     progress = mission_state.get("progress")
     if not isinstance(progress, dict):
         return [], "unavailable"
@@ -88,6 +88,12 @@ def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
             break
         if source == "unavailable":
             source = "empty"
+
+    return raw_results, source
+
+
+def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
+    raw_results, source = _durable_tool_result_records(mission_state)
 
     summary = []
     for item in raw_results:
@@ -421,10 +427,16 @@ def _canonical_sha256(value: object) -> str:
 
 def _tool_execution_projection(mission_state: dict) -> dict:
     summary, source = _safe_tool_result_summary(mission_state)
+    raw_results, raw_source = _durable_tool_result_records(mission_state)
     return {
         "source": source,
         "count": len(summary),
         "summary_sha256": _canonical_sha256(summary),
+        "records_count": len(raw_results),
+        "records_sha256": (
+            _canonical_sha256({"source": raw_source, "records": raw_results})
+            if raw_source != "unavailable" else None
+        ),
         "run_project_tests_count": sum(item.get("name") == "run_project_tests" for item in summary),
         "duplicate_tool_call_ids": len({item.get("tool_call_id") for item in summary if item.get("tool_call_id")})
         != sum(bool(item.get("tool_call_id")) for item in summary),
@@ -437,6 +449,7 @@ def _effect_ledger_projection(records: object, mission_id: str) -> dict:
             "available": False,
             "count": 0,
             "sha256": None,
+            "full_records_sha256": None,
             "mission_binding_verified": False,
             "duplicate_effect_ids": False,
         }
@@ -469,6 +482,7 @@ def _effect_ledger_projection(records: object, mission_id: str) -> dict:
         "available": True,
         "count": len(records),
         "sha256": _canonical_sha256(stable_records),
+        "full_records_sha256": _canonical_sha256(records),
         "mission_binding_verified": mission_binding_verified,
         "duplicate_effect_ids": len(effect_ids) != len(set(effect_ids)),
     }

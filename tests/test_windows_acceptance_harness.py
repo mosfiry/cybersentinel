@@ -297,6 +297,25 @@ def test_tool_execution_projection_detects_replayed_call_ids_without_payloads() 
     assert "must-not-appear" not in repr(projection)
 
 
+def test_tool_execution_projection_detects_payload_only_changes_without_exposing_them() -> None:
+    mission = {"progress": {"model_loop": {"tool_results": [{
+        "name": "status",
+        "tool_call_id": "status-call",
+        "ok": True,
+        "result": {"private_payload": "first-private-result"},
+    }]}}}
+
+    before = _tool_execution_projection(mission)
+    mission["progress"]["model_loop"]["tool_results"][0]["result"]["private_payload"] = "second-private-result"
+    after = _tool_execution_projection(mission)
+
+    assert before["summary_sha256"] == after["summary_sha256"]
+    assert before["records_sha256"] != after["records_sha256"]
+    assert before["records_count"] == after["records_count"] == 1
+    assert "first-private-result" not in repr(before)
+    assert "second-private-result" not in repr(after)
+
+
 def test_effect_ledger_projection_detects_duplicate_or_misbound_effects_without_payloads() -> None:
     mission_id = "mission-acceptance-1"
     records = [
@@ -326,6 +345,7 @@ def test_effect_ledger_projection_detects_duplicate_or_misbound_effects_without_
     assert projection["duplicate_effect_ids"] is True
     assert projection["mission_binding_verified"] is True
     assert projection["sha256"] == timestamp_only_change["sha256"]
+    assert projection["full_records_sha256"] != timestamp_only_change["full_records_sha256"]
     assert misbound["mission_binding_verified"] is False
     assert "must-not-appear" not in repr(projection)
 
