@@ -18,6 +18,15 @@ def graph():
 
 
 class TestActorKnowledge:
+    def test_graph_can_be_built_without_seed_techniques(self):
+        isolated = build_actor_graph(with_seed_techniques=False)
+
+        assert isolated.entity("actor:APT28") is not None
+        assert isolated.entity("campaign:solarwinds-supply-chain") is not None
+        assert isolated.entity("malware:sunburst") is not None
+        assert isolated.entity("T1566.001") is None
+        assert isolated.techniques_of_actor("actor:APT28") == []
+
     def test_actor_ttps_answer_by_traversal(self, graph):
         apts28 = graph.techniques_of_actor("actor:APT28")
         # direct USES

@@ -166,3 +166,40 @@ def test_handle_returns_unknown_lifecycle_when_error_happens_before_record(monke
     assert result["request_id"] == "early-error"
     assert result["lifecycle"] == "unknown"
     assert result["error"] == "early failure"
+
+
+def test_handle_fails_closed_when_lifecycle_error_recording_fails(monkeypatch):
+    class ActiveLifecycle:
+        status = "executing"
+
+    monkeypatch.setattr(
+        engine,
+        "_handle_once",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("tool failure")),
+    )
+    monkeypatch.setattr(engine, "get_lifecycle", lambda _request_id: ActiveLifecycle())
+    monkeypatch.setattr(
+        engine,
+        "transition_lifecycle",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("lifecycle store unavailable")),
+    )
+    complete_calls = []
+    monkeypatch.setattr(
+        engine,
+        "complete_lifecycle",
+        lambda *args, **kwargs: complete_calls.append((args, kwargs)),
+    )
+
+    result = engine.handle("status", request_id="lifecycle-store-error")
+
+    assert result == {
+        "ok": False,
+        "decision": "failed",
+        "request_id": "lifecycle-store-error",
+        "lifecycle": "unknown",
+        "answer": "توقف التنفيذ قبل اكتمال سجل lifecycle.",
+        "error": "tool failure",
+        "plan": [],
+        "results": [],
+    }
+    assert complete_calls == []

@@ -86,6 +86,26 @@ def test_invalid_likelihoods_rejected():
         CyberEvidence(kind="x", likelihoods={"h1": 1.5})
 
 
+def test_hypothesis_engine_rejects_empty_or_invalid_priors():
+    with pytest.raises(ValueError):
+        MultiHypothesisEngine([])
+    with pytest.raises(ValueError):
+        MultiHypothesisEngine([("h1", "invalid prior", -0.1)])
+
+
+def test_eliminated_hypothesis_stays_eliminated_and_empty_active_is_unknown():
+    engine = MultiHypothesisEngine([("h1", "only hypothesis", 1.0)])
+    engine.apply(CyberEvidence(kind="contradiction", likelihoods={"h1": 0.0}))
+    engine.apply(CyberEvidence(kind="later evidence", likelihoods={"h1": 1.0}))
+
+    assert engine.hypotheses["h1"].eliminated is True
+    assert engine.dominant() is None
+    assert engine.suggest_discriminator([]) is None
+    assert engine.snapshot()["h1"]["elimination_reason"] == (
+        "contradicted by evidence: contradiction"
+    )
+
+
 # --------------------------------------------------------------------------
 # Attack-chain reconstruction
 # --------------------------------------------------------------------------
@@ -98,6 +118,20 @@ def test_chain_without_evidence_is_unknown_not_fabricated():
     assert result["status"] == "UNKNOWN"
     assert len(result["missing_transitions"]) == 6
     assert "PRIMITIVE -> HYPOTHESIS" in result["missing_transitions"]
+
+
+def test_chain_with_unknown_edge_remains_unknown_when_complete():
+    recon = AttackChainReconstructor()
+    edges = [
+        ChainEdge(a, b, evidence_refs=("e",), confidence=0.8, source="research", status=EdgeStatus.SUPPORTED)
+        for a, b in zip(
+            ("OBSERVATION", "PRIMITIVE", "HYPOTHESIS", "PRECONDITIONS", "INPUT_FLOW", "TRUST_BOUNDARY", "CONTROL_BYPASS"),
+            ("PRIMITIVE", "HYPOTHESIS", "PRECONDITIONS", "INPUT_FLOW", "TRUST_BOUNDARY", "CONTROL_BYPASS", "IMPACT"),
+        )
+    ]
+    edges[-1] = ChainEdge("CONTROL_BYPASS", "IMPACT", status=EdgeStatus.UNKNOWN)
+
+    assert recon.reconstruct(edges)["status"] == "UNKNOWN"
 
 
 def test_fully_evidenced_chain_is_supported():
@@ -173,6 +207,10 @@ def test_agreeing_sources_merge_without_conflict():
     assert result["conflict"] is False
     assert result["status"] == "SUPPORTED"
     assert len(result["supporting_sources"]) == 2
+
+
+def test_empty_source_claims_are_unknown():
+    assert SourceConflictEngine().evaluate([]) == {"status": "UNKNOWN", "values": []}
 
 
 # --------------------------------------------------------------------------
