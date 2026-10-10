@@ -252,20 +252,23 @@ class MissionScheduler:
 
     def dispatch_due(self, *, now: str) -> list[MissionSchedule]:
         current = datetime.fromisoformat(now.replace("Z", "+00:00"))
-        with sqlite3.connect(self.db_path) as db:
-            rows = db.execute("SELECT schedule_id FROM mission_schedules WHERE state=? AND next_run_at<=? ORDER BY next_run_at,schedule_id", (WorkerMissionState.SCHEDULED.value, now)).fetchall()
         dispatched = []
-        for (schedule_id,) in rows:
-            item = self.get(schedule_id)
-            self.queue.enqueue(item.mission_id, available_at=now, state=WorkerMissionState.QUEUED)
-            if item.interval_seconds:
-                next_run = (current + timedelta(seconds=item.interval_seconds)).isoformat()
-                with sqlite3.connect(self.db_path) as db:
-                    db.execute("UPDATE mission_schedules SET next_run_at=?,retries=0 WHERE schedule_id=?", (next_run, schedule_id))
-            else:
-                with sqlite3.connect(self.db_path) as db:
-                    db.execute("UPDATE mission_schedules SET state=? WHERE schedule_id=?", (WorkerMissionState.COMPLETED.value, schedule_id))
-            dispatched.append(self.get(schedule_id))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT schedule_id,mission_id,next_run_at,interval_seconds,retry_limit,retries,state "
+                "FROM mission_schedules WHERE state=? AND next_run_at<=? ORDER BY next_run_at,schedule_id",
+                (WorkerMissionState.SCHEDULED.value, now),
+            ).fetchall()
+            for schedule_id, mission_id, next_run_at, interval_seconds, retry_limit, retries, state in rows:
+                self.queue.enqueue(mission_id, available_at=now, state=WorkerMissionState.QUEUED)
+                if interval_seconds:
+                    next_run = (current + timedelta(seconds=interval_seconds)).isoformat()
+                    db.execute("UPDATE mission_schedules SET next_run_at=?,retries=0 WHERE schedule_id=? AND state=?", (next_run, schedule_id, WorkerMissionState.SCHEDULED.value))
+                    dispatched.append(MissionSchedule(schedule_id, mission_id, next_run, interval_seconds, retry_limit, 0, WorkerMissionState.SCHEDULED))
+                else:
+                    db.execute("UPDATE mission_schedules SET state=? WHERE schedule_id=? AND state=?", (WorkerMissionState.COMPLETED.value, schedule_id, WorkerMissionState.SCHEDULED.value))
+                    dispatched.append(MissionSchedule(schedule_id, mission_id, next_run_at, interval_seconds, retry_limit, retries, WorkerMissionState.COMPLETED))
         return dispatched
 
     def mark_missed(self, schedule_id: str, *, now: str) -> MissionSchedule:

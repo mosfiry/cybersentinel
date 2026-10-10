@@ -295,6 +295,46 @@ def test_scheduler_supports_one_time_and_recurring_dispatch(tmp_path):
     assert scheduler.get("recurring").next_run_at == "2026-01-01T00:02:00+00:00"
 
 
+def test_concurrent_scheduler_dispatch_claims_one_time_schedule_once(tmp_path, monkeypatch):
+    import threading
+
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    db = Path(tmp_path) / "scheduler.sqlite3"
+    first = MissionScheduler(db, queue)
+    first.schedule("mission-once", run_at="2026-01-01T00:00:00+00:00", schedule_id="one")
+    second = MissionScheduler(db, queue)
+    barrier = threading.Barrier(2)
+    local = threading.local()
+    original_dispatch_due = MissionScheduler.dispatch_due
+
+    def synchronized_dispatch_due(self, *, now):
+        if not getattr(local, "passed", False):
+            local.passed = True
+            barrier.wait(timeout=5)
+        return original_dispatch_due(self, now=now)
+
+    monkeypatch.setattr(MissionScheduler, "dispatch_due", synchronized_dispatch_due)
+    dispatched = []
+    errors = []
+
+    def dispatch(scheduler):
+        try:
+            dispatched.extend(scheduler.dispatch_due(now="2026-01-01T00:01:00+00:00"))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=dispatch, args=(scheduler,)) for scheduler in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(dispatched) == 1
+    assert queue.list(states=(WorkerMissionState.QUEUED,))[0].mission_id == "mission-once"
+
+
 def test_context_separation_and_independent_verification():
     context = MissionContext("mission-1")
     context.add("mission", ContextRecord("m1", {"decision": "run tests"}, "owner_instruction"))
