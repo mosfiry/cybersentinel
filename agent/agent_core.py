@@ -169,6 +169,31 @@ class AgentCore:
         return allowed.difference(forbidden_raw or ())
 
     @staticmethod
+    def _normalize_planning_requirements(
+        raw: list[str] | tuple[str, ...] | None,
+        permitted_tool_names: set[str] | None,
+    ) -> tuple[str, ...]:
+        if raw is None:
+            return ()
+        if not isinstance(raw, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in raw
+        ):
+            raise ValueError("invalid_required_planning_tools")
+        required = tuple(raw)
+        if len(set(required)) != len(required):
+            raise ValueError("duplicate_required_planning_tool")
+        registered = {
+            str(item.get("function", {}).get("name", ""))
+            for item in AgentCore._schemas()
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+        if not set(required).issubset(registered):
+            raise ValueError("unknown_required_planning_tool")
+        if permitted_tool_names is not None and not set(required).issubset(permitted_tool_names):
+            raise PermissionError("required_planning_tool_outside_owner_scope")
+        return required
+
+    @staticmethod
     def _validate_plan_tool_scope(plan: Plan, permitted_tool_names: set[str] | None) -> None:
         if permitted_tool_names is None:
             return
@@ -210,7 +235,10 @@ class AgentCore:
         return selected or None
 
     def _eligible_planning_tools(
-        self, objective: str, permitted_tool_names: set[str] | None
+        self,
+        objective: str,
+        permitted_tool_names: set[str] | None,
+        required_tool_names: tuple[str, ...] = (),
     ) -> set[str]:
         """Reduce model-visible schemas to the task and existing Owner scope."""
         registered = {
@@ -220,18 +248,60 @@ class AgentCore:
         }
         permitted = registered if permitted_tool_names is None else registered.intersection(permitted_tool_names)
         intent = self._intent_tool_allowlist(objective)
-        # This is context-size/capability selection only. Scope authorization,
-        # plan validation, Mission snapshots, and execution checks remain separate.
-        return permitted if intent is None else permitted.intersection(intent)
+        # Required actions are task constraints, not authority. The intersection
+        # with the caller's pre-existing scope is always applied first.
+        return permitted if intent is None else permitted.intersection(intent.union(required_tool_names))
+
+    @staticmethod
+    def _planning_failure_plan(
+        objective: str,
+        *,
+        reason_code: str,
+        issues: list[dict[str, str]] | None = None,
+        missing_required_tools: tuple[str, ...] = (),
+    ) -> Plan:
+        code = reason_code if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason_code) else "INVALID_MODEL_PLAN"
+        safe_issues: list[dict[str, str]] = []
+        for issue in (issues or ())[:10]:
+            issue_code = str(issue.get("code", "INVALID_MODEL_PLAN"))
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", issue_code):
+                issue_code = "INVALID_MODEL_PLAN"
+            safe_issue = {"code": issue_code}
+            tool_name = issue.get("tool")
+            if isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", tool_name):
+                safe_issue["tool"] = tool_name
+            safe_issues.append(safe_issue)
+        safe_missing = [
+            name for name in missing_required_tools
+            if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", name)
+        ]
+        step = PlanStep(
+            "planning-failure",
+            "Produce a complete plan using the registered tool schemas",
+            action="__planning_failure__",
+            expected_observation="complete schema-valid planning response",
+            retry_policy={
+                "failure_class": FailureClass.LOGIC.value,
+                "reason_code": code,
+                "validation_issues": safe_issues,
+                "missing_required_tools": safe_missing,
+            },
+        )
+        return Plan.initial(objective, created_from="agent_core").replan(
+            steps=(step,), reason="model plan rejected by deterministic validation"
+        )
 
     @staticmethod
     def _calls(response: dict[str, Any]) -> list[ToolCall]:
         calls: list[ToolCall] = []
-        for item in response.get("tool_calls") or []:
+        raw_calls = response.get("tool_calls") or []
+        if not isinstance(raw_calls, list):
+            raw_calls = []
+        for item in raw_calls:
             if isinstance(item, ToolCall):
                 calls.append(item)
             elif isinstance(item, dict) and isinstance(item.get("name"), str):
-                args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+                args = item["arguments"] if "arguments" in item else {}
                 calls.append(ToolCall(item["name"], args, str(item.get("id") or uuid.uuid4().hex)))
         if calls:
             return calls
@@ -241,9 +311,11 @@ class AgentCore:
         except json.JSONDecodeError:
             return []
         if isinstance(payload, dict) and isinstance(payload.get("tool"), str):
-            return [ToolCall(payload["tool"], payload.get("arguments") or {}, str(payload.get("id") or uuid.uuid4().hex))]
+            args = payload["arguments"] if "arguments" in payload else {}
+            return [ToolCall(payload["tool"], args, str(payload.get("id") or uuid.uuid4().hex))]
         if isinstance(payload, dict) and payload.get("type") == "tool_call" and isinstance(payload.get("name"), str):
-            return [ToolCall(payload["name"], payload.get("arguments") or {}, str(payload.get("id") or uuid.uuid4().hex))]
+            args = payload["arguments"] if "arguments" in payload else {}
+            return [ToolCall(payload["name"], args, str(payload.get("id") or uuid.uuid4().hex))]
         return []
 
     def _ask(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None, available_tool_names: set[str] | None = None) -> dict[str, Any]:
@@ -293,41 +365,165 @@ class AgentCore:
         except CapabilityUnsupported:
             return self.router.generate(messages, reasoning_profile=profile)
 
-    def _plan(self, objective: str, observation: dict[str, Any] | None = None, *, policy_context: str = "", request_id: str = "", conversation_id: str = "", skill_context: dict[str, Any] | None = None, memory_provider: Any = None, available_tool_names: set[str] | None = None) -> Plan:
-        eligible_tool_names = self._eligible_planning_tools(objective, available_tool_names)
-        response = self._ask(objective, observation, policy_context=policy_context, request_id=request_id, conversation_id=conversation_id, skill_context=skill_context, memory_provider=memory_provider, available_tool_names=eligible_tool_names)
+    def _plan(
+        self,
+        objective: str,
+        observation: dict[str, Any] | None = None,
+        *,
+        policy_context: str = "",
+        request_id: str = "",
+        conversation_id: str = "",
+        skill_context: dict[str, Any] | None = None,
+        memory_provider: Any = None,
+        available_tool_names: set[str] | None = None,
+        planning_requirements: tuple[str, ...] = (),
+        planning_feedback: str = "",
+    ) -> Plan:
+        eligible_tool_names = self._eligible_planning_tools(
+            objective, available_tool_names, planning_requirements
+        )
+        prompt_parts = [objective]
+        if planning_requirements:
+            prompt_parts.append(
+                "Planning contract (not additional authority): include every listed registered tool action, "
+                "using the supplied schemas and only the already authorized scope: "
+                + " -> ".join(planning_requirements)
+                + ". Follow task dependencies (including discovery before invocation); return the complete plan and do not claim any action has already executed."
+            )
+        if planning_feedback:
+            prompt_parts.append(
+                "The preceding plan was rejected by deterministic validation. Correct it and return the complete plan: "
+                + planning_feedback
+            )
+        response = self._ask(
+            "\n\n".join(prompt_parts),
+            observation,
+            policy_context=policy_context,
+            request_id=request_id,
+            conversation_id=conversation_id,
+            skill_context=skill_context,
+            memory_provider=memory_provider,
+            available_tool_names=eligible_tool_names,
+        )
+        if not isinstance(response, dict):
+            response = {"content": str(response)}
         self._last_model_response = dict(response)
         calls = self._calls(response)
+        issues: list[dict[str, str]] = []
+        valid_calls: list[tuple[int, ToolCall, Any, Any]] = []
+        seen_signatures: set[tuple[str, str]] = set()
         steps: list[PlanStep] = []
+        skill_ceiling: set[str] | None = None
+        if skill_context is not None:
+            raw_ceiling = skill_context.get("allowed_tools_ceiling", ())
+            if isinstance(raw_ceiling, (list, tuple, set, frozenset)):
+                skill_ceiling = {str(item) for item in raw_ceiling}
+
         for index, call in enumerate(calls, start=1):
-            if call.name not in eligible_tool_names:
+            name = call.name
+            safe_name = name if isinstance(name, str) and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", name
+            ) else ""
+            if not safe_name:
+                issues.append({"code": "INVALID_TOOL_NAME"})
+                continue
+            spec = get_tool(name)
+            if spec is None:
+                issues.append({"code": "UNSUPPORTED_TOOL", "tool": name})
+                continue
+            if name not in eligible_tool_names:
                 if skill_context is not None:
                     from .intelligence_layer.skills import SkillAuthorizationError
                     raise SkillAuthorizationError("model proposal exceeds the explicitly selected Skill tool ceiling")
+                issues.append({"code": "UNAUTHORIZED_TOOL", "tool": name})
                 continue
-            spec = get_tool(call.name)
-            if spec is None:
+            if skill_ceiling is not None and name not in skill_ceiling:
+                from .intelligence_layer.skills import SkillAuthorizationError
+                raise SkillAuthorizationError("model proposal exceeds the explicitly selected Skill tool ceiling")
+            if not isinstance(call.arguments, dict):
+                issues.append({"code": "INVALID_ARGUMENTS", "tool": name})
                 continue
+            valid, _reason, normalized_argument = spec.validate_input(call.arguments)
+            if not valid:
+                issues.append({"code": "INVALID_ARGUMENTS", "tool": name})
+                continue
+            try:
+                signature = (name, json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ))
+            except (TypeError, ValueError, UnicodeError):
+                issues.append({"code": "INVALID_ARGUMENTS", "tool": name})
+                continue
+            if signature in seen_signatures:
+                issues.append({"code": "DUPLICATE_TOOL_CALL", "tool": name})
+                continue
+            seen_signatures.add(signature)
+            valid_calls.append((index, call, spec, normalized_argument))
             steps.append(PlanStep(
-                step_id=f"step-{index}-{call.name}",
-                objective=f"Execute proposed tool {call.name} and capture an observation",
-                action=call.name,
+                step_id=f"step-{index}-{name}",
+                objective=f"Execute proposed tool {name} and capture an observation",
+                action=name,
                 expected_observation="tool observation",
                 authorization_requirement="owner" if spec.requires_owner else "",
                 scope_requirement="scope" if spec.scope_required else "",
                 retry_policy={"arguments": dict(call.arguments), "tool_call_id": call.call_id},
-                verification=(f"step-{index}-{call.name}",),
+                verification=(f"step-{index}-{name}",),
             ))
+
+        watch_targets: dict[str, set[str]] = {"watch": set(), "unwatch": set()}
+        for _index, call, _spec, normalized in valid_calls:
+            if call.name in watch_targets and isinstance(normalized, str):
+                watch_targets[call.name].add(normalized.strip().casefold())
+        if watch_targets["watch"].intersection(watch_targets["unwatch"]):
+            issues.append({"code": "CONTRADICTORY_ACTIONS", "tool": "watch"})
+
+        valid_names = [call.name for _index, call, _spec, _normalized in valid_calls]
+        if "mcp.discover" in valid_names and "mcp.invoke" in valid_names:
+            discovered: list[tuple[str, str | None]] = []
+            for _index, call, _spec, _normalized in valid_calls:
+                arguments = call.arguments
+                if call.name == "mcp.discover":
+                    discovered.append((str(arguments.get("server_id", "")), arguments.get("tool_name")))
+                elif call.name == "mcp.invoke":
+                    server_id = str(arguments.get("server_id", ""))
+                    tool_name = str(arguments.get("tool_name", ""))
+                    if not any(
+                        prior_server == server_id and (prior_tool is None or prior_tool == tool_name)
+                        for prior_server, prior_tool in discovered
+                    ):
+                        issues.append({"code": "INVALID_MCP_SEQUENCE", "tool": "mcp.invoke"})
+
+        missing_required = tuple(name for name in planning_requirements if name not in valid_names)
+
+        if issues or missing_required:
+            reason_code = issues[0]["code"] if issues else "MISSING_REQUIRED_TOOLS"
+            return self._planning_failure_plan(
+                objective,
+                reason_code=reason_code,
+                issues=issues,
+                missing_required_tools=missing_required,
+            )
         if not steps:
             if observation is not None:
                 # A textual continuation after an observed action means that
-                # the durable evidence should be verified now; it is not a
-                # new executable step.
-                return Plan.initial(objective, created_from="agent_core").replan(steps=(), reason="model final after observation")
-            # No model call is an explicit planning failure, not a silent success.
+                # durable evidence should be verified; it is not a new step.
+                return Plan.initial(objective, created_from="agent_core").replan(
+                    steps=(), reason="model final after observation"
+                )
             failure_class = "PROVIDER" if response.get("error") else "LOGIC"
-            steps.append(PlanStep("planning-failure", "Recover from malformed or empty model proposal", action="__planning_failure__", expected_observation="replanned action", retry_policy={"failure_class": failure_class}))
-        return Plan.initial(objective, created_from="agent_core").replan(steps=steps, reason="initial agent-core plan")
+            return self._planning_failure_plan(
+                objective,
+                reason_code="EMPTY_PLAN",
+                issues=[{"code": failure_class}],
+                missing_required_tools=planning_requirements,
+            )
+        return Plan.initial(objective, created_from="agent_core").replan(
+            steps=steps, reason="initial agent-core plan"
+        )
 
     def _observation_proposal(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Ask the configured model to interpret an observation, never to authorize it."""
@@ -584,7 +780,7 @@ class AgentCore:
             raise KeyError("unknown_mission")
         return result
 
-    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True, skill_id: str | None = None) -> Mission:
+    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True, skill_id: str | None = None, planning_requirements: list[str] | tuple[str, ...] | None = None) -> Mission:
         request_id = request_id or uuid.uuid4().hex
         authorization_context, policy_context = self._auth(instruction, owner_session_token, request_id)
         if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
@@ -634,11 +830,23 @@ class AgentCore:
             skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
         runtime_limits = self._context_runtime_limits()
         planning_tool_names = self._planning_tool_allowlist(scope_context)
+        required_planning_tools = self._normalize_planning_requirements(
+            planning_requirements, planning_tool_names
+        )
+        if skill_binding is not None and not set(required_planning_tools).issubset(
+            set(skill_binding.required_tools)
+        ):
+            from .intelligence_layer.skills import SkillAuthorizationError
+            raise SkillAuthorizationError("required planning actions exceed the selected Skill tool ceiling")
         planning_policy = RecoveryPolicy(max_retries=runtime_limits.max_retries)
         planning_run_id = uuid.uuid4().hex
         planning_failures: list[dict[str, Any]] = []
         planning_exhausted = False
         plan: Plan | None = None
+        initial_model_response: dict[str, Any] | None = None
+        planning_attempt_summaries: list[dict[str, Any]] = []
+        planning_feedback = ""
+        planning_repair_used = False
         for attempt_index in range(planning_policy.max_retries + 1):
             provider_attempt = attempt_index + 1
             self._last_model_response = {}
@@ -648,9 +856,52 @@ class AgentCore:
                         from .intelligence_layer.skills import SkillAuthorizationError
                         raise SkillAuthorizationError("active canonical Owner changed during Skill-guided planning")
                     skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
-                candidate_plan = self._plan(instruction, policy_context=policy_context, request_id=request_id, conversation_id=request_id, skill_context=skill_context_payload, memory_provider=memory_provider, available_tool_names=planning_tool_names)
+                candidate_plan = self._plan(
+                    instruction,
+                    policy_context=policy_context,
+                    request_id=request_id,
+                    conversation_id=request_id,
+                    skill_context=skill_context_payload,
+                    memory_provider=memory_provider,
+                    available_tool_names=planning_tool_names,
+                    planning_requirements=required_planning_tools,
+                    planning_feedback=planning_feedback,
+                )
+                model_response = dict(self._last_model_response)
+                if initial_model_response is None:
+                    initial_model_response = model_response
+                proposed_tool_names = []
+                for proposed_call in self._calls(model_response):
+                    proposed_name = proposed_call.name
+                    proposed_tool_names.append(
+                        proposed_name
+                        if isinstance(proposed_name, str) and re.fullmatch(
+                            r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", proposed_name
+                        )
+                        else "<invalid_action_name>"
+                    )
+                candidate_failure = (
+                    dict(candidate_plan.steps[0].retry_policy)
+                    if candidate_plan.steps and candidate_plan.steps[0].action == "__planning_failure__"
+                    else None
+                )
+                planning_attempt_summaries.append({
+                    "attempt_number": provider_attempt,
+                    "proposed_tool_names": proposed_tool_names,
+                    "plan_valid": candidate_failure is None,
+                    **({
+                        "failure_code": str(candidate_failure.get("reason_code", "INVALID_MODEL_PLAN")),
+                        "missing_required_tools": list(candidate_failure.get("missing_required_tools", ())),
+                    } if candidate_failure is not None else {}),
+                })
             except ProviderError as exc:
                 kind = getattr(getattr(exc, "kind", None), "value", getattr(exc, "kind", "PROVIDER_FAILURE"))
+                planning_attempt_summaries.append({
+                    "attempt_number": provider_attempt,
+                    "proposed_tool_names": [],
+                    "plan_valid": False,
+                    "failure_code": str(kind),
+                })
                 retryable_kind = str(kind) in {"PROVIDER_FAILURE", "TIMEOUT"}
                 recovery = planning_policy.action_for(FailureClass.PROVIDER, attempt_index)
                 if recovery in {RecoveryAction.RETRY, RecoveryAction.REPLAN} and not retryable_kind:
@@ -720,32 +971,62 @@ class AgentCore:
                     raise SkillAuthorizationError("model proposal exceeds the explicitly selected Skill tool ceiling")
             if candidate_plan.steps and candidate_plan.steps[0].action == "__planning_failure__":
                 final_content = str(self._last_model_response.get("content", "") or "").strip()
-                if final_content and not self._last_model_response.get("error"):
+                failure_details = dict(candidate_plan.steps[0].retry_policy)
+                failure_code = str(failure_details.get("reason_code", "INVALID_MODEL_PLAN"))
+                if (
+                    failure_code == "EMPTY_PLAN"
+                    and not required_planning_tools
+                    and final_content
+                    and not self._last_model_response.get("error")
+                ):
                     # A successful text-only answer is valid for chat, but it
                     # is not evidence that a Mission goal was executed.
-                    plan = candidate_plan
+                    plan = Plan.initial(instruction, created_from="agent_core").replan(
+                        steps=(), reason="model text final without a Mission action"
+                    )
+                    planning_attempt_summaries[-1]["accepted_text_final"] = True
                     break
-                recovery = planning_policy.action_for(FailureClass.LOGIC, attempt_index)
+                retry_planning = not planning_repair_used
+                recovery = RecoveryAction.REPLAN if retry_planning else RecoveryAction.FAIL
+                missing_tools = list(failure_details.get("missing_required_tools", ()))
+                validation_issues = list(failure_details.get("validation_issues", ()))
                 planning_failures.append({
                     "request_id": request_id,
                     "class": FailureClass.LOGIC.value,
-                    "kind": "INVALID_MODEL_RESPONSE",
+                    "kind": "INVALID_MODEL_PLAN",
+                    "reason_code": failure_code,
+                    "missing_required_tools": missing_tools,
+                    "validation_issues": validation_issues,
                     "provider": str(self._last_model_response.get("provider", "")),
                     "model": str(self._last_model_response.get("model", "")),
                     "error_type": "PlanningFailure",
                     "provider_attempt": provider_attempt,
                     "attempts": [],
-                    "reason": "model planning returned no executable action",
+                    "reason": "model plan did not satisfy registered schemas and required planning constraints",
                     "run_id": planning_run_id,
                     "turn_id": f"{planning_run_id}:planning:{provider_attempt}",
                     "retry_policy": {
-                        "max_retries": planning_policy.max_retries,
+                        "max_retries": 1,
                         "action": recovery.value,
-                        "retryable": recovery is RecoveryAction.REPLAN,
-                        "retry_scheduled": recovery is RecoveryAction.REPLAN,
+                        "retryable": retry_planning,
+                        "retry_scheduled": retry_planning,
                     },
                 })
-                if recovery is RecoveryAction.REPLAN:
+                if retry_planning:
+                    planning_repair_used = True
+                    planning_attempt_summaries[-1]["repair_requested"] = True
+                    feedback_parts = [f"reason_code={failure_code}"]
+                    if missing_tools:
+                        feedback_parts.append("missing required tools=" + ",".join(missing_tools))
+                    safe_issue_codes = [
+                        str(item.get("code", "INVALID_MODEL_PLAN"))
+                        + (":" + str(item["tool"]) if isinstance(item, dict) and item.get("tool") else "")
+                        for item in validation_issues
+                        if isinstance(item, dict)
+                    ]
+                    if safe_issue_codes:
+                        feedback_parts.append("validation issues=" + ",".join(safe_issue_codes))
+                    planning_feedback = "; ".join(feedback_parts)
                     continue
                 plan = candidate_plan
                 planning_exhausted = True
@@ -874,6 +1155,7 @@ class AgentCore:
                     "max_execution_steps": runtime_limits.max_execution_steps,
                     "max_execution_time_seconds": runtime_limits.max_execution_time_seconds,
                 },
+                **({"planning_requirements": list(required_planning_tools)} if required_planning_tools else {}),
                 **({"mission_memory_scope_ref": memory_scope_key} if memory_scope_key else {}),
             },
             authorization_snapshot_factory=authorization_snapshot_factory,
@@ -882,8 +1164,12 @@ class AgentCore:
             mission_id=mission_id,
             skill_binding=skill_binding.to_dict() if skill_binding is not None else None,
         )
-        if getattr(self, "_last_model_response", None):
-            mission.progress["initial_model_response"] = dict(self._last_model_response)
+        if initial_model_response is not None:
+            mission.progress["initial_model_response"] = initial_model_response
+        if planning_attempt_summaries:
+            mission.progress["planning_attempts"] = planning_attempt_summaries
+        if required_planning_tools:
+            mission.progress["planning_requirements"] = list(required_planning_tools)
         mission.semantic_intent = NaturalLanguageUnderstanding().understand(instruction).to_dict()
         adaptive_knowledge = self.knowledge_retriever.retrieve_adaptive(instruction, required_evidence=("supporting evidence", "counter-evidence"), limit=5)
         mission.knowledge_context = list(adaptive_knowledge.get("results", ()))

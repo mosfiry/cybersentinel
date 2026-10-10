@@ -1115,7 +1115,17 @@ class MissionRuntime:
                 kind = str(final_failure.get("kind", "PROVIDER_FAILURE"))
                 status_code = final_failure.get("http_status")
                 error_prefix = "model planning failure" if final_failure.get("class") == "LOGIC" else "model provider failure"
-                mission.error = f"{error_prefix}: {kind}" + (f" (HTTP {status_code})" if status_code is not None else "")
+                reason_code = final_failure.get("reason_code")
+                safe_reason_code = (
+                    isinstance(reason_code, str)
+                    and 0 < len(reason_code) <= 64
+                    and all(character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for character in reason_code)
+                )
+                mission.error = (
+                    f"{error_prefix}: {kind}"
+                    + (f" ({reason_code})" if safe_reason_code else "")
+                    + (f" (HTTP {status_code})" if status_code is not None else "")
+                )
                 mission.transition(
                     MissionStatus.FAILED_RETRY_EXHAUSTED,
                     "initial planning failed under bounded recovery policy",

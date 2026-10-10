@@ -652,6 +652,9 @@ def main() -> int:
             {"criterion_id": "mcp-invocation", "description": "owner-approved schema-pinned MCP result is evidence-bound", "check": "mcp_invoke", "expected_tool_name": TOOL_NAME, "required": True},
             {"criterion_id": "project-tests-pass", "description": "bounded project test process exits successfully", "check": "pytest_success", "required": True},
         ]
+        required_action_names = (
+            "status", "latest_intel", "browser", "mcp.discover", "mcp.invoke", "run_project_tests",
+        )
         failure_phase = "qwen_owner_mission_planning"
         mission = core.run_owner_mission(
             objective,
@@ -660,27 +663,60 @@ def main() -> int:
             scope_context=scope_context,
             completion_criteria=criteria,
             run=False,
+            planning_requirements=required_action_names,
         )
-        if mission.status is not MissionStatus.READY or not mission.verify_integrity():
-            raise RuntimeError("qwen_owner_mission_not_ready_or_integrity_invalid")
         initial_response = mission.progress.get("initial_model_response", {})
         initial_calls = initial_response.get("tool_calls", []) if isinstance(initial_response, dict) else []
-        qwen_proposed_actions = [
+        qwen_initial_actions = [
             str(call.get("name", "")) for call in initial_calls if isinstance(call, dict)
         ]
+        planning_attempts = mission.progress.get("planning_attempts", [])
+        final_attempt = planning_attempts[-1] if isinstance(planning_attempts, list) and planning_attempts else {}
+        raw_final_actions = final_attempt.get("proposed_tool_names", []) if isinstance(final_attempt, dict) else []
+        qwen_final_actions = [str(name) for name in raw_final_actions if isinstance(name, str)]
+        if not qwen_final_actions:
+            qwen_final_actions = list(qwen_initial_actions)
         qwen_plan_actions = [step.action for step in mission.plan.steps]
-        mission.progress["full_e2e_qwen_proposed_actions"] = list(qwen_proposed_actions)
-        required_actions = {"status", "latest_intel", "browser", "mcp.discover", "mcp.invoke", "run_project_tests"}
-        required_qwen_actions = {"status", "latest_intel", "browser", "mcp.discover"}
+        mission.progress["full_e2e_qwen_initial_tool_names"] = list(qwen_initial_actions)
+        mission.progress["full_e2e_qwen_final_tool_names"] = list(qwen_final_actions)
+        mission.progress["full_e2e_qwen_proposed_actions"] = list(qwen_final_actions)
+        qwen_proposed_actions = list(qwen_final_actions)
+        required_actions = set(required_action_names)
+
+        def mcp_dependency_order_valid(proposed: list[str]) -> bool:
+            if "mcp.discover" not in proposed or "mcp.invoke" not in proposed:
+                return False
+            return proposed.index("mcp.discover") < proposed.index("mcp.invoke")
+
+        initial_complete = required_actions.issubset(set(qwen_initial_actions))
+        final_complete = required_actions.issubset(set(qwen_final_actions))
+        plan_complete = required_actions.issubset(set(qwen_plan_actions))
+        final_mcp_order_valid = mcp_dependency_order_valid(qwen_final_actions)
+        plan_mcp_order_valid = mcp_dependency_order_valid(qwen_plan_actions)
+        repair_attempt_count = sum(
+            1 for item in planning_attempts
+            if isinstance(item, dict) and item.get("repair_requested") is True
+        ) if isinstance(planning_attempts, list) else 0
         result["qwen_planning_diagnostics"] = {
-            "initial_model_tool_names": _safe_action_names(qwen_proposed_actions),
+            "initial_model_tool_names": _safe_action_names(qwen_initial_actions),
+            "final_model_tool_names": _safe_action_names(qwen_final_actions),
             "planned_action_names": _safe_action_names(qwen_plan_actions),
-            "missing_initial_model_tool_names": sorted(required_qwen_actions - set(qwen_proposed_actions)),
+            "missing_initial_model_tool_names": sorted(required_actions - set(qwen_initial_actions)),
+            "missing_final_model_tool_names": sorted(required_actions - set(qwen_final_actions)),
             "missing_planned_action_names": sorted(required_actions - set(qwen_plan_actions)),
+            "initial_turn_complete": initial_complete,
+            "final_turn_complete": final_complete,
+            "final_plan_complete": plan_complete,
+            "final_model_mcp_discovery_before_invocation": final_mcp_order_valid,
+            "final_plan_mcp_discovery_before_invocation": plan_mcp_order_valid,
+            "planning_attempt_count": len(planning_attempts) if isinstance(planning_attempts, list) else 0,
+            "repair_attempt_count": repair_attempt_count,
         }
-        if not required_qwen_actions.issubset(set(qwen_proposed_actions)):
+        if mission.status is not MissionStatus.READY or not mission.verify_integrity():
+            raise RuntimeError("qwen_owner_mission_not_ready_or_integrity_invalid")
+        if not final_complete or not final_mcp_order_valid:
             raise RuntimeError("real_qwen_plan_missing_required_integrated_actions")
-        if not required_actions.issubset(set(qwen_plan_actions)):
+        if not plan_complete or not plan_mcp_order_valid:
             raise RuntimeError("owner_gated_mcp_invoke_continuation_missing")
         if qwen_plan_actions.index("mcp.discover") > qwen_plan_actions.index("mcp.invoke"):
             raise RuntimeError("real_qwen_plan_orders_mcp_invoke_before_discovery")
@@ -696,6 +732,8 @@ def main() -> int:
         bounded_test_steps = []
         browser_session_id = "bs_" + uuid.uuid4().hex
         updated_steps = []
+        acceptance_injected_steps: list[dict[str, str]] = []
+        model_generated_step_ids = {step.step_id for step in mission.plan.steps}
         for step in mission.plan.steps:
             policy = dict(step.retry_policy)
             arguments = dict(policy.get("arguments") or {})
@@ -741,6 +779,11 @@ def main() -> int:
             open_index = next(index for index, step in enumerate(updated_steps) if step.action == "browser" and step.step_id == open_steps[0])
             updated_steps.insert(open_index + 1, extraction)
             link_steps.append(extraction.step_id)
+            acceptance_injected_steps.append({
+                "step_id": extraction.step_id,
+                "action": extraction.action,
+                "reason": "deterministic scoped links extraction continuation",
+            })
         mission.plan = mission.plan.replan(
             steps=updated_steps,
             assumptions=mission.plan.assumptions,
@@ -771,6 +814,8 @@ def main() -> int:
             "mcp_server_id": server_id,
             "mcp_endpoint_sha256": sha256(endpoint),
             "effective_plan_actions": qwen_plan_actions,
+            "model_generated_step_ids": sorted(model_generated_step_ids),
+            "acceptance_injected_steps": acceptance_injected_steps,
             "browser_extraction_step_ids": link_steps,
             "scope_snapshot_id": snapshot.snapshot_id,
         }
@@ -786,7 +831,8 @@ def main() -> int:
             "status_initial": mission.status.value,
             "effective_plan_actions": qwen_plan_actions,
             "qwen_proposed_actions": qwen_proposed_actions,
-            "runtime_guardrail_actions": sorted(set(qwen_plan_actions) - set(qwen_proposed_actions)),
+            "runtime_guardrail_actions": sorted({item["action"] for item in acceptance_injected_steps}),
+            "acceptance_injected_steps": acceptance_injected_steps,
             "owner_gated_mcp_invoke_added_by_runtime_guardrail": "mcp.invoke" not in qwen_proposed_actions,
             "plan_version": mission.plan.version,
             "authorization_snapshot_present": bool(auth_snapshot),
