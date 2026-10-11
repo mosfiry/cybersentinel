@@ -62,12 +62,15 @@ class MissionQueue:
                 except sqlite3.OperationalError:
                     pass
 
-    def enqueue(self, mission_id: str, *, available_at: str | None = None, state: WorkerMissionState = WorkerMissionState.QUEUED) -> QueueItem:
+    def enqueue(self, mission_id: str, *, available_at: str | None = None, state: WorkerMissionState = WorkerMissionState.QUEUED, preserve_active: bool = False) -> QueueItem:
         if not mission_id.strip():
             raise ValueError("mission_id required")
         available = available_at or datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.db_path) as db:
-            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL", (mission_id, state.value, 0, available))
+            if preserve_active:
+                db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL WHERE mission_queue.state NOT IN (?,?,?,?)", (mission_id, state.value, 0, available, WorkerMissionState.EXECUTING.value, WorkerMissionState.PLANNING.value, WorkerMissionState.WAITING_FOR_TOOL.value, WorkerMissionState.WAITING_FOR_MODEL.value))
+            else:
+                db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL", (mission_id, state.value, 0, available))
         return self.get(mission_id)
 
     def get(self, mission_id: str) -> QueueItem:
@@ -261,7 +264,7 @@ class MissionScheduler:
                 (WorkerMissionState.SCHEDULED.value, now),
             ).fetchall()
             for schedule_id, mission_id, next_run_at, interval_seconds, retry_limit, retries, state in rows:
-                self.queue.enqueue(mission_id, available_at=now, state=WorkerMissionState.QUEUED)
+                self.queue.enqueue(mission_id, available_at=now, state=WorkerMissionState.QUEUED, preserve_active=True)
                 if interval_seconds:
                     next_run = (current + timedelta(seconds=interval_seconds)).isoformat()
                     db.execute("UPDATE mission_schedules SET next_run_at=?,retries=0 WHERE schedule_id=? AND state=?", (next_run, schedule_id, WorkerMissionState.SCHEDULED.value))

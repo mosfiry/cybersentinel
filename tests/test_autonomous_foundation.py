@@ -126,6 +126,18 @@ def test_reenqueue_clears_stale_lease_and_error(tmp_path):
     assert reclaimed.lease_owner == "new-worker"
 
 
+def test_scheduler_reenqueue_preserves_active_worker_lease(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-active", available_at="2026-01-01T00:00:00+00:00")
+    claimed = queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="active-worker", lease_seconds=3600)
+    assert claimed is not None
+
+    preserved = queue.enqueue("mission-active", available_at="2026-01-01T00:01:00+00:00", preserve_active=True)
+    assert preserved.state is WorkerMissionState.EXECUTING
+    assert preserved.lease_owner == "active-worker"
+    assert preserved.lease_expires_at == claimed.lease_expires_at
+
+
 def test_concurrent_workers_claim_a_mission_once(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
 
