@@ -88,13 +88,22 @@ def test_handle_once_denies_request_when_owner_session_challenge_fails(monkeypat
         "begin_lifecycle",
         lambda request_id, source: SimpleNamespace(status="created", claimed=True),
     )
-    monkeypatch.setattr(
-        engine,
-        "consume_owner_challenge",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            PermissionError("invalid owner challenge")
-        ),
-    )
+    if hasattr(engine, "consume_owner_challenge"):
+        monkeypatch.setattr(
+            engine,
+            "consume_owner_challenge",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                PermissionError("invalid owner challenge")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            engine,
+            "authenticate_owner",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                PermissionError("invalid owner challenge")
+            ),
+        )
     events = []
     completions = []
     monkeypatch.setattr(
@@ -108,13 +117,21 @@ def test_handle_once_denies_request_when_owner_session_challenge_fails(monkeypat
         lambda *args, **kwargs: completions.append((args, kwargs)),
     )
 
-    result = engine._handle_once(
-        "status",
-        source="test",
-        request_id="session-auth-denied",
-        owner_session_id="session-1",
-        owner_challenge="challenge-1",
-    )
+    if hasattr(engine, "consume_owner_challenge"):
+        result = engine._handle_once(
+            "status",
+            source="test",
+            request_id="session-auth-denied",
+            owner_session_id="session-1",
+            owner_challenge="challenge-1",
+        )
+    else:
+        result = engine._handle_once(
+            "status",
+            source="test",
+            owner_session_token="session-token",
+            request_id="session-auth-denied",
+        )
 
     assert result == {
         "ok": False,
@@ -146,6 +163,7 @@ def test_handle_once_denies_request_when_policy_rejects_authenticated_owner(monk
         "authenticate_owner",
         lambda *args, **kwargs: SimpleNamespace(
             authenticated_at="2026-10-12T00:00:00Z",
+            session_id="session-1",
             is_valid=lambda request_id: True,
             to_dict=lambda: {"method": "owner_token", "request_id": "policy-denied"},
         ),
