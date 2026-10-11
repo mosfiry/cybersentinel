@@ -13,14 +13,24 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import ProxyHandler, build_opener
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+from agent.evidence import verify_chain as _verify_evidence_chain
+from agent.mission import Mission as _Mission
+from agent.reporting import build_mission_report as _build_mission_report
+from agent.trajectory import EventType as _TrajectoryEventType, verify_trajectory as _verify_trajectory
 
 # This is only the harness's HTTP-response wait; AgentCore remains bounded by the
 # 300-second Owner mission limit, with a 30-second response-finalization margin.
@@ -70,25 +80,70 @@ def _safe_failure_reason_code(value: object) -> str | None:
     return None
 
 
+def _verify_durable_execution_chain(records: object) -> bool:
+    if not isinstance(records, list) or not records:
+        return False
+    try:
+        return _verify_evidence_chain(records)
+    except Exception:
+        return False
+
+
 def _durable_tool_result_records(mission_state: dict) -> tuple[list, str]:
     progress = mission_state.get("progress")
     if not isinstance(progress, dict):
         return [], "unavailable"
     model_loop = progress.get("model_loop")
-    nested_results = model_loop.get("tool_results") if isinstance(model_loop, dict) else None
-    candidates = (("model_loop", nested_results), ("top_level", progress.get("tool_results")))
-    raw_results: list = []
-    source = "unavailable"
-    for candidate_source, candidate in candidates:
-        if not isinstance(candidate, list):
-            continue
-        if candidate:
-            raw_results = candidate
-            source = candidate_source
-            break
-        if source == "unavailable":
-            source = "empty"
+    candidates: list[tuple[str, object]] = []
+    if isinstance(model_loop, dict) and "tool_results" in model_loop:
+        candidates.append(("model_loop", model_loop["tool_results"]))
+    elif "model_loop" in progress and model_loop is not None:
+        candidates.append(("model_loop", None))
+    if "tool_results" in progress:
+        candidates.append(("top_level", progress["tool_results"]))
 
+    result_lists: dict[str, list] = {}
+    invalid_sources: list[str] = []
+    for candidate_source, candidate in candidates:
+        if isinstance(candidate, list):
+            result_lists[candidate_source] = candidate
+        else:
+            invalid_sources.append(candidate_source)
+
+    nested_results = result_lists.get("model_loop", [])
+    top_level_results = result_lists.get("top_level", [])
+    raw_results = list(nested_results)
+    consumed_nested_mirrors: set[int] = set()
+    for item in top_level_results:
+        mirrored_index = None
+        call_id = item.get("tool_call_id") if isinstance(item, dict) else None
+        if isinstance(call_id, str) and call_id:
+            mirrored_index = next((
+                index for index, nested_item in enumerate(nested_results)
+                if index not in consumed_nested_mirrors
+                and isinstance(nested_item, dict)
+                and nested_item.get("tool_call_id") == call_id
+                and nested_item == item
+            ), None)
+        if mirrored_index is not None:
+            consumed_nested_mirrors.add(mirrored_index)
+            continue
+        raw_results.append(item)
+
+    raw_results.extend(None for _ in invalid_sources)
+    populated_sources = [
+        name for name, records in result_lists.items() if records
+    ]
+    if populated_sources:
+        source = "+".join(populated_sources)
+    elif result_lists:
+        source = "empty"
+    elif invalid_sources:
+        source = "invalid"
+    else:
+        source = "unavailable"
+    if invalid_sources and populated_sources:
+        source += "+invalid"
     return raw_results, source
 
 
@@ -98,6 +153,7 @@ def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
     summary = []
     for item in raw_results:
         if not isinstance(item, dict):
+            summary.append({"name": "<invalid_action_name>", "ok": None})
             continue
         raw_name = item.get("name")
         name = raw_name if isinstance(raw_name, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(raw_name) else "<invalid_action_name>"
@@ -160,6 +216,14 @@ def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
     return summary
 
 
+def _safe_exception_diagnostics(exc: BaseException) -> dict[str, str]:
+    """Omit exception text because it may contain credentials or submitted form data."""
+    return {
+        "error_type": type(exc).__name__,
+        "error": "failure details omitted for secret safety",
+    }
+
+
 def _safe_checkpoint_diagnostics(mission_state: dict) -> dict:
     checkpoint = mission_state.get("checkpoint")
     if not isinstance(checkpoint, dict):
@@ -179,7 +243,13 @@ def _safe_checkpoint_diagnostics(mission_state: dict) -> dict:
 def _tools_within_authorized_allowlist(tool_summary: list[dict], allowed_tools: object) -> bool:
     if not tool_summary or not isinstance(allowed_tools, list):
         return False
-    return all(isinstance(item, dict) and item.get("name") in allowed_tools for item in tool_summary)
+    return all(
+        isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and item.get("name") != "<invalid_action_name>"
+        and item.get("name") in allowed_tools
+        for item in tool_summary
+    )
 
 
 def _local_health_status(page) -> int | None:
@@ -425,6 +495,935 @@ def _canonical_sha256(value: object) -> str:
     return _sha256(encoded)
 
 
+_BLOCKED_STATUS_FIELDS = frozenset({
+    "status", "mission_status", "outcome", "state", "result", "result_status",
+    "verification", "verification_status", "verification_state", "report_verification",
+    "report_status", "execution_chain_integrity", "evidence_status", "reason_code",
+    "failure_class", "authorization_status", "decision", "error_code", "code",
+    "validation_state", "result_validation_state",
+})
+_UNVERIFIED_STATUS_VALUES = frozenset({
+    "UNVERIFIED", "USED_UNVERIFIED", "UNVERIFIED_PROVENANCE",
+    "UNVERIFIED_MODEL_PROPOSAL", "UNVERIFIED_EVIDENCE_PROVENANCE",
+    "PENDING_VALIDATION", "NOT_VERIFIED", "PARTIALLY_VERIFIED", "UNKNOWN",
+    "INVALID", "UNREADABLE", "NOT_PRESENT", "RECOVERY_REQUIRED",
+    "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED", "FAILED", "FAILURE",
+    "CANCELLED", "INTERRUPTED", "REJECTED", "ERROR",
+})
+_STATUS_FAILURE_PHRASE_PREFIXES = (_UNVERIFIED_STATUS_VALUES - frozenset({"ERROR"})) | frozenset({
+    "BLOCKED", "FAIL", "TOOL_FAILED", "TESTS_FAILED", "ACTION_FAILED",
+    "EXECUTION_FAILED", "AUTHORIZATION_DENIED", "SCOPE_DENIED", "ERROR_OCCURRED",
+    "ERROR_DETECTED", "ERROR_ENCOUNTERED", "ERROR_DURING", "ERROR_WHILE",
+})
+
+
+def _canonical_report_body_sha256(report: dict) -> str:
+    """Reproduce the canonical digest computed before its digest/approval envelope is added."""
+    body = dict(report)
+    for envelope_field in ("report_sha256", "report_digest_scope", "final_report_approval"):
+        body.pop(envelope_field, None)
+    return _canonical_sha256(body)
+
+
+_REPORT_DIGEST_SCOPE = (
+    "SHA-256 over canonical sorted compact UTF-8 JSON report content before the digest and approval envelope."
+)
+_REPORT_APPROVAL_LIMITATION = (
+    "Final report approval is a separate Owner decision bound to this report digest; it does not authorize actions or replace action-level approvals."
+)
+_EVIDENCE_RECEIPT_FIELDS = (
+    "mission_id", "task_id", "execution_id", "request_id", "worker_id",
+    "worker_instance_id", "runtime_generation", "lease_epoch", "task_version",
+    "authorization_hash", "fence_id",
+)
+
+
+def _execution_evidence_receipts_match(
+    full_chain: object, mission_state: dict, mission_id: str
+) -> bool:
+    """Match fenced global-chain records to exact receipts in this durable mission."""
+    if not isinstance(full_chain, list) or not isinstance(mission_state, dict):
+        return False
+    progress = mission_state.get("progress")
+    if not isinstance(progress, dict):
+        return False
+    raw_receipts = progress.get("execution_evidence_refs", [])
+    if not isinstance(raw_receipts, list) or any(not isinstance(item, dict) for item in raw_receipts):
+        return False
+    expected_receipts: list[dict] = []
+    for record in full_chain:
+        if not isinstance(record, dict):
+            return False
+        if not record.get("fence_id"):
+            continue
+        # The full global chain is verified independently; this status response
+        # carries receipts only for the current Mission's fenced records.
+        if record.get("mission_id") != mission_id:
+            continue
+        try:
+            expected_receipts.append({
+                "evidence_id": record["evidence_id"],
+                "sequence": int(record["sequence"]),
+                "current_hash": str(record["current_hash"]),
+                **{name: record[name] for name in _EVIDENCE_RECEIPT_FIELDS},
+            })
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+    return raw_receipts == expected_receipts
+
+
+def _independent_execution_chain_status(
+    full_chain: object, mission_state: dict, mission_id: str, request_id: str
+) -> str:
+    if not isinstance(full_chain, list):
+        return "UNREADABLE"
+    if not full_chain:
+        return "NOT_PRESENT"
+    if not _verify_durable_execution_chain(full_chain):
+        return "INVALID"
+    mission_chain = [
+        item for item in full_chain
+        if isinstance(item, dict)
+        and (
+            item.get("mission_id") == mission_id
+            or (not item.get("mission_id") and bool(request_id) and item.get("request_id") == request_id)
+        )
+    ]
+    if not mission_chain:
+        return "NOT_PRESENT"
+    if not _execution_evidence_receipts_match(full_chain, mission_state, mission_id):
+        return "INVALID"
+    return "VALID"
+
+
+def _producer_report_from_status(
+    mission_state: dict, mission_chain: list, chain_integrity: str
+) -> dict | None:
+    """Rebuild the report body from the status payload using the actual producer."""
+    try:
+        mission_view = SimpleNamespace(**mission_state)
+        expected = _build_mission_report(
+            mission_view,
+            execution_evidence=mission_chain,
+            evidence_chain_integrity=chain_integrity,
+        )
+        limitations = expected.get("limitations")
+        expected["limitations"] = (list(limitations) if isinstance(limitations, list) else []) + [
+            _REPORT_APPROVAL_LIMITATION
+        ]
+        report_sha256 = _canonical_report_body_sha256(expected)
+        expected["report_sha256"] = report_sha256
+        expected["report_digest_scope"] = _REPORT_DIGEST_SCOPE
+        progress = mission_state.get("progress")
+        progress = progress if isinstance(progress, dict) else {}
+        stored_approval = progress.get("final_report_approval")
+        owner_identity_ref = str(mission_state.get("owner_identity_ref", "") or "")
+        if not isinstance(stored_approval, dict):
+            approval_view = {"status": "PENDING", "report_sha256": report_sha256}
+        elif (
+            stored_approval.get("decision") == "APPROVED"
+            and stored_approval.get("report_sha256") == report_sha256
+            and stored_approval.get("owner_identity_ref") == owner_identity_ref
+        ):
+            approval_view = {
+                "status": "APPROVED",
+                "report_sha256": report_sha256,
+                "approved_at": str(stored_approval.get("approved_at", "")),
+            }
+        else:
+            approval_view = {
+                "status": "STALE",
+                "report_sha256": str(stored_approval.get("report_sha256", "")),
+                "current_report_sha256": report_sha256,
+                "approved_at": str(stored_approval.get("approved_at", "")),
+            }
+        expected["final_report_approval"] = approval_view
+        return expected
+    except Exception:
+        return None
+
+
+def _is_structured_verification_summary(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    verified = value.get("verified")
+    evidence_count = value.get("evidence_count")
+    missing_criteria = value.get("missing_criteria", [])
+    runtime_reported_verified = value.get("runtime_reported_verified")
+    return (
+        (verified is None or type(verified) is bool)
+        and type(evidence_count) is int
+        and evidence_count >= 0
+        and isinstance(missing_criteria, list)
+        and all(isinstance(item, str) for item in missing_criteria)
+        and (
+            "runtime_reported_verified" not in value
+            or runtime_reported_verified is None
+            or type(runtime_reported_verified) is bool
+        )
+    )
+
+
+def _contains_status_failure_phrase(normalized_phrase: str) -> bool:
+    negations = {"NO", "NOT", "NEVER", "WITHOUT"}
+    for prefix in _STATUS_FAILURE_PHRASE_PREFIXES:
+        pattern = re.compile(rf"(?:^|_){re.escape(prefix)}(?:_|$)")
+        for match in pattern.finditer(normalized_phrase):
+            before = normalized_phrase[:match.start()].rstrip("_")
+            previous_word = before.rsplit("_", 1)[-1] if before else ""
+            if previous_word not in negations:
+                return True
+    return False
+
+
+def _contains_blocked_or_unverified_status(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            field = key.casefold() if isinstance(key, str) else ""
+            if field in _BLOCKED_STATUS_FIELDS:
+                if isinstance(child, str):
+                    normalized = child.strip().upper().replace("-", "_").replace(" ", "_")
+                    if field in {"reason_code", "error_code", "code", "failure_class"} and normalized:
+                        return True
+                    if (
+                        normalized in _UNVERIFIED_STATUS_VALUES
+                        or normalized.startswith("UNVERIFIED_")
+                        or normalized == "BLOCKED"
+                        or normalized.endswith("_BLOCKED")
+                    ):
+                        return True
+                    allowed_statuses = _STATUS_SCALAR_ALLOWLISTS.get(field)
+                    if allowed_statuses is not None and normalized not in allowed_statuses:
+                        return True
+                    if (
+                        field == "result"
+                        and re.search(r"\bERROR\s*:", child, flags=re.IGNORECASE)
+                    ):
+                        return True
+                    phrase_normalized = re.sub(r"[^A-Z0-9]+", "_", child.strip().upper()).strip("_")
+                    if (
+                        field == "result"
+                        and _contains_status_failure_phrase(phrase_normalized)
+                    ):
+                        return True
+                    if (
+                        field == "result"
+                        and re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)*", child.strip())
+                        and normalized not in _STATUS_GENERIC_VALUES
+                    ):
+                        return True
+                elif field == "result":
+                    pass
+                elif field in {"verification", "verification_state"} and _is_structured_verification_summary(child):
+                    pass
+                else:
+                    return True
+            if _contains_blocked_or_unverified_status(child):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_contains_blocked_or_unverified_status(item) for item in value)
+    return False
+
+
+def _mission_ids(value: object) -> list[object]:
+    values: list[object] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "mission_id":
+                values.append(child)
+            values.extend(_mission_ids(child))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            values.extend(_mission_ids(child))
+    return values
+
+
+def _record_bound_to_mission(record: object, mission_id: str) -> bool:
+    values = _mission_ids(record)
+    return bool(values) and all(isinstance(value, str) and value == mission_id for value in values)
+
+
+def _field_values(value: object, field: str) -> list[object]:
+    values: list[object] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == field:
+                values.append(child)
+            values.extend(_field_values(child, field))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            values.extend(_field_values(child, field))
+    return values
+
+
+def _record_request_binding(record: object, request_id: str, *, require_present: bool) -> bool:
+    values = _field_values(record, "request_id")
+    return (bool(values) or not require_present) and all(
+        isinstance(value, str) and value == request_id for value in values
+    )
+
+
+def _evidence_ref_matches(reference: object, record: object) -> bool:
+    if not isinstance(reference, dict) or not isinstance(record, dict):
+        return False
+    sequence = reference.get("sequence")
+    return (
+        isinstance(reference.get("evidence_id"), str)
+        and bool(reference.get("evidence_id"))
+        and type(sequence) is int
+        and sequence > 0
+        and re.fullmatch(r"[0-9a-f]{64}", str(reference.get("current_hash", ""))) is not None
+        and reference.get("evidence_id") == record.get("evidence_id")
+        and sequence == record.get("sequence")
+        and reference.get("current_hash") == record.get("current_hash")
+    )
+
+
+def _project_test_result_digest(result: dict) -> tuple[str, int] | None:
+    observation_fields = {"type", "action_id", "step_id", "mission_id", "tool_call_id"}
+    raw_result = {key: value for key, value in result.items() if key not in observation_fields}
+    try:
+        encoded = json.dumps(
+            raw_result, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False, default=str,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return hashlib.sha256(encoded).hexdigest(), len(encoded)
+
+
+def _durable_tool_result_linkage(record: object, mission_id: str, request_id: str) -> dict | None:
+    if not isinstance(record, dict):
+        return None
+    name = record.get("name")
+    call_id = record.get("tool_call_id")
+    raw_action_id = record.get("action_id")
+    raw_step_id = record.get("step_id")
+    result = record.get("result")
+    error = record.get("error")
+    if (
+        not isinstance(name, str)
+        or _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(name) is None
+        or not isinstance(call_id, str)
+        or _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(call_id) is None
+        or not isinstance(raw_action_id, str)
+        or not isinstance(raw_step_id, str)
+        or type(record.get("ok")) is not bool
+        or not isinstance(result, dict)
+        or not isinstance(error, str)
+        or record.get("mission_id") != mission_id
+        or not _record_bound_to_mission(record, mission_id)
+        or not _record_request_binding(record, request_id, require_present=True)
+    ):
+        return None
+
+    result_successful = record["ok"] is True and error == ""
+    for status_field in ("ok", "success"):
+        if status_field in result:
+            if type(result[status_field]) is not bool or result[status_field] is not True:
+                result_successful = False
+    if "error" in result and (not isinstance(result["error"], str) or result["error"]):
+        result_successful = False
+    if _contains_blocked_or_unverified_status(result):
+        result_successful = False
+
+    return {
+        "name": name,
+        "tool_call_id": call_id,
+        "raw_action_id": raw_action_id,
+        "action_id": raw_action_id or call_id,
+        "raw_step_id": raw_step_id,
+        "step_id": raw_step_id or name,
+        "status": "completed" if record["ok"] is True else "failed",
+        "successful": result_successful,
+    }
+
+
+def _reconcile_tool_executed_timeline(
+    mission_state: dict,
+    timeline: object,
+    tool_results: list,
+    mission_id: str,
+    request_id: str,
+) -> dict:
+    events = [
+        item for item in timeline
+        if isinstance(item, dict) and item.get("event") == "ToolExecuted"
+    ] if isinstance(timeline, list) else []
+    history = mission_state.get("action_history")
+    history_records = history if isinstance(history, list) else []
+    result_records = tool_results if isinstance(tool_results, list) else []
+    result_linkages = [
+        _durable_tool_result_linkage(record, mission_id, request_id)
+        for record in result_records
+    ]
+    malformed_result_count = sum(linkage is None for linkage in result_linkages)
+    failed_result_count = sum(
+        linkage is not None and linkage["successful"] is not True
+        for linkage in result_linkages
+    )
+    valid = (
+        isinstance(timeline, list)
+        and all(isinstance(item, dict) for item in timeline)
+        and isinstance(history, list)
+        and all(isinstance(item, dict) for item in history_records)
+        and isinstance(tool_results, list)
+        and len(events) == len(history_records) == len(result_records)
+        and malformed_result_count == 0
+        and failed_result_count == 0
+    )
+    matched_events = 0
+    used_history: set[int] = set()
+    used_results: set[int] = set()
+
+    for event in events:
+        data = event.get("data")
+        action_id = data.get("action_id") if isinstance(data, dict) else None
+        step_id = event.get("step_id")
+        action_status = data.get("status") if isinstance(data, dict) else None
+        if (
+            not isinstance(data, dict)
+            or not isinstance(action_id, str) or not action_id
+            or not isinstance(step_id, str) or not step_id
+            or not isinstance(action_status, str)
+            or action_status not in {"completed", "failed"}
+            or event.get("mission_id") != mission_id
+            or event.get("request_id") != request_id
+            or not _record_bound_to_mission(event, mission_id)
+            or not _record_request_binding(event, request_id, require_present=True)
+            or ("task_id" in event and event.get("task_id") != step_id)
+            or ("step_id" in data and data.get("step_id") != step_id)
+            or ("task_id" in data and data.get("task_id") != step_id)
+        ):
+            valid = False
+            continue
+
+        history_matches = [
+            index for index, record in enumerate(history_records)
+            if isinstance(record, dict)
+            and record.get("action_id") == action_id
+            and record.get("step_id") == step_id
+            and record.get("status") == action_status
+            and _record_bound_to_mission(record, mission_id)
+        ]
+        if len(history_matches) != 1 or history_matches[0] in used_history:
+            valid = False
+            continue
+
+        history_record = history_records[history_matches[0]]
+        observation = history_record.get("observation")
+        if not isinstance(observation, dict) or not _record_bound_to_mission(observation, mission_id):
+            valid = False
+            continue
+        result_matches = []
+        for index, linkage in enumerate(result_linkages):
+            if (
+                linkage is None
+                or index in used_results
+                or linkage["action_id"] != action_id
+                or linkage["step_id"] != step_id
+                or linkage["status"] != action_status
+                or observation.get("tool_call_id") != linkage["tool_call_id"]
+                or observation.get("action_id", linkage["raw_action_id"]) != linkage["raw_action_id"]
+                or observation.get("step_id", linkage["raw_step_id"]) != linkage["raw_step_id"]
+                or ("tool_call_id" in data and data.get("tool_call_id") != linkage["tool_call_id"])
+                or ("tool_name" in data and data.get("tool_name") != linkage["name"])
+            ):
+                continue
+            result_matches.append(index)
+        if len(result_matches) != 1:
+            valid = False
+            continue
+        used_history.add(history_matches[0])
+        used_results.add(result_matches[0])
+        matched_events += 1
+
+    unaccounted_results = max(0, len(result_records) - len(used_results))
+    all_results_accounted = (
+        isinstance(tool_results, list)
+        and malformed_result_count == 0
+        and unaccounted_results == 0
+    )
+    all_results_successful = (
+        isinstance(tool_results, list)
+        and malformed_result_count == 0
+        and failed_result_count == 0
+    )
+    verified = (
+        valid
+        and matched_events == len(events)
+        and len(used_history) == len(history_records)
+        and all_results_accounted
+        and all_results_successful
+    )
+    return {
+        "verified": verified,
+        "tool_executed_event_count": len(events),
+        "action_history_record_count": len(history_records),
+        "durable_tool_result_record_count": len(result_records),
+        "matched_durable_call_count": len(used_results),
+        "unaccounted_tool_executed_event_count": max(0, len(events) - matched_events),
+        "unaccounted_action_history_record_count": max(0, len(history_records) - len(used_history)),
+        "unaccounted_durable_tool_result_count": unaccounted_results,
+        "malformed_durable_tool_result_count": malformed_result_count,
+        "failed_durable_tool_result_count": failed_result_count,
+        "all_durable_tool_results_accounted": all_results_accounted,
+        "all_durable_tool_results_successful": all_results_successful,
+    }
+
+
+def _reconcile_tool_authorization_timeline(
+    mission_state: dict, timeline: object, tool_results: list,
+    mission_id: str, request_id: str,
+) -> dict:
+    """Require ordered, scope-bound authorization; never infer missing runtime scope fields."""
+    if not isinstance(timeline, list) or not isinstance(tool_results, list):
+        return {"verified": False, "all_call_decisions_reconciled": False,
+                "fully_authorized_successful_execution": False,
+                "unreconciled_authorization_event_count": 1, "call_classifications": [],
+                "schema_status": "INVALID"}
+    proposals: dict[str, list[tuple[int, dict]]] = {}
+    decisions: dict[str, list[tuple[int, dict]]] = {}
+    malformed = 0
+    runtime_scope_schema_missing = False
+    for index, event in enumerate(timeline):
+        if not isinstance(event, dict) or event.get("event") not in {"ToolProposed", "AuthorizationChecked"}:
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            malformed += 1
+            continue
+        if "tool_call_id" not in data:
+            malformed += 1
+            continue
+        call_id = data.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            malformed += 1
+            continue
+        target = proposals if event["event"] == "ToolProposed" else decisions
+        target.setdefault(call_id, []).append((index, event))
+        if event["event"] == "AuthorizationChecked" and not all(
+            isinstance(data.get(field), str) and data[field]
+            for field in ("action_id", "step_id", "authorization_context_id", "scope_snapshot_id")
+        ):
+            runtime_scope_schema_missing = True
+
+    call_ids = [item.get("tool_call_id") for item in tool_results if isinstance(item, dict)]
+    valid_ids = {item for item in call_ids if isinstance(item, str) and item}
+    unaccounted = malformed + (len(call_ids) - len(valid_ids))
+    unaccounted += sum(len(rows) for key, rows in (*proposals.items(), *decisions.items()) if key not in valid_ids)
+    classifications: list[str] = []
+    history = mission_state.get("action_history")
+    history = history if isinstance(history, list) else []
+
+    for result in tool_results:
+        if not isinstance(result, dict):
+            classifications.append("MALFORMED_RESULT")
+            unaccounted += 1
+            continue
+        call_id, action_id, step_id = (
+            result.get("tool_call_id"), result.get("action_id"), result.get("step_id")
+        )
+        context_id, scope_id = result.get("authorization_context_id"), result.get("scope_snapshot_id")
+        if not all(isinstance(value, str) and value for value in (call_id, action_id, step_id, context_id, scope_id)):
+            classifications.append("IDENTITY_OR_SCOPE_UNBOUND")
+            unaccounted += 1
+            continue
+        proposed, checked = proposals.get(call_id, []), decisions.get(call_id, [])
+        if len(proposed) != 1 or len(checked) != 1:
+            classifications.append("MISSING_OR_DUPLICATE_AUTHORIZATION_RECORD")
+            unaccounted += 1
+            continue
+        proposal_index, proposal_event = proposed[0]
+        authorization_index, authorization_event = checked[0]
+        proposal = proposal_event.get("data")
+        authorization = authorization_event.get("data")
+        expected = {
+            "mission_id": mission_id, "request_id": request_id,
+            "name": result.get("name"), "tool_call_id": call_id,
+            "action_id": action_id, "step_id": step_id,
+            "authorization_context_id": context_id, "scope_snapshot_id": scope_id,
+        }
+        if (
+            not isinstance(proposal, dict) or not isinstance(authorization, dict)
+            or any(proposal.get(key) != value for key, value in expected.items())
+            or any(authorization.get(key) != value for key, value in expected.items() if key != "name")
+            or proposal_event.get("mission_id") != mission_id
+            or proposal_event.get("request_id") != request_id
+            or authorization_event.get("mission_id") != mission_id
+            or authorization_event.get("request_id") != request_id
+            or type(authorization.get("allowed")) is not bool
+            or proposal_index >= authorization_index
+        ):
+            classifications.append("AUTHORIZATION_IDENTITY_SCOPE_OR_ORDER_MISMATCH")
+            unaccounted += 1
+            continue
+        executed = []
+        for event_index, event in enumerate(timeline):
+            data = event.get("data") if isinstance(event, dict) else None
+            if (
+                isinstance(event, dict) and event.get("event") == "ToolExecuted"
+                and isinstance(data, dict) and data.get("action_id") == action_id
+                and event.get("mission_id") == mission_id and event.get("request_id") == request_id
+                and event.get("step_id") == step_id and event_index > authorization_index
+                and isinstance(data.get("status"), str)
+                and data.get("status") in {"completed", "failed"}
+            ):
+                executed.append((event_index, event))
+        actions = [item for item in history if isinstance(item, dict)
+                   and item.get("action_id") == action_id and item.get("step_id") == step_id
+                   and isinstance(item.get("observation"), dict)
+                   and item["observation"].get("tool_call_id") == call_id]
+        if authorization["allowed"] is False:
+            if result.get("ok") is False and isinstance(result.get("error"), str) and result["error"] and not executed and not actions:
+                classifications.append("PRE_DISPATCH_DENIED")
+            else:
+                classifications.append("DENIAL_CONFLICTS_WITH_EXECUTION_OR_RESULT")
+                unaccounted += 1
+        elif len(executed) == 1 and len(actions) == 1:
+            execution_status = executed[0][1]["data"].get("status")
+            if result.get("ok") is True and execution_status == "completed":
+                classifications.append("AUTHORIZED_EXECUTION_COMPLETED")
+            elif result.get("ok") is False and execution_status == "failed":
+                classifications.append("POST_DISPATCH_FAILURE")
+            else:
+                classifications.append("EXECUTION_RESULT_STATUS_MISMATCH")
+                unaccounted += 1
+        else:
+            classifications.append("AUTHORIZED_CALL_EXECUTION_UNACCOUNTED")
+            unaccounted += 1
+
+    reconciled = unaccounted == 0 and len(classifications) == len(tool_results)
+    return {
+        "verified": reconciled,
+        "all_call_decisions_reconciled": reconciled,
+        "fully_authorized_successful_execution": bool(classifications) and reconciled
+        and all(item == "AUTHORIZED_EXECUTION_COMPLETED" for item in classifications),
+        "unreconciled_authorization_event_count": unaccounted,
+        "call_classifications": classifications,
+        "schema_status": "BLOCKED" if runtime_scope_schema_missing else ("VALID" if reconciled else "INVALID"),
+    }
+
+
+def _mission_project_test_execution_proof(
+    mission_state: dict,
+    timeline: object,
+    mission_evidence: object,
+    report_goal_evidence: object,
+    execution_chain: object,
+    mission_id: str,
+    request_id: str,
+    chain_integrity: object,
+    *,
+    full_execution_chain: object = None,
+) -> dict:
+    raw_results, _source = _durable_tool_result_records(mission_state)
+    timeline_reconciliation = _reconcile_tool_executed_timeline(
+        mission_state, timeline, raw_results, mission_id, request_id
+    )
+    authorization_reconciliation = _reconcile_tool_authorization_timeline(
+        mission_state, timeline, raw_results, mission_id, request_id
+    )
+    durable_result_records_valid = (
+        timeline_reconciliation["malformed_durable_tool_result_count"] == 0
+        and timeline_reconciliation["all_durable_tool_results_accounted"] is True
+        and timeline_reconciliation["all_durable_tool_results_successful"] is True
+        and authorization_reconciliation["fully_authorized_successful_execution"] is True
+    )
+    test_results = [
+        item for item in raw_results
+        if isinstance(item, dict) and item.get("name") == "run_project_tests"
+    ]
+    successful_result_indices = {
+        index for index, item in enumerate(test_results)
+        if item.get("ok") is True
+        or (
+            isinstance(item.get("result"), dict)
+            and (
+                item["result"].get("ok") is True
+                or (
+                    type(item["result"].get("returncode")) is int
+                    and item["result"].get("returncode") == 0
+                )
+            )
+        )
+    }
+    evidence = mission_evidence if isinstance(mission_evidence, list) else []
+    goal_evidence = report_goal_evidence if isinstance(report_goal_evidence, list) else []
+    chain = execution_chain if isinstance(execution_chain, list) else []
+    full_chain = full_execution_chain if isinstance(full_execution_chain, list) else []
+    full_chain_receipts_valid = _execution_evidence_receipts_match(
+        full_chain, mission_state, mission_id
+    )
+    full_chain_hash_valid = (
+        _verify_durable_execution_chain(full_chain) and full_chain_receipts_valid
+    )
+    mission_filtered_global_chain = [
+        item for item in full_chain
+        if isinstance(item, dict)
+        and (
+            item.get("mission_id") == mission_id
+            or (
+                not item.get("mission_id")
+                and bool(request_id)
+                and item.get("request_id") == request_id
+            )
+        )
+    ]
+    report_chain_matches_global = (
+        full_chain_hash_valid
+        and isinstance(execution_chain, list)
+        and mission_filtered_global_chain == chain
+    )
+    execution_chain_hash_valid = full_chain_hash_valid and report_chain_matches_global
+    execution_chain_integrity_verified = (
+        chain_integrity == "VALID" and execution_chain_hash_valid
+    )
+    process_records = [
+        item for item in chain
+        if isinstance(item, dict) and item.get("source") == "sandboxed-process:run_project_tests"
+    ]
+    native_records = [
+        item for item in chain
+        if isinstance(item, dict) and item.get("source") == "native-tool:run_project_tests"
+    ]
+    linked_call_records: list[dict] = []
+    verified_candidates: list[dict] = []
+    verified_successful_result_indices: set[int] = set()
+
+    for call_index, call in enumerate(test_results):
+        call_id = call.get("tool_call_id")
+        action_id = call.get("action_id") or call_id
+        task_id = call.get("step_id")
+        result = call.get("result")
+        if (
+            not isinstance(call_id, str) or not call_id
+            or not isinstance(action_id, str) or not action_id
+            or not isinstance(task_id, str) or not task_id
+            or not isinstance(result, dict)
+            or not _record_bound_to_mission(call, mission_id)
+            or not _record_request_binding(call, request_id, require_present=True)
+        ):
+            continue
+        process_matches = [
+            item for item in process_records
+            if _evidence_ref_matches(result.get("evidence_ref"), item)
+            and item.get("mission_id") == mission_id
+            and item.get("request_id") == request_id
+            and item.get("task_id") == task_id
+            and item.get("execution_id") == action_id
+            and _record_bound_to_mission(item, mission_id)
+            and _record_request_binding(item, request_id, require_present=True)
+        ]
+        native_matches = [
+            item for item in native_records
+            if item.get("mission_id") == mission_id
+            and item.get("request_id") == request_id
+            and item.get("task_id") == task_id
+            and item.get("execution_id") == action_id
+            and _record_bound_to_mission(item, mission_id)
+            and _record_request_binding(item, request_id, require_present=True)
+            and isinstance(item.get("evidence"), dict)
+            and item["evidence"].get("record_type") == "NATIVE_TOOL_RESULT"
+            and item["evidence"].get("tool_name") == "run_project_tests"
+            and item["evidence"].get("tool_call_id") == call_id
+        ]
+        event_matches = [
+            item for item in (timeline if isinstance(timeline, list) else [])
+            if isinstance(item, dict)
+            and item.get("event") == "ToolExecuted"
+            and item.get("mission_id") == mission_id
+            and item.get("request_id") == request_id
+            and _record_bound_to_mission(item, mission_id)
+            and _record_request_binding(item, request_id, require_present=True)
+            and item.get("step_id") == task_id
+            and item.get("task_id", task_id) == task_id
+            and isinstance(item.get("data"), dict)
+            and item["data"].get("step_id", task_id) == task_id
+            and item["data"].get("task_id", task_id) == task_id
+            and item["data"].get("action_id") == action_id
+            and item["data"].get("status") == "completed"
+        ]
+        if len(process_matches) != 1 or len(native_matches) != 1 or len(event_matches) != 1:
+            continue
+        linked_call_records.append(call)
+
+        process_record = process_matches[0]
+        process_payload = process_record.get("evidence")
+        native_record = native_matches[0]
+        native_payload = native_record.get("evidence")
+        digest = _project_test_result_digest(result)
+        if not isinstance(process_payload, dict) or not isinstance(native_payload, dict) or digest is None:
+            continue
+        digest_sha256, digest_bytes = digest
+        process_payload_valid = (
+            process_payload.get("record_type") == "UNTRUSTED_SANDBOX_PROCESS_RESULT"
+            and process_payload.get("trust") == "untrusted_data"
+            and process_payload.get("authority") == "none"
+            and process_payload.get("sandbox_backend") == "bubblewrap+prlimit"
+            and process_payload.get("network") == "disabled"
+            and process_payload.get("workspace_mode") == "read_only"
+            and type(process_payload.get("exit_code")) is int
+            and process_payload.get("exit_code") == 0
+            and process_payload.get("timed_out") is False
+            and process_payload.get("cancelled") is False
+            and re.fullmatch(r"[0-9a-f]{64}", str(process_payload.get("output_sha256", ""))) is not None
+            and isinstance(process_payload.get("artifact_refs"), list)
+            and isinstance(process_payload.get("artifact_capture_truncated"), bool)
+            and process_record.get("verification") == "observed"
+        )
+        native_payload_valid = (
+            native_record.get("verification") == "observed"
+            and native_payload.get("trust_classification") == "untrusted_data"
+            and native_payload.get("authority") == "none"
+            and native_payload.get("authorized_tool") is True
+            and native_payload.get("result_type") == "dict"
+            and native_payload.get("result_sha256") == digest_sha256
+            and type(native_payload.get("result_bytes")) is int
+            and native_payload.get("result_bytes") == digest_bytes
+            and isinstance(native_record.get("chain"), (list, tuple))
+            and f"mission:{mission_id}" in native_record.get("chain", ())
+            and "tool:run_project_tests" in native_record.get("chain", ())
+            and f"call:{call_id}" in native_record.get("chain", ())
+        )
+        result_valid = (
+            call.get("ok") is True
+            and result.get("ok") is True
+            and type(result.get("returncode")) is int
+            and result.get("returncode") == 0
+            and result.get("timed_out") is False
+            and result.get("cancelled") is False
+            and result.get("sandbox_backend") == "bubblewrap+prlimit"
+            and result.get("network") == "disabled"
+            and result.get("workspace_mode") == "read_only"
+            and result.get("trust") == "untrusted_data"
+            and result.get("authority") == "none"
+            and _evidence_ref_matches(result.get("evidence_ref"), process_record)
+            and result.get("mission_id") == mission_id
+            and result.get("tool_call_id") == call_id
+            and result.get("action_id") == call.get("action_id", "")
+            and result.get("step_id") == call.get("step_id", "")
+            and not _contains_blocked_or_unverified_status(call)
+        )
+        call_evidence = [
+            item for item in evidence
+            if isinstance(item, dict)
+            and item.get("source") == "run_project_tests"
+            and isinstance(item.get("provenance"), dict)
+            and item["provenance"].get("tool_call_id") == call_id
+            and item.get("passed") is True
+            and _record_bound_to_mission(item, mission_id)
+            and _record_request_binding(item, request_id, require_present=False)
+            and isinstance(item.get("result"), dict)
+            and item["result"].get("result") == result
+            and item["provenance"].get("verification_authority") == "project_test_process_exit"
+        ]
+        report_call_evidence = [
+            item for item in goal_evidence
+            if isinstance(item, dict)
+            and item.get("source") == "run_project_tests"
+            and item.get("passed") is True
+            and item.get("report_verification") == "TRUSTED_DETERMINISTIC_SOURCE"
+            and isinstance(item.get("provenance"), dict)
+            and item["provenance"].get("tool_call_id") == call_id
+            and _record_bound_to_mission(item, mission_id)
+            and _record_request_binding(item, request_id, require_present=False)
+            and isinstance(item.get("result"), dict)
+            and item["result"].get("result") == result
+        ]
+        if (
+            process_payload_valid and native_payload_valid and result_valid
+            and len(call_evidence) == 1 and len(report_call_evidence) == 1
+        ):
+            verified_candidates.append({
+                "process_record": process_record,
+                "native_record": native_record,
+                "call_id": call_id,
+                "action_id": action_id,
+            })
+            verified_successful_result_indices.add(call_index)
+
+    unaccounted_successful_result_count = len(
+        successful_result_indices - verified_successful_result_indices
+    )
+    unaccounted_result_record_count = len(
+        set(range(len(test_results))) - verified_successful_result_indices
+    )
+    exactly_one = (
+        durable_result_records_valid
+        and execution_chain_integrity_verified
+        and len(process_records) == 1
+        and len(native_records) == 1
+        and len(linked_call_records) == 1
+        and len(verified_candidates) == 1
+        and timeline_reconciliation.get("verified") is True
+        and len(successful_result_indices) == 1
+        and unaccounted_successful_result_count == 0
+        and unaccounted_result_record_count == 0
+    )
+    verified = exactly_one and not _contains_blocked_or_unverified_status(
+        (mission_state, evidence, goal_evidence, chain)
+    )
+    return {
+        "verified": verified,
+        "exactly_one_actual_execution_verified": verified,
+        "durable_result_records_valid": durable_result_records_valid,
+        "tool_executed_timeline_reconciled": timeline_reconciliation["verified"],
+        "authorization_timeline_reconciled": authorization_reconciliation["verified"],
+        "authorization_schema_status": authorization_reconciliation["schema_status"],
+        "all_calls_fully_authorized_successful": authorization_reconciliation[
+            "fully_authorized_successful_execution"
+        ],
+        "unreconciled_authorization_event_count": authorization_reconciliation[
+            "unreconciled_authorization_event_count"
+        ],
+        "authorization_call_classifications": authorization_reconciliation[
+            "call_classifications"
+        ],
+        "tool_executed_event_count": timeline_reconciliation["tool_executed_event_count"],
+        "action_history_record_count": timeline_reconciliation["action_history_record_count"],
+        "matched_durable_action_call_count": timeline_reconciliation["matched_durable_call_count"],
+        "unaccounted_tool_executed_event_count": timeline_reconciliation["unaccounted_tool_executed_event_count"],
+        "unaccounted_action_history_record_count": timeline_reconciliation["unaccounted_action_history_record_count"],
+        "durable_tool_result_record_count": timeline_reconciliation["durable_tool_result_record_count"],
+        "unaccounted_durable_tool_result_record_count": timeline_reconciliation["unaccounted_durable_tool_result_count"],
+        "malformed_durable_tool_result_record_count": timeline_reconciliation["malformed_durable_tool_result_count"],
+        "failed_durable_tool_result_record_count": timeline_reconciliation["failed_durable_tool_result_count"],
+        "all_durable_tool_results_accounted": timeline_reconciliation["all_durable_tool_results_accounted"],
+        "all_durable_tool_results_successful": timeline_reconciliation["all_durable_tool_results_successful"],
+        "execution_chain_hash_valid": execution_chain_hash_valid,
+        "execution_chain_receipts_verified": full_chain_receipts_valid,
+        "global_execution_chain_hash_valid": full_chain_hash_valid,
+        "report_execution_chain_matches_global": report_chain_matches_global,
+        "execution_chain_integrity_verified": execution_chain_integrity_verified,
+        "result_record_count": len(test_results),
+        "successful_result_record_count": len(successful_result_indices),
+        "unaccounted_successful_result_record_count": unaccounted_successful_result_count,
+        "unaccounted_result_record_count": unaccounted_result_record_count,
+        "all_project_test_results_accounted": unaccounted_result_record_count == 0,
+        "sandbox_process_evidence_record_count": len(process_records),
+        "native_tool_result_record_count": len(native_records),
+        "linked_result_record_count": len(linked_call_records),
+        "verified_linked_execution_count": len(verified_candidates),
+        "mission_request_binding_verified": bool(request_id)
+        and bool(process_records or native_records)
+        and all(
+            _record_request_binding(item, request_id, require_present=True)
+            for item in (*process_records, *native_records)
+        ),
+        "sandbox_record_type": "UNTRUSTED_SANDBOX_PROCESS_RESULT" if verified else None,
+        "sandbox_backend": "bubblewrap+prlimit" if verified else None,
+        "network": "disabled" if verified else None,
+        "workspace_mode": "read_only" if verified else None,
+        "successful_exit_code": 0 if verified else None,
+        "timed_out": False if verified else None,
+        "cancelled": False if verified else None,
+        "result_evidence_ref_matches_hash_chained_record": verified,
+        "native_tool_result_digest_matches": verified,
+        "mission_bound_validation_evidence_verified": verified,
+    }
+
+
 def _tool_execution_projection(mission_state: dict) -> dict:
     summary, source = _safe_tool_result_summary(mission_state)
     raw_results, raw_source = _durable_tool_result_records(mission_state)
@@ -437,7 +1436,9 @@ def _tool_execution_projection(mission_state: dict) -> dict:
             _canonical_sha256({"source": raw_source, "records": raw_results})
             if raw_source != "unavailable" else None
         ),
-        "run_project_tests_count": sum(item.get("name") == "run_project_tests" for item in summary),
+        "run_project_tests_result_record_count": sum(
+            item.get("name") == "run_project_tests" for item in summary
+        ),
         "duplicate_tool_call_ids": len({item.get("tool_call_id") for item in summary if item.get("tool_call_id")})
         != sum(bool(item.get("tool_call_id")) for item in summary),
     }
@@ -465,7 +1466,12 @@ def _effect_ledger_projection(records: object, mission_id: str) -> dict:
         effect_mission_id = item.get("mission_id")
         if isinstance(effect_id, str) and effect_id:
             effect_ids.append(effect_id)
-        if effect_mission_id != mission_id or not isinstance(effect_id, str) or not effect_id:
+        if (
+            effect_mission_id != mission_id
+            or not _record_bound_to_mission(item, mission_id)
+            or not isinstance(effect_id, str)
+            or not effect_id
+        ):
             mission_binding_verified = False
         stable = {}
         for key in (
@@ -571,6 +1577,384 @@ def _windows_process_image_path(process_id: int) -> str | None:
         kernel32.CloseHandle(handle)
 
 
+def _windows_process_api():
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+        kernel32.GetProcessId.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        filetime_pointer = ctypes.POINTER(wintypes.FILETIME)
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE, filetime_pointer, filetime_pointer, filetime_pointer, filetime_pointer
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        return kernel32
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _windows_process_handle_identity(kernel32, handle: object) -> dict | None:
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        if kernel32.WaitForSingleObject(handle, 0) != 258:
+            return None
+        process_id = int(kernel32.GetProcessId(handle))
+        if process_id <= 0:
+            return None
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
+            return None
+        creation_time = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation_time),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            return None
+        if kernel32.WaitForSingleObject(handle, 0) != 258:
+            return None
+        ticks = (int(creation_time.dwHighDateTime) << 32) | int(creation_time.dwLowDateTime)
+        if ticks <= 0 or not buffer.value:
+            return None
+        return {
+            "process_id": process_id,
+            "image_path": buffer.value,
+            "creation_time": str(ticks),
+            "running": True,
+        }
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _windows_process_identity(process_id: int) -> dict | None:
+    if os.name != "nt" or type(process_id) is not int or process_id <= 0:
+        return None
+    kernel32 = _windows_process_api()
+    if kernel32 is None:
+        return None
+    try:
+        handle = kernel32.OpenProcess(0x0400 | 0x1000 | 0x00100000, False, process_id)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not handle:
+        return None
+    try:
+        identity = _windows_process_handle_identity(kernel32, handle)
+        return identity if isinstance(identity, dict) and identity.get("process_id") == process_id else None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _valid_process_creation_time(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.isascii()
+        and value.isdecimal()
+        and int(value) > 0
+    )
+
+
+def _normalized_process_image_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        normalized = os.path.normcase(os.path.realpath(os.path.expanduser(value)))
+        return normalized if os.path.isabs(normalized) and os.path.isfile(normalized) else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _windows_process_snapshot() -> dict[int, dict] | None:
+    if os.name != "nt":
+        return None
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$processes = @(Get-CimInstance -ClassName Win32_Process); "
+        "$processes | "
+        "Select-Object @{Name='process_id';Expression={[int]$_.ProcessId}}, "
+        "@{Name='parent_process_id';Expression={[int]$_.ParentProcessId}}, "
+        "@{Name='creation_time';Expression={$_.CreationDate.ToUniversalTime().ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture)}}, "
+        "@{Name='image_path';Expression={$_.ExecutablePath}} | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        payload = json.loads(result.stdout.lstrip("\ufeff"))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    records = payload if isinstance(payload, list) else [payload] if isinstance(payload, dict) else []
+    snapshot = {}
+    for record in records:
+        if not isinstance(record, dict):
+            return None
+        process_id = record.get("process_id")
+        parent_process_id = record.get("parent_process_id")
+        if type(process_id) is not int or type(parent_process_id) is not int:
+            return None
+        creation_time = record.get("creation_time")
+        image_path = record.get("image_path")
+        if (
+            process_id <= 0
+            or parent_process_id < 0
+            or not _valid_process_creation_time(creation_time)
+            or (image_path is not None and (not isinstance(image_path, str) or not image_path.strip()))
+        ):
+            return None
+        if process_id in snapshot:
+            return None
+        snapshot[process_id] = {
+            "parent_process_id": parent_process_id,
+            "creation_time": creation_time,
+            "image_path": image_path,
+        }
+    return snapshot or None
+
+
+def _windows_process_tree_identities(snapshot: dict[int, dict] | None, root_process_id: int) -> dict[int, str] | None:
+    if not isinstance(snapshot, dict) or root_process_id not in snapshot:
+        return None
+    tree_ids = {root_process_id}
+    changed = True
+    while changed:
+        changed = False
+        for process_id, record in snapshot.items():
+            if process_id not in tree_ids and record.get("parent_process_id") in tree_ids:
+                tree_ids.add(process_id)
+                changed = True
+    return {
+        process_id: snapshot[process_id]["creation_time"]
+        for process_id in sorted(tree_ids)
+    }
+
+
+def _windows_process_tree_identity_records(
+    snapshot: dict[int, dict] | None, root_process_id: int
+) -> dict[int, dict] | None:
+    if type(root_process_id) is not int or root_process_id <= 0:
+        return None
+    try:
+        tree_ids = _windows_process_tree_identities(snapshot, root_process_id)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if tree_ids is None:
+        return None
+
+    records = {}
+    for process_id in tree_ids:
+        record = snapshot.get(process_id)
+        if not isinstance(record, dict):
+            return None
+        parent_process_id = record.get("parent_process_id")
+        creation_time = record.get("creation_time")
+        image_path = _normalized_process_image_path(record.get("image_path"))
+        if (
+            type(process_id) is not int
+            or process_id <= 0
+            or type(parent_process_id) is not int
+            or parent_process_id < 0
+            or parent_process_id == process_id
+            or not _valid_process_creation_time(creation_time)
+            or image_path is None
+        ):
+            return None
+        records[process_id] = {
+            "process_id": process_id,
+            "parent_process_id": parent_process_id,
+            "creation_time": creation_time,
+            "image_path": image_path,
+        }
+
+    root_record = records.get(root_process_id)
+    if root_record is None or root_record["parent_process_id"] in records:
+        return None
+    # A parent PID can be reused; a captured parent must predate each linked child.
+    for process_id, record in records.items():
+        if process_id == root_process_id:
+            continue
+        parent = records.get(record["parent_process_id"])
+        if parent is None or int(parent["creation_time"]) >= int(record["creation_time"]):
+            return None
+    return records
+
+
+def _process_identity_matches_tree_record(
+    identity: object, process_id: int, expected: object
+) -> bool:
+    if not isinstance(expected, dict) or not isinstance(identity, dict):
+        return False
+    return (
+        type(identity.get("process_id")) is int
+        and identity.get("process_id") == process_id
+        and identity.get("running") is True
+        and _valid_process_creation_time(identity.get("creation_time"))
+        and identity.get("creation_time") == expected.get("creation_time")
+        and _normalized_process_image_path(identity.get("image_path")) == expected.get("image_path")
+    )
+
+
+def _close_windows_process_handles(kernel32, handles: dict[int, object]) -> None:
+    close_failed = False
+    for process_id in reversed(list(handles)):
+        handle = handles.pop(process_id)
+        try:
+            if not handle or not kernel32.CloseHandle(handle):
+                close_failed = True
+        except Exception:
+            close_failed = True
+    if close_failed:
+        raise RuntimeError("windows_process_handle_close_failed")
+
+
+def _validate_pinned_windows_process_tree(pinned_tree: object, expected_tree: object) -> bool:
+    if not isinstance(pinned_tree, dict) or not isinstance(expected_tree, dict):
+        return False
+    kernel32 = pinned_tree.get("kernel32")
+    handles = pinned_tree.get("handles")
+    if (
+        kernel32 is None
+        or not isinstance(handles, dict)
+        or set(handles) != set(expected_tree)
+    ):
+        return False
+    for process_id, expected in expected_tree.items():
+        handle = handles.get(process_id)
+        if not handle:
+            return False
+        identity = _windows_process_handle_identity(kernel32, handle)
+        if not _process_identity_matches_tree_record(identity, process_id, expected):
+            return False
+    return True
+
+
+def _pin_windows_process_tree(expected_tree: object) -> dict | None:
+    if os.name != "nt" or not isinstance(expected_tree, dict) or not expected_tree:
+        return None
+    kernel32 = _windows_process_api()
+    if kernel32 is None:
+        return None
+    handles: dict[int, object] = {}
+    pinned = False
+    try:
+        # Keep each process instance pinned through the termination-safety decision.
+        for process_id in sorted(expected_tree):
+            expected = expected_tree[process_id]
+            if type(process_id) is not int or process_id <= 0 or not isinstance(expected, dict):
+                return None
+            handle = kernel32.OpenProcess(0x0400 | 0x1000 | 0x00100000, False, process_id)
+            if not handle:
+                return None
+            handles[process_id] = handle
+            identity = _windows_process_handle_identity(kernel32, handle)
+            if not _process_identity_matches_tree_record(identity, process_id, expected):
+                return None
+        result = {"kernel32": kernel32, "handles": handles}
+        if not _validate_pinned_windows_process_tree(result, expected_tree):
+            return None
+        pinned = True
+        return result
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    finally:
+        if not pinned:
+            _close_windows_process_handles(kernel32, handles)
+
+
+def _release_pinned_windows_process_tree(pinned_tree: object) -> None:
+    if not isinstance(pinned_tree, dict):
+        raise RuntimeError("windows_process_tree_pin_invalid")
+    kernel32 = pinned_tree.get("kernel32")
+    handles = pinned_tree.get("handles")
+    if kernel32 is None or not isinstance(handles, dict):
+        raise RuntimeError("windows_process_tree_pin_invalid")
+    _close_windows_process_handles(kernel32, handles)
+
+
+def _remaining_process_tree_ids(original_tree: dict[int, str], snapshot: dict[int, dict]) -> set[int]:
+    remaining = {
+        process_id
+        for process_id, creation_time in original_tree.items()
+        if snapshot.get(process_id, {}).get("creation_time") == creation_time
+    }
+    parent_ids = set(original_tree)
+    changed = True
+    while changed:
+        changed = False
+        for process_id, record in snapshot.items():
+            if process_id not in parent_ids and record.get("parent_process_id") in parent_ids:
+                parent_ids.add(process_id)
+                remaining.add(process_id)
+                changed = True
+    return remaining
+
+
+def _process_tree_termination_status(
+    *,
+    taskkill_started: bool,
+    taskkill_exit_code: int | None,
+    initial_tree_verified: bool,
+    remaining_process_count: int | None,
+    process_id_stopped: bool | None,
+    cdp_endpoint_unavailable: bool | None,
+) -> str:
+    # The current harness deliberately has no launch-bound process-tree
+    # termination primitive; PID-only taskkill evidence can never establish PASS.
+    return "NOT_RUN"
+
+
+def _process_tree_termination_from_alive_probe(
+    *,
+    taskkill_started: bool,
+    taskkill_exit_code: int | None,
+    initial_tree_verified: bool,
+    remaining_process_count: int | None,
+    process_alive: bool | None,
+    cdp_endpoint_unavailable: bool | None,
+) -> tuple[str, bool | None]:
+    process_stopped = None if process_alive is None else not process_alive
+    return _process_tree_termination_status(
+        taskkill_started=taskkill_started,
+        taskkill_exit_code=taskkill_exit_code,
+        initial_tree_verified=initial_tree_verified,
+        remaining_process_count=remaining_process_count,
+        process_id_stopped=process_stopped,
+        cdp_endpoint_unavailable=cdp_endpoint_unavailable,
+    ), process_stopped
+
+
 def _cdp_version(port: int) -> dict | None:
     try:
         opener = build_opener(ProxyHandler({}))
@@ -581,36 +1965,72 @@ def _cdp_version(port: int) -> dict | None:
         return None
 
 
-def _terminate_installed_process_tree(process_id: int, cdp_port: int) -> dict:
+def _terminate_installed_process_tree(
+    process_id: int, cdp_port: int, installed_executable: Path
+) -> dict:
     if os.name != "nt":
         raise RuntimeError("native_windows_process_restart_required")
-    result = subprocess.run(
-        ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS,
-        check=False,
-    )
-    deadline = time.monotonic() + APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS
-    process_stopped = False
-    while time.monotonic() < deadline:
-        process_stopped = _windows_process_alive(process_id) is False
-        endpoint_stopped = _cdp_version(cdp_port) is None
-        if process_stopped and endpoint_stopped:
-            return {
-                "taskkill_exit_code": result.returncode,
-                "process_id_stopped": True,
-                "old_cdp_endpoint_unavailable": True,
-                "process_tree_termination_verified": True,
-            }
-        time.sleep(0.5)
-    return {
-        "taskkill_exit_code": result.returncode,
-        "process_id_stopped": process_stopped,
-        "old_cdp_endpoint_unavailable": _cdp_version(cdp_port) is None,
-        "process_tree_termination_verified": False,
+
+    def refuse_termination(reason: str, initial_member_count: int | None = None) -> dict:
+        return {
+            "taskkill_attempted": False,
+            "taskkill_succeeded": False,
+            "taskkill_exit_code": None,
+            "taskkill_error_type": None,
+            "process_tree_termination_status": "NOT_RUN",
+            "process_tree_termination_verified": False,
+            "process_tree_initial_member_count": initial_member_count,
+            "process_tree_remaining_member_count": None,
+            "descendant_termination_verified": None,
+            "process_id_stopped": None,
+            "old_cdp_endpoint_unavailable": None,
+            "installed_process_identity_verified": False,
+            "termination_refusal_reason": reason,
+        }
+
+    before_snapshot = _windows_process_snapshot()
+    try:
+        expected_image = _normalized_process_image_path(os.fspath(installed_executable))
+    except (TypeError, ValueError):
+        expected_image = None
+    if not isinstance(before_snapshot, dict) or not expected_image:
+        return refuse_termination("process_tree_snapshot_or_installed_image_unavailable")
+
+    try:
+        before_tree_records = _windows_process_tree_identity_records(before_snapshot, process_id)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        before_tree_records = None
+    if before_tree_records is None:
+        return refuse_termination("process_tree_snapshot_unavailable")
+    if before_tree_records[process_id]["image_path"] != expected_image:
+        return refuse_termination("captured_installed_process_identity_unavailable", len(before_tree_records))
+    before_tree = {
+        member_id: record["creation_time"]
+        for member_id, record in before_tree_records.items()
     }
+
+    # Pin every process instance in the captured tree before evaluating whether
+    # any PID-based termination mechanism could be used safely.
+    pinned_tree = _pin_windows_process_tree(before_tree_records)
+    if pinned_tree is None:
+        return refuse_termination("process_tree_member_handle_or_identity_unavailable", len(before_tree))
+
+    try:
+        latest_tree_records = _windows_process_tree_identity_records(
+            _windows_process_snapshot(), process_id
+        )
+        if latest_tree_records != before_tree_records:
+            return refuse_termination("process_tree_changed_after_handle_pin", len(before_tree))
+        if not _validate_pinned_windows_process_tree(pinned_tree, before_tree_records):
+            return refuse_termination("pre_kill_pinned_process_tree_identity_mismatch", len(before_tree))
+        # The CLI receives only a PID, and taskkill's /T performs a separate PID
+        # lookup/tree walk. Retained handles cannot bind that operation to the
+        # original launcher-owned process or constrain its descendant set.
+        return refuse_termination(
+            "launch_bound_process_identity_unavailable", len(before_tree)
+        )
+    finally:
+        _release_pinned_windows_process_tree(pinned_tree)
 
 
 def _launch_installed_application(executable: Path, profile_root: Path, cdp_port: int) -> subprocess.Popen:
@@ -731,6 +2151,7 @@ def _owner_auth_after_restart(
         "invalid_login_preserved_existing_owner": None,
         "owner_session_restored": False,
         "valid_login_after_restart": False,
+        "valid_login_credentials_submitted": False,
         "owner_identity_matches": False,
         "mission_read_authorized": False,
         "renderer_authenticated_after_restart": False,
@@ -744,7 +2165,10 @@ def _owner_auth_after_restart(
         invalid_http_status = invalid.get("http_status")
         invalid_error_code = invalid.get("error_code")
         invalid_rejected = (
-            invalid_http_status == 403
+            invalid.get("credentials_submitted") is True
+            and invalid.get("submitted_username_matches") is True
+            and invalid.get("submitted_password_matches") is True
+            and invalid_http_status == 403
             and invalid.get("authenticated") is not True
             and invalid_error_code == "invalid_credentials"
         )
@@ -762,7 +2186,7 @@ def _owner_auth_after_restart(
         )
         invalid_auth_state_unchanged = invalid_preserved or invalid_did_not_create_session
         reauthenticated = False
-        ui_login = {"http_status": None, "authenticated": False}
+        ui_login = {"http_status": None, "authenticated": False, "credentials_submitted": False}
         if before_owner_authenticated:
             page.locator("#loginForm").evaluate("(form) => form.classList.add('hidden')")
         if after_invalid["http_status"] != 200:
@@ -771,6 +2195,9 @@ def _owner_auth_after_restart(
                 ui_login.get("http_status") == 200
                 and ui_login.get("authenticated") is True
                 and ui_login.get("username") == username
+                and ui_login.get("credentials_submitted") is True
+                and ui_login.get("submitted_username_matches") is True
+                and ui_login.get("submitted_password_matches") is True
             )
         final = _public_api(page, "GET", mission_path + "/status")
         final_state = final["body"].get("status", {})
@@ -793,7 +2220,16 @@ def _owner_auth_after_restart(
             "invalid_login_did_not_create_owner_session": invalid_did_not_create_session,
             "invalid_login_authorization_state_unchanged": invalid_auth_state_unchanged,
             "owner_session_restored": before_owner_authenticated and invalid_preserved,
-            "valid_login_after_restart": reauthenticated or (before_owner_authenticated and invalid_preserved),
+            "valid_login_after_restart": reauthenticated,
+            "valid_login_credentials_submitted": ui_login.get("credentials_submitted") is True,
+            "valid_login_submitted_username_matches": ui_login.get("submitted_username_matches") is True,
+            "valid_login_submitted_password_matches": ui_login.get("submitted_password_matches") is True,
+            "post_restart_authentication_mode": (
+                "fresh_valid_login" if reauthenticated
+                else "restored_session" if before_owner_authenticated and invalid_preserved
+                else "not_authenticated"
+            ),
+            "owner_authenticated_after_restart": reauthenticated or (before_owner_authenticated and invalid_preserved),
             "owner_identity_matches": owner_identity_matches,
             "owner_identity_sha256": _sha256(str(final_state.get("owner_identity_ref", "")))
             if isinstance(final_state, dict) and final_state.get("owner_identity_ref") else None,
@@ -810,7 +2246,7 @@ def _owner_auth_after_restart(
     result["status"] = "PASS" if all(
         result.get(key) is True for key in (
             "invalid_credentials_rejected", "invalid_login_authorization_state_unchanged",
-            "valid_login_after_restart", "owner_identity_matches", "mission_read_authorized",
+            "owner_authenticated_after_restart", "owner_identity_matches", "mission_read_authorized",
             "renderer_authenticated_after_restart", "renderer_login_form_hidden",
             "renderer_logout_button_visible",
         )
@@ -848,37 +2284,108 @@ def _renderer_owner_auth_state(page) -> dict:
         return {}
 
 
+def _loopback_http_origin(value: object) -> tuple[str, str, int] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.casefold()
+    hostname = parsed.hostname.casefold() if parsed.hostname else ""
+    if (
+        scheme != "http"
+        or hostname not in {"127.0.0.1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    normalized_port = 80 if port is None else port
+    if not 1 <= normalized_port <= 65535:
+        return None
+    return scheme, hostname, normalized_port
+
+
+def _is_expected_owner_login_request(page, request) -> bool:
+    if getattr(request, "method", None) != "POST":
+        return False
+    page_origin = _loopback_http_origin(getattr(page, "url", None))
+    request_url = getattr(request, "url", None)
+    request_origin = _loopback_http_origin(request_url)
+    if page_origin is None or request_origin != page_origin or not isinstance(request_url, str):
+        return False
+    try:
+        request_path = urlsplit(request_url).path
+    except ValueError:
+        return False
+    return request_path == "/api/public/auth/login"
+
+
 def _login_owner_after_restart(page, username: str, password: str) -> dict:
+    credentials_submitted = False
+    submitted_username_matches = False
+    submitted_password_matches = False
     try:
         page.locator("#loginForm").evaluate("(form) => form.classList.remove('hidden')")
         page.locator("#loginUsername").fill(username)
         page.locator("#loginPassword").fill(password)
         with page.expect_response(
-            lambda response: response.request.method == "POST"
-            and "/api/public/auth/login" in response.url,
+            lambda response: getattr(getattr(response, "request", None), "method", None) == "POST",
             timeout=30_000,
         ) as response_info:
             page.locator("#loginButton").click(timeout=30_000)
         response = response_info.value
+        request_target_matches = _is_expected_owner_login_request(page, response.request)
+        request_body = None
+        try:
+            post_data = response.request.post_data
+            request_body = json.loads(post_data) if isinstance(post_data, str) else None
+        except (TypeError, ValueError):
+            request_body = None
+        submitted_username_matches = (
+            isinstance(request_body, dict) and request_body.get("username") == username
+        )
+        submitted_password_matches = (
+            isinstance(request_body, dict)
+            and isinstance(request_body.get("password"), str)
+            and request_body.get("password") == password
+        )
+        credentials_submitted = bool(
+            request_target_matches and submitted_username_matches and submitted_password_matches
+        )
         body = response.json()
         if response.status == 200 and isinstance(body, dict):
             state = _renderer_owner_auth_state(page)
             return {
                 "http_status": response.status,
-                "authenticated": body.get("authenticated") is True,
-                "username": body.get("username"),
-                "renderer_authenticated": state.get("authenticated") is True,
+                "authenticated": credentials_submitted and body.get("authenticated") is True,
+                "username": body.get("username") if credentials_submitted else None,
+                "renderer_authenticated": credentials_submitted and state.get("authenticated") is True,
+                "credentials_submitted": credentials_submitted,
+                "submitted_username_matches": submitted_username_matches,
+                "submitted_password_matches": submitted_password_matches,
             }
         error_code = body.get("error") if isinstance(body, dict) else None
         return {
             "http_status": response.status,
             "authenticated": False,
+            "credentials_submitted": credentials_submitted,
+            "submitted_username_matches": submitted_username_matches,
+            "submitted_password_matches": submitted_password_matches,
             "error_code": error_code
             if isinstance(error_code, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,79}", error_code)
             else None,
         }
     except Exception as exc:
-        return {"http_status": None, "authenticated": False, "error_type": type(exc).__name__}
+        return {
+            "http_status": None,
+            "authenticated": False,
+            "credentials_submitted": credentials_submitted,
+            "submitted_username_matches": submitted_username_matches,
+            "submitted_password_matches": submitted_password_matches,
+            "error_type": type(exc).__name__,
+        }
 
 
 def _model_runtime_after_restart(page, executable: Path, progress: list[dict], *, verify_inference: bool) -> dict:
@@ -988,7 +2495,14 @@ def _model_runtime_after_restart(page, executable: Path, progress: list[dict], *
     return result
 
 
-def _mission_audit_snapshot(page, mission_id: str) -> dict:
+class _MissionAuditSnapshotError(RuntimeError):
+    def __init__(self, failure_class: str, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.failure_class = failure_class
+        self.reason_code = reason_code
+
+
+def _mission_audit_snapshot(page, mission_id: str, profile_root: Path) -> dict:
     mission_path = "/api/public/missions/" + mission_id
     results = {
         "status": _public_api(page, "GET", mission_path + "/status"),
@@ -998,7 +2512,7 @@ def _mission_audit_snapshot(page, mission_id: str) -> dict:
         "effects": _public_api(page, "GET", mission_path + "/effects"),
     }
     if any(item["http_status"] != 200 for item in results.values()):
-        raise RuntimeError("installed_app_mission_audit_endpoints_unavailable_after_restart")
+        raise _MissionAuditSnapshotError("restoration", "mission_audit_endpoints_unavailable")
     status = results["status"]["body"].get("status")
     timeline = results["timeline"]["body"].get("timeline")
     evidence = results["evidence"]["body"].get("evidence")
@@ -1011,8 +2525,485 @@ def _mission_audit_snapshot(page, mission_id: str) -> dict:
         or not isinstance(report, dict)
         or not isinstance(effects, list)
     ):
-        raise RuntimeError("installed_app_mission_audit_payload_invalid_after_restart")
-    return {"status": status, "timeline": timeline, "evidence": evidence, "report": report, "effects": effects}
+        raise _MissionAuditSnapshotError("restoration", "mission_audit_payload_invalid")
+    full_chain, full_chain_status = _read_profile_evidence_chain_diagnostic(profile_root)
+    return {
+        "status": status,
+        "timeline": timeline,
+        "evidence": evidence,
+        "report": report,
+        "effects": effects,
+        "full_execution_chain": full_chain,
+        "full_execution_chain_status": full_chain_status,
+    }
+
+
+_REPORT_MISSION_STATUSES = frozenset({
+    "CREATED", "PLANNING", "READY", "RUNNING", "OBSERVING", "VERIFYING",
+    "REPLANNING", "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+    "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED", "RECOVERY_REQUIRED",
+    "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
+})
+_REPORT_OUTCOMES = frozenset({
+    "RECOVERY_REQUIRED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED", "UNKNOWN",
+    "VERIFIED", "NOT_VERIFIED", "PARTIALLY_VERIFIED",
+})
+_REPORT_FINDING_STATUSES = frozenset({
+    "PASS", "FAIL", "UNKNOWN", "UNVERIFIED_PROVENANCE", "UNVERIFIED_MODEL_PROPOSAL",
+})
+_REPORT_CHAIN_STATUSES = frozenset({"VALID", "INVALID", "UNREADABLE", "UNKNOWN", "NOT_PRESENT"})
+_REPORT_GOAL_VERIFICATION_STATUSES = frozenset({
+    "TRUSTED_DETERMINISTIC_SOURCE", "UNVERIFIED_PROVENANCE",
+})
+_REPORT_CONFIDENCE_VERIFICATION_STATUSES = frozenset({
+    "TRUSTED_SOURCE", "UNVERIFIED_PROVENANCE",
+})
+_REPORT_OWNER_APPROVAL_STATUSES = frozenset({
+    "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED", "INVALID", "RECORDED", "NOT_RECORDED",
+})
+_REPORT_FINAL_APPROVAL_STATUSES = frozenset({"PENDING", "APPROVED", "STALE"})
+_STATUS_GENERIC_VALUES = (
+    _REPORT_MISSION_STATUSES | _REPORT_OUTCOMES | _REPORT_FINDING_STATUSES
+    | _REPORT_CHAIN_STATUSES | _REPORT_GOAL_VERIFICATION_STATUSES
+    | _REPORT_CONFIDENCE_VERIFICATION_STATUSES | _REPORT_OWNER_APPROVAL_STATUSES
+    | _REPORT_FINAL_APPROVAL_STATUSES
+    | frozenset({
+        "COMPLETED", "SUCCEEDED", "SUCCESS", "PASSED", "OBSERVED", "VERIFIED",
+        "NOT_RECORDED", "RECORDED", "PAUSED", "NEEDS_INPUT", "QUEUED", "ACTIVE",
+        "EXECUTING", "SCHEDULED", "RETRY_SCHEDULED", "OCCURRENCE_SCHEDULED",
+        "IN_FLIGHT", "IN_FLIGHT_PARALLEL", "NOT_DISPATCHED", "NOT_DISPATCHED_PARALLEL",
+        "BUDGET_BLOCKED", "SPECIALISTS_QUARANTINED", "NOT_GENERATED_RESOURCE_LIMITED",
+        "GENERATED_COMPACT_NO_TOOLS", "VALIDATED_STATUS_SNAPSHOT", "STARTING", "STOPPING",
+        "STOPPED", "IDLE", "COMPLETE", "CANCELLING", "AUTHORIZED", "UNAUTHORIZED", "OK",
+        "ALLOWED", "DENIED", "CHAIN_PROVENANCE_CLASSIFICATION", "PROVIDER_UNAVAILABLE",
+        "INVALID_PROPOSAL", "QUARANTINED_PROVIDER_OUTCOME_UNKNOWN", "VALIDATED",
+        "NOT_VALIDATED", "TRANSIENT", "DEPENDENCY", "COMPILATION", "TEST_FAILURE",
+        "NETWORK", "PROVIDER", "TOOL", "AUTHORIZATION", "SCOPE", "RESOURCE", "LOGIC",
+    })
+)
+_STATUS_SCALAR_ALLOWLISTS = {
+    "status": _STATUS_GENERIC_VALUES,
+    "mission_status": _REPORT_MISSION_STATUSES,
+    "outcome": _REPORT_OUTCOMES,
+    "state": _STATUS_GENERIC_VALUES,
+    "result_status": _STATUS_GENERIC_VALUES,
+    "verification": _REPORT_GOAL_VERIFICATION_STATUSES
+    | _REPORT_CONFIDENCE_VERIFICATION_STATUSES
+    | frozenset({"OBSERVED", "VERIFIED", "CHAIN_PROVENANCE_CLASSIFICATION"}),
+    "verification_status": _REPORT_GOAL_VERIFICATION_STATUSES
+    | _REPORT_CONFIDENCE_VERIFICATION_STATUSES
+    | frozenset({"OBSERVED", "VERIFIED", "NOT_VERIFIED", "PARTIALLY_VERIFIED"}),
+    "verification_state": _REPORT_GOAL_VERIFICATION_STATUSES
+    | _REPORT_CONFIDENCE_VERIFICATION_STATUSES
+    | frozenset({"OBSERVED", "VERIFIED", "NOT_VERIFIED", "PARTIALLY_VERIFIED"}),
+    "report_verification": _REPORT_GOAL_VERIFICATION_STATUSES
+    | _REPORT_CONFIDENCE_VERIFICATION_STATUSES
+    | frozenset({"CHAIN_PROVENANCE_CLASSIFICATION"}),
+    "report_status": _REPORT_MISSION_STATUSES | _REPORT_OUTCOMES | _REPORT_FINDING_STATUSES,
+    "execution_chain_integrity": _REPORT_CHAIN_STATUSES,
+    "evidence_status": _STATUS_GENERIC_VALUES,
+    "authorization_status": frozenset({
+        "ALLOWED", "DENIED", "AUTHORIZED", "UNAUTHORIZED", "APPROVED", "REJECTED", "PENDING",
+    }),
+    "decision": frozenset({
+        "ALLOWED", "DENIED", "AUTHORIZED", "UNAUTHORIZED", "APPROVED", "REJECTED", "PENDING", "STALE",
+    }),
+    "failure_class": frozenset({
+        "TRANSIENT", "DEPENDENCY", "COMPILATION", "TEST_FAILURE", "NETWORK", "PROVIDER",
+        "TOOL", "AUTHORIZATION", "SCOPE", "RESOURCE", "LOGIC", "UNKNOWN",
+    }),
+    "validation_state": _STATUS_GENERIC_VALUES,
+    "result_validation_state": _STATUS_GENERIC_VALUES,
+}
+
+
+def _report_status_is_allowed(value: object, allowed: frozenset[str]) -> bool:
+    return isinstance(value, str) and value in allowed
+
+
+def _completed_report_status_fields_are_valid(report: dict, summary: dict, verification: dict) -> bool:
+    if (
+        report.get("schema_version") != "cybersentinel.mission-report.v1"
+        or not all(key in report for key in (
+            "findings", "evidence", "confidence", "unknown_states",
+            "owner_approval_status", "final_report_approval",
+        ))
+        or not _report_status_is_allowed(summary.get("mission_status"), _REPORT_MISSION_STATUSES)
+        or summary.get("mission_status") != "GOAL_COMPLETED"
+        or not _report_status_is_allowed(summary.get("outcome"), _REPORT_OUTCOMES)
+        or summary.get("outcome") != "VERIFIED"
+        or not all(key in verification for key in (
+            "verified", "runtime_reported_verified", "missing_criteria", "evidence_count",
+            "trusted_evidence_count", "unverified_evidence_count", "required_criteria_count",
+        ))
+        or verification.get("verified") is not True
+        or verification.get("runtime_reported_verified") is not True
+        or not isinstance(verification.get("missing_criteria"), list)
+        or verification.get("missing_criteria")
+        or not isinstance(report.get("unknown_states"), list)
+        or report.get("unknown_states")
+    ):
+        return False
+
+    for field in ("evidence_count", "trusted_evidence_count", "required_criteria_count"):
+        if type(verification.get(field)) is not int or verification[field] <= 0:
+            return False
+    if (
+        type(verification.get("unverified_evidence_count")) is not int
+        or verification["unverified_evidence_count"] != 0
+    ):
+        return False
+
+    findings = report.get("findings")
+    if not isinstance(findings, list) or not findings or any(
+        not isinstance(item, dict)
+        or not _report_status_is_allowed(item.get("status"), _REPORT_FINDING_STATUSES)
+        for item in findings
+    ):
+        return False
+
+    evidence = report.get("evidence")
+    if (
+        not isinstance(evidence, dict)
+        or not _report_status_is_allowed(evidence.get("execution_chain_integrity"), _REPORT_CHAIN_STATUSES)
+        or not isinstance(evidence.get("goal"), list)
+        or any(
+            not isinstance(item, dict)
+            or not _report_status_is_allowed(
+                item.get("report_verification"), _REPORT_GOAL_VERIFICATION_STATUSES
+            )
+            for item in evidence["goal"]
+        )
+        or not isinstance(evidence.get("unverified_model_proposals"), list)
+        or any(
+            not isinstance(proposal, dict)
+            or proposal.get("verification") != "UNVERIFIED_MODEL_PROPOSAL"
+            or not isinstance(proposal.get("proposed_evidence"), list)
+            or any(
+                not isinstance(item, dict)
+                or item.get("verification") != "UNVERIFIED_MODEL_PROPOSAL"
+                for item in proposal["proposed_evidence"]
+            )
+            for proposal in evidence["unverified_model_proposals"]
+        )
+    ):
+        return False
+
+    confidence = report.get("confidence")
+    if (
+        not isinstance(confidence, dict)
+        or not isinstance(confidence.get("items"), list)
+        or any(
+            not isinstance(item, dict)
+            or not _report_status_is_allowed(
+                item.get("verification"), _REPORT_CONFIDENCE_VERIFICATION_STATUSES
+            )
+            for item in confidence["items"]
+        )
+    ):
+        return False
+
+    owner_approval = report.get("owner_approval_status")
+    if (
+        not isinstance(owner_approval, dict)
+        or not _report_status_is_allowed(
+            owner_approval.get("status"), _REPORT_OWNER_APPROVAL_STATUSES
+        )
+        or owner_approval.get("status") not in {"RECORDED", "NOT_RECORDED"}
+        or owner_approval.get("source") != "mission_authorization_snapshot"
+        or owner_approval.get("scope") != "mission-level authorization only; action-level approval is not assessed"
+        or owner_approval.get("current_authority") != "not_assessed"
+    ):
+        return False
+
+    final_approval = report.get("final_report_approval")
+    return (
+        isinstance(final_approval, dict)
+        and _report_status_is_allowed(
+            final_approval.get("status"), _REPORT_FINAL_APPROVAL_STATUSES
+        )
+    )
+
+
+def _completed_report_verification_is_consistent(
+    report: dict, summary: dict, verification: dict
+) -> bool:
+    """Accept only the producer's complete, internally consistent verified status schema."""
+    return _completed_report_status_fields_are_valid(report, summary, verification)
+
+
+_TRAJECTORY_EVENT_FIELDS = frozenset({
+    "event", "mission_id", "request_id", "step_id", "timestamp",
+    "provenance", "data", "previous_hash", "event_hash",
+})
+_TRAJECTORY_EVENT_NAMES = frozenset(item.value for item in _TrajectoryEventType)
+
+
+def _trajectory_timeline_integrity(timeline: object, mission_id: object, request_id: object) -> bool:
+    """Validate the exact event shape and hash-linked order emitted by Mission.trajectory."""
+    if (
+        not isinstance(timeline, list) or not timeline
+        or not isinstance(mission_id, str) or not mission_id.strip()
+        or not isinstance(request_id, str) or not request_id.strip()
+    ):
+        return False
+    previous_hash = ""
+    seen_hashes: set[str] = set()
+    for index, event in enumerate(timeline):
+        if not isinstance(event, dict) or set(event) != _TRAJECTORY_EVENT_FIELDS:
+            return False
+        if (
+            event.get("event") not in _TRAJECTORY_EVENT_NAMES
+            or event.get("mission_id") != mission_id
+            or event.get("request_id") != request_id
+            or not isinstance(event.get("step_id"), str)
+            or not isinstance(event.get("timestamp"), str)
+            or not event["timestamp"].strip()
+            or not isinstance(event.get("provenance"), dict)
+            or not isinstance(event.get("data"), dict)
+        ):
+            return False
+        try:
+            timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            return False
+        event_hash = event.get("event_hash")
+        if (
+            not isinstance(event_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", event_hash) is None
+            or event_hash in seen_hashes
+            or event.get("previous_hash") != previous_hash
+        ):
+            return False
+        if index == 0 and event.get("event") != _TrajectoryEventType.MISSION_STARTED.value:
+            return False
+        seen_hashes.add(event_hash)
+        previous_hash = event_hash
+    try:
+        return _verify_trajectory(timeline) is True
+    except Exception:
+        return False
+
+
+def _mission_record_integrity_verified(status: object) -> bool:
+    """Verify the persisted Mission envelope returned by status, excluding its API-only queue view."""
+    if not isinstance(status, dict):
+        return False
+    record = dict(status)
+    record.pop("queue", None)
+    try:
+        mission = _Mission.from_dict(record)
+        return mission.verify_integrity() is True
+    except Exception:
+        return False
+
+
+_RESTART_STABLE_PROJECTION_FIELDS = (
+    "mission_id", "mission_record_integrity_verified",
+    "timeline_matches_integrity_checked_mission", "timeline_integrity_verified",
+    "status_mission_id_matches", "report_mission_id_matches", "provenance_mission_id_matches",
+    "timeline_records_bound_to_mission", "evidence_and_chain_bound_to_mission",
+    "evidence_records_bound_to_mission", "execution_chain_records_bound_to_mission",
+    "execution_chain_provenance_bound_to_mission", "execution_chain_provenance_matches_payload",
+    "mission_request_binding_verified", "project_test_evidence_source_verified",
+    "project_test_execution_proof", "validation_record_bound_to_mission", "mission_status",
+    "mission_plan_sha256", "mission_plan_history_sha256",
+    "queue_state", "pause_requested", "tool_execution_count", "tool_projection",
+    "action_history_count", "action_history_sha256", "timeline_event_count", "timeline_sha256",
+    "evidence_item_count", "evidence_sha256", "validation_sha256", "report_sha256",
+    "report_body_sha256", "report_digest_matches_canonical_body", "report_digest_scope_matches_producer",
+    "report_producer_payload_matches_status", "report_producer_source_sha256", "report_provenance_sha256",
+    "report_evidence_digest_matches_source",
+    "report_execution_chain_head_matches_source", "report_verification_counts_match_source",
+    "report_outcome", "report_verified", "report_verification_summary_consistent",
+    "report_projection_valid", "completed_mission_inspectable",
+    "effect_ledger", "execution_chain_integrity", "independent_execution_chain_integrity",
+    "execution_chain_storage_status", "execution_chain_storage_verified",
+    "execution_chain_receipts_verified", "full_execution_chain_count", "full_execution_chain_sha256",
+    "execution_chain_hash_valid", "execution_chain_integrity_verified", "final_report_approval_status",
+)
+
+_RESTART_PROJECTION_HASH_FIELDS = frozenset({
+    "mission_plan_sha256", "mission_plan_history_sha256", "action_history_sha256",
+    "timeline_sha256", "evidence_sha256", "validation_sha256", "report_sha256",
+    "report_body_sha256", "report_producer_source_sha256", "report_provenance_sha256",
+    "full_execution_chain_sha256",
+})
+_RESTART_PROJECTION_BOOLEAN_FIELDS = frozenset({
+    "mission_record_integrity_verified", "timeline_matches_integrity_checked_mission",
+    "timeline_integrity_verified", "status_mission_id_matches", "report_mission_id_matches",
+    "provenance_mission_id_matches", "timeline_records_bound_to_mission",
+    "evidence_and_chain_bound_to_mission", "evidence_records_bound_to_mission",
+    "execution_chain_records_bound_to_mission", "execution_chain_provenance_bound_to_mission",
+    "execution_chain_provenance_matches_payload", "mission_request_binding_verified",
+    "project_test_evidence_source_verified", "pause_requested",
+    "report_digest_matches_canonical_body", "report_digest_scope_matches_producer",
+    "report_producer_payload_matches_status", "report_evidence_digest_matches_source",
+    "report_execution_chain_head_matches_source", "report_verification_counts_match_source",
+    "report_verified", "report_verification_summary_consistent", "report_projection_valid",
+    "completed_mission_inspectable", "execution_chain_storage_verified",
+    "execution_chain_receipts_verified", "execution_chain_hash_valid",
+    "execution_chain_integrity_verified",
+})
+_RESTART_PROJECTION_COUNT_FIELDS = frozenset({
+    "tool_execution_count", "action_history_count", "timeline_event_count",
+    "evidence_item_count", "full_execution_chain_count",
+})
+_RESTART_PROJECTION_TEXT_FIELDS = frozenset({
+    "mission_id", "mission_status", "queue_state", "report_outcome",
+    "execution_chain_integrity", "independent_execution_chain_integrity",
+    "execution_chain_storage_status", "final_report_approval_status",
+})
+_RESTART_PROJECTION_MAPPING_FIELDS = frozenset({
+    "project_test_execution_proof", "tool_projection", "effect_ledger",
+})
+_RESTART_REQUIRED_TRUE_FIELDS = frozenset({
+    "mission_record_integrity_verified", "timeline_matches_integrity_checked_mission",
+    "timeline_integrity_verified", "status_mission_id_matches", "report_mission_id_matches",
+    "provenance_mission_id_matches", "timeline_records_bound_to_mission",
+    "evidence_and_chain_bound_to_mission", "evidence_records_bound_to_mission",
+    "execution_chain_records_bound_to_mission", "execution_chain_provenance_bound_to_mission",
+    "execution_chain_provenance_matches_payload", "mission_request_binding_verified",
+    "report_digest_matches_canonical_body", "report_digest_scope_matches_producer",
+    "report_producer_payload_matches_status", "report_evidence_digest_matches_source",
+    "report_execution_chain_head_matches_source", "report_verification_counts_match_source",
+    "execution_chain_hash_valid", "execution_chain_integrity_verified",
+    "execution_chain_storage_verified", "execution_chain_receipts_verified",
+})
+
+
+def _invalid_restart_projection_fields(projection: dict) -> set[str]:
+    required = set(_RESTART_STABLE_PROJECTION_FIELDS) | _RESTART_PROJECTION_MAPPING_FIELDS
+    invalid = {field for field in required if field not in projection}
+    for field in required - invalid:
+        value = projection[field]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            invalid.add(field)
+    for field in _RESTART_PROJECTION_HASH_FIELDS:
+        if field not in projection or not isinstance(projection[field], str) or re.fullmatch(
+            r"[0-9a-f]{64}", projection[field]
+        ) is None:
+            invalid.add(field)
+    for field in _RESTART_PROJECTION_BOOLEAN_FIELDS:
+        if field not in projection or type(projection[field]) is not bool:
+            invalid.add(field)
+    for field in _RESTART_PROJECTION_COUNT_FIELDS:
+        if field not in projection or type(projection[field]) is not int or projection[field] < 0:
+            invalid.add(field)
+    for field in _RESTART_PROJECTION_TEXT_FIELDS:
+        if field not in projection or not isinstance(projection[field], str) or not projection[field].strip():
+            invalid.add(field)
+    for field in _RESTART_PROJECTION_MAPPING_FIELDS:
+        if field not in projection or not isinstance(projection[field], dict) or not projection[field]:
+            invalid.add(field)
+    return invalid
+
+
+def _mission_restart_reconciliation(
+    before: dict, after: dict, *, allow_owner_reauth_transition: bool = False
+) -> dict:
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {"reconciled": False, "mismatched_fields": ["snapshot"]}
+    invalid_fields = _invalid_restart_projection_fields(before) | _invalid_restart_projection_fields(after)
+    invalid_fields.update(
+        field for field in _RESTART_REQUIRED_TRUE_FIELDS
+        if before.get(field) is not True or after.get(field) is not True
+    )
+    if before.get("mission_id") != after.get("mission_id"):
+        invalid_fields.add("mission_id")
+    owner_reauth_transition = (
+        allow_owner_reauth_transition and not invalid_fields
+        and before.get("mission_status") in {"RUNNING", "OBSERVING", "VERIFYING", "REPLANNING"}
+        and before.get("queue_state") == "paused"
+        and before.get("pause_requested") is True
+        and before.get("report_digest_matches_canonical_body") is True
+        and before.get("report_digest_scope_matches_producer") is True
+        and before.get("report_producer_payload_matches_status") is True
+        and before.get("report_evidence_digest_matches_source") is True
+        and before.get("report_execution_chain_head_matches_source") is True
+        and before.get("report_verification_counts_match_source") is True
+        and after.get("mission_status") == "OWNER_REAUTH_REQUIRED"
+        and after.get("queue_state") == "needs_input"
+        and after.get("pause_requested") is True
+        and after.get("report_digest_matches_canonical_body") is True
+        and after.get("report_digest_scope_matches_producer") is True
+        and after.get("report_producer_payload_matches_status") is True
+        and after.get("report_evidence_digest_matches_source") is True
+        and after.get("report_execution_chain_head_matches_source") is True
+        and after.get("report_verification_counts_match_source") is True
+        and isinstance(before.get("report_producer_source_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", before["report_producer_source_sha256"]) is not None
+        and before.get("report_producer_source_sha256") == after.get("report_producer_source_sha256")
+        and isinstance(before.get("report_provenance_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", before["report_provenance_sha256"]) is not None
+        and before.get("report_provenance_sha256") == after.get("report_provenance_sha256")
+    )
+    justified_transition_fields = {
+        "mission_status", "queue_state", "validation_sha256", "project_test_evidence_source_verified",
+        "project_test_execution_proof", "report_sha256", "report_body_sha256",
+        "report_digest_matches_canonical_body", "report_producer_payload_matches_status",
+        "report_evidence_digest_matches_source", "report_execution_chain_head_matches_source",
+        "report_verification_counts_match_source", "report_outcome", "report_verified",
+        "report_verification_summary_consistent", "report_projection_valid",
+        "completed_mission_inspectable", "final_report_approval_status",
+    } if owner_reauth_transition else set()
+    mismatches = sorted(invalid_fields | {
+        field for field in _RESTART_STABLE_PROJECTION_FIELDS
+        if field not in justified_transition_fields and before.get(field) != after.get(field)
+    })
+    return {
+        "reconciled": not mismatches,
+        "mismatched_fields": mismatches,
+        "owner_reauth_transition_justified": owner_reauth_transition,
+        "report_digest_changed": before.get("report_sha256") != after.get("report_sha256"),
+        "timeline_hash_unchanged": before.get("timeline_sha256") == after.get("timeline_sha256"),
+        "action_history_hash_unchanged": before.get("action_history_sha256") == after.get("action_history_sha256"),
+        "global_chain_hash_unchanged": before.get("full_execution_chain_sha256")
+        == after.get("full_execution_chain_sha256"),
+    }
+
+
+def _report_status_scan_view(report: dict, mission_chain: list) -> dict:
+    """Mask only the producer's non-authoritative confidence label for chain rows."""
+    confidence = report.get("confidence")
+    if not isinstance(confidence, dict) or not isinstance(confidence.get("items"), list):
+        return report
+    chain_confidence = {
+        (record.get("source"), record.get("evidence_id")): record.get("confidence")
+        for record in mission_chain
+        if isinstance(record, dict)
+    }
+    normalized_items = []
+    for item in confidence["items"]:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+        key = (item.get("source"), item.get("evidence_id"))
+        if (
+            item.get("verification") == "UNVERIFIED_PROVENANCE"
+            and key in chain_confidence
+            and item.get("confidence") == chain_confidence[key]
+        ):
+            normalized_items.append({**item, "verification": "CHAIN_PROVENANCE_CLASSIFICATION"})
+        else:
+            normalized_items.append(item)
+    return {**report, "confidence": {**confidence, "items": normalized_items}}
+
+
+def _report_producer_source_sha256(status: dict) -> str:
+    source_fields = (
+        "mission_id", "request_id", "objective", "current_step", "iteration_count",
+        "verification_state", "evidence", "completion_criteria", "failures",
+        "action_history", "interpretations", "authorization_snapshot", "owner_identity_ref",
+    )
+    progress = status.get("progress")
+    source = {field: status.get(field) for field in source_fields}
+    source["final_report_approval"] = (
+        progress.get("final_report_approval") if isinstance(progress, dict) else None
+    )
+    return _canonical_sha256(source)
 
 
 def _mission_audit_projection(snapshot: dict, mission_id: str) -> dict:
@@ -1022,67 +3013,255 @@ def _mission_audit_projection(snapshot: dict, mission_id: str) -> dict:
     report = snapshot.get("report") if isinstance(snapshot.get("report"), dict) else {}
     summary = report.get("mission_summary") if isinstance(report.get("mission_summary"), dict) else {}
     verification = summary.get("verification") if isinstance(summary.get("verification"), dict) else {}
+    report_verification_consistent = _completed_report_verification_is_consistent(
+        report, summary, verification
+    )
     report_evidence = report.get("evidence") if isinstance(report.get("evidence"), dict) else {}
     chain = report_evidence.get("execution_chain") if isinstance(report_evidence.get("execution_chain"), list) else []
+    full_chain = snapshot.get("full_execution_chain")
+    full_chain_storage_status = snapshot.get("full_execution_chain_status")
     provenance = report.get("provenance") if isinstance(report.get("provenance"), dict) else {}
     effects = _effect_ledger_projection(snapshot.get("effects", []), mission_id)
-    evidence_mission_ids = []
-    for item in evidence:
-        if not isinstance(item, dict):
-            evidence_mission_ids.append(None)
-            continue
-        evidence_provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
-        evidence_mission_ids.append(item.get("mission_id") or evidence_provenance.get("mission_id"))
-    evidence_records_bound = all(item == mission_id for item in evidence_mission_ids)
+    request_id = provenance.get("request_id") if isinstance(provenance.get("request_id"), str) else ""
+    status_request_id = status.get("request_id")
+    provenance_chain = provenance.get("execution_chain") if isinstance(provenance.get("execution_chain"), list) else []
+    timeline_records_bound = bool(timeline) and all(
+        isinstance(item, dict)
+        and _record_bound_to_mission(item, mission_id)
+        and isinstance(status_request_id, str) and bool(status_request_id)
+        and item.get("request_id") == status_request_id
+        for item in timeline
+    )
+    timeline_integrity_verified = _trajectory_timeline_integrity(
+        timeline, mission_id, status_request_id
+    )
+    mission_record_integrity_verified = _mission_record_integrity_verified(status)
+    timeline_matches_integrity_checked_mission = (
+        mission_record_integrity_verified
+        and isinstance(status.get("trajectory"), list)
+        and status["trajectory"] == timeline
+    )
+    evidence_records_bound = bool(evidence) and all(
+        _record_bound_to_mission(item, mission_id)
+        and _record_request_binding(item, request_id, require_present=False)
+        for item in evidence
+    )
+    chain_records_bound = bool(chain) and all(
+        isinstance(item, dict)
+        and item.get("mission_id") == mission_id
+        and item.get("request_id") == request_id
+        and _record_bound_to_mission(item, mission_id)
+        and _record_request_binding(item, request_id, require_present=True)
+        and isinstance(item.get("evidence_id"), str)
+        and bool(item.get("evidence_id"))
+        and type(item.get("sequence")) is int
+        and item.get("sequence") > 0
+        and re.fullmatch(r"[0-9a-f]{64}", str(item.get("current_hash", ""))) is not None
+        for item in chain
+    )
+    provenance_chain_bound = bool(provenance_chain) and all(
+        isinstance(item, dict)
+        and item.get("mission_id") == mission_id
+        and item.get("request_id") == request_id
+        and _record_bound_to_mission(item, mission_id)
+        and _record_request_binding(item, request_id, require_present=True)
+        for item in provenance_chain
+    )
+    chain_identity_fields = (
+        "evidence_id", "source", "sequence", "previous_hash", "current_hash",
+        "mission_id", "request_id", "task_id", "execution_id",
+        "worker_id", "worker_instance_id", "runtime_generation", "lease_epoch",
+        "task_version", "authorization_hash", "fence_id",
+    )
+    provenance_chain_matches_payload = (
+        len(chain) == len(provenance_chain)
+        and all(
+            all(projected.get(key) == payload.get(key) for key in chain_identity_fields)
+            for projected, payload in zip(provenance_chain, chain)
+            if isinstance(projected, dict) and isinstance(payload, dict)
+        )
+    )
+    chain_integrity = report_evidence.get("execution_chain_integrity")
+    independent_chain_integrity = _independent_execution_chain_status(
+        full_chain, status, mission_id, request_id
+    )
+    mission_filtered_global_chain = [
+        item for item in full_chain
+        if isinstance(item, dict)
+        and (
+            item.get("mission_id") == mission_id
+            or (not item.get("mission_id") and bool(request_id) and item.get("request_id") == request_id)
+        )
+    ] if isinstance(full_chain, list) else []
+    full_chain_storage_verified = (
+        full_chain_storage_status == "VALID"
+        and independent_chain_integrity == "VALID"
+    )
+    expected_report = _producer_report_from_status(
+        status, mission_filtered_global_chain, independent_chain_integrity
+    )
+    report_producer_payload_matches = expected_report == report
+    report_digest_scope_matches = report.get("report_digest_scope") == _REPORT_DIGEST_SCOPE
+    expected_report_evidence = (
+        expected_report.get("evidence") if isinstance(expected_report, dict) else None
+    )
+    report_evidence_digest_matches_source = (
+        isinstance(expected_report_evidence, dict)
+        and report_evidence.get("digest_sha256") == expected_report_evidence.get("digest_sha256")
+    )
+    report_execution_chain_head_matches = (
+        isinstance(expected_report_evidence, dict)
+        and report_evidence.get("execution_chain_head") == expected_report_evidence.get("execution_chain_head")
+    )
+    expected_verification = (
+        (expected_report.get("mission_summary") or {}).get("verification")
+        if isinstance(expected_report, dict) else None
+    )
+    report_verification_counts_match_source = (
+        isinstance(expected_verification, dict)
+        and verification == expected_verification
+    )
+    project_test_execution_proof = _mission_project_test_execution_proof(
+        status,
+        timeline,
+        evidence,
+        report_evidence.get("goal"),
+        chain,
+        mission_id,
+        request_id,
+        chain_integrity,
+        full_execution_chain=full_chain,
+    )
+    project_test_evidence_sources = (
+        ["sandboxed-process:run_project_tests"]
+        if project_test_execution_proof.get("verified") is True else []
+    )
     tool_execution_count = sum(
         isinstance(item, dict) and item.get("event") == "ToolExecuted" for item in timeline
     )
+    mission_plan = status.get("plan")
+    mission_plan_history = status.get("plan_history")
     binding_verified = (
         status.get("mission_id") == mission_id
         and summary.get("mission_id") == mission_id
+        and summary.get("request_id") == request_id
         and provenance.get("mission_id") == mission_id
-        and all(isinstance(item, dict) and item.get("mission_id") == mission_id for item in chain)
+        and bool(request_id)
+        and _record_bound_to_mission(status, mission_id)
+        and _record_request_binding(status, request_id, require_present=False)
+        and _record_bound_to_mission(summary, mission_id)
+        and _record_request_binding(summary, request_id, require_present=True)
+        and _record_bound_to_mission(provenance, mission_id)
+        and _record_request_binding(provenance, request_id, require_present=True)
+        and timeline_records_bound
         and evidence_records_bound
+        and chain_records_bound
+        and provenance_chain_bound
+        and provenance_chain_matches_payload
         and effects.get("mission_binding_verified") is True
     )
     report_sha256 = report.get("report_sha256")
+    report_provenance_sha256 = _canonical_sha256(report.get("provenance"))
+    report_producer_source_sha256 = _report_producer_source_sha256(status)
     validation_sha256 = _canonical_sha256(verification)
+    report_body_sha256 = _canonical_report_body_sha256(report)
+    report_digest_matches_body = (
+        isinstance(report_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", report_sha256) is not None
+        and report_sha256 == report_body_sha256
+    )
     report_verified = (
         summary.get("mission_status") == status.get("status")
-        and isinstance(report_sha256, str)
-        and re.fullmatch(r"[0-9a-f]{64}", report_sha256) is not None
-        and isinstance(report_evidence.get("execution_chain_integrity"), str)
+        and report_digest_matches_body
+        and report_digest_scope_matches
+        and report_producer_payload_matches
+        and full_chain_storage_verified
+        and project_test_execution_proof.get("execution_chain_integrity_verified") is True
+        and binding_verified
+        and report_verification_consistent
+        and _record_bound_to_mission(report, mission_id)
+        and not _contains_blocked_or_unverified_status(
+            (status, _report_status_scan_view(report, chain))
+        )
     )
     return {
         "mission_id": mission_id,
+        "mission_record_integrity_verified": mission_record_integrity_verified,
+        "timeline_matches_integrity_checked_mission": timeline_matches_integrity_checked_mission,
         "status_mission_id_matches": status.get("mission_id") == mission_id,
         "report_mission_id_matches": summary.get("mission_id") == mission_id,
         "provenance_mission_id_matches": provenance.get("mission_id") == mission_id,
+        "timeline_records_bound_to_mission": timeline_records_bound,
+        "timeline_integrity_verified": timeline_integrity_verified,
         "evidence_and_chain_bound_to_mission": binding_verified,
         "evidence_records_bound_to_mission": evidence_records_bound,
+        "execution_chain_records_bound_to_mission": chain_records_bound,
+        "execution_chain_provenance_bound_to_mission": provenance_chain_bound,
+        "execution_chain_provenance_matches_payload": provenance_chain_matches_payload,
+        "mission_request_binding_verified": bool(request_id)
+        and summary.get("request_id") == request_id
+        and _record_request_binding(status, request_id, require_present=False),
         "evidence_record_count": len(evidence),
         "validation_record_mission_id": summary.get("mission_id"),
         "validation_record_bound_to_mission": (
             summary.get("mission_id") == mission_id
+            and _record_bound_to_mission(summary, mission_id)
+            and _record_request_binding(summary, request_id, require_present=True)
             and summary.get("mission_status") == status.get("status")
             and isinstance(verification.get("verified"), bool)
         ),
+        "project_test_evidence_sources": project_test_evidence_sources,
+        "project_test_evidence_source_verified": project_test_execution_proof.get("verified") is True,
+        "project_test_execution_proof": project_test_execution_proof,
         "effect_ledger": effects,
         "mission_status": status.get("status"),
+        "mission_plan_sha256": _canonical_sha256(mission_plan)
+        if isinstance(mission_plan, dict) and mission_plan else None,
+        "mission_plan_history_sha256": _canonical_sha256(mission_plan_history)
+        if isinstance(mission_plan_history, list) and mission_plan_history else None,
         "queue_state": (status.get("queue") or {}).get("state") if isinstance(status.get("queue"), dict) else None,
         "pause_requested": (status.get("progress") or {}).get("pause_requested") is True
         if isinstance(status.get("progress"), dict) else False,
         "tool_execution_count": tool_execution_count,
         "tool_projection": _tool_execution_projection(status),
+        "action_history_count": len(status.get("action_history"))
+        if isinstance(status.get("action_history"), list) else None,
+        "action_history_sha256": _canonical_sha256(status.get("action_history"))
+        if isinstance(status.get("action_history"), list) else None,
         "timeline_event_count": len(timeline),
         "timeline_sha256": _canonical_sha256(timeline),
         "evidence_item_count": len(evidence),
         "evidence_sha256": _canonical_sha256(evidence),
         "validation_sha256": validation_sha256,
         "report_sha256": report_sha256,
+        "report_body_sha256": report_body_sha256,
+        "report_digest_matches_canonical_body": report_digest_matches_body,
+        "report_digest_scope_matches_producer": report_digest_scope_matches,
+        "report_producer_payload_matches_status": report_producer_payload_matches,
+        "report_producer_source_sha256": report_producer_source_sha256,
+        "report_provenance_sha256": report_provenance_sha256,
+        "report_evidence_digest_matches_source": report_evidence_digest_matches_source,
+        "report_execution_chain_head_matches_source": report_execution_chain_head_matches,
+        "report_verification_counts_match_source": report_verification_counts_match_source,
         "report_outcome": summary.get("outcome"),
         "report_verified": verification.get("verified"),
-        "execution_chain_integrity": report_evidence.get("execution_chain_integrity"),
+        "report_verification_summary_consistent": report_verification_consistent,
+        "execution_chain_integrity": chain_integrity,
+        "execution_chain_hash_valid": (
+            project_test_execution_proof.get("execution_chain_hash_valid") is True
+        ),
+        "execution_chain_integrity_verified": (
+            project_test_execution_proof.get("execution_chain_integrity_verified") is True
+        ),
+        "independent_execution_chain_integrity": independent_chain_integrity,
+        "execution_chain_storage_status": full_chain_storage_status,
+        "execution_chain_storage_verified": full_chain_storage_verified,
+        "execution_chain_receipts_verified": (
+            project_test_execution_proof.get("execution_chain_receipts_verified") is True
+        ),
+        "full_execution_chain_count": len(full_chain) if isinstance(full_chain, list) else None,
+        "full_execution_chain_sha256": _canonical_sha256(full_chain)
+        if isinstance(full_chain, list) else None,
         "final_report_approval_status": (report.get("final_report_approval") or {}).get("status")
         if isinstance(report.get("final_report_approval"), dict) else None,
         "report_projection_valid": report_verified,
@@ -1090,11 +3269,15 @@ def _mission_audit_projection(snapshot: dict, mission_id: str) -> dict:
             status.get("status") == "GOAL_COMPLETED"
             and summary.get("mission_status") == "GOAL_COMPLETED"
             and summary.get("outcome") == "VERIFIED"
-            and verification.get("verified") is True
-            and report_evidence.get("execution_chain_integrity") == "VALID"
+            and report_verification_consistent
+            and project_test_execution_proof.get("execution_chain_integrity_verified") is True
             and len(evidence) > 0
             and bool(chain)
             and evidence_records_bound
+            and chain_records_bound
+            and provenance_chain_bound
+            and provenance_chain_matches_payload
+            and project_test_execution_proof.get("verified") is True
             and effects.get("duplicate_effect_ids") is False
             and binding_verified
             and report_verified
@@ -1109,6 +3292,117 @@ def _find_state_directory(profile_root: Path) -> Path:
         if state.name.casefold() == "state" and (state / "workspaces").is_dir():
             return state
     raise RuntimeError("installed_app_disposable_state_directory_not_found")
+
+
+def _read_profile_evidence_chain_diagnostic(profile_root: Path) -> tuple[list[dict] | None, str]:
+    """Read the complete profile chain read-only and keep storage vs integrity failures distinct."""
+    try:
+        root = profile_root.expanduser().resolve(strict=True)
+        state_directory = (root / "userData" / "state").resolve(strict=True)
+        if (
+            not state_directory.is_relative_to(root)
+            or not (state_directory / "intel.sqlite3").is_file()
+            or not (state_directory / "workspaces").is_dir()
+        ):
+            return None, "UNREADABLE"
+        evidence_path = state_directory / "evidence_chain.db"
+        if not evidence_path.exists():
+            return [], "NOT_PRESENT"
+        evidence_path = evidence_path.resolve(strict=True)
+        if not evidence_path.is_relative_to(state_directory):
+            return None, "UNREADABLE"
+        uri = "file:" + quote(str(evidence_path), safe="/:") + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            rows = db.execute(
+                "SELECT sequence,current_hash,payload FROM evidence_chain ORDER BY sequence"
+            ).fetchall()
+        finally:
+            db.close()
+        records: list[dict] = []
+        for row_sequence, row_hash, encoded_record in rows:
+            if type(row_sequence) is not int or not isinstance(row_hash, str) or not isinstance(encoded_record, str):
+                return None, "INVALID"
+            record = json.loads(encoded_record)
+            if (
+                not isinstance(record, dict)
+                or type(record.get("sequence")) is not int
+                or record.get("sequence") != row_sequence
+                or record.get("current_hash") != row_hash
+            ):
+                return None, "INVALID"
+            records.append(record)
+        if not records:
+            return [], "NOT_PRESENT"
+        if not _verify_durable_execution_chain(records):
+            return None, "INVALID"
+        receipt_status = _verify_profile_execution_chain_receipts(state_directory, records)
+        return (records, "VALID") if receipt_status == "VALID" else (None, receipt_status)
+    except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError, OverflowError, RuntimeError):
+        return None, "UNREADABLE"
+
+
+def _verify_profile_execution_chain_receipts(state_directory: Path, records: list[dict]) -> str:
+    if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
+        return "INVALID"
+    fenced_records = [record for record in records if isinstance(record, dict) and record.get("fence_id")]
+    if not fenced_records:
+        return "VALID"
+    try:
+        from agent.evidence import EvidenceChainStore
+        from agent.mission import Mission
+
+        expected_by_mission: dict[str, list[dict]] = {}
+        for record in fenced_records:
+            mission_id = record.get("mission_id")
+            if not isinstance(mission_id, str) or not mission_id:
+                return "INVALID"
+            expected_by_mission.setdefault(mission_id, []).append(
+                EvidenceChainStore._receipt(record)
+            )
+        state_root = state_directory.resolve(strict=True)
+        mission_db_path = (state_root / "missions.sqlite3").resolve(strict=True)
+        if not mission_db_path.is_relative_to(state_root) or not mission_db_path.is_file():
+            return "UNREADABLE"
+        uri = "file:" + quote(str(mission_db_path), safe="/:") + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            mission_rows = {}
+            for mission_id in expected_by_mission:
+                row = db.execute(
+                    "SELECT payload FROM missions WHERE mission_id=?", (mission_id,)
+                ).fetchone()
+                if row is None or not isinstance(row[0], str):
+                    return "INVALID"
+                mission_rows[mission_id] = json.loads(row[0])
+        finally:
+            db.close()
+
+        verified_missions = {}
+        for mission_id, payload in mission_rows.items():
+            if not isinstance(payload, dict) or payload.get("mission_id") != mission_id:
+                return "INVALID"
+            mission = Mission.from_dict(payload)
+            if mission.mission_id != mission_id or not mission.verify_integrity():
+                return "INVALID"
+            refs = mission.progress.get("execution_evidence_refs")
+            if not isinstance(refs, list) or any(not isinstance(item, dict) for item in refs):
+                return "INVALID"
+            verified_missions[mission_id] = refs
+        for mission_id, expected_receipts in expected_by_mission.items():
+            if verified_missions[mission_id] != expected_receipts:
+                return "INVALID"
+        return "VALID"
+    except (sqlite3.Error, OSError, RuntimeError):
+        return "UNREADABLE"
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return "INVALID"
+
+
+def _read_profile_evidence_chain(profile_root: Path) -> list[dict] | None:
+    """Compatibility wrapper for read-only loading of a fully valid profile chain."""
+    records, status = _read_profile_evidence_chain_diagnostic(profile_root)
+    return records if status == "VALID" else None
 
 
 def _installed_app_mission(
@@ -1260,8 +3554,10 @@ def _installed_app_mission(
     no_automatic_resume_verified = False
     execution_history_unchanged = False
     resume_gate_verified = False
+    before_projection: dict = {}
+    after_projection: dict = {}
     if pause_verified:
-        before_restart_snapshot = _mission_audit_snapshot(page, mission_id)
+        before_restart_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
         page_after_restart, paused_restart_cycle, paused_restart_snapshot = restart_callback(
             "paused_mission", mission_id, before_restart_snapshot, True
         )
@@ -1291,6 +3587,9 @@ def _installed_app_mission(
         after_tool = _tool_execution_projection(persisted_status)
         before_projection = _mission_audit_projection(before_restart_snapshot, mission_id)
         after_projection = _mission_audit_projection(paused_restart_snapshot, mission_id)
+        restart_reconciliation = _mission_restart_reconciliation(
+            before_projection, after_projection, allow_owner_reauth_transition=True
+        )
         reauth_quarantine = (
             persisted_status.get("status") == "OWNER_REAUTH_REQUIRED"
             and persisted_queue.get("state") == "needs_input"
@@ -1315,6 +3614,8 @@ def _installed_app_mission(
             == after_projection["effect_ledger"].get("full_records_sha256")
             and before_projection["effect_ledger"].get("duplicate_effect_ids") is False
             and after_projection["effect_ledger"].get("duplicate_effect_ids") is False
+            and after_projection.get("execution_chain_storage_verified") is True
+            and restart_reconciliation.get("reconciled") is True
         )
         no_automatic_resume_verified = persistence_verified and execution_history_unchanged
         owner_authorized = paused_restart_cycle.get("owner_authentication", {}).get("status") == "PASS"
@@ -1363,6 +3664,12 @@ def _installed_app_mission(
             "mission_id": mission_id,
             "before_restart": before_projection,
             "after_restart": after_projection,
+            "restoration_status": "PASS",
+            "execution_chain_storage_status": after_projection.get("execution_chain_storage_status"),
+            "execution_chain_storage_verified": after_projection.get("execution_chain_storage_verified") is True,
+            "storage_failure_class": None if after_projection.get("execution_chain_storage_verified") is True else "storage",
+            "restart_reconciliation": restart_reconciliation,
+            "reconciliation_status": "PASS" if restart_reconciliation.get("reconciled") is True else "FAIL",
             "paused_state_persisted": persistence_verified,
             "no_automatic_resume": no_automatic_resume_verified,
             "tool_history_unchanged_before_explicit_resume": execution_history_unchanged,
@@ -1486,13 +3793,32 @@ def _installed_app_mission(
     tool_authorization_verified = _tools_within_authorized_allowlist(tool_summary, allowed_tools)
     report_outcome = str(report_summary.get("outcome", ""))
     chain_integrity = str(report_evidence.get("execution_chain_integrity", ""))
-    test_tool_pass = any(item.get("name") == "run_project_tests" and item.get("ok") is True for item in tool_summary)
+    project_test_execution_proof = (
+        after_projection.get("project_test_execution_proof")
+        if isinstance(after_projection.get("project_test_execution_proof"), dict) else {}
+    )
+    project_test_evidence_sources = after_projection.get("project_test_evidence_sources", [])
+    if not isinstance(project_test_evidence_sources, list):
+        project_test_evidence_sources = []
+    project_test_evidence_source_verified = project_test_execution_proof.get("verified") is True
+    blocked_or_unverified_status_present = _contains_blocked_or_unverified_status(
+        (mission_state, report, tool_summary)
+    )
+    test_tool_pass = project_test_execution_proof.get("exactly_one_actual_execution_verified") is True
     event_types = [str(item.get("event", "")) for item in timeline if isinstance(item, dict)]
     research_stage = any(name in event_types for name in ("ObservationReceived", "ObservationInterpreted"))
     hypothesis_stage = "HypothesisUpdated" in event_types
-    evidence_stage = len(evidence) > 0 and "EvidenceAdded" in event_types
+    evidence_stage = (
+        len(evidence) > 0
+        and "EvidenceAdded" in event_types
+        and project_test_evidence_source_verified
+    )
     finding_count = len(report.get("findings", [])) if isinstance(report.get("findings"), list) else 0
-    report_stage = bool(report.get("report_sha256")) and bool(report_summary)
+    report_stage = (
+        bool(report.get("report_sha256"))
+        and bool(report_summary)
+        and report.get("report_sha256") == _canonical_report_body_sha256(report)
+    )
     approval_pending = final_report_approval.get("status") == "PENDING"
     terminal_restart_cycle: dict = {"status": "NOT_RUN", "reason": "mission_not_terminal_or_restart_unavailable"}
     terminal_restart_snapshot: dict | None = None
@@ -1500,7 +3826,7 @@ def _installed_app_mission(
         paused_restart_cycle.get("status") in {"PASS", "NOT_RUN"}
     )
     if terminal_restart_eligible:
-        before_terminal_snapshot = _mission_audit_snapshot(page, mission_id)
+        before_terminal_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
         page_after_terminal_restart, terminal_restart_cycle, terminal_restart_snapshot = restart_callback(
             "terminal_mission", mission_id, before_terminal_snapshot, False
         )
@@ -1509,22 +3835,20 @@ def _installed_app_mission(
         if terminal_restart_snapshot is not None:
             before_terminal_projection = _mission_audit_projection(before_terminal_snapshot, mission_id)
             after_terminal_projection = _mission_audit_projection(terminal_restart_snapshot, mission_id)
-            stable_fields = (
-                "status_mission_id_matches", "report_mission_id_matches", "provenance_mission_id_matches",
-                "evidence_and_chain_bound_to_mission", "evidence_records_bound_to_mission",
-                "validation_record_bound_to_mission", "mission_status", "queue_state", "tool_execution_count",
-                "evidence_sha256", "validation_sha256", "report_sha256", "report_outcome", "report_verified",
-                "effect_ledger",
-                "execution_chain_integrity", "final_report_approval_status",
+            terminal_reconciliation = _mission_restart_reconciliation(
+                before_terminal_projection, after_terminal_projection
             )
-            terminal_records_unchanged = all(
-                before_terminal_projection.get(key) == after_terminal_projection.get(key)
-                for key in stable_fields
-            )
+            terminal_records_unchanged = terminal_reconciliation.get("reconciled") is True
             terminal_restart_cycle["mission"] = {
                 "mission_id": mission_id,
                 "before_restart": before_terminal_projection,
                 "after_restart": after_terminal_projection,
+                "restoration_status": "PASS",
+                "execution_chain_storage_status": after_terminal_projection.get("execution_chain_storage_status"),
+                "execution_chain_storage_verified": after_terminal_projection.get("execution_chain_storage_verified") is True,
+                "storage_failure_class": None if after_terminal_projection.get("execution_chain_storage_verified") is True else "storage",
+                "restart_reconciliation": terminal_reconciliation,
+                "reconciliation_status": "PASS" if terminal_records_unchanged else "FAIL",
                 "terminal_state_and_records_unchanged": terminal_records_unchanged,
                 "completed_mission_inspectable_after_restart": after_terminal_projection[
                     "completed_mission_inspectable"
@@ -1535,6 +3859,7 @@ def _installed_app_mission(
                 and terminal_restart_cycle.get("owner_authentication", {}).get("status") == "PASS"
                 and terminal_restart_cycle.get("model_runtime", {}).get("status") == "PASS"
                 and terminal_records_unchanged
+                and after_terminal_projection.get("execution_chain_storage_verified") is True
                 and after_terminal_projection.get("evidence_and_chain_bound_to_mission") is True
                 and after_terminal_projection.get("report_projection_valid") is True
             ) else "FAIL"
@@ -1542,19 +3867,22 @@ def _installed_app_mission(
         terminal_restart_snapshot
         and _mission_audit_projection(terminal_restart_snapshot, mission_id)["completed_mission_inspectable"]
     )
-    run_project_tests_calls = [item for item in tool_summary if item.get("name") == "run_project_tests"]
     no_duplicate_tool_call_ids = not _tool_execution_projection(mission_state)["duplicate_tool_call_ids"]
     paused_restart_pass = paused_restart_cycle.get("status") == "PASS"
     terminal_restart_pass = terminal_restart_cycle.get("status") == "PASS"
     mission_pass = (
         mission_state.get("status") == "GOAL_COMPLETED"
+        and not blocked_or_unverified_status_present
         and authorization_binding
         and scope_firewall_verified
         and tool_authorization_verified
         and research_stage
         and hypothesis_stage
         and test_tool_pass
+        and project_test_execution_proof.get("verified") is True
+        and project_test_execution_proof.get("verified_linked_execution_count") == 1
         and evidence_stage
+        and project_test_evidence_source_verified
         and chain_integrity == "VALID"
         and report_outcome == "VERIFIED"
         and report_verification.get("verified") is True
@@ -1570,7 +3898,6 @@ def _installed_app_mission(
         and resume_verified is True
         and not wait_skipped_for_safety
         and no_duplicate_tool_call_ids
-        and len(run_project_tests_calls) == 1
         and terminal_restart_pass
         and completed_mission_inspectable_after_restart
     )
@@ -1594,7 +3921,26 @@ def _installed_app_mission(
         "resource_failure_diagnostics": _safe_failure_diagnostics(mission_state),
         "resource_checkpoint_diagnostics": _safe_checkpoint_diagnostics(mission_state),
         "tool_calls": tool_summary,
-        "run_project_tests_invocation_count": len(run_project_tests_calls),
+        "run_project_tests_result_record_count": project_test_execution_proof.get("result_record_count", 0),
+        "run_project_tests_successful_result_record_count": project_test_execution_proof.get(
+            "successful_result_record_count", 0
+        ),
+        "run_project_tests_unaccounted_successful_result_record_count": project_test_execution_proof.get(
+            "unaccounted_successful_result_record_count", 0
+        ),
+        "run_project_tests_sandbox_process_evidence_record_count": project_test_execution_proof.get(
+            "sandbox_process_evidence_record_count"
+        ),
+        "run_project_tests_verified_actual_execution_count": project_test_execution_proof.get(
+            "verified_linked_execution_count"
+        ),
+        "run_project_tests_exactly_once_verified": project_test_execution_proof.get(
+            "exactly_one_actual_execution_verified"
+        ) is True,
+        "project_test_evidence_sources": project_test_evidence_sources,
+        "project_test_evidence_source_verified": project_test_evidence_source_verified,
+        "project_test_execution_proof": project_test_execution_proof,
+        "blocked_or_unverified_status_present": blocked_or_unverified_status_present,
         "duplicate_tool_call_ids": not no_duplicate_tool_call_ids,
         "tool_results_source": tool_results_source,
         "research_stage": research_stage,
@@ -1746,7 +4092,7 @@ def main() -> int:
         "installed_executable_launch": {"status": "NOT_RUN"},
         "application_restart": {
             "status": "NOT_RUN",
-            "close_method": "taskkill.exe /PID <pid> /T /F",
+            "close_method": "NOT_RUN: PID-only tree termination is not safely bound to the launched process",
             "graceful_quit_claimed": False,
             "renderer_reload_used": False,
             "cycles": [],
@@ -2182,23 +4528,28 @@ def main() -> int:
                 page.locator("#loginUsername").fill(username)
                 page.locator("#loginPassword").fill("intentionally-invalid-windows-acceptance-password")
                 with page.expect_response(
-                    lambda response: response.request.method == "POST" and "/api/public/auth/login" in response.url,
+                    lambda response: getattr(getattr(response, "request", None), "method", None) == "POST",
                     timeout=30_000,
                 ) as invalid_response_info:
                     page.locator("#loginButton").click(timeout=30_000)
                 invalid_response = invalid_response_info.value
                 invalid_body = invalid_response.json()
+                invalid_login_request_target_matches = _is_expected_owner_login_request(
+                    page, invalid_response.request
+                )
                 stage = "invalid_owner_login_renderer_state"
                 page.wait_for_function(
                     "() => document.querySelector('#authStateSide')?.textContent.trim() === 'غير مسجل الدخول'",
                     timeout=30_000,
                 )
                 invalid_rejected = (
-                    invalid_response.status in (400, 401, 403)
+                    invalid_login_request_target_matches
+                    and invalid_response.status in (400, 401, 403)
                     and invalid_body.get("authenticated") is not True
                 )
                 report["owner_authentication"].update({
                     "invalid_credentials_rejected": invalid_rejected,
+                    "invalid_login_request_target_matches": invalid_login_request_target_matches,
                     "invalid_login_http_status": invalid_response.status,
                     "invalid_login_error": invalid_body.get("error"),
                     "invalid_login_left_owner_unauthenticated": "غير مسجل الدخول" in page.locator("#authStateSide").inner_text(),
@@ -2209,23 +4560,28 @@ def main() -> int:
                 page.locator("#loginUsername").fill(username)
                 page.locator("#loginPassword").fill(owner_password)
                 with page.expect_response(
-                    lambda response: response.request.method == "POST" and "/api/public/auth/login" in response.url,
+                    lambda response: getattr(getattr(response, "request", None), "method", None) == "POST",
                     timeout=30_000,
                 ) as valid_response_info:
                     page.locator("#loginButton").click(timeout=30_000)
                 valid_response = valid_response_info.value
                 valid_body = valid_response.json()
+                valid_login_request_target_matches = _is_expected_owner_login_request(
+                    page, valid_response.request
+                )
                 page.wait_for_function(
                     "() => (document.querySelector('#authStateSide')?.textContent || '').includes('مسجل الدخول')",
                     timeout=30_000,
                 )
                 valid_login = (
-                    valid_response.status == 200
+                    valid_login_request_target_matches
+                    and valid_response.status == 200
                     and valid_body.get("authenticated") is True
                     and valid_body.get("username") == username
                 )
                 report["owner_authentication"].update({
                     "valid_credentials_accepted": valid_login,
+                    "valid_login_request_target_matches": valid_login_request_target_matches,
                     "valid_login_http_status": valid_response.status,
                     "valid_login_identity_matches_owner": valid_body.get("username") == username,
                 })
@@ -2241,7 +4597,10 @@ def main() -> int:
                     cycle = {
                         "cycle": cycle_name,
                         "status": "FAIL",
-                        "close_method": "taskkill.exe /PID <pid> /T /F",
+                        "close_method": "NOT_RUN: PID-only tree termination is not safely bound to the launched process",
+                        "execution_chain_storage_status": "NOT_READ",
+                        "restoration_status": "NOT_RUN",
+                        "reconciliation_status": "NOT_RUN",
                         "graceful_quit_claimed": False,
                         "renderer_reload_used": False,
                         "installed_executable": str(args.installed_executable),
@@ -2259,7 +4618,9 @@ def main() -> int:
                             finally:
                                 browser = None
                                 page = None
-                        termination = _terminate_installed_process_tree(active_application_pid, args.cdp_port)
+                        termination = _terminate_installed_process_tree(
+                            active_application_pid, args.cdp_port, args.installed_executable
+                        )
                         cycle.update(termination)
                         if termination.get("process_tree_termination_verified") is not True:
                             raise RuntimeError("installed_application_process_tree_did_not_stop")
@@ -2308,13 +4669,32 @@ def main() -> int:
                             page, args.installed_executable, progress, verify_inference=verify_inference
                         )
                         if cycle["owner_authentication"].get("status") == "PASS":
-                            after_snapshot = _mission_audit_snapshot(page, mission_id)
+                            after_snapshot = _mission_audit_snapshot(page, mission_id, args.profile_root)
                             before_projection = _mission_audit_projection(before_snapshot, mission_id)
                             after_projection = _mission_audit_projection(after_snapshot, mission_id)
+                            restart_reconciliation = _mission_restart_reconciliation(
+                                before_projection,
+                                after_projection,
+                                allow_owner_reauth_transition=(cycle_name == "paused_mission"),
+                            )
+                            cycle["restoration_status"] = "PASS"
+                            cycle["execution_chain_storage_status"] = after_projection.get(
+                                "execution_chain_storage_status"
+                            )
+                            cycle["execution_chain_storage_verified"] = (
+                                after_projection.get("execution_chain_storage_verified") is True
+                            )
+                            cycle["storage_failure_class"] = (
+                                None if cycle["execution_chain_storage_verified"] else "storage"
+                            )
+                            cycle["reconciliation_status"] = (
+                                "PASS" if restart_reconciliation.get("reconciled") is True else "FAIL"
+                            )
                             cycle["mission"] = {
                                 "mission_id": mission_id,
                                 "before_restart": before_projection,
                                 "after_restart": after_projection,
+                                "restart_reconciliation": restart_reconciliation,
                                 "mission_id_and_report_binding_verified": (
                                     before_projection.get("evidence_and_chain_bound_to_mission") is True
                                     and after_projection.get("evidence_and_chain_bound_to_mission") is True
@@ -2332,6 +4712,9 @@ def main() -> int:
                             and cycle["owner_authentication"].get("status") == "PASS"
                             and cycle["model_runtime"].get("status") == "PASS"
                             and cycle.get("mission", {}).get("mission_id_and_report_binding_verified") is True
+                            and cycle.get("restoration_status") == "PASS"
+                            and cycle.get("execution_chain_storage_verified") is True
+                            and cycle.get("reconciliation_status") == "PASS"
                         ) else "FAIL"
                         if cycle_name == "terminal_mission" and after_snapshot is not None:
                             try:
@@ -2343,7 +4726,17 @@ def main() -> int:
                     except Exception as exc:
                         cycle["status"] = "FAIL"
                         cycle["restart_error_type"] = type(exc).__name__
-                        cycle["restart_error_code"] = "installed_application_restart_validation_failed"
+                        if isinstance(exc, _MissionAuditSnapshotError):
+                            cycle["restart_failure_class"] = exc.failure_class
+                            cycle["restart_error_code"] = exc.reason_code
+                            cycle["restoration_status"] = "FAIL"
+                        elif after_snapshot is not None:
+                            cycle["restart_failure_class"] = "reconciliation"
+                            cycle["restart_error_code"] = "mission_audit_reconciliation_failed"
+                            cycle["reconciliation_status"] = "FAIL"
+                        else:
+                            cycle["restart_failure_class"] = "restart_validation"
+                            cycle["restart_error_code"] = "installed_application_restart_validation_failed"
                     cycle["current_process_id_after_cycle"] = active_application_pid
                     report["application_restart"]["cycles"].append(cycle)
                     report["application_restart"]["current_process_id"] = active_application_pid
@@ -2459,8 +4852,8 @@ def main() -> int:
             return return_code
     except Exception as exc:
         report["failure_stage"] = stage
-        report["error_type"] = type(exc).__name__
-        report["error"] = str(exc)[:500]
+        safe_error = _safe_exception_diagnostics(exc)
+        report.update(safe_error)
         report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         report["status"] = "FAIL"
         if report.get("application_restart", {}).get("status") == "IN_PROGRESS":
@@ -2471,7 +4864,7 @@ def main() -> int:
             mission_report["incomplete_operation_reported_truthfully"] = True
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps({"status": report["status"], "error_type": report["error_type"], "error": report["error"]}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"status": report["status"], **safe_error}, ensure_ascii=False), file=sys.stderr)
         return 2
     finally:
         # A CDP disconnect must not close the installed Electron process; the
