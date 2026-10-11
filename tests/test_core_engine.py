@@ -82,6 +82,113 @@ def test_handle_once_denies_request_when_owner_authentication_fails(monkeypatch)
     ]
 
 
+def test_handle_once_denies_request_when_owner_session_challenge_fails(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(status="created", claimed=True),
+    )
+    monkeypatch.setattr(
+        engine,
+        "consume_owner_challenge",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError("invalid owner challenge")
+        ),
+    )
+    events = []
+    completions = []
+    monkeypatch.setattr(
+        engine,
+        "add_event",
+        lambda *args, **kwargs: events.append((args, kwargs)) or "auth-event",
+    )
+    monkeypatch.setattr(
+        engine,
+        "complete_lifecycle",
+        lambda *args, **kwargs: completions.append((args, kwargs)),
+    )
+
+    result = engine._handle_once(
+        "status",
+        source="test",
+        request_id="session-auth-denied",
+        owner_session_id="session-1",
+        owner_challenge="challenge-1",
+    )
+
+    assert result == {
+        "ok": False,
+        "decision": "deny",
+        "request_id": "session-auth-denied",
+        "answer": "مصادقة المالك مطلوبة.",
+        "plan": [],
+        "results": [],
+        "lifecycle": "completed",
+    }
+    assert events[0][0][0:3] == (
+        "auth",
+        "Owner authentication",
+        "invalid owner challenge",
+    )
+    assert completions == [
+        (("session-auth-denied", result), {"success": False, "error": "invalid owner challenge"})
+    ]
+
+
+def test_handle_once_denies_request_when_policy_rejects_authenticated_owner(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(status="created", claimed=True),
+    )
+    monkeypatch.setattr(
+        engine,
+        "authenticate_owner",
+        lambda *args, **kwargs: SimpleNamespace(
+            authenticated_at="2026-10-12T00:00:00Z",
+            is_valid=lambda request_id: True,
+            to_dict=lambda: {"method": "owner_token", "request_id": "policy-denied"},
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "evaluate",
+        lambda _request: SimpleNamespace(allowed=False, reason="policy denied by contract"),
+    )
+    events = []
+    completions = []
+    monkeypatch.setattr(
+        engine,
+        "add_event",
+        lambda *args, **kwargs: events.append((args, kwargs)) or len(events),
+    )
+    monkeypatch.setattr(
+        engine,
+        "complete_lifecycle",
+        lambda *args, **kwargs: completions.append((args, kwargs)),
+    )
+
+    result = engine._handle_once("status", source="test", request_id="policy-denied")
+
+    assert result == {
+        "ok": False,
+        "decision": "deny",
+        "request_id": "policy-denied",
+        "answer": "policy denied by contract",
+        "plan": [],
+        "results": [],
+        "lifecycle": "completed",
+    }
+    assert events[1][0][0:3] == (
+        "policy",
+        "Policy evaluation",
+        "policy denied by contract",
+    )
+    assert completions == [
+        (("policy-denied", result), {"success": False, "error": "policy denied by contract"})
+    ]
+
+
 def test_summarize_covers_local_and_tool_result_branches():
     local = engine.summarize([], [], "local", "ignored")
     assert local == "يعمل النظام في الوضع المحلي المحدود؛ لم يتوفر مزود نموذج للمحادثة."
