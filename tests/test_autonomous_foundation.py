@@ -138,6 +138,39 @@ def test_scheduler_reenqueue_preserves_active_worker_lease(tmp_path):
     assert preserved.lease_expires_at == claimed.lease_expires_at
 
 
+def test_scheduler_restart_after_queue_commit_failure_preserves_active_lease(tmp_path):
+    class CrashAfterQueueEnqueue(MissionQueue):
+        def __init__(self, db_path):
+            super().__init__(db_path)
+            self.crash_once = True
+
+        def enqueue(self, mission_id, **kwargs):
+            item = super().enqueue(mission_id, **kwargs)
+            if self.crash_once:
+                self.crash_once = False
+                claimed = self.claim_next(now="2026-01-01T00:01:00+00:00", worker_id="active-worker", lease_seconds=3600)
+                assert claimed is not None
+                raise RuntimeError("crash after queue commit")
+            return item
+
+    queue = CrashAfterQueueEnqueue(Path(tmp_path) / "queue.sqlite3")
+    db = Path(tmp_path) / "scheduler.sqlite3"
+    scheduler = MissionScheduler(db, queue)
+    scheduler.schedule("mission-cross-db", run_at="2026-01-01T00:00:00+00:00", schedule_id="one")
+
+    with pytest.raises(RuntimeError, match="after queue commit"):
+        scheduler.dispatch_due(now="2026-01-01T00:01:00+00:00")
+
+    assert scheduler.get("one").state is WorkerMissionState.SCHEDULED
+    assert queue.get("mission-cross-db").lease_owner == "active-worker"
+
+    restarted = MissionScheduler(db, queue)
+    dispatched = restarted.dispatch_due(now="2026-01-01T00:01:00+00:00")
+    assert [item.schedule_id for item in dispatched] == ["one"]
+    assert restarted.get("one").state is WorkerMissionState.COMPLETED
+    assert queue.get("mission-cross-db").lease_owner == "active-worker"
+
+
 def test_concurrent_workers_claim_a_mission_once(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
 
