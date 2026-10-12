@@ -10,11 +10,14 @@ These prove the reasoning discipline itself:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from cyber.reasoning_engine import (
     AttackPath,
     Critique,
+    OffensiveHypothesis,
     OffensiveReasoningEngine,
     ReasoningEffort,
     ReasoningStep,
@@ -158,3 +161,23 @@ def test_step_must_be_falsifiable_with_evidence_or_explicitly_not():
         ReasoningStep("s1", "unfalsifiable", falsifiable=True, evidence_required="")
     ok = ReasoningStep("s1", "unfalsifiable", falsifiable=False)
     assert ok.falsifiable is False
+
+
+def test_reasoning_artifacts_reject_invalid_priors_and_empty_descriptions():
+    with pytest.raises(ValueError):
+        OffensiveHypothesis("h1", "bad", prior=1.1)
+    with pytest.raises(ValueError):
+        ReasoningStep("s1", "")
+
+
+def test_empty_plan_is_critiqued_and_has_no_verification_plan():
+    engine = OffensiveReasoningEngine()
+    empty_path = AttackPath(
+        path_id="p-empty",
+        objective="assess target.example",
+        steps=(),
+    )
+    critiques = engine.critique_path(empty_path)
+
+    assert any(critique.kind == "empty_plan" for critique in critiques)
+    assert engine.verification_plan(SimpleNamespace(paths=[])) == []
