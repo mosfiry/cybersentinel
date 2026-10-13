@@ -7,6 +7,8 @@ or poison-payload authority all must be refused.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.offensive_mind import Engagement, OffensiveMind
@@ -60,6 +62,9 @@ def target(host, tid="t1", excluded=()):
 
 
 def test_no_snapshot_means_nothing_is_executable():
+    with pytest.raises(ValueError, match="requires a url"):
+        OffensiveAction()
+
     planner = OffensiveExecutionPlanner()
     plan = planner.plan_actions([OffensiveAction(url="https://target.example/")], None)
     assert plan["executable"] == []
@@ -190,6 +195,36 @@ def test_invalid_urls_are_refused_not_raised():
     assert all("invalid url" in reason for reason in reasons)
 
 
+def test_scope_guard_refuses_missing_target_identity_and_identity_mismatch():
+    auth = program([web_asset("target.example")])
+    missing_target = snapshot_with(auth, [target("other.example")])
+    mismatch_target = snapshot_with(auth, [target("target.example", tid="expected")])
+    guard = ScopeGuard()
+
+    no_identity = guard.evaluate(OffensiveAction(url="https://target.example/"), missing_target)
+    wrong_identity = guard.evaluate(
+        OffensiveAction(url="https://target.example/", target_id="wrong"),
+        mismatch_target,
+    )
+
+    assert no_identity.allowed is False
+    assert no_identity.reason == "no target identity in the snapshot covers this host"
+    assert wrong_identity.allowed is False
+    assert wrong_identity.reason == "action target identity mismatch"
+
+
+def test_guard_decision_serializes_only_decision_fields():
+    snap = snapshot_with(program([web_asset("target.example")]), [target("target.example")])
+    decision = ScopeGuard().evaluate(OffensiveAction(url="https://target.example/"), snap)
+
+    assert decision.to_dict() == {
+        "allowed": True,
+        "reason": "within authorized scope",
+        "canonical_url": "https://target.example/",
+        "rate_key": "snap-1/target.example",
+    }
+
+
 def test_campaign_steps_out_of_scope_are_refused_individually():
     engagement = Engagement(
         engagement_id="eng-1",
@@ -216,6 +251,17 @@ def test_campaign_without_snapshot_maps_to_zero_executable():
     mapped = OffensiveExecutionPlanner().plan_from_campaign(campaign, None)
     assert mapped["executable"] == []
     assert all("requires a typed ScopeSnapshot" in r["reason"] for r in mapped["refusals"])
+
+
+def test_campaign_steps_without_target_assets_are_not_invented():
+    campaign = SimpleNamespace(
+        steps=(SimpleNamespace(target_asset="", description="missing target"),)
+    )
+
+    mapped = OffensiveExecutionPlanner().plan_from_campaign(campaign, None)
+
+    assert mapped["executable"] == []
+    assert mapped["refusals"] == []
 
 
 def test_action_limit_caps_plan_size():
