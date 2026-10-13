@@ -120,6 +120,22 @@ def test_worker_lease_prevents_duplicate_and_recovers_expired(tmp_path):
     assert second and second.lease_owner == "b"
 
 
+def test_expired_recovery_does_not_requeue_a_renewed_lease(tmp_path):
+    queue = MissionQueue(tmp_path / "renewed.sqlite3")
+    queue.enqueue("renewed", available_at="2026-01-01T00:00:00+00:00")
+    claimed = queue.claim_next(now="2026-01-01T00:00:00+00:00", worker_id="owner-a", lease_seconds=10)
+    assert claimed is not None
+
+    renewed = queue.heartbeat("renewed", worker_id="owner-a", now="2026-01-01T00:00:05+00:00", lease_seconds=100)
+    recovered = queue.recover_expired(now="2026-01-01T00:00:11+00:00")
+
+    assert recovered == []
+    current = queue.get("renewed")
+    assert current.state is WorkerMissionState.EXECUTING
+    assert current.lease_owner == "owner-a"
+    assert current.lease_expires_at == renewed.lease_expires_at
+
+
 def test_successful_command_without_goal_evidence_is_unknown_and_repair_requires_auth(tmp_path):
     from agent.verification import FindingClaim, VerificationEngine, VerificationPlan, VerificationResult
     claim = FindingClaim("file created", "target-1")
