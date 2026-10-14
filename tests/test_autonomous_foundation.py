@@ -13,7 +13,7 @@ from agent.mission_worker import MissionQueue, MissionScheduler, MissionWorker, 
 from agent.self_repair import BoundedSelfRepair
 from agent.verification import FindingClaim, VerificationEngine, VerificationPlan, VerificationResult
 from security.mission_authorization import MissionAuthorizationSnapshot
-from tools.registry import get_tool, tool_definitions
+from tools.registry import ToolTimeout, get_tool, tool_definitions
 from workspace.environment import Workspace, WorkspaceBoundaryError, WorkspacePolicy, WorkspacePolicyError
 from api.missions import MissionService
 from agent.planning import Plan
@@ -254,6 +254,23 @@ def test_worker_records_runtime_permission_error_as_failure(tmp_path):
     result = MissionWorker(queue, lambda: Runtime(), worker_id="worker").run_once(now="2026-01-01T00:00:00+00:00")
     assert result.state is WorkerMissionState.FAILED
     assert result.last_error == "PermissionError: authorization denied"
+
+
+def test_worker_records_tool_timeout_as_failure_and_releases_renewal(tmp_path):
+    import threading
+
+    queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-tool-timeout", available_at="2026-01-01T00:00:00+00:00")
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            raise ToolTimeout("tool status timed out after 1s")
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="timeout-worker", lease_seconds=1).run_once(now="2026-01-01T00:00:00+00:00")
+
+    assert result.state is WorkerMissionState.FAILED
+    assert result.last_error == "ToolTimeout: tool status timed out after 1s"
+    assert not any(thread.name == "cybersentinel-lease-timeout-worker" for thread in threading.enumerate())
 
 
 def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
