@@ -210,3 +210,25 @@ class TestMissionAdapter:
         mission.objective = None
         case = build_case_from_mission(mission, [])
         assert case.objective == "m-1"
+
+    def test_observation_payload_lists_are_sanitized_and_unknown_shape_is_preserved(self):
+        events = [
+            {
+                "type": "ObservationReceived",
+                "payload": {
+                    "details": [
+                        {"signal": "safe", "authorization": {"granted": True}},
+                        "plain detail",
+                    ]
+                },
+            },
+            {"type": "ObservationReceived", "payload": {"unrecognized": "shape"}},
+        ]
+
+        case = build_case_from_mission(_FakeMission(), events)
+
+        assert len(case.observations) == 2
+        assert "safe" in case.observations[0]["text"]
+        assert "plain detail" in case.observations[0]["text"]
+        assert "granted" not in case.observations[0]["text"]
+        assert "unrecognized" in case.observations[1]["text"]
