@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import core.engine as engine
+from security.owner_policy import _issue_evidence
 
 
 def test_handle_once_replays_completed_lifecycle_without_reexecution(monkeypatch):
@@ -204,6 +205,67 @@ def test_handle_once_denies_request_when_policy_rejects_authenticated_owner(monk
     )
     assert completions == [
         (("policy-denied", result), {"success": False, "error": "policy denied by contract"})
+    ]
+
+
+def test_handle_once_rejects_unauthorized_plan_before_tool_execution(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(status="created", claimed=True),
+    )
+    evidence = _issue_evidence("owner_token", "plan-denied", "test")
+    monkeypatch.setattr(engine, "authenticate_owner", lambda *args, **kwargs: evidence)
+    monkeypatch.setattr(
+        engine.RUNTIME,
+        "plan",
+        lambda *args, **kwargs: {
+            "tools": ["status"],
+            "provider": "local",
+            "model": "fixture-model",
+            "planner": "fixture",
+        },
+    )
+    monkeypatch.setattr(engine, "transition_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        engine,
+        "authorize_plan",
+        lambda *args, **kwargs: ([], ["tool status is not authorized"]),
+    )
+    executed = []
+    monkeypatch.setattr(
+        engine,
+        "execute",
+        lambda *args, **kwargs: executed.append((args, kwargs)),
+    )
+    events = []
+    completions = []
+    monkeypatch.setattr(
+        engine,
+        "add_event",
+        lambda *args, **kwargs: events.append((args, kwargs)) or len(events),
+    )
+    monkeypatch.setattr(
+        engine,
+        "complete_lifecycle",
+        lambda *args, **kwargs: completions.append((args, kwargs)),
+    )
+
+    result = engine._handle_once("status", source="test", request_id="plan-denied")
+
+    assert result == {
+        "ok": False,
+        "decision": "deny",
+        "request_id": "plan-denied",
+        "answer": "تم رفض الخطة: tool status is not authorized",
+        "plan": [],
+        "results": [],
+        "lifecycle": "completed",
+    }
+    assert any(event[0][0:2] == ("authorization", "Plan rejected") for event in events)
+    assert executed == []
+    assert completions == [
+        (("plan-denied", result), {"success": False, "error": "tool status is not authorized"})
     ]
 
 
