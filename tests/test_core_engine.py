@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 import core.engine as engine
-from security.owner_policy import _issue_evidence
+from security.owner_policy import OwnerInstructionSource, _issue_evidence
 
 
 def test_handle_once_replays_completed_lifecycle_without_reexecution(monkeypatch):
@@ -214,7 +214,8 @@ def test_handle_once_rejects_unauthorized_plan_before_tool_execution(monkeypatch
         "begin_lifecycle",
         lambda request_id, source: SimpleNamespace(status="created", claimed=True),
     )
-    evidence = _issue_evidence("owner_token", "plan-denied", "test")
+    auth_method = next(iter(OwnerInstructionSource)).value
+    evidence = _issue_evidence(auth_method, "plan-denied", "test")
     monkeypatch.setattr(engine, "authenticate_owner", lambda *args, **kwargs: evidence)
     monkeypatch.setattr(
         engine.RUNTIME,
