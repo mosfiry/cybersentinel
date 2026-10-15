@@ -60,3 +60,31 @@ def test_tool_timeout_is_explicit(monkeypatch):
     monkeypatch.setitem(registry.REGISTRY, "slow_test", ToolSpec("slow_test", "test", "read", True, None, slow))
     with __import__("pytest").raises(ToolTimeout):
         execute("slow_test", timeout=0.001)
+
+
+def test_tool_timeout_does_not_claim_started_handler_was_cancelled(monkeypatch):
+    import threading
+    import time
+
+    finished = threading.Event()
+    side_effects = []
+
+    def slow_side_effect(_):
+        time.sleep(0.03)
+        side_effects.append("committed")
+        finished.set()
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        registry.REGISTRY,
+        "slow_side_effect",
+        ToolSpec("slow_side_effect", "test", "state-write", True, None, slow_side_effect),
+    )
+    with __import__("pytest").raises(ToolTimeout):
+        execute("slow_side_effect", timeout=0.001)
+
+    # ThreadPoolExecutor cannot interrupt a handler that already started.
+    # The timeout is therefore ambiguous: callers must reconcile, not retry.
+    assert not finished.is_set()
+    assert finished.wait(timeout=1), "the started handler must eventually finish"
+    assert side_effects == ["committed"]
