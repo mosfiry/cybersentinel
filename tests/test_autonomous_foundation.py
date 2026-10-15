@@ -273,6 +273,40 @@ def test_worker_records_tool_timeout_as_failure_and_releases_renewal(tmp_path):
     assert not any(thread.name == "cybersentinel-lease-timeout-worker" for thread in threading.enumerate())
 
 
+def test_worker_does_not_commit_result_after_background_renewal_failure(tmp_path):
+    import sqlite3
+    import time
+
+    class FailingHeartbeatQueue(MissionQueue):
+        def heartbeat(self, *args, **kwargs):
+            raise sqlite3.OperationalError("lease storage unavailable")
+
+    queue = FailingHeartbeatQueue(Path(tmp_path) / "queue.sqlite3")
+    queue.enqueue("mission-renewal-failure", available_at="2026-01-01T00:00:00+00:00")
+
+    class Mission:
+        status = MissionStatus.GOAL_COMPLETED
+        evidence = [{"criterion_id": "done"}]
+        error = ""
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            time.sleep(0.6)
+            return Mission()
+
+    worker = MissionWorker(queue, lambda: Runtime(), worker_id="renewal-failure", lease_seconds=1)
+    with pytest.raises(sqlite3.OperationalError, match="lease storage unavailable"):
+        worker.run_once(now="2026-01-01T00:00:00+00:00")
+
+    current = queue.get("mission-renewal-failure")
+    assert current.state is WorkerMissionState.EXECUTING
+    assert current.lease_owner == "renewal-failure"
+    assert current.last_error == ""
+    recovered = queue.recover_expired(now="2026-01-01T00:00:02+00:00")
+    assert [item.mission_id for item in recovered] == ["mission-renewal-failure"]
+    assert queue.get("mission-renewal-failure").state is WorkerMissionState.QUEUED
+
+
 def test_worker_lease_duration_is_configurable_and_validated(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-lease-config", available_at="2026-01-01T00:00:00+00:00")
