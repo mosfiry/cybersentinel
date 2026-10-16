@@ -1236,6 +1236,45 @@ class MissionRuntime:
             raise KeyError("unknown_mission")
         return mission
 
+    @staticmethod
+    def _process_sandbox_failure_audit_fields(
+        step: PlanStep,
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Preserve only structured local sandbox preflight evidence, never free text."""
+        if step.action != "run_project_tests":
+            return {}
+        reason_kinds = {
+            "backend_unavailable": "PROCESS_SANDBOX_UNAVAILABLE",
+            "sandbox_setup_failed": "PROCESS_SANDBOX_SETUP_FAILED",
+        }
+        reason_code = observation.get("reason_code")
+        kind = observation.get("kind")
+        if (
+            observation.get("failure_class") != FailureClass.RESOURCE.value
+            or not isinstance(reason_code, str)
+            or reason_kinds.get(reason_code) != kind
+            or observation.get("dispatch_attempted") is not False
+            or observation.get("process_started") is not False
+            or observation.get("process_start_confirmed") is not False
+        ):
+            return {}
+
+        fields: dict[str, Any] = {
+            "kind": kind,
+            "reason_code": reason_code,
+            "dispatch_attempted": False,
+            "process_started": False,
+            "process_start_confirmed": False,
+        }
+        detail_code = observation.get("detail_code")
+        if isinstance(detail_code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.+-]{0,127}", detail_code):
+            fields["detail_code"] = detail_code
+        backend = observation.get("sandbox_backend")
+        if isinstance(backend, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.+-]{0,127}", backend):
+            fields["sandbox_backend"] = backend
+        return fields
+
     def _interpret_observation(self, mission: Mission, step: PlanStep, observation: dict[str, Any], *, success: bool):
         previous = mission.observations[-2] if len(mission.observations) > 1 else None
         if not should_interpret_observation(observation, previous=previous):
@@ -3080,11 +3119,30 @@ class MissionRuntime:
             return self._save(mission)
 
         failure = FailureClass(str(observation.get("failure_class", FailureClass.UNKNOWN.value))) if str(observation.get("failure_class", FailureClass.UNKNOWN.value)) in {item.value for item in FailureClass} else FailureClass.UNKNOWN
-        mission.failures.append({"class": failure.value, "reason": observation.get("error", "action failed"), "step_id": step.step_id, "action_id": action_id})
-        mission.emit(EventType.FAILURE_DETECTED, step_id=step.step_id, data={"class": failure.value, "reason": observation.get("error", "action failed")})
+        sandbox_failure_fields = (
+            self._process_sandbox_failure_audit_fields(step, observation)
+            if failure is FailureClass.RESOURCE
+            else {}
+        )
+        failure_record = {
+            "class": failure.value,
+            "reason": observation.get("error", "action failed"),
+            "step_id": step.step_id,
+            "action_id": action_id,
+            **sandbox_failure_fields,
+        }
+        mission.failures.append(failure_record)
+        failure_event = {"class": failure.value, "reason": observation.get("error", "action failed"), **sandbox_failure_fields}
+        mission.emit(EventType.FAILURE_DETECTED, step_id=step.step_id, data=failure_event)
         mission.retry_count += 1
         action = self.recovery_policy.action_for(failure, mission.retry_count - 1)
-        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=step.step_id, data={"class": failure.value, "recovery": action.value})
+        diagnosis_event = {"class": failure.value, "recovery": action.value, **sandbox_failure_fields}
+        mission.emit(EventType.FAILURE_DIAGNOSED, step_id=step.step_id, data=diagnosis_event)
+        if sandbox_failure_fields:
+            checkpoint = dict(mission.checkpoint or {})
+            checkpoint.update(sandbox_failure_fields)
+            checkpoint["status"] = "not_dispatched"
+            mission.checkpoint = checkpoint
         if action is RecoveryAction.OWNER_INPUT_REQUIRED:
             mission.transition(MissionStatus.OWNER_INPUT_REQUIRED, "authorization requires owner input")
         elif action is RecoveryAction.SCOPE_BLOCKED:

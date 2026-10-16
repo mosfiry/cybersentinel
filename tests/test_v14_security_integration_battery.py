@@ -245,6 +245,88 @@ def test_owner_queue_worker_and_evidence_boundaries_compose_end_to_end(tmp_path,
     ]
 
 
+def test_text_only_run_project_tests_preflight_preserves_sanitized_audit_evidence(tmp_path, monkeypatch):
+    allow_owner_sessions(monkeypatch, "fallback-owner-session")
+    project_root = tmp_path / "authorized-fallback-project"
+    project_root.mkdir()
+    (project_root / "test_ok.py").write_text(
+        "def test_ok():\n    assert 2 + 2 == 4\n",
+        encoding="utf-8",
+    )
+    scope_snapshot = persist_canonical_scope(
+        monkeypatch,
+        tmp_path,
+        owner_session_token="fallback-owner-session",
+        target_id="fallback-workspace",
+        bind_session=False,
+    )
+    core, store, _provider = _core(
+        tmp_path,
+        monkeypatch,
+        response=_run_project_tests_proposal(),
+    )
+
+    import json
+
+    from scripts.acceptance_evidence import safe_mission_failure_snapshot
+    from workspace import Workspace
+    from workspace.process_sandbox import SandboxAvailability
+
+    availability = SandboxAvailability(
+        False,
+        backend="windows-appcontainer-fail-closed",
+        reason_code="backend_unavailable",
+        detail_code="windows_appcontainer_backend_unimplemented",
+        reason="private sandbox backend explanation",
+    )
+    monkeypatch.setattr(
+        Workspace,
+        "process_sandbox_availability",
+        staticmethod(lambda: availability),
+    )
+
+    def forbid_process_dispatch(self, *args, **kwargs):
+        pytest.fail("sandbox-unavailable preflight must not dispatch a process")
+
+    monkeypatch.setattr(Workspace, "develop", forbid_process_dispatch)
+    mission = core.run_owner_mission(
+        "Run the authorized local project tests and verify their result",
+        owner_session_token="fallback-owner-session",
+        request_id="fallback-sandbox-preflight",
+        scope_context=workspace_scope_context(scope_snapshot, project_root),
+    )
+
+    assert mission.status is MissionStatus.RESOURCE_BLOCKED
+    assert mission.checkpoint["status"] == "not_dispatched"
+    assert mission.checkpoint["reason_code"] == "backend_unavailable"
+    assert mission.checkpoint["detail_code"] == "windows_appcontainer_backend_unimplemented"
+    assert mission.checkpoint["dispatch_attempted"] is False
+    assert mission.checkpoint["process_started"] is False
+    assert mission.checkpoint["process_start_confirmed"] is False
+    failure = mission.failures[-1]
+    assert failure["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
+    assert failure["reason_code"] == "backend_unavailable"
+    assert failure["detail_code"] == "windows_appcontainer_backend_unimplemented"
+    assert failure["sandbox_backend"] == "windows-appcontainer-fail-closed"
+    assert failure["dispatch_attempted"] is False
+    assert failure["process_started"] is False
+    assert failure["process_start_confirmed"] is False
+    failure_event = next(
+        event for event in reversed(mission.trajectory)
+        if event.get("event") == "FailureDetected"
+    )
+    assert failure_event["data"]["reason_code"] == "backend_unavailable"
+    assert failure_event["data"]["dispatch_attempted"] is False
+
+    safe_snapshot = safe_mission_failure_snapshot(mission)
+    assert safe_snapshot["failure_diagnostics"][-1]["detail_code"] == (
+        "windows_appcontainer_backend_unimplemented"
+    )
+    assert safe_snapshot["checkpoint_diagnostics"]["status"] == "not_dispatched"
+    assert "private sandbox backend explanation" not in json.dumps(safe_snapshot)
+    assert _external_effect_count(store.db_path) == 0
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_path, monkeypatch, parallel):
     allow_owner_sessions(monkeypatch, "native-owner-session")

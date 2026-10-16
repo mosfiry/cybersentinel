@@ -710,8 +710,17 @@ class AgentCore:
                         return {
                             "success": False,
                             "failure_class": "RESOURCE",
+                            "kind": (
+                                "PROCESS_SANDBOX_SETUP_FAILED"
+                                if sandbox_availability.reason_code == "sandbox_setup_failed"
+                                else "PROCESS_SANDBOX_UNAVAILABLE"
+                            ),
                             "reason_code": sandbox_availability.reason_code or "backend_unavailable",
                             "detail_code": sandbox_availability.detail_code,
+                            "sandbox_backend": sandbox_availability.backend,
+                            "dispatch_attempted": False,
+                            "process_started": False,
+                            "process_start_confirmed": False,
                             "error": sandbox_availability.reason or "required process sandbox is unavailable",
                             "execution_id": action_id,
                         }
