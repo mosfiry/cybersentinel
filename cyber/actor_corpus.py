@@ -117,11 +117,12 @@ def build_actor_graph(*, with_seed_techniques: bool = True) -> CyberKnowledgeGra
             relation="USES", source_id=src, target_id=mal_id,
             provenance=prov, confidence=0.7, status=EdgeStatus.WEAK,
         ))
-    for src, tech_id in _USES_TECHNIQUE:
-        graph.add_claim(ClaimEdge(
-            relation="USES", source_id=src, target_id=tech_id,
-            provenance=prov, confidence=0.7, status=EdgeStatus.WEAK,
-        ))
+    if with_seed_techniques:
+        for src, tech_id in _USES_TECHNIQUE:
+            graph.add_claim(ClaimEdge(
+                relation="USES", source_id=src, target_id=tech_id,
+                provenance=prov, confidence=0.7, status=EdgeStatus.WEAK,
+            ))
     return graph
 
 
