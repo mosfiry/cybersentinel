@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.evidence import Evidence, EvidenceChainStore, verify_chain
-from agent.mission import Mission, MissionStore
+from agent.mission import Mission, MissionStatus, MissionStore
 from agent.reporting import build_mission_report
 from agent.local_runtime.catalog import get_model
 from agent.planning import Plan, PlanStep
@@ -363,6 +363,48 @@ def _d4_evidence_report_fixture_snapshot() -> tuple[str, dict, Mission]:
     return mission_id, snapshot, mission
 
 
+def _attach_completed_mission_trajectory(
+    snapshot: dict,
+    *,
+    completion_events: tuple[str, ...] = ("GoalVerified", "MissionCompleted"),
+) -> None:
+    """Replace a projection-only fixture timeline with a real, hash-linked Mission record."""
+    source = snapshot["status"]
+    objective = str(source["objective"])
+    mission = Mission.create(
+        "Run the authorized project tests",
+        objective,
+        Plan(version=1, objective=objective, steps=()),
+        mission_id=source["mission_id"],
+        request_id=source["request_id"],
+        completion_criteria=source["completion_criteria"],
+    )
+    mission.current_step = source["current_step"]
+    mission.iteration_count = source["iteration_count"]
+    mission.verification_state = source["verification_state"]
+    mission.evidence = source["evidence"]
+    mission.action_history = source["action_history"]
+    mission.progress = source["progress"]
+    mission.owner_identity_ref = source["owner_identity_ref"]
+    for event in snapshot["timeline"]:
+        mission.emit(
+            EventType(event["event"]),
+            step_id=str(event.get("step_id", "")),
+            data=event.get("data") if isinstance(event.get("data"), dict) else {},
+        )
+    mission.transition(MissionStatus.GOAL_COMPLETED, "verified acceptance fixture")
+    for event_name in completion_events:
+        if event_name == "GoalVerified":
+            mission.emit(EventType.GOAL_VERIFIED, data=mission.verification_state)
+        elif event_name == "MissionCompleted":
+            mission.emit(EventType.MISSION_COMPLETED, data={"verification": mission.verification_state})
+        else:
+            mission.emit(EventType(event_name), data={"reason": "fixture event after completion"})
+    snapshot["timeline"] = json.loads(json.dumps(mission.trajectory))
+    snapshot["status"] = mission.to_dict()
+    snapshot["status"]["queue"] = {"state": "completed"}
+
+
 @pytest.mark.parametrize(
     "producer_state",
     [
@@ -558,6 +600,7 @@ def test_completed_report_requires_nested_producer_status_fields(field: str) -> 
 
 def test_valid_global_chain_accepts_exact_mission_filtered_report_slice() -> None:
     mission_id, snapshot = _linked_project_test_snapshot(include_unrelated_prior=True)
+    _attach_completed_mission_trajectory(snapshot)
 
     projection = _mission_audit_projection(snapshot, mission_id)
     proof = projection["project_test_execution_proof"]
@@ -566,7 +609,48 @@ def test_valid_global_chain_accepts_exact_mission_filtered_report_slice() -> Non
     assert proof["report_execution_chain_matches_global"] is True
     assert proof["execution_chain_hash_valid"] is True
     assert projection["report_projection_valid"] is True
+    assert projection["mission_record_integrity_verified"] is True
+    assert projection["timeline_integrity_verified"] is True
+    assert projection["goal_completion_events_verified"] is True
     assert projection["completed_mission_inspectable"] is True
+
+
+@pytest.mark.parametrize(
+    "completion_events",
+    [
+        (),
+        ("MissionCompleted",),
+        ("GoalVerified",),
+        ("MissionCompleted", "GoalVerified"),
+        ("GoalVerified", "MissionCompleted", "FailureDetected"),
+        ("GoalVerified", "MissionCompleted"),
+    ],
+)
+def test_completed_mission_requires_one_ordered_final_terminal_event_pair(
+    completion_events: tuple[str, ...],
+) -> None:
+    mission_id, snapshot = _linked_project_test_snapshot(include_unrelated_prior=True)
+    _attach_completed_mission_trajectory(snapshot, completion_events=completion_events)
+
+    projection = _mission_audit_projection(snapshot, mission_id)
+
+    assert projection["mission_record_integrity_verified"] is True
+    assert projection["timeline_matches_integrity_checked_mission"] is True
+    assert projection["timeline_integrity_verified"] is True
+    expected = completion_events == ("GoalVerified", "MissionCompleted")
+    assert projection["goal_completion_events_verified"] is expected
+    assert projection["completed_mission_inspectable"] is expected
+
+
+def test_completed_mission_requires_integrity_bound_persisted_trajectory() -> None:
+    mission_id, snapshot = _linked_project_test_snapshot(include_unrelated_prior=True)
+
+    projection = _mission_audit_projection(snapshot, mission_id)
+
+    assert projection["timeline_records_bound_to_mission"] is True
+    assert projection["mission_record_integrity_verified"] is False
+    assert projection["timeline_integrity_verified"] is False
+    assert projection["completed_mission_inspectable"] is False
 
 
 @pytest.mark.parametrize("tamper", ["global_record", "report_subset"])
@@ -1434,6 +1518,48 @@ def test_orphan_authorization_event_blocks_project_test_proof() -> None:
     proof = _mission_project_test_execution_proof(
         snapshot["status"], snapshot["timeline"], snapshot["evidence"],
         snapshot["report"]["evidence"]["goal"], snapshot["report"]["evidence"]["execution_chain"],
+        mission_id, "request-acceptance-1", "VALID",
+        full_execution_chain=snapshot["full_execution_chain"],
+    )
+
+    assert proof["authorization_timeline_reconciled"] is False
+    assert proof["verified"] is False
+
+
+@pytest.mark.parametrize("authorization_name", ["browser", None])
+def test_authorization_event_must_bind_the_name_of_the_executed_tool(
+    authorization_name: str | None,
+) -> None:
+    mission_id, snapshot = _linked_project_test_snapshot()
+    authorization = next(
+        event for event in snapshot["timeline"]
+        if event.get("event") == "AuthorizationChecked"
+    )
+    if authorization_name is None:
+        authorization["data"].pop("name")
+    else:
+        authorization["data"]["name"] = authorization_name
+
+    proof = _mission_project_test_execution_proof(
+        snapshot["status"], snapshot["timeline"], snapshot["evidence"],
+        snapshot["report"]["evidence"]["goal"],
+        snapshot["report"]["evidence"]["execution_chain"],
+        mission_id, "request-acceptance-1", "VALID",
+        full_execution_chain=snapshot["full_execution_chain"],
+    )
+
+    assert proof["authorization_timeline_reconciled"] is False
+    assert proof["verified"] is False
+
+
+def test_project_test_proof_rejects_native_tool_result_without_a_name() -> None:
+    mission_id, snapshot = _linked_project_test_snapshot()
+    snapshot["status"]["progress"]["model_loop"]["tool_results"][0].pop("name")
+
+    proof = _mission_project_test_execution_proof(
+        snapshot["status"], snapshot["timeline"], snapshot["evidence"],
+        snapshot["report"]["evidence"]["goal"],
+        snapshot["report"]["evidence"]["execution_chain"],
         mission_id, "request-acceptance-1", "VALID",
         full_execution_chain=snapshot["full_execution_chain"],
     )
@@ -2390,12 +2516,15 @@ def test_effect_ledger_projection_detects_duplicate_or_misbound_effects_without_
 
 def test_mission_audit_projection_requires_mission_bound_validation_evidence_and_report() -> None:
     mission_id, snapshot = _linked_project_test_snapshot()
+    _attach_completed_mission_trajectory(snapshot)
 
     projection = _mission_audit_projection(snapshot, mission_id)
 
     assert verify_chain(snapshot["report"]["evidence"]["execution_chain"]) is True
     assert projection["evidence_and_chain_bound_to_mission"] is True
     assert projection["timeline_records_bound_to_mission"] is True
+    assert projection["timeline_integrity_verified"] is True
+    assert projection["goal_completion_events_verified"] is True
     assert projection["report_projection_valid"] is True
     assert projection["completed_mission_inspectable"] is True
     assert projection["evidence_records_bound_to_mission"] is True

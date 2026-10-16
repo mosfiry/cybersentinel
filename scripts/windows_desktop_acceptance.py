@@ -1021,11 +1021,15 @@ def _reconcile_tool_authorization_timeline(
             classifications.append("MALFORMED_RESULT")
             unaccounted += 1
             continue
-        call_id, action_id, step_id = (
-            result.get("tool_call_id"), result.get("action_id"), result.get("step_id")
+        tool_name, call_id, action_id, step_id = (
+            result.get("name"), result.get("tool_call_id"),
+            result.get("action_id"), result.get("step_id"),
         )
         context_id, scope_id = result.get("authorization_context_id"), result.get("scope_snapshot_id")
-        if not all(isinstance(value, str) and value for value in (call_id, action_id, step_id, context_id, scope_id)):
+        if not all(
+            isinstance(value, str) and value
+            for value in (tool_name, call_id, action_id, step_id, context_id, scope_id)
+        ):
             classifications.append("IDENTITY_OR_SCOPE_UNBOUND")
             unaccounted += 1
             continue
@@ -1040,14 +1044,14 @@ def _reconcile_tool_authorization_timeline(
         authorization = authorization_event.get("data")
         expected = {
             "mission_id": mission_id, "request_id": request_id,
-            "name": result.get("name"), "tool_call_id": call_id,
+            "name": tool_name, "tool_call_id": call_id,
             "action_id": action_id, "step_id": step_id,
             "authorization_context_id": context_id, "scope_snapshot_id": scope_id,
         }
         if (
             not isinstance(proposal, dict) or not isinstance(authorization, dict)
             or any(proposal.get(key) != value for key, value in expected.items())
-            or any(authorization.get(key) != value for key, value in expected.items() if key != "name")
+            or any(authorization.get(key) != value for key, value in expected.items())
             or proposal_event.get("mission_id") != mission_id
             or proposal_event.get("request_id") != request_id
             or authorization_event.get("mission_id") != mission_id
@@ -2787,6 +2791,50 @@ def _trajectory_timeline_integrity(timeline: object, mission_id: object, request
         return False
 
 
+def _goal_completion_events_verified(status: object, timeline: object) -> bool:
+    """Bind terminal status to one ordered, persisted GoalVerified/MissionCompleted pair."""
+    if not isinstance(status, dict) or not isinstance(timeline, list):
+        return False
+    event_names = [
+        event.get("event") for event in timeline if isinstance(event, dict)
+    ]
+    if status.get("status") != "GOAL_COMPLETED":
+        return "GoalVerified" not in event_names and "MissionCompleted" not in event_names
+
+    verification = status.get("verification_state")
+    goal_indexes = [index for index, name in enumerate(event_names) if name == "GoalVerified"]
+    completed_indexes = [index for index, name in enumerate(event_names) if name == "MissionCompleted"]
+    if (
+        not isinstance(verification, dict)
+        or verification.get("verified") is not True
+        or type(verification.get("evidence_count")) is not int
+        or verification["evidence_count"] < 0
+        or len(goal_indexes) != 1
+        or len(completed_indexes) != 1
+    ):
+        return False
+    goal_index, completed_index = goal_indexes[0], completed_indexes[0]
+    if goal_index >= completed_index or completed_index != len(timeline) - 1:
+        return False
+
+    goal_event, completed_event = timeline[goal_index], timeline[completed_index]
+    goal_data = goal_event.get("data") if isinstance(goal_event, dict) else None
+    completed_data = completed_event.get("data") if isinstance(completed_event, dict) else None
+    if (
+        not isinstance(goal_data, dict)
+        or not isinstance(completed_data, dict)
+        or goal_data.get("evidence_count") != verification["evidence_count"]
+        or ("verified" in goal_data and goal_data.get("verified") is not True)
+        or (
+            "missing_criteria" in goal_data
+            and goal_data.get("missing_criteria") != verification.get("missing_criteria")
+        )
+        or completed_data.get("verification") != verification
+    ):
+        return False
+    return True
+
+
 def _mission_record_integrity_verified(status: object) -> bool:
     """Verify the persisted Mission envelope returned by status, excluding its API-only queue view."""
     if not isinstance(status, dict):
@@ -2803,6 +2851,7 @@ def _mission_record_integrity_verified(status: object) -> bool:
 _RESTART_STABLE_PROJECTION_FIELDS = (
     "mission_id", "mission_record_integrity_verified",
     "timeline_matches_integrity_checked_mission", "timeline_integrity_verified",
+    "goal_completion_events_verified",
     "status_mission_id_matches", "report_mission_id_matches", "provenance_mission_id_matches",
     "timeline_records_bound_to_mission", "evidence_and_chain_bound_to_mission",
     "evidence_records_bound_to_mission", "execution_chain_records_bound_to_mission",
@@ -2833,7 +2882,8 @@ _RESTART_PROJECTION_HASH_FIELDS = frozenset({
 })
 _RESTART_PROJECTION_BOOLEAN_FIELDS = frozenset({
     "mission_record_integrity_verified", "timeline_matches_integrity_checked_mission",
-    "timeline_integrity_verified", "status_mission_id_matches", "report_mission_id_matches",
+    "timeline_integrity_verified", "goal_completion_events_verified",
+    "status_mission_id_matches", "report_mission_id_matches",
     "provenance_mission_id_matches", "timeline_records_bound_to_mission",
     "evidence_and_chain_bound_to_mission", "evidence_records_bound_to_mission",
     "execution_chain_records_bound_to_mission", "execution_chain_provenance_bound_to_mission",
@@ -2861,7 +2911,8 @@ _RESTART_PROJECTION_MAPPING_FIELDS = frozenset({
 })
 _RESTART_REQUIRED_TRUE_FIELDS = frozenset({
     "mission_record_integrity_verified", "timeline_matches_integrity_checked_mission",
-    "timeline_integrity_verified", "status_mission_id_matches", "report_mission_id_matches",
+    "timeline_integrity_verified", "goal_completion_events_verified",
+    "status_mission_id_matches", "report_mission_id_matches",
     "provenance_mission_id_matches", "timeline_records_bound_to_mission",
     "evidence_and_chain_bound_to_mission", "evidence_records_bound_to_mission",
     "execution_chain_records_bound_to_mission", "execution_chain_provenance_bound_to_mission",
@@ -3035,6 +3086,7 @@ def _mission_audit_projection(snapshot: dict, mission_id: str) -> dict:
     timeline_integrity_verified = _trajectory_timeline_integrity(
         timeline, mission_id, status_request_id
     )
+    goal_completion_events_verified = _goal_completion_events_verified(status, timeline)
     mission_record_integrity_verified = _mission_record_integrity_verified(status)
     timeline_matches_integrity_checked_mission = (
         mission_record_integrity_verified
@@ -3193,6 +3245,7 @@ def _mission_audit_projection(snapshot: dict, mission_id: str) -> dict:
         "provenance_mission_id_matches": provenance.get("mission_id") == mission_id,
         "timeline_records_bound_to_mission": timeline_records_bound,
         "timeline_integrity_verified": timeline_integrity_verified,
+        "goal_completion_events_verified": goal_completion_events_verified,
         "evidence_and_chain_bound_to_mission": binding_verified,
         "evidence_records_bound_to_mission": evidence_records_bound,
         "execution_chain_records_bound_to_mission": chain_records_bound,
@@ -3267,6 +3320,10 @@ def _mission_audit_projection(snapshot: dict, mission_id: str) -> dict:
         "report_projection_valid": report_verified,
         "completed_mission_inspectable": (
             status.get("status") == "GOAL_COMPLETED"
+            and mission_record_integrity_verified
+            and timeline_matches_integrity_checked_mission
+            and timeline_integrity_verified
+            and goal_completion_events_verified
             and summary.get("mission_status") == "GOAL_COMPLETED"
             and summary.get("outcome") == "VERIFIED"
             and report_verification_consistent
