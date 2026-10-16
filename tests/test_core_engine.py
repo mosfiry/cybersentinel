@@ -177,6 +177,7 @@ def test_handle_once_uses_authenticated_owner_session_before_policy_denial(monke
             ),
         )
         invocation = {"owner_session_id": "session-1", "owner_challenge": "challenge-1"}
+        expected_auth_reason = "owner-session-challenge"
     else:
         monkeypatch.setattr(
             engine,
@@ -188,6 +189,7 @@ def test_handle_once_uses_authenticated_owner_session_before_policy_denial(monke
             ),
         )
         invocation = {"owner_session_token": "session-token"}
+        expected_auth_reason = "owner-authenticated"
     monkeypatch.setattr(
         engine,
         "capture_policy_snapshot",
@@ -234,7 +236,7 @@ def test_handle_once_uses_authenticated_owner_session_before_policy_denial(monke
     assert events[0][0][0:3] == (
         "auth",
         "Owner authentication",
-        "owner-session-challenge",
+        expected_auth_reason,
     )
     assert planned == []
     assert completions == [
