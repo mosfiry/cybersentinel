@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -25,15 +25,124 @@ VALID_RISK_CLASSES = frozenset({"read", "network-read", "state-write", "bounded-
 VALID_NETWORK_ACCESS = frozenset({
     "none", "allowlisted_search_provider", "allowlisted_intel_providers",
     "scope_pinned_browser", "scope_pinned_http", "scope_pinned_web_research", "scope_pinned_mcp",
-    "host_process_unscoped",
 })
 VALID_FILESYSTEM_ACCESS = frozenset({
-    "none", "host_fs_via_process", "mission_artifact_write", "workspace_read_only_artifact_write",
+    "none", "mission_artifact_write", "workspace_read_only_artifact_write",
 })
-VALID_PROCESS_ACCESS = frozenset({"none", "workspace_process_unisolated", "workspace_process_sandboxed"})
+VALID_PROCESS_ACCESS = frozenset({"none", "workspace_process_sandboxed"})
+VALID_DISPATCH_BOUNDARIES = frozenset({"handler", "workspace_process_start", "scope_pinned_http_send"})
 VALID_CREDENTIAL_ACCESS = frozenset({"none", "provider_managed", "host_user_credentials_possible"})
 VALID_RATE_LIMITS = frozenset({"bounded"})
 DEFAULT_TOOL_TIMEOUT = 30
+
+@dataclass
+class _MissionToolCancellationState:
+    lock: Any = field(default_factory=threading.RLock, repr=False)
+    active: dict[threading.Event, Any] = field(default_factory=dict)
+    references: int = 0
+
+
+_ACTIVE_TOOL_CANCELLATIONS: dict[str, _MissionToolCancellationState] = {}
+_ACTIVE_TOOL_CANCELLATIONS_LOCK = threading.RLock()
+
+
+def cancel_active_mission_tool_executions(
+    mission_id: str,
+    *,
+    before_signal: Callable[[], Any] | None = None,
+) -> int:
+    """Commit an authenticated Owner cancel marker before signaling active tools."""
+    if not isinstance(mission_id, str) or not mission_id.strip():
+        return 0
+    state = _retain_mission_tool_cancellation_state(mission_id, create=True)
+    assert state is not None
+    try:
+        # Serialize this Mission's registrations and dispatch boundaries with
+        # its durable marker, without blocking unrelated Missions.
+        with state.lock:
+            active = tuple(state.active.items())
+            locks = sorted(
+                {id(lock): lock for _event, lock in active if lock is not None}.values(),
+                key=id,
+            )
+            acquired: list[Any] = []
+            try:
+                for lock in locks:
+                    lock.acquire()
+                    acquired.append(lock)
+                if before_signal is not None:
+                    before_signal()
+                for event, _dispatch_lock in active:
+                    event.set()
+            finally:
+                for lock in reversed(acquired):
+                    lock.release()
+            return len(active)
+    finally:
+        _release_mission_tool_cancellation_state(mission_id, state)
+
+
+def _retain_mission_tool_cancellation_state(
+    mission_id: str,
+    *,
+    create: bool,
+) -> _MissionToolCancellationState | None:
+    with _ACTIVE_TOOL_CANCELLATIONS_LOCK:
+        state = _ACTIVE_TOOL_CANCELLATIONS.get(mission_id)
+        if state is None and create:
+            state = _MissionToolCancellationState()
+            _ACTIVE_TOOL_CANCELLATIONS[mission_id] = state
+        if state is not None:
+            state.references += 1
+        return state
+
+
+def _release_mission_tool_cancellation_state(
+    mission_id: str,
+    state: _MissionToolCancellationState,
+) -> None:
+    with _ACTIVE_TOOL_CANCELLATIONS_LOCK:
+        state.references -= 1
+        if state.references <= 0 and _ACTIVE_TOOL_CANCELLATIONS.get(mission_id) is state:
+            _ACTIVE_TOOL_CANCELLATIONS.pop(mission_id, None)
+
+
+def _register_active_tool_cancellation(
+    mission_id: str,
+    event: threading.Event,
+    process_dispatch_lock: Any = None,
+) -> None:
+    if not mission_id:
+        return
+    state = _retain_mission_tool_cancellation_state(mission_id, create=True)
+    assert state is not None
+    registered = False
+    try:
+        with state.lock:
+            if event not in state.active:
+                registered = True
+            state.active[event] = process_dispatch_lock
+    finally:
+        if not registered:
+            _release_mission_tool_cancellation_state(mission_id, state)
+
+
+def _unregister_active_tool_cancellation(mission_id: str, event: threading.Event) -> None:
+    if not mission_id:
+        return
+    state = _retain_mission_tool_cancellation_state(mission_id, create=False)
+    if state is None:
+        return
+    removed = False
+    try:
+        with state.lock:
+            removed = event in state.active
+            state.active.pop(event, None)
+    finally:
+        _release_mission_tool_cancellation_state(mission_id, state)
+        if removed:
+            # Drop the reference held by the active registration itself.
+            _release_mission_tool_cancellation_state(mission_id, state)
 
 
 def _canonical_json_chunks(value: Any):
@@ -252,6 +361,7 @@ class ToolSpec:
     network_access: str = "none"
     filesystem_access: str = "none"
     process_access: str = "none"
+    dispatch_boundary: str = "handler"
     credential_access: str = "none"
     scope_requirements: tuple[str, ...] = ()
     timeout: int = DEFAULT_TOOL_TIMEOUT
@@ -297,6 +407,7 @@ class ToolSpec:
             "network_access": self.network_access,
             "filesystem_access": self.filesystem_access,
             "process_access": self.process_access,
+            "dispatch_boundary": self.dispatch_boundary,
             "credential_access": self.credential_access,
             "scope_requirements": list(self.scope_requirements),
             "timeout": self.timeout,
@@ -512,7 +623,7 @@ def _run_project_tests(argument, *, workspace=None, execution_context=None):
         timeout=effective_timeout,
         cancellation_event=execution_context.cancellation_event,
     )
-    execution_context.assert_active()
+    execution_context.assert_active(allow_cancelled=True, allow_deadline_expired=True)
     if execution_context.artifact_store is None:
         raise PermissionError("run_project_tests requires the Mission artifact store")
 
@@ -576,6 +687,11 @@ def _run_project_tests(argument, *, workspace=None, execution_context=None):
             "exit_code": result.exit_code,
             "timed_out": result.timed_out,
             "cancelled": result.cancelled,
+            "outcome": getattr(result, "outcome", None),
+            "reason_code": getattr(result, "reason_code", None),
+            "process_started": getattr(result, "process_id", None) is not None,
+            "process_id": getattr(result, "process_id", None),
+            "process_started_at_utc": getattr(result, "process_started_at_utc", None),
             "output_sha256": hashlib.sha256(raw_output.encode("utf-8", errors="replace")).hexdigest(),
             "artifact_refs": artifact_refs,
             "artifact_capture_truncated": result.artifact_capture_truncated,
@@ -591,6 +707,11 @@ def _run_project_tests(argument, *, workspace=None, execution_context=None):
         "ok": result.ok,
         "timed_out": result.timed_out,
         "cancelled": result.cancelled,
+        "outcome": getattr(result, "outcome", None),
+        "reason_code": getattr(result, "reason_code", None),
+        "process_started": getattr(result, "process_id", None) is not None,
+        "process_id": getattr(result, "process_id", None),
+        "process_started_at_utc": getattr(result, "process_started_at_utc", None),
         "returncode": result.exit_code,
         "output": safe_output,
         "trust": "untrusted_data",
@@ -708,6 +829,7 @@ def _access_metadata_valid(spec: ToolSpec) -> bool:
         (spec.network_access, VALID_NETWORK_ACCESS),
         (spec.filesystem_access, VALID_FILESYSTEM_ACCESS),
         (spec.process_access, VALID_PROCESS_ACCESS),
+        (spec.dispatch_boundary, VALID_DISPATCH_BOUNDARIES),
         (spec.credential_access, VALID_CREDENTIAL_ACCESS),
         (spec.rate_limit, VALID_RATE_LIMITS),
     ):
@@ -740,6 +862,22 @@ def _access_metadata_valid(spec: ToolSpec) -> bool:
         or not spec.execution_context_required
         or "owner_mission_workspace_root" not in spec.scope_requirements
     ):
+        return False
+    if spec.process_access == "workspace_process_sandboxed" and not spec.execution_context_required:
+        return False
+    if spec.process_access == "workspace_process_sandboxed" and not spec.effect_provider:
+        return False
+    if spec.process_access == "workspace_process_sandboxed" and spec.dispatch_boundary != "workspace_process_start":
+        return False
+    if spec.dispatch_boundary == "workspace_process_start" and spec.process_access != "workspace_process_sandboxed":
+        return False
+    if spec.dispatch_boundary == "scope_pinned_http_send" and (
+        not spec.effect_provider
+        or not spec.execution_context_required
+        or not spec.network_access.startswith("scope_pinned_")
+    ):
+        return False
+    if spec.dispatch_boundary != "handler" and not spec.effect_provider:
         return False
     if spec.network_access.startswith("scope_pinned_") and not spec.scope_required:
         return False
@@ -855,7 +993,7 @@ REGISTRY = build_registry([
         "bounded-exec", True, str, _run_project_tests,
         owner_only=True, network_access="none",
         filesystem_access="workspace_read_only_artifact_write",
-        process_access="workspace_process_sandboxed", credential_access="none",
+        process_access="workspace_process_sandboxed", dispatch_boundary="workspace_process_start", credential_access="none",
         scope_requirements=("owner_mission_workspace_root",),
         timeout=int(MAX_SANDBOX_PROCESS_SECONDS) + 10, effect_provider="cybersentinel.workspace-process",
         evidence_requirements=("owner_mission_context", "sandbox_profile", "untrusted_artifact_refs", "exit_status"),
@@ -897,6 +1035,7 @@ REGISTRY = build_registry([
         "network-read", True, dict, mcp_discover, owner_only=True, scope_required=True,
         version="1.0.0", input_schema=_MCP_DISCOVER_SCHEMA,
         network_access="scope_pinned_mcp", filesystem_access="none", process_access="none", credential_access="none",
+        dispatch_boundary="scope_pinned_http_send",
         scope_requirements=("canonical_owner_scope", "target_identity", "dns_pinned_https_post", "no_redirects"),
         evidence_requirements=("execution_fence", "untrusted_server_metadata", "identity_and_schema_hashes"),
         timeout=60, effect_provider="cybersentinel.mcp", execution_context_required=True,
@@ -907,6 +1046,7 @@ REGISTRY = build_registry([
         "state-write", True, dict, mcp_invoke, owner_only=True, scope_required=True,
         version="1.0.0", input_schema=_MCP_INVOKE_SCHEMA,
         network_access="scope_pinned_mcp", filesystem_access="none", process_access="none", credential_access="none",
+        dispatch_boundary="scope_pinned_http_send",
         scope_requirements=("canonical_owner_scope", "target_identity", "dns_pinned_https_post", "owner_approved_tool_revision"),
         evidence_requirements=("execution_fence", "untrusted_remote_result", "argument_response_provenance"),
         timeout=60, effect_provider="cybersentinel.mcp", execution_context_required=True,
@@ -1090,6 +1230,23 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
     spec = get_tool(name)
     if spec is None:
         raise ValueError("unknown tool")
+
+    def owner_cancellation_requested() -> bool:
+        if execution_fence is None or not mission_id:
+            return False
+        queue = getattr(execution_fence, "queue", None)
+        cancellation_check = getattr(queue, "owner_cancellation_requested", None)
+        if not callable(cancellation_check):
+            return False
+        try:
+            return bool(cancellation_check(str(mission_id)))
+        except Exception as exc:
+            raise PermissionError("Owner cancellation state could not be verified") from exc
+
+    def assert_owner_cancellation_not_requested() -> None:
+        if owner_cancellation_requested():
+            raise PermissionError("Owner cancellation requested; tool dispatch stopped")
+
     spec_timeout = float(spec.timeout)
     if not math.isfinite(spec_timeout) or spec_timeout <= 0:
         raise ValueError("tool timeout must be a positive finite number")
@@ -1173,6 +1330,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 argument=argument, scope_context=scope_context,
             ):
                 raise PermissionError("delegated scope does not grant the declared tool resource access")
+    assert_owner_cancellation_not_requested()
     if spec.workspace_scope_required:
         if snapshot is None or workspace is None:
             raise PermissionError("tool requires the canonical Owner-authorized Mission workspace")
@@ -1183,10 +1341,10 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         if not authorized_root or Path(workspace.root).resolve() != Path(authorized_root).expanduser().resolve():
             raise PermissionError("Workspace root differs from the Owner-authorized Mission boundary")
         if name == "run_project_tests":
-            sandbox_unavailable = workspace.process_sandbox_unavailable_reason()
-            if sandbox_unavailable:
+            availability = workspace.process_sandbox_availability()
+            if not availability.available:
                 from workspace.environment import ProcessSandboxUnavailable
-                raise ProcessSandboxUnavailable(sandbox_unavailable)
+                raise ProcessSandboxUnavailable(availability.reason or "approved process sandbox is unavailable", availability=availability)
     if execution_fence is not None:
         execution_fence.assert_dispatch(
             mission_id=str(mission_id or ""),
@@ -1195,6 +1353,11 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             authorization_snapshot=mission_authorization,
         )
     cancellation_event = threading.Event()
+    process_dispatch_lock = (
+        threading.Lock()
+        if spec.process_access == "workspace_process_sandboxed" or spec.effect_provider
+        else None
+    )
     tool_execution_context = None
     if spec.execution_context_required:
         from core.context import ExecutionContext
@@ -1248,9 +1411,14 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             cancellation_event=cancellation_event,
             deadline_monotonic=time.monotonic() + limit,
             delegation_scope=delegated_scope,
+            tool_dispatch_lock=process_dispatch_lock,
+            process_dispatch_lock=process_dispatch_lock,
         )
         tool_execution_context.assert_active()
     event_binding = ""
+    argument_sha256 = hashlib.sha256(
+        json.dumps(argument, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
     if event_bus is not None or hook_registry is not None:
         from agent.intelligence_layer.events import EventBus, HookPhase, HookRegistry, IntelligenceEventType
 
@@ -1262,9 +1430,6 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             raise PermissionError("mission-bound hooks and event records require an Owner authorization snapshot")
         event_binding = hashlib.sha256(
             "\0".join((str(snapshot.owner_identity), str(mission_id), str(request_id or ""), str(execution_id or ""), spec.tool_id)).encode("utf-8")
-        ).hexdigest()
-        argument_sha256 = hashlib.sha256(
-            json.dumps(argument, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
         ).hexdigest()
         if hook_registry is not None:
             hook_result = hook_registry.run(
@@ -1311,6 +1476,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 target_identity=target_identity or snapshot.target_identity,
             ):
                 raise PermissionError("task delegation changed before tool dispatch")
+        assert_owner_cancellation_not_requested()
         if event_bus is not None:
             event_bus.publish(
                 owner_identity_ref=str(snapshot.owner_identity),
@@ -1321,15 +1487,16 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 task_id=str(execution_id or ""),
                 payload={"tool_id": spec.tool_id, "tool_version": spec.version, "phase": "pre-dispatch"},
             )
-            event_bus.publish(
-                owner_identity_ref=str(snapshot.owner_identity),
-                mission_id=str(mission_id),
-                event_type=IntelligenceEventType.TOOL_CALLED,
-                idempotency_key=f"tool-called:{event_binding}",
-                request_id=str(request_id or ""),
-                task_id=str(execution_id or ""),
-                payload={"tool_id": spec.tool_id, "tool_version": spec.version, "risk_class": spec.risk_class, "argument_sha256": argument_sha256, "phase": "pre-dispatch"},
-            )
+            if spec.process_access != "workspace_process_sandboxed":
+                event_bus.publish(
+                    owner_identity_ref=str(snapshot.owner_identity),
+                    mission_id=str(mission_id),
+                    event_type=IntelligenceEventType.TOOL_CALLED,
+                    idempotency_key=f"tool-called:{event_binding}",
+                    request_id=str(request_id or ""),
+                    task_id=str(execution_id or ""),
+                    payload={"tool_id": spec.tool_id, "tool_version": spec.version, "risk_class": spec.risk_class, "argument_sha256": argument_sha256, "phase": "pre-dispatch"},
+                )
         if execution_fence is not None:
             execution_fence.assert_dispatch(
                 mission_id=str(mission_id or ""),
@@ -1387,26 +1554,128 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         from agent.execution_fence import ExecutionFenceError
         raise ExecutionFenceError("provider idempotency requires a fenced effect reservation")
 
-    def invoke_handler(*, workspace_context=None):
+    process_started_event = (
+        threading.Event() if spec.process_access == "workspace_process_sandboxed" else None
+    )
+    process_dispatch_committed = (
+        threading.Event() if spec.process_access == "workspace_process_sandboxed" else None
+    )
+    if tool_execution_context is not None and spec.process_access == "workspace_process_sandboxed":
+        def authorize_process_dispatch(backend: str) -> None:
+            assert_owner_cancellation_not_requested()
+            if tool_execution_context is not None:
+                tool_execution_context.assert_active()
+            if effect is not None:
+                effect_ledger.mark_dispatched(
+                    effect.effect_id,
+                    execution_fence,
+                    dispatch_id=dispatch_id,
+                    authorization_snapshot=mission_authorization,
+                )
+            if process_dispatch_committed is not None:
+                process_dispatch_committed.set()
+
+        def report_process_started(
+            backend: str,
+            process_id: int | None,
+            started_at_utc: str | None,
+        ) -> None:
+            if process_started_event is not None:
+                process_started_event.set()
+            if event_bus is not None:
+                from agent.intelligence_layer.events import IntelligenceEventType
+
+                event_bus.publish(
+                    owner_identity_ref=str(snapshot.owner_identity),
+                    mission_id=str(mission_id),
+                    event_type=IntelligenceEventType.TOOL_CALLED,
+                    idempotency_key=f"tool-called:{event_binding}",
+                    request_id=str(request_id or ""),
+                    task_id=str(execution_id or ""),
+                    payload={
+                        "tool_id": spec.tool_id,
+                        "tool_version": spec.version,
+                        "risk_class": spec.risk_class,
+                        "argument_sha256": argument_sha256,
+                        "phase": "process-started",
+                        "process_started": True,
+                        "dispatch_attempted": True,
+                        "sandbox_backend": backend,
+                        "process_id": process_id,
+                        "started_at_utc": started_at_utc,
+                    },
+                )
+
+        tool_execution_context = replace(
+            tool_execution_context,
+            process_dispatch_callback=authorize_process_dispatch,
+            process_start_callback=report_process_started,
+        )
+
+    def invoke_handler_body(*, workspace_context=None):
         from agent.execution_fence import ExecutionFenceError
         from agent.external_effects import EffectRecoveryRequired, EffectState
 
-        if execution_fence is not None:
-            execution_fence.assert_dispatch(
-                mission_id=str(mission_id or ""),
-                request_id=str(request_id or ""),
-                execution_id=str(execution_id or ""),
-                authorization_snapshot=mission_authorization,
-            )
-        if tool_execution_context is not None:
-            tool_execution_context.assert_active()
-        if effect is not None:
-            effect_ledger.mark_dispatched(
-                effect.effect_id,
-                execution_fence,
-                dispatch_id=dispatch_id,
-                authorization_snapshot=mission_authorization,
-            )
+        def mark_process_no_effect(exc: Exception) -> None:
+            if (
+                effect is None
+                or process_dispatch_committed is None
+                or process_dispatch_committed.is_set()
+            ):
+                return
+            explicit_reason_code = getattr(exc, "reason_code", None)
+            try:
+                owner_cancelled = owner_cancellation_requested()
+            except PermissionError:
+                owner_cancelled = False
+            if isinstance(explicit_reason_code, str) and explicit_reason_code:
+                reason_code = explicit_reason_code.upper()
+            elif owner_cancelled:
+                reason_code = "OWNER_CANCELLED_BEFORE_DISPATCH"
+            elif cancellation_event.is_set():
+                reason_code = "PROCESS_CANCELLED_BEFORE_START"
+            elif isinstance(exc, PermissionError):
+                reason_code = "AUTHORIZATION_REFUSED"
+            else:
+                reason_code = str(getattr(exc, "reason_code", "PROCESS_START_NOT_AUTHORIZED")).upper()
+            if not re.fullmatch(r"[A-Z0-9_]{1,64}", reason_code):
+                reason_code = "PROCESS_START_NOT_AUTHORIZED"
+            try:
+                effect_ledger.mark_failed(
+                    effect.effect_id,
+                    execution_fence,
+                    reason_code=reason_code,
+                    provider_confirmed_no_effect=True,
+                    authorization_snapshot=mission_authorization,
+                )
+            except Exception as ledger_exc:
+                raise EffectRecoveryRequired(
+                    effect.effect_id,
+                    EffectState.RESERVED,
+                    "OUTCOME_PERSISTENCE_FAILED",
+                ) from ledger_exc
+
+        try:
+            assert_owner_cancellation_not_requested()
+            if execution_fence is not None:
+                execution_fence.assert_dispatch(
+                    mission_id=str(mission_id or ""),
+                    request_id=str(request_id or ""),
+                    execution_id=str(execution_id or ""),
+                    authorization_snapshot=mission_authorization,
+                )
+            if tool_execution_context is not None:
+                tool_execution_context.assert_active()
+            if effect is not None and spec.process_access != "workspace_process_sandboxed":
+                effect_ledger.mark_dispatched(
+                    effect.effect_id,
+                    execution_fence,
+                    dispatch_id=dispatch_id,
+                    authorization_snapshot=mission_authorization,
+                )
+        except Exception as exc:
+            mark_process_no_effect(exc)
+            raise
         handler_kwargs = {}
         if spec.workspace_scope_required:
             handler_kwargs["workspace"] = workspace_context
@@ -1418,18 +1687,30 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         try:
             result = spec.handler(argument, **handler_kwargs)
             if tool_execution_context is not None:
-                tool_execution_context.assert_active()
-        except ExecutionFenceError:
-            raise
+                if spec.process_access == "workspace_process_sandboxed":
+                    tool_execution_context.assert_active(allow_cancelled=True, allow_deadline_expired=True)
+                else:
+                    tool_execution_context.assert_active()
         except Exception as exc:
+            if (
+                process_dispatch_committed is not None
+                and not process_dispatch_committed.is_set()
+            ):
+                mark_process_no_effect(exc)
+                raise
             if effect is None:
                 raise
+            recovery_reason_code = str(
+                getattr(exc, "reason_code", type(exc).__name__)
+            ).upper()
+            if not re.fullmatch(r"[A-Z0-9_]{1,64}", recovery_reason_code):
+                recovery_reason_code = "HANDLER_EXCEPTION"
             try:
                 effect_ledger.mark_recovery_required(
                     effect.effect_id,
                     execution_fence,
                     dispatch_id=dispatch_id,
-                    reason_code=type(exc).__name__.upper()[:64],
+                    reason_code=recovery_reason_code,
                     authorization_snapshot=mission_authorization,
                 )
             except ExecutionFenceError:
@@ -1443,7 +1724,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             raise EffectRecoveryRequired(
                 effect.effect_id,
                 EffectState.RECOVERY_REQUIRED,
-                "HANDLER_EXCEPTION",
+                recovery_reason_code.lower(),
             ) from None
         if max_result_chars is not None:
             try:
@@ -1500,19 +1781,42 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 ) from exc
         return result
 
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
-    if spec.workspace_scope_required:
-        workspace_authorization = mission_authorization
-        if workspace is None:
-            raise PermissionError("Owner-authorized Mission Workspace is required for sandboxed execution")
-        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=snapshot, evidence_store=evidence_store, execution_context=tool_execution_context)
-        def dispatch_workspace():
-            return invoke_handler(workspace_context=workspace)
-        future = executor.submit(dispatch_workspace)
-    else:
-        def dispatch_tool():
-            return invoke_handler()
-        future = executor.submit(dispatch_tool)
+    def invoke_handler(*, workspace_context=None):
+        if spec.effect_provider and spec.dispatch_boundary == "handler":
+            if process_dispatch_lock is None:
+                raise PermissionError("effectful handler is missing its Mission dispatch boundary")
+            # Local state changes and ordinary bounded effect handlers run to a
+            # known boundary before Owner cancellation can commit its marker.
+            with process_dispatch_lock:
+                return invoke_handler_body(workspace_context=workspace_context)
+        return invoke_handler_body(workspace_context=workspace_context)
+
+    _register_active_tool_cancellation(
+        str(mission_id or ""), cancellation_event, process_dispatch_lock
+    )
+    executor = None
+    try:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
+        if spec.workspace_scope_required:
+            if workspace is None:
+                raise PermissionError("Owner-authorized Mission Workspace is required for sandboxed execution")
+            workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=snapshot, evidence_store=evidence_store, execution_context=tool_execution_context)
+
+            def dispatch_workspace():
+                return invoke_handler(workspace_context=workspace)
+
+            future = executor.submit(dispatch_workspace)
+        else:
+            def dispatch_tool():
+                return invoke_handler()
+
+            future = executor.submit(dispatch_tool)
+    except BaseException:
+        _unregister_active_tool_cancellation(str(mission_id or ""), cancellation_event)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    defer_cancellation_unregister = False
     try:
         result = future.result(timeout=limit)
         if event_bus is not None:
@@ -1534,12 +1838,38 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 pass
         return result
     except FutureTimeout as exc:
-        cancellation_event.set()
+        if process_dispatch_lock is None or spec.dispatch_boundary == "handler":
+            cancellation_event.set()
+        else:
+            with process_dispatch_lock:
+                cancellation_event.set()
         cancelled = future.cancel()
+        if not future.done():
+            # A thread running a non-interruptible handler must remain visible
+            # to Owner cancellation until its protected boundary has exited.
+            defer_cancellation_unregister = True
+            future.add_done_callback(
+                lambda _future: _unregister_active_tool_cancellation(
+                    str(mission_id or ""), cancellation_event
+                )
+            )
         if effect is not None:
             from agent.external_effects import EffectRecoveryRequired, EffectState
 
-            if cancelled:
+            if process_dispatch_committed is not None and not process_dispatch_committed.is_set():
+                try:
+                    effect_ledger.mark_failed(
+                        effect.effect_id,
+                        execution_fence,
+                        reason_code="TOOL_TIMEOUT_BEFORE_PROCESS_START",
+                        provider_confirmed_no_effect=True,
+                        authorization_snapshot=mission_authorization,
+                    )
+                except Exception:
+                    pass
+                state = EffectState.FAILED
+                reason_code = "TOOL_TIMEOUT_BEFORE_PROCESS_START"
+            elif cancelled:
                 try:
                     effect_ledger.mark_failed(
                         effect.effect_id,
@@ -1568,4 +1898,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             raise EffectRecoveryRequired(effect.effect_id, state, reason_code) from exc
         raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        if not defer_cancellation_unregister:
+            _unregister_active_tool_cancellation(str(mission_id or ""), cancellation_event)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)

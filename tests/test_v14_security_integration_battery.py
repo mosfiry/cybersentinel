@@ -291,7 +291,7 @@ def test_native_model_workspace_dispatch_binds_authorized_root_and_evidence(tmp_
         assert provider.calls == 2
         assert mission.status is MissionStatus.RESOURCE_BLOCKED
         assert mission.checkpoint["status"] == "not_dispatched"
-        assert mission.checkpoint["reason_code"] == "process_sandbox_unavailable"
+        assert mission.checkpoint["reason_code"] == "backend_unavailable"
         assert mission.failures[-1]["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
         assert mission.failures[-1]["dispatch_attempted"] is False
         results = mission.progress["model_loop"]["tool_results"]
@@ -396,7 +396,7 @@ def test_native_model_serializes_tool_calls_when_provider_disables_parallel_call
         assert observed_worker_limits == []
         assert mission.status is MissionStatus.RESOURCE_BLOCKED
         assert mission.checkpoint["status"] == "not_dispatched"
-        assert mission.checkpoint["reason_code"] == "process_sandbox_unavailable"
+        assert mission.checkpoint["reason_code"] == "backend_unavailable"
         assert mission.failures[-1]["dispatch_attempted"] is False
         assert all(
             result.get("ok") is False

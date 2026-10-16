@@ -40,6 +40,7 @@ def test_canonical_registry_is_single_source_with_complete_access_contracts():
         "network_access",
         "filesystem_access",
         "process_access",
+        "dispatch_boundary",
         "credential_access",
         "evidence_requirements",
         "timeout",
@@ -67,6 +68,7 @@ def test_canonical_registry_is_single_source_with_complete_access_contracts():
     assert pytest_tool.network_access == "none"
     assert pytest_tool.filesystem_access == "workspace_read_only_artifact_write"
     assert pytest_tool.process_access == "workspace_process_sandboxed"
+    assert pytest_tool.dispatch_boundary == "workspace_process_start"
     assert pytest_tool.credential_access == "none"
     assert pytest_tool.timeout == 310
     assert WorkspacePolicy().max_timeout_seconds == 300
@@ -81,6 +83,13 @@ def test_canonical_registry_is_single_source_with_complete_access_contracts():
         {"network_access": "unrestricted"},
         {"filesystem_access": []},
         {"process_access": "host_shell"},
+        {"process_access": "workspace_process_unisolated", "risk_class": "bounded-exec"},
+        {"filesystem_access": "host_fs_via_process", "process_access": "workspace_process_unisolated", "risk_class": "bounded-exec"},
+        {"network_access": "host_process_unscoped", "process_access": "workspace_process_unisolated", "risk_class": "bounded-exec"},
+        {"process_access": "workspace_process_sandboxed", "risk_class": "bounded-exec"},
+        {"process_access": "workspace_process_sandboxed", "risk_class": "bounded-exec", "execution_context_required": True, "workspace_scope_required": True, "scope_requirements": ("owner_mission_workspace_root",)},
+        {"dispatch_boundary": "unknown_boundary"},
+        {"dispatch_boundary": "workspace_process_start", "process_access": "none"},
         {"credential_access": "caller_supplied"},
         {"evidence_requirements": ()},
         {"evidence_requirements": ([],)},
@@ -105,3 +114,10 @@ def test_tool_timeout_is_the_effective_canonical_dispatch_limit():
     assert callable(execute)
     assert REGISTRY["refresh_intel"].timeout == 30
     assert REGISTRY["run_project_tests"].timeout == 310
+
+
+def test_local_and_mcp_effects_declare_their_cancellation_boundary():
+    assert REGISTRY["watch"].dispatch_boundary == "handler"
+    assert REGISTRY["unwatch"].dispatch_boundary == "handler"
+    assert REGISTRY["mcp.discover"].dispatch_boundary == "scope_pinned_http_send"
+    assert REGISTRY["mcp.invoke"].dispatch_boundary == "scope_pinned_http_send"

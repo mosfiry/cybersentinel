@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,52 @@ class ExecutionContext:
     cancellation_event: Event | None = field(default=None, repr=False, compare=False)
     deadline_monotonic: float | None = field(default=None, repr=False, compare=False)
     delegation_scope: Any = field(default=None, repr=False, compare=False)
+    tool_dispatch_lock: Any = field(default=None, repr=False, compare=False)
+    process_dispatch_lock: Any = field(default=None, repr=False, compare=False)
+    process_dispatch_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
+    process_start_callback: Callable[[str, int | None, str | None], None] | None = field(default=None, repr=False, compare=False)
+
+    def authorize_process_dispatch(self, *, backend: str) -> None:
+        """Commit the fenced dispatch immediately before the approved backend starts a child."""
+        self.assert_active()
+        callback = self.process_dispatch_callback
+        if callback is not None:
+            callback(backend)
+
+    @contextmanager
+    def dispatch_guard(
+        self,
+        *,
+        allow_cancelled: bool = False,
+        allow_deadline_expired: bool = False,
+    ):
+        """Linearize an external dispatch boundary against Owner cancellation."""
+        lock = self.tool_dispatch_lock or self.process_dispatch_lock
+        if lock is None:
+            self.assert_active(
+                allow_cancelled=allow_cancelled,
+                allow_deadline_expired=allow_deadline_expired,
+            )
+            yield
+            return
+        with lock:
+            self.assert_active(
+                allow_cancelled=allow_cancelled,
+                allow_deadline_expired=allow_deadline_expired,
+            )
+            yield
+
+    def notify_process_started(
+        self,
+        *,
+        backend: str,
+        process_id: int | None,
+        started_at_utc: str | None = None,
+    ) -> None:
+        """Report a real sandbox process start to the registry's audit/effect boundary."""
+        callback = self.process_start_callback
+        if callback is not None:
+            callback(backend, process_id, started_at_utc)
 
     def to_dict(self) -> dict[str, Any]:
         """Return public execution metadata, excluding live authority objects."""
@@ -82,18 +129,24 @@ class ExecutionContext:
                 result["mission_authorization_version"] = self.mission_authorization_version
         return result
 
-    def assert_active(self) -> None:
+    def assert_active(
+        self,
+        *,
+        allow_cancelled: bool = False,
+        allow_deadline_expired: bool = False,
+    ) -> None:
         """Revalidate the exact Owner/Mission/tool/fence binding at use time."""
         from agent.execution_fence import ExecutionFenceError
         from security.authorization_context import AuthorizationContext, AuthorizationDecision
         from security.mission_authorization import MissionAuthorizationSnapshot
 
-        if self.cancellation_event is not None and self.cancellation_event.is_set():
+        if self.cancellation_event is not None and self.cancellation_event.is_set() and not allow_cancelled:
             raise PermissionError("tool execution cancelled")
         if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
             if self.cancellation_event is not None:
                 self.cancellation_event.set()
-            raise PermissionError("tool execution deadline exceeded")
+            if not allow_deadline_expired:
+                raise PermissionError("tool execution deadline exceeded")
         if not self.owner_authenticated or not self.request_id or not self.mission_id or not self.execution_id or not self.tool_id:
             raise PermissionError("a fully bound Owner/Mission execution context is required")
         if not isinstance(self.owner_authorization, AuthorizationContext):
