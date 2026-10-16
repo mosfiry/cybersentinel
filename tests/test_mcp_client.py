@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 import json
 import sqlite3
 import threading
 import time
+from typing import Any
 
 import pytest
 
+import security.pinned_http as pinned_http
 import security.scope_resolver as scope_resolver
+from tools.registry import (
+    REGISTRY,
+    _register_active_tool_cancellation,
+    _unregister_active_tool_cancellation,
+    cancel_active_mission_tool_executions,
+    get_tool,
+)
 from tools.mcp_client import (
     MCPClientError,
     MCPDiscoveredTool,
@@ -25,7 +35,6 @@ from tools.mcp_client import (
     _scrub_json_strings,
     _normalize_tool,
 )
-from tools.registry import REGISTRY, get_tool
 
 
 OWNER = "owner:7"
@@ -46,10 +55,24 @@ class DummyContext:
     tool_id: str = "mcp.discover"
     evidence_store: object | None = None
     execution_fence: object | None = None
+    dispatch_lock: Any = None
 
     def assert_active(self):
         if self.cancellation_event is not None and self.cancellation_event.is_set():
             raise RuntimeError("cancelled")
+
+    @contextmanager
+    def dispatch_guard(self, *, allow_cancelled=False, allow_deadline_expired=False):
+        lock = self.dispatch_lock
+        if lock is None:
+            if not allow_cancelled:
+                self.assert_active()
+            yield
+            return
+        with lock:
+            if not allow_cancelled:
+                self.assert_active()
+            yield
 
 
 def _context() -> DummyContext:
@@ -383,6 +406,48 @@ def test_mcp_tool_call_cancellation_sends_protocol_cancel_and_never_replays(monk
     assert cancel_messages[0]["params"]["reason"] == "tool_cancelled"
     assert sum(1 for item in fake.calls if (item[3] or {}).get("method") == "tools/call") == 1
     client.close()
+
+
+def test_mcp_pinned_http_rechecks_owner_cancel_at_socket_send_boundary(monkeypatch):
+    _allow_scope(monkeypatch)
+    context = _context()
+    context.dispatch_lock = threading.Lock()
+    marker_commits = []
+    _register_active_tool_cancellation(MISSION, context.cancellation_event, context.dispatch_lock)
+    connections = []
+
+    class NeverSendConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+            self.request_called = False
+            connections.append(self)
+
+        def request(self, *_args, **_kwargs):
+            self.request_called = True
+            raise AssertionError("MCP HTTP request was sent after Owner cancellation committed")
+
+        def close(self):
+            return None
+
+    def cancel_after_scope_check(*_args, **_kwargs):
+        assert cancel_active_mission_tool_executions(
+            MISSION,
+            before_signal=lambda: marker_commits.append("committed"),
+        ) == 1
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", cancel_after_scope_check)
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", NeverSendConnection)
+    client = MCPRemoteClient(ENDPOINT, context)
+    try:
+        with pytest.raises(RuntimeError, match="cancelled"):
+            client._post({"jsonrpc": "2.0", "method": "tools/call"})
+        assert marker_commits == ["committed"]
+        assert context.cancellation_event.is_set()
+        assert connections and all(not connection.request_called for connection in connections)
+    finally:
+        _unregister_active_tool_cancellation(MISSION, context.cancellation_event)
+        client.close()
 
 
 def test_mcp_internal_timeout_is_bounded_and_not_retried(monkeypatch):

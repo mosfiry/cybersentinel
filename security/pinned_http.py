@@ -8,6 +8,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 
@@ -41,7 +42,8 @@ class PinnedSession:
 
     def request(self, method: str, url: str, *, params: dict | None = None,
                 timeout: float | None = None, headers: dict[str, str] | None = None,
-                json_body=None, data: bytes | str | None = None, **kwargs) -> PinnedHTTPResponse:
+                json_body=None, data: bytes | str | None = None,
+                dispatch_guard: Callable[[], Any] | None = None, **kwargs) -> PinnedHTTPResponse:
         if kwargs:
             raise PinnedRequestError("unsupported HTTP request options")
         if params:
@@ -66,6 +68,7 @@ class PinnedSession:
             timeout=self.timeout if timeout is None else timeout,
             max_response_bytes=self.max_response_bytes,
             allow_loopback=self.allow_loopback,
+            dispatch_guard=dispatch_guard,
         )
 
     def get(self, url: str, **kwargs) -> PinnedHTTPResponse:
@@ -162,6 +165,7 @@ def pinned_http_request(
     max_response_bytes: int = 2_000_000,
     allow_loopback: bool = False,
     allow_redirect_response: bool = False,
+    dispatch_guard: Callable[[], Any] | None = None,
 ) -> PinnedHTTPResponse:
     """Send one bounded HTTP request to a DNS-pinned address without redirects.
 
@@ -242,7 +246,13 @@ def pinned_http_request(
     try:
         if deadline_expired.is_set() or time.monotonic() >= deadline:
             raise socket.timeout("HTTP request exceeded its total wall-clock deadline")
-        connection.request(method, target, body=body, headers=request_headers)
+        if dispatch_guard is None:
+            connection.request(method, target, body=body, headers=request_headers)
+        else:
+            with dispatch_guard():
+                if deadline_expired.is_set() or time.monotonic() >= deadline:
+                    raise socket.timeout("HTTP request exceeded its total wall-clock deadline")
+                connection.request(method, target, body=body, headers=request_headers)
         if deadline_expired.is_set() or time.monotonic() >= deadline:
             raise socket.timeout("HTTP request exceeded its total wall-clock deadline")
         response = connection.getresponse()

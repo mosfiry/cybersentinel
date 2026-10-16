@@ -691,10 +691,26 @@ class MCPRemoteClient:
             headers["Mcp-Session-Id"] = self._session_id
         if self._protocol_version:
             headers["MCP-Protocol-Version"] = self._protocol_version
-        return self._session.request(
-            "POST", self.endpoint, headers=headers, json_body=message,
-            timeout=self.timeout if timeout is None else timeout,
-        )
+        dispatch_guard_factory = getattr(self.context, "dispatch_guard", None)
+        dispatch_guard = None
+        if callable(dispatch_guard_factory):
+            dispatch_guard = lambda: dispatch_guard_factory(
+                allow_cancelled=ignore_cancel,
+                allow_deadline_expired=ignore_cancel,
+            )
+        request_kwargs = {
+            "headers": headers,
+            "json_body": message,
+            "timeout": self.timeout if timeout is None else timeout,
+        }
+        if dispatch_guard is not None and isinstance(self._session, PinnedSession):
+            return self._session.request(
+                "POST", self.endpoint, dispatch_guard=dispatch_guard, **request_kwargs,
+            )
+        if dispatch_guard is not None:
+            with dispatch_guard():
+                return self._session.request("POST", self.endpoint, **request_kwargs)
+        return self._session.request("POST", self.endpoint, **request_kwargs)
 
     @staticmethod
     def _event_messages(body: bytes) -> list[dict[str, Any]]:
