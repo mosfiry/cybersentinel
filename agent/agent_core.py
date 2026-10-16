@@ -705,13 +705,14 @@ class AgentCore:
                     evidence_store=evidence_store,
                 )
                 if step.action == "run_project_tests":
-                    sandbox_unavailable = workspace.process_sandbox_unavailable_reason()
-                    if sandbox_unavailable:
+                    sandbox_availability = workspace.process_sandbox_availability()
+                    if not sandbox_availability.available:
                         return {
                             "success": False,
                             "failure_class": "RESOURCE",
-                            "reason_code": "process_sandbox_unavailable",
-                            "error": sandbox_unavailable,
+                            "reason_code": sandbox_availability.reason_code or "backend_unavailable",
+                            "detail_code": sandbox_availability.detail_code,
+                            "error": sandbox_availability.reason or "required process sandbox is unavailable",
                             "execution_id": action_id,
                         }
             target_identity = str((mission.scope_snapshot or {}).get("target_id") or snapshot.target_identity) if isinstance(mission.scope_snapshot, dict) else snapshot.target_identity

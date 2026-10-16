@@ -104,6 +104,9 @@ class MissionQueue:
                 ("runtime_generation", "INTEGER NOT NULL DEFAULT 0"),
                 ("claim_phase", "TEXT NOT NULL DEFAULT 'NONE'"),
                 ("claim_fence_id", "TEXT NOT NULL DEFAULT ''"),
+                ("owner_cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+                ("owner_cancel_requested_by", "TEXT NOT NULL DEFAULT ''"),
+                ("owner_cancel_requested_at", "TEXT"),
             ):
                 if column not in columns:
                     db.execute(f"ALTER TABLE mission_queue ADD COLUMN {column} {definition}")
@@ -286,7 +289,7 @@ class MissionQueue:
         available = _utc_text(_utc_datetime(available_at, field_name="available_at"))
         with sqlite3.connect(self.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_queue.state != ?", (mission_id, state.value, 0, available, WorkerMissionState.EXECUTING.value))
+            db.execute("INSERT INTO mission_queue(mission_id,state,attempts,available_at,claimed_at,last_error) VALUES(?,?,?,?,NULL,'') ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,available_at=excluded.available_at,claimed_at=NULL,last_error='',lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='' WHERE mission_queue.state != ? AND mission_queue.owner_cancel_requested=0", (mission_id, state.value, 0, available, WorkerMissionState.EXECUTING.value))
             row = db.execute(
                 "SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM mission_queue WHERE mission_id=?",
                 (mission_id,),
@@ -295,6 +298,32 @@ class MissionQueue:
                 raise KeyError("unknown queued mission")
             item = self._item_from_row(row)
         return item
+
+    def request_owner_cancellation(self, mission_id: str, owner_identity_ref: str) -> bool:
+        """Durably flag cancellation without mutating the leased Mission version."""
+        if not isinstance(mission_id, str) or not mission_id.strip():
+            raise ValueError("mission_id required")
+        if not isinstance(owner_identity_ref, str) or not owner_identity_ref.strip() or len(owner_identity_ref) > 256:
+            raise ValueError("authenticated Owner identity reference required")
+        requested_at = _utc_text(datetime.now(timezone.utc))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            updated = db.execute(
+                "UPDATE mission_queue SET owner_cancel_requested=1, "
+                "owner_cancel_requested_by=CASE WHEN owner_cancel_requested=0 THEN ? ELSE owner_cancel_requested_by END, "
+                "owner_cancel_requested_at=CASE WHEN owner_cancel_requested=0 THEN ? ELSE owner_cancel_requested_at END "
+                "WHERE mission_id=? AND state=?",
+                (owner_identity_ref.strip(), requested_at, mission_id, WorkerMissionState.EXECUTING.value),
+            )
+            return updated.rowcount == 1
+
+    def owner_cancellation_requested(self, mission_id: str) -> bool:
+        with sqlite3.connect(self.db_path) as db:
+            row = db.execute(
+                "SELECT owner_cancel_requested FROM mission_queue WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+        return bool(row and int(row[0]) == 1)
 
     def get(self, mission_id: str) -> QueueItem:
         with sqlite3.connect(self.db_path) as db:
@@ -329,7 +358,7 @@ class MissionQueue:
             claimable_states = (WorkerMissionState.QUEUED.value, WorkerMissionState.SLEEPING.value)
             placeholders = ",".join("?" for _ in claimable_states)
             row = db.execute(
-                f"SELECT mission_id FROM mission_queue WHERE state IN ({placeholders}) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?) ORDER BY available_at,mission_id LIMIT 1",
+                f"SELECT mission_id FROM mission_queue WHERE state IN ({placeholders}) AND owner_cancel_requested=0 AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?) ORDER BY available_at,mission_id LIMIT 1",
                 (*claimable_states, moment, moment),
             ).fetchone()
             if row is None:
@@ -337,7 +366,7 @@ class MissionQueue:
             mission_id = row[0]
             updated = db.execute(
                 "UPDATE mission_queue SET state=?, attempts=attempts+1, claimed_at=?, lease_owner=?, lease_expires_at=?, worker_instance_id=?, runtime_generation=?, lease_epoch=lease_epoch+1,claim_phase='CLAIMED',claim_fence_id='' "
-                f"WHERE mission_id=? AND state IN ({placeholders}) AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+                f"WHERE mission_id=? AND state IN ({placeholders}) AND owner_cancel_requested=0 AND available_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
                 (
                     WorkerMissionState.EXECUTING.value,
                     moment,

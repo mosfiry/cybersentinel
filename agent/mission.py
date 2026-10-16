@@ -125,7 +125,10 @@ class Mission:
         recovery_reconciled = self.status is MissionStatus.RECOVERY_REQUIRED and target is MissionStatus.READY
         owner_intervention = self.status is MissionStatus.OWNER_INPUT_REQUIRED and target in {MissionStatus.AUTHORIZATION_BLOCKED, MissionStatus.READY}
         owner_reauthorized = self.status is MissionStatus.OWNER_REAUTH_REQUIRED and target is MissionStatus.READY
-        owner_cancelled = self.status in {MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.OWNER_REAUTH_REQUIRED} and target is MissionStatus.CANCELLED
+        owner_cancelled = target is MissionStatus.CANCELLED and (
+            self.status in {MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.OWNER_REAUTH_REQUIRED}
+            or self.progress.get("owner_cancel_requested") is True
+        )
         if self.is_terminal and target is not self.status and not recovery_reconciled and not recovery_reauthorization and not owner_intervention and not owner_reauthorized and not owner_cancelled:
             raise ValueError(f"terminal mission cannot transition {self.status.value}->{target.value}")
         self.status = target

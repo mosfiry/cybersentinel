@@ -541,7 +541,20 @@ class MissionService:
             return mission.to_dict()
         queued = self.queue.enqueue(mission_id, state=WorkerMissionState.CANCELLED)
         if queued.state is WorkerMissionState.EXECUTING:
-            raise PermissionError("active worker lease blocks Owner control")
+            from tools.registry import cancel_active_mission_tool_executions
+
+            def record_owner_cancellation() -> None:
+                if not self.queue.request_owner_cancellation(mission_id, mission.owner_identity_ref):
+                    raise PermissionError("active worker lease changed before Owner cancellation was recorded")
+
+            signaled = cancel_active_mission_tool_executions(
+                mission_id,
+                before_signal=record_owner_cancellation,
+            )
+            result = mission.to_dict()
+            result["cancel_requested"] = True
+            result["active_tool_cancellation_signals"] = signaled
+            return result
         if self.scheduler is not None:
             self.scheduler.cancel_scheduled(mission_id)
         if mission.status is MissionStatus.RECOVERY_REQUIRED:

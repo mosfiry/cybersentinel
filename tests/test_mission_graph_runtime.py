@@ -244,6 +244,147 @@ def test_owner_cancel_of_recovery_requests_stop_without_claiming_effect_stopped(
     assert task["cancel_requested"] is True
 
 
+def test_owner_cancel_of_active_worker_is_durable_and_signals_live_tool_without_staling_mission(tmp_path):
+    rt = _runtime(tmp_path, lambda mission, step, action_id: {"success": True})
+    plan = Plan.initial("cancel active").replan(steps=(PlanStep("step", "step", action="search"),), reason="test plan")
+    mission = rt.create("cancel active", "cancel active", plan, owner_identity_ref="test-owner")
+    queue = MissionQueue(tmp_path / "active-queue.sqlite3")
+    queue.enqueue(mission.mission_id)
+    identity = queue.register_worker("active-cancel-test-worker")
+    claimed = queue.claim_next(
+        worker_id=identity.worker_id,
+        worker_instance_id=identity.worker_instance_id,
+        runtime_generation=identity.runtime_generation,
+        lease_seconds=120,
+    )
+    assert claimed is not None and claimed.state is WorkerMissionState.EXECUTING
+    mission_snapshot = rt.store.load(mission.mission_id).to_dict()
+
+    from tools.registry import _register_active_tool_cancellation, _unregister_active_tool_cancellation
+
+    cancellation_event = threading.Event()
+    _register_active_tool_cancellation(mission.mission_id, cancellation_event)
+    service = MissionService(rt, queue)
+    service._authorized_mission = lambda requested_id, owner_session_token: (rt.store.load(requested_id), "test-owner")
+    try:
+        response = service.cancel_mission(mission.mission_id, owner_session_token="owner-session")
+    finally:
+        _unregister_active_tool_cancellation(mission.mission_id, cancellation_event)
+
+    assert response["cancel_requested"] is True
+    assert response["active_tool_cancellation_signals"] == 1
+    assert cancellation_event.is_set()
+    assert queue.owner_cancellation_requested(mission.mission_id) is True
+    assert queue.get(mission.mission_id).state is WorkerMissionState.EXECUTING
+    assert rt.store.load(mission.mission_id).to_dict() == mission_snapshot
+
+
+def test_worker_runtime_applies_durable_owner_cancel_under_current_execution_fence(tmp_path):
+    rt = _runtime(tmp_path, lambda mission, step, action_id: pytest.fail("cancelled Mission must not execute"))
+    plan = Plan.initial("cancel before dispatch").replan(
+        steps=(PlanStep("step", "step", action="search"),), reason="test plan"
+    )
+    mission = rt.create("cancel before dispatch", "cancel before dispatch", plan, owner_identity_ref="test-owner")
+    queue = MissionQueue(
+        tmp_path / "fenced-cancel-queue.sqlite3",
+        require_execution_fence=True,
+        mission_store=rt.store,
+    )
+    queue.enqueue(mission.mission_id)
+    identity = queue.register_worker("fenced-cancel-test-worker")
+    worker_fence = ExecutionFence.for_worker(queue, identity)
+    claimed = queue.claim_next(
+        worker_id=identity.worker_id,
+        worker_instance_id=identity.worker_instance_id,
+        runtime_generation=identity.runtime_generation,
+        lease_seconds=120,
+        execution_fence=worker_fence,
+    )
+    assert claimed is not None
+    rt.bind_execution_claim(mission.mission_id, worker_fence.with_lease(claimed))
+    assert queue.request_owner_cancellation(mission.mission_id, "test-owner") is True
+
+    cancelled = rt.run_to_completion(mission.mission_id)
+
+    assert cancelled.status is MissionStatus.CANCELLED
+    assert cancelled.progress["owner_cancel_requested"] is True
+    task = cancelled.agent_task_graph_state["graph"]["tasks"][0]
+    assert task["lifecycle"] == TaskLifecycle.CANCELLED.value
+    assert any(event.get("event") == "owner_cancel_requested" for event in cancelled.recovery_events)
+    fence = rt.execution_fence
+    queue.update(
+        mission.mission_id,
+        WorkerMissionState.CANCELLED,
+        worker_id=identity.worker_id,
+        lease_epoch=claimed.lease_epoch,
+        runtime_generation=identity.runtime_generation,
+        worker_instance_id=identity.worker_instance_id,
+        execution_fence=fence,
+    )
+    assert queue.enqueue(mission.mission_id).state is WorkerMissionState.CANCELLED
+    assert queue.claim_next(
+        worker_id=identity.worker_id,
+        worker_instance_id=identity.worker_instance_id,
+        runtime_generation=identity.runtime_generation,
+        lease_seconds=120,
+        execution_fence=worker_fence,
+    ) is None
+
+
+def test_native_model_owner_cancel_during_provider_call_prevents_goal_completion(tmp_path):
+    from agent.model_protocol import ModelTurn
+
+    plan = Plan.initial("cancel during model turn").replan(
+        steps=(PlanStep("step", "step", action="search"),), reason="test plan"
+    )
+    rt, mission_id, queue = _strict_parallel_runtime(
+        tmp_path, lambda *_args: pytest.fail("native model test must not use the plan executor"), plan
+    )
+
+    class CancelDuringModel:
+        parallel_tool_calls = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, _messages, _tools, **kwargs):
+            self.calls += 1
+            assert queue.request_owner_cancellation(mission_id, "test-owner") is True
+            return ModelTurn(
+                turn_id=kwargs["turn_id"],
+                content="The goal is complete.",
+                provider="test-provider",
+                model="test-model",
+            )
+
+    model = CancelDuringModel()
+    rt.verifier = lambda _mission: pytest.fail("cancelled final response must not be verified")
+
+    cancelled = rt.run_model_loop(mission_id, model, tools=[], max_turns=1)
+
+    assert model.calls == 1
+    assert cancelled.status is MissionStatus.CANCELLED
+    assert cancelled.progress["owner_cancel_requested"] is True
+    assert all(item["to"] != MissionStatus.GOAL_COMPLETED.value for item in cancelled.transitions)
+
+
+def test_durable_owner_cancel_wins_if_requested_before_terminal_mission_save(tmp_path):
+    plan = Plan.initial("cancel at final save").replan(
+        steps=(PlanStep("step", "step", action="search"),), reason="test plan"
+    )
+    rt, mission_id, queue = _strict_parallel_runtime(tmp_path, lambda *_args: {}, plan)
+    mission = rt.store.load(mission_id)
+    mission.transition(MissionStatus.RUNNING, "test runtime start")
+    mission.transition(MissionStatus.GOAL_COMPLETED, "test final response")
+    assert queue.request_owner_cancellation(mission_id, "test-owner") is True
+
+    saved = rt._save(mission)
+
+    assert saved.status is MissionStatus.CANCELLED
+    assert saved.progress["owner_cancel_requested"] is True
+    assert saved.transitions[-1]["to"] == MissionStatus.CANCELLED.value
+
+
 def test_fresh_owner_snapshot_rebinds_graph_without_replaying_completed_steps(tmp_path):
     calls = []
     rt = _runtime(tmp_path, lambda mission, step, action_id: calls.append(step.step_id) or {"success": True})

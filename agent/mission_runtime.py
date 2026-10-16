@@ -565,6 +565,8 @@ class MissionRuntime:
         return self.execution_fence.for_mission(mission, task_id=task_id, execution_id=execution_id)
 
     def _save(self, mission: Mission, *, execution_fence: ExecutionFence | None = None) -> Mission:
+        if self._owner_cancellation_requested(mission.mission_id):
+            self._mark_owner_cancellation(mission)
         fence = execution_fence or self._fence_for(mission)
         if fence is None:
             if self.require_execution_fence:
@@ -581,6 +583,38 @@ class MissionRuntime:
                 import logging
                 logging.getLogger(__name__).warning("mission_episode_memory_persist_failed")
         return saved
+
+    def _owner_cancellation_requested(self, mission_id: str) -> bool:
+        queue = getattr(self.execution_fence, "queue", None)
+        check = getattr(queue, "owner_cancellation_requested", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check(mission_id))
+        except Exception as exc:
+            raise ExecutionFenceError("Owner cancellation state could not be verified") from exc
+
+    def _mark_owner_cancellation(self, mission: Mission) -> None:
+        if not mission.progress.get("owner_cancel_requested"):
+            mission.progress["owner_cancel_requested"] = True
+            mission.recovery_events.append({
+                "event": "owner_cancel_requested",
+                "reason": "active tool cancellation was requested by the authenticated Owner",
+            })
+            if self.task_graph_adapter is not None:
+                try:
+                    self.task_graph_adapter.cancel(mission)
+                except MissionTaskGraphError:
+                    mission.recovery_events.append({"event": "agent_task_graph_cancellation_requires_review"})
+        if mission.status not in {MissionStatus.RECOVERY_REQUIRED, MissionStatus.CANCELLED}:
+            mission.transition(MissionStatus.CANCELLED, "Owner requested cancellation of the active Mission")
+            mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+
+    def _apply_owner_cancellation(self, mission: Mission) -> Mission:
+        if not self._owner_cancellation_requested(mission.mission_id):
+            return mission
+        self._mark_owner_cancellation(mission)
+        return self._save(mission)
 
     @staticmethod
     def _executor_accepts_fence(executor: Callable[..., Any]) -> bool:
@@ -725,16 +759,20 @@ class MissionRuntime:
         mission.transition(MissionStatus.SAFETY_BLOCKED, reason)
         return self._save(mission)
 
-    def request_agent_task_cancellation(self, mission: Mission) -> None:
+    def request_agent_task_cancellation(self, mission: Mission) -> int:
         """Record graph cancellation after the caller has authenticated Owner control."""
+        from tools.registry import cancel_active_mission_tool_executions
+
+        signaled = cancel_active_mission_tool_executions(mission.mission_id)
         if self.task_graph_adapter is None:
-            return
+            return signaled
         try:
             self.task_graph_adapter.cancel(mission)
         except MissionTaskGraphError:
             # Mission cancellation/recovery remains authoritative; a graph audit
             # failure must never turn an Owner cancellation into permission to run.
             mission.recovery_events.append({"event": "agent_task_graph_cancellation_requires_review"})
+        return signaled
 
     @staticmethod
     def _default_authorizer(mission: Mission, step: PlanStep) -> tuple[bool, str]:
@@ -1456,6 +1494,8 @@ class MissionRuntime:
         proposals: tuple[Any, ...],
         *,
         reason: str,
+        reason_code: str = "backend_unavailable",
+        detail_code: str | None = None,
         run_id: str,
         turn_id: str,
         progress: dict[str, Any],
@@ -1473,11 +1513,10 @@ class MissionRuntime:
             blocked_ids.append(call_id)
             if call_id not in already_proposed:
                 mission.emit(EventType.TOOL_PROPOSED, step_id=proposal.step_id, data=proposal.to_dict())
-            error = (
-                "process_sandbox_unavailable"
-                if proposal.name == "run_project_tests"
-                else "turn_blocked_before_dispatch_due_to_process_sandbox_unavailable"
-            )
+            if proposal.name == "run_project_tests":
+                error = "process_sandbox_setup_failed" if reason_code == "sandbox_setup_failed" else "process_sandbox_unavailable"
+            else:
+                error = "turn_blocked_before_dispatch_due_to_process_sandbox_unavailable"
             progress["tool_results"].append(ToolCallResult(proposal, False, error=error).to_dict())
 
         reason = self._bounded_tool_error(reason) or "required process sandbox is unavailable"
@@ -1487,7 +1526,8 @@ class MissionRuntime:
             "run_id": run_id,
             "turn_id": turn_id,
             "class": FailureClass.RESOURCE.value,
-            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "kind": "PROCESS_SANDBOX_SETUP_FAILED" if reason_code == "sandbox_setup_failed" else "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": reason_code,
             "reason": reason,
             "blocked_tool_call_ids": blocked_ids,
             "dispatch_attempted": False,
@@ -1497,12 +1537,14 @@ class MissionRuntime:
                 "attempts": 0,
             },
         }
+        if detail_code:
+            failure["detail_code"] = detail_code
         mission.error = "required bounded process sandbox is unavailable"
         mission.failures.append(failure)
         mission.progress.setdefault("resource_failures", []).append(failure)
         mission.checkpoint = {
             "status": "not_dispatched",
-            "reason_code": "process_sandbox_unavailable",
+            "reason_code": reason_code,
             "run_id": run_id,
             "turn_id": turn_id,
             "plan_version": mission.plan.version,
@@ -1513,7 +1555,8 @@ class MissionRuntime:
         mission.emit(EventType.FAILURE_DETECTED, data=failure)
         mission.emit(EventType.FAILURE_DIAGNOSED, data={
             "class": FailureClass.RESOURCE.value,
-            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "kind": failure["kind"],
+            "reason_code": reason_code,
             "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
             "dispatch_attempted": False,
         })
@@ -1522,7 +1565,7 @@ class MissionRuntime:
             mission.error,
             run_id=run_id,
             turn_id=turn_id,
-            reason_code="process_sandbox_unavailable",
+            reason_code=reason_code,
             dispatch_attempted=False,
         )
         return self._save(mission)
@@ -1657,7 +1700,11 @@ class MissionRuntime:
         timeout_seconds: float = 0.0,
     ) -> Mission | None:
         """Complete only when required deterministic evidence already proves the goal."""
+        if self._owner_cancellation_requested(mission.mission_id):
+            return self._apply_owner_cancellation(mission)
         verification = self.verifier(mission)
+        if self._owner_cancellation_requested(mission.mission_id):
+            return self._apply_owner_cancellation(mission)
         if not verification.verified:
             return None
         mission.verification_state = {
@@ -1675,6 +1722,8 @@ class MissionRuntime:
             context_message_limit=context_message_limit,
             timeout_seconds=timeout_seconds,
         )
+        if self._owner_cancellation_requested(mission.mission_id):
+            return self._apply_owner_cancellation(mission)
         if final_turn is not None:
             progress = mission.progress.setdefault("model_loop", {})
             progress.setdefault("turns", []).append(final_turn.to_dict())
@@ -1778,6 +1827,8 @@ class MissionRuntime:
         from security.authorization_context import AuthorizationContext
 
         mission = self._load(mission_id)
+        if self._owner_cancellation_requested(mission_id):
+            return self._apply_owner_cancellation(mission)
         if mission.is_terminal:
             return mission
         if (mission.checkpoint or {}).get("status") in {"in_flight", "in_flight_parallel"}:
@@ -1843,6 +1894,8 @@ class MissionRuntime:
 
         retryable_provider_failure = False
         for _ in range(turn_budget):
+            if self._owner_cancellation_requested(mission_id):
+                return self._apply_owner_cancellation(mission)
             if len(progress["turns"]) >= max_execution_steps:
                 return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
             remaining_seconds = self._remaining_seconds(deadline)
@@ -1933,6 +1986,8 @@ class MissionRuntime:
                 remaining_seconds = self._remaining_seconds(deadline)
                 if remaining_seconds <= 0:
                     raise _MissionBudgetExceeded("max_execution_time_seconds", execution_time_limit)
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
                 response = self._complete_with_timeout(
                     model,
                     messages,
@@ -1944,6 +1999,8 @@ class MissionRuntime:
                     timeout_seconds=remaining_seconds,
                     require_timeout=self.require_execution_fence,
                 )
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
                 if self._remaining_seconds(deadline) <= 0:
                     raise _MissionBudgetExceeded("max_execution_time_seconds", execution_time_limit)
                 turn = self._bind_model_provenance(model, validate_model_turn(response))
@@ -1979,6 +2036,8 @@ class MissionRuntime:
                     return completed
                 return self._block_on_budget(mission, exc.budget, exc.limit)
             except ProviderError as exc:
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
                 kind = getattr(exc, "kind", "PROVIDER_FAILURE")
                 kind_value = getattr(kind, "value", kind)
                 attempts = []
@@ -2170,12 +2229,14 @@ class MissionRuntime:
                     ).allowed
                     for proposal in turn.tool_calls
                 )
-                sandbox_unavailable = Workspace.process_sandbox_unavailable_reason() if sandbox_required else None
-                if sandbox_unavailable:
+                sandbox_availability = Workspace.process_sandbox_availability() if sandbox_required else None
+                if sandbox_availability is not None and not sandbox_availability.available:
                     return self._block_on_process_sandbox_unavailable(
                         mission,
                         turn.tool_calls,
-                        reason=sandbox_unavailable,
+                        reason=sandbox_availability.reason or "required process sandbox is unavailable",
+                        reason_code=sandbox_availability.reason_code or "backend_unavailable",
+                        detail_code=sandbox_availability.detail_code,
                         run_id=run_id,
                         turn_id=turn.turn_id,
                         progress=progress,
@@ -2185,9 +2246,13 @@ class MissionRuntime:
             if not turn.tool_calls:
                 progress["last_model_content"] = turn.content
                 progress["last_model_finish_reason"] = turn.finish_reason
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
                 if self._remaining_seconds(deadline) <= 0:
                     return self._block_on_budget(mission, "max_execution_time_seconds", execution_time_limit)
                 verification = self.verifier(mission)
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
                 mission.verification_state = {"verified": verification.verified, "missing_criteria": list(verification.missing_criteria), "evidence_count": len(verification.evidence)}
                 if verification.verified:
                     mission.transition(MissionStatus.GOAL_COMPLETED, "model final accepted with deterministic evidence")
@@ -2214,11 +2279,15 @@ class MissionRuntime:
                     skill_context=skill_context,
                     max_workers=parallel_workers,
                 )
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
                 self._save(mission)
                 if mission.is_terminal:
                     return mission
                 continue
             for index, proposal in enumerate(turn.tool_calls):
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
                 seen.add(proposal.tool_call_id)
                 progress["seen_call_ids"].append(proposal.tool_call_id)
                 argument = proposal.arguments.get("query") if isinstance(proposal.arguments, dict) else None
@@ -2250,6 +2319,8 @@ class MissionRuntime:
                         if dispatch_fence is not None:
                             dispatch_fence.assert_active_execution(mission)
                         self._save(mission)
+                        if self._owner_cancellation_requested(mission_id):
+                            return self._apply_owner_cancellation(mission)
                         if heartbeat is not None:
                             heartbeat()
                         if dispatch_fence is not None:
@@ -2356,12 +2427,14 @@ class MissionRuntime:
                         )
                         return self._save(mission)
                     except Exception as exc:
-                        from workspace.environment import ProcessSandboxUnavailable
-                        if isinstance(exc, ProcessSandboxUnavailable):
+                        from workspace.environment import ProcessSandboxSetupError, ProcessSandboxUnavailable
+                        if isinstance(exc, ProcessSandboxSetupError):
                             return self._block_on_process_sandbox_unavailable(
                                 mission,
                                 (proposal,),
                                 reason=str(exc),
+                                reason_code="sandbox_setup_failed",
+                                detail_code=exc.detail_code,
                                 run_id=run_id,
                                 turn_id=turn_id,
                                 progress=progress,
@@ -2369,8 +2442,85 @@ class MissionRuntime:
                                 skill_context=dispatch_skill_context,
                                 already_proposed_ids={proposal.tool_call_id},
                             )
+                        if isinstance(exc, ProcessSandboxUnavailable):
+                            return self._block_on_process_sandbox_unavailable(
+                                mission,
+                                (proposal,),
+                                reason=str(exc),
+                                reason_code=exc.reason_code,
+                                detail_code=exc.detail_code,
+                                run_id=run_id,
+                                turn_id=turn_id,
+                                progress=progress,
+                                seen=seen,
+                                skill_context=dispatch_skill_context,
+                                already_proposed_ids={proposal.tool_call_id},
+                            )
+                        if proposal.name == "run_project_tests" and isinstance(exc, PermissionError):
+                            if self._owner_cancellation_requested(mission_id):
+                                return self._apply_owner_cancellation(mission)
+                            reason = self._bounded_tool_error(str(exc)) or "process authorization was refused before dispatch"
+                            failure = {
+                                "mission_id": mission.mission_id,
+                                "request_id": mission.request_id,
+                                "run_id": run_id,
+                                "turn_id": turn_id,
+                                "tool_call_id": proposal.tool_call_id,
+                                "action_id": execution_id,
+                                "step_id": task_id,
+                                "class": FailureClass.AUTHORIZATION.value,
+                                "kind": "PROCESS_AUTHORIZATION_REFUSED",
+                                "reason_code": "authorization_refused",
+                                "reason": reason,
+                                "dispatch_attempted": False,
+                                "retry_policy": {
+                                    "action": MissionStatus.AUTHORIZATION_BLOCKED.value,
+                                    "retryable": False,
+                                    "attempts": 0,
+                                },
+                            }
+                            mission.error = "process authorization was refused before dispatch"
+                            mission.failures.append(failure)
+                            mission.progress.setdefault("authorization_failures", []).append(failure)
+                            mission.checkpoint = {
+                                "status": "not_dispatched",
+                                "tool_call_id": proposal.tool_call_id,
+                                "action_id": execution_id,
+                                "step_id": task_id,
+                                "run_id": run_id,
+                                "turn_id": turn_id,
+                                "plan_version": mission.plan.version,
+                                "reason_code": "authorization_refused",
+                            }
+                            if dispatch_skill_context is not None:
+                                mission.checkpoint["skill_reference"] = dispatch_skill_context.reference
+                            mission.emit(EventType.FAILURE_DETECTED, step_id=task_id, data=failure)
+                            mission.emit(EventType.FAILURE_DIAGNOSED, step_id=task_id, data={
+                                "class": FailureClass.AUTHORIZATION.value,
+                                "kind": "PROCESS_AUTHORIZATION_REFUSED",
+                                "reason_code": "authorization_refused",
+                                "recovery": MissionStatus.AUTHORIZATION_BLOCKED.value,
+                                "dispatch_attempted": False,
+                                "run_id": run_id,
+                                "turn_id": turn_id,
+                                "tool_call_id": proposal.tool_call_id,
+                            })
+                            mission.transition(
+                                MissionStatus.AUTHORIZATION_BLOCKED,
+                                mission.error,
+                                run_id=run_id,
+                                turn_id=turn_id,
+                                tool_call_id=proposal.tool_call_id,
+                                checkpoint_status="not_dispatched",
+                            )
+                            return self._save(mission)
                         error_detail = self._bounded_tool_error(str(exc)) or "no exception detail"
                         reason = f"native tool outcome is ambiguous: {type(exc).__name__}"
+                        sandbox_start_uncertain = (
+                            proposal.name == "run_project_tests"
+                            and type(exc).__name__ == "EffectRecoveryRequired"
+                            and getattr(exc, "reason_code", None) == "sandbox_setup_failed"
+                        )
                         failure = {
                             "mission_id": mission.mission_id,
                             "request_id": mission.request_id,
@@ -2380,7 +2530,18 @@ class MissionRuntime:
                             "action_id": execution_id,
                             "step_id": task_id,
                             "class": FailureClass.UNKNOWN.value,
-                            "kind": "NATIVE_TOOL_OUTCOME_UNKNOWN",
+                            "kind": (
+                                "PROCESS_SANDBOX_START_UNCERTAIN"
+                                if sandbox_start_uncertain
+                                else "NATIVE_TOOL_OUTCOME_UNKNOWN"
+                            ),
+                            "reason_code": (
+                                "sandbox_setup_failed"
+                                if sandbox_start_uncertain
+                                else "native_tool_outcome_unknown"
+                            ),
+                            "dispatch_attempted": sandbox_start_uncertain,
+                            "process_start_confirmed": False if sandbox_start_uncertain else None,
                             "error_type": type(exc).__name__,
                             "error": error_detail,
                             "reason": reason,
@@ -2414,6 +2575,8 @@ class MissionRuntime:
                         )
                         return self._save(mission)
                 progress["tool_results"].append(result.to_dict())
+                if self._owner_cancellation_requested(mission_id):
+                    return self._apply_owner_cancellation(mission)
             self._save(mission)
         if len(progress["turns"]) >= max_execution_steps and not mission.is_terminal:
             return self._block_on_budget(mission, "max_execution_steps", max_execution_steps)
@@ -2950,6 +3113,8 @@ class MissionRuntime:
 
     def run_to_completion(self, mission_id: str, *, max_slices: int | None = None, heartbeat: Callable[[], None] | None = None) -> Mission:
         mission = self._load(mission_id)
+        if self._owner_cancellation_requested(mission_id):
+            return self._apply_owner_cancellation(mission)
         if mission.is_terminal:
             return mission
         try:
@@ -2992,12 +3157,16 @@ class MissionRuntime:
             if heartbeat is not None:
                 heartbeat()
             mission = self.run_slice(mission_id)
+            if self._owner_cancellation_requested(mission_id):
+                return self._apply_owner_cancellation(mission)
             if mission.is_terminal:
                 return mission
             if self._remaining_seconds(deadline) <= 0:
                 return self._block_on_budget(mission, "max_execution_time_seconds", time_limit)
 
         mission = self._load(mission_id)
+        if self._owner_cancellation_requested(mission_id):
+            return self._apply_owner_cancellation(mission)
         if not mission.is_terminal and mission.iteration_count >= step_limit:
             return self._block_on_budget(mission, "max_execution_steps", step_limit)
         return mission
