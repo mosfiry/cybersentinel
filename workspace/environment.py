@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import move as shutil_move
-from subprocess import PIPE, DEVNULL, Popen
+from subprocess import Popen
 from threading import Lock, Thread
 from typing import Any, Callable, Iterable, Sequence
 import heapq
@@ -22,6 +23,8 @@ import sys
 import tempfile
 import time
 
+from .process_sandbox import SandboxAvailability, get_process_sandbox_backend
+
 MAX_SANDBOX_PROCESS_SECONDS = 300.0
 
 
@@ -35,6 +38,26 @@ class WorkspacePolicyError(PermissionError):
 
 class ProcessSandboxUnavailable(WorkspacePolicyError):
     """Raised when bounded process execution has no approved OS sandbox backend."""
+
+    def __init__(self, reason: str, *, availability: SandboxAvailability | None = None) -> None:
+        self.reason_code = (availability.reason_code if availability else None) or "backend_unavailable"
+        self.detail_code = (availability.detail_code if availability else None) or "approved_backend_unavailable"
+        self.sandbox_backend = availability.backend if availability else "unknown"
+        super().__init__(reason)
+
+
+class ProcessSandboxSetupError(ProcessSandboxUnavailable):
+    """Raised when an approved sandbox exists but cannot be safely initialized."""
+
+    def __init__(self, reason: str, *, detail_code: str, backend: str = "unknown") -> None:
+        availability = SandboxAvailability(
+            False,
+            backend,
+            "sandbox_setup_failed",
+            detail_code,
+            reason,
+        )
+        super().__init__(reason, availability=availability)
 
 
 @dataclass(frozen=True)
@@ -216,15 +239,13 @@ class Workspace:
         return self.supports_secure_public_workspace_access and os.path.isdir("/proc/self/fd")
 
     @staticmethod
+    def process_sandbox_availability() -> SandboxAvailability:
+        return get_process_sandbox_backend().availability()
+
+    @staticmethod
     def process_sandbox_unavailable_reason() -> str | None:
-        if sys.platform != "linux" or os.name != "posix" or os.geteuid() == 0:
-            return "required rootless Linux process sandbox is unavailable"
-        if not shutil.which("bwrap", path="/usr/bin:/bin"):
-            return "bubblewrap sandbox is unavailable; process dispatch denied"
-        safe_path = os.pathsep.join((str(Path(sys.prefix) / "bin"), "/usr/local/bin", "/usr/bin", "/bin"))
-        if not shutil.which("prlimit", path=safe_path):
-            return "resource-limit launcher is unavailable; process dispatch denied"
-        return None
+        availability = Workspace.process_sandbox_availability()
+        return None if availability.available else availability.reason
 
     def resolve(self, relative: str | Path = ".") -> Path:
         candidate = Path(relative)
@@ -723,100 +744,48 @@ class Workspace:
         timeout: float,
     ) -> Popen[bytes]:
         self._require_process_authority()
-        unavailable_reason = self.process_sandbox_unavailable_reason()
-        if unavailable_reason is not None:
-            raise ProcessSandboxUnavailable(unavailable_reason)
-        bwrap = shutil.which("bwrap", path="/usr/bin:/bin")
-        if not bwrap:
-            raise WorkspacePolicyError("bubblewrap sandbox is unavailable; process dispatch denied")
-        safe_path = os.pathsep.join((str(Path(sys.prefix) / "bin"), "/usr/local/bin", "/usr/bin", "/bin"))
-        prlimit = shutil.which("prlimit", path=safe_path)
-        if not prlimit:
-            raise WorkspacePolicyError("resource-limit launcher is unavailable; process dispatch denied")
+        backend = get_process_sandbox_backend()
+        context = self.execution_context
+        authorize = getattr(context, "authorize_process_dispatch", None)
+        dispatch_lock = getattr(context, "tool_dispatch_lock", None)
+        if dispatch_lock is None:
+            dispatch_lock = getattr(context, "process_dispatch_lock", None)
 
-        root_fd = self._open_dir_fd(".")
-        cwd_fd = None
-        if root_fd is None:
-            raise WorkspacePolicyError("race-resistant workspace handles are required for process isolation")
+        def before_spawn(backend_id: str) -> None:
+            if callable(authorize):
+                authorize(backend=backend_id)
+
+        def spawn() -> Popen[bytes]:
+            return backend.spawn(
+                self,
+                command,
+                cwd=cwd,
+                artifact_fd=artifact_fd,
+                timeout=timeout,
+                before_spawn=before_spawn if callable(authorize) else None,
+            )
+
+        if dispatch_lock is None:
+            return spawn()
+        with dispatch_lock:
+            return spawn()
+
+    def _notify_process_started(self, process: Popen[bytes]) -> str:
+        started_at_utc = datetime.now(timezone.utc).isoformat()
+        context = self.execution_context
+        notify = getattr(context, "notify_process_started", None)
+        if not callable(notify):
+            return started_at_utc
         try:
-            cwd_fd = self._open_dir_fd(cwd)
-            if cwd_fd is None:
-                raise WorkspacePolicyError("race-resistant working-directory handle is required")
-
-            args: list[str] = [
-                bwrap,
-                "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-                "--die-with-parent", "--new-session", "--cap-drop", "ALL",
-            ]
-            mounted_roots: list[Path] = []
-            for source in ("/usr", "/lib", "/lib64", "/bin"):
-                if Path(source).exists():
-                    args.extend(("--dir", source, "--ro-bind", source, source))
-                    mounted_roots.append(Path(source).resolve())
-
-            for prefix_value in dict.fromkeys((sys.prefix, sys.base_prefix)):
-                prefix = Path(prefix_value).resolve()
-                if prefix == Path("/") or any(prefix == root or root in prefix.parents for root in mounted_roots):
-                    continue
-                for parent in reversed(prefix.parents):
-                    if parent == Path("/") or any(parent == root or root in parent.parents for root in mounted_roots):
-                        continue
-                    args.extend(("--dir", str(parent)))
-                args.extend(("--dir", str(prefix), "--ro-bind", str(prefix), str(prefix)))
-                mounted_roots.append(prefix)
-
-            args.extend(("--dir", "/workspace", "--dir", "/workspace/project"))
-            args.extend(("--ro-bind-fd", str(root_fd), "/workspace/project"))
-            args.extend(("--dir", "/workspace/cwd", "--ro-bind-fd", str(cwd_fd), "/workspace/cwd"))
-            args.extend(("--dev", "/dev", "--proc", "/proc"))
-            args.extend(("--size", str(self.policy.max_temp_bytes), "--tmpfs", "/tmp"))
-            args.extend(("--size", str(self.policy.max_total_artifact_bytes), "--tmpfs", "/artifacts"))
-            args.extend(("--bind-fd", str(artifact_fd), "/artifacts/pytest.xml"))
-            args.extend(("--chdir", "/workspace/cwd", "--clearenv"))
-            for key, value in (
-                ("PATH", safe_path),
-                ("HOME", "/tmp"),
-                ("TMPDIR", "/tmp"),
-                ("LANG", "C.UTF-8"),
-                ("PYTHONDONTWRITEBYTECODE", "1"),
-                ("PYTHONNOUSERSITE", "1"),
-                ("PYTEST_ADDOPTS", "-p no:cacheprovider"),
-                ("CYBERSENTINEL_ARTIFACT_DIR", "/artifacts"),
-            ):
-                args.extend(("--setenv", key, value))
-
-            cpu_limit = min(
-                self.policy.max_cpu_seconds,
-                int(MAX_SANDBOX_PROCESS_SECONDS),
-                max(2, math.ceil(timeout)),
+            notify(
+                backend=get_process_sandbox_backend().backend_id,
+                process_id=process.pid if isinstance(process.pid, int) else None,
+                started_at_utc=started_at_utc,
             )
-            limit_argv = (
-                prlimit,
-                f"--cpu={cpu_limit}:{cpu_limit}",
-                f"--as={self.policy.max_memory_bytes}:{self.policy.max_memory_bytes}",
-                f"--fsize={min(self.policy.max_file_bytes, self.policy.max_total_artifact_bytes)}:{min(self.policy.max_file_bytes, self.policy.max_total_artifact_bytes)}",
-                f"--nofile={self.policy.max_open_files}:{self.policy.max_open_files}",
-                f"--nproc={self.policy.max_child_processes}:{self.policy.max_child_processes}",
-                "--core=0:0",
-                "--",
-                *command,
-            )
-            args.extend(("--", *limit_argv))
-            return Popen(
-                args,
-                stdin=DEVNULL,
-                stdout=PIPE,
-                stderr=PIPE,
-                text=False,
-                cwd="/",
-                env={"PATH": safe_path, "LANG": "C"},
-                start_new_session=True,
-                pass_fds=(root_fd, cwd_fd, artifact_fd),
-            )
-        finally:
-            if cwd_fd is not None:
-                os.close(cwd_fd)
-            os.close(root_fd)
+        except BaseException:
+            _stop_process_tree(process, grace_seconds=0.1)
+            raise
+        return started_at_utc
 
     def _capture_artifacts(self, directory: str) -> tuple[tuple["ProcessArtifact", ...], bool]:
         artifacts: list[ProcessArtifact] = []
@@ -928,6 +897,7 @@ class Workspace:
                     command, cwd=cwd, artifact_fd=artifact_fd,
                     timeout=float(effective_timeout),
                 )
+                process_started_at_utc = self._notify_process_started(process)
             finally:
                 os.close(artifact_fd)
             stdout_tail, stderr_tail = bytearray(), bytearray()
@@ -968,11 +938,17 @@ class Workspace:
                 timed_out, time.time() - started,
                 cancelled=cancelled, artifacts=artifacts,
                 artifact_capture_truncated=capture_truncated,
+                process_id=process.pid if isinstance(process.pid, int) else None,
+                process_started_at_utc=process_started_at_utc,
             )
         audit_summary = {
             "exit_code": result.exit_code,
             "timed_out": result.timed_out,
             "cancelled": result.cancelled,
+            "outcome": result.outcome,
+            "reason_code": result.reason_code,
+            "process_id": result.process_id,
+            "process_started_at_utc": result.process_started_at_utc,
             "duration_seconds": round(result.duration_seconds, 3),
             "sandbox_backend": result.sandbox_backend,
             "stdout_bytes": len(stdout.encode("utf-8", errors="replace")),
@@ -1067,6 +1043,30 @@ class ProcessResult:
     sandbox_backend: str = "bubblewrap+prlimit"
     artifacts: tuple[ProcessArtifact, ...] = ()
     artifact_capture_truncated: bool = False
+    outcome: str | None = None
+    reason_code: str | None = None
+    process_id: int | None = None
+    process_started_at_utc: str | None = None
+
+    def __post_init__(self) -> None:
+        outcome = self.outcome
+        reason_code = self.reason_code
+        if outcome is None or reason_code is None:
+            if self.timed_out:
+                outcome, reason_code = "TIMED_OUT", "process_timeout"
+            elif self.cancelled:
+                outcome, reason_code = "CANCELLED", "process_cancelled"
+            elif self.exit_code == 0:
+                outcome, reason_code = "SUCCEEDED", "process_exit_zero"
+            elif self.exit_code in {
+                -getattr(signal, "SIGXCPU", 99999),
+                -getattr(signal, "SIGXFSZ", 99998),
+            }:
+                outcome, reason_code = "RESOURCE_LIMIT_EXCEEDED", "resource_limit_signal"
+            else:
+                outcome, reason_code = "COMMAND_FAILED", "command_nonzero_exit"
+            object.__setattr__(self, "outcome", outcome)
+            object.__setattr__(self, "reason_code", reason_code)
 
     @property
     def ok(self) -> bool:
@@ -1080,6 +1080,11 @@ class ProcessResult:
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
             "cancelled": self.cancelled,
+            "outcome": self.outcome,
+            "reason_code": self.reason_code,
+            "process_started": self.process_id is not None,
+            "process_id": self.process_id,
+            "process_started_at_utc": self.process_started_at_utc,
             "duration_seconds": self.duration_seconds,
             "sandbox_backend": self.sandbox_backend,
             "artifacts": [item.to_dict() for item in self.artifacts],
@@ -1091,13 +1096,14 @@ class ProcessResult:
 class ProcessHandle:
     """Controlled asynchronous process handle with bounded output and termination."""
 
-    def __init__(self, process: Popen[bytes], command: tuple[str, ...], max_output_bytes: int, *, temporary_directory: Any = None, max_timeout_seconds: float = MAX_SANDBOX_PROCESS_SECONDS, cancellation_event: Any = None):
+    def __init__(self, process: Popen[bytes], command: tuple[str, ...], max_output_bytes: int, *, temporary_directory: Any = None, max_timeout_seconds: float = MAX_SANDBOX_PROCESS_SECONDS, cancellation_event: Any = None, process_started_at_utc: str | None = None):
         self.process = process
         self.command = command
         self.max_output_bytes = max_output_bytes
         self.max_timeout_seconds = max_timeout_seconds
         self.temporary_directory = temporary_directory
         self.cancellation_event = cancellation_event
+        self.process_started_at_utc = process_started_at_utc or datetime.now(timezone.utc).isoformat()
         self._cancelled = False
         self._cleaned = False
         self._stdout_tail, self._stderr_tail = bytearray(), bytearray()
@@ -1114,21 +1120,28 @@ class ProcessHandle:
     def monitor(self, timeout: float | None = None) -> ProcessResult:
         started = time.time()
         timed_out = False
-        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0 or timeout > self.max_timeout_seconds):
+        effective_timeout = self.max_timeout_seconds if timeout is None else timeout
+        if isinstance(effective_timeout, bool) or not isinstance(effective_timeout, (int, float)) or not math.isfinite(effective_timeout) or effective_timeout <= 0 or effective_timeout > self.max_timeout_seconds:
+            try:
+                self.terminate()
+            except Exception as exc:
+                raise WorkspacePolicyError(
+                    "invalid process monitor timeout and the active process could not be stopped"
+                ) from exc
             raise WorkspacePolicyError("process monitor timeout is outside the workspace policy limit")
-        deadline = None if timeout is None else time.monotonic() + timeout
+        deadline = time.monotonic() + effective_timeout
         while self.process.poll() is None:
             if self.cancellation_event is not None and bool(getattr(self.cancellation_event, "is_set", lambda: False)()):
                 self._cancelled = True
                 self.terminate()
                 break
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 timed_out = True
                 self.terminate()
                 break
             try:
-                self.process.wait(timeout=0.1 if remaining is None else min(0.1, remaining))
+                self.process.wait(timeout=min(0.1, remaining))
             except subprocess.TimeoutExpired:
                 continue
         _join_process_readers(self.process, self._readers)
@@ -1142,6 +1155,8 @@ class ProcessHandle:
             self.command, stdout, stderr,
             None if timed_out or self._cancelled else self.process.returncode,
             timed_out, time.time() - started, cancelled=self._cancelled,
+            process_id=self.process.pid if isinstance(self.process.pid, int) else None,
+            process_started_at_utc=self.process_started_at_utc,
         )
         self._cleanup()
         return result
@@ -1199,6 +1214,11 @@ class ProcessManager:
                     command, cwd=cwd, artifact_fd=artifact_fd,
                     timeout=self.workspace.policy.max_timeout_seconds,
                 )
+                try:
+                    process_started_at_utc = self.workspace._notify_process_started(process)
+                except BaseException:
+                    temporary_directory.cleanup()
+                    raise
             finally:
                 os.close(artifact_fd)
         finally:
@@ -1211,11 +1231,22 @@ class ProcessManager:
             temporary_directory=temporary_directory,
             max_timeout_seconds=self.workspace.policy.max_timeout_seconds,
             cancellation_event=execution_context.cancellation_event,
+            process_started_at_utc=process_started_at_utc,
         )
         with self._lock:
             self.active.add(handle)
         try:
-            self.workspace._record("process_start", path=self.workspace._logical_path(cwd), command=command, result="started")
+            self.workspace._record(
+                "process_start",
+                path=self.workspace._logical_path(cwd),
+                command=command,
+                output_value={
+                    "process_id": process.pid if isinstance(process.pid, int) else None,
+                    "process_started_at_utc": process_started_at_utc,
+                    "sandbox_backend": get_process_sandbox_backend().backend_id,
+                },
+                result="started",
+            )
         except Exception:
             handle.terminate()
             raise

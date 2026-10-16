@@ -71,6 +71,8 @@ def test_project_tests_use_finite_effective_cap_and_preserve_cancellation(
                 exit_code=0,
                 timed_out=False,
                 cancelled=False,
+                outcome="SUCCEEDED",
+                reason_code="process_exit_zero",
                 duration_seconds=0.20,
                 sandbox_backend="bubblewrap+prlimit",
                 artifact_capture_truncated=False,
@@ -78,7 +80,7 @@ def test_project_tests_use_finite_effective_cap_and_preserve_cancellation(
 
     workspace = Workspace()
     context = SimpleNamespace(
-        assert_active=lambda: None,
+        assert_active=lambda **_kwargs: None,
         mission_authorization=authorization,
         mission_id="mission-test",
         request_id="request-test",
@@ -102,6 +104,8 @@ def test_project_tests_use_finite_effective_cap_and_preserve_cancellation(
     assert result["ok"] is True
     assert result["timed_out"] is False
     assert result["cancelled"] is False
+    assert result["outcome"] == "SUCCEEDED"
+    assert result["reason_code"] == "process_exit_zero"
     assert result["returncode"] == 0
     assert "7 passed" in result["output"]
     assert result["evidence_ref"]["evidence_id"] == "evidence-test"
