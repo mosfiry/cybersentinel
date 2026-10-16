@@ -1,7 +1,6 @@
 # تصميم Windows sandbox لعمليات المهمة
 
-**الحالة:** التصميم موثق؛ backend Linux مفصول ويحافظ على القيود الحالية، وحد dispatch محمي write-ahead، وإلغاء Owner النشط دائم عبر tool/native-model saves. نُفّذ قبول على runner Windows أصلي في CI، لكن بوابات full Mission وrestart لم تنجح؛ بقي Windows backend متوقفًا fail-closed عمدًا ولا يوجد قبول Windows ناجح. سجل التشغيل: [38914831236](https://github.com/mosfiry/cybersentinel/actions/runs/38914831236).
-
+**الحالة:** مراجعة التصميم المنقحة موثقة قبل التنفيذ على HEAD `9e95fbbac83ea7edd6b6613f8956e0fd6abc0699`. Windows sandbox ما زال محجوبًا fail-closed، كما أن Linux `RLIMIT_AS` الحالي لا يثبت حدًا إجماليًا لشجرة العمليات/الأعمال المتزامنة؛ شروط التمكين والتصحيحات المطلوبة موثقة في §10. لا يُدّعى قبول Windows جديد.
 **نقطة المراجعة:** الفرع `fix/blocker-d-review-20261010`، commit `34cca3b54f316b9989994e9327be1b91e306409b`.
 
 ## 1. القرار الأمني
@@ -82,3 +81,78 @@ Windows backend في الشيفرة الحالية يعيد `backend_unavailable
 - [AppContainer isolation](https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation): عزل ملفات النظام وبيانات الاعتماد والشبكة والعمليات، مع منح وصول تفصيلي وفق capabilities.
 - [Launch an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer): إنشاء AppContainer، token وSIDs وACL، واشتراط منح القدرات اللازمة صراحةً.
 - [CreateRestrictedToken](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken): تعطيل SIDs كـdeny-only، حذف privileges، وإضافة restricting SIDs؛ لا يمثل وحده sandbox مكتملًا.
+
+
+## 10. مراجعة تصميم منقحة قبل التنفيذ — 2026-10-16
+
+**حالة هذه المراجعة:** تصميم فقط؛ لم يبدأ تعديل مصدر الإنتاج. هذا القسم أحدث من الوصف التاريخي أعلاه، ويصحح أي استنتاج قديم بأن lock داخل العملية وحده ينسّق الإلغاء، أو أن `RLIMIT_AS` يضع حدًا إجماليًا لشجرة العمليات.
+
+**الحالة المحققة للمستودع قبل التصميم:** الفرع `fix/blocker-d-review-20261010` عند `9e95fbbac83ea7edd6b6613f8956e0fd6abc0699`، والأب `f915490c28e3a0cdbd65a2a0b214b99ab167225b`. نقطة البداية `34cca3b54f316b9989994e9327be1b91e306409b` سلف للفرع. تحقق GitHub المباشر أعاد الفرع نفسه، و`main` عند `8a3fd109c0e586db13ed48a7371ac9ad06465b74`، و`v5.1.0` عند الكائن `684b344c183da1dee8dfd229c93cef0fd29396a5` (مفكوكًا إلى `26739d9b01b3b1ff492854e7e21789be20b1be0e`)، وصفحة الإصدارات تعرض `v5.1.0` كأحدث إصدار ولا تعرض `v5.2.0`.
+
+نقطتا الاستعادة المحليتان قبل التعديل:
+
+- baseline: `safety/blocker-d-pre-remediation-20261016` عند `34cca3b…`، bundle SHA-256: `d8e4ea289c8ddaf2f0193fbac10ca4435f2d9f246941a5eef67268e0ae7ab338`.
+- رأس ما قبل الإصلاح: `safety/blocker-d-pre-remediation-20261016-9e95fbb` عند `9e95fbb…`، bundle SHA-256: `5745e5815958ecea9e9d25bc0feac0418fb17c47219bdf4f78db0e16b63232e4`.
+
+### 10.1 عقد تنفيذ موحد لكل منصة
+
+يبقى العقد المشترك في `workspace/process_sandbox.py` محايدًا للمنصة، ولا تنتشر فروع `sys.platform` في أدوات المهمة. يتضمن طلب التنفيذ: argv مثبتًا ومتحققًا؛ cwd وجذر workspace مربوطين بحد Owner؛ mission/request/task/action/tool-call ومعرّفات fence؛ سياسة لا تسمح بالشبكة أو أسرار المضيف افتراضيًا؛ حدود الوقت والذاكرة الإجمالية وCPU وعدد العمليات والكتابة؛ ومرجع artifact محدودًا.
+
+يجب أن يميز العقد بين `authorization_denied`، و`backend_unavailable`، و`sandbox_setup_failed`، و`RESOURCE_LIMIT_EXCEEDED`، و`TIMED_OUT`، و`CANCELLED`، و`COMMAND_FAILED`، و`SUCCEEDED`. لا يحوّل `RESOURCE_BLOCKED` أو فشل الإعداد إلى نجاح. نتيجة بدء العملية receipt مستقل صادر من backend بعد نجاح إنشاء العملية، يحتوي على PID موجب ووقت UTC وهوية عملية/تشغيل ومراجع المهمة والنداء والـbackend/profile؛ عدم وجود receipt يعني عدم وجود دليل على بدء العملية.
+
+`DISPATCHED` في ledger هو حد write-ahead لمحاولة الأثر، وليس برهانًا على إنشاء OS process. لا ينشئ harness حدث `TOOL_CALLED` أو process evidence قبل تحقق التفويض والنطاق والإعداد وبدء العملية بالطريقة المعتمدة. إذا أثبتت واجهة النظام فشل الإنشاء قبل وجود child، يسجل no-effect؛ وإذا تعذر إثبات ذلك بعد write-ahead، تبقى الحالة `RECOVERY_REQUIRED`/ملتبسة ولا يسمح بإعادة المحاولة تلقائيًا.
+
+### 10.2 Windows: لا تفعيل دون حاجز أمني كامل وإثبات أصلي
+
+يبقى `WindowsAppContainerBackend` محجوبًا fail-closed حتى اكتمال backend حقيقي ونجاح اختبارات Windows أصلية. الاسم الحالي `windows-appcontainer-job` لا يثبت وجود Job أو AppContainer؛ التنفيذ الحالي يصرح `windows_appcontainer_backend_unimplemented` حتى على Windows. لا يُستبدل ذلك بـ`Popen` عادي أو تشغيل بصلاحيات المستخدم أو Job Object منفرد.
+
+التنفيذ المقترح عند توفر Windows runner:
+
+1. إنشاء AppContainer أو LPAC مخصص لكل profile أمني مع capabilities أقل ما يمكن. السياسة الافتراضية لا تمنح `internetClient` أو `privateNetworkClientServer` أو server capabilities. يجب أن تثبت اختبارات sockets حظر الشبكة الفعلية، لا مجرد حذف متغيرات البيئة.
+2. منح SID الخاص بالعزل قراءة/تنفيذًا للـPython runtime ومدخل workspace مصرح/منقّى فقط. يكون إدخال workspace للقراءة فقط؛ والكتابة تذهب إلى temp/artifacts معزولين. لا تُكشف ملفات المستخدم أو بيانات الاعتماد أو DB التطبيق أو مفاتيحه. إذا لم يمكن فرض ACL الفعلية أو عزل الأسرار، يرفض backend التشغيل.
+3. ينشأ Job Object لكل تشغيل قبل العملية، وتضبط حدود العملية/CPU والذاكرة/عدد الأبناء المتاحة، `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`، ومنع breakaway. يبدأ child معلقًا، ثم يربط بالـJob ويُتحقق من عضويته وهوية token والـACL والسياسات قبل Resume. فشل أي تحقق ينهي handle المعلّق المملوك لهذه المحاولة فقط ويغلقه.
+4. Job Object لإدارة lifecycle وحدود العمليات؛ لا يوفر وحده عزل ملفات أو شبكة ولا حصة كتابة موثوقة على القرص. يتطلب حد الكتابة حاوية/قرصًا مؤقتًا محدودًا فعليًا أو يظل backend غير متاح. Restricted Token تقييم إضافي لتقليل privileges/SIDs فقط، وليس بديلًا عن AppContainer/ACL أو آلية افتراضية مكافئة.
+5. الإلغاء ينهي Job المملوك لهذه المحاولة فقط، وينتظر إشارة خلوه ويتحقق من اختفاء كل أعضائه. غياب `AssignProcessToJobObject` أو capability أو ACL أو حد القرص أو تحقق الشبكة سبب رفض دقيق قبل بدء التنفيذ، بلا fallback.
+
+للقبول المثبت، يقتضي Windows CI أصليًا اختبارات نجاح تنفيذ معزول، رفض مسار خارج workspace، منع ملف حساس وشبكة غير مصرح بها، موارد، timeout/cancel وتنظيف كل descendants. اختبارات Linux أو mocks أو `sys.platform` المحاكى لا تعد إثباتًا. وثائق Microsoft المرجعية: [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)، [AppContainer isolation](https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation)، [Implementing an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer)، و[CreateRestrictedToken](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken).
+
+### 10.3 Linux: حد إجمالي مطلوب؛ لا اعتبار RLIMIT_AS حد شجرة
+
+`bubblewrap+prlimit` الحالي يفرض `RLIMIT_AS` لكل عملية ولا يحد مجموع ذاكرة الأبناء أو الأعمال المتزامنة. لا يُعرض backend Linux على أنه متاح إلا مع cgroup v2 مفوضة ومهيأة ومملوكة للخدمة: controller `memory` مفعّل، حد إجمالي `memory.max` مثبت على subtree خاص بالخدمة، child cgroup لكل تشغيل، `memory.oom.group=1`، وحد `pids.max`، وآلية `cgroup.kill` موثوقة متاحة. يجب أن يدخل launcher موثوق إلى child cgroup **قبل** `exec` لـbubblewrap/الأمر غير الموثوق؛ لا يُنقل process بعد إطلاقه ولا يكشف cgroup filesystem داخل sandbox. تُقرأ `memory.events.local` لتصنيف OOM صريحًا كـ`RESOURCE_LIMIT_EXCEEDED` دون الخلط مع timeout أو cancel أو SIGKILL خارجي. تبقى حدود `prlimit` الحالية مكملة ولا تضعف.
+
+الـsubtree الإجمالي يحد كل الأعمال المتزامنة التابعة لنفس service delegation، وليس عمليات تطبيق أخرى أو host كاملًا. لا تُنشأ أو تُنقل cgroups في hierarchy يملكها systemd/المضيف؛ إعداد `Delegate=` والـleaf/controller topology مسؤولية deployment مصرح به. عدم توافر التفويض/التحقق/الكتابة/`cgroup.kill` يؤدي إلى `backend_unavailable` أو `sandbox_setup_failed` مع صفر إطلاق. وثائق Linux الرسمية: [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) و[systemd delegation](https://systemd.io/CGROUP_DELEGATION/). الفحص الحالي أظهر أن runner لا يملك تفويضًا قابلًا للكتابة؛ لذلك لا يوجد تكامل cgroup حقيقي يمكن إثباته هنا.
+
+### 10.4 مزامنة Owner cancellation وdispatch وterminal state
+
+الـlocks والـevents داخل `tools.registry` إشارات محلية فقط ولا تصلح مصدر الحقيقة عبر worker processes. مصدر الحقيقة هو SQLite fence والحالة الدائمة:
+
+- تتسابق كتابة marker الإلغاء وCAS انتقال الأثر `RESERVED → DISPATCHED` في transaction دائمة واحدة على DB queue/effect؛ يتحقق CAS من marker وlease epoch/worker generation/fence وOwner snapshot. إذا سبق الإلغاء، لا handler ولا process يبدأ، ويغلق الحجز `FAILED/no-effect` فقط بدليل عدم dispatch. إذا سبق dispatch، لا يدعي الإلغاء no-effect؛ يعرض التنفيذ in-flight/ambiguous ويمنع retry.
+- يقتصر القفل المحلي على حدود CAS قصيرة. لا يبقى ممسوكًا حول handler طويل؛ بعد قبول marker تُرسل إشارة cancellation تعاونية ويظل أثر ما بعد dispatch غير محسوم إلى أن تثبت نتيجته.
+- لا تستخدم `MissionQueue.enqueue(CANCELLED)` كعملية cancel. تُراجع حالة Mission والـqueue terminal داخل CAS؛ إن سبق الإكمال ترجع العملية `already_completed` بلا marker دائم أو تغيير terminal state. إذا اختلفت DBs، يلزم transaction بربط SQLite تحت rollback-journal أو بروتوكول دائم متكافئ؛ لا يعتمد على قفل Python.
+- recovery يقرأ marker الدائم ويطابقه مع Mission progress/queue. لا تعاد المهمة إلى READY أو claimable مع بقاء marker، وتُرفض start/resume بعد restart بوضوح. لا تُمحى هوية Owner أو موافقة/Scope أو fence عند الاستعادة.
+
+### 10.5 MCP: deadline يشمل انتظار executor وحد الإرسال
+
+الـdeadline يبدأ قبل `submit` ويحسب وقت الانتظار في `_REMOTE_EXECUTOR`. عند timeout/cancel يُضبط token للمحاولة وتلغى Future إن كانت ما تزال queued. يتحقق worker نفسه من token والـdeadline وOwner/Mission/Scope/ExecutionFence عند حد socket send تحت dispatch guard؛ أي Future استيقظت متأخرة ترفض قبل إرسال bytes. إذا بدأ الإرسال فعلًا، النتيجة الخارجية ملتبسة ولا تحدث retry تلقائية. `notifications/cancelled` محاولة منفصلة قصيرة، ويمكنها تجاوز deadline التنفيذ فقط، لا Owner authentication أو mission identity أو scope أو fence. لا تنتظر إشعار الإلغاء داخل lock يعيق إلغاء Owner.
+
+### 10.6 أدلة القبول والخصوصية
+
+متحقق القبول يربط receipt `process_started` حقيقيًا بـMission/request/task/action/tool-call وdispatch/effect، ويفرض `process_started=true` وPID موجبًا ووقت بدء UTC والـbackend/profile المثبتين، ثم يربطه بنتيجة الأمر و`ToolExecuted` وevent/chain. حذف أو عدم تطابق أي جزء يفشل التحقق. لا يكفي HTTP 200 أو hash غير مرتبط بإيصال البدء أو صفقة ناجحة في DB وحدها للوصول إلى `GOAL_COMPLETED`.
+
+تُستبدل فحوص regex الشكلية للـIDs/الأكواد بـallowlists ثابتة أو كشف أسرار قبل الإسقاط. لا تمرر قيم token-shaped حتى لو بدت صياغتها كـID أو `reason_code`. لا تسجل نص exception الخام من API/PowerShell أو traceback غير مفلتر؛ تسجل فئة/`reason_code` ثابتًا وحقولًا آمنة وhash/length عند الحاجة. لا تلتقط كلمات مرور Owner أو tokens أو environment أو output غير ضروري. chain/hash يثبت الاتساق لا هوية مصدر خارجي؛ يجب وصفه كدليل قابل للمراجعة لا كتوقيع/attestation مستقل.
+
+### 10.7 Lifecycle القبول وإعادة الاستعادة
+
+الإطلاق الأول وإعادة الفتح في acceptance harness يستخدمان primitive واحدة تملكها عملية الاختبار: Job Object للـUI app process tree، يحتفظ بالـhandles حتى إغلاقها. يسجل launch receipt يشمل image path المثبت، PID، creation time، job identity/عضوية Job وCDP endpoint المربوط بالعملية. الإنهاء عبر Job/handle الذي أنشأه الاختبار فقط، ثم wait والتحقق من Job فارغ وprocess exited وCDP غير متاح. لا تستخدم اسم executable وحده، ولا snapshot واسع أو `taskkill` PID-only، ولا تقتل عمليات مستخدم أخرى. إذا لم يثبت launch identity، يفشل الاختبار بوضوح بلا إنهاء. يعاد تشغيل نفس executable/profile، وتستعاد Mission من checkpoint وسجلات DB الحقيقية؛ لا يُنشئ harness أي أحداث إكمال ولا يعيد أثرًا غير آمن تلقائيًا. تبقى نتيجة Mission كما سجلتها runtime فعلًا.
+
+هذا الـJob في harness مسؤول عن دورة حياة **التطبيق المثبت** فقط، ولا يثبت أن كود الاختبارات داخل Windows sandbox. لا يُخلط الإثباتان. يجب حفظ Mission ID وسلسلة الأدلة، مقارنة سلامة DB/trajectory/hash-chain قبل وبعد restart، وتسجيل حالات الإغلاق وإعادة الفتح/resume ومحاولاتها ونتائجها.
+
+### 10.8 جرد مسارات التشغيل وحدودها
+
+تصل واجهات `Workspace.run_shell`, `run_process`, `develop`, `git_readonly`, `ProcessManager.start` وأداة `run_project_tests` إلى `_sandbox_popen` والـbackend المشترك؛ يظل هذا المسار الوحيد لتنفيذ أوامر Mission. `tools.browser`/Playwright مسار منفصل بحدود المتصفح وشبكة scope، وليس منفذ shell ولا بديلًا عن sandbox workspace. `agent/local_runtime/runtime.py` يبدأ executable ثابتًا من مجلد runtime للاستدلال المحلي على loopback مع مفتاح مؤقت ومهل startup/inference؛ و`agent/local_runtime/hardware.py` يشغّل استعلامات ثابتة مثل `nvidia-smi` وPowerShell بمهلة قصيرة، وهذه خدمات/استطلاعات موثوقة وليست ToolSpecs تعطي تنفيذًا اعتباطيًا. تبقى هذه المسارات محدودة بالـargv والثابت التنفيذي والبيئة والمهلة، ولا تسجل كدليل sandbox لاختبارات المشروع؛ فشل timeout لا يخفى كنجاح.
+
+### 10.9 بوابة التنفيذ والاختبارات
+
+الترتيب: إغلاق السباقات ذات الاختبار الحتمي؛ تحديث عقد backend ونتائج الموارد/البدء؛ إصلاح إرسال MCP؛ إحكام evidence sanitizer/verifier؛ إصلاح lifecycle harness؛ ثم تشغيل Linux tests وCI Windows الأصلي. تتضمن الاختبارات: إلغاء/dispatch يتسابق عبر عمليتين؛ إلغاء بعد terminal؛ recovery مع marker؛ no-effect للـRESERVED قبل dispatch؛ handler طويل لا يحجب الإلغاء؛ Future MCP queued لا ترسل لاحقًا؛ لا receipt/dispatch دليل إن لم تبدأ العملية؛ IDs/الأكواد تحوي أسرارًا مصطنعة؛ وresume لا يعيد أثرًا سابقًا. اختبار cgroup ناجح يحتاج runner مفوضًا أصليًا؛ runner الحالي لا يثبت ذلك. اختبار Windows الأصلي يجب أن يفشل إذا حاول تشغيل الاختبار دون AppContainer/ACL/network/resource controls، ولا يُحسب mock بديلًا.
+
+لا تُفعّل Windows backend ولا تُخفض المتطلبات ولا تُنشئ tag/release. التقرير النهائي يصنف وفق الأدلة. ما لم تتوفر بيئة Windows ذات backend حقيقي واختبار Mission كامل، لا تكون النتيجة `PASS`.
