@@ -1,6 +1,6 @@
 # تصميم Windows sandbox لعمليات المهمة
 
-**الحالة:** التصميم موثق؛ backend Linux مفصول ويحافظ على القيود الحالية، وحد dispatch محمي write-ahead، وإلغاء Owner النشط دائم عبر tool/native-model saves. Windows backend متوقف fail-closed عمدًا، ولا يوجد إثبات قبول Windows أصلي.
+**الحالة:** التصميم موثق؛ backend Linux مفصول ويحافظ على القيود الحالية، وحد dispatch محمي write-ahead، وإلغاء Owner النشط دائم عبر tool/native-model saves. نُفّذ قبول على runner Windows أصلي في CI، لكن بوابات full Mission وrestart لم تنجح؛ بقي Windows backend متوقفًا fail-closed عمدًا ولا يوجد قبول Windows ناجح. سجل التشغيل: [38914831236](https://github.com/mosfiry/cybersentinel/actions/runs/38914831236).
 
 **نقطة المراجعة:** الفرع `fix/blocker-d-review-20261010`، commit `34cca3b54f316b9989994e9327be1b91e306409b`.
 
@@ -59,6 +59,8 @@
 سجل قبول آمن ومقيد الحقول يسجل: هوية GitHub Actions (repository/run/attempt/ref/commit/runner image) عند توفرها، إصدار التطبيق وبصمة SHA-256 للـexecutable المثبت والإصدار/commit المتوقع، معرف Mission/request/tool call عند توفرها، ترتيب الأحداث وsequence/timestamp وhash الحدث، `kind` و`reason_code` والبيانات الخام على شكل حقول آمنة منتقاة مع SHA-256 للحمولة الأصلية، backend/profile والسبب الدقيق للرفض أو فشل الإعداد، وإثبات بدء العملية (PID ووقت UTC) ونتيجة الأمر الفعلية، الحدود المطبقة، مراجع الأدلة وهاشاتها وسلسلتها، حالة Mission النهائية، ودورة الإغلاق وإعادة الفتح والاستعادة.
 
 لا يتضمن السجل كلمات مرور Owner أو الرموز أو environment أو النص الحر للحدث/نتيجة الاختبار؛ يسجل الحقول الآمنة فقط وهاش البيانات الأصلية كي لا تضيع قابلية المطابقة دون تسريب الحمولة. كل سجل فشل يظل فشلًا؛ لا يصنع harness أحداثًا أو أدلة لإكمال السلسلة، ولا يستنتج نجاحًا من HTTP 200 أو اختفاء نافذة.
+
+يشمل إسقاط الفشل المبكر قبل restart أيضًا timeline والأدلة وسلسلة التنفيذ كعدادات وهاشات وحقول منتقاة، بدل إرجاع حالة مختصرة فقط. ويحفظ تقرير E2E عند الاستثناء الحالة النهائية للـMission، وصحة hash-chain، و`kind`/`reason_code`/`detail_code` و`dispatch_attempted` وtool-call IDs عند توفرها؛ وتُحجب قيم `reason` والنصوص الحرة ومخرجات الأدوات.
 
 ## 7. آلية قبول التطبيق وإعادة Mission
 

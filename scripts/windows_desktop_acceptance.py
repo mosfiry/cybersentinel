@@ -31,6 +31,7 @@ from agent.evidence import verify_chain as _verify_evidence_chain
 from agent.mission import Mission as _Mission
 from agent.reporting import build_mission_report as _build_mission_report
 from agent.trajectory import EventType as _TrajectoryEventType, verify_trajectory as _verify_trajectory
+from scripts.acceptance_evidence import safe_mission_event_trace as _safe_mission_event_trace
 
 # This is only the harness's HTTP-response wait; AgentCore remains bounded by the
 # 300-second Owner mission limit, with a 30-second response-finalization margin.
@@ -199,73 +200,6 @@ def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
                 safe_item["exception_type"] = exception_type
         summary.append(safe_item)
     return summary, source
-
-
-_SAFE_EVENT_TRACE_DATA_FIELDS = frozenset({
-    "action_id", "allowed", "authorization_context_id", "budget", "cancelled",
-    "detail_code", "dispatch_attempted", "exit_code", "failure_class", "kind",
-    "mission_id", "name", "outcome", "process_id", "process_started", "reason_code",
-    "recovery", "request_id", "run_id", "sandbox_backend", "scope_snapshot_id",
-    "sequence", "status", "step_id", "target_identity", "timed_out", "tool_call_id",
-    "turn_id",
-})
-
-
-def _safe_mission_event_trace(timeline: object, *, limit: int = 2_000) -> tuple[list[dict], bool]:
-    """Keep ordered event metadata and a raw-data digest without serializing free-form payloads."""
-    if not isinstance(timeline, list):
-        return [], False
-    trace: list[dict] = []
-    for index, event in enumerate(timeline[:limit]):
-        if not isinstance(event, dict):
-            trace.append({"timeline_index": index, "sequence": index, "event": "<invalid_event>"})
-            continue
-        event_name = event.get("event")
-        data = event.get("data")
-        item: dict[str, object] = {
-            "timeline_index": index,
-            "sequence": event.get("sequence") if type(event.get("sequence")) is int else index,
-            "event": event_name if isinstance(event_name, str) and _SAFE_MACHINE_CODE.fullmatch(event_name) else "<invalid_event>",
-        }
-        for key in ("mission_id", "request_id", "step_id", "task_id"):
-            value = event.get(key)
-            if isinstance(value, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value):
-                item[key] = value
-        timestamp_value = next((
-            event.get(key) for key in ("timestamp", "created_at_utc", "created_at", "occurred_at")
-            if isinstance(event.get(key), str)
-        ), None)
-        if isinstance(timestamp_value, str) and len(timestamp_value) <= 80:
-            try:
-                parsed_timestamp = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
-                if parsed_timestamp.tzinfo is not None:
-                    item["timestamp_utc"] = parsed_timestamp.astimezone(timezone.utc).isoformat()
-            except ValueError:
-                pass
-        for hash_key in ("event_hash", "previous_hash"):
-            value = event.get(hash_key)
-            if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value):
-                item[hash_key] = value.lower()
-        if isinstance(data, dict):
-            safe_data: dict[str, object] = {}
-            for key in _SAFE_EVENT_TRACE_DATA_FIELDS:
-                value = data.get(key)
-                if isinstance(value, str) and _SAFE_MACHINE_CODE.fullmatch(value):
-                    safe_data[key] = value
-                elif type(value) is bool:
-                    safe_data[key] = value
-                elif type(value) is int and -1_000_000_000 <= value <= 2_147_483_647:
-                    safe_data[key] = value
-            item["data"] = safe_data
-            item["raw_data_available"] = True
-            item["raw_data_sha256"] = _canonical_sha256(data)
-        elif data is not None:
-            item["raw_data_available"] = True
-            item["raw_data_sha256"] = _canonical_sha256(data)
-        else:
-            item["raw_data_available"] = False
-        trace.append(item)
-    return trace, len(timeline) > limit
 
 
 def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
@@ -3553,6 +3487,69 @@ def _read_profile_evidence_chain(profile_root: Path) -> list[dict] | None:
     return records if status == "VALID" else None
 
 
+def _safe_early_restart_audit_projection(snapshot: object) -> dict:
+    """Retain hashes and allowlisted audit fields when restart fails before Mission completion."""
+    if not isinstance(snapshot, dict):
+        return {}
+    status = snapshot.get("status") if isinstance(snapshot.get("status"), dict) else {}
+    timeline = snapshot.get("timeline") if isinstance(snapshot.get("timeline"), list) else []
+    evidence = snapshot.get("evidence") if isinstance(snapshot.get("evidence"), list) else []
+    report = snapshot.get("report") if isinstance(snapshot.get("report"), dict) else {}
+    report_evidence = report.get("evidence") if isinstance(report.get("evidence"), dict) else {}
+    chain = report_evidence.get("execution_chain") if isinstance(report_evidence.get("execution_chain"), list) else []
+    full_chain = snapshot.get("full_execution_chain")
+    full_chain = full_chain if isinstance(full_chain, list) else []
+    trace, trace_truncated = _safe_mission_event_trace(timeline)
+    tool_calls, tool_results_source = _safe_tool_result_summary(status)
+    mission_id = status.get("mission_id")
+    request_id = status.get("request_id")
+    try:
+        mission_integrity_verified = _mission_record_integrity_verified(status)
+    except Exception:
+        mission_integrity_verified = False
+    try:
+        timeline_integrity_verified = (
+            _trajectory_timeline_integrity(timeline, mission_id, request_id)
+            if isinstance(mission_id, str) and isinstance(request_id, str) else False
+        )
+    except Exception:
+        timeline_integrity_verified = False
+    chain_integrity = report_evidence.get("execution_chain_integrity")
+    if chain_integrity not in _REPORT_CHAIN_STATUSES:
+        chain_integrity = None
+    storage_status = snapshot.get("full_execution_chain_status")
+    if storage_status not in _REPORT_CHAIN_STATUSES:
+        storage_status = None
+    report_summary = report.get("mission_summary") if isinstance(report.get("mission_summary"), dict) else {}
+    report_outcome = report_summary.get("outcome")
+    if report_outcome not in _REPORT_OUTCOMES:
+        report_outcome = None
+    safe_request_id = next((item.get("request_id") for item in trace if item.get("request_id")), None)
+    return {
+        "request_id": safe_request_id,
+        "mission_record_integrity_verified": mission_integrity_verified,
+        "timeline_integrity_verified": timeline_integrity_verified,
+        "timeline_event_count": len(timeline),
+        "timeline_event_types": [item.get("event") for item in trace],
+        "timeline_event_trace": trace,
+        "timeline_event_trace_truncated": trace_truncated,
+        "timeline_sha256": _canonical_sha256(timeline),
+        "evidence_item_count": len(evidence),
+        "evidence_sha256": _canonical_sha256(evidence),
+        "execution_chain_count": len(chain),
+        "execution_chain_sha256": _canonical_sha256(chain),
+        "execution_chain_integrity": chain_integrity,
+        "execution_chain_storage_count": len(full_chain),
+        "execution_chain_storage_sha256": _canonical_sha256(full_chain),
+        "execution_chain_storage_status": storage_status,
+        "report_outcome": report_outcome,
+        "resource_failure_diagnostics": _safe_failure_diagnostics(status),
+        "resource_checkpoint_diagnostics": _safe_checkpoint_diagnostics(status),
+        "tool_calls": tool_calls,
+        "tool_results_source": tool_results_source,
+    }
+
+
 def _installed_app_mission(
     page, profile_root: Path, progress: list[dict], restart_callback, report: dict
 ) -> tuple[dict, object]:
@@ -3725,6 +3722,7 @@ def _installed_app_mission(
                 "resume_attempted": False,
                 "incomplete_operation_reported_truthfully": True,
             }
+            failed_result.update(_safe_early_restart_audit_projection(before_restart_snapshot))
             report["installed_app_mission"] = failed_result
             return failed_result, page_after_restart
         page = page_after_restart

@@ -35,6 +35,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.acceptance_result import apply_cleanup_gate
+from scripts.acceptance_evidence import safe_acceptance_error, safe_mission_failure_snapshot
 
 DEFAULT_RUNTIME_DIR = Path("/workspace/cybersentinel-acceptance-runtime/extracted/llama-b11146")
 DEFAULT_MODEL_PATH = Path(
@@ -373,6 +374,7 @@ def main() -> int:
     browser_module = None
     previous_browser_service = None
     original_ssl_cert_file = os.environ.get("SSL_CERT_FILE")
+    mission = None
     failure_phase = "initialization"
     try:
         # Set isolated persistence before importing modules with DB globals.
@@ -1544,7 +1546,26 @@ def main() -> int:
     except Exception as exc:
         result["failure_phase"] = failure_phase
         result["error_type"] = type(exc).__name__
-        result["error"] = str(exc)[:1000]
+        result["error"] = safe_acceptance_error(exc)
+        if mission is not None:
+            try:
+                failure_snapshot = safe_mission_failure_snapshot(mission)
+                result["mission"].update(failure_snapshot)
+                result["mission"]["failure_snapshot_captured"] = bool(failure_snapshot)
+                result["checks"]["failure_audit_snapshot_captured"] = bool(failure_snapshot)
+                result["evidence"].update({
+                    key: failure_snapshot[key]
+                    for key in (
+                        "trajectory_event_count", "trajectory_sha256", "trajectory_integrity_verified",
+                        "trajectory_event_trace", "trajectory_event_trace_truncated", "evidence_item_count",
+                        "evidence_sha256", "failure_diagnostics", "checkpoint_diagnostics",
+                        "tool_result_diagnostics", "tool_results_source",
+                    )
+                    if key in failure_snapshot
+                })
+            except Exception as evidence_exc:
+                result["mission"]["failure_snapshot_captured"] = False
+                result["mission"]["failure_snapshot_error_type"] = type(evidence_exc).__name__
         try:
             (run_dir / "failure-traceback.txt").write_text(traceback.format_exc(), encoding="utf-8")
             result["failure_traceback"] = str(run_dir / "failure-traceback.txt")

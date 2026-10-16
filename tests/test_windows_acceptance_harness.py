@@ -19,6 +19,7 @@ from scripts.run_full_e2e_gate_acceptance import (
     _safe_action_names,
     find_llama_server_binary,
 )
+from scripts.acceptance_evidence import safe_acceptance_error, safe_mission_failure_snapshot
 import scripts.windows_desktop_acceptance as windows_acceptance
 from scripts.windows_desktop_acceptance import (
     EXPECTED_QWEN3_4B_INSTALL_IDENTITY,
@@ -48,6 +49,7 @@ from scripts.windows_desktop_acceptance import (
     _require_qwen_install_consent,
     _refresh_qwen_model_snapshot,
     _safe_checkpoint_diagnostics,
+    _safe_early_restart_audit_projection,
     _safe_failure_diagnostics,
     _safe_mission_event_trace,
     _safe_tool_result_summary,
@@ -1105,6 +1107,126 @@ def test_mission_event_trace_preserves_order_codes_and_hash_but_redacts_free_tex
     }]
     assert "private diagnostic text" not in repr(trace)
     assert "raw-secret-token" not in repr(trace)
+
+
+def test_safe_mission_failure_snapshot_preserves_block_reason_and_redacts_free_text() -> None:
+    plan = Plan.initial("safe failure fixture").replan(
+        steps=(PlanStep("step-1", "run_project_tests", action="run_project_tests"),),
+        reason="fixture",
+    )
+    mission = Mission.create(
+        "PRIVATE_OWNER_REQUEST", "PRIVATE_OBJECTIVE", plan,
+        mission_id="42mission", request_id="42request", owner_identity_ref="owner:fixture",
+    )
+    failure = {
+        "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+        "reason_code": "backend_unavailable",
+        "detail_code": "windows_appcontainer_backend_unimplemented",
+        "dispatch_attempted": False,
+        "blocked_tool_call_ids": ["call-42"],
+        "reason": "PRIVATE_DIAGNOSTIC_TEXT",
+        "token": "PRIVATE_TOKEN_VALUE",
+    }
+    mission.transition(
+        MissionStatus.RESOURCE_BLOCKED,
+        "PRIVATE_TRANSITION_TEXT",
+        reason_code="backend_unavailable",
+        dispatch_attempted=False,
+    )
+    mission.failures.append(failure)
+    mission.checkpoint = {
+        "status": "not_dispatched",
+        "reason_code": "backend_unavailable",
+        "blocked_tool_call_ids": ["call-42"],
+        "token": "PRIVATE_CHECKPOINT_TOKEN",
+    }
+    mission.progress["tool_results"] = [{
+        "name": "run_project_tests",
+        "tool_call_id": "call-42",
+        "ok": False,
+        "error": "process_sandbox_unavailable",
+        "output": "PRIVATE_RAW_TOOL_OUTPUT",
+    }]
+    mission.emit(EventType.FAILURE_DETECTED, data=failure)
+
+    snapshot = safe_mission_failure_snapshot(mission)
+
+    assert snapshot["status_final"] == "RESOURCE_BLOCKED"
+    assert snapshot["trajectory_integrity_verified"] is True
+    assert snapshot["failure_diagnostics"][-1]["detail_code"] == "windows_appcontainer_backend_unimplemented"
+    assert snapshot["failure_diagnostics"][-1]["dispatch_attempted"] is False
+    assert snapshot["checkpoint_diagnostics"]["status"] == "not_dispatched"
+    assert snapshot["tool_result_diagnostics"][0]["error_code"] == "process_sandbox_unavailable"
+    failure_event = next(item for item in snapshot["trajectory_event_trace"] if item["event"] == "FailureDetected")
+    assert failure_event["mission_id"] == "42mission"
+    assert failure_event["request_id"] == "42request"
+    assert failure_event["data"]["blocked_tool_call_ids"] == ["call-42"]
+    assert "PRIVATE_" not in repr(snapshot)
+
+
+def test_safe_acceptance_error_keeps_machine_codes_and_redacts_arbitrary_text() -> None:
+    assert safe_acceptance_error(
+        RuntimeError("integrated_mission_did_not_reach_goal_completed:RESOURCE_BLOCKED")
+    ) == "integrated_mission_did_not_reach_goal_completed:RESOURCE_BLOCKED"
+    assert safe_acceptance_error(RuntimeError("private token=do-not-export")) == "failure_details_omitted_for_secret_safety"
+
+
+def test_early_restart_failure_projection_keeps_safe_timeline_and_chain_digests() -> None:
+    timeline = [{
+        "sequence": 1,
+        "timestamp": "2026-10-16T14:00:00Z",
+        "event": "FailureDetected",
+        "mission_id": "42mission",
+        "request_id": "42request",
+        "data": {
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "backend_unavailable",
+            "detail_code": "windows_appcontainer_backend_unimplemented",
+            "dispatch_attempted": False,
+            "blocked_tool_call_ids": ["call-42"],
+            "reason": "PRIVATE_TIMELINE_REASON",
+        },
+    }]
+    failure = {
+        "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+        "reason_code": "backend_unavailable",
+        "detail_code": "windows_appcontainer_backend_unimplemented",
+        "dispatch_attempted": False,
+        "reason": "PRIVATE_FAILURE_REASON",
+    }
+    snapshot = {
+        "status": {
+            "mission_id": "42mission",
+            "request_id": "42request",
+            "status": "RESOURCE_BLOCKED",
+            "queue": {"state": "paused"},
+            "trajectory": timeline,
+            "failures": [failure],
+            "checkpoint": {"status": "not_dispatched", "reason_code": "backend_unavailable"},
+            "plan": {"steps": []},
+            "progress": {"tool_results": []},
+        },
+        "timeline": timeline,
+        "evidence": [{"evidence_id": "evidence-1", "private": "PRIVATE_EVIDENCE_TEXT"}],
+        "report": {"mission_summary": {"outcome": "NOT_VERIFIED"}, "evidence": {
+            "execution_chain": [], "execution_chain_integrity": "NOT_PRESENT",
+        }},
+        "effects": [],
+        "full_execution_chain": [],
+        "full_execution_chain_status": "NOT_PRESENT",
+    }
+
+    projection = _safe_early_restart_audit_projection(snapshot)
+
+    assert projection["request_id"] == "42request"
+    assert projection["timeline_event_count"] == 1
+    assert projection["timeline_event_types"] == ["FailureDetected"]
+    assert projection["timeline_event_trace"][0]["data"]["detail_code"] == "windows_appcontainer_backend_unimplemented"
+    assert projection["timeline_event_trace"][0]["data"]["dispatch_attempted"] is False
+    assert projection["evidence_item_count"] == 1
+    assert len(projection["evidence_sha256"]) == 64
+    assert projection["execution_chain_integrity"] == "NOT_PRESENT"
+    assert "PRIVATE_" not in repr(projection)
 
 
 def test_split_tool_results_are_merged_and_identical_cross_source_mirrors_count_once() -> None:
