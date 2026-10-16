@@ -183,6 +183,7 @@ def test_handle_once_uses_authenticated_owner_session_before_policy_denial(monke
             "authenticate_owner",
             lambda *args, **kwargs: SimpleNamespace(
                 authenticated_at="2026-10-17T00:00:00Z",
+                session_id="session-1",
                 to_dict=lambda: {"method": "owner_session_challenge"},
             ),
         )
