@@ -246,6 +246,7 @@ def test_cancel_during_final_model_call_wins_over_stale_completion(isolated_dbs,
     assert cancelled.cancel_requested is True
     assert cancelled.result is None
     assert TaskManager.get_task(task.task_id).status == TaskStatus.CANCELLED
+    assert not any(message["role"] == "assistant" for message in core_db.conversation_messages(task.conversation_id))
     assert provider.calls == 1
 
 
