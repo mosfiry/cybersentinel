@@ -153,6 +153,94 @@ def test_handle_once_denies_request_when_owner_session_challenge_fails(monkeypat
     ]
 
 
+def test_handle_once_uses_authenticated_owner_session_before_policy_denial(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "begin_lifecycle",
+        lambda request_id, source: SimpleNamespace(status="created", claimed=True),
+    )
+    if hasattr(engine, "consume_owner_challenge"):
+        monkeypatch.setattr(
+            engine,
+            "consume_owner_challenge",
+            lambda *args, **kwargs: {
+                "owner_authenticated": True,
+                "owner_session_id": "session-1",
+            },
+        )
+        monkeypatch.setattr(
+            engine,
+            "authentication_from_session",
+            lambda *args, **kwargs: SimpleNamespace(
+                authenticated_at="2026-10-17T00:00:00Z",
+                to_dict=lambda: {"method": "owner_session_challenge"},
+            ),
+        )
+        invocation = {"owner_session_id": "session-1", "owner_challenge": "challenge-1"}
+    else:
+        monkeypatch.setattr(
+            engine,
+            "authenticate_owner",
+            lambda *args, **kwargs: SimpleNamespace(
+                authenticated_at="2026-10-17T00:00:00Z",
+                to_dict=lambda: {"method": "owner_session_challenge"},
+            ),
+        )
+        invocation = {"owner_session_token": "session-token"}
+    monkeypatch.setattr(
+        engine,
+        "capture_policy_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(
+            owner_policy_fingerprint="policy-fp",
+            owner_instruction="",
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "evaluate",
+        lambda _request: SimpleNamespace(allowed=False, reason="session policy denied"),
+    )
+    planned = []
+    monkeypatch.setattr(
+        engine.RUNTIME,
+        "plan",
+        lambda *args, **kwargs: planned.append((args, kwargs)),
+    )
+    events = []
+    completions = []
+    monkeypatch.setattr(
+        engine,
+        "add_event",
+        lambda *args, **kwargs: events.append((args, kwargs)) or len(events),
+    )
+    monkeypatch.setattr(
+        engine,
+        "complete_lifecycle",
+        lambda *args, **kwargs: completions.append((args, kwargs)),
+    )
+
+    result = engine._handle_once("status", source="test", request_id="session-policy-denied", **invocation)
+
+    assert result == {
+        "ok": False,
+        "decision": "deny",
+        "request_id": "session-policy-denied",
+        "answer": "session policy denied",
+        "plan": [],
+        "results": [],
+        "lifecycle": "completed",
+    }
+    assert events[0][0][0:3] == (
+        "auth",
+        "Owner authentication",
+        "owner-session-challenge",
+    )
+    assert planned == []
+    assert completions == [
+        (("session-policy-denied", result), {"success": False, "error": "session policy denied"})
+    ]
+
+
 def test_handle_once_denies_request_when_policy_rejects_authenticated_owner(monkeypatch):
     monkeypatch.setattr(
         engine,
