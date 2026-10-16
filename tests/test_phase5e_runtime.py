@@ -208,6 +208,47 @@ def test_cancel_during_long_tool_finishes_boundary_without_resume_replay(isolate
     assert provider.calls == 1
 
 
+def test_cancel_during_final_model_call_wins_over_stale_completion(isolated_dbs, monkeypatch):
+    import threading
+
+    class BlockingProvider(ScriptedProvider):
+        def __init__(self):
+            super().__init__([ProviderResponse(text="must not commit", finish_reason="stop")])
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def generate(self, messages, temperature=0, **kwargs):
+            self.calls += 1
+            self.started.set()
+            assert self.release.wait(3)
+            return self.responses.pop(0)
+
+        def tool_calling(self, messages, tools, temperature=0, **kwargs):
+            return self.generate(messages, temperature=temperature, **kwargs)
+
+    provider = BlockingProvider()
+    allow_owner_sessions(monkeypatch, "owner")
+    runtime = runtime_for(provider, monkeypatch)
+    task = runtime.create_task("conv-cancel-final-model", "cancel final model")
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault("task", runtime.run_slice(task.task_id, owner_session_token="owner")))
+    worker.start()
+    assert provider.started.wait(2)
+
+    persisted = TaskManager.get_task(task.task_id)
+    persisted.request_cancel()
+    TaskManager.update_task(persisted)
+    provider.release.set()
+    worker.join(3)
+
+    cancelled = outcome["task"]
+    assert cancelled.status == TaskStatus.CANCELLED
+    assert cancelled.cancel_requested is True
+    assert cancelled.result is None
+    assert TaskManager.get_task(task.task_id).status == TaskStatus.CANCELLED
+    assert provider.calls == 1
+
+
 def test_native_and_json_fallback_share_task_runtime(isolated_dbs, monkeypatch):
     class Legacy:
         name = "legacy"

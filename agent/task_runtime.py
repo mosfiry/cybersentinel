@@ -283,7 +283,10 @@ class AgentTaskRuntime:
             task.provider = response.get("provider", task.provider)
             task.model = response.get("model", task.model)
             kind, value = self._parse(response)
-            if kind == "final":
+            if self._cancel_requested(task):
+                task.update_status(TaskStatus.CANCELLED)
+                self._event(task, "task.cancelled")
+            elif kind == "final":
                 task.result = {"answer": value, "provenance": {"provider": task.provider, "model": task.model}, "context_hash": context.context_hash}
                 add_conversation_message(task.conversation_id, "assistant", value, {"task_id": task.task_id, "step": task.current_step})
                 ConversationMemory.store_conversation_memory(task.conversation_id, value, MemoryType.RECENT, source="assistant", provenance=f"task:{task.task_id}")
