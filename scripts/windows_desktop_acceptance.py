@@ -65,7 +65,16 @@ def _sha256(value: bytes | str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 _SAFE_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
+_SAFE_MACHINE_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]{0,127}\Z")
 
 
 def _safe_failure_reason_code(value: object) -> str | None:
@@ -166,15 +175,97 @@ def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
             safe_item["error_code"] = error_code
         result = item.get("result")
         if isinstance(result, dict):
-            for key in ("failure_class", "reason_code", "code", "kind"):
+            for key in (
+                "failure_class", "reason_code", "code", "kind", "outcome", "sandbox_backend",
+            ):
                 value = result.get(key)
-                if isinstance(value, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value):
+                if isinstance(value, str) and _SAFE_MACHINE_CODE.fullmatch(value):
                     safe_item[key] = value
+            if type(result.get("process_started")) is bool:
+                safe_item["process_started"] = result["process_started"]
+            process_id = result.get("process_id")
+            if type(process_id) is int and 0 < process_id <= 2_147_483_647:
+                safe_item["process_id"] = process_id
+            started_at = result.get("process_started_at_utc")
+            if isinstance(started_at, str) and len(started_at) <= 64:
+                try:
+                    parsed_started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                    if parsed_started_at.tzinfo is not None:
+                        safe_item["process_started_at_utc"] = parsed_started_at.astimezone(timezone.utc).isoformat()
+                except ValueError:
+                    pass
             exception_type = result.get("exception")
             if isinstance(exception_type, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(exception_type):
                 safe_item["exception_type"] = exception_type
         summary.append(safe_item)
     return summary, source
+
+
+_SAFE_EVENT_TRACE_DATA_FIELDS = frozenset({
+    "action_id", "allowed", "authorization_context_id", "budget", "cancelled",
+    "detail_code", "dispatch_attempted", "exit_code", "failure_class", "kind",
+    "mission_id", "name", "outcome", "process_id", "process_started", "reason_code",
+    "recovery", "request_id", "run_id", "sandbox_backend", "scope_snapshot_id",
+    "sequence", "status", "step_id", "target_identity", "timed_out", "tool_call_id",
+    "turn_id",
+})
+
+
+def _safe_mission_event_trace(timeline: object, *, limit: int = 2_000) -> tuple[list[dict], bool]:
+    """Keep ordered event metadata and a raw-data digest without serializing free-form payloads."""
+    if not isinstance(timeline, list):
+        return [], False
+    trace: list[dict] = []
+    for index, event in enumerate(timeline[:limit]):
+        if not isinstance(event, dict):
+            trace.append({"timeline_index": index, "sequence": index, "event": "<invalid_event>"})
+            continue
+        event_name = event.get("event")
+        data = event.get("data")
+        item: dict[str, object] = {
+            "timeline_index": index,
+            "sequence": event.get("sequence") if type(event.get("sequence")) is int else index,
+            "event": event_name if isinstance(event_name, str) and _SAFE_MACHINE_CODE.fullmatch(event_name) else "<invalid_event>",
+        }
+        for key in ("mission_id", "request_id", "step_id", "task_id"):
+            value = event.get(key)
+            if isinstance(value, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value):
+                item[key] = value
+        timestamp_value = next((
+            event.get(key) for key in ("timestamp", "created_at_utc", "created_at", "occurred_at")
+            if isinstance(event.get(key), str)
+        ), None)
+        if isinstance(timestamp_value, str) and len(timestamp_value) <= 80:
+            try:
+                parsed_timestamp = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
+                if parsed_timestamp.tzinfo is not None:
+                    item["timestamp_utc"] = parsed_timestamp.astimezone(timezone.utc).isoformat()
+            except ValueError:
+                pass
+        for hash_key in ("event_hash", "previous_hash"):
+            value = event.get(hash_key)
+            if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                item[hash_key] = value.lower()
+        if isinstance(data, dict):
+            safe_data: dict[str, object] = {}
+            for key in _SAFE_EVENT_TRACE_DATA_FIELDS:
+                value = data.get(key)
+                if isinstance(value, str) and _SAFE_MACHINE_CODE.fullmatch(value):
+                    safe_data[key] = value
+                elif type(value) is bool:
+                    safe_data[key] = value
+                elif type(value) is int and -1_000_000_000 <= value <= 2_147_483_647:
+                    safe_data[key] = value
+            item["data"] = safe_data
+            item["raw_data_available"] = True
+            item["raw_data_sha256"] = _canonical_sha256(data)
+        elif data is not None:
+            item["raw_data_available"] = True
+            item["raw_data_sha256"] = _canonical_sha256(data)
+        else:
+            item["raw_data_available"] = False
+        trace.append(item)
+    return trace, len(timeline) > limit
 
 
 def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
@@ -3863,6 +3954,7 @@ def _installed_app_mission(
     )
     test_tool_pass = project_test_execution_proof.get("exactly_one_actual_execution_verified") is True
     event_types = [str(item.get("event", "")) for item in timeline if isinstance(item, dict)]
+    timeline_event_trace, timeline_event_trace_truncated = _safe_mission_event_trace(timeline)
     research_stage = any(name in event_types for name in ("ObservationReceived", "ObservationInterpreted"))
     hypothesis_stage = "HypothesisUpdated" in event_types
     evidence_stage = (
@@ -4009,6 +4101,8 @@ def _installed_app_mission(
         "report_stage": report_stage,
         "timeline_event_count": len(timeline),
         "timeline_event_types": event_types,
+        "timeline_event_trace": timeline_event_trace,
+        "timeline_event_trace_truncated": timeline_event_trace_truncated,
         "evidence_item_count": len(evidence),
         "evidence_records_bound_to_mission": after_projection.get("evidence_records_bound_to_mission"),
         "validation_record_bound_to_mission": after_projection.get("validation_record_bound_to_mission"),
@@ -4134,6 +4228,16 @@ def main() -> int:
     if args.mode == "full" and (args.installed_executable is None or not args.application_pid):
         parser.error("--mode full requires --installed-executable and --application-pid for real process restart coverage")
     started = time.monotonic()
+    installed_executable_sha256 = None
+    if args.installed_executable is not None:
+        try:
+            if args.installed_executable.is_file():
+                installed_executable_sha256 = _file_sha256(args.installed_executable)
+        except OSError:
+            installed_executable_sha256 = None
+    source_commit = os.environ.get("GITHUB_SHA") or None
+    if source_commit is not None and not re.fullmatch(r"[0-9a-fA-F]{40,64}", source_commit):
+        source_commit = None
 
     report: dict[str, object] = {
         "schema": "cybersentinel-windows-installed-desktop-acceptance-v2",
@@ -4141,7 +4245,23 @@ def main() -> int:
         "mode": args.mode,
         "qwen3_4b_test_download_authorized": args.authorize_qwen3_4b_test_download,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "run_identity": {
+            "provider": "github-actions" if os.environ.get("GITHUB_ACTIONS", "").lower() == "true" else "local",
+            "repository": os.environ.get("GITHUB_REPOSITORY"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "ref": os.environ.get("GITHUB_REF"),
+            "source_commit": source_commit,
+            "runner_os": os.environ.get("RUNNER_OS"),
+            "image_os": os.environ.get("ImageOS"),
+            "image_version": os.environ.get("ImageVersion"),
+        },
         "expected_version": args.expected_version,
+        "application_fingerprint": {
+            "expected_version": args.expected_version,
+            "installed_executable_sha256": installed_executable_sha256,
+            "source_commit": source_commit,
+        },
         "version_endpoint": {},
         "cdp_port": args.cdp_port,
         "installed_executable": str(args.installed_executable) if args.installed_executable else None,
@@ -4167,6 +4287,10 @@ def main() -> int:
     inference_response_fields: list[str] = []
     stage = "initialize_acceptance"
     try:
+        if args.mode == "full" and installed_executable_sha256 is None:
+            raise RuntimeError("installed_executable_fingerprint_unavailable")
+        if args.mode == "full" and source_commit is None:
+            raise RuntimeError("source_commit_identity_unavailable")
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
         with sync_playwright() as playwright:
@@ -4214,6 +4338,10 @@ def main() -> int:
                     and reported_version == args.expected_version
                 ),
             }
+            fingerprint = report["application_fingerprint"]
+            if isinstance(fingerprint, dict):
+                fingerprint["reported_version"] = reported_version
+                fingerprint["sha256"] = _canonical_sha256(fingerprint)
             if report["version_endpoint"]["matches_expected_version"] is not True:
                 raise RuntimeError("installed_desktop_version_endpoint_mismatch")
             page.wait_for_selector("#firstRunOverlay", state="attached", timeout=90_000)

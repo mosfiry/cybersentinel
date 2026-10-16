@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -48,6 +49,7 @@ from scripts.windows_desktop_acceptance import (
     _refresh_qwen_model_snapshot,
     _safe_checkpoint_diagnostics,
     _safe_failure_diagnostics,
+    _safe_mission_event_trace,
     _safe_tool_result_summary,
     _tool_execution_projection,
     _tools_within_authorized_allowlist,
@@ -55,6 +57,87 @@ from scripts.windows_desktop_acceptance import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_simulated_github_full_acceptance_binds_installed_executable_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "CyberSentinel.exe"
+    executable.write_bytes(b"simulated-installed-executable")
+    report_path = tmp_path / "acceptance.json"
+    source_commit = "2ef29b7de9eb43a7880223d0d256699eac2d4945"
+
+    class FakePlaywright:
+        chromium = SimpleNamespace(
+            connect_over_cdp=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated CI: no installed application/CDP endpoint")
+            )
+        )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    playwright_package = ModuleType("playwright")
+    playwright_package.__path__ = []
+    playwright_sync_api = ModuleType("playwright.sync_api")
+    playwright_sync_api.TimeoutError = TimeoutError
+    playwright_sync_api.sync_playwright = FakePlaywright
+    monkeypatch.setitem(sys.modules, "playwright", playwright_package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", playwright_sync_api)
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mosfiry/cybersentinel")
+    monkeypatch.setenv("GITHUB_RUN_ID", "987654321")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/fix/blocker-d-review-20261010")
+    monkeypatch.setenv("GITHUB_SHA", source_commit)
+    monkeypatch.setenv("RUNNER_OS", "Windows")
+    monkeypatch.setenv("ImageOS", "windows-2022")
+    monkeypatch.setenv("ImageVersion", "simulated-image")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "windows_desktop_acceptance.py",
+            "--cdp-port",
+            "9222",
+            "--expected-version",
+            "5.1.0",
+            "--profile-root",
+            str(tmp_path / "profile"),
+            "--installed-executable",
+            str(executable),
+            "--application-pid",
+            "12345",
+            "--mode",
+            "full",
+            "--output",
+            str(report_path),
+        ],
+    )
+
+    assert windows_acceptance.main() == 2
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "FAIL"  # Deliberate: no real installed app/CDP in this simulation.
+    assert report["run_identity"] == {
+        "provider": "github-actions",
+        "repository": "mosfiry/cybersentinel",
+        "run_id": "987654321",
+        "run_attempt": "2",
+        "ref": "refs/heads/fix/blocker-d-review-20261010",
+        "source_commit": source_commit,
+        "runner_os": "Windows",
+        "image_os": "windows-2022",
+        "image_version": "simulated-image",
+    }
+    assert report["application_fingerprint"]["installed_executable_sha256"] == hashlib.sha256(
+        executable.read_bytes()
+    ).hexdigest()
+    assert report["application_fingerprint"]["source_commit"] == source_commit
 
 
 def _linked_project_test_snapshot(*, include_unrelated_prior: bool = False) -> tuple[str, dict]:
@@ -941,6 +1024,87 @@ def test_tool_result_summary_falls_back_to_top_level_results() -> None:
 
     assert source == "top_level"
     assert summary == [{"name": "run_project_tests", "ok": True}]
+
+
+def test_tool_result_summary_keeps_sandbox_start_and_outcome_metadata() -> None:
+    summary, source = _safe_tool_result_summary({
+        "progress": {"model_loop": {"tool_results": [{
+            "name": "run_project_tests",
+            "tool_call_id": "call_42",
+            "ok": False,
+            "result": {
+                "outcome": "CANCELLED",
+                "reason_code": "process_cancelled",
+                "sandbox_backend": "bubblewrap+prlimit",
+                "process_started": True,
+                "process_id": 4242,
+                "process_started_at_utc": "2026-10-16T14:00:00+00:00",
+                "output": "untrusted output is not included",
+            },
+        }]}}
+    })
+
+    assert source == "model_loop"
+    assert summary == [{
+        "name": "run_project_tests",
+        "ok": False,
+        "tool_call_id": "call_42",
+        "outcome": "CANCELLED",
+        "reason_code": "process_cancelled",
+        "sandbox_backend": "bubblewrap+prlimit",
+        "process_started": True,
+        "process_id": 4242,
+        "process_started_at_utc": "2026-10-16T14:00:00+00:00",
+    }]
+    assert "untrusted output" not in repr(summary)
+
+
+def test_mission_event_trace_preserves_order_codes_and_hash_but_redacts_free_text() -> None:
+    trace, truncated = _safe_mission_event_trace([{
+        "sequence": 8,
+        "timestamp": "2026-10-16T13:00:00+01:00",
+        "event": "FailureDetected",
+        "mission_id": "mission-1",
+        "request_id": "request-1",
+        "data": {
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "backend_unavailable",
+            "detail_code": "windows_appcontainer_backend_unimplemented",
+            "dispatch_attempted": False,
+            "process_started": False,
+            "reason": "private diagnostic text",
+            "token": "raw-secret-token",
+        },
+    }])
+
+    assert truncated is False
+    assert trace == [{
+        "timeline_index": 0,
+        "sequence": 8,
+        "event": "FailureDetected",
+        "mission_id": "mission-1",
+        "request_id": "request-1",
+        "timestamp_utc": "2026-10-16T12:00:00+00:00",
+        "data": {
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "backend_unavailable",
+            "detail_code": "windows_appcontainer_backend_unimplemented",
+            "dispatch_attempted": False,
+            "process_started": False,
+        },
+        "raw_data_available": True,
+        "raw_data_sha256": _canonical_sha256({
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "backend_unavailable",
+            "detail_code": "windows_appcontainer_backend_unimplemented",
+            "dispatch_attempted": False,
+            "process_started": False,
+            "reason": "private diagnostic text",
+            "token": "raw-secret-token",
+        }),
+    }]
+    assert "private diagnostic text" not in repr(trace)
+    assert "raw-secret-token" not in repr(trace)
 
 
 def test_split_tool_results_are_merged_and_identical_cross_source_mirrors_count_once() -> None:
@@ -2864,24 +3028,21 @@ def test_acceptance_restart_fails_closed_without_launch_bound_tree_termination()
     assert "taskkill.exe\", \"/PID\", str(process_id), \"/T\", \"/F\"" not in driver
     assert "--installed-executable" in powershell
     assert "--application-pid" in powershell
+    assert "installed_executable_fingerprint_unavailable" in driver
+    assert "source_commit_identity_unavailable" in driver
     assert "process_tree_termination_verified" in driver
     assert "initial_application_process_not_running_from_installed_path" in driver
     assert "--mode full requires --installed-executable and --application-pid" in driver
     assert '"renderer_reload_used": False' in driver
     assert "page.reload(" not in driver
-    assert "Stop-InstalledProcessTrees" in powershell
-    assert "remaining_process_ids" in powershell
-    cleanup_call = powershell.index("$installedProcessCleanup = Stop-InstalledProcessTrees")
-    post_cleanup_check = powershell.index(
-        "$restartProcessStillRunning = $installedProcessCleanup.query_failed -eq $true",
-        cleanup_call,
-    )
-    cleanup_gate = powershell.index(
-        "$report.cleanup.restarted_application_process_stopped = -not $restartProcessStillRunning",
-        cleanup_call,
-    )
-    assert cleanup_call < post_cleanup_check < cleanup_gate
-    assert "$installedProcessCleanup.remaining_process_ids" in powershell[post_cleanup_check:cleanup_gate]
+    assert "Inspect-ApplicationProcess" in powershell
+    assert "taskkill.exe" not in powershell
+    assert "Get-CimInstance" not in powershell
+    assert "Stop-InstalledProcessTrees" not in powershell
+    assert '$report.cleanup.taskkill_attempted = $false' in powershell
+    assert '$report.cleanup.process_tree_termination_verified = $false' in powershell
+    assert '"launch_bound_job_unavailable"' in powershell
+    assert '"NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"' in powershell
 
 
 def test_checkpoint_diagnostics_expose_only_safe_budget_metadata() -> None:

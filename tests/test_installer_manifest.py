@@ -40,6 +40,40 @@ def test_installer_manifest_binds_digest_and_source_commit(tmp_path: Path, monke
     assert (tmp_path / f"{installer.name}.sha256").read_text(encoding="ascii") == f"{digest}  {installer.name}\n"
 
 
+def test_installer_manifest_records_simulated_github_run_identity(tmp_path: Path, monkeypatch) -> None:
+    installer = tmp_path / f"CyberSentinel-Setup-{REPOSITORY_VERSION}.exe"
+    installer.write_bytes(b"fixture-nsis-installer")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "write_installer_manifest.py",
+            str(tmp_path),
+            "--version",
+            REPOSITORY_VERSION,
+            "--source-commit",
+            "2ef29b7de9eb43a7880223d0d256699eac2d4945",
+        ],
+    )
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mosfiry/cybersentinel")
+    monkeypatch.setenv("GITHUB_RUN_ID", "987654321")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    monkeypatch.setenv("GITHUB_WORKFLOW", "Windows Acceptance")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/fix/blocker-d-review-20261010")
+
+    assert main() == 0
+
+    manifest = json.loads((tmp_path / "installer-manifest.json").read_text(encoding="utf-8"))
+    workflow = manifest["workflow"]
+    assert workflow["run_id"] == "987654321"
+    assert workflow["run_attempt"] == "2"
+    assert workflow["repository"] == "mosfiry/cybersentinel"
+    assert workflow["name"] == "Windows Acceptance"
+    assert workflow["ref"] == "refs/heads/fix/blocker-d-review-20261010"
+    assert workflow["run_url"] == "https://github.com/mosfiry/cybersentinel/actions/runs/987654321"
+
+
 def test_installer_manifest_records_separate_windows_acceptance_gates(tmp_path: Path, monkeypatch) -> None:
     installer = tmp_path / f"CyberSentinel-Setup-{REPOSITORY_VERSION}.exe"
     installer.write_bytes(b"fixture-nsis-installer")

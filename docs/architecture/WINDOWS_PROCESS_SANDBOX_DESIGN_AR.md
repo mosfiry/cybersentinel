@@ -1,6 +1,6 @@
 # تصميم Windows sandbox لعمليات المهمة
 
-**الحالة:** تصميم ومراجعة مخاطر قبل التنفيذ — لا يمثل اعتمادًا لـWindows backend ولا إثبات قبول Windows.
+**الحالة:** التصميم موثق؛ backend Linux مفصول ويحافظ على القيود الحالية، وحد dispatch محمي write-ahead، وإلغاء Owner النشط دائم عبر tool/native-model saves. Windows backend متوقف fail-closed عمدًا، ولا يوجد إثبات قبول Windows أصلي.
 
 **نقطة المراجعة:** الفرع `fix/blocker-d-review-20261010`، commit `34cca3b54f316b9989994e9327be1b91e306409b`.
 
@@ -21,7 +21,7 @@
 ### عمليات المنتج والقبول غير المصنفة كأداة تنفيذ
 
 - `agent/local_runtime/runtime.py` يشغّل `llama-server` المحلي، و`agent/local_runtime/hardware.py` يشغّل أدوات استطلاع عتاد محددة. هذه خدمات/استطلاعات موثوقة نسبيًا وليست تصريحًا بتنفيذ محتوى المشروع. يلزم حصر executable والوسائط والبيئة والمهلة وهوية العملية عند إدارتها؛ ولا تُسجل على أنها عمليات sandbox لاختبارات المشروع.
-- scripts وعمليات القبول وعمليات worker هي أدوات تشغيل/اختبار وليست ToolSpecs متاحة للمهمة. لكنها تخضع لحدود آمنة خاصة بها. تحديدًا، لا يجوز أن ينهي harness تطبيقًا باستهداف اسم العملية أو مسحًا واسعًا أو `taskkill /PID /T` غير مربوط بإطلاق القبول.
+- scripts وعمليات القبول وعمليات worker هي أدوات تشغيل/اختبار وليست ToolSpecs متاحة للمهمة. لا يملك harness الحالي Job Object مرتبطًا بعملية الإطلاق؛ لذلك PowerShell الآن يلاحظ فقط حالة الـProcess handle التي أنشأها الاختبار، ولا ينفذ `taskkill` أو مسحًا واسعًا أو حذفًا لملفات التثبيت/profile، ويصرح بأن إنهاء الشجرة غير متحقق. يرفض Python acceptance harness إعادة التشغيل الكامل بدل استنتاجه من PID أو اختفاء النافذة.
 
 ## 3. عقد sandbox المشترك
 
@@ -29,13 +29,15 @@
 
 - **طلب التنفيذ** محدود ومثبت: argv ثابت، مسار عمل داخل جذر Owner المصرح به، هوية Mission/request/tool-call، ExecutionContext وفنس التنفيذ، بيئة قليلة ومحددة، سياسة شبكة، حدود زمن/موارد، ومسارات artifacts المسموح بها.
 - **واجهة backend** تتضمن فحص قدرات المنصة قبل dispatch، تهيئة العزل، تشغيلًا بإيصال بدء صادر من backend، مراقبة الحالة والإلغاء، ثم إغلاقًا يؤكد انتهاء كل العمليات التابعة. لا يقبل العقد تشغيلًا افتراضيًا بصلاحيات المضيف عند غياب backend.
-- **بيانات النتيجة** تفصل بين حالة بدء العملية والنتيجة النهائية؛ وتحتوي هوية backend وإصداره، سببًا آليًا آمنًا، exit code عند وجوده، timeout/cancellation/resource-limit flags، وهاشات/مراجع artifacts. لا تحفظ الأسرار أو environment أو command output الخام غير الضروري.
-- **الأسباب المميزة التي يجب أن تبقى قابلة للتدقيق:** `authorization_denied`، `backend_unavailable`، `sandbox_setup_failed`، `resource_limit_exceeded`، `timed_out`، `cancelled`، `command_failed`، `succeeded`. يظل `RESOURCE_BLOCKED` حالة Mission كما هي ولا يختزل هذه الأسباب إلى نجاح أو إلى سبب مشترك. `dispatch_attempted=false` وغياب إيصال بدء العملية شرط عند الرفض أو غياب/فشل تهيئة العزل.
-- لا ينشر النظام حدث بدء تنفيذ أو يسجل dispatch قبل اجتياز التفويض والسياسة وتهيئة backend وبدء العملية وفق primitive المعتمد. أحداث الاقتراح/فحص التفويض تبقى متميزة عن أحداث بدء العملية ونتيجتها.
+- يحدد `ToolSpec.dispatch_boundary` حد الإلغاء لكل أثر: `workspace_process_start` لـ`run_project_tests`، و`scope_pinned_http_send` لطلبات MCP المقيدة، و`handler` للأدوات المحلية. تُسلسل كتابات الحالة المحلية مع marker الإلغاء حتى لا يُقبل marker بين كتابة الأثر وتسجيل نتيجته؛ وتبقى الأداة النشطة مسجلة حتى تنتهي فعليًا بعد timeout.
+- **بيانات النتيجة** تفصل بين حالة بدء العملية والنتيجة النهائية؛ و`ProcessResult` يسجل outcome وreason code صريحين (`SUCCEEDED`, `COMMAND_FAILED`, `TIMED_OUT`, `CANCELLED`, `RESOURCE_LIMIT_EXCEEDED`) مع `process_started`, PID ووقت UTC لبدء العملية عندما تتوفر. لا يصنف إشارات الإيقاف الملتبسة مثل `SIGKILL` تلقائيًا كحد موارد؛ في Linux تُعرف إشارة حد الموارد فقط عندما تكون الإشارة نفسها صريحة مثل `SIGXCPU`/`SIGXFSZ`. لا تحفظ الأسرار أو environment أو command output الخام غير الضروري.
+- **الأسباب المميزة القابلة للتدقيق:** رفض التفويض، `backend_unavailable`، `sandbox_setup_failed`، `resource_limit_signal`، `process_timeout`، `process_cancelled`، `command_nonzero_exit`، `process_exit_zero`. يظل `RESOURCE_BLOCKED` حالة Mission كما هي ولا يختزل هذه الأسباب إلى نجاح أو إلى سبب مشترك. الرفض أو غياب backend أو فشل الإعداد قبل حد الإطلاق يسجل `dispatch_attempted=false` مع غياب إيصال البدء؛ أما فشل `Popen` بعد write-ahead فيسجل `sandbox_setup_failed` مع نتيجة بدء غير مؤكدة و`RECOVERY_REQUIRED`، وليس رفضًا قبل dispatch.
+- لأداة process المعزولة فقط، يمر `TOOL_CALLED` بعد عودة primitive التشغيل بعملية فعلية، مع `process_started=true` ومعرف backend/PID. يثبت Registry الـeffect dispatch write-ahead بعد التفويض وتجهيز backend مباشرة قبل `Popen`؛ إذا فشل callback لا يُنشأ child. فشل التهيئة قبل callback يسجل no-effect/`RESOURCE_BLOCKED` ولا ينتج حدث بدء أو دليل نتيجة؛ أما فشل `Popen` أو تسجيل start بعد تثبيت dispatch فيبقى ملتبسًا ويُحال إلى recovery بدل إعادة المحاولة.
+- إلغاء Owner النشط يُسجل في `mission_queue` منفصلًا عن نسخة Mission حتى لا يبطل worker fence، ويُكتب عند حد الإلغاء المحمي قبل الإشارة للأدوات النشطة. إذا كان handler محليًا يكتب حالة، يكتمل الأثر الجاري أولًا تحت الحد نفسه، ثم يثبت marker؛ وأي dispatch جديد بعده يُرفض. طلبات MCP المحددة النطاق تعيد فحص سياق التنفيذ داخل النقل تحت القفل مباشرة قبل كتابة الطلب على socket: إذا سبق marker الإرسال يُمنع الطلب، وإذا سبقه الإرسال فالأثر البعيد يبقى ملتبسًا؛ `notifications/cancelled` أفضل جهد وليست دليلًا على عكس أثر الخادم. يطبق Runtime الإلغاء تحت الـfence الحالي عند العودة من provider/tool وعند كل حفظ، فلا يُكمل native-model Mission بعد قبول marker؛ يبقى `RECOVERY_REQUIRED` كما هو عند أثر ملتبس، ويمنع marker إعادة claim/re-enqueue تلقائيًا.
 
 ## 4. ملف Linux الذي يجب الحفاظ عليه
 
-المسار المثبت حاليًا في `Workspace._sandbox_popen` يستخدم rootless Bubblewrap و`prlimit`: namespaces للمستخدم والشبكة وPID وIPC وUTS، صلاحيات capabilities مسقطة، بيئة نظيفة، workspace للقراءة فقط، مجلدات tmpfs محدودة، ملف تقرير مربوطًا منفردًا، حدود وقت/CPU/ذاكرة/ملفات/عمليات، ومراقبة إلغاء. يجب نقل هذا التنفيذ إلى backend Linux دون تغيير السلوك أو تخفيف الضوابط، وإبقاء الاختبارات القائمة ناجحة. لا يجعل هذا الوصف ادعاءً بأن Linux profile يحمي من كل ثغرات النواة أو أن مجلد workspace نفسه خالٍ من أسرار وضعها المستخدم.
+المسار في `Workspace._sandbox_popen` يفوض الآن إلى `workspace/process_sandbox.py`؛ backend `bubblewrap+prlimit` يستخدم rootless Bubblewrap و`prlimit`: namespaces للمستخدم والشبكة وPID وIPC وUTS، صلاحيات capabilities مسقطة، بيئة نظيفة، workspace للقراءة فقط، مجلدات tmpfs محدودة، ملف تقرير مربوطًا منفردًا، حدود وقت/CPU/ذاكرة/ملفات/عمليات، ومراقبة إلغاء. لا يُتاح إلا حيث rootless Linux وbwrap/prlimit متوفرة. لا يجعل هذا الوصف ادعاءً بأن Linux profile يحمي من كل ثغرات النواة أو أن مجلد workspace نفسه خالٍ من أسرار وضعها المستخدم.
 
 ## 5. متطلبات backend Windows المقترح
 
@@ -54,15 +56,15 @@
 
 ## 6. التسجيل والأدلة
 
-سجل قبول آمن ومقيد الحقول يسجل: معرف التشغيل وإصدار التطبيق وبصمته، معرف Mission/request/tool call عند توفرها، sequence/timestamp للأحداث، `kind` و`reason_code` وبيانات خام منقحة/محددة الحقول، backend/profile والسبب الدقيق للرفض أو فشل الإعداد، إثبات بدء العملية وهوية launch/job ونتيجة الأمر الفعلية، الحدود المطبقة، مراجع الأدلة وهاشاتها وسلسلتها، حالة Mission النهائية، ودورة الإغلاق وإعادة الفتح والاستعادة.
+سجل قبول آمن ومقيد الحقول يسجل: هوية GitHub Actions (repository/run/attempt/ref/commit/runner image) عند توفرها، إصدار التطبيق وبصمة SHA-256 للـexecutable المثبت والإصدار/commit المتوقع، معرف Mission/request/tool call عند توفرها، ترتيب الأحداث وsequence/timestamp وhash الحدث، `kind` و`reason_code` والبيانات الخام على شكل حقول آمنة منتقاة مع SHA-256 للحمولة الأصلية، backend/profile والسبب الدقيق للرفض أو فشل الإعداد، وإثبات بدء العملية (PID ووقت UTC) ونتيجة الأمر الفعلية، الحدود المطبقة، مراجع الأدلة وهاشاتها وسلسلتها، حالة Mission النهائية، ودورة الإغلاق وإعادة الفتح والاستعادة.
 
-لا يتضمن السجل كلمات مرور Owner أو الرموز أو environment أو نصًا حرًا غير منقح. كل سجل فشل يظل فشلًا؛ لا يصنع harness أحداثًا أو أدلة لإكمال السلسلة، ولا يستنتج نجاحًا من HTTP 200 أو اختفاء نافذة.
+لا يتضمن السجل كلمات مرور Owner أو الرموز أو environment أو النص الحر للحدث/نتيجة الاختبار؛ يسجل الحقول الآمنة فقط وهاش البيانات الأصلية كي لا تضيع قابلية المطابقة دون تسريب الحمولة. كل سجل فشل يظل فشلًا؛ لا يصنع harness أحداثًا أو أدلة لإكمال السلسلة، ولا يستنتج نجاحًا من HTTP 200 أو اختفاء نافذة.
 
 ## 7. آلية قبول التطبيق وإعادة Mission
 
 يجب أن يكون launch الأصلي للتطبيق المثبت والإطلاق بعد restart عبر آلية واحدة موثقة تحتفظ بهوية العملية الحية وJob Object حتى نهاية دورة القبول. يُتحقق من executable path ووقت إنشاء العملية وPID ومقابلة process handle وعضوية Job؛ ويكون الإنهاء عبر handle/Job الذي أنشأه harness لا عبر إعادة حل PID من `taskkill`.
 
-بعد الإنهاء، ينتظر harness إشارة Job الفارغ، يتحقق من زوال عملية التطبيق واتصال CDP، ثم يعيد تشغيل نفس executable المثبت ونفس ملف profile المؤقت. يجري فحص Owner من جديد، ويعيد قراءة سجل Mission وسلسلة الأدلة وقاعدة البيانات؛ ولا يرسل resume إلا بعد إثبات حفظ حالة pause، وصحة Owner/runtime، وثبات سجل التنفيذ وعدم وجود إجراء سابق ملتبس. لا يُعاد تنفيذ أداة سابقة غير آمنة تلقائيًا. إن تعذر إثبات هوية/شجرة العملية، يفشل الاختبار بوضوح دون إنهاء واسع.
+بعد الإنهاء، يجب أن ينتظر harness إشارة Job الفارغ، ويتحقق من زوال عملية التطبيق واتصال CDP، ثم يعيد تشغيل نفس executable المثبت ونفس ملف profile المؤقت. حاليًا لا ينفذ Python harness هذا المسار: `_terminate_installed_process_tree` يرفض الإنهاء لأن CLI يستلم PID ولا يملك launch-bound Job Object. PowerShell لا ينفذ إنهاءً احتياطيًا ولا يمسح العمليات أو يحذف ملفات قيد الاستخدام؛ يسجل `taskkill_attempted=false` و`process_tree_termination_verified=false`. لذلك تبقى دورة الإغلاق/إعادة الفتح/استئناف Mission غير مثبتة حتى تنفيذ primitive مملوك للإطلاق واختباره على Windows أصلي.
 
 ## 8. خطة الاختبارات ومعيار التمكين
 
@@ -70,7 +72,7 @@
 
 اختبارات Linux المستقلة تحافظ على Bubblewrap/prlimit كما هو. اختبارات Windows مستقلة يجب أن تكون على Windows أصلي وتشغل عمليات فعلية داخل backend الحقيقي؛ الم mocks واختبارات Linux لا تثبت سلوك Windows. اختبار القبول يثبت التثبيت/Owner/الاستدلال المحلي، إنشاء Mission، الأداة المعزولة ونتيجتها، الأدلة و`GOAL_COMPLETED` فقط بعد التحقق، إغلاق Job وإعادة فتح التطبيق، استعادة Mission، سلامة قاعدة البيانات والصلاحيات.
 
-لا يُفعّل Windows backend ولا يُمنح `PASS` إلا بعد اجتياز الاختبارات الأصلية كاملة على Windows. إذا لم تكن البيئة أو سياسة النظام أو حصة القرص متاحة، تبقى الحالة `BLOCKED`/`PARTIALLY VERIFIED` وفق الأدلة، مع `dispatch_attempted=false` عند عدم البدء.
+Windows backend في الشيفرة الحالية يعيد `backend_unavailable/windows_appcontainer_backend_unimplemented` حتى على Windows؛ لا يوجد AppContainer/Job Object/قيود ACL وحصة قرص منفذة. لا يُفعّل backend ولا يُمنح `PASS` إلا بعد اجتياز الاختبارات الأصلية كاملة على Windows. الاختبار الأصلي المستقبلي الذي يثبت backend غير المنفذ يثبت فقط الحجب fail-closed، لا قبول المهمة. تبقى المهمة `BLOCKED`/`PARTIALLY VERIFIED` وفق الأدلة؛ عند الرفض قبل حد الإطلاق يكون `dispatch_attempted=false`، أما فشل البدء الملتبس بعد write-ahead فيتطلب recovery ولا يوصف كأنه لم يُحاول.
 
 ## 9. مراجع Microsoft
 

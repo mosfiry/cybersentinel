@@ -62,64 +62,20 @@ function Save-Report {
     $Value | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding utf8
 }
 
-function Stop-ApplicationTree {
+function Inspect-ApplicationProcess {
     param([System.Diagnostics.Process]$Process)
-    if ($null -eq $Process) { return $true }
+    if ($null -eq $Process) {
+        return [ordered]@{ alive = $false; exited = $true; query_failed = $false }
+    }
     try {
         $Process.Refresh()
-        if (-not $Process.HasExited) {
-            & taskkill.exe /PID $Process.Id /T /F | Out-Null
-            Start-Sleep -Seconds 2
-        }
-        $Process.Refresh()
-        return $Process.HasExited
-    }
-    catch { return $false }
-}
-
-function Get-InstalledProcessIds {
-    param([string]$Directory)
-    try {
-        $prefix = [IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
-        $processIds = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
-            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
-            ForEach-Object { [int]$_.ProcessId })
-        return ,$processIds
-    }
-    catch { return $null }
-}
-
-function Stop-InstalledProcessTrees {
-    param([string]$Directory, [int[]]$SeedProcessIds)
-    $initial = Get-InstalledProcessIds -Directory $Directory
-    if ($null -eq $initial) {
-        return [ordered]@{ verified = $false; process_ids_found = @(); remaining_process_ids = @(); query_failed = $true }
-    }
-    $targets = @()
-    foreach ($processId in (@($SeedProcessIds) + @($initial))) {
-        if ($processId -gt 0 -and $targets -notcontains $processId) { $targets += $processId }
-    }
-    foreach ($processId in $targets) {
-        & taskkill.exe /PID $processId /T /F 2>$null | Out-Null
-    }
-    $remaining = $initial
-    for ($attempt = 0; $attempt -lt 4 -and $remaining.Count -gt 0; $attempt++) {
-        Start-Sleep -Seconds 2
-        $remaining = Get-InstalledProcessIds -Directory $Directory
-        if ($null -eq $remaining) { break }
-        foreach ($processId in $remaining) {
-            & taskkill.exe /PID $processId /T /F 2>$null | Out-Null
+        return [ordered]@{
+            alive = (-not $Process.HasExited)
+            exited = $Process.HasExited
+            query_failed = $false
         }
     }
-    if ($null -eq $remaining) {
-        return [ordered]@{ verified = $false; process_ids_found = @($targets); remaining_process_ids = @(); query_failed = $true }
-    }
-    return [ordered]@{
-        verified = ($remaining.Count -eq 0)
-        process_ids_found = @($targets)
-        remaining_process_ids = @($remaining)
-        query_failed = $false
-    }
+    catch { return [ordered]@{ alive = $null; exited = $null; query_failed = $true } }
 }
 
 function Get-NormalizedWindowsProductVersion {
@@ -139,6 +95,9 @@ try {
     }
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
         throw "Installer file not found."
+    }
+    if (Test-Path -LiteralPath $installDirectory) {
+        throw "Acceptance install directory already exists; refusing cleanup without a launch-bound process Job."
     }
     New-Item -ItemType Directory -Force -Path $EvidenceDirectory, $InstallRoot, $profileRoot | Out-Null
     $installerItem = Get-Item -LiteralPath $InstallerPath
@@ -226,11 +185,6 @@ try {
         product_version_matches_expected = $productVersionMatches
     }
     if ($installerExitCode -ne 0 -or -not $installed -or -not $productVersionMatches) { throw "Silent installation or normalized ProductVersion/FileVersion consistency check failed." }
-
-    Get-CimInstance Win32_Process -Filter "Name = 'CyberSentinel.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installDirectory, [StringComparison]::OrdinalIgnoreCase) } |
-        ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F | Out-Null }
-    Start-Sleep -Seconds 2
 
     $tcpListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $tcpListener.Start()
@@ -405,54 +359,31 @@ finally {
     $env:LOCALAPPDATA = $originalLocalAppData
     $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
     $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = $originalAcceptanceDiagnostics
-    $initialProcessStopped = Stop-ApplicationTree -Process $applicationProcess
+    $initialProcessObservation = Inspect-ApplicationProcess -Process $applicationProcess
     $restartProcessId = 0
     if ($report.installed_desktop_ui.application_restart.current_process_id) {
         $restartProcessId = [int]$report.installed_desktop_ui.application_restart.current_process_id
     }
-    $seedProcessIds = @()
-    if ($applicationProcess) { $seedProcessIds += [int]$applicationProcess.Id }
-    if ($restartProcessId -gt 0) { $seedProcessIds += $restartProcessId }
-    $installedProcessCleanup = Stop-InstalledProcessTrees -Directory $installDirectory -SeedProcessIds $seedProcessIds
-    $restartProcessStillRunning = $false
-    if ($restartProcessId -gt 0) {
-        $restartProcessStillRunning = $installedProcessCleanup.query_failed -eq $true
-        if (-not $restartProcessStillRunning) {
-            $restartProcessStillRunning = @($installedProcessCleanup.remaining_process_ids) -contains $restartProcessId
-        }
-    }
-    $report.cleanup.initial_application_process_stopped = $initialProcessStopped
-    $report.cleanup.restarted_application_process_stopped = -not $restartProcessStillRunning
-    $report.cleanup.installed_path_processes_stopped = $installedProcessCleanup.verified
-    $report.cleanup.installed_path_process_ids = $installedProcessCleanup.process_ids_found
-    $report.cleanup.remaining_installed_process_ids = $installedProcessCleanup.remaining_process_ids
-    $report.cleanup.application_process_tree_stopped = (
-        $initialProcessStopped -and -not $restartProcessStillRunning -and
-        $installedProcessCleanup.verified -and $installedProcessCleanup.query_failed -ne $true
-    )
-    if ($report.installation.installed_executable_exists -and (Test-Path -LiteralPath $installDirectory)) {
-        try {
-            Remove-Item -LiteralPath $installDirectory -Recurse -Force
-            $report.cleanup.install_directory_removed = -not (Test-Path -LiteralPath $installDirectory)
-        }
-        catch { $report.cleanup.install_directory_removed = $false; $report.cleanup.install_directory_cleanup_error = $_.Exception.GetType().Name }
-    }
-    if (Test-Path -LiteralPath $profileRoot) {
-        try {
-            Remove-Item -LiteralPath $profileRoot -Recurse -Force
-            $report.cleanup.disposable_profile_removed = -not (Test-Path -LiteralPath $profileRoot)
-        }
-        catch { $report.cleanup.disposable_profile_removed = $false; $report.cleanup.disposable_profile_cleanup_error = $_.Exception.GetType().Name }
-    }
-    if ($Mode -eq "full" -and $e2eState -and (Test-Path -LiteralPath $e2eState)) {
-        try {
-            Remove-Item -LiteralPath $e2eState -Recurse -Force
-            $report.cleanup.full_e2e_state_removed = -not (Test-Path -LiteralPath $e2eState)
-        }
-        catch { $report.cleanup.full_e2e_state_removed = $false; $report.cleanup.full_e2e_state_cleanup_error = $_.Exception.GetType().Name }
-    }
-    elseif ($Mode -ne "full" -or -not $e2eState) {
-        $report.cleanup.full_e2e_state_removed = $true
+    $report.cleanup.initial_application_process_stopped = $initialProcessObservation.exited
+    $report.cleanup.initial_application_process_alive = $initialProcessObservation.alive
+    $report.cleanup.initial_application_process_query_failed = $initialProcessObservation.query_failed
+    $report.cleanup.restarted_application_process_stopped = if ($restartProcessId -gt 0) { $false } else { $null }
+    $report.cleanup.taskkill_attempted = $false
+    $report.cleanup.process_termination_attempted = $false
+    $report.cleanup.process_tree_termination_verified = $false
+    $report.cleanup.process_tree_termination_reason = "launch_bound_job_unavailable"
+    $report.cleanup.application_process_tree_stopped = $false
+    $report.cleanup.installed_path_processes_stopped = $false
+    $report.cleanup.installed_path_process_inspection = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
+    $report.cleanup.installed_path_process_ids = $null
+    $report.cleanup.remaining_installed_process_ids = $null
+    $report.cleanup.install_directory_removed = $false
+    $report.cleanup.install_directory_cleanup_status = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
+    $report.cleanup.disposable_profile_removed = $false
+    $report.cleanup.disposable_profile_cleanup_status = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
+    $report.cleanup.full_e2e_state_removed = ($null -eq $e2eState)
+    if ($null -ne $e2eState) {
+        $report.cleanup.full_e2e_state_cleanup_status = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
     }
     if ($report.status -eq "PASS" -and
         ($report.cleanup.application_process_tree_stopped -ne $true -or
