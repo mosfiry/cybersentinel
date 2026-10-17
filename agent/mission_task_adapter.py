@@ -41,6 +41,10 @@ class MissionTaskAdapter:
         task = TaskManager.get_task(task_id)
         if task is None:
             raise KeyError("unknown_task")
+        if task.cancel_requested:
+            from security.owner_policy import authenticate_owner
+            authenticate_owner(owner_session_token, task.request_id)
+            return task
         mission_id = str(task.execution_state.get("mission_id", ""))
         if not mission_id:
             raise ValueError("task is not bound to canonical mission")

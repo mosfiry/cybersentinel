@@ -14,6 +14,7 @@ from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 from agent.task_manager import TaskManager
 from agent.task_runtime import AgentTaskRuntime
 from agent.task import TaskStatus
+from agent.mission_task_adapter import MissionTaskAdapter
 from agent.model_router import ModelRouter
 
 
@@ -248,6 +249,33 @@ def test_cancel_during_final_model_call_wins_over_stale_completion(isolated_dbs,
     assert TaskManager.get_task(task.task_id).status == TaskStatus.CANCELLED
     assert not any(message["role"] == "assistant" for message in core_db.conversation_messages(task.conversation_id))
     assert provider.calls == 1
+
+
+def test_cancelled_compatibility_task_cannot_be_resumed(isolated_dbs, monkeypatch):
+    allow_owner_sessions(monkeypatch, "owner")
+    task = TaskManager.create_task("conv-cancelled-adapter", "request", "owner", "cancelled task")
+    task.execution_state = {"mission_id": "mission-cancelled"}
+    task.request_cancel()
+    task.update_status(TaskStatus.CANCELLED)
+    TaskManager.update_task(task)
+
+    class Core:
+        def __init__(self):
+            self.calls = 0
+
+        def resume_mission(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("cancelled task must not resume its canonical mission")
+
+    core = Core()
+    adapter = MissionTaskAdapter(router=None, core=core)
+    with pytest.raises(PermissionError):
+        adapter.resume_task(task.task_id, owner_session_token="wrong-owner")
+    resumed = adapter.resume_task(task.task_id, owner_session_token="owner")
+
+    assert resumed.status is TaskStatus.CANCELLED
+    assert resumed.cancel_requested is True
+    assert core.calls == 0
 
 
 def test_native_and_json_fallback_share_task_runtime(isolated_dbs, monkeypatch):
