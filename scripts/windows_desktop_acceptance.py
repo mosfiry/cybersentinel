@@ -217,23 +217,7 @@ def _durable_tool_result_records(mission_state: dict) -> tuple[list, str]:
 
     nested_results = result_lists.get("model_loop", [])
     top_level_results = result_lists.get("top_level", [])
-    raw_results = list(nested_results)
-    consumed_nested_mirrors: set[int] = set()
-    for item in top_level_results:
-        mirrored_index = None
-        call_id = item.get("tool_call_id") if isinstance(item, dict) else None
-        if isinstance(call_id, str) and call_id:
-            mirrored_index = next((
-                index for index, nested_item in enumerate(nested_results)
-                if index not in consumed_nested_mirrors
-                and isinstance(nested_item, dict)
-                and nested_item.get("tool_call_id") == call_id
-                and nested_item == item
-            ), None)
-        if mirrored_index is not None:
-            consumed_nested_mirrors.add(mirrored_index)
-            continue
-        raw_results.append(item)
+    raw_results = [*nested_results, *top_level_results]
 
     raw_results.extend(None for _ in invalid_sources)
     populated_sources = [
@@ -3075,7 +3059,59 @@ _PROCESS_SANDBOX_PREFLIGHT_KINDS = frozenset(_PROCESS_SANDBOX_PREFLIGHT_REASON_K
 _PROCESS_SANDBOX_PREFLIGHT_REASONS = frozenset(_PROCESS_SANDBOX_PREFLIGHT_REASON_KINDS)
 
 
-def _mission_restart_authority_projection(status: object, mission_id: str) -> dict | None:
+def _mission_active_owner_session_binding_is_valid(
+    owner_identity_ref: object,
+    request_id: object,
+    authorization: object,
+    context: object,
+) -> bool:
+    if (
+        not isinstance(owner_identity_ref, str)
+        or not isinstance(request_id, str)
+        or not isinstance(authorization, dict)
+        or not isinstance(context, dict)
+    ):
+        return False
+    session_id = context.get("session_id")
+    owner_evidence = context.get("owner_evidence")
+    if (
+        not isinstance(session_id, str) or not session_id
+        or not isinstance(owner_evidence, dict)
+        or owner_evidence.get("request_id") != request_id
+        or owner_evidence.get("session_id") != session_id
+        or not isinstance(owner_evidence.get("proof_fingerprint"), str)
+        or not owner_evidence.get("proof_fingerprint")
+        or context.get("owner_evidence_fingerprint") != _canonical_sha256(owner_evidence)
+    ):
+        return False
+    try:
+        from security.owner_password import resolve_session
+        from security.owner_policy import OwnerAuthenticationEvidence
+
+        evidence = OwnerAuthenticationEvidence(**owner_evidence)
+        if not evidence.is_valid_for_active_session(request_id, session_id):
+            return False
+        owner_prefix, owner_separator, owner_id_text = owner_identity_ref.partition(":")
+        if owner_prefix != "owner" or not owner_separator or re.fullmatch(r"[1-9][0-9]*", owner_id_text) is None:
+            return False
+        active_session = resolve_session(session_id)
+        if not isinstance(active_session, dict) or active_session.get("session_id") != session_id:
+            return False
+        active_owner_id = active_session.get("owner_id")
+        if isinstance(active_owner_id, bool) or int(active_owner_id) != int(owner_id_text):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _mission_restart_authority_projection(
+    status: object,
+    mission_id: str,
+    *,
+    expected_project_id: str | None = None,
+    expected_project_root: str | Path | None = None,
+) -> dict | None:
     if not isinstance(status, dict):
         return None
     request_id = status.get("request_id")
@@ -3097,8 +3133,11 @@ def _mission_restart_authority_projection(status: object, mission_id: str) -> di
     context_scope = context.get("scope_snapshot")
     context_scope_id = context.get("scope_snapshot_id")
     allowed_tools = authorization.get("allowed_tools")
+    allowed_actions = authorization.get("allowed_actions")
     network = authorization.get("network_boundary")
     credentials = authorization.get("credential_boundary")
+    data_boundary = authorization.get("data_boundary")
+    workspace_boundary = authorization.get("workspace_boundary")
     scope_networks = scope.get("allowed_networks")
     scope_credentials = scope.get("allowed_credentials")
     if (
@@ -3106,40 +3145,177 @@ def _mission_restart_authority_projection(status: object, mission_id: str) -> di
         or authorization.get("owner_identity") != owner_identity_ref
         or not isinstance(target_identity, str) or not target_identity
         or scope.get("target_id") != target_identity
-        or not isinstance(scope_id, str) or not scope_id
         or context.get("request_id") != request_id
-        or context_scope_id != scope_id
-        or not isinstance(context_scope, dict)
-        or context_scope.get("snapshot_id") != scope_id
         or scope.get("scope") != ["workspace"]
+        or authorization.get("scope") != ["workspace"]
         or not isinstance(allowed_tools, list)
+        or not all(isinstance(item, str) and item for item in allowed_tools)
         or "run_project_tests" not in allowed_tools
+        or not isinstance(allowed_actions, list)
+        or not all(isinstance(item, str) and item for item in allowed_actions)
+        or "run_project_tests" not in allowed_actions
         or not isinstance(network, dict)
         or not isinstance(network.get("allowed"), (list, tuple))
         or network["allowed"]
         or not isinstance(credentials, dict)
         or not isinstance(credentials.get("allowed"), (list, tuple))
         or credentials["allowed"]
+        or not isinstance(data_boundary, dict)
+        or not isinstance(data_boundary.get("allowed"), (list, tuple))
+        or list(data_boundary["allowed"]) != [target_identity]
+        or not isinstance(workspace_boundary, dict)
+        or not isinstance(workspace_boundary.get("root"), str)
+        or not workspace_boundary["root"]
+        or not isinstance(scope.get("workspace_root"), str)
+        or not scope["workspace_root"]
         or not isinstance(scope_networks, list)
         or scope_networks
-        or (scope_credentials is not None and (not isinstance(scope_credentials, list) or scope_credentials))
+        or not isinstance(scope_credentials, list)
+        or scope_credentials
     ):
         return None
-    raw_scope_authorization = context_scope.get("authorization")
-    context_session_id = context.get("session_id")
-    if (
-        not isinstance(raw_scope_authorization, dict)
-        or (
-            raw_scope_authorization.get("owner_session_id")
-            and raw_scope_authorization.get("owner_session_id") != context_session_id
-        )
-    ):
+    try:
+        from security.mission_authorization import MissionAuthorizationSnapshot
+
+        verified_authorization = MissionAuthorizationSnapshot.from_dict(dict(authorization))
+        if (
+            verified_authorization.mission_id != mission_id
+            or verified_authorization.owner_identity != owner_identity_ref
+            or verified_authorization.target_identity != target_identity
+        ):
+            return None
+        scope_root = Path(scope["workspace_root"]).resolve(strict=True)
+        authorization_root = Path(workspace_boundary["root"]).resolve(strict=True)
+        if scope_root != authorization_root or not scope_root.is_dir():
+            return None
+        if expected_project_root is not None:
+            independently_bound_root = Path(expected_project_root).resolve(strict=True)
+            if not independently_bound_root.is_dir() or scope_root != independently_bound_root:
+                return None
+    except Exception:
+        return None
+
+    plan = status.get("plan")
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    if not isinstance(steps, list):
+        return None
+    plan_actions: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict) or not isinstance(step.get("action"), str):
+            return None
+        action = step["action"]
+        if action != "__planning_failure__":
+            plan_actions.append(action)
+    if not plan_actions or not set(plan_actions).issubset(set(allowed_tools)) or not set(plan_actions).issubset(set(allowed_actions)):
+        return None
+
+    scope_binding_kind: str
+    if scope_id is None and context_scope_id is None and context_scope is None:
+        # Public project Missions persist the Owner-approved local workspace as
+        # a project-bound scope context, not as an external ScopeSnapshot row.
+        public_scope_tools = scope.get("allowed_tools")
+        owner_evidence = context.get("owner_evidence")
+        policy_snapshot = context.get("policy_snapshot")
+        context_session_id = context.get("session_id")
+        owner_instruction = status.get("owner_instruction")
+        if (
+            not target_identity.startswith("local-project:")
+            or len(target_identity) <= len("local-project:")
+            or not isinstance(expected_project_id, str)
+            or not expected_project_id
+            or target_identity != f"local-project:{expected_project_id}"
+            or expected_project_root is None
+            or not isinstance(public_scope_tools, list)
+            or not all(isinstance(item, str) and item for item in public_scope_tools)
+            or not set(plan_actions).issubset(set(public_scope_tools))
+            or "run_project_tests" not in public_scope_tools
+            or context.get("scope_fingerprint") != ""
+            or not isinstance(context_session_id, str) or not context_session_id
+            or not isinstance(owner_evidence, dict)
+            or owner_evidence.get("request_id") != request_id
+            or owner_evidence.get("session_id") != context_session_id
+            or not isinstance(owner_evidence.get("proof_fingerprint"), str)
+            or not owner_evidence.get("proof_fingerprint")
+            or context.get("owner_evidence_fingerprint") != _canonical_sha256(owner_evidence)
+            or authorization.get("owner_approval") != owner_evidence.get("proof_fingerprint")
+            or not isinstance(policy_snapshot, dict)
+            or policy_snapshot.get("request_id") != request_id
+            or authorization.get("policy_version") != policy_snapshot.get("policy_version")
+            or context.get("policy_fingerprint") != policy_snapshot.get("owner_policy_fingerprint")
+            or context.get("instruction_fingerprint") != policy_snapshot.get("owner_instruction_fingerprint")
+            or not isinstance(owner_instruction, str)
+            or not owner_instruction.strip()
+        ):
+            return None
+        try:
+            from agent.agent_core import OWNER_UI_CONTROL_PLANE_CAPABILITIES
+            from bridge import _public_project_owner_tool_scope
+
+            expected_public_scope_tools = _public_project_owner_tool_scope(owner_instruction)
+            expected_authorized_tools = list(dict.fromkeys(
+                (*plan_actions, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
+            ))
+            # Cross-process attribution only; this neither reauthorizes nor
+            # resumes a Mission requiring Owner reauthentication.
+            if not _mission_active_owner_session_binding_is_valid(
+                owner_identity_ref,
+                request_id,
+                authorization,
+                context,
+            ):
+                return None
+        except Exception:
+            return None
+        if (
+            public_scope_tools != expected_public_scope_tools
+            or allowed_tools != expected_authorized_tools
+            or allowed_actions != expected_authorized_tools
+        ):
+            return None
+        scope_binding_kind = "public_local_project_workspace"
+    else:
+        if (
+            expected_project_id is not None
+            or expected_project_root is not None
+            or not isinstance(scope_id, str) or not scope_id
+            or context_scope_id != scope_id
+            or not isinstance(context_scope, dict)
+            or context_scope.get("snapshot_id") != scope_id
+        ):
+            return None
+        raw_scope_authorization = context_scope.get("authorization")
+        context_session_id = context.get("session_id")
+        if (
+            not isinstance(raw_scope_authorization, dict)
+            or not isinstance(context_session_id, str) or not context_session_id
+            or raw_scope_authorization.get("owner_session_id") != context_session_id
+            or not _mission_active_owner_session_binding_is_valid(
+                owner_identity_ref,
+                request_id,
+                authorization,
+                context,
+            )
+        ):
+            return None
+        scope_binding_kind = "persisted_owner_scope_snapshot"
+    model_authorization_context_id = context.get("owner_evidence_fingerprint")
+    if not isinstance(model_authorization_context_id, str) or not model_authorization_context_id:
+        return None
+    model_scope_snapshot_id = (
+        scope_id
+        if scope_binding_kind == "persisted_owner_scope_snapshot"
+        else f"public-local-project-scope:{_canonical_sha256(scope)}"
+    )
+    if not isinstance(model_scope_snapshot_id, str) or not model_scope_snapshot_id:
         return None
     return {
         "mission_id": mission_id,
         "request_id": request_id,
         "owner_identity_ref": owner_identity_ref,
         "target_identity": target_identity,
+        "scope_binding_kind": scope_binding_kind,
+        "model_authorization_context_id": model_authorization_context_id,
+        "model_scope_snapshot_id": model_scope_snapshot_id,
         "scope_snapshot_sha256": _canonical_sha256(scope),
         "authorization_snapshot_sha256": _canonical_sha256(authorization),
         "authorization_context_sha256": _canonical_sha256(context),
@@ -3151,23 +3327,36 @@ def _mission_restart_candidate_snapshot(
     status: dict,
     full_execution_chain: object,
     full_execution_chain_status: object,
+    effects: object | None = None,
 ) -> dict:
     """Build the cheap polling snapshot from one status response and chain probe."""
     return {
         "status": status,
         "timeline": status.get("trajectory"),
         "evidence": status.get("evidence"),
+        "effects": effects,
         "full_execution_chain": full_execution_chain,
         "full_execution_chain_status": full_execution_chain_status,
     }
 
 
-def _mission_preflight_block_projection(snapshot: object, mission_id: str) -> dict | None:
+def _mission_preflight_block_projection(
+    snapshot: object,
+    mission_id: str,
+    *,
+    expected_project_id: str | None = None,
+    expected_project_root: str | Path | None = None,
+) -> dict | None:
     if not isinstance(snapshot, dict):
         return None
     status = snapshot.get("status")
     timeline = snapshot.get("timeline")
-    authority = _mission_restart_authority_projection(status, mission_id)
+    authority = _mission_restart_authority_projection(
+        status,
+        mission_id,
+        expected_project_id=expected_project_id,
+        expected_project_root=expected_project_root,
+    )
     if (
         authority is None
         or not isinstance(status, dict)
@@ -3320,9 +3509,269 @@ def _mission_preflight_block_projection(snapshot: object, mission_id: str) -> di
     } if isinstance(steps, list) else {}
     step_ids = set(blocked_step_ids)
     project_test_steps = {step_id for step_id, action in plan_steps.items() if action == "run_project_tests"}
-    if not (step_ids & project_test_steps):
+    if not (step_ids & project_test_steps) or not step_ids.issubset(plan_steps):
         return None
+
+    blocked_action_names = {plan_steps[step_id] for step_id in step_ids}
+    effects = snapshot.get("effects")
+    if not isinstance(effects, list):
+        return None
+    authorization_snapshot = status.get("authorization_snapshot")
+    authorized_effect_operations = (
+        set(authorization_snapshot.get("allowed_tools", ()))
+        if isinstance(authorization_snapshot, dict)
+        and isinstance(authorization_snapshot.get("allowed_tools"), list)
+        else set()
+    )
+    effect_ids: set[str] = set()
+    effect_by_id: dict[str, dict] = {}
+    known_effect_states = {
+        "PLANNED", "RESERVED", "DISPATCHED", "SUCCEEDED", "FAILED",
+        "AMBIGUOUS", "RECOVERY_REQUIRED", "UNKNOWN",
+    }
+    requires_reconciliation_states = {
+        "DISPATCHED", "AMBIGUOUS", "RECOVERY_REQUIRED", "UNKNOWN",
+    }
+    blocked_reference_sets = {
+        "attempt_id": {attempt_id},
+        "tool_call_id": set(blocked_call_ids),
+        "action_id": blocked_action_id_set,
+        "step_id": step_ids,
+    }
+    blocked_reference_list_sets = {
+        "blocked_tool_call_ids": set(blocked_call_ids),
+        "blocked_action_ids": blocked_action_id_set,
+        "blocked_step_ids": step_ids,
+    }
+    for effect in effects:
+        if not isinstance(effect, dict):
+            return None
+        required_effect_strings = (
+            "effect_id", "mission_id", "task_id", "execution_id", "origin_request_id",
+            "provider", "operation", "state", "created_at", "updated_at",
+        )
+        if any(not isinstance(effect.get(field), str) or not effect.get(field) for field in required_effect_strings):
+            return None
+        if (
+            effect.get("mission_id") != mission_id
+            or effect.get("origin_request_id") != request_id
+            or not isinstance(effect.get("error_code"), str)
+            or effect.get("owner_binding_status") != "BOUND"
+            or effect.get("state") not in known_effect_states
+            or effect.get("requires_reconciliation") is not (effect.get("state") in requires_reconciliation_states)
+            or effect.get("operation") not in authorized_effect_operations
+            or effect.get("operation") in blocked_action_names
+            or effect.get("requires_reconciliation") is True
+            or isinstance(effect.get("task_version"), bool)
+            or not isinstance(effect.get("task_version"), int)
+            or effect.get("task_version") < 1
+            or not isinstance(effect.get("idempotency_supported"), bool)
+            or not isinstance(effect.get("has_idempotency_key"), bool)
+            or effect.get("effect_id") in effect_ids
+        ):
+            return None
+        effect_ids.add(effect["effect_id"])
+        effect_by_id[effect["effect_id"]] = effect
+        for field, bound_values in blocked_reference_sets.items():
+            if field in effect:
+                value = effect[field]
+                if not isinstance(value, str) or not value or value in bound_values:
+                    return None
+        for field, bound_values in blocked_reference_list_sets.items():
+            if field in effect:
+                values = effect[field]
+                if (
+                    not isinstance(values, list)
+                    or any(not isinstance(value, str) or not value for value in values)
+                    or bool(bound_values.intersection(values))
+                ):
+                    return None
+
+    progress = status.get("progress", {})
+    if not isinstance(progress, dict):
+        return None
+    model_loop = progress.get("model_loop")
+    if model_loop is not None and not isinstance(model_loop, dict):
+        return None
+    if "tool_results" in status and not isinstance(status["tool_results"], list):
+        return None
+    if "tool_results" in progress and not isinstance(progress["tool_results"], list):
+        return None
+    if isinstance(model_loop, dict) and "tool_results" in model_loop and not isinstance(model_loop["tool_results"], list):
+        return None
+    tool_result_ledgers = {
+        "top_level": status.get("tool_results"),
+        "progress": progress.get("tool_results"),
+        "model_loop": model_loop.get("tool_results") if isinstance(model_loop, dict) else None,
+    }
+    if attempt_source == "model_turn" and (
+        not isinstance(model_loop, dict)
+        or "tool_results" not in model_loop
+        or not isinstance(tool_result_ledgers["model_loop"], list)
+    ):
+        return None
+    unique_tool_results: dict[str, dict] = {}
+    reconciled_tool_result_hashes: set[str] = set()
+    seen_tool_result_hashes: set[str] = set()
+    seen_tool_call_ids: set[str] = set()
+    common_tool_result_fields = {
+        "tool_call_id", "name", "arguments", "ok", "result", "error",
+        "mission_id", "request_id", "plan_version", "step_id",
+    }
+    reconciled_tool_result_fields = common_tool_result_fields
+    model_tool_result_fields = common_tool_result_fields | {
+        "run_id", "turn_id", "action_id", "authorization_context_id", "scope_snapshot_id",
+    }
+    for ledger in tool_result_ledgers.values():
+        if ledger is None:
+            continue
+        if not isinstance(ledger, list):
+            return None
+        for result_record in ledger:
+            if not isinstance(result_record, dict):
+                return None
+            if not common_tool_result_fields.issubset(result_record):
+                return None
+            common_string_fields = ("tool_call_id", "name", "mission_id", "request_id", "step_id")
+            if any(
+                not isinstance(result_record[field], str) or not result_record[field]
+                for field in common_string_fields
+            ):
+                return None
+            if (
+                result_record["mission_id"] != mission_id
+                or result_record["request_id"] != request_id
+                or isinstance(result_record["plan_version"], bool)
+                or not isinstance(result_record["plan_version"], int)
+                or result_record["plan_version"] < 1
+                or not isinstance(result_record["arguments"], dict)
+                or not isinstance(result_record["ok"], bool)
+                or not isinstance(result_record["result"], dict)
+                or not isinstance(result_record["error"], str)
+            ):
+                return None
+
+            result_payload = result_record["result"]
+            is_reconciled_result = result_payload.get("type") == "external_effect_reconciled"
+            if is_reconciled_result:
+                if (
+                    set(result_record) != reconciled_tool_result_fields
+                    or set(result_payload) != {"type", "effect_id", "effect_state"}
+                    or not isinstance(result_payload.get("effect_id"), str)
+                    or not result_payload.get("effect_id")
+                    or not isinstance(result_payload.get("effect_state"), str)
+                ):
+                    return None
+                reconciled_effect = effect_by_id.get(result_payload["effect_id"])
+                reconciled_state = reconciled_effect.get("state") if isinstance(reconciled_effect, dict) else None
+                reconciled_success = reconciled_state == "SUCCEEDED"
+                if (
+                    reconciled_state not in {"SUCCEEDED", "FAILED"}
+                    or result_payload.get("effect_state") != reconciled_state
+                    or result_record.get("ok") is not reconciled_success
+                    or result_record.get("error") != ("" if reconciled_success else "OWNER_CONFIRMED_NO_EFFECT")
+                    or result_record.get("arguments") != {}
+                    or result_record.get("name") != reconciled_effect.get("operation")
+                    or result_record.get("step_id") != reconciled_effect.get("task_id")
+                    or result_record.get("tool_call_id") in blocked_call_id_set
+                    or result_record.get("step_id") in step_ids
+                ):
+                    return None
+            else:
+                if not model_tool_result_fields.issubset(result_record):
+                    return None
+                model_identity_fields = (
+                    "run_id", "turn_id", "action_id", "authorization_context_id", "scope_snapshot_id",
+                )
+                if any(
+                    not isinstance(result_record[field], str) or not result_record[field]
+                    for field in model_identity_fields
+                ):
+                    return None
+                if any(
+                    field in result_record and result_record[field] is not False
+                    for field in ("success", "dispatch_attempted", "process_started", "process_start_confirmed")
+                ):
+                    return None
+
+            record_hash = _canonical_sha256(result_record)
+            call_id = result_record["tool_call_id"]
+            if record_hash in seen_tool_result_hashes or call_id in seen_tool_call_ids:
+                return None
+            seen_tool_result_hashes.add(record_hash)
+            seen_tool_call_ids.add(call_id)
+            unique_tool_results[record_hash] = result_record
+            if is_reconciled_result:
+                reconciled_tool_result_hashes.add(record_hash)
+
+    matching_tool_results = []
+    for record_hash, result_record in unique_tool_results.items():
+        if record_hash in reconciled_tool_result_hashes:
+            continue
+        result_call_id = result_record.get("tool_call_id")
+        result_action_id = result_record.get("action_id")
+        result_step_id = result_record.get("step_id")
+        result_name = result_record.get("name")
+        same_attempt_turn = result_record.get("run_id") == run_id and result_record.get("turn_id") == turn_id
+        related = (
+            result_call_id in blocked_call_id_set
+            or result_action_id in blocked_action_id_set
+            or result_step_id in step_ids
+            or same_attempt_turn
+            or (isinstance(result_name, str) and result_name in blocked_action_names)
+        )
+        if not related:
+            continue
+        if attempt_source != "model_turn":
+            return None
+        result_step_action = plan_steps.get(result_step_id)
+        expected_error = (
+            ("process_sandbox_setup_failed" if reason_code == "sandbox_setup_failed" else "process_sandbox_unavailable")
+            if result_name == "run_project_tests"
+            else "turn_blocked_before_dispatch_due_to_process_sandbox_unavailable"
+        )
+        if (
+            result_record.get("mission_id") != mission_id
+            or result_record.get("request_id") != request_id
+            or result_record.get("run_id") != run_id
+            or result_record.get("turn_id") != turn_id
+            or result_call_id not in blocked_call_id_set
+            or result_action_id not in blocked_action_id_set
+            or result_step_id not in step_ids
+            or result_name != result_step_action
+            or result_record.get("plan_version") != (plan.get("version") if isinstance(plan, dict) else None)
+            or result_record.get("ok") is not False
+            or result_record.get("result") != {}
+            or result_record.get("error") != expected_error
+            or not isinstance(result_record.get("arguments"), dict)
+            or not isinstance(result_record.get("authorization_context_id"), str)
+            or not isinstance(result_record.get("scope_snapshot_id"), str)
+            or any(
+                field in result_record and result_record[field] is not False
+                for field in ("success", "dispatch_attempted", "process_started", "process_start_confirmed")
+            )
+        ):
+            return None
+        matching_tool_results.append(result_record)
     if attempt_source == "model_turn":
+        matching_result_call_ids = [item.get("tool_call_id") for item in matching_tool_results]
+        if (
+            len(matching_tool_results) != len(blocked_call_ids)
+            or len(set(matching_result_call_ids)) != len(matching_result_call_ids)
+            or set(matching_result_call_ids) != blocked_call_id_set
+        ):
+            return None
+
+    if attempt_source == "model_turn":
+        expected_authorization_context_id = authority.get("model_authorization_context_id")
+        expected_scope_snapshot_id = authority.get("model_scope_snapshot_id")
+        if (
+            not isinstance(expected_authorization_context_id, str)
+            or not expected_authorization_context_id
+            or not isinstance(expected_scope_snapshot_id, str)
+            or not expected_scope_snapshot_id
+        ):
+            return None
         related_proposals = []
         for event in timeline:
             if not isinstance(event, dict) or event.get("event") != "ToolProposed" or not isinstance(event.get("data"), dict):
@@ -3379,11 +3828,47 @@ def _mission_preflight_block_projection(snapshot: object, mission_id: str) -> di
                 and action_id in blocked_action_id_set
                 and isinstance(step_id, str)
                 and step_id in step_ids
+                and isinstance(data.get("name"), str)
+                and data.get("name") == plan_steps.get(step_id)
+                and isinstance(data.get("arguments"), dict)
+                and isinstance(data.get("plan_version"), int)
+                and not isinstance(data.get("plan_version"), bool)
+                and data.get("authorization_context_id") == expected_authorization_context_id
+                and data.get("scope_snapshot_id") == expected_scope_snapshot_id
                 and (not event_step_id or (isinstance(event_step_id, str) and event_step_id in step_ids))
             )
 
         if any(not proposal_is_bound(event) for event in related_proposals):
             return None
+        proposals_by_call_id = {
+            event["data"]["tool_call_id"]: event["data"]
+            for event in related_proposals
+        }
+        results_by_call_id = {
+            result_record["tool_call_id"]: result_record
+            for result_record in matching_tool_results
+        }
+        if set(proposals_by_call_id) != blocked_call_id_set or set(results_by_call_id) != blocked_call_id_set:
+            return None
+        for call_id in blocked_call_ids:
+            proposal_data = proposals_by_call_id[call_id]
+            result_record = results_by_call_id[call_id]
+            if (
+                result_record.get("name") != proposal_data.get("name")
+                or _canonical_sha256(result_record.get("arguments")) != _canonical_sha256(proposal_data.get("arguments"))
+                or result_record.get("mission_id") != proposal_data.get("mission_id")
+                or result_record.get("request_id") != proposal_data.get("request_id")
+                or result_record.get("run_id") != proposal_data.get("run_id")
+                or result_record.get("turn_id") != proposal_data.get("turn_id")
+                or result_record.get("plan_version") != proposal_data.get("plan_version")
+                or isinstance(result_record.get("plan_version"), bool)
+                or not isinstance(result_record.get("plan_version"), int)
+                or result_record.get("action_id") != proposal_data.get("action_id")
+                or result_record.get("step_id") != proposal_data.get("step_id")
+                or result_record.get("authorization_context_id") != proposal_data.get("authorization_context_id")
+                or result_record.get("scope_snapshot_id") != proposal_data.get("scope_snapshot_id")
+            ):
+                return None
         if not any(event["data"].get("name") == "run_project_tests" for event in related_proposals):
             return None
 
@@ -3504,32 +3989,41 @@ def _mission_preflight_block_projection(snapshot: object, mission_id: str) -> di
     if not isinstance(action_history, list):
         return None
 
-    def contains_positive_process_start_marker(value: object) -> bool:
-        if isinstance(value, dict):
-            if any(value.get(field) is True for field in ("process_started", "process_start_confirmed")):
-                return True
-            return any(contains_positive_process_start_marker(item) for item in value.values())
-        if isinstance(value, list):
-            return any(contains_positive_process_start_marker(item) for item in value)
-        return False
-
-    def contains_positive_preflight_marker(value: object) -> bool:
+    def contains_invalid_process_start_marker(value: object) -> bool:
         if isinstance(value, dict):
             if any(
-                value.get(field) is True
-                for field in ("dispatch_attempted", "process_started", "process_start_confirmed", "success")
+                field in value and value[field] is not False
+                for field in ("process_started", "process_start_confirmed")
             ):
                 return True
-            return any(contains_positive_preflight_marker(item) for item in value.values())
+            return any(contains_invalid_process_start_marker(item) for item in value.values())
         if isinstance(value, list):
-            return any(contains_positive_preflight_marker(item) for item in value)
+            return any(contains_invalid_process_start_marker(item) for item in value)
+        return False
+
+    def contains_invalid_preflight_marker(value: object) -> bool:
+        if isinstance(value, dict):
+            if any(
+                field in value and value[field] is not False
+                for field in ("dispatch_attempted", "process_started", "process_start_confirmed", "success", "ok")
+            ):
+                return True
+            status_value = value.get("status")
+            if isinstance(status_value, str) and status_value.strip().lower() in {
+                "success", "succeeded", "complete", "completed", "passed", "partial_success",
+                "goal_completed", "ok", "verified"
+            }:
+                return True
+            return any(contains_invalid_preflight_marker(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_invalid_preflight_marker(item) for item in value)
         return False
 
     matching_actions = []
     for action in action_history:
         if not isinstance(action, dict):
             return None
-        if contains_positive_process_start_marker(action):
+        if contains_invalid_process_start_marker(action):
             return None
         observation = action.get("observation")
         entry_action_id = action.get("action_id")
@@ -3567,8 +4061,8 @@ def _mission_preflight_block_projection(snapshot: object, mission_id: str) -> di
             or observation.get("dispatch_attempted") is not False
             or observation.get("process_started") is not False
             or observation.get("process_start_confirmed") is not False
-            or observation.get("success") is True
-            or contains_positive_preflight_marker(action)
+            or ("success" in observation and observation.get("success") is not False)
+            or contains_invalid_preflight_marker(action)
         ):
             return None
     evidence_records = status.get("evidence")
@@ -3651,17 +4145,30 @@ def _mission_preflight_block_projection(snapshot: object, mission_id: str) -> di
         "action_history_sha256": _canonical_sha256(action_history),
         "evidence_sha256": _canonical_sha256(evidence_records),
         "evidence_endpoint_sha256": _canonical_sha256(endpoint_evidence),
+        "effects_sha256": _canonical_sha256(effects),
+        "tool_results_sha256": _canonical_sha256(tool_result_ledgers),
         "mission_execution_chain_sha256": _canonical_sha256(mission_chain),
         "full_execution_chain_status": full_chain_status,
     }
 
 
-def _mission_restart_basis(snapshot: object, mission_id: str) -> dict:
+def _mission_restart_basis(
+    snapshot: object,
+    mission_id: str,
+    *,
+    expected_project_id: str | None = None,
+    expected_project_root: str | Path | None = None,
+) -> dict:
     if not isinstance(snapshot, dict):
         return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "snapshot_unavailable"}
     status = snapshot.get("status")
     timeline = snapshot.get("timeline")
-    authority = _mission_restart_authority_projection(status, mission_id)
+    authority = _mission_restart_authority_projection(
+        status,
+        mission_id,
+        expected_project_id=expected_project_id,
+        expected_project_root=expected_project_root,
+    )
     if (
         authority is None
         or not isinstance(status, dict)
@@ -3671,7 +4178,12 @@ def _mission_restart_basis(snapshot: object, mission_id: str) -> dict:
         or not _trajectory_timeline_integrity(timeline, mission_id, status.get("request_id"))
     ):
         return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "mission_integrity_or_scope_binding_invalid"}
-    preflight = _mission_preflight_block_projection(snapshot, mission_id)
+    preflight = _mission_preflight_block_projection(
+        snapshot,
+        mission_id,
+        expected_project_id=expected_project_id,
+        expected_project_root=expected_project_root,
+    )
     if preflight is not None:
         return {"status": "VERIFIED", "kind": "PREFLIGHT_BLOCK", "projection": preflight}
     full_chain = snapshot.get("full_execution_chain")
@@ -3702,9 +4214,26 @@ def _mission_restart_basis(snapshot: object, mission_id: str) -> dict:
     return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "no_durable_execution_chain_or_preflight_block"}
 
 
-def _mission_preflight_block_reconciliation(before: object, after: object, mission_id: str) -> dict:
-    before_record = _mission_preflight_block_projection(before, mission_id)
-    after_record = _mission_preflight_block_projection(after, mission_id)
+def _mission_preflight_block_reconciliation(
+    before: object,
+    after: object,
+    mission_id: str,
+    *,
+    expected_project_id: str | None = None,
+    expected_project_root: str | Path | None = None,
+) -> dict:
+    before_record = _mission_preflight_block_projection(
+        before,
+        mission_id,
+        expected_project_id=expected_project_id,
+        expected_project_root=expected_project_root,
+    )
+    after_record = _mission_preflight_block_projection(
+        after,
+        mission_id,
+        expected_project_id=expected_project_id,
+        expected_project_root=expected_project_root,
+    )
     if before_record is None or after_record is None:
         return {
             "reconciled": False,
@@ -4546,16 +5075,32 @@ def _installed_app_mission(
     while time.monotonic() < deadline:
         mission_state = read_status()
         chain_records, chain_status = _read_profile_evidence_chain_diagnostic(profile_root)
+        candidate_effects = None
+        if mission_state.get("status") == "RESOURCE_BLOCKED":
+            effects_response = _public_api(page, "GET", mission_path + "/effects")
+            if effects_response.get("http_status") == 200 and isinstance(effects_response.get("body"), dict):
+                candidate_effects = effects_response["body"].get("effects")
         status_snapshot = _mission_restart_candidate_snapshot(
             mission_state,
             chain_records,
             chain_status,
+            effects=candidate_effects,
         )
-        candidate_basis = _mission_restart_basis(status_snapshot, mission_id)
+        candidate_basis = _mission_restart_basis(
+            status_snapshot,
+            mission_id,
+            expected_project_id=project_id,
+            expected_project_root=project_root,
+        )
         if candidate_basis.get("status") == "VERIFIED":
             try:
                 candidate_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
-                candidate_basis = _mission_restart_basis(candidate_snapshot, mission_id)
+                candidate_basis = _mission_restart_basis(
+                    candidate_snapshot,
+                    mission_id,
+                    expected_project_id=project_id,
+                    expected_project_root=project_root,
+                )
             except _MissionAuditSnapshotError as exc:
                 candidate_snapshot = None
                 candidate_basis = {
@@ -4595,7 +5140,12 @@ def _installed_app_mission(
         if pause_verified:
             try:
                 before_restart_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
-                paused_basis = _mission_restart_basis(before_restart_snapshot, mission_id)
+                paused_basis = _mission_restart_basis(
+                    before_restart_snapshot,
+                    mission_id,
+                    expected_project_id=project_id,
+                    expected_project_root=project_root,
+                )
             except _MissionAuditSnapshotError as exc:
                 paused_basis = {"status": "BLOCKED", "kind": "NOT_RUN", "reason": exc.reason_code}
             pause_basis_ready = (
@@ -4664,7 +5214,12 @@ def _installed_app_mission(
     after_projection: dict = {}
     if pause_verified and pause_basis_ready:
         page_after_restart, paused_restart_cycle, paused_restart_snapshot = restart_callback(
-            "paused_mission", mission_id, before_restart_snapshot, True
+            "paused_mission",
+            mission_id,
+            before_restart_snapshot,
+            True,
+            expected_project_id=project_id,
+            expected_project_root=project_root,
         )
         if page_after_restart is None or paused_restart_snapshot is None:
             failed_result = {
@@ -4942,17 +5497,36 @@ def _installed_app_mission(
     if terminal_restart_eligible:
         before_terminal_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
         page_after_terminal_restart, terminal_restart_cycle, terminal_restart_snapshot = restart_callback(
-            "terminal_mission", mission_id, before_terminal_snapshot, False
+            "terminal_mission",
+            mission_id,
+            before_terminal_snapshot,
+            False,
+            expected_project_id=project_id,
+            expected_project_root=project_root,
         )
         if page_after_terminal_restart is not None:
             page = page_after_terminal_restart
         if terminal_restart_snapshot is not None:
             before_terminal_projection = _mission_audit_projection(before_terminal_snapshot, mission_id)
             after_terminal_projection = _mission_audit_projection(terminal_restart_snapshot, mission_id)
-            before_terminal_basis = _mission_restart_basis(before_terminal_snapshot, mission_id)
-            after_terminal_basis = _mission_restart_basis(terminal_restart_snapshot, mission_id)
+            before_terminal_basis = _mission_restart_basis(
+                before_terminal_snapshot,
+                mission_id,
+                expected_project_id=project_id,
+                expected_project_root=project_root,
+            )
+            after_terminal_basis = _mission_restart_basis(
+                terminal_restart_snapshot,
+                mission_id,
+                expected_project_id=project_id,
+                expected_project_root=project_root,
+            )
             terminal_preflight_reconciliation = _mission_preflight_block_reconciliation(
-                before_terminal_snapshot, terminal_restart_snapshot, mission_id
+                before_terminal_snapshot,
+                terminal_restart_snapshot,
+                mission_id,
+                expected_project_id=project_id,
+                expected_project_root=project_root,
             ) if (
                 before_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
                 and after_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
@@ -5834,7 +6408,15 @@ def main() -> int:
                 relaunched_application_process = None
                 report["application_restart"]["status"] = "IN_PROGRESS"
 
-                def restart_installed_application(cycle_name: str, mission_id: str, before_snapshot: dict, verify_inference: bool):
+                def restart_installed_application(
+                    cycle_name: str,
+                    mission_id: str,
+                    before_snapshot: dict,
+                    verify_inference: bool,
+                    *,
+                    expected_project_id: str | None = None,
+                    expected_project_root: Path | None = None,
+                ):
                     nonlocal browser, page, active_application_pid, relaunched_application_process
                     cycle = {
                         "cycle": cycle_name,
@@ -5850,7 +6432,12 @@ def main() -> int:
                         "same_disposable_profile_root": True,
                         "post_restart_inference_requested": verify_inference,
                     }
-                    before_basis = _mission_restart_basis(before_snapshot, mission_id)
+                    before_basis = _mission_restart_basis(
+                        before_snapshot,
+                        mission_id,
+                        expected_project_id=expected_project_id,
+                        expected_project_root=expected_project_root,
+                    )
                     cycle["restart_basis_before"] = {
                         "status": before_basis.get("status"),
                         "kind": before_basis.get("kind"),
@@ -5938,9 +6525,18 @@ def main() -> int:
                             after_snapshot = _mission_audit_snapshot(page, mission_id, args.profile_root)
                             before_projection = _mission_audit_projection(before_snapshot, mission_id)
                             after_projection = _mission_audit_projection(after_snapshot, mission_id)
-                            after_basis = _mission_restart_basis(after_snapshot, mission_id)
+                            after_basis = _mission_restart_basis(
+                                after_snapshot,
+                                mission_id,
+                                expected_project_id=expected_project_id,
+                                expected_project_root=expected_project_root,
+                            )
                             preflight_block_reconciliation = _mission_preflight_block_reconciliation(
-                                before_snapshot, after_snapshot, mission_id
+                                before_snapshot,
+                                after_snapshot,
+                                mission_id,
+                                expected_project_id=expected_project_id,
+                                expected_project_root=expected_project_root,
                             ) if (
                                 before_basis.get("kind") == "PREFLIGHT_BLOCK"
                                 and after_basis.get("kind") == "PREFLIGHT_BLOCK"

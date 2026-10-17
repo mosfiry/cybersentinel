@@ -1479,7 +1479,7 @@ def test_early_restart_failure_projection_keeps_safe_timeline_and_chain_digests(
     assert "PRIVATE_" not in repr(projection)
 
 
-def test_split_tool_results_are_merged_and_identical_cross_source_mirrors_count_once() -> None:
+def test_split_tool_results_preserve_cross_source_duplicates_and_fail_closed() -> None:
     mission_id, snapshot = _linked_project_test_snapshot()
     progress = snapshot["status"]["progress"]
     project_test = progress["model_loop"]["tool_results"].pop()
@@ -1492,14 +1492,14 @@ def test_split_tool_results_are_merged_and_identical_cross_source_mirrors_count_
     tool_projection = _tool_execution_projection(snapshot["status"])
 
     assert source == "model_loop+top_level"
-    assert [item["name"] for item in summary] == ["status", "run_project_tests"]
+    assert [item["name"] for item in summary] == ["status", "run_project_tests", "status"]
     assert projection["project_test_execution_proof"]["verified"] is False
-    assert projection["project_test_execution_proof"]["unaccounted_durable_tool_result_record_count"] == 1
-    assert tool_projection["records_count"] == 2
-    assert tool_projection["duplicate_tool_call_ids"] is False
+    assert projection["project_test_execution_proof"]["unaccounted_durable_tool_result_record_count"] > 0
+    assert tool_projection["records_count"] == 3
+    assert tool_projection["duplicate_tool_call_ids"] is True
 
 
-def test_identical_nested_and_top_level_project_result_mirror_counts_once_and_verifies() -> None:
+def test_identical_nested_and_top_level_project_result_duplicate_fails_closed() -> None:
     mission_id, snapshot = _linked_project_test_snapshot()
     project_test = snapshot["status"]["progress"]["model_loop"]["tool_results"][0]
     snapshot["status"]["progress"]["tool_results"] = [dict(project_test)]
@@ -1508,10 +1508,9 @@ def test_identical_nested_and_top_level_project_result_mirror_counts_once_and_ve
     projection = _mission_audit_projection(snapshot, mission_id)
 
     assert source == "model_loop+top_level"
-    assert [item["name"] for item in summary] == ["run_project_tests"]
-    assert projection["project_test_execution_proof"]["verified"] is True
-    assert projection["project_test_execution_proof"]["durable_tool_result_record_count"] == 1
-    assert projection["project_test_execution_proof"]["unaccounted_durable_tool_result_record_count"] == 0
+    assert [item["name"] for item in summary] == ["run_project_tests", "run_project_tests"]
+    assert projection["project_test_execution_proof"]["verified"] is False
+    assert _tool_execution_projection(snapshot["status"])["duplicate_tool_call_ids"] is True
 
 
 def test_malformed_durable_tool_result_is_not_ignored_by_authorization_projection() -> None:
@@ -4040,6 +4039,773 @@ def _resign_preflight_snapshot(snapshot, *, mutate_mission=None, event_transform
     return corrupted
 
 
+def _public_project_scope_snapshot(snapshot: dict) -> dict:
+    from dataclasses import replace
+
+    from agent.agent_core import OWNER_UI_CONTROL_PLANE_CAPABILITIES
+    from agent.mission import Mission
+    from security.authorization_context import AuthorizationContext
+    from security.mission_authorization import MissionAuthorizationSnapshot
+
+    target_identity = "local-project:acceptance-project"
+    scope_identity: dict[str, str] = {}
+
+    def bind_public_project_scope(mission: Mission) -> None:
+        context = AuthorizationContext.from_dict(dict(mission.authorization_context or {}))
+        authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
+        workspace_root = str(Path(str(authorization.workspace_boundary.get("root", ""))).resolve())
+        plan_actions = tuple(
+            step.action for step in mission.plan.steps if step.action != "__planning_failure__"
+        )
+        authorized_tools = tuple(dict.fromkeys(
+            (*plan_actions, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
+        ))
+        authorization = replace(
+            authorization,
+            target_identity=target_identity,
+            allowed_actions=authorized_tools,
+            allowed_tools=authorized_tools,
+            network_boundary={"allowed": ()},
+            data_boundary={"allowed": (target_identity,)},
+            credential_boundary={"allowed": ()},
+            workspace_boundary={"root": workspace_root},
+            policy_version=context.policy_snapshot.policy_version,
+            owner_approval=context.owner_evidence.proof_fingerprint,
+            authorization_hash="",
+        )
+        mission.authorization_snapshot = authorization.to_dict()
+        mission.authorization_context = replace(context, scope_snapshot=None).to_dict()
+        from bridge import _public_project_owner_tool_scope
+
+        mission.scope_snapshot = {
+            "target_id": target_identity,
+            "workspace_root": workspace_root,
+            "scope": ["workspace"],
+            "allowed_tools": _public_project_owner_tool_scope(mission.owner_instruction),
+            "allowed_networks": [],
+            "allowed_credentials": [],
+        }
+        scope_identity["id"] = (
+            f"public-local-project-scope:{windows_acceptance._canonical_sha256(mission.scope_snapshot)}"
+        )
+        model_loop = mission.progress.get("model_loop")
+        tool_results = model_loop.get("tool_results") if isinstance(model_loop, dict) else None
+        if isinstance(tool_results, list):
+            for result_record in tool_results:
+                if isinstance(result_record, dict):
+                    result_record["scope_snapshot_id"] = scope_identity["id"]
+
+    def rebind_public_tool_proposal(event: dict) -> dict:
+        if event.get("event") == "ToolProposed" and isinstance(event.get("data"), dict):
+            data = dict(event["data"])
+            data["scope_snapshot_id"] = scope_identity["id"]
+            event["data"] = data
+        return event
+
+    return _resign_preflight_snapshot(
+        snapshot,
+        mutate_mission=bind_public_project_scope,
+        event_transform=rebind_public_tool_proposal,
+    )
+
+
+def _public_project_expected_binding(snapshot: dict) -> dict:
+    status = snapshot.get("status") if isinstance(snapshot, dict) else None
+    scope = status.get("scope_snapshot") if isinstance(status, dict) else None
+    target_identity = scope.get("target_id") if isinstance(scope, dict) else None
+    workspace_root = scope.get("workspace_root") if isinstance(scope, dict) else None
+    assert isinstance(target_identity, str) and target_identity.startswith("local-project:")
+    assert isinstance(workspace_root, str) and workspace_root
+    return {
+        "expected_project_id": target_identity.removeprefix("local-project:"),
+        "expected_project_root": Path(workspace_root),
+    }
+
+
+def _preflight_effect_inspection(mission_id: str, request_id: str, operation: str) -> dict:
+    return {
+        "effect_id": "fixture-effect-1",
+        "mission_id": mission_id,
+        "task_id": "acceptance-task",
+        "task_version": 1,
+        "execution_id": "acceptance-execution",
+        "origin_request_id": request_id,
+        "provider": "fixture-provider",
+        "operation": operation,
+        "state": "SUCCEEDED",
+        "created_at": "2026-10-17T00:00:00+00:00",
+        "updated_at": "2026-10-17T00:00:00+00:00",
+        "idempotency_supported": False,
+        "has_idempotency_key": False,
+        "error_code": "",
+        "requires_reconciliation": False,
+        "owner_binding_status": "BOUND",
+    }
+
+
+def test_installed_app_restart_cycles_bind_expected_project_identity() -> None:
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(windows_acceptance._installed_app_mission))
+    function = ast.parse(source)
+    restart_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "restart_callback"
+    ]
+
+    assert len(restart_calls) == 2
+    for call in restart_calls:
+        keyword_values = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+        assert ast.unparse(keyword_values["expected_project_id"]) == "project_id"
+        assert ast.unparse(keyword_values["expected_project_root"]) == "project_root"
+
+
+@pytest.mark.parametrize("attempt_source", ["mission_slice", "model_turn"])
+def test_preflight_restart_basis_accepts_bound_public_project_scope_without_external_snapshot(
+    attempt_source: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source=attempt_source,
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+
+    unbound_basis = windows_acceptance._mission_restart_basis(public_scope_snapshot, mission_id)
+    assert unbound_basis["status"] == "BLOCKED"
+    assert unbound_basis["kind"] == "NOT_RUN"
+    assert windows_acceptance._mission_restart_basis(
+        public_scope_snapshot,
+        mission_id,
+        expected_project_id="different-project",
+        expected_project_root=expected_binding["expected_project_root"],
+    )["status"] == "BLOCKED"
+    other_project_root = tmp_path / "other-project"
+    other_project_root.mkdir()
+    assert windows_acceptance._mission_restart_basis(
+        public_scope_snapshot,
+        mission_id,
+        expected_project_id=expected_binding["expected_project_id"],
+        expected_project_root=other_project_root,
+    )["status"] == "BLOCKED"
+
+    basis = windows_acceptance._mission_restart_basis(
+        public_scope_snapshot,
+        mission_id,
+        **expected_binding,
+    )
+    assert basis["status"] == "VERIFIED"
+    assert basis["kind"] == "PREFLIGHT_BLOCK"
+    assert basis["projection"]["dispatch_attempted"] is False
+    assert basis["projection"]["process_started"] is False
+    assert basis["projection"]["process_start_confirmed"] is False
+    assert public_scope_snapshot["status"]["authorization_context"]["scope_snapshot"] is None
+    assert public_scope_snapshot["status"]["scope_snapshot"]["scope"] == ["workspace"]
+    restored_snapshot = json.loads(json.dumps(public_scope_snapshot))
+    reconciliation = windows_acceptance._mission_preflight_block_reconciliation(
+        public_scope_snapshot,
+        restored_snapshot,
+        mission_id,
+        **expected_binding,
+    )
+    assert reconciliation["reconciled"] is True
+    assert reconciliation["dispatch_attempted"] is False
+    assert reconciliation["process_started"] is False
+    assert reconciliation["process_start_confirmed"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target_id", "local-project:other-project"),
+        ("workspace_root", "/unrelated/workspace"),
+        ("scope", ["workspace", "network"]),
+        ("allowed_tools", ["status"]),
+        ("allowed_tools", ["latest_intel", "local_security_check", "local_system_info", "run_project_tests", "status", "watch"]),
+        ("allowed_networks", ["127.0.0.1"]),
+        ("allowed_credentials", ["credential-ref"]),
+    ],
+)
+def test_preflight_public_project_scope_tampering_fails_closed(
+    field: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+
+    def tamper_scope(mission: Mission) -> None:
+        mission.scope_snapshot[field] = value
+
+    tampered = _resign_preflight_snapshot(public_scope_snapshot, mutate_mission=tamper_scope)
+    basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "authorization_owner_approval_mismatch",
+        "authorization_hash_mismatch",
+        "authorization_allowed_tools_expanded",
+        "authorization_allowed_actions_expanded",
+        "owner_evidence_request_mismatch",
+        "owner_session_mismatch",
+        "owner_identity_active_session_mismatch",
+        "unexpected_external_scope_id",
+    ],
+)
+def test_preflight_public_project_owner_binding_tampering_fails_closed(
+    corruption: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from security.mission_authorization import MissionAuthorizationSnapshot
+
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+
+    def tamper_owner_binding(mission: Mission) -> None:
+        if corruption == "authorization_owner_approval_mismatch":
+            authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+            mission.authorization_snapshot = replace(
+                authorization,
+                owner_approval="unrelated-owner-proof",
+                authorization_hash="",
+            ).to_dict()
+        elif corruption == "authorization_hash_mismatch":
+            mission.authorization_snapshot["allowed_tools"] = ["status"]
+        elif corruption == "authorization_allowed_tools_expanded":
+            authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+            mission.authorization_snapshot = replace(
+                authorization,
+                allowed_tools=(*authorization.allowed_tools, "watch"),
+                authorization_hash="",
+            ).to_dict()
+        elif corruption == "authorization_allowed_actions_expanded":
+            authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+            mission.authorization_snapshot = replace(
+                authorization,
+                allowed_actions=(*authorization.allowed_actions, "watch"),
+                authorization_hash="",
+            ).to_dict()
+        elif corruption == "owner_evidence_request_mismatch":
+            mission.authorization_context["owner_evidence"]["request_id"] = "different-request"
+        elif corruption == "owner_session_mismatch":
+            mission.authorization_context["session_id"] = "different-session"
+        elif corruption == "owner_identity_active_session_mismatch":
+            authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+            mission.owner_identity_ref = "owner:2"
+            mission.authorization_snapshot = replace(
+                authorization,
+                owner_identity="owner:2",
+                authorization_hash="",
+            ).to_dict()
+        elif corruption == "unexpected_external_scope_id":
+            mission.authorization_context["scope_snapshot_id"] = "unrelated-scope"
+
+    tampered = _resign_preflight_snapshot(
+        public_scope_snapshot,
+        mutate_mission=tamper_owner_binding,
+    )
+    basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+def test_preflight_public_project_basis_requires_active_owner_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import security.owner_password as owner_password
+
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    monkeypatch.setattr(owner_password, "resolve_session", lambda _session_id: None)
+
+    basis = windows_acceptance._mission_restart_basis(
+        public_scope_snapshot,
+        mission_id,
+        **expected_binding,
+    )
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+def test_preflight_public_project_basis_requires_project_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from security.mission_authorization import MissionAuthorizationSnapshot
+
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    workspace_file = tmp_path / "not-a-workspace-directory"
+    workspace_file.write_text("not a project directory", encoding="utf-8")
+
+    def point_both_records_at_file(mission: Mission) -> None:
+        authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+        mission.scope_snapshot["workspace_root"] = str(workspace_file)
+        mission.authorization_snapshot = replace(
+            authorization,
+            workspace_boundary={"root": str(workspace_file)},
+            authorization_hash="",
+        ).to_dict()
+
+    tampered = _resign_preflight_snapshot(
+        public_scope_snapshot,
+        mutate_mission=point_both_records_at_file,
+    )
+    expected_binding["expected_project_root"] = workspace_file
+    basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_current_result",
+        "missing_result_ledger",
+        "success_claimed",
+        "duplicate_current_result",
+        "cross_ledger_duplicate",
+        "wrong_call_binding",
+        "wrong_step_binding",
+        "wrong_result_name",
+        "changed_arguments",
+        "wrong_scope_context_binding",
+        "empty_scope_context_binding",
+        "empty_authorization_context_binding",
+        "wrong_error",
+        "nonempty_result",
+        "positive_dispatch_marker",
+        "string_dispatch_marker",
+        "integer_success_marker",
+        "orphan_missing_tool_call_id",
+        "orphan_missing_name",
+        "orphan_missing_run_identity",
+    ],
+)
+def test_preflight_model_turn_tool_result_must_match_failed_attempt(
+    corruption: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source="model_turn",
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    identity_field = {
+        "empty_scope_context_binding": "scope_snapshot_id",
+        "empty_authorization_context_binding": "authorization_context_id",
+    }.get(corruption)
+    proposal_call_id = (
+        public_scope_snapshot["status"]["progress"]["model_loop"]["tool_results"][0]["tool_call_id"]
+    )
+
+    def corrupt_proposal_event(event: dict) -> dict:
+        data = event.get("data")
+        if (
+            identity_field
+            and event.get("event") == "ToolProposed"
+            and isinstance(data, dict)
+            and data.get("tool_call_id") == proposal_call_id
+        ):
+            event["data"] = {**data, identity_field: ""}
+        return event
+
+    def corrupt_tool_result(mission: Mission) -> None:
+        model_loop = mission.progress["model_loop"]
+        records = model_loop["tool_results"]
+        if corruption == "missing_current_result":
+            records.clear()
+        elif corruption == "missing_result_ledger":
+            model_loop.pop("tool_results")
+        elif corruption == "success_claimed":
+            records[0]["ok"] = True
+        elif corruption == "duplicate_current_result":
+            records.append(dict(records[0]))
+        elif corruption == "cross_ledger_duplicate":
+            mission.progress["tool_results"] = [dict(records[0])]
+        elif corruption == "wrong_call_binding":
+            records[0]["tool_call_id"] = "unrelated-call"
+        elif corruption == "wrong_step_binding":
+            records[0]["step_id"] = "unrelated-step"
+        elif corruption == "wrong_result_name":
+            records[0]["name"] = "workspace_read"
+        elif corruption == "changed_arguments":
+            records[0]["arguments"] = {"query": "altered-fixture"}
+        elif corruption == "wrong_scope_context_binding":
+            records[0]["scope_snapshot_id"] = "unrelated-scope"
+        elif corruption in {"empty_scope_context_binding", "empty_authorization_context_binding"}:
+            field = (
+                "scope_snapshot_id"
+                if corruption == "empty_scope_context_binding"
+                else "authorization_context_id"
+            )
+            records[0][field] = ""
+        elif corruption == "wrong_error":
+            records[0]["error"] = "process_sandbox_unavailable_but_dispatched"
+        elif corruption == "nonempty_result":
+            records[0]["result"] = {"process_started": True}
+        elif corruption == "positive_dispatch_marker":
+            records[0]["dispatch_attempted"] = True
+        elif corruption == "string_dispatch_marker":
+            records[0]["dispatch_attempted"] = "true"
+        elif corruption == "integer_success_marker":
+            records[0]["success"] = 1
+        elif corruption in {
+            "orphan_missing_tool_call_id",
+            "orphan_missing_name",
+            "orphan_missing_run_identity",
+        }:
+            orphan = dict(records[0])
+            orphan.update(
+                run_id="unrelated-run",
+                turn_id="unrelated-turn",
+                action_id="unrelated-action",
+                step_id="unrelated-step",
+                tool_call_id="unrelated-call",
+                name="unrelated_tool",
+            )
+            if corruption == "orphan_missing_tool_call_id":
+                orphan.pop("tool_call_id")
+            elif corruption == "orphan_missing_name":
+                orphan.pop("name")
+            else:
+                orphan.pop("run_id")
+            records.append(orphan)
+
+    tampered = _resign_preflight_snapshot(
+        public_scope_snapshot,
+        mutate_mission=corrupt_tool_result,
+        event_transform=corrupt_proposal_event if identity_field else None,
+    )
+    basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+@pytest.mark.parametrize("location", ["top_level", "progress", "model_loop"])
+def test_preflight_rejects_explicit_null_tool_result_ledger(
+    location: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source="model_turn",
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    if location == "top_level":
+        tampered = json.loads(json.dumps(public_scope_snapshot))
+        tampered["status"]["tool_results"] = None
+    else:
+        def set_null_tool_results(mission: Mission) -> None:
+            if location == "progress":
+                mission.progress["tool_results"] = None
+            else:
+                mission.progress["model_loop"]["tool_results"] = None
+
+        tampered = _resign_preflight_snapshot(
+            public_scope_snapshot,
+            mutate_mission=set_null_tool_results,
+        )
+
+    basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+def test_model_scope_identity_is_content_bound_for_public_local_scope() -> None:
+    from types import SimpleNamespace
+
+    from agent.mission_runtime import _model_scope_snapshot_identity
+
+    scope = {
+        "target_id": "local-project:identity-test",
+        "workspace_root": "/tmp/identity-test",
+        "scope": ["workspace"],
+        "allowed_tools": ["run_project_tests"],
+        "allowed_networks": [],
+        "allowed_credentials": [],
+    }
+    mission = SimpleNamespace(scope_snapshot=scope)
+    no_external_scope = SimpleNamespace(scope_snapshot=None)
+    expected = f"public-local-project-scope:{windows_acceptance._canonical_sha256(scope)}"
+    assert _model_scope_snapshot_identity(mission, no_external_scope) == expected
+
+    changed_scope = {**scope, "allowed_networks": ["*"]}
+    assert _model_scope_snapshot_identity(
+        SimpleNamespace(scope_snapshot=changed_scope), no_external_scope
+    ) != expected
+
+    persisted_scope = SimpleNamespace(snapshot_id="persisted-owner-scope-1")
+    assert _model_scope_snapshot_identity(
+        mission,
+        SimpleNamespace(scope_snapshot=persisted_scope),
+    ) == "persisted-owner-scope-1"
+
+
+def test_preflight_model_turn_rejects_untrusted_top_level_tool_result_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source="model_turn",
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    tampered = json.loads(json.dumps(public_scope_snapshot))
+    result_record = tampered["status"]["progress"]["model_loop"]["tool_results"][0]
+    tampered["status"]["tool_results"] = [{**result_record, "ok": True}]
+
+    basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+def test_preflight_projection_requires_and_validates_effect_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+
+    missing_effects = json.loads(json.dumps(public_scope_snapshot))
+    missing_effects.pop("effects")
+    assert windows_acceptance._mission_restart_basis(
+        missing_effects, mission_id, **expected_binding
+    )["status"] == "BLOCKED"
+
+    blocked_action_effect = json.loads(json.dumps(public_scope_snapshot))
+    request_id = blocked_action_effect["status"]["request_id"]
+    blocked_action_effect["effects"] = [
+        _preflight_effect_inspection(mission_id, request_id, "run_project_tests")
+    ]
+    assert windows_acceptance._mission_restart_basis(
+        blocked_action_effect, mission_id, **expected_binding
+    )["status"] == "BLOCKED"
+
+    unresolved_effect = json.loads(json.dumps(public_scope_snapshot))
+    unresolved = _preflight_effect_inspection(
+        mission_id,
+        unresolved_effect["status"]["request_id"],
+        "workspace_read",
+    )
+    unresolved["state"] = "AMBIGUOUS"
+    unresolved["requires_reconciliation"] = True
+    unresolved_effect["effects"] = [unresolved]
+    assert windows_acceptance._mission_restart_basis(
+        unresolved_effect, mission_id, **expected_binding
+    )["status"] == "BLOCKED"
+
+
+def test_preflight_reconciliation_binds_effect_and_tool_result_ledgers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source="model_turn",
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    request_id = public_scope_snapshot["status"]["request_id"]
+    before = json.loads(json.dumps(public_scope_snapshot))
+    before["effects"] = [_preflight_effect_inspection(mission_id, request_id, "workspace_read")]
+    after = json.loads(json.dumps(before))
+    after["effects"][0]["updated_at"] = "2026-10-17T00:00:01+00:00"
+
+    before_basis = windows_acceptance._mission_restart_basis(before, mission_id, **expected_binding)
+    after_basis = windows_acceptance._mission_restart_basis(after, mission_id, **expected_binding)
+    reconciliation = windows_acceptance._mission_preflight_block_reconciliation(
+        before, after, mission_id, **expected_binding
+    )
+    assert before_basis["status"] == after_basis["status"] == "VERIFIED"
+    assert reconciliation["reconciled"] is False
+    assert "effects_sha256" in reconciliation["mismatched_fields"]
+
+
+def test_preflight_accepts_bound_external_effect_reconciliation_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source="model_turn",
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    request_id = public_scope_snapshot["status"]["request_id"]
+    effect = _preflight_effect_inspection(mission_id, request_id, "workspace_read")
+    reconciled_result = {
+        "tool_call_id": "prior-reconciled-call",
+        "name": "workspace_read",
+        "arguments": {},
+        "ok": True,
+        "result": {
+            "type": "external_effect_reconciled",
+            "effect_id": effect["effect_id"],
+            "effect_state": "SUCCEEDED",
+        },
+        "error": "",
+        "mission_id": mission_id,
+        "request_id": request_id,
+        "plan_version": 1,
+        "step_id": effect["task_id"],
+    }
+
+    def append_reconciled_result(mission: Mission) -> None:
+        reconciled_result["plan_version"] = mission.plan.version
+        mission.progress["model_loop"]["tool_results"].append(dict(reconciled_result))
+
+    snapshot = _resign_preflight_snapshot(
+        public_scope_snapshot,
+        mutate_mission=append_reconciled_result,
+    )
+    snapshot["effects"] = [effect]
+
+    basis = windows_acceptance._mission_restart_basis(snapshot, mission_id, **expected_binding)
+    assert basis["status"] == "VERIFIED"
+    assert basis["kind"] == "PREFLIGHT_BLOCK"
+
+
+@pytest.mark.parametrize("corruption", ["missing_effect", "effect_state_mismatch"])
+def test_preflight_rejects_unbound_external_effect_reconciliation_result(
+    corruption: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source="model_turn",
+    )
+    public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    request_id = public_scope_snapshot["status"]["request_id"]
+    effect = _preflight_effect_inspection(mission_id, request_id, "workspace_read")
+    reconciled_result = {
+        "tool_call_id": "prior-reconciled-call",
+        "name": "workspace_read",
+        "arguments": {},
+        "ok": True,
+        "result": {
+            "type": "external_effect_reconciled",
+            "effect_id": effect["effect_id"],
+            "effect_state": "SUCCEEDED",
+        },
+        "error": "",
+        "mission_id": mission_id,
+        "request_id": request_id,
+        "plan_version": 1,
+        "step_id": effect["task_id"],
+    }
+    effects = [effect]
+    if corruption == "missing_effect":
+        effects = []
+    else:
+        reconciled_result["ok"] = False
+        reconciled_result["error"] = "OWNER_CONFIRMED_NO_EFFECT"
+        reconciled_result["result"]["effect_state"] = "FAILED"
+
+    def append_reconciled_result(mission: Mission) -> None:
+        reconciled_result["plan_version"] = mission.plan.version
+        mission.progress["model_loop"]["tool_results"].append(dict(reconciled_result))
+
+    snapshot = _resign_preflight_snapshot(
+        public_scope_snapshot,
+        mutate_mission=append_reconciled_result,
+    )
+    snapshot["effects"] = effects
+
+    basis = windows_acceptance._mission_restart_basis(snapshot, mission_id, **expected_binding)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+def test_external_scope_restart_basis_requires_active_owner_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import security.owner_password as owner_password
+
+    mission_id, _ready_snapshot, external_scope_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(owner_password, "resolve_session", lambda _session_id: None)
+
+    basis = windows_acceptance._mission_restart_basis(external_scope_snapshot, mission_id)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+def test_external_scope_cannot_satisfy_project_bound_restart_basis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, external_scope_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    public_snapshot_for_binding = _public_project_scope_snapshot(external_scope_snapshot)
+    expected_binding = _public_project_expected_binding(public_snapshot_for_binding)
+
+    basis = windows_acceptance._mission_restart_basis(
+        external_scope_snapshot,
+        mission_id,
+        **expected_binding,
+    )
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
 def test_preflight_block_is_restart_basis_only_and_reconciles_durable_owner_scope(tmp_path, monkeypatch):
     mission_id, ready_snapshot, before_restart = _durable_preflight_acceptance_snapshots(
         tmp_path,
@@ -4168,6 +4934,15 @@ def test_preflight_restart_basis_rejects_reason_kind_mismatch(
         "evidence_endpoint_mismatch",
         "observation_process_start_confirmed",
         "observation_nested_process_start_confirmed",
+        "observation_success_integer",
+        "observation_dispatch_string",
+        "observation_nested_process_started_integer",
+        "observation_ok_integer",
+        "observation_nested_ok_string",
+        "observation_nested_status_success",
+        "observation_nested_status_ok",
+        "observation_nested_status_verified",
+        "action_nested_success_string",
         "action_root_process_start_confirmed",
         "action_root_normalized_data_process_start_confirmed",
         "duplicate_failure_same_action",
@@ -4235,6 +5010,24 @@ def test_preflight_restart_basis_fails_closed_for_missing_corrupt_or_expanded_re
         corrupted["status"]["action_history"][0]["observation"]["process_start_confirmed"] = True
     elif corruption == "observation_nested_process_start_confirmed":
         corrupted["status"]["action_history"][0]["observation"]["observation"]["normalized_data"]["process_start_confirmed"] = True
+    elif corruption == "observation_success_integer":
+        corrupted["status"]["action_history"][0]["observation"]["success"] = 1
+    elif corruption == "observation_dispatch_string":
+        corrupted["status"]["action_history"][0]["observation"]["dispatch_attempted"] = "false"
+    elif corruption == "observation_nested_process_started_integer":
+        corrupted["status"]["action_history"][0]["observation"]["observation"]["normalized_data"]["process_started"] = 0
+    elif corruption == "observation_ok_integer":
+        corrupted["status"]["action_history"][0]["observation"]["ok"] = 1
+    elif corruption == "observation_nested_ok_string":
+        corrupted["status"]["action_history"][0]["observation"]["observation"]["normalized_data"]["ok"] = "false"
+    elif corruption == "observation_nested_status_success":
+        corrupted["status"]["action_history"][0]["observation"]["observation"]["status"] = "success"
+    elif corruption == "observation_nested_status_ok":
+        corrupted["status"]["action_history"][0]["observation"]["observation"]["status"] = "ok"
+    elif corruption == "observation_nested_status_verified":
+        corrupted["status"]["action_history"][0]["observation"]["observation"]["status"] = "verified"
+    elif corruption == "action_nested_success_string":
+        corrupted["status"]["action_history"][0]["normalized_data"] = {"success": "false"}
     elif corruption == "action_root_process_start_confirmed":
         corrupted["status"]["action_history"][0]["process_start_confirmed"] = True
     elif corruption == "action_root_normalized_data_process_start_confirmed":
@@ -4461,12 +5254,20 @@ def test_live_restart_candidate_snapshot_includes_status_evidence(
         monkeypatch,
     )
     status = audit_snapshot["status"]
-    candidate = windows_acceptance._mission_restart_candidate_snapshot(
+    candidate_without_effects = windows_acceptance._mission_restart_candidate_snapshot(
         status,
         audit_snapshot["full_execution_chain"],
         audit_snapshot["full_execution_chain_status"],
     )
-    assert candidate["evidence"] == status["evidence"]
+    assert candidate_without_effects["evidence"] == status["evidence"]
+    assert windows_acceptance._mission_restart_basis(candidate_without_effects, mission_id)["status"] == "BLOCKED"
+    candidate = windows_acceptance._mission_restart_candidate_snapshot(
+        status,
+        audit_snapshot["full_execution_chain"],
+        audit_snapshot["full_execution_chain_status"],
+        effects=audit_snapshot["effects"],
+    )
+    assert candidate["effects"] == audit_snapshot["effects"]
     assert windows_acceptance._mission_restart_basis(candidate, mission_id)["status"] == "VERIFIED"
 
     status_without_evidence = dict(status)

@@ -36,6 +36,34 @@ MAX_VERIFIED_FINAL_OUTPUT_CHARS = 2048
 VERIFIED_FINAL_MAX_TOKENS = 128
 
 
+def _model_scope_snapshot_identity(mission: Mission, auth_context: Any) -> str:
+    """Return the persisted scope identity used to bind model tool records.
+
+    Public local-project Missions have no external ScopeSnapshot row. In that
+    case, bind proposals to the canonical digest of the Mission's persisted
+    scope context; this is an identifier only and grants no authority.
+    """
+    scope_snapshot = getattr(auth_context, "scope_snapshot", None) if auth_context is not None else None
+    external_scope_id = getattr(scope_snapshot, "snapshot_id", "")
+    if isinstance(external_scope_id, str) and external_scope_id.strip():
+        return external_scope_id
+    mission_scope = getattr(mission, "scope_snapshot", None)
+    if not isinstance(mission_scope, dict) or not mission_scope:
+        return ""
+    try:
+        encoded = json.dumps(
+            mission_scope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError, UnicodeError):
+        return ""
+    return f"public-local-project-scope:{digest}"
+
+
 class _MissionBudgetExceeded(RuntimeError):
     def __init__(self, budget: str, limit: int) -> None:
         super().__init__(budget)
@@ -469,7 +497,7 @@ class MissionRuntime:
 
         historical_ids, action_ids, tool_counts, prior_call_count = self._history_for_preflight(progress)
         context_id = str(getattr(auth_context, "owner_evidence_fingerprint", "") or "") if auth_context is not None else ""
-        scope_id = str(getattr(getattr(auth_context, "scope_snapshot", None), "snapshot_id", "") or "") if auth_context is not None else ""
+        scope_id = _model_scope_snapshot_identity(mission, auth_context)
         expected_step_id = str(getattr(current_step, "step_id", "") or "")
         current_ids: set[str] = set()
         current_actions: set[str] = set()
