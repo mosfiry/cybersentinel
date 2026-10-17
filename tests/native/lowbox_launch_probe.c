@@ -31,6 +31,48 @@ typedef NTSTATUS (NTAPI *PFN_NT_CREATE_LOW_BOX_TOKEN)(
     PHANDLE, HANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PSID, ULONG,
     PSID_AND_ATTRIBUTES, ULONG, HANDLE *);
 typedef ULONG (NTAPI *PFN_RTL_NT_STATUS_TO_DOS_ERROR)(NTSTATUS);
+typedef NTSTATUS (NTAPI *PFN_NT_QUERY_OBJECT)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+
+typedef struct ProbeObjectBasicInformation {
+    ULONG Attributes;
+    ACCESS_MASK GrantedAccess;
+    ULONG HandleCount;
+    ULONG PointerCount;
+    ULONG Reserved[10];
+} ProbeObjectBasicInformation;
+
+#define MAX_QUERY_RECORDS 16
+#define QUERY_VALUE_CAPACITY 4096
+
+typedef struct QueryRecord {
+    const char *name;
+    ULONG info_class;
+    DWORD buffer_size;
+    DWORD win32_error;
+    BOOL win32_error_set;
+    ULONG ntstatus;
+    BOOL ntstatus_set;
+    DWORD returned_length;
+    BOOL success;
+    char validation[16];
+    char value[QUERY_VALUE_CAPACITY];
+} QueryRecord;
+
+typedef struct TokenObservation {
+    QueryRecord records[MAX_QUERY_RECORDS];
+    DWORD count;
+} TokenObservation;
+
+typedef struct InputHandleObservation {
+    ULONG info_class;
+    ULONG buffer_size;
+    ULONG returned_length;
+    ULONG ntstatus;
+    BOOL ntstatus_set;
+    ACCESS_MASK granted_access;
+    BOOL success;
+    char validation[16];
+} InputHandleObservation;
 
 typedef struct TokenFacts {
     BOOL app_container;
@@ -67,6 +109,14 @@ typedef struct ProbeReport {
     DWORD wait_win32;
     DWORD child_exit_code;
     DWORD cleanup_error;
+    TokenObservation pretoken_observation;
+    TokenObservation lowbox_observation;
+    TokenObservation child_observation;
+    TokenObservation thread_token_observation;
+    InputHandleObservation input_handle_observation;
+    BOOL thread_token_checked;
+    BOOL thread_token_present;
+    DWORD thread_token_win32;
 } ProbeReport;
 
 static BOOL append_environment(wchar_t *buffer, size_t capacity, wchar_t **cursor,
@@ -88,55 +138,120 @@ static void set_first_error(DWORD *target, DWORD error)
     if (*target == ERROR_SUCCESS && error != ERROR_SUCCESS) *target = error;
 }
 
-static BOOL read_token_bool(HANDLE token, TOKEN_INFORMATION_CLASS info_class, BOOL *value, DWORD *error)
+static QueryRecord *new_query_record(TokenObservation *observation, const char *name, ULONG info_class)
 {
-    DWORD raw = 0;
-    DWORD returned = 0;
-    if (!GetTokenInformation(token, info_class, &raw, sizeof(raw), &returned)) {
-        *error = GetLastError();
+    QueryRecord *record;
+    if (observation->count >= MAX_QUERY_RECORDS) return NULL;
+    record = &observation->records[observation->count++];
+    ZeroMemory(record, sizeof(*record));
+    record->name = name;
+    record->info_class = info_class;
+    return record;
+}
+
+static void set_query_validation(QueryRecord *record, BOOL valid)
+{
+    if (record) (void)strcpy_s(record->validation, sizeof(record->validation), valid ? "valid" : "invalid");
+}
+
+static BOOL sid_within_buffer(const BYTE *buffer, DWORD returned, PSID sid)
+{
+    ULONG_PTR start = (ULONG_PTR)buffer, address = (ULONG_PTR)sid, offset;
+    const BYTE *bytes;
+    DWORD length;
+    if (!sid || address < start) return FALSE;
+    offset = address - start;
+    if (offset > returned || returned - offset < 8U) return FALSE;
+    bytes = buffer + offset;
+    if (bytes[1] > SID_MAX_SUB_AUTHORITIES) return FALSE;
+    length = 8U + (DWORD)bytes[1] * (DWORD)sizeof(DWORD);
+    return length <= returned - offset && IsValidSid(sid);
+}
+
+static BOOL observed_get_token_information(HANDLE token, TokenObservation *observation,
+        const char *name, TOKEN_INFORMATION_CLASS info_class, void *buffer, DWORD buffer_size,
+        DWORD *returned, QueryRecord **record_out)
+{
+    QueryRecord *record = new_query_record(observation, name, (ULONG)info_class);
+    BOOL ok;
+    DWORD error = ERROR_SUCCESS;
+    *returned = 0;
+    SetLastError(ERROR_SUCCESS);
+    ok = GetTokenInformation(token, info_class, buffer, buffer_size, returned);
+    if (!ok) error = GetLastError();
+    if (record) {
+        record->buffer_size = buffer_size;
+        record->returned_length = *returned;
+        record->success = ok;
+        record->win32_error = error;
+        record->win32_error_set = !ok;
+        if (!buffer) (void)strcpy_s(record->validation, sizeof(record->validation), "not_applicable");
+        else if (ok) (void)strcpy_s(record->validation, sizeof(record->validation), "valid");
+    }
+    if (record_out) *record_out = record;
+    return ok;
+}
+
+static BOOL read_token_bool(HANDLE token, TokenObservation *observation,
+        TOKEN_INFORMATION_CLASS info_class, const char *name, BOOL *value, DWORD *error)
+{
+    DWORD raw = 0, returned = 0;
+    QueryRecord *record = NULL;
+    if (!observed_get_token_information(token, observation, name, info_class,
+            &raw, sizeof(raw), &returned, &record)) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
         return FALSE;
     }
+    if (returned != sizeof(raw)) { set_query_validation(record, FALSE); *error = ERROR_INVALID_DATA; return FALSE; }
     *value = raw != 0;
+    if (record) (void)sprintf_s(record->value, sizeof(record->value), "%s", raw ? "true" : "false");
     return TRUE;
 }
 
-static BOOL read_integrity(HANDLE token, BOOL *is_low, DWORD *error)
+static BOOL read_integrity(HANDLE token, TokenObservation *observation, BOOL *is_low, DWORD *error)
 {
-    DWORD needed = 0;
+    DWORD needed = 0, returned = 0;
     BYTE *buffer = NULL;
     TOKEN_MANDATORY_LABEL *label;
     SID_IDENTIFIER_AUTHORITY mandatory_authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+    QueryRecord *record = NULL;
     BOOL ok = FALSE;
     *is_low = FALSE;
-    SetLastError(ERROR_SUCCESS);
-    if (GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &needed)) {
+    if (observed_get_token_information(token, observation, "TokenIntegrityLevel", TokenIntegrityLevel,
+            NULL, 0, &needed, &record)) {
         *error = ERROR_INVALID_DATA;
         return FALSE;
     }
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(TOKEN_MANDATORY_LABEL)) {
-        *error = GetLastError();
-        if (*error == ERROR_SUCCESS) *error = ERROR_INVALID_DATA;
+    if (!record || record->win32_error != ERROR_INSUFFICIENT_BUFFER) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
+        return FALSE;
+    }
+    if (needed < sizeof(TOKEN_MANDATORY_LABEL)) {
+        *error = ERROR_INVALID_DATA;
         return FALSE;
     }
     buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-    if (!buffer) {
-        *error = ERROR_NOT_ENOUGH_MEMORY;
-        return FALSE;
-    }
-    if (!GetTokenInformation(token, TokenIntegrityLevel, buffer, needed, &needed)) {
-        *error = GetLastError();
+    if (!buffer) { *error = ERROR_NOT_ENOUGH_MEMORY; return FALSE; }
+    if (!observed_get_token_information(token, observation, "TokenIntegrityLevel", TokenIntegrityLevel,
+            buffer, needed, &returned, &record)) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
         goto done;
     }
+    if (returned > needed || returned < sizeof(*label)) { set_query_validation(record, FALSE); *error = ERROR_INVALID_DATA; goto done; }
     label = (TOKEN_MANDATORY_LABEL *)buffer;
-    if (!label->Label.Sid || !IsValidSid(label->Label.Sid) ||
+    if (!sid_within_buffer(buffer, returned, label->Label.Sid) ||
         *GetSidSubAuthorityCount(label->Label.Sid) != 1 ||
         memcmp(GetSidIdentifierAuthority(label->Label.Sid), &mandatory_authority,
                sizeof(mandatory_authority)) != 0) {
+        set_query_validation(record, FALSE);
         *error = ERROR_INVALID_DATA;
         goto done;
     }
-    *is_low = *GetSidSubAuthority(label->Label.Sid,
-        (DWORD)(*GetSidSubAuthorityCount(label->Label.Sid) - 1)) == SECURITY_MANDATORY_LOW_RID;
+    {
+        DWORD rid = *GetSidSubAuthority(label->Label.Sid, 0);
+        *is_low = rid == SECURITY_MANDATORY_LOW_RID;
+        if (record) (void)sprintf_s(record->value, sizeof(record->value), "%lu", (unsigned long)rid);
+    }
     ok = TRUE;
     *error = ERROR_SUCCESS;
 done:
@@ -144,16 +259,44 @@ done:
     return ok;
 }
 
-static BOOL read_zero_capabilities(HANDLE token, BOOL *zero, DWORD *error)
+static BOOL append_sid_group_value(char *out, size_t capacity, size_t *used,
+        PSID sid, DWORD attributes, BOOL first)
 {
-    DWORD needed = 0;
+    LPSTR sid_text = NULL;
+    int written;
+    BOOL ok = FALSE;
+    if (!ConvertSidToStringSidA(sid, &sid_text)) return FALSE;
+    written = _snprintf_s(out + *used, capacity - *used, _TRUNCATE,
+        "%s{\"sid\":\"%s\",\"attributes\":%lu}", first ? "" : ",",
+        sid_text, (unsigned long)attributes);
+    if (written >= 0) { *used += (size_t)written; ok = TRUE; }
+    LocalFree(sid_text);
+    return ok;
+}
+
+static BOOL read_zero_capabilities(HANDLE token, TokenObservation *observation,
+        BOOL *zero, DWORD *error)
+{
+    DWORD needed = 0, returned = 0, i;
     BYTE *buffer = NULL;
     TOKEN_GROUPS *groups;
+    QueryRecord *record = NULL;
     BOOL ok = FALSE;
     *zero = FALSE;
-    SetLastError(ERROR_SUCCESS);
-    if (GetTokenInformation(token, TokenCapabilities, NULL, 0, &needed)) {
+    if (observed_get_token_information(token, observation, "TokenCapabilities", TokenCapabilities,
+            NULL, 0, &needed, &record)) {
+        QueryRecord *empty_record = NULL;
         if (needed == 0) {
+            if (!observed_get_token_information(token, observation, "TokenCapabilities", TokenCapabilities,
+                    NULL, 0, &returned, &empty_record)) {
+                *error = empty_record ? empty_record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
+                return FALSE;
+            }
+            if (returned != 0) { set_query_validation(empty_record, FALSE); *error = ERROR_INVALID_DATA; return FALSE; }
+            if (empty_record) {
+                (void)strcpy_s(empty_record->value, sizeof(empty_record->value), "[]");
+                set_query_validation(empty_record, TRUE);
+            }
             *zero = TRUE;
             *error = ERROR_SUCCESS;
             return TRUE;
@@ -161,27 +304,44 @@ static BOOL read_zero_capabilities(HANDLE token, BOOL *zero, DWORD *error)
         *error = ERROR_INVALID_DATA;
         return FALSE;
     }
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < offsetof(TOKEN_GROUPS, Groups)) {
-        *error = GetLastError();
-        if (*error == ERROR_SUCCESS) *error = ERROR_INVALID_DATA;
+    if (!record || record->win32_error != ERROR_INSUFFICIENT_BUFFER) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
         return FALSE;
     }
+    if (needed < offsetof(TOKEN_GROUPS, Groups)) { *error = ERROR_INVALID_DATA; return FALSE; }
     buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-    if (!buffer) {
-        *error = ERROR_NOT_ENOUGH_MEMORY;
-        return FALSE;
-    }
-    if (!GetTokenInformation(token, TokenCapabilities, buffer, needed, &needed)) {
-        *error = GetLastError();
+    if (!buffer) { *error = ERROR_NOT_ENOUGH_MEMORY; return FALSE; }
+    if (!observed_get_token_information(token, observation, "TokenCapabilities", TokenCapabilities,
+            buffer, needed, &returned, &record)) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
         goto done;
     }
     groups = (TOKEN_GROUPS *)buffer;
-    if (needed < offsetof(TOKEN_GROUPS, Groups) ||
-        groups->GroupCount > (needed - offsetof(TOKEN_GROUPS, Groups)) / sizeof(SID_AND_ATTRIBUTES)) {
+    if (returned > needed || returned < offsetof(TOKEN_GROUPS, Groups) ||
+        groups->GroupCount > (returned - offsetof(TOKEN_GROUPS, Groups)) / sizeof(SID_AND_ATTRIBUTES)) {
+        set_query_validation(record, FALSE);
         *error = ERROR_INVALID_DATA;
         goto done;
     }
     *zero = groups->GroupCount == 0;
+    if (record) {
+        size_t used = 1;
+        record->value[0] = '[';
+        record->value[1] = '\0';
+        for (i = 0; i < groups->GroupCount; ++i) {
+            if (!sid_within_buffer(buffer, returned, groups->Groups[i].Sid) ||
+                !append_sid_group_value(record->value, sizeof(record->value), &used,
+                    groups->Groups[i].Sid, groups->Groups[i].Attributes, i == 0)) {
+                record->value[0] = '\0';
+                set_query_validation(record, FALSE);
+                *error = ERROR_INVALID_DATA;
+                goto done;
+            }
+        }
+        if (used + 2 > sizeof(record->value)) { set_query_validation(record, FALSE); *error = ERROR_INSUFFICIENT_BUFFER; goto done; }
+        record->value[used++] = ']';
+        record->value[used] = '\0';
+    }
     *error = *zero ? ERROR_SUCCESS : ERROR_INVALID_TOKEN;
     ok = TRUE;
 done:
@@ -189,73 +349,312 @@ done:
     return ok;
 }
 
-static TokenFacts inspect_token(HANDLE token)
+static BOOL read_token_type(HANDLE token, TokenObservation *observation, DWORD *type_out, DWORD *error)
+{
+    TOKEN_TYPE type = TokenPrimary;
+    DWORD returned = 0;
+    QueryRecord *record = NULL;
+    if (!observed_get_token_information(token, observation, "TokenType", TokenType,
+            &type, sizeof(type), &returned, &record)) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
+        return FALSE;
+    }
+    if (returned != sizeof(type) || (type != TokenPrimary && type != TokenImpersonation)) {
+        set_query_validation(record, FALSE); *error = ERROR_INVALID_DATA; return FALSE;
+    }
+    *type_out = (DWORD)type;
+    if (record) (void)sprintf_s(record->value, sizeof(record->value), "%lu", (unsigned long)*type_out);
+    return TRUE;
+}
+
+static BOOL read_token_privileges(HANDLE token, TokenObservation *observation, DWORD *error)
+{
+    DWORD needed = 0, returned = 0, i;
+    BYTE *buffer;
+    TOKEN_PRIVILEGES *privileges;
+    QueryRecord *record = NULL;
+    size_t used = 1;
+    if (observed_get_token_information(token, observation, "TokenPrivileges", TokenPrivileges,
+            NULL, 0, &needed, &record)) { *error = ERROR_INVALID_DATA; return FALSE; }
+    if (!record || record->win32_error != ERROR_INSUFFICIENT_BUFFER) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
+        return FALSE;
+    }
+    if (needed < sizeof(DWORD)) { *error = ERROR_INVALID_DATA; return FALSE; }
+    buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+    if (!buffer) { *error = ERROR_NOT_ENOUGH_MEMORY; return FALSE; }
+    if (!observed_get_token_information(token, observation, "TokenPrivileges", TokenPrivileges,
+            buffer, needed, &returned, &record)) {
+        *error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
+        HeapFree(GetProcessHeap(), 0, buffer);
+        return FALSE;
+    }
+    privileges = (TOKEN_PRIVILEGES *)buffer;
+    if (returned > needed || returned < sizeof(DWORD) || privileges->PrivilegeCount >
+            (returned - sizeof(DWORD)) / sizeof(LUID_AND_ATTRIBUTES)) {
+        set_query_validation(record, FALSE);
+        *error = ERROR_INVALID_DATA;
+        HeapFree(GetProcessHeap(), 0, buffer);
+        return FALSE;
+    }
+    if (record) {
+        record->value[0] = '[';
+        record->value[1] = '\0';
+        for (i = 0; i < privileges->PrivilegeCount; ++i) {
+            int n = _snprintf_s(record->value + used, sizeof(record->value) - used, _TRUNCATE,
+                "%s{\"luid_low\":%lu,\"luid_high\":%ld,\"attributes\":%lu}",
+                i ? "," : "", (unsigned long)privileges->Privileges[i].Luid.LowPart,
+                (long)privileges->Privileges[i].Luid.HighPart,
+                (unsigned long)privileges->Privileges[i].Attributes);
+            if (n < 0) { set_query_validation(record, FALSE); *error = ERROR_INSUFFICIENT_BUFFER; HeapFree(GetProcessHeap(), 0, buffer); return FALSE; }
+            used += (size_t)n;
+        }
+        if (used + 2 > sizeof(record->value)) { set_query_validation(record, FALSE); *error = ERROR_INSUFFICIENT_BUFFER; HeapFree(GetProcessHeap(), 0, buffer); return FALSE; }
+        record->value[used++] = ']';
+        record->value[used] = '\0';
+    }
+    *error = ERROR_SUCCESS;
+    HeapFree(GetProcessHeap(), 0, buffer);
+    return TRUE;
+}
+
+static TokenFacts inspect_token(HANDLE token, TokenObservation *observation, BOOL extended_facts)
 {
     TokenFacts facts;
-    DWORD error = ERROR_SUCCESS;
+    DWORD error = ERROR_SUCCESS, ignored = 0;
     facts.app_container = FALSE;
     facts.lpac = FALSE;
     facts.low_integrity = FALSE;
     facts.zero_capabilities = FALSE;
     facts.error = ERROR_SUCCESS;
-    if (!read_token_bool(token, TokenIsAppContainer, &facts.app_container, &error))
-        set_first_error(&facts.error, error);
-    if (!read_token_bool(token, TokenIsLessPrivilegedAppContainer, &facts.lpac, &error))
-        set_first_error(&facts.error, error);
-    if (!read_integrity(token, &facts.low_integrity, &error))
-        set_first_error(&facts.error, error);
-    if (!read_zero_capabilities(token, &facts.zero_capabilities, &error))
-        set_first_error(&facts.error, error);
+    if (!read_token_bool(token, observation, TokenIsAppContainer, "TokenIsAppContainer", &facts.app_container, &error)) set_first_error(&facts.error, error);
+    if (!read_token_bool(token, observation, TokenIsLessPrivilegedAppContainer, "TokenIsLessPrivilegedAppContainer", &facts.lpac, &error)) set_first_error(&facts.error, error);
+    if (!read_integrity(token, observation, &facts.low_integrity, &error)) set_first_error(&facts.error, error);
+    if (!read_zero_capabilities(token, observation, &facts.zero_capabilities, &error)) set_first_error(&facts.error, error);
+    if (extended_facts) {
+        if (!read_token_type(token, observation, &ignored, &error)) set_first_error(&facts.error, error);
+        if (!read_token_privileges(token, observation, &error)) set_first_error(&facts.error, error);
+    }
     return facts;
 }
 
-static int fact_json_value(int known, BOOL value)
+static BOOL facts_satisfy_requirements(const TokenFacts *facts)
 {
-    return known ? (value ? 1 : 0) : -1;
+    return facts->error == ERROR_SUCCESS && facts->app_container && facts->lpac &&
+        facts->low_integrity && facts->zero_capabilities;
 }
 
-static DWORD verify_child_token(HANDLE process, PSID expected_sid)
+static BOOL read_impersonation_level(HANDLE token, TokenObservation *observation)
+{
+    SECURITY_IMPERSONATION_LEVEL level = SecurityAnonymous;
+    DWORD returned = 0;
+    QueryRecord *record = NULL;
+    if (!observed_get_token_information(token, observation, "TokenImpersonationLevel",
+            TokenImpersonationLevel, &level, sizeof(level), &returned, &record)) return FALSE;
+    if (returned != sizeof(level) || level < SecurityAnonymous || level > SecurityDelegation) {
+        set_query_validation(record, FALSE);
+        return FALSE;
+    }
+    if (record) (void)sprintf_s(record->value, sizeof(record->value), "%lu", (unsigned long)level);
+    return TRUE;
+}
+
+static void inspect_effective_thread_token(ProbeReport *report, DWORD *cleanup_error)
 {
     HANDLE token = NULL;
-    DWORD error = ERROR_SUCCESS;
-    DWORD needed = 0;
+    report->thread_token_checked = TRUE;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+        report->thread_token_win32 = GetLastError();
+        return;
+    }
+    report->thread_token_present = TRUE;
+    (void)inspect_token(token, &report->thread_token_observation, TRUE);
+    (void)read_impersonation_level(token, &report->thread_token_observation);
+    if (!CloseHandle(token)) set_first_error(cleanup_error, GetLastError());
+}
+
+static void inspect_input_handle(HANDLE handle, PFN_NT_QUERY_OBJECT query_object,
+        InputHandleObservation *observation)
+{
+    ProbeObjectBasicInformation basic;
+    ULONG returned = 0;
+    NTSTATUS status;
+    ZeroMemory(observation, sizeof(*observation));
+    observation->info_class = 0; /* ObjectBasicInformation */
+    observation->buffer_size = (ULONG)sizeof(basic);
+    (void)strcpy_s(observation->validation, sizeof(observation->validation), "not_applicable");
+    if (!query_object) return;
+    ZeroMemory(&basic, sizeof(basic));
+    status = query_object(handle, (OBJECT_INFORMATION_CLASS)observation->info_class,
+        &basic, observation->buffer_size, &returned);
+    observation->ntstatus = (ULONG)status;
+    observation->ntstatus_set = TRUE;
+    observation->returned_length = returned;
+    if (status >= 0) {
+        observation->success = TRUE;
+        if (returned != sizeof(basic)) {
+            (void)strcpy_s(observation->validation, sizeof(observation->validation), "invalid");
+            return;
+        }
+        (void)strcpy_s(observation->validation, sizeof(observation->validation), "valid");
+        observation->granted_access = basic.GrantedAccess;
+    }
+}
+
+static const char *successful_query_value(const TokenObservation *observation, const char *name)
+{
+    DWORD i;
+    for (i = 0; i < observation->count; ++i) {
+        const QueryRecord *record = &observation->records[i];
+        if (record->success && strcmp(record->validation, "valid") == 0 &&
+            record->name && strcmp(record->name, name) == 0 && record->value[0])
+            return record->value;
+    }
+    return NULL;
+}
+
+static int observed_fact(const TokenObservation *observation, const char *name)
+{
+    const char *value = successful_query_value(observation, name);
+    if (!value) return -1;
+    if (strcmp(name, "TokenIntegrityLevel") == 0)
+        return strtoul(value, NULL, 10) == SECURITY_MANDATORY_LOW_RID ? 1 : 0;
+    if (strcmp(name, "TokenCapabilities") == 0) return strcmp(value, "[]") == 0 ? 1 : 0;
+    return strcmp(value, "true") == 0 ? 1 : 0;
+}
+
+static void emit_query_array(const TokenObservation *observation)
+{
+    DWORD i;
+    putchar('[');
+    for (i = 0; i < observation->count; ++i) {
+        const QueryRecord *record = &observation->records[i];
+        if (i) putchar(',');
+        printf("{\"name\":\"%s\",\"class\":%lu,\"buffer_size\":%lu,\"win32_error\":",
+            record->name ? record->name : "unknown", (unsigned long)record->info_class,
+            (unsigned long)record->buffer_size);
+        if (record->win32_error_set) printf("%lu", (unsigned long)record->win32_error);
+        else printf("null");
+        printf(",\"ntstatus\":");
+        if (record->ntstatus_set) printf("\"0x%08lX\"", (unsigned long)record->ntstatus);
+        else printf("null");
+        printf(",\"returned_length\":%lu,\"success\":%s,\"validation\":",
+            (unsigned long)record->returned_length, record->success ? "true" : "false");
+        if (record->validation[0]) printf("\"%s\"", record->validation);
+        else printf("null");
+        printf(",\"value\":");
+        if (record->success && strcmp(record->validation, "valid") == 0 && record->value[0]) printf("%s", record->value);
+        else printf("null");
+        putchar('}');
+    }
+    putchar(']');
+}
+
+static void emit_token_observation(const TokenObservation *observation, BOOL caller_facts)
+{
+    printf("{");
+    if (caller_facts) {
+        const char *token_type = successful_query_value(observation, "TokenType");
+        const char *integrity_rid = successful_query_value(observation, "TokenIntegrityLevel");
+        const char *privileges = successful_query_value(observation, "TokenPrivileges");
+        printf("\"token_type\":%s,\"integrity_rid\":%s,\"privileges\":%s,",
+            token_type ? token_type : "null", integrity_rid ? integrity_rid : "null",
+            privileges ? privileges : "null");
+    }
+    printf("\"queries\":");
+    emit_query_array(observation);
+    putchar('}');
+}
+
+static void emit_observations(const ProbeReport *r)
+{
+    const InputHandleObservation *input = &r->input_handle_observation;
+    printf(",\"observations\":{\"pretoken\":");
+    emit_token_observation(&r->pretoken_observation, TRUE);
+    printf(",\"lowbox\":");
+    emit_token_observation(&r->lowbox_observation, FALSE);
+    printf(",\"child\":");
+    emit_token_observation(&r->child_observation, FALSE);
+    printf(",\"thread_token\":{\"state\":\"%s\",\"win32_error\":",
+        !r->thread_token_checked ? "not_checked" : r->thread_token_present ? "present" :
+        r->thread_token_win32 == ERROR_NO_TOKEN ? "absent" : "query_error");
+    if (r->thread_token_checked && !r->thread_token_present) printf("%lu", (unsigned long)r->thread_token_win32);
+    else printf("null");
+    printf(",\"queries\":");
+    emit_query_array(&r->thread_token_observation);
+    printf("},\"input_handle\":{\"class\":\"ObjectBasicInformation\",\"info_class\":%lu,\"buffer_size\":%lu,\"win32_error\":null,\"ntstatus\":",
+        (unsigned long)input->info_class, (unsigned long)input->buffer_size);
+    if (input->ntstatus_set) printf("\"0x%08lX\"", (unsigned long)input->ntstatus);
+    else printf("null");
+    printf(",\"returned_length\":%lu,\"success\":%s,\"validation\":",
+        (unsigned long)input->returned_length, input->success ? "true" : "false");
+    if (input->validation[0]) printf("\"%s\"", input->validation);
+    else printf("null");
+    printf(",\"value\":");
+    if (input->success && strcmp(input->validation, "invalid") != 0)
+        printf("%lu", (unsigned long)input->granted_access);
+    else printf("null");
+    printf("}}");
+}
+
+static DWORD query_appcontainer_sid(HANDLE token, TokenObservation *observation,
+        PSID expected_sid, BOOL compare_sid)
+{
+    DWORD needed = 0, returned = 0, error = ERROR_SUCCESS;
     BYTE *buffer = NULL;
-    TokenFacts facts;
     TOKEN_APPCONTAINER_INFORMATION *container_info;
-    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return GetLastError();
-    facts = inspect_token(token);
-    if (facts.error != ERROR_SUCCESS) {
-        error = facts.error;
-        goto done;
-    }
-    if (!facts.app_container || !facts.lpac || !facts.low_integrity || !facts.zero_capabilities) {
-        error = ERROR_INVALID_TOKEN;
-        goto done;
-    }
-    SetLastError(ERROR_SUCCESS);
-    if (GetTokenInformation(token, TokenAppContainerSid, NULL, 0, &needed)) {
-        error = ERROR_INVALID_DATA;
-        goto done;
-    }
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(*container_info)) {
-        error = GetLastError();
-        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
-        goto done;
-    }
+    QueryRecord *record = NULL;
+    if (observed_get_token_information(token, observation, "TokenAppContainerSid", TokenAppContainerSid,
+            NULL, 0, &needed, &record)) return ERROR_INVALID_DATA;
+    if (!record || record->win32_error != ERROR_INSUFFICIENT_BUFFER)
+        return record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
+    if (needed < sizeof(*container_info)) return ERROR_INVALID_DATA;
     buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-    if (!buffer) {
-        error = ERROR_NOT_ENOUGH_MEMORY;
-        goto done;
-    }
-    if (!GetTokenInformation(token, TokenAppContainerSid, buffer, needed, &needed)) {
-        error = GetLastError();
+    if (!buffer) return ERROR_NOT_ENOUGH_MEMORY;
+    if (!observed_get_token_information(token, observation, "TokenAppContainerSid", TokenAppContainerSid,
+            buffer, needed, &returned, &record)) {
+        error = record ? record->win32_error : ERROR_NOT_ENOUGH_MEMORY;
         goto done;
     }
     container_info = (TOKEN_APPCONTAINER_INFORMATION *)buffer;
-    if (!container_info->TokenAppContainer || !IsValidSid(container_info->TokenAppContainer) ||
-        !EqualSid(container_info->TokenAppContainer, expected_sid)) error = ERROR_INVALID_TOKEN;
+    if (returned > needed || returned < sizeof(*container_info) || !container_info->TokenAppContainer ||
+        !sid_within_buffer(buffer, returned, container_info->TokenAppContainer)) {
+        set_query_validation(record, FALSE);
+        error = ERROR_INVALID_TOKEN;
+        goto done;
+    }
+    if (record) {
+        LPSTR sid_text = NULL;
+        if (!ConvertSidToStringSidA(container_info->TokenAppContainer, &sid_text)) {
+            error = GetLastError();
+            set_query_validation(record, FALSE);
+            goto done;
+        }
+        if (sprintf_s(record->value, sizeof(record->value), "\"%s\"", sid_text) < 0)
+            error = ERROR_INSUFFICIENT_BUFFER;
+        LocalFree(sid_text);
+        if (error != ERROR_SUCCESS) { set_query_validation(record, FALSE); goto done; }
+    }
+    if (compare_sid && !EqualSid(container_info->TokenAppContainer, expected_sid))
+        error = ERROR_INVALID_TOKEN;
 done:
-    if (buffer) HeapFree(GetProcessHeap(), 0, buffer);
+    HeapFree(GetProcessHeap(), 0, buffer);
+    return error;
+}
+
+static DWORD verify_child_token(HANDLE process, PSID expected_sid, TokenObservation *observation)
+{
+    HANDLE token = NULL;
+    DWORD error = ERROR_SUCCESS;
+    TokenFacts facts;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return GetLastError();
+    facts = inspect_token(token, observation, FALSE);
+    error = query_appcontainer_sid(token, observation, expected_sid, TRUE);
+    if (facts.error != ERROR_SUCCESS) {
+        set_first_error(&error, facts.error);
+    } else if (!facts_satisfy_requirements(&facts)) {
+        set_first_error(&error, ERROR_INVALID_TOKEN);
+    }
     if (!CloseHandle(token)) set_first_error(&error, GetLastError());
     return error;
 }
@@ -338,7 +737,7 @@ static void emit_report(const ProbeReport *r)
     if (r->child_exit_code_set) (void)sprintf_s(exit_code_text, sizeof(exit_code_text), "%lu", (unsigned long)r->child_exit_code);
     else (void)strcpy_s(exit_code_text, sizeof(exit_code_text), "null");
     (void)printf(
-        "{\"stage\":\"%s\",\"classification\":\"%s\",\"child_token_verified\":%s,\"resumed\":%s,\"ntstatus\":%s,\"mapped_win32\":%lu,\"win32_error\":%lu,\"cleanup_error\":%lu,\"child_exit_code\":%s,\"pretoken_win32\":%lu,\"pretoken_appcontainer\":%d,\"pretoken_lpac\":%d,\"pretoken_low_integrity\":%d,\"pretoken_zero_capabilities\":%d,\"lowbox_win32\":%lu,\"lowbox_appcontainer\":%d,\"lowbox_lpac\":%d,\"lowbox_low_integrity\":%d,\"lowbox_zero_capabilities\":%d,\"candidate_access_win32\":%lu,\"launch_win32\":%lu,\"child_verify_win32\":%lu,\"resume_win32\":%lu,\"wait_win32\":%lu}\n",
+        "{\"stage\":\"%s\",\"classification\":\"%s\",\"child_token_verified\":%s,\"resumed\":%s,\"ntstatus\":%s,\"mapped_win32\":%lu,\"win32_error\":%lu,\"cleanup_error\":%lu,\"child_exit_code\":%s,\"pretoken_win32\":%lu,\"pretoken_appcontainer\":%d,\"pretoken_lpac\":%d,\"pretoken_low_integrity\":%d,\"pretoken_zero_capabilities\":%d,\"lowbox_win32\":%lu,\"lowbox_appcontainer\":%d,\"lowbox_lpac\":%d,\"lowbox_low_integrity\":%d,\"lowbox_zero_capabilities\":%d,\"candidate_access_win32\":%lu,\"launch_win32\":%lu,\"child_verify_win32\":%lu,\"resume_win32\":%lu,\"wait_win32\":%lu",
         r->stage, r->classification, r->child_token_verified ? "true" : "false",
         r->resumed ? "true" : "false", ntstatus_text,
         (unsigned long)r->mapped_win32, (unsigned long)r->win32_error,
@@ -351,6 +750,8 @@ static void emit_report(const ProbeReport *r)
         (unsigned long)r->candidate_access_win32, (unsigned long)r->launch_win32,
         (unsigned long)r->child_verify_win32, (unsigned long)r->resume_win32,
         (unsigned long)r->wait_win32);
+    emit_observations(r);
+    printf("}\n");
     (void)fflush(stdout);
 }
 
@@ -361,12 +762,29 @@ static int child_main(int argc, wchar_t **argv)
     return 0;
 }
 
+static void set_self_test_query(TokenObservation *observation, const char *name,
+        ULONG info_class, DWORD buffer_size, DWORD returned, BOOL success,
+        DWORD win32_error, const char *value)
+{
+    QueryRecord *record = new_query_record(observation, name, info_class);
+    if (!record) return;
+    record->buffer_size = buffer_size;
+    record->returned_length = returned;
+    record->success = success;
+    record->win32_error_set = !success;
+    record->win32_error = win32_error;
+    if (success) (void)strcpy_s(record->validation, sizeof(record->validation), "valid");
+    else (void)strcpy_s(record->validation, sizeof(record->validation), "not_applicable");
+    if (success && value) (void)strcpy_s(record->value, sizeof(record->value), value);
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     ProbeReport report;
     HMODULE ntdll = NULL;
     PFN_NT_CREATE_LOW_BOX_TOKEN nt_create_lowbox = NULL;
     PFN_RTL_NT_STATUS_TO_DOS_ERROR status_to_error = NULL;
+    PFN_NT_QUERY_OBJECT nt_query_object = NULL;
     HANDLE base_token = NULL, lowbox_token = NULL, job = NULL;
     HANDLE attribute_list = NULL;
     PSID package_sid = NULL;
@@ -398,6 +816,69 @@ int wmain(int argc, wchar_t **argv)
     report.lowbox_low_integrity = -1;
     report.lowbox_zero_capabilities = -1;
     if (argc == 2 && wcscmp(argv[1], L"--child") == 0) return child_main(argc, argv);
+    if (argc == 2 && wcscmp(argv[1], L"--serialization-self-test") == 0) {
+        TokenFacts deliberately_invalid_facts;
+        QueryRecord *invalid;
+        SID bounded_sid;
+        SID_IDENTIFIER_AUTHORITY mandatory_authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+        ZeroMemory(&bounded_sid, sizeof(bounded_sid));
+        bounded_sid.Revision = SID_REVISION;
+        bounded_sid.SubAuthorityCount = 1;
+        bounded_sid.IdentifierAuthority = mandatory_authority;
+        bounded_sid.SubAuthority[0] = SECURITY_MANDATORY_LOW_RID;
+        if (!sid_within_buffer((BYTE *)&bounded_sid, sizeof(bounded_sid), &bounded_sid) ||
+            sid_within_buffer((BYTE *)&bounded_sid, sizeof(bounded_sid) - 1, &bounded_sid) ||
+            sid_within_buffer((BYTE *)&bounded_sid, sizeof(bounded_sid),
+                (PSID)((ULONG_PTR)&bounded_sid + sizeof(bounded_sid))) ||
+            sid_within_buffer((BYTE *)&bounded_sid, sizeof(bounded_sid),
+                (PSID)((ULONG_PTR)&bounded_sid - 1))) return 3;
+        ZeroMemory(&deliberately_invalid_facts, sizeof(deliberately_invalid_facts));
+        deliberately_invalid_facts.app_container = TRUE;
+        deliberately_invalid_facts.lpac = TRUE;
+        deliberately_invalid_facts.low_integrity = TRUE;
+        deliberately_invalid_facts.zero_capabilities = TRUE;
+        if (!facts_satisfy_requirements(&deliberately_invalid_facts)) return 3;
+        deliberately_invalid_facts.error = ERROR_ACCESS_DENIED;
+        if (facts_satisfy_requirements(&deliberately_invalid_facts)) return 3;
+        deliberately_invalid_facts.error = ERROR_SUCCESS;
+        deliberately_invalid_facts.lpac = FALSE;
+        if (facts_satisfy_requirements(&deliberately_invalid_facts)) return 3;
+        report.stage = "serialization_self_test";
+        set_self_test_query(&report.pretoken_observation, "TokenIsAppContainer", TokenIsAppContainer,
+            sizeof(DWORD), sizeof(DWORD), TRUE, ERROR_SUCCESS, "false");
+        set_self_test_query(&report.pretoken_observation, "TokenIsLessPrivilegedAppContainer",
+            TokenIsLessPrivilegedAppContainer, sizeof(DWORD), 0, FALSE, ERROR_INVALID_PARAMETER, NULL);
+        set_self_test_query(&report.pretoken_observation, "TokenType", TokenType,
+            sizeof(TOKEN_TYPE), sizeof(TOKEN_TYPE), TRUE, ERROR_SUCCESS, "1");
+        set_self_test_query(&report.pretoken_observation, "TokenIntegrityLevel", TokenIntegrityLevel,
+            0, sizeof(TOKEN_MANDATORY_LABEL), FALSE, ERROR_INSUFFICIENT_BUFFER, NULL);
+        set_self_test_query(&report.pretoken_observation, "TokenPrivileges", TokenPrivileges,
+            sizeof(DWORD), sizeof(DWORD), TRUE, ERROR_SUCCESS, "[]");
+        set_self_test_query(&report.lowbox_observation, "TokenIsAppContainer", TokenIsAppContainer,
+            sizeof(DWORD), sizeof(DWORD), TRUE, ERROR_SUCCESS, "true");
+        set_self_test_query(&report.child_observation, "TokenAppContainerSid", TokenAppContainerSid,
+            0, 0, FALSE, ERROR_ACCESS_DENIED, NULL);
+        set_self_test_query(&report.child_observation, "TokenPrivileges", TokenPrivileges,
+            sizeof(DWORD), sizeof(DWORD), TRUE, ERROR_SUCCESS, "[partial");
+        invalid = &report.child_observation.records[report.child_observation.count - 1];
+        set_query_validation(invalid, FALSE);
+        if (successful_query_value(&report.child_observation, "TokenPrivileges")) return 3;
+        report.thread_token_checked = TRUE;
+        report.thread_token_win32 = ERROR_NO_TOKEN;
+        report.input_handle_observation.info_class = 0;
+        report.input_handle_observation.buffer_size = sizeof(ProbeObjectBasicInformation);
+        report.input_handle_observation.ntstatus = 0xC0000022UL;
+        report.input_handle_observation.ntstatus_set = TRUE;
+        (void)strcpy_s(report.input_handle_observation.validation,
+            sizeof(report.input_handle_observation.validation), "not_applicable");
+        report.pretoken_win32 = ERROR_INVALID_PARAMETER;
+        report.pretoken_appcontainer = observed_fact(&report.pretoken_observation, "TokenIsAppContainer");
+        report.pretoken_lpac = observed_fact(&report.pretoken_observation, "TokenIsLessPrivilegedAppContainer");
+        if (report.pretoken_appcontainer != 0 || report.pretoken_lpac != -1) return 3;
+        report.child_token_verified = facts_satisfy_requirements(&deliberately_invalid_facts);
+        emit_report(&report);
+        return report.child_token_verified ? 3 : 0;
+    }
     if (argc != 3 || !argv[1][0] || !argv[2][0]) return 2;
     if (!ConvertStringSidToSidW(argv[1], &package_sid) || !IsValidSid(package_sid)) {
         if (package_sid) LocalFree(package_sid);
@@ -423,12 +904,13 @@ int wmain(int argc, wchar_t **argv)
         report.win32_error = GetLastError();
         goto finish;
     }
-    pretoken = inspect_token(base_token);
+    pretoken = inspect_token(base_token, &report.pretoken_observation, TRUE);
     report.pretoken_win32 = pretoken.error;
-    report.pretoken_appcontainer = fact_json_value(pretoken.error == ERROR_SUCCESS, pretoken.app_container);
-    report.pretoken_lpac = fact_json_value(pretoken.error == ERROR_SUCCESS, pretoken.lpac);
-    report.pretoken_low_integrity = fact_json_value(pretoken.error == ERROR_SUCCESS, pretoken.low_integrity);
-    report.pretoken_zero_capabilities = fact_json_value(pretoken.error == ERROR_SUCCESS, pretoken.zero_capabilities);
+    report.pretoken_appcontainer = observed_fact(&report.pretoken_observation, "TokenIsAppContainer");
+    report.pretoken_lpac = observed_fact(&report.pretoken_observation, "TokenIsLessPrivilegedAppContainer");
+    report.pretoken_low_integrity = observed_fact(&report.pretoken_observation, "TokenIntegrityLevel");
+    report.pretoken_zero_capabilities = observed_fact(&report.pretoken_observation, "TokenCapabilities");
+    inspect_effective_thread_token(&report, &cleanup_error);
 
     report.stage = "nt_create_lowbox_token";
     ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -436,6 +918,9 @@ int wmain(int argc, wchar_t **argv)
         FARPROC address = GetProcAddress(ntdll, "NtCreateLowBoxToken");
         if (address && sizeof(address) == sizeof(nt_create_lowbox))
             memcpy(&nt_create_lowbox, &address, sizeof(nt_create_lowbox));
+        address = GetProcAddress(ntdll, "NtQueryObject");
+        if (address && sizeof(address) == sizeof(nt_query_object))
+            memcpy(&nt_query_object, &address, sizeof(nt_query_object));
         address = GetProcAddress(ntdll, "RtlNtStatusToDosError");
         if (address && sizeof(address) == sizeof(status_to_error))
             memcpy(&status_to_error, &address, sizeof(status_to_error));
@@ -445,6 +930,7 @@ int wmain(int argc, wchar_t **argv)
         report.classification = "inconclusive";
         goto finish;
     }
+    inspect_input_handle(base_token, nt_query_object, &report.input_handle_observation);
     report.ntstatus = (ULONG)nt_create_lowbox(&lowbox_token, base_token, LOWBOX_TOKEN_ACCESS,
                                                NULL, package_sid, 0, NULL, 0, NULL);
     report.ntstatus_set = TRUE;
@@ -456,12 +942,12 @@ int wmain(int argc, wchar_t **argv)
     }
 
     {
-        TokenFacts lowbox_facts = inspect_token(lowbox_token);
+        TokenFacts lowbox_facts = inspect_token(lowbox_token, &report.lowbox_observation, FALSE);
         report.lowbox_win32 = lowbox_facts.error;
-        report.lowbox_appcontainer = fact_json_value(lowbox_facts.error == ERROR_SUCCESS, lowbox_facts.app_container);
-        report.lowbox_lpac = fact_json_value(lowbox_facts.error == ERROR_SUCCESS, lowbox_facts.lpac);
-        report.lowbox_low_integrity = fact_json_value(lowbox_facts.error == ERROR_SUCCESS, lowbox_facts.low_integrity);
-        report.lowbox_zero_capabilities = fact_json_value(lowbox_facts.error == ERROR_SUCCESS, lowbox_facts.zero_capabilities);
+        report.lowbox_appcontainer = observed_fact(&report.lowbox_observation, "TokenIsAppContainer");
+        report.lowbox_lpac = observed_fact(&report.lowbox_observation, "TokenIsLessPrivilegedAppContainer");
+        report.lowbox_low_integrity = observed_fact(&report.lowbox_observation, "TokenIntegrityLevel");
+        report.lowbox_zero_capabilities = observed_fact(&report.lowbox_observation, "TokenCapabilities");
     }
     report.stage = "candidate_image_access";
     report.candidate_access_win32 = candidate_read_execute(lowbox_token, &candidate_revert_failed);
@@ -541,7 +1027,8 @@ int wmain(int argc, wchar_t **argv)
     process_created = TRUE;
 
     report.stage = "verify_suspended_child_token";
-    report.child_verify_win32 = verify_child_token(process.hProcess, package_sid);
+    report.child_verify_win32 = verify_child_token(process.hProcess, package_sid,
+        &report.child_observation);
     if (report.child_verify_win32 != ERROR_SUCCESS) {
         report.win32_error = report.child_verify_win32;
         if (report.child_verify_win32 == ERROR_INVALID_TOKEN) report.classification = "blocked";
