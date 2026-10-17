@@ -109,6 +109,8 @@ class OwnerAuthenticationEvidence:
         request_id: str,
         session_id: str | None = None,
         now: datetime | None = None,
+        *,
+        database_path: str | Path | None = None,
     ) -> bool:
         """Validate a serialized grant in another process using the durable Owner session.
 
@@ -116,6 +118,8 @@ class OwnerAuthenticationEvidence:
         the bridge's HMAC after deserialization, so this fallback binds the
         exact request, evidence fingerprint, and expiry to the still-active
         server-side Owner session. It never accepts a missing/revoked session.
+        An explicit database_path is read-only and is intended for an external
+        acceptance harness inspecting the installed application's isolated profile.
         """
         if not self.session_id or (session_id is not None and self.session_id != session_id):
             return False
@@ -147,7 +151,11 @@ class OwnerAuthenticationEvidence:
         try:
             from security.owner_password import resolve_session
 
-            active_session = resolve_session(self.session_id)
+            active_session = (
+                resolve_session(self.session_id, database_path=database_path)
+                if database_path is not None
+                else resolve_session(self.session_id)
+            )
         except Exception:
             return False
         if not isinstance(active_session, dict):

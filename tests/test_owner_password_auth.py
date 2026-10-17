@@ -286,3 +286,122 @@ def test_create_account_rejects_wrong_username(tmp_db, monkeypatch):
     with pytest.raises(PermissionError):
         op.create_owner_account("intruder", "some-password")
     assert not op.owner_account_exists()
+
+
+def test_explicit_profile_db_lookup_fails_closed_for_missing_or_corrupt_database(
+    tmp_db,
+    monkeypatch,
+):
+    assert _bootstrap(monkeypatch) == 0
+    session = op.login("mosfiry", TEST_PASSWORD)
+    missing_database = tmp_db.with_name("missing-profile.sqlite3")
+    corrupt_database = tmp_db.with_name("corrupt-profile.sqlite3")
+    corrupt_database.write_bytes(b"not a sqlite database")
+
+    assert op.resolve_session(
+        session["session_id"],
+        database_path=missing_database,
+    ) is None
+    corrupt_bytes = corrupt_database.read_bytes()
+    assert op.resolve_session(
+        session["session_id"],
+        database_path=corrupt_database,
+    ) is None
+    assert corrupt_database.read_bytes() == corrupt_bytes
+
+
+def test_explicit_profile_db_lookup_rejects_wal_without_creating_sidecars(
+    tmp_db,
+    monkeypatch,
+):
+    assert _bootstrap(monkeypatch) == 0
+    session = op.login("mosfiry", TEST_PASSWORD)
+    connection = sqlite3.connect(tmp_db)
+    try:
+        journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+    finally:
+        connection.close()
+    assert str(journal_mode).lower() == "wal"
+    assert tmp_db.read_bytes()[18:20] == b"\x02\x02"
+
+    wal_path = Path(str(tmp_db) + "-wal")
+    shm_path = Path(str(tmp_db) + "-shm")
+    for sidecar in (wal_path, shm_path):
+        if sidecar.exists():
+            sidecar.unlink()
+    database_bytes = tmp_db.read_bytes()
+
+    assert op.resolve_session(
+        session["session_id"],
+        database_path=tmp_db,
+    ) is None
+    assert tmp_db.read_bytes() == database_bytes
+    assert not wal_path.exists()
+    assert not shm_path.exists()
+
+
+def test_explicit_profile_db_lookup_is_read_only_and_reauthentication_does_not_revive_old_evidence(
+    tmp_db,
+    monkeypatch,
+):
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+
+    from security.owner_policy import _issue_evidence
+
+    assert _bootstrap(monkeypatch) == 0
+    original_session = op.login("mosfiry", TEST_PASSWORD)
+    original_reference = session_reference(original_session["session_id"])
+    request_id = "read-only-profile-session-test"
+    evidence = _issue_evidence(
+        op.AUTH_METHOD,
+        request_id,
+        original_reference,
+        original_reference,
+    )
+
+    database_before_lookup = tmp_db.read_bytes()
+    assert op.resolve_session(
+        original_session["session_id"], database_path=tmp_db
+    )["session_id"] == original_reference
+    assert evidence.is_valid_for_active_session(
+        request_id,
+        original_reference,
+        database_path=tmp_db,
+    ) is True
+    assert tmp_db.read_bytes() == database_before_lookup
+
+    expired_evidence = replace(
+        evidence,
+        expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    )
+    assert expired_evidence.is_valid_for_active_session(
+        request_id,
+        original_reference,
+        database_path=tmp_db,
+    ) is False
+
+    with sqlite3.connect(tmp_db) as con:
+        con.execute(
+            "UPDATE owner_sessions SET expires_at = ? WHERE session_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), original_reference),
+        )
+        con.commit()
+    expired_database = tmp_db.read_bytes()
+    assert op.resolve_session(
+        original_session["session_id"], database_path=tmp_db
+    ) is None
+    assert evidence.is_valid_for_active_session(
+        request_id,
+        original_reference,
+        database_path=tmp_db,
+    ) is False
+    assert tmp_db.read_bytes() == expired_database
+
+    fresh_session = op.login("mosfiry", TEST_PASSWORD)
+    assert op.resolve_session(fresh_session["session_id"], database_path=tmp_db) is not None
+    assert evidence.is_valid_for_active_session(
+        request_id,
+        original_reference,
+        database_path=tmp_db,
+    ) is False

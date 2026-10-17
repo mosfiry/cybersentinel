@@ -18,7 +18,9 @@ import hashlib
 import hmac
 import json
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import core.db as core_db
 from security.session_reference import is_session_reference, session_reference
@@ -196,11 +198,72 @@ def _resolve_session_reference(session_ref: str) -> dict | None:
     }
 
 
-def resolve_session(session_id) -> dict | None:
-    """Resolve a bearer token or server-generated reference; never return the bearer."""
+def _resolve_session_reference_read_only(
+    session_ref: str,
+    database_path: str | Path,
+) -> dict | None:
+    """Resolve a session from an explicit existing DB without creating or migrating it."""
+    if not is_session_reference(session_ref):
+        return None
+    try:
+        path = Path(database_path).expanduser().resolve(strict=True)
+        if not path.is_file():
+            return None
+        # A read-only SQLite connection can still create WAL/SHM sidecars when
+        # the database header is in WAL mode. The installed profile uses the
+        # rollback-journal default; reject any other format rather than mutate it.
+        with path.open("rb") as database_file:
+            header = database_file.read(20)
+        if len(header) < 20 or header[:16] != b"SQLite format 3\x00" or header[18:20] != b"\x01\x01":
+            return None
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                "SELECT s.session_id, s.owner_id, s.status, s.expires_at, s.auth_method,"
+                " a.username, a.status AS account_status"
+                " FROM owner_sessions s JOIN owner_accounts a ON a.owner_id = s.owner_id"
+                " WHERE s.session_id = ?",
+                (session_ref,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        return None
+    if row is None or row["status"] != "active" or row["account_status"] != "active":
+        return None
+    try:
+        expires = datetime.fromisoformat(row["expires_at"])
+    except (TypeError, ValueError):
+        return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires <= _now():
+        return None
+    return {
+        "session_id": row["session_id"],
+        "owner_id": int(row["owner_id"]),
+        "username": row["username"],
+        "auth_method": row["auth_method"],
+        "expires_at": row["expires_at"],
+    }
+
+
+def resolve_session(
+    session_id,
+    *,
+    database_path: str | Path | None = None,
+) -> dict | None:
+    """Resolve a session without returning its bearer token.
+
+    The optional explicit database path is for external acceptance checks; it is
+    opened strictly read-only and never runs schema creation or migration.
+    """
     if not isinstance(session_id, str) or not session_id:
         return None
     reference = session_id if is_session_reference(session_id) else session_reference(session_id)
+    if database_path is not None:
+        return _resolve_session_reference_read_only(reference, database_path)
     return _resolve_session_reference(reference)
 
 

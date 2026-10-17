@@ -130,6 +130,11 @@ def test_restarted_paused_mission_resumes_only_after_fresh_owner_reauthorization
         owner_revalidator=core.prepare_mission_for_queue,
     )
     with pytest.raises(PermissionError, match="owner authentication required"):
+        service.status(
+            mission.mission_id,
+            owner_session_token="stale-owner",
+        )
+    with pytest.raises(PermissionError, match="owner authentication required"):
         service.resume_mission(
             mission.mission_id,
             owner_session_token="stale-owner",
@@ -139,6 +144,13 @@ def test_restarted_paused_mission_resumes_only_after_fresh_owner_reauthorization
     assert quarantined is not None
     assert quarantined.status is MissionStatus.OWNER_REAUTH_REQUIRED
     assert quarantined.progress["pause_requested"] is True
+    assert queue.get(mission.mission_id).state is WorkerMissionState.NEEDS_INPUT
+
+    fresh_owner_view = service.status(
+        mission.mission_id,
+        owner_session_token="fresh-owner",
+    )
+    assert fresh_owner_view["status"] == MissionStatus.OWNER_REAUTH_REQUIRED.value
     assert queue.get(mission.mission_id).state is WorkerMissionState.NEEDS_INPUT
 
     resumed = service.resume_mission(

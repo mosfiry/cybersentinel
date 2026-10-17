@@ -4164,6 +4164,38 @@ def test_installed_app_restart_cycles_bind_expected_project_identity() -> None:
         assert ast.unparse(keyword_values["expected_project_id"]) == "project_id"
         assert ast.unparse(keyword_values["expected_project_root"]) == "project_root"
 
+    basis_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_mission_restart_basis"
+    ]
+    assert basis_calls
+    for call in basis_calls:
+        keyword_values = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+        assert ast.unparse(keyword_values["owner_database_path"]) == "owner_database_path"
+
+    source_tree = ast.parse(Path(windows_acceptance.__file__).read_text(encoding="utf-8"))
+    restart_functions = [
+        node
+        for node in ast.walk(source_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "restart_installed_application"
+    ]
+    assert len(restart_functions) == 1
+    callback_basis_calls = [
+        node
+        for node in ast.walk(restart_functions[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_mission_restart_basis"
+    ]
+    assert len(callback_basis_calls) == 2
+    for call in callback_basis_calls:
+        keyword_values = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+        assert ast.unparse(keyword_values["owner_database_path"]) == "owner_database_path"
+
 
 def test_restart_diagnostic_code_is_restricted_to_static_allowlist() -> None:
     assert (
@@ -4379,6 +4411,115 @@ def test_preflight_public_project_basis_requires_active_owner_session(
     )
     assert basis["status"] == "BLOCKED"
     assert basis["kind"] == "NOT_RUN"
+
+
+def test_profile_owner_database_is_read_only_and_fresh_login_does_not_revive_preflight_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    import core.db as core_db
+    import security.owner_password as owner_password
+
+    original_resolve_session = owner_password.resolve_session
+    mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    public_snapshot = _public_project_scope_snapshot(blocked_snapshot)
+    expected_binding = _public_project_expected_binding(public_snapshot)
+    session_id = public_snapshot["status"]["authorization_context"]["owner_evidence"]["session_id"]
+
+    owner_database_path = tmp_path / "installed-profile" / "userData" / "state" / "intel.sqlite3"
+    owner_database_path.parent.mkdir(parents=True)
+    monkeypatch.setattr(core_db, "DB_PATH", owner_database_path)
+    monkeypatch.setattr(owner_password, "resolve_session", original_resolve_session)
+    owner_password.create_owner_account(
+        owner_password.OWNER_USERNAME,
+        "ephemeral-acceptance-only-password",
+    )
+    now = datetime.now(timezone.utc)
+    with sqlite3.connect(owner_database_path) as connection:
+        connection.execute(
+            "INSERT INTO owner_sessions "
+            "(session_id, owner_id, created_at, authenticated_at, expires_at, status, auth_method) "
+            "VALUES (?, 1, ?, ?, ?, 'active', ?)",
+            (
+                session_id,
+                now.isoformat(),
+                now.isoformat(),
+                (now + timedelta(hours=8)).isoformat(),
+                owner_password.AUTH_METHOD,
+            ),
+        )
+        connection.commit()
+
+    bytes_before_validation = owner_database_path.read_bytes()
+    active_basis = windows_acceptance._mission_restart_basis(
+        public_snapshot,
+        mission_id,
+        **expected_binding,
+        owner_database_path=owner_database_path,
+    )
+    after_restart_snapshot = json.loads(json.dumps(public_snapshot))
+    active_reconciliation = windows_acceptance._mission_preflight_block_reconciliation(
+        public_snapshot,
+        after_restart_snapshot,
+        mission_id,
+        **expected_binding,
+        owner_database_path=owner_database_path,
+    )
+    assert active_basis["status"] == "VERIFIED"
+    assert active_basis["kind"] == "PREFLIGHT_BLOCK"
+    assert active_reconciliation["reconciled"] is True
+    assert owner_database_path.read_bytes() == bytes_before_validation
+
+    with sqlite3.connect(owner_database_path) as connection:
+        connection.execute(
+            "UPDATE owner_sessions SET status = 'revoked' WHERE session_id = ?",
+            (session_id,),
+        )
+        connection.commit()
+    bytes_before_rejected_validation = owner_database_path.read_bytes()
+    revoked_basis = windows_acceptance._mission_restart_basis(
+        public_snapshot,
+        mission_id,
+        **expected_binding,
+        owner_database_path=owner_database_path,
+    )
+    revoked_reconciliation = windows_acceptance._mission_preflight_block_reconciliation(
+        public_snapshot,
+        after_restart_snapshot,
+        mission_id,
+        **expected_binding,
+        owner_database_path=owner_database_path,
+    )
+    assert revoked_basis["status"] == "BLOCKED"
+    assert revoked_basis["kind"] == "NOT_RUN"
+    assert revoked_basis["diagnostic_code"] == "active_owner_session_binding_invalid"
+    assert revoked_reconciliation["reconciled"] is False
+    assert public_snapshot["status"]["status"] == "RESOURCE_BLOCKED"
+    assert public_snapshot["status"]["evidence"] == []
+    assert owner_database_path.read_bytes() == bytes_before_rejected_validation
+
+    fresh_session = owner_password.login(
+        owner_password.OWNER_USERNAME,
+        "ephemeral-acceptance-only-password",
+    )
+    assert owner_password.resolve_session(
+        fresh_session["session_id"],
+        database_path=owner_database_path,
+    ) is not None
+    still_revoked_basis = windows_acceptance._mission_restart_basis(
+        public_snapshot,
+        mission_id,
+        **expected_binding,
+        owner_database_path=owner_database_path,
+    )
+    assert still_revoked_basis["status"] == "BLOCKED"
+    assert public_snapshot["status"]["status"] == "RESOURCE_BLOCKED"
 
 
 def test_preflight_public_project_basis_requires_project_directory(

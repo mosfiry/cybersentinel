@@ -3064,6 +3064,7 @@ def _mission_active_owner_session_binding_is_valid(
     request_id: object,
     authorization: object,
     context: object,
+    owner_database_path: str | Path | None = None,
 ) -> bool:
     if (
         not isinstance(owner_identity_ref, str)
@@ -3089,12 +3090,20 @@ def _mission_active_owner_session_binding_is_valid(
         from security.owner_policy import OwnerAuthenticationEvidence
 
         evidence = OwnerAuthenticationEvidence(**owner_evidence)
-        if not evidence.is_valid_for_active_session(request_id, session_id):
+        if not evidence.is_valid_for_active_session(
+            request_id,
+            session_id,
+            database_path=owner_database_path,
+        ):
             return False
         owner_prefix, owner_separator, owner_id_text = owner_identity_ref.partition(":")
         if owner_prefix != "owner" or not owner_separator or re.fullmatch(r"[1-9][0-9]*", owner_id_text) is None:
             return False
-        active_session = resolve_session(session_id)
+        active_session = (
+            resolve_session(session_id, database_path=owner_database_path)
+            if owner_database_path is not None
+            else resolve_session(session_id)
+        )
         if not isinstance(active_session, dict) or active_session.get("session_id") != session_id:
             return False
         active_owner_id = active_session.get("owner_id")
@@ -3145,6 +3154,7 @@ def _mission_restart_authority_projection(
     *,
     expected_project_id: str | None = None,
     expected_project_root: str | Path | None = None,
+    owner_database_path: str | Path | None = None,
     diagnostics: list[str] | None = None,
 ) -> dict | None:
     def reject(code: str) -> None:
@@ -3306,6 +3316,7 @@ def _mission_restart_authority_projection(
                 request_id,
                 authorization,
                 context,
+                owner_database_path,
             ):
                 return reject("active_owner_session_binding_invalid")
         except Exception:
@@ -3338,6 +3349,7 @@ def _mission_restart_authority_projection(
                 request_id,
                 authorization,
                 context,
+                owner_database_path,
             )
         ):
             return reject("persisted_scope_owner_binding_invalid")
@@ -3390,6 +3402,7 @@ def _mission_preflight_block_projection(
     *,
     expected_project_id: str | None = None,
     expected_project_root: str | Path | None = None,
+    owner_database_path: str | Path | None = None,
 ) -> dict | None:
     if not isinstance(snapshot, dict):
         return None
@@ -3400,6 +3413,7 @@ def _mission_preflight_block_projection(
         mission_id,
         expected_project_id=expected_project_id,
         expected_project_root=expected_project_root,
+        owner_database_path=owner_database_path,
     )
     if (
         authority is None
@@ -4202,6 +4216,7 @@ def _mission_restart_basis(
     *,
     expected_project_id: str | None = None,
     expected_project_root: str | Path | None = None,
+    owner_database_path: str | Path | None = None,
 ) -> dict:
     if not isinstance(snapshot, dict):
         return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "snapshot_unavailable"}
@@ -4213,6 +4228,7 @@ def _mission_restart_basis(
         mission_id,
         expected_project_id=expected_project_id,
         expected_project_root=expected_project_root,
+        owner_database_path=owner_database_path,
         diagnostics=authority_diagnostics,
     )
     if authority is None:
@@ -4246,6 +4262,7 @@ def _mission_restart_basis(
         mission_id,
         expected_project_id=expected_project_id,
         expected_project_root=expected_project_root,
+        owner_database_path=owner_database_path,
     )
     if preflight is not None:
         return {"status": "VERIFIED", "kind": "PREFLIGHT_BLOCK", "projection": preflight}
@@ -4284,18 +4301,21 @@ def _mission_preflight_block_reconciliation(
     *,
     expected_project_id: str | None = None,
     expected_project_root: str | Path | None = None,
+    owner_database_path: str | Path | None = None,
 ) -> dict:
     before_record = _mission_preflight_block_projection(
         before,
         mission_id,
         expected_project_id=expected_project_id,
         expected_project_root=expected_project_root,
+        owner_database_path=owner_database_path,
     )
     after_record = _mission_preflight_block_projection(
         after,
         mission_id,
         expected_project_id=expected_project_id,
         expected_project_root=expected_project_root,
+        owner_database_path=owner_database_path,
     )
     if before_record is None or after_record is None:
         return {
@@ -5027,9 +5047,16 @@ def _installed_app_mission(
         raise RuntimeError("installed_app_disposable_project_creation_failed")
 
     state_directory = _find_state_directory(profile_root)
+    owner_database_path = (state_directory / "intel.sqlite3").resolve(strict=True)
     project_root = (state_directory / "workspaces" / project_id).resolve(strict=True)
-    if not project_root.is_relative_to(profile_root.expanduser().resolve(strict=True)):
+    resolved_profile_root = profile_root.expanduser().resolve(strict=True)
+    if not project_root.is_relative_to(resolved_profile_root):
         raise RuntimeError("installed_app_acceptance_project_escaped_disposable_profile")
+    if (
+        not owner_database_path.is_file()
+        or not owner_database_path.is_relative_to(resolved_profile_root)
+    ):
+        raise RuntimeError("installed_app_owner_database_escaped_disposable_profile")
     fixture = project_root / "test_windows_acceptance.py"
     fixture_source = (
         "def test_bounded_windows_acceptance_fixture():\n"
@@ -5154,6 +5181,7 @@ def _installed_app_mission(
             mission_id,
             expected_project_id=project_id,
             expected_project_root=project_root,
+            owner_database_path=owner_database_path,
         )
         if candidate_basis.get("status") == "VERIFIED":
             try:
@@ -5163,6 +5191,7 @@ def _installed_app_mission(
                     mission_id,
                     expected_project_id=project_id,
                     expected_project_root=project_root,
+                    owner_database_path=owner_database_path,
                 )
             except _MissionAuditSnapshotError as exc:
                 candidate_snapshot = None
@@ -5208,6 +5237,7 @@ def _installed_app_mission(
                     mission_id,
                     expected_project_id=project_id,
                     expected_project_root=project_root,
+                    owner_database_path=owner_database_path,
                 )
             except _MissionAuditSnapshotError as exc:
                 paused_basis = {"status": "BLOCKED", "kind": "NOT_RUN", "reason": exc.reason_code}
@@ -5577,12 +5607,14 @@ def _installed_app_mission(
                 mission_id,
                 expected_project_id=project_id,
                 expected_project_root=project_root,
+                owner_database_path=owner_database_path,
             )
             after_terminal_basis = _mission_restart_basis(
                 terminal_restart_snapshot,
                 mission_id,
                 expected_project_id=project_id,
                 expected_project_root=project_root,
+                owner_database_path=owner_database_path,
             )
             terminal_preflight_reconciliation = _mission_preflight_block_reconciliation(
                 before_terminal_snapshot,
@@ -5590,6 +5622,7 @@ def _installed_app_mission(
                 mission_id,
                 expected_project_id=project_id,
                 expected_project_root=project_root,
+                owner_database_path=owner_database_path,
             ) if (
                 before_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
                 and after_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
@@ -6484,6 +6517,15 @@ def main() -> int:
                     expected_project_root: Path | None = None,
                 ):
                     nonlocal browser, page, active_application_pid, relaunched_application_process
+                    profile_root = args.profile_root.expanduser().resolve(strict=True)
+                    owner_database_path = (
+                        _find_state_directory(args.profile_root) / "intel.sqlite3"
+                    ).resolve(strict=True)
+                    if (
+                        not owner_database_path.is_file()
+                        or not owner_database_path.is_relative_to(profile_root)
+                    ):
+                        raise RuntimeError("installed_app_owner_database_escaped_disposable_profile")
                     cycle = {
                         "cycle": cycle_name,
                         "status": "FAIL",
@@ -6503,6 +6545,7 @@ def main() -> int:
                         mission_id,
                         expected_project_id=expected_project_id,
                         expected_project_root=expected_project_root,
+                        owner_database_path=owner_database_path,
                     )
                     cycle["restart_basis_before"] = {
                         "status": before_basis.get("status"),
@@ -6596,6 +6639,7 @@ def main() -> int:
                                 mission_id,
                                 expected_project_id=expected_project_id,
                                 expected_project_root=expected_project_root,
+                                owner_database_path=owner_database_path,
                             )
                             preflight_block_reconciliation = _mission_preflight_block_reconciliation(
                                 before_snapshot,
@@ -6603,6 +6647,7 @@ def main() -> int:
                                 mission_id,
                                 expected_project_id=expected_project_id,
                                 expected_project_root=expected_project_root,
+                                owner_database_path=owner_database_path,
                             ) if (
                                 before_basis.get("kind") == "PREFLIGHT_BLOCK"
                                 and after_basis.get("kind") == "PREFLIGHT_BLOCK"
