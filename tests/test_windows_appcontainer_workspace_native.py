@@ -478,8 +478,8 @@ def test_native_lpac_denies_outside_write_and_create(tmp_path: Path, native_prob
         _make_directory(outside, f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;OICI;NW;;;LW)")
         victim = outside / "existing.bin"
         payload = b"broker-owned low mandatory label sentinel"
-        _make_file(victim, payload, f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;NW;;;LW)")
-        _make_file(outside / "write-check.bin", b"DACL not MIC sentinel", f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;NW;;;LW)")
+        _make_file(victim, payload, f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;;NW;;;LW)")
+        _make_file(outside / "write-check.bin", b"DACL not MIC sentinel", f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;;NW;;;LW)")
         dir_entries, _, dir_labels, _ = _get_security(outside, include_label=True)
         file_entries, _, file_labels, _ = _get_security(victim, include_label=True)
         assert dir_labels == [("S-1-16-4096", 1)], f"outside directory is not low-labeled: {dir_labels}"
@@ -513,7 +513,7 @@ def test_native_lpac_denies_other_run_workspace(tmp_path: Path, native_probe_tem
         # Existing, broker-created second-run file is explicitly LOW integrity so
         # only its DACL (not MIC) can explain denial by the first run identity.
         other_file = second.workspace_path / "cross-run-sentinel.bin"
-        _make_file(other_file, b"second run stays intact", f"D:P(A;;FA;;;SY)(A;;FA;;;{_broker_sid()})(A;;0x{_FILE_REPORT:08X};;;{second.sid_string})S:(ML;NW;;;LW)")
+        _make_file(other_file, b"second run stays intact", f"D:P(A;;FA;;;SY)(A;;FA;;;{_broker_sid()})(A;;0x{_FILE_REPORT:08X};;;{second.sid_string})S:(ML;;NW;;;LW)")
         first_report = first.workspace_path / "isolation-evidence.json"
         evidence = _launch(probe, first, "isolation", other_file, Path("ignored"), first_report)
         _assert_check(evidence, "environment_minimal")
@@ -584,7 +584,7 @@ def test_native_lpac_exit_cleanup_revokes_workspace(tmp_path: Path, native_probe
         _make_directory(old_path, f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})(A;;0x{_FILE_TRAVERSE:08X};;;{stale_sid})S:(ML;OICI;NW;;;LW)")
         sentinel = old_path / "fresh-broker-only-sentinel.bin"
         sentinel_payload = b"new broker-only object after revocation"
-        _make_file(sentinel, sentinel_payload, f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;NW;;;LW)")
+        _make_file(sentinel, sentinel_payload, f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;;NW;;;LW)")
         stale_report = evidence_dir / "stale-evidence.json"
         stale_result = _launch(probe, workspace, "stale", sentinel, Path("ignored"), stale_report)
         _assert_check(stale_result, "environment_minimal")

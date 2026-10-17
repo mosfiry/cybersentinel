@@ -470,7 +470,7 @@ static int launch_child(int argc, wchar_t **argv) {
         status = fail(L"create bounded child job", GetLastError()); goto done;
     }
     if (!CreateProcessW(argv[0], command, NULL, NULL, FALSE,
-                        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
                         env_block, argv[4], &startup.StartupInfo, &process)) { status = fail(L"CreateProcessW LPAC", GetLastError()); goto done; }
     if (!AssignProcessToJobObject(job, process.hProcess)) {
         DWORD error = GetLastError();

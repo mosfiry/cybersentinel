@@ -67,3 +67,16 @@ def test_native_compiler_uses_batch_path_not_escaped_nested_cmd_quotes(tmp_path,
     prefix = "@echo off\r\nchcp 65001 >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\n"
     assert script.read_bytes() == (prefix + command + "\r\nexit /b %errorlevel%\r\n").encode("utf-8")
     assert result.returncode == 7
+
+
+def test_native_fixture_uses_valid_mandatory_label_fields_and_no_console():
+    source = (ROOT / "tests/test_windows_appcontainer_workspace_native.py").read_text(encoding="utf-8")
+    labels = re.findall(r"\(ML;[^)]*\)", source)
+    assert labels
+    for label in labels:
+        fields = label[1:-1].split(";")
+        assert len(fields) == 6 and fields[2] == "NW" and fields[5] == "LW", label
+    probe = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
+    flags = probe.split("if (!CreateProcessW(argv[0]", 1)[1].split("env_block,", 1)[0]
+    assert "CREATE_NO_WINDOW" in flags and "CREATE_SUSPENDED" in flags
+    assert "LowBoxConsoleEnabled" not in probe
