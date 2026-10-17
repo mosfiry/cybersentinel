@@ -103,7 +103,10 @@ class _PosixOwnedProcess:
                     cleanup_verified = False
                     self._signal_group(signal.SIGKILL)
                     try:
-                        self._cgroup_scope.cleanup(kill_if_populated=True, timeout=1.0)
+                        self._cgroup_scope.cleanup(
+                            kill_if_populated=True,
+                            timeout=max(0.0, deadline - time.monotonic()),
+                        )
                         self._cgroup_removed = True
                         cleanup_verified = True
                     except Exception:
@@ -117,15 +120,17 @@ class _PosixOwnedProcess:
                 self._signal_group(signal.SIGKILL)
 
         try:
-            self.process.wait(timeout=max(0.1, deadline - time.monotonic()) if deadline > time.monotonic() else 1.0)
+            self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             self._signal_group(signal.SIGKILL)
-            try:
-                self.process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                pass
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining > 0:
+                try:
+                    self.process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
 
-        group_stopped = self._wait_group_until(time.monotonic() + 2.0)
+        group_stopped = self._wait_group_until(deadline)
         cgroup_empty = self._cgroup_removed
         self._stop_verified = (
             cleanup_verified
@@ -155,8 +160,12 @@ class _PosixOwnedProcess:
             return True
 
     def _wait_group_until(self, deadline: float) -> bool:
-        while self._group_exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
+        while time.monotonic() < deadline:
+            if not self._group_exists():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.02, remaining))
         return not self._group_exists()
 
 
@@ -336,24 +345,21 @@ def run_owned_command(
         stderr=stderr,
         use_cgroup_if_configured=True,
     )
+    timed_out = False
+    return_code = None
     try:
         try:
             return_code = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            process.terminate_tree(
-                timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS
-            )
-            raise subprocess.TimeoutExpired([str(part) for part in command], timeout_seconds) from None
-        if not process.terminate_tree(
-            timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS
-        ):
-            raise RuntimeError("acceptance_process_tree_stop_unverified")
-        if check and return_code != 0:
-            raise subprocess.CalledProcessError(return_code, [str(part) for part in command])
-        return return_code
+            timed_out = True
     finally:
         if not process.close():
             raise RuntimeError("acceptance_process_tree_stop_unverified")
+    if timed_out:
+        raise subprocess.TimeoutExpired([str(part) for part in command], timeout_seconds) from None
+    if check and return_code != 0:
+        raise subprocess.CalledProcessError(return_code, [str(part) for part in command])
+    return return_code
 
 
 __all__ = ["run_owned_command", "start_owned_process"]
