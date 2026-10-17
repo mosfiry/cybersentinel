@@ -1,56 +1,49 @@
 # Owner Authority Model
 
-`OWNER_INSTRUCTION` is the highest **application-configurable** authority. `SYSTEM_PLATFORM` remains the immutable outer boundary and cannot be redefined by Owner text, a model, knowledge, memory, tool output, or an expert.
+## Normative instruction precedence
 
-## Order
-
-```text
-SYSTEM_PLATFORM
-  > OWNER_INSTRUCTION
-  > OWNER_POLICY
-  > DETERMINISTIC_ENFORCEMENT
-  > AUTHORIZATION_SCOPE
-  > TOOL_RUNTIME
-  > MODEL_OUTPUT
-  > EXTERNAL_DATA
-```
-
-## Authentication Evidence
-
-An Owner update requires an issued `OwnerAuthenticationEvidence` containing method, authenticated time, expiry, proof fingerprint, request ID, optional session ID, nonce, and an HMAC signature. Boolean fields such as `owner_authenticated=True` are not accepted by the Owner Instruction writer. Evidence is request-bound, time-bounded, signature-checked, and nonce-replay-protected within the process.
-
-The current evidence source is `username_password`, backed by the server-managed Owner session; token-issued and session-challenge sources are not claimed. A copied evidence object is a bearer capability for its exact request, but replay of its nonce is rejected. The signing secret and replay set are process-local; serialized worker validation instead checks the exact request, evidence fingerprint, expiry, and active Owner session. Distributed replay protection is not claimed.
-
-## OwnerInstruction Entity
-
-The state contains a versioned `OwnerInstruction` record with text, created/updated timestamps, fingerprint, authentication record, request ID, source, previous version, and status. `OwnerInstructionSnapshot` and `OwnerPolicySnapshot` are immutable dataclass values used as decision inputs.
-
-Normal authenticated conversation does not update policy. An explicit `Owner instruction:` request is required, followed by typed evidence validation.
-
-## Decision Context
-
-At the beginning of a sensitive request:
+The Owner's explicit direction is the highest normative instruction source:
 
 ```text
-Intent
-  ↓
-Policy Snapshot
-  ↓
-Authorization
-  ↓
-Scope
-  ↓
-Plan
-  ↓
-Tool Validation
-  ↓
-Execution
-  ↓
-Evidence
+OWNER_INSTRUCTION (900)
+  > SYSTEM_PLATFORM (800)
+  > OWNER_POLICY (600)
+  > DETERMINISTIC_ENFORCEMENT (500)
+  > AUTHORIZATION_SCOPE (400)
+  > TOOL_RUNTIME (300)
+  > MODEL_OUTPUT (200)
+  > EXTERNAL_DATA (100)
 ```
 
-Later Owner updates do not rewrite an already captured request snapshot. The current code provides single-process multi-thread locking for policy writes; it does not claim multi-process or distributed consistency.
+This ordering resolves **instruction and policy-source precedence only**. An authority rank is not an execution capability, an authentication credential, a selected scope, or an authorization decision. `SYSTEM_PLATFORM` is the second normative source; platform/runtime invariants are enforced separately as unconditional gates and cannot be waived by any instruction.
 
-## Non-Authority Sources
+## Non-overridable execution gates
 
-Model output, RAG, memory, knowledge, user claims, external documents, tool output, and expert advice cannot become Owner Instruction. They are data, proposals, or advice only.
+Every relevant operation must pass all applicable gates:
+
+1. Valid, request-bound `OwnerAuthenticationEvidence` from the Owner authentication path.
+2. An explicitly Owner-selected, valid `ScopeSnapshot` for scope-bound operations.
+3. Tool authorization and `ToolSpec`/argument-boundary checks.
+4. A supported process sandbox and workspace/resource boundary.
+5. Owner cancellation and execution-fence checks, including transport send boundaries.
+6. Evidence provenance and integrity checks.
+
+A failed gate denies the operation even when the Owner instruction requests it. Model output, external data, memory, tool output, and a natural-language claim cannot manufacture a gate result. The authority snapshot records these as `NON_OVERRIDABLE_EXECUTION_GATES` and explicitly records that Owner rank grants no execution permission.
+
+## Authentication evidence
+
+An Owner update requires an issued `OwnerAuthenticationEvidence` containing method, authenticated time, expiry, proof fingerprint, request ID, optional session ID, nonce, and an HMAC signature. Boolean fields such as `owner_authenticated=True` and client-supplied mappings are not accepted by the Owner Instruction writer. Evidence is request-bound, time-bounded, signature-checked, and nonce-replay-protected within the process.
+
+The current evidence source is `username_password`, backed by the server-managed Owner session. The policy reference module also requires typed, request-bound evidence; it does not authenticate a session by inspecting client claims. The signing secret and replay set are process-local; serialized worker validation checks the exact request, evidence fingerprint, expiry, and active Owner session. Distributed replay protection is not claimed.
+
+## OwnerInstruction snapshots and request context
+
+The state contains a versioned `OwnerInstruction` record with text, timestamps, fingerprint, authentication record, request ID, source, previous version, and status. `OwnerInstructionSnapshot` and `OwnerPolicySnapshot` are immutable decision inputs. A later Owner update does not rewrite a request snapshot already captured.
+
+A natural-language instruction can state the desired policy or objective, but cannot itself create a `ScopeSnapshot`, authorize a tool, start a process, disable cancellation, or attest evidence. Those are separate runtime decisions.
+
+## Code boundaries and status
+
+`security/authority.py` exports descriptive precedence metadata; no tool authorization decision is made by comparing enum numbers. `security/owner_charter.py` is a policy reference model and is not imported by the live request/authorization path; its result is not execution permission. Live authorization is enforced by `AuthorizationContext`, `security/authorization.py`, the tool registry, and the governed runtime/sandbox/transport boundaries.
+
+The CI test workflow runs `python -m pytest -q`, including regressions for the numeric order and the independent authentication/scope gates. The keyword-based `owner-charter-audit` workflow is only a human-review inventory, not semantic proof.

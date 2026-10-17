@@ -1,59 +1,53 @@
-# OWNER_INSTRUCTION — الميثاق الأعلى لـ CyberSentinel X
+# OWNER_INSTRUCTION — ميثاق أولوية التعليمات في CyberSentinel X
 
-> وثيقة دستورية صادرة عن المالك (mosfiry) بتاريخ 2026-09-27.
-> النص التشريعي الكامل محفوظ حرفيًا في المعرفة الدائمة للمشروع (owner-charter) ولا يُعدّل.
+> تصحيح موثق وفق توجيه المالك بتاريخ 2026-10-17: `OWNER_INSTRUCTION = 900` ثم `SYSTEM_PLATFORM = 800`. يعلو هذا التصحيح على أي ترتيب رقمي أقدم في وثائق التدقيق التاريخية.
 
-## المبدأ الدستوري
+## ترتيب الأولوية المعياري
 
-OWNER_INSTRUCTION (الميثاق — مصدر التشريع الوحيد) في القمة. تحته فروع مشتقة تنفيذية:
-POLICY وETHICS وSECURITY (طبقات مشتقة) ثم SCOPE ثم AUTHORIZATION ثم DELEGATION ثم EXECUTION.
+```text
+OWNER_INSTRUCTION (900)
+  > SYSTEM_PLATFORM (800)
+  > OWNER_POLICY (600)
+  > DETERMINISTIC_ENFORCEMENT (500)
+  > AUTHORIZATION_SCOPE (400)
+  > TOOL_RUNTIME (300)
+  > MODEL_OUTPUT (200)
+  > EXTERNAL_DATA (100)
+```
 
-- **لا سلطة تشريعية ثانية**: POLICY/ETHICS/SECURITY/SCOPE/AUTHORIZATION/DELEGATION كلها مشتقات تنفيذية للميثاق ولا تملك حق التنافس معه أو إلغائه.
-- **النموذج لا يشرّع**: MODEL_OUTPUT وEXTERNAL_DATA وTOOL_OUTPUT وKNOWLEDGE_BASE لا يمكنها أبدًا تسجيل قاعدة ميثاق — try_legislate ترفضها fail-closed بـ ILLEGITIMATE_LEGISLATION.
-- **التشريع يتطلب هوية المالك الموثّقة**: فقط جلسة username+password (security.owner_password.authenticated_owner) تملك إصدار قواعد الميثاق. أي client claim أو token نقل لا يُعتبر مصدرًا تشريعيًا.
-- **التعارض = خطأ في النظام**: أي قاعدة تطبيقية تناقض الميثاق تُرفع كـ OWNER_INSTRUCTION_CONFLICT (تصنيف انحراف تنفيذي يجب تصحيحه) — ولا يوجد أي مسار "اختيار البديل".
+هذا الترتيب يحسم **أولوية مصادر التعليمات والسياسات** فقط. لا يمنح إذن تنفيذ لأي أداة، حتى عند صدور `OWNER_INSTRUCTION` الأعلى، ولا ينشئ قدرة على تجاوز حاجز تشغيلي. ولا يعني ترتيب الأرقام أن حواجز التنفيذ أدنى أو اختيارية.
 
-## التجسيد الكودي (runtime semantics)
+## بوابات التنفيذ الإلزامية
 
-الوحدة القانونية: security/owner_charter.py
+كل عملية محكومة يجب أن تجتاز البوابات ذات الصلة جميعًا؛ أي فشل يعني الرفض. لا تستطيع تعليمة المالك أو مخرجات النموذج تخطيها أو تصنيعها:
 
-| المفهوم | التجسيد |
-|---|---|
-| مصدر التشريع | RuleProvenance.OWNER_INSTRUCTION — القمة الدستورية (CHARTER_PRECEDENCE[0]) |
-| المجالات المشترَعة | CharterDomain: POLICY, ETHICS, SECURITY, SCOPE, AUTHORIZATION, DELEGATION, EXECUTION |
-| قاعدة الميثاق | CharterRule frozen dataclass (domain + behavior + stance + specification + provenance) |
-| اكتشاف التعارض | assert_charter_compliance(charter, system_rule) — يرفع OwnerInstructionConflict عند التناقض (stance أو specification) |
-| الانحراف بالغياب | assert_required_behaviors_present — غياب سلوك يوجبه المالك = انحراف fail-closed |
-| منع تشريع النموذج | try_legislate — رفض حتمي لأي provenance غير المالك (ILLEGITIMATE_LEGISLATION) |
-| حسم مرجعي | resolve_against_charter — الميثاق دائمًا هو الجواب؛ لا تحكيم |
-| اشتقاق الطبقات | derive(domain) — كل طبقة مشتقة تحمل may_override_charter: False وسياسة تعارض = تصحيح الانحراف |
-| قابلية التدقيق | OwnerInstructionConflict.audit_record() — سجل حتمي كامل |
+- مصادقة المالك بأدلة `OwnerAuthenticationEvidence` صادرة من مسار المصادقة، لا من قيمة boolean أو ادعاء عميل.
+- اختيار المالك الصريح للنطاق، وتمثيله بـ `ScopeSnapshot` صالح؛ لا تنشئه التعليمة النصية ولا توسّعه.
+- تفويض الأداة والتحقق من `ToolSpec` وحدود المعاملات عند حد التنفيذ.
+- عزل العملية داخل sandbox مدعوم فعليًا، مع حدود مساحة العمل والموارد.
+- حاجز الإلغاء ودفتر الأثر قبل الإرسال إلى الخارج، بما في ذلك حدود إرسال MCP.
+- سلامة مصدر الأدلة وتعقيم سجل القبول ومنع اعتبار ادعاء النموذج أو نتيجة مجهولة نجاحًا.
 
-## الاختبارات
+تُسجّل هذه المتطلبات في `NON_OVERRIDABLE_EXECUTION_GATES`. وتُقيّم في مسارات التفويض والتنفيذ المستقلة عن ترتيب التعليمات؛ فكلها شروط إلزامية وليست عناصر تفاوض في السلم.
 
-tests/test_owner_charter.py — بطارية إلزامية تغطي السيناريوهات الستة التي أمر بها المالك:
-1. تعارض POLICY مع OWNER_INSTRUCTION — يُكتشف كـ OWNER_INSTRUCTION_CONFLICT / IMPLEMENTATION_DRIFT.
-2. تعارض SCOPE — يُكتشف (تخفيف القيد أو تغيير المواصفة).
-3. تعارض AUTHORIZATION — يُكتشف.
-4. تعارض ETHICS — يُكتشف.
-5. تعارض SECURITY — يُكتشف (stance أو specification).
-6. MODEL_OUTPUT (وكل المصادر غير المالكة) يحاول التشريع — مرفوض و inert: لا يتحول أبدًا لمصدر تشريع بديل.
+## المصادقة وعدم تفويض الصلاحية بالنص
 
-زائدًا: تشريع المالك يتطلب هوية موثّقة (auth_method=username_password فقط)؛ client claims لا تُشرّع أبدًا؛ الطبقات المشتقة تعلن بنيويًا عدم التنافس؛ سجل التدقيق حتمي كامل.
+حفظ أو تحديث تعليمة Owner يتطلب دليلًا typed وموقّعًا ومربوطًا بـ`request_id` من مسار `username+password` المعتمد. لا تكفي `owner_authenticated=True` ولا قاموس يصرّح بـ`auth_method`. لا تمنح مخرجات النموذج أو البيانات الخارجية أو الذاكرة أو مخرجات الأدوات (`MODEL_OUTPUT`, `EXTERNAL_DATA`, `TOOL_OUTPUT`, `KNOWLEDGE_BASE`) سلطة تشريع؛ ويرفض `try_legislate` المصدر غير الموثق بتصنيف `ILLEGITIMATE_LEGISLATION`. لا يمنح نص التعليمات وحده هوية أو جلسة أو scope أو تفويض أداة.
 
-## التدقيق الدستوري المستمر
+## حدود التنفيذ الحي مقابل نموذج الميثاق
 
-workflow `owner-charter-audit` ينفّذ عند كل push (غير main) فحصًا استدلاليًا لمواضع عبارات الترجيح/الأولوية/التجاوز، وذكر `OWNER_INSTRUCTION`، وتسميات السلطات المحتملة. ينشر الأعداد ومسارات الملفات وأرقام الأسطر فقط في ملخص GitHub Actions، بصلاحية قراءة فقط؛ لا يصدّر نصوص المصدر ولا ينشئ ملفات أو يدفع تغييرات. هذا الفحص دليل مساعد للمراجعة البشرية وليس إثباتًا مستقلًا على الامتثال.
+`security/owner_charter.py` **نموذج مرجعي لترتيب السياسة، وليست جزءًا من مسار التفويض الحي**. لا تصدر صلاحيات أدوات ولا تعدّل `ScopeSnapshot` أو sandbox أو سجل الأثر. تتحقق `try_legislate` من `OwnerAuthenticationEvidence` المرتبط بالطلب، وترفض مصادر النموذج والبيانات الخارجية. كما ترفض `assert_charter_compliance` مقارنة حارس تنفيذ فعلي على أنه قاعدة سياسة قابلة للإلغاء؛ فلا يصنّف رفض النطاق أو المصادقة انحرافًا يجب تخفيفه.
 
-## حدود هذه الوثيقة
+المسارات التنفيذية الحية منفصلة: `security/authorization.py` و`AuthorizationContext` يفرضان دليل Owner والنطاق الصريح؛ `tools/registry.py` يعيد التحقق من التفويض وحدود الأداة؛ وطبقة sandbox والإلغاء وسلامة الأدلة تفرض شروط التنفيذ. نتائج النموذج والمقترحات تبقى غير موثوقة ولا تقرر الإذن.
 
-هذه الوثيقة تصف وتشرح الميثاق؛ النص التشريعي الملزم هو أمر المالك المحفوظ في المعرفة الدائمة، والتجسيد الملزم هو الكود والاختبارات أعلاه. الميثاق = المعمارية = الكود = الاختبارات.
+`RuleProvenance.OWNER_INSTRUCTION` و`CHARTER_PRECEDENCE` يصفان أولوية السياسة فقط. و`may_override_charter: False` وصف لقاعدة مشتقة، لا قدرة لتجاوز بوابات التنفيذ. اختلاف قاعدة سياسة مشتقة قد يُسجّل `OWNER_INSTRUCTION_CONFLICT` لمراجعة اتساق السياسة؛ لا يعني ذلك أن رفض المصادقة أو النطاق أو sandbox هو `IMPLEMENTATION_DRIFT` يجب تخفيفه. `assert_charter_compliance` مقصور على قواعد السياسة المشتقة، أما حواجز التنفيذ فلها تصنيف مستقل `NON_OVERRIDABLE_EXECUTION_GATE`.
 
-## تدقيق المستودع الكامل (2026-09-27) — الإغلاق
+## الاختبارات وCI
 
-تم تنفيذ مسح كامل للمستودع (371 ملفًا) عبر خطوة التدقيق الدستوري في CI
-(diagnostics/charter-audit-*.md): **لا توجد أي سلطة تشريعية منافسة**. اكتُشف انحراف
-واحد ("استثناء التشديد" في اختبار الميثاق نفسه) وأُصلح في commit `3725c7b5fc13`
-مع اختبار انحدار يؤكد تصنيف OWNER_INSTRUCTION_CONFLICT. CI أخضر
-(`diagnostics/ci-3725c7b5fc13.md` = SUCCESS و `ci-024f5cef935d.md` = SUCCESS).
-التفاصيل الكاملة: `docs/OWNER_CHARTER_AUDIT_2026-09-27.md`.
+تشمل اختبارات العقد `tests/test_directive_acceptance.py` و`tests/test_phase6a1_hardening.py` و`tests/test_phase6k4_deep_hardening.py` و`tests/test_owner_authority_refactor.py` و`tests/test_owner_charter.py`. وهي تثبت الترتيب الرقمي المطلوب، واشتراط الدليل الموثّق، واستمرار رفض طلب أداة محكومة بالنطاق عند غياب `ScopeSnapshot` حتى لو طلبت التعليمة عكس ذلك.
+
+يشغّل `.github/workflows/tests.yml` مجموعة `pytest` كاملة. أما `owner-charter-audit` فهو فحص كلمات/مواضع استدلالي مساعد للمراجعة البشرية، وليس مدققًا دلاليًا ولا إثبات امتثال مستقلًا.
+
+## تصحيح السجل التاريخي
+
+تقارير 2026-09-27 و2026-10-06 وثائق تاريخية احتوت ترتيبات متعارضة وادعاءات أوسع من الأدلة المتاحة. لا تمثل ترتيب السلطة الحالي ولا تثبت وحدها أن `owner_charter.py` موصول بمسار runtime. الترتيب الحالي هو `OWNER_INSTRUCTION (900) > SYSTEM_PLATFORM (800)`، مع بقاء بوابات التنفيذ أعلاه إلزامية وغير قابلة للتجاوز.

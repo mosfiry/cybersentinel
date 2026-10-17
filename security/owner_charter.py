@@ -1,27 +1,15 @@
-"""OWNER_INSTRUCTION charter — the supreme application-policy source of CyberSentinel X.
+"""Reference model for Owner policy precedence; not a live authorization path.
 
-Immutable system/platform constraints form the outer boundary above this charter
-and cannot be redefined by Owner instructions.
+OWNER_INSTRUCTION is the highest-ranked normative instruction source
+(AuthorityTier 900; SYSTEM_PLATFORM is 800). This source ordering resolves
+policy/instruction precedence only. It never grants execution permission and
+cannot bypass the unconditional authentication, explicit-scope, tool-authorization,
+sandbox, cancellation, or evidence-integrity gates enforced elsewhere.
 
-Constitutional invariants (issued by the Owner 2026-09-27, immutable):
-
-1. OWNER_INSTRUCTION is the application charter: the single legislative source that
-   defines policy, ethics, protection, security, scope, delegation,
-   objectives, permissions, prohibitions, and execution conditions.
-2. No second legislative authority exists within application policy.
-   SYSTEM_PLATFORM is the immutable outer boundary and outranks this charter.
-   POLICY, ETHICS, SECURITY,
-   SCOPE, AUTHORIZATION and DELEGATION are DERIVED from the charter —
-   they never compete with it and can never override it.
-3. Any application rule that contradicts the charter is an
-   OWNER_INSTRUCTION_CONFLICT (implementation drift), not a rival law.
-   The conflicting rule must be corrected; the charter stays supreme.
-4. The model never legislates. MODEL_OUTPUT (and any other non-owner
-   provenance) can never register, amend, or supersede charter rules.
-
-This module is the runtime embodiment of that charter: deterministic,
-fail-closed, and auditable. It contains no LLM, no network access, and
-no configurable priority — the precedence is constitutional.
+This module is not imported by the production request/authorization path. Its
+helpers model policy intent only; they do not issue tool permissions, modify a
+ScopeSnapshot, launch a process, or certify evidence. Keep that boundary explicit
+if this reference model is extended or connected in the future.
 """
 from __future__ import annotations
 
@@ -31,7 +19,7 @@ from typing import Any
 
 
 class CharterDomain(str, Enum):
-    """Domains the Owner charter legislates. All other layers derive from it."""
+    """Domains for normative Owner policy intent, not execution capabilities."""
 
     POLICY = "policy"
     ETHICS = "ethics"
@@ -51,14 +39,15 @@ class Stance(str, Enum):
 class RuleProvenance(str, Enum):
     OWNER_INSTRUCTION = "owner_instruction"
     DERIVED_SYSTEM_RULE = "derived_system_rule"
+    RUNTIME_GATE = "non_overridable_runtime_gate"
     MODEL_OUTPUT = "model_output"
     EXTERNAL_DATA = "external_data"
     TOOL_OUTPUT = "tool_output"
     KNOWLEDGE_BASE = "knowledge_base"
 
 
-#: Application-charter precedence. Index 0 is supreme within application policy;
-#: the immutable SYSTEM_PLATFORM boundary remains above this sequence.
+#: Normative instruction precedence. Execution gates are separate and are never
+#: compared as subordinate policy rules.
 CHARTER_PRECEDENCE: tuple[RuleProvenance, ...] = (
     RuleProvenance.OWNER_INSTRUCTION,
     RuleProvenance.DERIVED_SYSTEM_RULE,
@@ -72,6 +61,7 @@ FORBIDDEN_LEGISLATIVE_SOURCES: frozenset[RuleProvenance] = frozenset(
         RuleProvenance.TOOL_OUTPUT,
         RuleProvenance.KNOWLEDGE_BASE,
         RuleProvenance.DERIVED_SYSTEM_RULE,
+        RuleProvenance.RUNTIME_GATE,
     }
 )
 
@@ -138,6 +128,12 @@ class LegislationError(CharterError):
     classification = "ILLEGITIMATE_LEGISLATION"
 
 
+class NonOverridableExecutionGateError(CharterError):
+    """A runtime gate was incorrectly submitted to policy-precedence logic."""
+
+    classification = "NON_OVERRIDABLE_EXECUTION_GATE"
+
+
 @dataclass(frozen=True)
 class CharterRule:
     """A normative statement about one behavior in one charter domain."""
@@ -156,29 +152,44 @@ class CharterRule:
             raise ValueError("charter rule requires a CharterDomain")
 
 
-def is_authoritative_source(identity: Any) -> bool:
-    """Only the authenticated human Owner can legislate the charter.
+def is_authoritative_source(identity: Any, *, request_id: str | None = None) -> bool:
+    """Accept only issued, request-bound Owner authentication evidence.
 
-    Identity comes exclusively from the server-side owner password
-    session (security.owner_password.authenticated_owner). Client
-    claims, model output, and transport tokens are never authoritative.
+    A client-controlled mapping containing ``auth_method`` is not proof. This
+    reference model does not authenticate sessions itself; its caller must pass
+    typed evidence issued by ``security.owner_policy``.
     """
-    if not isinstance(identity, dict):
+    if not request_id:
         return False
-    return identity.get("auth_method") == AUTHORITATIVE_AUTH_METHOD
+    try:
+        from security.owner_policy import OwnerAuthenticationEvidence
+
+        if not isinstance(identity, OwnerAuthenticationEvidence):
+            return False
+        return identity.is_valid(str(request_id), identity.session_id) or identity.is_valid_for_active_session(
+            str(request_id), identity.session_id
+        )
+    except Exception:
+        return False
 
 
-def try_legislate(rule: CharterRule, identity: Any = None) -> CharterRule:
+def try_legislate(
+    rule: CharterRule,
+    identity: Any = None,
+    *,
+    request_id: str | None = None,
+) -> CharterRule:
     """Attempt to register a charter rule. Fail-closed by design.
 
-    - OWNER_INSTRUCTION provenance requires an authenticated Owner identity.
+    - OWNER_INSTRUCTION provenance requires issued OwnerAuthenticationEvidence
+      valid for this request ID.
     - Any other provenance can NEVER legislate: the attempt is rejected
       as ILLEGITIMATE_LEGISLATION and never becomes a rule source.
     """
     if rule.provenance == RuleProvenance.OWNER_INSTRUCTION:
-        if not is_authoritative_source(identity):
+        if not is_authoritative_source(identity, request_id=request_id):
             raise LegislationError(
-                "owner_instruction_requires_authenticated_owner_identity"
+                "owner_instruction_requires_request_bound_owner_evidence"
             )
         return rule
     raise LegislationError(
@@ -200,12 +211,20 @@ def assert_charter_compliance(
     charter_rules: frozenset[CharterRule] | set[CharterRule],
     system_rule: CharterRule,
 ) -> None:
-    """Assert a system rule does not contradict the Owner charter.
+    """Compare normative policy rules only; never adjudicate execution gates.
 
     Raises OwnerInstructionConflict on contradiction. A contradiction is
     NEVER resolved by choosing the system rule — it is classified as
-    OWNER_INSTRUCTION_CONFLICT / implementation drift to be corrected.
+    OWNER_INSTRUCTION_CONFLICT / policy implementation drift to be reviewed.
+    Runtime gates are not policy rules: submitting one here raises a separate
+    error and cannot label a security denial as drift to be removed.
     """
+    if system_rule.provenance == RuleProvenance.RUNTIME_GATE:
+        raise NonOverridableExecutionGateError(
+            "runtime gates are unconditional and outside Owner policy precedence"
+        )
+    if system_rule.provenance != RuleProvenance.DERIVED_SYSTEM_RULE:
+        raise ValueError("only derived normative policy rules are comparable")
     for charter_rule in charter_rules:
         if charter_rule.domain != system_rule.domain:
             continue
@@ -288,11 +307,11 @@ def resolve_against_charter(
     domain: CharterDomain,
     behavior: str,
 ) -> CharterRule | None:
-    """Resolve a behavior against the charter. The charter ALWAYS wins.
+    """Resolve normative policy intent; this result is not execution permission.
 
-    There is no arbitration: if the Owner legislated the behavior, that
-    is the answer. System rules may only tighten (never loosen) and
-    are validated separately via assert_charter_compliance.
+    There is no policy-source arbitration: if the Owner legislated the behavior,
+    that is the normative policy result. Authorization, selected scope, sandbox,
+    cancellation, and evidence gates are evaluated independently by runtime code.
     """
     for charter_rule in charter_rules:
         if (
@@ -312,6 +331,7 @@ __all__ = [
     "CharterRule",
     "FORBIDDEN_LEGISLATIVE_SOURCES",
     "LegislationError",
+    "NonOverridableExecutionGateError",
     "OwnerInstructionConflict",
     "RuleProvenance",
     "Stance",

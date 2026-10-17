@@ -15,6 +15,7 @@ from agent.model_router import ModelRouter
 from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 from agent.trajectory import EventType
 from owner_session_testutils import allow_owner_sessions, persist_canonical_scope, workspace_scope_context
+from process_sandbox_testutils import require_live_process_sandbox
 
 
 class StatusProvider:
@@ -70,6 +71,7 @@ def _candidate_definition(description: str) -> SkillDefinition:
 
 
 def _completed_mission(tmp_path: Path, monkeypatch):
+    require_live_process_sandbox()
     allow_owner_sessions(monkeypatch, "valid-owner")
     project = tmp_path / "owner-project"
     project.mkdir()

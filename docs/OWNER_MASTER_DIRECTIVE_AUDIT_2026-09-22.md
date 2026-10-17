@@ -320,3 +320,13 @@ git diff --check
 ## Superseding authority-order correction (2026-10-06)
 
 The 2026-09-22 order above records the design at that audit date. The v5.2 final-completion mission requires immutable system/platform constraints to sit above Owner Instruction. The current metadata contract encodes `SYSTEM_PLATFORM > OWNER_INSTRUCTION > OWNER_POLICY > ...`; Owner Instruction remains the highest application-configurable authority. This correction is reflected in `security/authority.py`, `docs/AGENT_ARCHITECTURE.md`, and the authority-order regression tests. It changes the documented and serialized tier ordering only: the repository audit found no runtime path that consumes `AuthorityTier` as a tool-authorization decision. External host constraints remain outside application control and non-overridable.
+
+## Superseding Owner correction (2026-10-17)
+
+The 2026-10-06 paragraph above is historical and is superseded by the Owner's
+explicit current instruction: `OWNER_INSTRUCTION (900) > SYSTEM_PLATFORM (800)`.
+The rank is normative instruction precedence only; it does not grant execution
+permission or bypass Owner authentication, explicitly selected scope, tool
+authorization, process sandbox, cancellation, or evidence-integrity gates. The
+runtime must deny an operation when any required gate fails. No `v5.2` release
+or tag is created by this correction.

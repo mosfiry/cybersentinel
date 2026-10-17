@@ -1,4 +1,4 @@
-"""Adversarial battery for the OWNER_INSTRUCTION charter (supreme legislation).
+"""Adversarial battery for the Owner policy reference model.
 
 The Owner's mandated scenarios: a contradicting POLICY / SCOPE /
 AUTHORIZATION / ETHICS / SECURITY rule must be detected as
@@ -15,6 +15,7 @@ from security.owner_charter import (
     CharterDomain,
     CharterRule,
     LegislationError,
+    NonOverridableExecutionGateError,
     OwnerInstructionConflict,
     RuleProvenance,
     Stance,
@@ -26,7 +27,10 @@ from security.owner_charter import (
     try_legislate,
 )
 
-OWNER_IDENTITY = {"owner_id": 1, "username": "mosfiry", "auth_method": AUTHORITATIVE_AUTH_METHOD}
+def owner_evidence(request_id="owner-charter-test"):
+    import security.owner_policy as policy
+
+    return policy._issue_evidence(AUTHORITATIVE_AUTH_METHOD, request_id, "test-proof")
 
 
 def owner_rule(domain, behavior, stance, spec=None):
@@ -138,7 +142,8 @@ def test_non_owner_sources_cannot_legislate(provenance):
         provenance=provenance,
     )
     with pytest.raises(LegislationError):
-        try_legislate(rule, identity=OWNER_IDENTITY)
+        evidence = owner_evidence()
+        try_legislate(rule, identity=evidence, request_id=evidence.request_id)
 
 
 def test_model_output_attempting_charter_amendment_is_rejected_and_inert():
@@ -162,10 +167,11 @@ def test_owner_instruction_legislation_requires_authenticated_owner_identity():
     with pytest.raises(LegislationError):
         try_legislate(rule, identity=None)
     with pytest.raises(LegislationError):
-        try_legislate(rule, identity={"auth_method": "owner_token"})  # transport/legacy claim
+        try_legislate(rule, identity={"auth_method": AUTHORITATIVE_AUTH_METHOD}, request_id="owner-charter-test")
     with pytest.raises(LegislationError):
-        try_legislate(rule, identity={"auth_method": "owner_session_challenge"})
-    legislated = try_legislate(rule, identity=OWNER_IDENTITY)
+        try_legislate(rule, identity=owner_evidence("actual-request"), request_id="different-request")
+    evidence = owner_evidence()
+    legislated = try_legislate(rule, identity=evidence, request_id=evidence.request_id)
     assert legislated.provenance == RuleProvenance.OWNER_INSTRUCTION
 
 
@@ -177,9 +183,25 @@ def test_client_claims_are_never_authoritative():
         {"owner_authenticated": True},
         {"role": "owner"},
         {"is_owner": True},
-        {"auth_method": "OWNER_TOKEN"},
+        {"auth_method": AUTHORITATIVE_AUTH_METHOD},
     ):
-        assert is_authoritative_source(bogus) is False
+        assert is_authoritative_source(bogus, request_id="owner-charter-test") is False
+
+    evidence = owner_evidence()
+    assert is_authoritative_source(evidence, request_id=evidence.request_id) is True
+    assert is_authoritative_source(evidence, request_id="different-request") is False
+
+
+def test_runtime_gates_are_not_classified_as_owner_policy_drift():
+    charter = frozenset({owner_rule(CharterDomain.SCOPE, "explicit_scope_required", Stance.ALLOWED)})
+    gate = CharterRule(
+        domain=CharterDomain.SCOPE,
+        behavior="explicit_scope_required",
+        stance=Stance.REQUIRED,
+        provenance=RuleProvenance.RUNTIME_GATE,
+    )
+    with pytest.raises(NonOverridableExecutionGateError, match="outside Owner policy precedence"):
+        assert_charter_compliance(charter, gate)
 
 
 # --- Charter resolution: the charter always wins, no arbitration ---

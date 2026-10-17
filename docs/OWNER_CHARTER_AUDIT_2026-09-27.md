@@ -1,5 +1,9 @@
 # OWNER Charter Full-Repository Audit — Closure 2026-09-27
 
+> **Historical report; conclusions superseded by the Owner's correction dated
+> 2026-10-17.** The order and runtime/CI claims below describe the earlier audit
+> snapshot, not the current authority contract. See the correction at the end.
+
 Mandate §12 (بحث المستودع بالكامل عن أي سلطة تشريعية منافسة): تم تنفيذ مسح كامل
 على جميع ملفات المستودع (371 ملفًا) عبر خطوة التدقيق الدستوري في CI
 (workflow: pytest-diagnostics.yml, commit 60641eb89996, report:
@@ -60,3 +64,17 @@ diagnostics/charter-audit-70b618f193e8.part000/001.md).
 الخلاصة: الميثاق = المعمارية = الكود = الاختبارات — OWNER_INSTRUCTION هي مصدر
 التشريع الوحيد، وكل التعارضات تُصنَّف OWNER_INSTRUCTION_CONFLICT / IMPLEMENTATION_DRIFT
 وتُصحَّح، ولا يوجد أي مسار تحكيم بديل.
+
+## تصحيح المالك والتدقيق اللاحق (2026-10-17)
+
+التقرير أعلاه سجل تاريخي وليس وصفًا حاليًا. توجيه المالك الحالي يحدد
+`OWNER_INSTRUCTION (900) > SYSTEM_PLATFORM (800)`؛ لذلك فإن القيم القديمة
+`800 > 700` وأي تصحيح لاحق يضع `SYSTEM_PLATFORM` فوق `OWNER_INSTRUCTION` لم تعد
+نافذة.
+
+كما كشف التدقيق اللاحق أن `security/owner_charter.py` نموذج مرجعي غير مستورد في
+مسار التفويض الحي، وأن workflow `owner-charter-audit` جردٌ استدلالي للكلمات
+والمواضع لا مدقق دلالي. لذا لا يثبت هذا التقرير أن الوحدة موصولة بالـruntime أو
+أن فحص الكلمات وحده يثبت الامتثال. الأولوية النصية لا تمنح إذن تنفيذ: المصادقة،
+والنطاق المختار صراحة، وتفويض الأداة، وsandbox، والإلغاء، وسلامة الأدلة تبقى
+بوابات تشغيلية مستقلة وغير قابلة للتجاوز بأي تعليمة.

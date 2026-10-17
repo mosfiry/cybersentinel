@@ -1,15 +1,8 @@
-"""OWNER_INSTRUCTION charter — canonical-knowledge invariants (session 5).
+"""Contract tests for the documented Owner policy reference model.
 
-The Owner's constitutional mandate requires that the charter principle is not
-merely present as prose, but is pinned as a testable invariant over the
-canonical architectural knowledge of this repository:
-
-- docs/OWNER_CHARTER.md is the canonical charter document inside the repo
-  (the full immutable legislative text lives in the project's durable
-  knowledge, owner-charter, and is binding).
-
-These tests fail closed if the canonical document is weakened, and they pin
-the runtime semantics: EXTERNAL_DATA can never legislate or amend the charter.
+The live authorization boundary is implemented separately by owner_policy,
+AuthorizationContext, authorize_tool, and the governed execution runtime.
+These tests must not imply that owner_charter.py itself grants runtime access.
 """
 
 from __future__ import annotations
@@ -36,12 +29,15 @@ def _charter_doc_text() -> str:
     return _CHARTER_DOC.read_text(encoding="utf-8")
 
 
-def test_canonical_charter_document_declares_owner_instruction_supreme():
+def test_canonical_charter_document_declares_owner_rank_and_separate_gates():
     text = _charter_doc_text()
     assert "OWNER_INSTRUCTION" in text
-    # single legislative source — no second legislative authority
+    assert "900" in text
+    assert "800" in text
     assert "RuleProvenance.OWNER_INSTRUCTION" in text
     assert "CHARTER_PRECEDENCE" in text
+    assert "NON_OVERRIDABLE_EXECUTION_GATES" in text
+    assert "لا يمنح إذن تنفيذ" in text
 
 
 def test_canonical_charter_document_forbids_rival_legislation():
@@ -61,6 +57,7 @@ def test_canonical_charter_document_pins_conflict_classification():
     assert "assert_charter_compliance" in text
     assert "may_override_charter" in text
     assert "username+password" in text
+    assert "ليست جزءًا من مسار التفويض الحي" in text
 
 
 def test_external_data_cannot_legislate_or_amend_charter():
