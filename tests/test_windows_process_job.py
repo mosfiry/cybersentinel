@@ -114,12 +114,43 @@ def test_job_runner_fails_closed_when_tree_emptiness_cannot_be_verified(tmp_path
     assert result["job_remaining_member_count"] == 1
 
 
-@pytest.mark.parametrize("termination_method", ["terminate_current", "terminate_owned_job"])
 @pytest.mark.parametrize(
-    ("initial_members", "process_counts", "wait_results"),
+    "termination_method", ("terminate_current", "terminate_owned_job")
+)
+@pytest.mark.parametrize(
+    (
+        "initial_members",
+        "process_counts",
+        "wait_results",
+        "timeout_seconds",
+        "expected_success",
+    ),
     [
-        (1, (1, 0, 0), (windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_OBJECT_0)),
-        (0, (0, 0), (windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_OBJECT_0)),
+        (
+            1,
+            (1, 0, 0),
+            (
+                windows_job_module._WAIT_TIMEOUT,
+                windows_job_module._WAIT_TIMEOUT,
+                windows_job_module._WAIT_OBJECT_0,
+            ),
+            10.0,
+            True,
+        ),
+        (
+            0,
+            (0, 0),
+            (windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_OBJECT_0),
+            10.0,
+            True,
+        ),
+        (
+            0,
+            (0, 0),
+            (windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_TIMEOUT),
+            0.0,
+            False,
+        ),
     ],
 )
 def test_termination_waits_for_root_handle_after_job_becomes_empty(
@@ -129,6 +160,8 @@ def test_termination_waits_for_root_handle_after_job_becomes_empty(
     initial_members: int,
     process_counts: tuple[int, ...],
     wait_results: tuple[int, ...],
+    timeout_seconds: float,
+    expected_success: bool,
 ) -> None:
     executable = tmp_path / "CyberSentinel.exe"
     executable.write_bytes(b"fixture executable")
@@ -168,15 +201,46 @@ def test_termination_waits_for_root_handle_after_job_becomes_empty(
     monkeypatch.setattr(job, "process_count", lambda: next(member_counts))
 
     if termination_method == "terminate_current":
-        result = job.terminate_current(1234, executable, timeout_seconds=10)
+        result = job.terminate_current(
+            1234, executable, timeout_seconds=timeout_seconds
+        )
     else:
-        result = job.terminate_owned_job(timeout_seconds=10)
+        result = job.terminate_owned_job(timeout_seconds=timeout_seconds)
 
     assert result["initial_member_count"] == initial_members
     assert result["remaining_member_count"] == 0
-    assert result["root_process_stopped"] is True
-    assert result["termination_succeeded"] is True
+    assert result["root_process_stopped"] is expected_success
+    assert result["termination_succeeded"] is expected_success
     assert kernel32.terminated_jobs == [(77, 0xD)]
+    if expected_success:
+        assert job.current is None
+    else:
+        assert job.current is identity
+
+
+@pytest.mark.parametrize(
+    "termination_method", ("terminate_current", "terminate_owned_job")
+)
+@pytest.mark.parametrize(
+    "timeout_seconds", (float("inf"), float("-inf"), float("nan"), -1.0)
+)
+def test_termination_rejects_unbounded_or_negative_timeout_before_os_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    termination_method: str,
+    timeout_seconds: float,
+) -> None:
+    monkeypatch.setattr(windows_job_module, "_kernel32", lambda: object())
+    job = WindowsOwnedJob("Local\\invalid-timeout-job", 77)
+
+    with pytest.raises(ValueError, match="windows_job_timeout_invalid"):
+        if termination_method == "terminate_current":
+            job.terminate_current(
+                1234, tmp_path / "missing.exe", timeout_seconds=timeout_seconds
+            )
+        else:
+            job.terminate_owned_job(timeout_seconds=timeout_seconds)
+
     assert job.current is None
 
 
