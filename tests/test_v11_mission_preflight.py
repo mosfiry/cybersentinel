@@ -439,3 +439,121 @@ def test_action_id_encoding_is_unambiguous_for_embedded_separators():
     left = derive_action_id("a\0b", "c", "d")
     right = derive_action_id("a", "\0b", "c")
     assert left != right
+
+
+def test_windows_process_preflight_block_survives_store_reopen_without_success(tmp_path):
+    database_path = tmp_path / "missions.sqlite3"
+    owner_identity_ref = "owner:preflight-fixture"
+    scope_snapshot = {
+        "target_id": "test-target",
+        "scope": ["workspace"],
+        "allowed_targets": ["test-target"],
+    }
+    executor_invocations: list[tuple[str, str, str]] = []
+
+    def authorize(mission, step):
+        if (
+            mission.owner_identity_ref != owner_identity_ref
+            or mission.scope_snapshot != scope_snapshot
+            or step.action != "run_project_tests"
+        ):
+            return False, "owner scope binding mismatch"
+        return True, "exact owner project scope"
+
+    def reject_before_process_start(mission, step, action_id):
+        assert authorize(mission, step)[0] is True
+        executor_invocations.append((mission.mission_id, step.step_id, action_id))
+        return {
+            "success": False,
+            "failure_class": "RESOURCE",
+            "error": "process_sandbox_unavailable",
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "backend_unavailable",
+            "detail_code": "windows_appcontainer_backend_unimplemented",
+            "sandbox_backend": "windows-appcontainer-job",
+            "dispatch_attempted": False,
+            "process_started": False,
+            "process_start_confirmed": False,
+        }
+
+    store = MissionStore(database_path)
+    runtime = MissionRuntime(
+        store,
+        executor=reject_before_process_start,
+        authorizer=authorize,
+        authorization_snapshot_factory=make_test_snapshot,
+        require_authorization_snapshot=True,
+    )
+    objective = "Run the bounded project test under the exact Owner scope"
+    plan = Plan.initial(objective).replan(
+        steps=(
+            PlanStep(
+                "preflight-step",
+                "Run the bounded project test",
+                action="run_project_tests",
+                retry_policy={"arguments": {"query": "bounded-fixture"}},
+            ),
+        ),
+        reason="preflight persistence regression",
+    )
+    mission = runtime.create(
+        objective,
+        "bounded project test",
+        plan,
+        mission_id="preflight-blocked-mission",
+        request_id="preflight-blocked-request",
+        owner_identity_ref=owner_identity_ref,
+        scope_snapshot=scope_snapshot,
+    )
+
+    blocked = runtime.run_slice(mission.mission_id)
+
+    assert len(executor_invocations) == 1
+    assert blocked.status is MissionStatus.RESOURCE_BLOCKED
+    assert blocked.checkpoint["status"] == "not_dispatched"
+    assert blocked.checkpoint["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
+    assert blocked.checkpoint["attempt_source"] == "mission_slice"
+    assert blocked.checkpoint["dispatch_attempted"] is False
+    assert blocked.checkpoint["process_started"] is False
+    assert blocked.checkpoint["process_start_confirmed"] is False
+    assert blocked.evidence == []
+    assert not any(name in _event_names(blocked) for name in ("GoalVerified", "MissionCompleted"))
+    failure_event = next(item for item in blocked.trajectory if item["event"] == "FailureDetected")
+    assert failure_event["mission_id"] == blocked.mission_id
+    assert failure_event["request_id"] == blocked.request_id
+    assert failure_event["data"]["attempt_source"] == "mission_slice"
+    assert failure_event["data"]["dispatch_attempted"] is False
+    assert failure_event["data"]["process_started"] is False
+    assert failure_event["data"]["process_start_confirmed"] is False
+    assert failure_event["data"]["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
+    diagnosed = next(item for item in blocked.trajectory if item["event"] == "FailureDiagnosed")
+    assert diagnosed["data"]["attempt_source"] == "mission_slice"
+    assert diagnosed["data"]["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"
+    assert diagnosed["data"]["attempt_id"] == blocked.checkpoint["attempt_id"]
+
+    reopened_store = MissionStore(database_path)
+    restored = reopened_store.load(mission.mission_id)
+    assert restored is not None and restored.verify_integrity()
+    assert restored.status is MissionStatus.RESOURCE_BLOCKED
+    assert restored.owner_identity_ref == owner_identity_ref
+    assert restored.scope_snapshot == scope_snapshot
+    assert restored.checkpoint["status"] == "not_dispatched"
+    assert restored.checkpoint["attempt_source"] == "mission_slice"
+    assert restored.checkpoint["reason_code"] == "backend_unavailable"
+    assert restored.checkpoint["dispatch_attempted"] is False
+    assert restored.checkpoint["process_started"] is False
+    assert restored.checkpoint["process_start_confirmed"] is False
+    assert restored.evidence == []
+    assert not any(name in _event_names(restored) for name in ("GoalVerified", "MissionCompleted"))
+
+    restarted_runtime = MissionRuntime(
+        reopened_store,
+        executor=lambda *_args, **_kwargs: pytest.fail("terminal preflight block must not be replayed"),
+        authorizer=authorize,
+        authorization_snapshot_factory=make_test_snapshot,
+        require_authorization_snapshot=True,
+    )
+    after_restart = restarted_runtime.run_to_completion(mission.mission_id)
+    assert after_restart.status is MissionStatus.RESOURCE_BLOCKED
+    assert len(executor_invocations) == 1
+    assert restored.checkpoint["kind"] == "PROCESS_SANDBOX_UNAVAILABLE"

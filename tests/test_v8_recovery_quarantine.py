@@ -197,3 +197,42 @@ def test_live_strict_lease_is_not_stolen_but_is_quarantined_after_expiry(tmp_pat
     assert parked.state is WorkerMissionState.NEEDS_INPUT
     assert parked.lease_owner is None
     assert store.load(mission.mission_id).status is MissionStatus.OWNER_REAUTH_REQUIRED
+
+
+def test_strict_restart_recovery_fails_closed_on_missing_or_corrupt_mission_record(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    from agent.execution_fence import ExecutionFenceError
+    from agent.mission import MissionStore
+
+    for case in ("missing", "corrupt"):
+        case_path = tmp_path / case
+        case_path.mkdir()
+        store, mission, queue = _strict_ready_mission(
+            case_path,
+            mission_id=f"restart-{case}-mission",
+        )
+        queue.enqueue(mission.mission_id)
+        with sqlite3.connect(store.db_path) as db:
+            if case == "missing":
+                db.execute("DELETE FROM missions WHERE mission_id=?", (mission.mission_id,))
+            else:
+                db.execute(
+                    "UPDATE missions SET payload=? WHERE mission_id=?",
+                    ("not-json", mission.mission_id),
+                )
+
+        worker = MissionWorker(
+            queue,
+            lambda: pytest.fail("corrupt or missing Mission must not reach a runtime"),
+            worker_id=f"strict-restart-{case}-worker",
+        )
+        with pytest.raises(ExecutionFenceError):
+            worker.recover_after_restart()
+
+        queued = queue.get(mission.mission_id)
+        assert queued.state is WorkerMissionState.QUEUED
+        assert queued.lease_owner is None
+        assert queued.lease_expires_at is None

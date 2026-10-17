@@ -1664,6 +1664,7 @@ def _may_resume_after_application_restart(
     return (
         persisted_pause
         and pause_requested is True
+        and isinstance(mission_status, str)
         and mission_status not in terminal
         and owner_authorized
         and runtime_ready
@@ -2719,7 +2720,8 @@ def _mission_audit_snapshot(page, mission_id: str, profile_root: Path) -> dict:
         "report": _public_api(page, "GET", mission_path + "/report"),
         "effects": _public_api(page, "GET", mission_path + "/effects"),
     }
-    if any(item["http_status"] != 200 for item in results.values()):
+    required_endpoints = ("status", "timeline", "evidence", "effects")
+    if any(results[name]["http_status"] != 200 for name in required_endpoints):
         raise _MissionAuditSnapshotError("restoration", "mission_audit_endpoints_unavailable")
     status = results["status"]["body"].get("status")
     timeline = results["timeline"]["body"].get("timeline")
@@ -2730,16 +2732,27 @@ def _mission_audit_snapshot(page, mission_id: str, profile_root: Path) -> dict:
         not isinstance(status, dict)
         or not isinstance(timeline, list)
         or not isinstance(evidence, list)
-        or not isinstance(report, dict)
         or not isinstance(effects, list)
     ):
         raise _MissionAuditSnapshotError("restoration", "mission_audit_payload_invalid")
+    report_missing_for_preflight = (
+        status.get("status") == "RESOURCE_BLOCKED"
+        and results["report"]["http_status"] == 404
+        and not isinstance(report, dict)
+    )
+    if not isinstance(report, dict):
+        if report_missing_for_preflight:
+            report = {}
+        else:
+            raise _MissionAuditSnapshotError("restoration", "mission_audit_payload_invalid")
     full_chain, full_chain_status = _read_profile_evidence_chain_diagnostic(profile_root)
     return {
         "status": status,
         "timeline": timeline,
         "evidence": evidence,
         "report": report,
+        "report_http_status": results["report"]["http_status"],
+        "report_missing_for_preflight": report_missing_for_preflight,
         "effects": effects,
         "full_execution_chain": full_chain,
         "full_execution_chain_status": full_chain_status,
@@ -2960,8 +2973,10 @@ def _trajectory_timeline_integrity(timeline: object, mission_id: object, request
     for index, event in enumerate(timeline):
         if not isinstance(event, dict) or set(event) != _TRAJECTORY_EVENT_FIELDS:
             return False
+        event_name = event.get("event")
         if (
-            event.get("event") not in _TRAJECTORY_EVENT_NAMES
+            not isinstance(event_name, str)
+            or event_name not in _TRAJECTORY_EVENT_NAMES
             or event.get("mission_id") != mission_id
             or event.get("request_id") != request_id
             or not isinstance(event.get("step_id"), str)
@@ -3050,6 +3065,667 @@ def _mission_record_integrity_verified(status: object) -> bool:
         return mission.verify_integrity() is True
     except Exception:
         return False
+
+
+_PROCESS_SANDBOX_PREFLIGHT_REASON_KINDS = {
+    "backend_unavailable": "PROCESS_SANDBOX_UNAVAILABLE",
+    "sandbox_setup_failed": "PROCESS_SANDBOX_SETUP_FAILED",
+}
+_PROCESS_SANDBOX_PREFLIGHT_KINDS = frozenset(_PROCESS_SANDBOX_PREFLIGHT_REASON_KINDS.values())
+_PROCESS_SANDBOX_PREFLIGHT_REASONS = frozenset(_PROCESS_SANDBOX_PREFLIGHT_REASON_KINDS)
+
+
+def _mission_restart_authority_projection(status: object, mission_id: str) -> dict | None:
+    if not isinstance(status, dict):
+        return None
+    request_id = status.get("request_id")
+    owner_identity_ref = status.get("owner_identity_ref")
+    scope = status.get("scope_snapshot")
+    authorization = status.get("authorization_snapshot")
+    context = status.get("authorization_context")
+    if (
+        status.get("mission_id") != mission_id
+        or not isinstance(request_id, str) or not request_id
+        or not isinstance(owner_identity_ref, str) or not owner_identity_ref.startswith("owner:")
+        or not isinstance(scope, dict)
+        or not isinstance(authorization, dict)
+        or not isinstance(context, dict)
+    ):
+        return None
+    target_identity = authorization.get("target_identity")
+    scope_id = scope.get("scope_snapshot_id")
+    context_scope = context.get("scope_snapshot")
+    context_scope_id = context.get("scope_snapshot_id")
+    allowed_tools = authorization.get("allowed_tools")
+    network = authorization.get("network_boundary")
+    credentials = authorization.get("credential_boundary")
+    scope_networks = scope.get("allowed_networks")
+    scope_credentials = scope.get("allowed_credentials")
+    if (
+        authorization.get("mission_id") != mission_id
+        or authorization.get("owner_identity") != owner_identity_ref
+        or not isinstance(target_identity, str) or not target_identity
+        or scope.get("target_id") != target_identity
+        or not isinstance(scope_id, str) or not scope_id
+        or context.get("request_id") != request_id
+        or context_scope_id != scope_id
+        or not isinstance(context_scope, dict)
+        or context_scope.get("snapshot_id") != scope_id
+        or scope.get("scope") != ["workspace"]
+        or not isinstance(allowed_tools, list)
+        or "run_project_tests" not in allowed_tools
+        or not isinstance(network, dict)
+        or not isinstance(network.get("allowed"), (list, tuple))
+        or network["allowed"]
+        or not isinstance(credentials, dict)
+        or not isinstance(credentials.get("allowed"), (list, tuple))
+        or credentials["allowed"]
+        or not isinstance(scope_networks, list)
+        or scope_networks
+        or (scope_credentials is not None and (not isinstance(scope_credentials, list) or scope_credentials))
+    ):
+        return None
+    raw_scope_authorization = context_scope.get("authorization")
+    context_session_id = context.get("session_id")
+    if (
+        not isinstance(raw_scope_authorization, dict)
+        or (
+            raw_scope_authorization.get("owner_session_id")
+            and raw_scope_authorization.get("owner_session_id") != context_session_id
+        )
+    ):
+        return None
+    return {
+        "mission_id": mission_id,
+        "request_id": request_id,
+        "owner_identity_ref": owner_identity_ref,
+        "target_identity": target_identity,
+        "scope_snapshot_sha256": _canonical_sha256(scope),
+        "authorization_snapshot_sha256": _canonical_sha256(authorization),
+        "authorization_context_sha256": _canonical_sha256(context),
+        "plan_sha256": _canonical_sha256(status.get("plan")),
+    }
+
+
+def _mission_restart_candidate_snapshot(
+    status: dict,
+    full_execution_chain: object,
+    full_execution_chain_status: object,
+) -> dict:
+    """Build the cheap polling snapshot from one status response and chain probe."""
+    return {
+        "status": status,
+        "timeline": status.get("trajectory"),
+        "evidence": status.get("evidence"),
+        "full_execution_chain": full_execution_chain,
+        "full_execution_chain_status": full_execution_chain_status,
+    }
+
+
+def _mission_preflight_block_projection(snapshot: object, mission_id: str) -> dict | None:
+    if not isinstance(snapshot, dict):
+        return None
+    status = snapshot.get("status")
+    timeline = snapshot.get("timeline")
+    authority = _mission_restart_authority_projection(status, mission_id)
+    if (
+        authority is None
+        or not isinstance(status, dict)
+        or status.get("status") != "RESOURCE_BLOCKED"
+        or not isinstance(timeline, list)
+        or status.get("trajectory") != timeline
+        or not _mission_record_integrity_verified(status)
+        or not _trajectory_timeline_integrity(timeline, mission_id, status.get("request_id"))
+        or not _goal_completion_events_verified(status, timeline)
+    ):
+        return None
+    queue = status.get("queue")
+    queue_state = queue.get("state") if isinstance(queue, dict) else None
+    if not isinstance(queue_state, str) or queue_state not in {"failed", "needs_input", "cancelled", "partial_success"}:
+        return None
+    checkpoint = status.get("checkpoint")
+    plan = status.get("plan")
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    if not isinstance(checkpoint, dict) or checkpoint.get("status") != "not_dispatched":
+        return None
+    reason_code = checkpoint.get("reason_code")
+    if not isinstance(reason_code, str):
+        return None
+    failure_kind = _PROCESS_SANDBOX_PREFLIGHT_REASON_KINDS.get(reason_code)
+    if failure_kind is None or checkpoint.get("kind") != failure_kind:
+        return None
+    if (
+        checkpoint.get("dispatch_attempted") is not False
+        or checkpoint.get("process_started") is not False
+        or checkpoint.get("process_start_confirmed") is not False
+    ):
+        return None
+    failures = status.get("failures")
+    if not isinstance(failures, list):
+        return None
+    request_id = status.get("request_id")
+    attempt_id = checkpoint.get("attempt_id")
+    attempt_source = checkpoint.get("attempt_source")
+    run_id = checkpoint.get("run_id")
+    turn_id = checkpoint.get("turn_id")
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or not isinstance(attempt_id, str)
+        or re.fullmatch(r"[a-f0-9]{64}", attempt_id) is None
+        or not isinstance(attempt_source, str)
+        or attempt_source not in {"mission_slice", "model_turn"}
+        or not isinstance(run_id, str)
+        or not isinstance(turn_id, str)
+        or checkpoint.get("mission_id") != mission_id
+        or checkpoint.get("request_id") != request_id
+    ):
+        return None
+
+    def canonical_ids(value: object, *, allow_empty: bool = False) -> tuple[str, ...] | None:
+        if (
+            not isinstance(value, list)
+            or (not value and not allow_empty)
+            or any(not isinstance(item, str) or not item for item in value)
+            or len(set(value)) != len(value)
+        ):
+            return None
+        return tuple(sorted(value))
+
+    blocked_call_ids = canonical_ids(checkpoint.get("blocked_tool_call_ids"), allow_empty=True)
+    blocked_action_ids = canonical_ids(checkpoint.get("blocked_action_ids"))
+    blocked_step_ids = canonical_ids(checkpoint.get("blocked_step_ids"))
+    if blocked_call_ids is None or blocked_action_ids is None or blocked_step_ids is None:
+        return None
+    checkpoint_action_id = checkpoint.get("action_id")
+    checkpoint_step_id = checkpoint.get("step_id")
+    if (
+        ("action_id" in checkpoint and checkpoint_action_id not in blocked_action_ids)
+        or ("step_id" in checkpoint and checkpoint_step_id not in blocked_step_ids)
+    ):
+        return None
+    if attempt_source == "mission_slice":
+        if (
+            blocked_call_ids
+            or run_id
+            or turn_id
+            or checkpoint_action_id not in blocked_action_ids
+            or checkpoint_step_id not in blocked_step_ids
+        ):
+            return None
+    elif not blocked_call_ids or not run_id or not turn_id:
+        return None
+    attempt_identity = {
+        "attempt_source": attempt_source,
+        "mission_id": mission_id,
+        "request_id": request_id,
+        "run_id": run_id,
+        "turn_id": turn_id,
+        "blocked_tool_call_ids": list(blocked_call_ids),
+        "blocked_action_ids": list(blocked_action_ids),
+        "blocked_step_ids": list(blocked_step_ids),
+    }
+    if _canonical_sha256(attempt_identity) != attempt_id:
+        return None
+
+    related_failures = []
+    blocked_call_id_set = set(blocked_call_ids)
+    blocked_action_id_set = set(blocked_action_ids)
+    for item in failures:
+        if not isinstance(item, dict):
+            continue
+        item_call_ids = canonical_ids(item.get("blocked_tool_call_ids"))
+        item_action_ids = canonical_ids(item.get("blocked_action_ids"))
+        same_run_turn_preflight = (
+            bool(run_id and turn_id)
+            and
+            item.get("run_id") == run_id
+            and item.get("turn_id") == turn_id
+            and isinstance(item.get("kind"), str)
+            and item.get("kind") in _PROCESS_SANDBOX_PREFLIGHT_KINDS
+        )
+        overlaps_attempt = (
+            item_call_ids is not None and bool(blocked_call_id_set & set(item_call_ids))
+        ) or (
+            item_action_ids is not None and bool(blocked_action_id_set & set(item_action_ids))
+        )
+        if item.get("attempt_id") == attempt_id or same_run_turn_preflight or overlaps_attempt:
+            related_failures.append(item)
+    if len(related_failures) != 1:
+        return None
+    matching_failure = related_failures[0]
+    if (
+        matching_failure.get("mission_id") != mission_id
+        or matching_failure.get("request_id") != request_id
+        or matching_failure.get("attempt_source") != attempt_source
+        or matching_failure.get("attempt_id") != attempt_id
+        or matching_failure.get("run_id") != run_id
+        or matching_failure.get("turn_id") != turn_id
+        or canonical_ids(matching_failure.get("blocked_tool_call_ids"), allow_empty=True) != blocked_call_ids
+        or canonical_ids(matching_failure.get("blocked_action_ids")) != blocked_action_ids
+        or canonical_ids(matching_failure.get("blocked_step_ids")) != blocked_step_ids
+        or ("action_id" in matching_failure and matching_failure.get("action_id") not in blocked_action_ids)
+        or ("step_id" in matching_failure and matching_failure.get("step_id") not in blocked_step_ids)
+        or matching_failure.get("class") != "RESOURCE"
+        or matching_failure.get("kind") != failure_kind
+        or matching_failure.get("reason_code") != reason_code
+        or matching_failure.get("dispatch_attempted") is not False
+        or matching_failure.get("process_started") is not False
+        or matching_failure.get("process_start_confirmed") is not False
+    ):
+        return None
+    plan_steps = {
+        item.get("step_id"): item.get("action")
+        for item in steps if isinstance(item, dict) and isinstance(item.get("step_id"), str)
+    } if isinstance(steps, list) else {}
+    step_ids = set(blocked_step_ids)
+    project_test_steps = {step_id for step_id, action in plan_steps.items() if action == "run_project_tests"}
+    if not (step_ids & project_test_steps):
+        return None
+    if attempt_source == "model_turn":
+        related_proposals = []
+        for event in timeline:
+            if not isinstance(event, dict) or event.get("event") != "ToolProposed" or not isinstance(event.get("data"), dict):
+                continue
+            data = event["data"]
+            call_id = data.get("tool_call_id")
+            action_id = data.get("action_id")
+            if not isinstance(action_id, str) or not action_id:
+                action_id = call_id
+            step_id = data.get("step_id")
+            if not isinstance(step_id, str) or not step_id:
+                step_id = data.get("name")
+            related = (isinstance(call_id, str) and call_id in blocked_call_id_set) or (
+                data.get("run_id") == run_id
+                and data.get("turn_id") == turn_id
+                and (
+                    (isinstance(action_id, str) and action_id in blocked_action_id_set)
+                    or (isinstance(step_id, str) and step_id in step_ids)
+                )
+            )
+            if related:
+                related_proposals.append(event)
+        proposal_call_ids = [event["data"].get("tool_call_id") for event in related_proposals]
+        if (
+            len(related_proposals) != len(blocked_call_ids)
+            or any(not isinstance(call_id, str) or not call_id for call_id in proposal_call_ids)
+            or len(set(proposal_call_ids)) != len(proposal_call_ids)
+            or set(proposal_call_ids) != blocked_call_id_set
+        ):
+            return None
+        plan_version = plan.get("version") if isinstance(plan, dict) else None
+
+        def proposal_is_bound(event: dict) -> bool:
+            data = event["data"]
+            call_id = data.get("tool_call_id")
+            action_id = data.get("action_id")
+            if not isinstance(action_id, str) or not action_id:
+                action_id = call_id
+            step_id = data.get("step_id")
+            if not isinstance(step_id, str) or not step_id:
+                step_id = data.get("name")
+            event_step_id = event.get("step_id")
+            return (
+                event.get("mission_id") == mission_id
+                and event.get("request_id") == request_id
+                and data.get("mission_id") == mission_id
+                and data.get("request_id") == request_id
+                and data.get("run_id") == run_id
+                and data.get("turn_id") == turn_id
+                and data.get("plan_version") == plan_version
+                and isinstance(call_id, str)
+                and call_id in blocked_call_id_set
+                and isinstance(action_id, str)
+                and action_id in blocked_action_id_set
+                and isinstance(step_id, str)
+                and step_id in step_ids
+                and (not event_step_id or (isinstance(event_step_id, str) and event_step_id in step_ids))
+            )
+
+        if any(not proposal_is_bound(event) for event in related_proposals):
+            return None
+        if not any(event["data"].get("name") == "run_project_tests" for event in related_proposals):
+            return None
+
+    def event_matches_attempt(event: object, event_name: str) -> bool:
+        if (
+            not isinstance(event, dict)
+            or event.get("event") != event_name
+            or not isinstance(event.get("data"), dict)
+        ):
+            return False
+        data = event["data"]
+        if data.get("attempt_id") == attempt_id:
+            return True
+        event_call_ids = canonical_ids(data.get("blocked_tool_call_ids"), allow_empty=True)
+        event_action_ids = canonical_ids(data.get("blocked_action_ids"))
+        event_step_ids = canonical_ids(data.get("blocked_step_ids"))
+        return (
+            (
+                bool(run_id and turn_id)
+                and data.get("run_id") == run_id
+                and data.get("turn_id") == turn_id
+                and event_call_ids == blocked_call_ids
+            )
+            or (event_action_ids is not None and bool(blocked_action_id_set & set(event_action_ids)))
+            or (event_step_ids is not None and bool(step_ids & set(event_step_ids)))
+        )
+
+    def failure_event_is_bound(event: object) -> bool:
+        if (
+            not isinstance(event, dict)
+            or event.get("event") != "FailureDetected"
+            or not isinstance(event.get("data"), dict)
+            or event.get("mission_id") != mission_id
+            or event.get("request_id") != request_id
+        ):
+            return False
+        event_data = event["data"]
+        event_step_id = event.get("step_id")
+        if event_step_id and (not isinstance(event_step_id, str) or event_step_id not in step_ids):
+            return False
+        return (
+            event_data.get("attempt_id") == attempt_id
+            and event_data.get("attempt_source") == attempt_source
+            and event_data.get("run_id") == run_id
+            and event_data.get("turn_id") == turn_id
+            and canonical_ids(event_data.get("blocked_tool_call_ids"), allow_empty=True) == blocked_call_ids
+            and canonical_ids(event_data.get("blocked_action_ids")) == blocked_action_ids
+            and canonical_ids(event_data.get("blocked_step_ids")) == blocked_step_ids
+            and all(
+                event_data.get(field) == matching_failure.get(field)
+                for field in (
+                    "mission_id", "request_id", "class", "kind", "reason_code", "reason",
+                    "dispatch_attempted", "process_started", "process_start_confirmed", "detail_code",
+                )
+                if field in matching_failure
+            )
+        )
+
+    detected_candidates = [
+        event for event in timeline
+        if event_matches_attempt(event, "FailureDetected")
+    ]
+    detected = len(detected_candidates) == 1 and failure_event_is_bound(detected_candidates[0])
+
+    diagnosis_candidates = [
+        event for event in timeline
+        if event_matches_attempt(event, "FailureDiagnosed")
+    ]
+    diagnosed = len(diagnosis_candidates) == 1
+    if diagnosed:
+        diagnosis = diagnosis_candidates[0]
+        diagnosis_data = diagnosis["data"]
+        diagnosed = (
+            diagnosis.get("mission_id") == mission_id
+            and diagnosis.get("request_id") == request_id
+            and diagnosis_data.get("attempt_source") == attempt_source
+            and diagnosis_data.get("attempt_id") == attempt_id
+            and diagnosis_data.get("run_id") == run_id
+            and diagnosis_data.get("turn_id") == turn_id
+            and canonical_ids(diagnosis_data.get("blocked_tool_call_ids"), allow_empty=True) == blocked_call_ids
+            and canonical_ids(diagnosis_data.get("blocked_action_ids")) == blocked_action_ids
+            and canonical_ids(diagnosis_data.get("blocked_step_ids")) == blocked_step_ids
+            and diagnosis_data.get("class") == "RESOURCE"
+            and diagnosis_data.get("kind") == failure_kind
+            and diagnosis_data.get("recovery") == "RESOURCE_BLOCKED"
+            and diagnosis_data.get("reason_code") == reason_code
+            and diagnosis_data.get("dispatch_attempted") is False
+            and diagnosis_data.get("process_started") is False
+            and diagnosis_data.get("process_start_confirmed") is False
+            and ("detail_code" not in matching_failure or diagnosis_data.get("detail_code") == matching_failure.get("detail_code"))
+        )
+    if not detected or not diagnosed:
+        return None
+    transitions = status.get("transitions")
+    if not isinstance(transitions, list) or any(not isinstance(item, dict) for item in transitions):
+        return None
+    resource_transitions = [item for item in transitions if item.get("to") == "RESOURCE_BLOCKED"]
+    if len(resource_transitions) != 1:
+        return None
+    transition_data = resource_transitions[0].get("data")
+    if (
+        not isinstance(transition_data, dict)
+        or transition_data.get("attempt_source") != attempt_source
+        or transition_data.get("attempt_id") != attempt_id
+        or transition_data.get("run_id") != run_id
+        or transition_data.get("turn_id") != turn_id
+        or transition_data.get("kind") != failure_kind
+        or transition_data.get("reason_code") != reason_code
+        or transition_data.get("dispatch_attempted") is not False
+        or transition_data.get("process_started") is not False
+        or transition_data.get("process_start_confirmed") is not False
+        or canonical_ids(transition_data.get("blocked_tool_call_ids"), allow_empty=True) != blocked_call_ids
+        or canonical_ids(transition_data.get("blocked_action_ids")) != blocked_action_ids
+        or canonical_ids(transition_data.get("blocked_step_ids")) != blocked_step_ids
+    ):
+        return None
+    action_history = status.get("action_history")
+    if not isinstance(action_history, list):
+        return None
+
+    def contains_positive_process_start_marker(value: object) -> bool:
+        if isinstance(value, dict):
+            if any(value.get(field) is True for field in ("process_started", "process_start_confirmed")):
+                return True
+            return any(contains_positive_process_start_marker(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_positive_process_start_marker(item) for item in value)
+        return False
+
+    def contains_positive_preflight_marker(value: object) -> bool:
+        if isinstance(value, dict):
+            if any(
+                value.get(field) is True
+                for field in ("dispatch_attempted", "process_started", "process_start_confirmed", "success")
+            ):
+                return True
+            return any(contains_positive_preflight_marker(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_positive_preflight_marker(item) for item in value)
+        return False
+
+    matching_actions = []
+    for action in action_history:
+        if not isinstance(action, dict):
+            return None
+        if contains_positive_process_start_marker(action):
+            return None
+        observation = action.get("observation")
+        entry_action_id = action.get("action_id")
+        if not isinstance(entry_action_id, str) and isinstance(observation, dict):
+            entry_action_id = observation.get("action_id")
+        entry_call_id = action.get("tool_call_id")
+        if not isinstance(entry_call_id, str) and isinstance(observation, dict):
+            entry_call_id = observation.get("tool_call_id")
+        if (
+            isinstance(entry_action_id, str) and entry_action_id in blocked_action_id_set
+        ) or (
+            isinstance(entry_call_id, str) and entry_call_id in blocked_call_id_set
+        ):
+            matching_actions.append((action, observation))
+        elif (
+            isinstance(action.get("step_id"), str)
+            and action.get("step_id") in step_ids
+            and not entry_action_id
+            and not entry_call_id
+        ):
+            return None
+    if len(matching_actions) > 1:
+        return None
+    if attempt_source == "mission_slice" and len(matching_actions) != 1:
+        return None
+    if attempt_source == "model_turn" and matching_actions:
+        return None
+    if matching_actions:
+        action, observation = matching_actions[0]
+        if (
+            not isinstance(action.get("step_id"), str)
+            or action.get("step_id") not in step_ids
+            or action.get("status") != "failed"
+            or not isinstance(observation, dict)
+            or observation.get("dispatch_attempted") is not False
+            or observation.get("process_started") is not False
+            or observation.get("process_start_confirmed") is not False
+            or observation.get("success") is True
+            or contains_positive_preflight_marker(action)
+        ):
+            return None
+    evidence_records = status.get("evidence")
+    endpoint_evidence = snapshot.get("evidence")
+    if not isinstance(evidence_records, list) or not isinstance(endpoint_evidence, list) or endpoint_evidence != evidence_records:
+        return None
+
+    def evidence_references_attempt(value: object) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = key.lower() if isinstance(key, str) else ""
+                if normalized_key in {"attempt_id", "action_id", "tool_call_id", "step_id"}:
+                    if not isinstance(item, str) or not item:
+                        return True
+                    if (
+                        (normalized_key == "attempt_id" and item == attempt_id)
+                        or (normalized_key == "action_id" and item in blocked_action_id_set)
+                        or (normalized_key == "tool_call_id" and item in blocked_call_id_set)
+                        or (normalized_key == "step_id" and item in step_ids)
+                    ):
+                        return True
+                elif normalized_key in {"blocked_action_ids", "blocked_tool_call_ids", "blocked_step_ids"}:
+                    if not isinstance(item, list) or any(not isinstance(entry, str) or not entry for entry in item):
+                        return True
+                    blocked_values = (
+                        blocked_action_id_set if normalized_key == "blocked_action_ids"
+                        else blocked_call_id_set if normalized_key == "blocked_tool_call_ids"
+                        else step_ids
+                    )
+                    if blocked_values.intersection(item):
+                        return True
+                if evidence_references_attempt(item):
+                    return True
+        elif isinstance(value, list):
+            return any(evidence_references_attempt(item) for item in value)
+        return False
+
+    for evidence_item in evidence_records:
+        if not isinstance(evidence_item, dict) or evidence_item.get("passed") is not True:
+            return None
+        provenance = evidence_item.get("provenance")
+        if (
+            not isinstance(provenance, dict)
+            or provenance.get("mission_id") != mission_id
+            or not any(
+                isinstance(provenance.get(field), str) and provenance[field]
+                for field in ("action_id", "tool_call_id", "step_id")
+            )
+            or evidence_references_attempt(evidence_item)
+        ):
+            return None
+    full_chain = snapshot.get("full_execution_chain")
+    full_chain_status = snapshot.get("full_execution_chain_status")
+    if not isinstance(full_chain_status, str) or full_chain_status not in {"VALID", "NOT_PRESENT"}:
+        return None
+    if full_chain_status == "VALID" and (
+        not isinstance(full_chain, list) or not _verify_durable_execution_chain(full_chain)
+    ):
+        return None
+    mission_chain = [
+        item for item in (full_chain if isinstance(full_chain, list) else [])
+        if isinstance(item, dict)
+        and item.get("mission_id") == mission_id
+        and item.get("request_id") == status.get("request_id")
+    ]
+    return {
+        **authority,
+        "mission_status": "RESOURCE_BLOCKED",
+        "queue_state": queue_state,
+        "attempt_id": attempt_id,
+        "failure_kind": failure_kind,
+        "reason_code": reason_code,
+        "dispatch_attempted": False,
+        "process_started": False,
+        "process_start_confirmed": False,
+        "completion_events_absent": True,
+        "timeline_sha256": _canonical_sha256(timeline),
+        "checkpoint_sha256": _canonical_sha256(checkpoint),
+        "failure_sha256": _canonical_sha256(matching_failure),
+        "action_history_sha256": _canonical_sha256(action_history),
+        "evidence_sha256": _canonical_sha256(evidence_records),
+        "evidence_endpoint_sha256": _canonical_sha256(endpoint_evidence),
+        "mission_execution_chain_sha256": _canonical_sha256(mission_chain),
+        "full_execution_chain_status": full_chain_status,
+    }
+
+
+def _mission_restart_basis(snapshot: object, mission_id: str) -> dict:
+    if not isinstance(snapshot, dict):
+        return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "snapshot_unavailable"}
+    status = snapshot.get("status")
+    timeline = snapshot.get("timeline")
+    authority = _mission_restart_authority_projection(status, mission_id)
+    if (
+        authority is None
+        or not isinstance(status, dict)
+        or not isinstance(timeline, list)
+        or status.get("trajectory") != timeline
+        or not _mission_record_integrity_verified(status)
+        or not _trajectory_timeline_integrity(timeline, mission_id, status.get("request_id"))
+    ):
+        return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "mission_integrity_or_scope_binding_invalid"}
+    preflight = _mission_preflight_block_projection(snapshot, mission_id)
+    if preflight is not None:
+        return {"status": "VERIFIED", "kind": "PREFLIGHT_BLOCK", "projection": preflight}
+    full_chain = snapshot.get("full_execution_chain")
+    full_chain_status = snapshot.get("full_execution_chain_status")
+    if isinstance(full_chain_status, str) and full_chain_status in {"INVALID", "UNREADABLE"}:
+        return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "execution_chain_storage_invalid"}
+    if full_chain_status == "VALID" and isinstance(full_chain, list) and _verify_durable_execution_chain(full_chain):
+        request_id = status.get("request_id")
+        mission_records = [
+            item for item in full_chain
+            if isinstance(item, dict)
+            and item.get("mission_id") == mission_id
+            and item.get("request_id") == request_id
+            and _record_bound_to_mission(item, mission_id)
+            and _record_request_binding(item, request_id, require_present=True)
+        ]
+        if mission_records:
+            return {
+                "status": "VERIFIED",
+                "kind": "EXECUTION_CHAIN",
+                "projection": {
+                    **authority,
+                    "mission_status": status.get("status"),
+                    "timeline_sha256": _canonical_sha256(timeline),
+                    "mission_execution_chain_sha256": _canonical_sha256(mission_records),
+                },
+            }
+    return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "no_durable_execution_chain_or_preflight_block"}
+
+
+def _mission_preflight_block_reconciliation(before: object, after: object, mission_id: str) -> dict:
+    before_record = _mission_preflight_block_projection(before, mission_id)
+    after_record = _mission_preflight_block_projection(after, mission_id)
+    if before_record is None or after_record is None:
+        return {
+            "reconciled": False,
+            "basis": "PREFLIGHT_BLOCK",
+            "mismatched_fields": ["integrity_checked_preflight_record"],
+        }
+    mismatches = sorted(
+        key for key in before_record
+        if before_record.get(key) != after_record.get(key)
+    )
+    return {
+        "reconciled": not mismatches,
+        "basis": "PREFLIGHT_BLOCK",
+        "mismatched_fields": mismatches,
+        "before_record_sha256": _canonical_sha256(before_record),
+        "after_record_sha256": _canonical_sha256(after_record),
+        "dispatch_attempted": False,
+        "process_started": False,
+        "process_start_confirmed": False,
+        "completion_events_absent": True,
+    }
 
 
 _RESTART_STABLE_PROJECTION_FIELDS = (
@@ -3170,6 +3846,7 @@ def _mission_restart_reconciliation(
         invalid_fields.add("mission_id")
     owner_reauth_transition = (
         allow_owner_reauth_transition and not invalid_fields
+        and isinstance(before.get("mission_status"), str)
         and before.get("mission_status") in {"RUNNING", "OBSERVING", "VERIFYING", "REPLANNING"}
         and before.get("queue_state") == "paused"
         and before.get("pause_requested") is True
@@ -3853,22 +4530,124 @@ def _installed_app_mission(
             raise RuntimeError("installed_app_mission_status_shape_invalid")
         return value
 
-    csrf = _new_csrf_token(page)
-    pause_response = _public_api(page, "POST", mission_path + "/pause", csrf=csrf, payload={})
-    pause_state = read_status()
-    pause_verified = (
-        pause_response["http_status"] == 200
-        and pause_state.get("queue", {}).get("state") == "paused"
-        and pause_state.get("progress", {}).get("pause_requested") is True
+    terminal = {
+        "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
+        "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
+        "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
+    }
+
+    def is_terminal_status(value: object) -> bool:
+        return isinstance(value, str) and value in terminal
+
+    deadline = started_at + 300.0
+    mission_state = read_status()
+    restart_basis: dict = {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "durable_restart_basis_unavailable"}
+    before_restart_snapshot: dict | None = None
+    while time.monotonic() < deadline:
+        mission_state = read_status()
+        chain_records, chain_status = _read_profile_evidence_chain_diagnostic(profile_root)
+        status_snapshot = _mission_restart_candidate_snapshot(
+            mission_state,
+            chain_records,
+            chain_status,
+        )
+        candidate_basis = _mission_restart_basis(status_snapshot, mission_id)
+        if candidate_basis.get("status") == "VERIFIED":
+            try:
+                candidate_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
+                candidate_basis = _mission_restart_basis(candidate_snapshot, mission_id)
+            except _MissionAuditSnapshotError as exc:
+                candidate_snapshot = None
+                candidate_basis = {
+                    "status": "BLOCKED",
+                    "kind": "NOT_RUN",
+                    "reason": exc.reason_code,
+                }
+            if candidate_snapshot is not None and candidate_basis.get("status") == "VERIFIED":
+                before_restart_snapshot = candidate_snapshot
+                restart_basis = candidate_basis
+                mission_state = candidate_snapshot["status"]
+                break
+            restart_basis = candidate_basis
+        else:
+            restart_basis = candidate_basis
+        if is_terminal_status(mission_state.get("status")):
+            break
+        page.wait_for_timeout(500)
+
+    basis_ready_for_restart = (
+        restart_basis.get("status") == "VERIFIED"
+        and before_restart_snapshot is not None
     )
+    csrf = _new_csrf_token(page)
+    pause_response = {"http_status": 0, "body": {"error": "pause_not_attempted"}}
+    pause_state = mission_state
+    pause_verified = False
+    pause_basis_ready = False
+    if basis_ready_for_restart and not is_terminal_status(mission_state.get("status")):
+        pause_response = _public_api(page, "POST", mission_path + "/pause", csrf=csrf, payload={})
+        pause_state = read_status()
+        pause_verified = (
+            pause_response["http_status"] == 200
+            and pause_state.get("queue", {}).get("state") == "paused"
+            and pause_state.get("progress", {}).get("pause_requested") is True
+        )
+        if pause_verified:
+            try:
+                before_restart_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
+                paused_basis = _mission_restart_basis(before_restart_snapshot, mission_id)
+            except _MissionAuditSnapshotError as exc:
+                paused_basis = {"status": "BLOCKED", "kind": "NOT_RUN", "reason": exc.reason_code}
+            pause_basis_ready = (
+                paused_basis.get("status") == "VERIFIED"
+                and paused_basis.get("kind") == restart_basis.get("kind")
+            )
+            if not pause_basis_ready:
+                restart_basis = {
+                    "status": "BLOCKED",
+                    "kind": "NOT_RUN",
+                    "reason": "restart_basis_changed_or_invalid_after_pause",
+                }
+    elif not basis_ready_for_restart and not is_terminal_status(mission_state.get("status")):
+        # Pause for containment, but never restart or resume a Mission with no proven durable basis.
+        pause_response = _public_api(page, "POST", mission_path + "/pause", csrf=csrf, payload={})
+        pause_state = read_status()
+        pause_verified = (
+            pause_response["http_status"] == 200
+            and pause_state.get("queue", {}).get("state") == "paused"
+            and pause_state.get("progress", {}).get("pause_requested") is True
+        )
     progress.append({
         "phase": "installed_app_mission_pause",
         "at_utc": datetime.now(timezone.utc).isoformat(),
         "http_status": pause_response["http_status"],
         "persisted_queue_state": pause_state.get("queue", {}).get("state"),
         "pause_requested": pause_state.get("progress", {}).get("pause_requested") is True,
+        "restart_basis_status": restart_basis.get("status"),
+        "restart_basis_kind": restart_basis.get("kind"),
+        "restart_basis_reason": restart_basis.get("reason"),
+        "restart_basis_revalidated_after_pause": pause_basis_ready,
     })
-    paused_restart_cycle: dict = {"status": "NOT_RUN", "reason": "pause_not_verified"}
+    if basis_ready_for_restart and is_terminal_status(mission_state.get("status")):
+        paused_restart_cycle: dict = {
+            "status": "NOT_RUN",
+            "reason": "mission_terminal_before_pause_restart",
+            "restart_basis_kind": restart_basis.get("kind"),
+        }
+    elif not basis_ready_for_restart:
+        paused_restart_cycle = {
+            "status": "NOT_RUN" if pause_verified else "BLOCKED",
+            "reason": "no_verified_durable_restart_basis",
+            "restart_basis_kind": restart_basis.get("kind"),
+        }
+    elif not pause_verified or not pause_basis_ready:
+        paused_restart_cycle = {
+            "status": "BLOCKED",
+            "reason": "pause_or_post_pause_basis_not_verified",
+            "restart_basis_kind": restart_basis.get("kind"),
+        }
+    else:
+        paused_restart_cycle = {"status": "IN_PROGRESS", "reason": "durable_restart_basis_verified"}
     paused_restart_snapshot: dict | None = None
     page_after_restart = page
     resume_response = {"http_status": 0, "body": {"error": "resume_not_authorized_by_restart_state"}}
@@ -3883,8 +4662,7 @@ def _installed_app_mission(
     resume_gate_verified = False
     before_projection: dict = {}
     after_projection: dict = {}
-    if pause_verified:
-        before_restart_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
+    if pause_verified and pause_basis_ready:
         page_after_restart, paused_restart_cycle, paused_restart_snapshot = restart_callback(
             "paused_mission", mission_id, before_restart_snapshot, True
         )
@@ -3970,8 +4748,11 @@ def _installed_app_mission(
             resume_mission_status = resume_state.get("status")
             resume_verified = (
                 resume_response["http_status"] == 200
+                and isinstance(resume_queue.get("state"), str)
                 and resume_queue.get("state") in {"queued", "executing"}
                 and (resume_state.get("progress") or {}).get("pause_requested") is not True
+                and isinstance(resume_state.get("status"), str)
+                and not is_terminal_status(resume_state.get("status"))
                 and resume_state.get("status") not in {
                     "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED",
                     "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
@@ -3982,11 +4763,7 @@ def _installed_app_mission(
             resume_queue_state = resume_queue.get("state")
             resume_pause_requested = (resume_state.get("progress") or {}).get("pause_requested") is True
         else:
-            terminal_status = persisted_status.get("status") in {
-                "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED",
-                "AUTHORIZATION_BLOCKED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED",
-                "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED", "CANCELLED",
-            }
+            terminal_status = is_terminal_status(persisted_status.get("status"))
             resume_gate_verified = terminal_status and not resume_attempted
         paused_restart_cycle["mission"] = {
             "mission_id": mission_id,
@@ -4034,19 +4811,20 @@ def _installed_app_mission(
     wait_skipped_for_safety = bool(
         paused_restart_snapshot
         and persisted_queue.get("state") == "paused"
-        and persisted_status.get("status") not in terminal
+        and isinstance(persisted_status.get("status"), str)
+        and not is_terminal_status(persisted_status.get("status"))
         and (
             not resume_attempted
             or (resume_queue_state == "paused" and not resume_verified)
         )
-    )
+    ) or (pause_verified and not pause_basis_ready)
     if wait_skipped_for_safety:
-        mission_state = persisted_status
+        mission_state = persisted_status if paused_restart_snapshot else pause_state
     else:
         while time.monotonic() < deadline:
             mission_state = read_status()
-            status = str(mission_state.get("status", ""))
-            if status in terminal:
+            status = mission_state.get("status")
+            if not isinstance(status, str) or is_terminal_status(status):
                 break
             time.sleep(2)
         else:
@@ -4149,10 +4927,17 @@ def _installed_app_mission(
         and report.get("report_sha256") == _canonical_report_body_sha256(report)
     )
     approval_pending = final_report_approval.get("status") == "PENDING"
-    terminal_restart_cycle: dict = {"status": "NOT_RUN", "reason": "mission_not_terminal_or_restart_unavailable"}
+    terminal_restart_cycle: dict = {
+        "status": "NOT_RUN",
+        "reason": "mission_not_terminal_or_restart_unavailable"
+        if restart_basis.get("status") == "VERIFIED" else "no_verified_durable_restart_basis",
+    }
     terminal_restart_snapshot: dict | None = None
-    terminal_restart_eligible = mission_state.get("status") in terminal and (
-        paused_restart_cycle.get("status") in {"PASS", "NOT_RUN"}
+    terminal_restart_eligible = (
+        is_terminal_status(mission_state.get("status"))
+        and isinstance(paused_restart_cycle.get("status"), str)
+        and paused_restart_cycle.get("status") in {"PASS", "NOT_RUN"}
+        and restart_basis.get("status") == "VERIFIED"
     )
     if terminal_restart_eligible:
         before_terminal_snapshot = _mission_audit_snapshot(page, mission_id, profile_root)
@@ -4164,8 +4949,26 @@ def _installed_app_mission(
         if terminal_restart_snapshot is not None:
             before_terminal_projection = _mission_audit_projection(before_terminal_snapshot, mission_id)
             after_terminal_projection = _mission_audit_projection(terminal_restart_snapshot, mission_id)
-            terminal_reconciliation = _mission_restart_reconciliation(
-                before_terminal_projection, after_terminal_projection
+            before_terminal_basis = _mission_restart_basis(before_terminal_snapshot, mission_id)
+            after_terminal_basis = _mission_restart_basis(terminal_restart_snapshot, mission_id)
+            terminal_preflight_reconciliation = _mission_preflight_block_reconciliation(
+                before_terminal_snapshot, terminal_restart_snapshot, mission_id
+            ) if (
+                before_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
+                and after_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
+            ) else {"reconciled": False, "basis": "PREFLIGHT_BLOCK", "mismatched_fields": ["basis_mismatch"]}
+            if terminal_preflight_reconciliation.get("reconciled") is True:
+                terminal_reconciliation = terminal_preflight_reconciliation
+            else:
+                terminal_reconciliation = _mission_restart_reconciliation(
+                    before_terminal_projection, after_terminal_projection
+                )
+            terminal_preflight_verified = (
+                before_terminal_basis.get("status") == "VERIFIED"
+                and before_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
+                and after_terminal_basis.get("status") == "VERIFIED"
+                and after_terminal_basis.get("kind") == "PREFLIGHT_BLOCK"
+                and terminal_preflight_reconciliation.get("reconciled") is True
             )
             terminal_records_unchanged = terminal_reconciliation.get("reconciled") is True
             terminal_restart_cycle["mission"] = {
@@ -4177,6 +4980,18 @@ def _installed_app_mission(
                 "execution_chain_storage_verified": after_terminal_projection.get("execution_chain_storage_verified") is True,
                 "storage_failure_class": None if after_terminal_projection.get("execution_chain_storage_verified") is True else "storage",
                 "restart_reconciliation": terminal_reconciliation,
+                "preflight_block_reconciliation": terminal_preflight_reconciliation,
+                "restart_basis_before": {
+                    "status": before_terminal_basis.get("status"),
+                    "kind": before_terminal_basis.get("kind"),
+                    "reason": before_terminal_basis.get("reason"),
+                },
+                "restart_basis_after": {
+                    "status": after_terminal_basis.get("status"),
+                    "kind": after_terminal_basis.get("kind"),
+                    "reason": after_terminal_basis.get("reason"),
+                },
+                "preflight_block_reconciliation_verified": terminal_preflight_verified,
                 "reconciliation_status": "PASS" if terminal_records_unchanged else "FAIL",
                 "terminal_state_and_records_unchanged": terminal_records_unchanged,
                 "completed_mission_inspectable_after_restart": after_terminal_projection[
@@ -4188,9 +5003,18 @@ def _installed_app_mission(
                 and terminal_restart_cycle.get("owner_authentication", {}).get("status") == "PASS"
                 and terminal_restart_cycle.get("model_runtime", {}).get("status") == "PASS"
                 and terminal_records_unchanged
-                and after_terminal_projection.get("execution_chain_storage_verified") is True
-                and after_terminal_projection.get("evidence_and_chain_bound_to_mission") is True
-                and after_terminal_projection.get("report_projection_valid") is True
+                and (
+                    after_terminal_projection.get("execution_chain_storage_verified") is True
+                    or terminal_preflight_verified
+                )
+                and (
+                    after_terminal_projection.get("evidence_and_chain_bound_to_mission") is True
+                    or terminal_preflight_verified
+                )
+                and (
+                    after_terminal_projection.get("report_projection_valid") is True
+                    or terminal_preflight_verified
+                )
             ) else "FAIL"
     completed_mission_inspectable_after_restart = bool(
         terminal_restart_snapshot
@@ -4238,6 +5062,13 @@ def _installed_app_mission(
         "project_name": project_name,
         "project_fixture_sha256": fixture_digest,
         "project_fixture_size_bytes": len(fixture_source.encode("utf-8")),
+        "restart_basis": {
+            "status": restart_basis.get("status"),
+            "kind": restart_basis.get("kind"),
+            "reason": restart_basis.get("reason"),
+            "projection_sha256": _canonical_sha256(restart_basis.get("projection"))
+            if isinstance(restart_basis.get("projection"), dict) else None,
+        },
         "authorization_snapshot_present": bool(authorization_snapshot),
         "authorization_binding_verified": authorization_binding,
         "scope_firewall_verified": scope_firewall_verified,
@@ -5019,6 +5850,18 @@ def main() -> int:
                         "same_disposable_profile_root": True,
                         "post_restart_inference_requested": verify_inference,
                     }
+                    before_basis = _mission_restart_basis(before_snapshot, mission_id)
+                    cycle["restart_basis_before"] = {
+                        "status": before_basis.get("status"),
+                        "kind": before_basis.get("kind"),
+                        "reason": before_basis.get("reason"),
+                    }
+                    if before_basis.get("status") != "VERIFIED":
+                        cycle["status"] = "NOT_RUN"
+                        cycle["restoration_status"] = "NOT_RUN"
+                        cycle["reconciliation_status"] = "NOT_RUN"
+                        cycle["reason"] = "no_verified_durable_restart_basis"
+                        return page, cycle, None
                     after_snapshot = None
                     try:
                         if browser is not None:
@@ -5095,12 +5938,36 @@ def main() -> int:
                             after_snapshot = _mission_audit_snapshot(page, mission_id, args.profile_root)
                             before_projection = _mission_audit_projection(before_snapshot, mission_id)
                             after_projection = _mission_audit_projection(after_snapshot, mission_id)
-                            restart_reconciliation = _mission_restart_reconciliation(
-                                before_projection,
-                                after_projection,
-                                allow_owner_reauth_transition=(cycle_name == "paused_mission"),
+                            after_basis = _mission_restart_basis(after_snapshot, mission_id)
+                            preflight_block_reconciliation = _mission_preflight_block_reconciliation(
+                                before_snapshot, after_snapshot, mission_id
+                            ) if (
+                                before_basis.get("kind") == "PREFLIGHT_BLOCK"
+                                and after_basis.get("kind") == "PREFLIGHT_BLOCK"
+                            ) else {"reconciled": False, "basis": "PREFLIGHT_BLOCK", "mismatched_fields": ["basis_mismatch"]}
+                            if preflight_block_reconciliation.get("reconciled") is True:
+                                restart_reconciliation = preflight_block_reconciliation
+                            else:
+                                restart_reconciliation = _mission_restart_reconciliation(
+                                    before_projection,
+                                    after_projection,
+                                    allow_owner_reauth_transition=(cycle_name == "paused_mission"),
+                                )
+                            preflight_block_verified = (
+                                before_basis.get("status") == "VERIFIED"
+                                and before_basis.get("kind") == "PREFLIGHT_BLOCK"
+                                and after_basis.get("status") == "VERIFIED"
+                                and after_basis.get("kind") == "PREFLIGHT_BLOCK"
+                                and preflight_block_reconciliation.get("reconciled") is True
                             )
                             cycle["restoration_status"] = "PASS"
+                            cycle["restart_basis_after"] = {
+                                "status": after_basis.get("status"),
+                                "kind": after_basis.get("kind"),
+                                "reason": after_basis.get("reason"),
+                            }
+                            cycle["preflight_block_reconciliation_verified"] = preflight_block_verified
+                            cycle["preflight_failure_storage_verified"] = preflight_block_verified
                             cycle["execution_chain_storage_status"] = after_projection.get(
                                 "execution_chain_storage_status"
                             )
@@ -5118,10 +5985,14 @@ def main() -> int:
                                 "before_restart": before_projection,
                                 "after_restart": after_projection,
                                 "restart_reconciliation": restart_reconciliation,
+                                "preflight_block_reconciliation": preflight_block_reconciliation,
+                                "restart_basis_before": cycle["restart_basis_before"],
+                                "restart_basis_after": cycle["restart_basis_after"],
                                 "mission_id_and_report_binding_verified": (
                                     before_projection.get("evidence_and_chain_bound_to_mission") is True
                                     and after_projection.get("evidence_and_chain_bound_to_mission") is True
                                 ),
+                                "preflight_block_reconciliation_verified": preflight_block_verified,
                             }
                         cycle["process_restart_verified"] = bool(
                             cycle.get("process_tree_termination_verified") is True
@@ -5134,9 +6005,15 @@ def main() -> int:
                             cycle["process_restart_verified"]
                             and cycle["owner_authentication"].get("status") == "PASS"
                             and cycle["model_runtime"].get("status") == "PASS"
-                            and cycle.get("mission", {}).get("mission_id_and_report_binding_verified") is True
+                            and (
+                                cycle.get("mission", {}).get("mission_id_and_report_binding_verified") is True
+                                or cycle.get("mission", {}).get("preflight_block_reconciliation_verified") is True
+                            )
                             and cycle.get("restoration_status") == "PASS"
-                            and cycle.get("execution_chain_storage_verified") is True
+                            and (
+                                cycle.get("execution_chain_storage_verified") is True
+                                or cycle.get("preflight_failure_storage_verified") is True
+                            )
                             and cycle.get("reconciliation_status") == "PASS"
                         ) else "FAIL"
                         if cycle_name == "terminal_mission" and after_snapshot is not None:

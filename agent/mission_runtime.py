@@ -1554,12 +1554,16 @@ class MissionRuntime:
     ) -> Mission:
         already_proposed = already_proposed_ids or set()
         blocked_ids: list[str] = []
+        blocked_action_ids: list[str] = []
+        blocked_step_ids: list[str] = []
         for proposal in proposals:
             call_id = str(proposal.tool_call_id)
             if call_id not in seen:
                 seen.add(call_id)
                 progress["seen_call_ids"].append(call_id)
             blocked_ids.append(call_id)
+            blocked_action_ids.append(str(getattr(proposal, "action_id", "") or call_id))
+            blocked_step_ids.append(str(getattr(proposal, "step_id", "") or proposal.name))
             if call_id not in already_proposed:
                 mission.emit(EventType.TOOL_PROPOSED, step_id=proposal.step_id, data=proposal.to_dict())
             if proposal.name == "run_project_tests":
@@ -1569,17 +1573,36 @@ class MissionRuntime:
             progress["tool_results"].append(ToolCallResult(proposal, False, error=error).to_dict())
 
         reason = self._bounded_tool_error(reason) or "required process sandbox is unavailable"
-        failure = {
+        attempt_identity = {
+            "attempt_source": "model_turn",
             "mission_id": mission.mission_id,
             "request_id": mission.request_id,
             "run_id": run_id,
             "turn_id": turn_id,
+            "blocked_tool_call_ids": sorted(set(blocked_ids)),
+            "blocked_action_ids": sorted(set(blocked_action_ids)),
+            "blocked_step_ids": sorted(set(blocked_step_ids)),
+        }
+        attempt_id = hashlib.sha256(
+            json.dumps(attempt_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        failure = {
+            "attempt_source": attempt_identity["attempt_source"],
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+            "attempt_id": attempt_id,
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "blocked_tool_call_ids": sorted(set(blocked_ids)),
+            "blocked_action_ids": sorted(set(blocked_action_ids)),
+            "blocked_step_ids": sorted(set(blocked_step_ids)),
             "class": FailureClass.RESOURCE.value,
             "kind": "PROCESS_SANDBOX_SETUP_FAILED" if reason_code == "sandbox_setup_failed" else "PROCESS_SANDBOX_UNAVAILABLE",
             "reason_code": reason_code,
             "reason": reason,
-            "blocked_tool_call_ids": blocked_ids,
             "dispatch_attempted": False,
+            "process_started": False,
+            "process_start_confirmed": False,
             "retry_policy": {
                 "action": RecoveryAction.RESOURCE_BLOCKED.value,
                 "retryable": False,
@@ -1593,29 +1616,61 @@ class MissionRuntime:
         mission.progress.setdefault("resource_failures", []).append(failure)
         mission.checkpoint = {
             "status": "not_dispatched",
+            "attempt_source": attempt_identity["attempt_source"],
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
+            "attempt_id": attempt_id,
             "reason_code": reason_code,
+            "kind": failure["kind"],
+            "dispatch_attempted": False,
+            "process_started": False,
+            "process_start_confirmed": False,
             "run_id": run_id,
             "turn_id": turn_id,
+            "blocked_tool_call_ids": sorted(set(blocked_ids)),
+            "blocked_action_ids": sorted(set(blocked_action_ids)),
+            "blocked_step_ids": sorted(set(blocked_step_ids)),
             "plan_version": mission.plan.version,
-            "blocked_tool_call_ids": blocked_ids,
         }
         if skill_context is not None:
             mission.checkpoint["skill_reference"] = skill_context.reference
         mission.emit(EventType.FAILURE_DETECTED, data=failure)
-        mission.emit(EventType.FAILURE_DIAGNOSED, data={
+        diagnosis = {
+            "attempt_source": attempt_identity["attempt_source"],
+            "mission_id": mission.mission_id,
+            "request_id": mission.request_id,
             "class": FailureClass.RESOURCE.value,
             "kind": failure["kind"],
             "reason_code": reason_code,
             "recovery": RecoveryAction.RESOURCE_BLOCKED.value,
+            "attempt_id": attempt_id,
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "blocked_tool_call_ids": sorted(set(blocked_ids)),
+            "blocked_action_ids": sorted(set(blocked_action_ids)),
+            "blocked_step_ids": sorted(set(blocked_step_ids)),
             "dispatch_attempted": False,
-        })
+            "process_started": False,
+            "process_start_confirmed": False,
+        }
+        if detail_code:
+            diagnosis["detail_code"] = detail_code
+        mission.emit(EventType.FAILURE_DIAGNOSED, data=diagnosis)
         mission.transition(
             MissionStatus.RESOURCE_BLOCKED,
             mission.error,
+            attempt_source=attempt_identity["attempt_source"],
+            attempt_id=attempt_id,
             run_id=run_id,
             turn_id=turn_id,
+            blocked_tool_call_ids=attempt_identity["blocked_tool_call_ids"],
+            blocked_action_ids=attempt_identity["blocked_action_ids"],
+            blocked_step_ids=attempt_identity["blocked_step_ids"],
             reason_code=reason_code,
+            kind=failure["kind"],
             dispatch_attempted=False,
+            process_started=False,
+            process_start_confirmed=False,
         )
         return self._save(mission)
 
@@ -3134,6 +3189,23 @@ class MissionRuntime:
             if failure is FailureClass.RESOURCE
             else {}
         )
+        if sandbox_failure_fields:
+            attempt_identity = {
+                "attempt_source": "mission_slice",
+                "mission_id": mission.mission_id,
+                "request_id": mission.request_id,
+                "run_id": "",
+                "turn_id": "",
+                "blocked_tool_call_ids": [],
+                "blocked_action_ids": [action_id],
+                "blocked_step_ids": [step.step_id],
+            }
+            sandbox_failure_fields.update({
+                **attempt_identity,
+                "attempt_id": hashlib.sha256(
+                    json.dumps(attempt_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+            })
         failure_record = {
             "class": failure.value,
             "reason": observation.get("error", "action failed"),
@@ -3158,7 +3230,19 @@ class MissionRuntime:
         elif action is RecoveryAction.SCOPE_BLOCKED:
             mission.transition(MissionStatus.SCOPE_BLOCKED, "scope blocked")
         elif action is RecoveryAction.RESOURCE_BLOCKED:
-            mission.transition(MissionStatus.RESOURCE_BLOCKED, "resource blocked")
+            mission.transition(
+                MissionStatus.RESOURCE_BLOCKED,
+                "resource blocked",
+                **{
+                    key: sandbox_failure_fields[key]
+                    for key in (
+                    "attempt_id", "run_id", "turn_id", "blocked_tool_call_ids",
+                    "blocked_action_ids", "blocked_step_ids", "kind", "reason_code", "dispatch_attempted",
+                    "process_started", "process_start_confirmed", "attempt_source",
+                    )
+                    if key in sandbox_failure_fields
+                },
+            )
         elif action is RecoveryAction.REPLAN:
             mission.transition(MissionStatus.REPLANNING, "observation invalidated current plan")
             mission.emit(EventType.REPLAN_TRIGGERED, step_id=step.step_id, data={"reason": "failure observation"})

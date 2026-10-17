@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 import sys
@@ -3826,6 +3827,716 @@ def test_qwen_install_post_rejects_unexpected_http_status() -> None:
 )
 def test_qwen_install_post_without_started_install_operation_fails_immediately(body: dict) -> None:
     response = _FakeInstallResponse(202, body)
-
     with pytest.raises(RuntimeError, match="qwen3_4b_install_operation_not_started"):
         _validate_qwen_install_post_response(response, "qwen3-4b-q4-k-m")
+
+
+def _durable_preflight_acceptance_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    attempt_source: str = "mission_slice",
+):
+    from dataclasses import replace
+
+    from agent.agent_core import AgentCore
+    from agent.model_protocol import ModelTurn, ToolCallProposal
+    from agent.mission_runtime import MissionRuntime
+    from owner_session_testutils import (
+        allow_owner_sessions,
+        persist_canonical_scope,
+        workspace_scope_context,
+    )
+    from runtime_authorization import make_test_snapshot, mission_model_tools
+    from security.authorization import authorize_tool
+    from security.authorization_context import AuthorizationContext
+    from workspace import Workspace
+    from workspace.process_sandbox import SandboxAvailability
+
+    request_id = "acceptance-preflight-request"
+    owner_token = "valid-acceptance-preflight-owner"
+    allow_owner_sessions(monkeypatch, owner_token)
+    persisted_scope = persist_canonical_scope(
+        monkeypatch,
+        tmp_path,
+        owner_session_token=owner_token,
+        target_id="test-target",
+    )
+    base_context, _policy_context = AgentCore._auth("run_project_tests", owner_token, request_id)
+    context = replace(base_context, scope_snapshot=persisted_scope)
+    assert authorize_tool(
+        ["run_project_tests", "bounded-fixture"],
+        context=context,
+    ).allowed is True
+
+    workspace_root = tmp_path / "acceptance-workspace"
+    workspace_root.mkdir()
+    store_path = tmp_path / "acceptance-missions.sqlite3"
+    store = MissionStore(store_path)
+
+    def authorize(mission, step):
+        mission_context = AuthorizationContext.from_dict(mission.authorization_context)
+        decision = authorize_tool(
+            [step.action, "bounded-fixture"],
+            context=mission_context,
+        )
+        return decision.allowed, decision.reason
+
+    executor_calls: list[tuple[str, str, str]] = []
+
+    def reject_before_process_start(mission, step, action_id):
+        executor_calls.append((mission.mission_id, step.step_id, action_id))
+        return {
+            "success": False,
+            "failure_class": "RESOURCE",
+            "error": "process_sandbox_unavailable",
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": "backend_unavailable",
+            "detail_code": "windows_appcontainer_backend_unimplemented",
+            "dispatch_attempted": False,
+            "process_started": False,
+            "process_start_confirmed": False,
+        }
+
+    runtime = MissionRuntime(
+        store,
+        executor=reject_before_process_start,
+        authorizer=authorize,
+        authorization_snapshot_factory=lambda mission: make_test_snapshot(
+            mission,
+            root=str(workspace_root),
+        ),
+        require_authorization_snapshot=True,
+    )
+    objective = "Run the bounded local project test under persisted Owner scope"
+    plan = Plan.initial(objective).replan(
+        steps=(
+            PlanStep(
+                "preflight-step",
+                "Run the bounded local project test",
+                action="run_project_tests",
+                retry_policy={"arguments": {"query": "bounded-fixture"}},
+            ),
+        ),
+        reason="acceptance preflight restart regression",
+    )
+    mission = runtime.create(
+        objective,
+        "Run the bounded local project test",
+        plan,
+        mission_id="acceptance-preflight-mission",
+        request_id=request_id,
+        owner_identity_ref="owner:1",
+        authorization_context=context.to_dict(),
+        scope_snapshot=workspace_scope_context(persisted_scope, workspace_root),
+    )
+    ready = store.load(mission.mission_id)
+    assert ready is not None and ready.status is MissionStatus.READY
+    ready_status = ready.to_dict()
+    ready_status["queue"] = {"state": "queued"}
+    ready_snapshot = {
+        "status": ready_status,
+        "timeline": ready.trajectory,
+        "evidence": [],
+        "report": {},
+        "effects": [],
+        "full_execution_chain": [],
+        "full_execution_chain_status": "NOT_PRESENT",
+    }
+
+    if attempt_source == "mission_slice":
+        blocked = runtime.run_slice(mission.mission_id)
+    elif attempt_source == "model_turn":
+        availability = SandboxAvailability(
+            False,
+            "windows-appcontainer-job",
+            "backend_unavailable",
+            "windows_appcontainer_backend_unimplemented",
+            "required Windows process sandbox is unavailable",
+        )
+        monkeypatch.setattr(
+            Workspace,
+            "process_sandbox_availability",
+            staticmethod(lambda: availability),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_execute_native_tool",
+            lambda *_args, **_kwargs: pytest.fail("native preflight must block before tool dispatch"),
+        )
+
+        class OneProjectTestProposal:
+            def complete(self, _messages, _tools, *, mission_id, run_id, turn_id, plan_version, timeout_seconds=None):
+                proposal = ToolCallProposal.create(
+                    "run_project_tests",
+                    {"query": "bounded-fixture"},
+                    mission_id=mission_id,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    plan_version=plan_version,
+                    step_id="preflight-step",
+                    tool_call_id="acceptance-preflight-tool-call",
+                )
+                return ModelTurn(turn_id, tool_calls=(proposal,))
+
+        blocked = runtime.run_model_loop(
+            mission.mission_id,
+            OneProjectTestProposal(),
+            tools=mission_model_tools("run_project_tests"),
+            run_id="acceptance-preflight-run",
+            max_turns=1,
+        )
+    else:
+        raise AssertionError(f"unexpected preflight source: {attempt_source}")
+    assert len(executor_calls) == (1 if attempt_source == "mission_slice" else 0)
+    assert blocked.status is MissionStatus.RESOURCE_BLOCKED
+    reopened_store = MissionStore(store_path)
+    restored = reopened_store.load(mission.mission_id)
+    assert restored is not None and restored.verify_integrity()
+    blocked_status = restored.to_dict()
+    blocked_status["queue"] = {"state": "failed"}
+    blocked_snapshot = {
+        "status": blocked_status,
+        "timeline": restored.trajectory,
+        "evidence": restored.evidence,
+        "report": {},
+        "effects": [],
+        "full_execution_chain": [],
+        "full_execution_chain_status": "NOT_PRESENT",
+    }
+    return mission.mission_id, ready_snapshot, blocked_snapshot
+
+
+def _resign_preflight_snapshot(snapshot, *, mutate_mission=None, event_transform=None):
+    corrupted = json.loads(json.dumps(snapshot))
+    queue = corrupted["status"].get("queue")
+    status_record = dict(corrupted["status"])
+    status_record.pop("integrity_hash", None)
+    status_record.pop("queue", None)
+    mission = Mission.from_dict(status_record)
+    if mutate_mission is not None:
+        mutate_mission(mission)
+    if event_transform is not None:
+        original_events = list(mission.trajectory)
+        mission.trajectory = []
+        for original in original_events:
+            transformed = event_transform(dict(original))
+            if transformed is None:
+                continue
+            transformed_events = transformed if isinstance(transformed, list) else [transformed]
+            for event in transformed_events:
+                mission.emit(
+                    EventType(event["event"]),
+                    step_id=event.get("step_id", ""),
+                    data=dict(event.get("data") or {}),
+                )
+    resigned_status = mission.to_dict()
+    if queue is not None:
+        resigned_status["queue"] = queue
+    corrupted["status"] = resigned_status
+    corrupted["timeline"] = resigned_status["trajectory"]
+    corrupted["evidence"] = resigned_status["evidence"]
+    return corrupted
+
+
+def test_preflight_block_is_restart_basis_only_and_reconciles_durable_owner_scope(tmp_path, monkeypatch):
+    mission_id, ready_snapshot, before_restart = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+
+    ready_basis = windows_acceptance._mission_restart_basis(ready_snapshot, mission_id)
+    before_basis = windows_acceptance._mission_restart_basis(before_restart, mission_id)
+    after_restart = json.loads(json.dumps(before_restart))
+    after_basis = windows_acceptance._mission_restart_basis(after_restart, mission_id)
+    reconciliation = windows_acceptance._mission_preflight_block_reconciliation(
+        before_restart,
+        after_restart,
+        mission_id,
+    )
+
+    assert ready_basis["status"] == "BLOCKED"
+    assert ready_basis["kind"] == "NOT_RUN"
+    assert before_restart["status"]["status"] == "RESOURCE_BLOCKED"
+    assert before_basis["status"] == after_basis["status"] == "VERIFIED"
+    assert before_basis["kind"] == after_basis["kind"] == "PREFLIGHT_BLOCK"
+    assert before_basis["projection"]["mission_status"] == "RESOURCE_BLOCKED"
+    assert before_basis["projection"]["attempt_id"] == after_basis["projection"]["attempt_id"]
+    assert before_basis["projection"]["attempt_id"] == before_restart["status"]["checkpoint"]["attempt_id"]
+    assert before_basis["projection"]["dispatch_attempted"] is False
+    assert before_basis["projection"]["process_started"] is False
+    assert before_basis["projection"]["process_start_confirmed"] is False
+    assert reconciliation["reconciled"] is True
+    assert reconciliation["dispatch_attempted"] is False
+    assert reconciliation["process_started"] is False
+    assert reconciliation["process_start_confirmed"] is False
+    assert reconciliation["completion_events_absent"] is True
+    assert before_restart["status"]["evidence"] == []
+    assert not any(
+        event["event"] in {"GoalVerified", "MissionCompleted"}
+        for event in before_restart["timeline"]
+    )
+
+
+@pytest.mark.parametrize("attempt_source", ["mission_slice", "model_turn"])
+def test_preflight_restart_basis_rejects_reason_kind_mismatch(
+    attempt_source: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, original = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source=attempt_source,
+    )
+    original_status = original["status"]
+    original_attempt_id = original_status["checkpoint"]["attempt_id"]
+    mismatched_kind = "PROCESS_SANDBOX_SETUP_FAILED"
+
+    def mutate_mission(mission: Mission) -> None:
+        mission.checkpoint["kind"] = mismatched_kind
+        for record in mission.failures + mission.progress.get("resource_failures", []):
+            if isinstance(record, dict) and record.get("attempt_id") == original_attempt_id:
+                record["kind"] = mismatched_kind
+        for transition in mission.transitions:
+            data = transition.get("data") if isinstance(transition, dict) else None
+            if isinstance(data, dict) and data.get("attempt_id") == original_attempt_id:
+                data["kind"] = mismatched_kind
+
+    def transform_event(event: dict) -> dict:
+        if (
+            event.get("event") in {"FailureDetected", "FailureDiagnosed"}
+            and isinstance(event.get("data"), dict)
+            and event["data"].get("attempt_id") == original_attempt_id
+        ):
+            event["data"]["kind"] = mismatched_kind
+        return event
+
+    corrupted = _resign_preflight_snapshot(
+        original,
+        mutate_mission=mutate_mission,
+        event_transform=transform_event,
+    )
+    status = corrupted["status"]
+    assert status["checkpoint"]["reason_code"] == "backend_unavailable"
+    assert status["checkpoint"]["kind"] == mismatched_kind
+    assert status["failures"][-1]["reason_code"] == "backend_unavailable"
+    assert status["failures"][-1]["kind"] == mismatched_kind
+    assert all(
+        event["data"]["kind"] == mismatched_kind
+        for event in status["trajectory"]
+        if event["event"] in {"FailureDetected", "FailureDiagnosed"}
+        and event.get("data", {}).get("attempt_id") == original_attempt_id
+    )
+    assert any(
+        transition.get("data", {}).get("kind") == mismatched_kind
+        and transition.get("data", {}).get("reason_code") == "backend_unavailable"
+        for transition in status["transitions"]
+        if transition.get("data", {}).get("attempt_id") == original_attempt_id
+    )
+    assert windows_acceptance._mission_record_integrity_verified(status) is True
+
+    basis = windows_acceptance._mission_restart_basis(corrupted, mission_id)
+    reconciliation = windows_acceptance._mission_preflight_block_reconciliation(
+        original,
+        corrupted,
+        mission_id,
+    )
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+    assert reconciliation["reconciled"] is False
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_failure",
+        "invalid_chain",
+        "scope_expanded",
+        "network_allowlist_expanded",
+        "checkpoint_process_start_confirmed",
+        "checkpoint_attempt_id_mismatch",
+        "checkpoint_action_id_mismatch",
+        "checkpoint_step_id_mismatch",
+        "failure_process_start_confirmed",
+        "failure_attempt_id_mismatch",
+        "missing_run_slice_action_history",
+        "evidence_same_action",
+        "evidence_same_step",
+        "evidence_missing_provenance",
+        "evidence_endpoint_mismatch",
+        "observation_process_start_confirmed",
+        "observation_nested_process_start_confirmed",
+        "action_root_process_start_confirmed",
+        "action_root_normalized_data_process_start_confirmed",
+        "duplicate_failure_same_action",
+        "diagnosis_process_start_confirmed",
+        "diagnosis_attempt_id_mismatch",
+        "duplicate_diagnosis_same_step",
+        "other_action_process_start_confirmed",
+        "duplicate_action_history_same_action",
+    ],
+)
+def test_preflight_restart_basis_fails_closed_for_missing_corrupt_or_expanded_records(
+    corruption: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, before_restart = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    corrupted = json.loads(json.dumps(before_restart))
+    if corruption == "missing_failure":
+        corrupted["status"]["failures"] = []
+    elif corruption == "invalid_chain":
+        corrupted["full_execution_chain_status"] = "INVALID"
+    elif corruption == "scope_expanded":
+        corrupted["status"]["scope_snapshot"]["scope"] = ["workspace", "network"]
+    elif corruption == "checkpoint_process_start_confirmed":
+        corrupted["status"]["checkpoint"]["process_start_confirmed"] = True
+    elif corruption == "checkpoint_attempt_id_mismatch":
+        corrupted["status"]["checkpoint"]["attempt_id"] = "0" * 64
+    elif corruption == "checkpoint_action_id_mismatch":
+        corrupted["status"]["checkpoint"]["action_id"] = "unrelated-action"
+    elif corruption == "checkpoint_step_id_mismatch":
+        corrupted["status"]["checkpoint"]["step_id"] = "unrelated-step"
+    elif corruption == "failure_process_start_confirmed":
+        corrupted["status"]["failures"][-1]["process_start_confirmed"] = True
+    elif corruption == "failure_attempt_id_mismatch":
+        corrupted["status"]["failures"][-1]["attempt_id"] = "0" * 64
+    elif corruption == "missing_run_slice_action_history":
+        corrupted["status"]["action_history"] = []
+    elif corruption in {"evidence_same_action", "evidence_same_step", "evidence_missing_provenance"}:
+        checkpoint = corrupted["status"]["checkpoint"]
+        if corruption == "evidence_same_action":
+            provenance = {
+                "mission_id": mission_id,
+                "action_id": checkpoint["action_id"],
+                "step_id": "unrelated-step",
+            }
+        elif corruption == "evidence_same_step":
+            provenance = {
+                "mission_id": mission_id,
+                "action_id": "unrelated-action",
+                "step_id": checkpoint["step_id"],
+            }
+        else:
+            provenance = None
+        evidence = {"criterion_id": "test-only-conflicting-record", "passed": True}
+        if provenance is not None:
+            evidence["provenance"] = provenance
+        corrupted["status"]["evidence"] = [evidence]
+        corrupted["evidence"] = [evidence]
+    elif corruption == "evidence_endpoint_mismatch":
+        corrupted["evidence"] = [{"criterion_id": "endpoint-only-record", "passed": True}]
+    elif corruption == "observation_process_start_confirmed":
+        corrupted["status"]["action_history"][0]["observation"]["process_start_confirmed"] = True
+    elif corruption == "observation_nested_process_start_confirmed":
+        corrupted["status"]["action_history"][0]["observation"]["observation"]["normalized_data"]["process_start_confirmed"] = True
+    elif corruption == "action_root_process_start_confirmed":
+        corrupted["status"]["action_history"][0]["process_start_confirmed"] = True
+    elif corruption == "action_root_normalized_data_process_start_confirmed":
+        corrupted["status"]["action_history"][0]["normalized_data"] = {"process_start_confirmed": True}
+    elif corruption == "duplicate_failure_same_action":
+        duplicate = dict(corrupted["status"]["failures"][-1])
+        duplicate["process_start_confirmed"] = True
+        corrupted["status"]["failures"].append(duplicate)
+    elif corruption == "other_action_process_start_confirmed":
+        corrupted["status"]["action_history"].append(
+            {
+                "action_id": "unrelated-action",
+                "step_id": "unrelated-step",
+                "status": "failed",
+                "observation": {"normalized_data": {"process_started": True}},
+            }
+        )
+    elif corruption == "duplicate_action_history_same_action":
+        duplicate_action = json.loads(json.dumps(corrupted["status"]["action_history"][0]))
+        corrupted["status"]["action_history"].append(duplicate_action)
+    else:
+        corrupted["status"]["scope_snapshot"]["allowed_networks"] = ["*"]
+    queue = corrupted["status"].get("queue")
+    status_without_integrity = dict(corrupted["status"])
+    status_without_integrity.pop("integrity_hash", None)
+    status_without_integrity.pop("queue", None)
+    corrupted_mission = Mission.from_dict(status_without_integrity)
+    if corruption in {"diagnosis_process_start_confirmed", "diagnosis_attempt_id_mismatch", "duplicate_diagnosis_same_step"}:
+        diagnosis = next(event for event in corrupted_mission.trajectory if event["event"] == "FailureDiagnosed")
+        diagnosis_data = dict(diagnosis["data"])
+        if corruption == "diagnosis_attempt_id_mismatch":
+            diagnosis_data["attempt_id"] = "0" * 64
+        else:
+            diagnosis_data["process_start_confirmed"] = True
+        if corruption in {"diagnosis_process_start_confirmed", "diagnosis_attempt_id_mismatch"}:
+            diagnosis_index = corrupted_mission.trajectory.index(diagnosis)
+            corrupted_mission.trajectory = corrupted_mission.trajectory[:diagnosis_index]
+        corrupted_mission.emit(
+            EventType.FAILURE_DIAGNOSED,
+            step_id=diagnosis.get("step_id", ""),
+            data=diagnosis_data,
+        )
+    corrupted_status = corrupted_mission.to_dict()
+    if queue is not None:
+        corrupted_status["queue"] = queue
+    corrupted["status"] = corrupted_status
+    corrupted["timeline"] = corrupted_status["trajectory"]
+    if corruption != "evidence_endpoint_mismatch":
+        corrupted["evidence"] = corrupted_status["evidence"]
+
+    basis = windows_acceptance._mission_restart_basis(corrupted, mission_id)
+    reconciliation = windows_acceptance._mission_preflight_block_reconciliation(
+        before_restart,
+        corrupted,
+        mission_id,
+    )
+
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+    assert reconciliation["reconciled"] is False
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "model_turn_empty_run_turn",
+        "model_turn_proposal_run_mismatch",
+        "model_turn_proposal_turn_mismatch",
+        "model_turn_proposal_call_mismatch",
+        "model_turn_duplicate_proposal",
+        "model_turn_missing_proposal",
+        "model_turn_checkpoint_action_mismatch",
+        "model_turn_checkpoint_step_mismatch",
+        "model_turn_unexpected_action_history",
+    ],
+)
+def test_model_turn_preflight_restart_basis_fails_closed_without_exact_proposal_binding(
+    corruption: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, original = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source="model_turn",
+    )
+    original_basis = windows_acceptance._mission_restart_basis(original, mission_id)
+    assert original_basis["status"] == "VERIFIED"
+    assert original_basis["projection"]["attempt_id"] == original["status"]["checkpoint"]["attempt_id"]
+
+    new_attempt: dict[str, str] = {}
+
+    def mutate_mission(mission: Mission) -> None:
+        checkpoint = mission.checkpoint
+        if corruption == "model_turn_empty_run_turn":
+            previous_id = checkpoint["attempt_id"]
+            checkpoint["run_id"] = ""
+            checkpoint["turn_id"] = ""
+            identity = {
+                "attempt_source": "model_turn",
+                "mission_id": mission.mission_id,
+                "request_id": mission.request_id,
+                "run_id": "",
+                "turn_id": "",
+                "blocked_tool_call_ids": checkpoint["blocked_tool_call_ids"],
+                "blocked_action_ids": checkpoint["blocked_action_ids"],
+                "blocked_step_ids": checkpoint["blocked_step_ids"],
+            }
+            replacement_id = _canonical_sha256(identity)
+            checkpoint["attempt_id"] = replacement_id
+            new_attempt.update(previous_id=previous_id, replacement_id=replacement_id)
+            for records in (mission.failures, mission.progress.get("resource_failures", [])):
+                for record in records:
+                    if isinstance(record, dict) and record.get("attempt_id") == previous_id:
+                        record.update(run_id="", turn_id="", attempt_id=replacement_id)
+            for transition in mission.transitions:
+                data = transition.get("data") if isinstance(transition, dict) else None
+                if isinstance(data, dict) and data.get("attempt_id") == previous_id:
+                    data.update(run_id="", turn_id="", attempt_id=replacement_id)
+        elif corruption == "model_turn_checkpoint_action_mismatch":
+            checkpoint["action_id"] = "unrelated-action"
+        elif corruption == "model_turn_checkpoint_step_mismatch":
+            checkpoint["step_id"] = "unrelated-step"
+        elif corruption == "model_turn_unexpected_action_history":
+            checkpoint = mission.checkpoint
+            mission.action_history = [{
+                "action_id": checkpoint["blocked_action_ids"][0],
+                "step_id": checkpoint["blocked_step_ids"][0],
+                "status": "failed",
+                "observation": {
+                    "dispatch_attempted": False,
+                    "process_started": False,
+                    "process_start_confirmed": False,
+                    "success": False,
+                },
+            }]
+
+    def transform_event(event: dict) -> dict | list[dict] | None:
+        data = event.get("data", {})
+        if corruption == "model_turn_empty_run_turn":
+            if event.get("event") == "ToolProposed":
+                data.update(run_id="", turn_id="")
+            if data.get("attempt_id") == new_attempt.get("previous_id"):
+                data.update(
+                    run_id="",
+                    turn_id="",
+                    attempt_id=new_attempt["replacement_id"],
+                )
+        elif event.get("event") == "ToolProposed":
+            if corruption == "model_turn_proposal_run_mismatch":
+                data["run_id"] = "different-run"
+            elif corruption == "model_turn_proposal_turn_mismatch":
+                data["turn_id"] = "different-turn"
+            elif corruption == "model_turn_proposal_call_mismatch":
+                data["tool_call_id"] = "different-tool-call"
+            elif corruption == "model_turn_duplicate_proposal":
+                return [event, event]
+            elif corruption == "model_turn_missing_proposal":
+                return None
+        event["data"] = data
+        return event
+
+    corrupted = _resign_preflight_snapshot(
+        original,
+        mutate_mission=mutate_mission,
+        event_transform=transform_event,
+    )
+    basis = windows_acceptance._mission_restart_basis(corrupted, mission_id)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
+
+
+@pytest.mark.parametrize(
+    ("mission_status", "report_http_status", "expected_missing_report"),
+    [
+        ("RESOURCE_BLOCKED", 404, True),
+        ("READY", 404, False),
+        ("RESOURCE_BLOCKED", 500, False),
+    ],
+)
+def test_audit_snapshot_only_tolerates_missing_report_for_resource_blocked(
+    mission_status: str,
+    report_http_status: int,
+    expected_missing_report: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_root = tmp_path / "disposable-profile"
+    state = profile_root / "userData" / "state"
+    (state / "workspaces").mkdir(parents=True)
+    (state / "intel.sqlite3").write_bytes(b"")
+
+    def fake_public_api(_page, _method, path, **_kwargs):
+        if path.endswith("/status"):
+            return {"http_status": 200, "body": {"status": {"status": mission_status}}}
+        if path.endswith("/timeline"):
+            return {"http_status": 200, "body": {"timeline": []}}
+        if path.endswith("/evidence"):
+            return {"http_status": 200, "body": {"evidence": []}}
+        if path.endswith("/effects"):
+            return {"http_status": 200, "body": {"effects": []}}
+        if path.endswith("/report"):
+            return {"http_status": report_http_status, "body": {"error": "report_not_available"}}
+        raise AssertionError(f"unexpected audit path: {path}")
+
+    monkeypatch.setattr(windows_acceptance, "_public_api", fake_public_api)
+    if expected_missing_report:
+        snapshot = windows_acceptance._mission_audit_snapshot(object(), "mission-404", profile_root)
+        assert snapshot["report"] == {}
+        assert snapshot["report_http_status"] == 404
+        assert snapshot["report_missing_for_preflight"] is True
+        assert snapshot["full_execution_chain_status"] == "NOT_PRESENT"
+    else:
+        with pytest.raises(windows_acceptance._MissionAuditSnapshotError):
+            windows_acceptance._mission_audit_snapshot(object(), "mission-404", profile_root)
+
+
+def test_live_restart_candidate_snapshot_includes_status_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, audit_snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    status = audit_snapshot["status"]
+    candidate = windows_acceptance._mission_restart_candidate_snapshot(
+        status,
+        audit_snapshot["full_execution_chain"],
+        audit_snapshot["full_execution_chain_status"],
+    )
+    assert candidate["evidence"] == status["evidence"]
+    assert windows_acceptance._mission_restart_basis(candidate, mission_id)["status"] == "VERIFIED"
+
+    status_without_evidence = dict(status)
+    status_without_evidence.pop("evidence")
+    incomplete_candidate = windows_acceptance._mission_restart_candidate_snapshot(
+        status_without_evidence,
+        audit_snapshot["full_execution_chain"],
+        audit_snapshot["full_execution_chain_status"],
+    )
+    assert windows_acceptance._mission_restart_basis(incomplete_candidate, mission_id)["status"] == "BLOCKED"
+
+
+@pytest.mark.parametrize(
+    ("attempt_source", "corruption"),
+    [
+        ("mission_slice", "attempt_source_list"),
+        ("model_turn", "failure_kind_list"),
+        ("mission_slice", "full_chain_status_list"),
+        ("mission_slice", "action_history_action_id_list"),
+        ("mission_slice", "action_history_step_id_list"),
+        ("mission_slice", "plan_step_id_list"),
+        ("mission_slice", "timeline_event_name_list"),
+    ],
+)
+def test_preflight_restart_basis_fails_closed_without_type_error_for_unhashable_values(
+    attempt_source: str,
+    corruption: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, original = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+        attempt_source=attempt_source,
+    )
+    attempt_id = original["status"]["checkpoint"]["attempt_id"]
+
+    def mutate_mission(mission: Mission) -> None:
+        if corruption == "attempt_source_list":
+            mission.checkpoint["attempt_source"] = ["mission_slice"]
+        elif corruption == "failure_kind_list":
+            for record in mission.failures + mission.progress.get("resource_failures", []):
+                if isinstance(record, dict) and record.get("attempt_id") == attempt_id:
+                    record["kind"] = ["PROCESS_SANDBOX_UNAVAILABLE"]
+        elif corruption == "action_history_action_id_list":
+            action = mission.action_history[0]
+            action["action_id"] = ["malformed-action"]
+            observation = action.get("observation")
+            if isinstance(observation, dict):
+                observation["action_id"] = ["malformed-action"]
+        elif corruption == "action_history_step_id_list":
+            mission.action_history[0]["step_id"] = ["malformed-step"]
+        elif corruption == "plan_step_id_list":
+            mission.plan = replace(
+                mission.plan,
+                steps=(replace(mission.plan.steps[0], step_id=["malformed-step"]),),
+            )
+        elif corruption == "timeline_event_name_list":
+            mission.trajectory[0]["event"] = ["MissionStarted"]
+
+    corrupted = _resign_preflight_snapshot(original, mutate_mission=mutate_mission)
+    if corruption == "full_chain_status_list":
+        corrupted["full_execution_chain_status"] = ["NOT_PRESENT"]
+    if corruption == "timeline_event_name_list":
+        assert windows_acceptance._trajectory_timeline_integrity(
+            corrupted["timeline"],
+            mission_id,
+            corrupted["status"]["request_id"],
+        ) is False
+
+    basis = windows_acceptance._mission_restart_basis(corrupted, mission_id)
+    assert basis["status"] == "BLOCKED"
+    assert basis["kind"] == "NOT_RUN"
