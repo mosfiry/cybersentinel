@@ -44,6 +44,15 @@ def test_process_result_has_distinct_success_failure_timeout_and_cancellation_ou
         "CANCELLED",
         "process_cancelled",
     )
+    assert _result(0).sandbox_backend == "bubblewrap+prlimit+cgroup-v2"
+
+
+def test_process_result_preserves_cgroup_resource_limit_reason():
+    result = replace(_result(-9), resource_limit_reason="memory_max")
+
+    assert result.outcome == "RESOURCE_LIMIT_EXCEEDED"
+    assert result.reason_code == "memory_max"
+    assert result.to_dict()["resource_limit_reason"] == "memory_max"
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGXCPU"), reason="SIGXCPU is not available on this platform")
@@ -128,6 +137,7 @@ def test_pre_spawn_dispatch_failure_never_creates_a_child(tmp_path, monkeypatch)
                 (sys.executable, "-c", "raise SystemExit(99)"),
                 cwd=".",
                 artifact_fd=artifact_fd,
+                start_marker_fd=artifact_fd,
                 timeout=5,
                 before_spawn=lambda _backend: (_ for _ in ()).throw(RuntimeError("fence refused dispatch")),
             )
@@ -137,7 +147,186 @@ def test_pre_spawn_dispatch_failure_never_creates_a_child(tmp_path, monkeypatch)
     assert popen_calls == []
 
 
-def test_owner_cancel_marker_waits_for_active_process_dispatch_boundary():
+def test_workspace_spawn_holds_cross_process_start_gate_through_backend_spawn(tmp_path, monkeypatch):
+    from security.dispatch_gate import MissionDispatchGate
+    from workspace import environment
+
+    store_path = tmp_path / "mission-store.sqlite3"
+    mission_id = "mission-process-start-boundary"
+    gate = MissionDispatchGate(store_path, mission_id)
+    peer_gate = MissionDispatchGate(store_path, mission_id)
+    authorized = []
+    spawn_observations = []
+    sentinel = object()
+    context = SimpleNamespace(
+        dispatch_gate=gate,
+        tool_dispatch_lock=None,
+        process_dispatch_lock=None,
+        authorize_process_dispatch=lambda *, backend: authorized.append(backend),
+    )
+
+    class FakeBackend:
+        backend_id = "contract-test-backend"
+
+        def spawn(self, _workspace, _command, **kwargs):
+            kwargs["before_spawn"](self.backend_id)
+            with pytest.raises(TimeoutError):
+                with peer_gate.process_start_guard(timeout=0.03):
+                    pytest.fail("peer process start crossed the active Workspace spawn gate")
+            spawn_observations.append("spawned-under-gate")
+            return sentinel
+
+    workspace = Workspace(
+        tmp_path / "workspace",
+        mission_id=mission_id,
+        request_id="request-process-start-boundary",
+        tool_id="run_project_tests",
+        execution_context=context,
+    )
+    monkeypatch.setattr(workspace, "_require_process_authority", lambda: None)
+    monkeypatch.setattr(environment, "get_process_sandbox_backend", lambda: FakeBackend())
+    try:
+        result = workspace._sandbox_popen(
+            (sys.executable, "-c", "pass"),
+            cwd=".",
+            artifact_fd=1,
+            start_marker_fd=2,
+            timeout=1,
+        )
+        assert result is sentinel
+        assert authorized == ["contract-test-backend"]
+        assert spawn_observations == ["spawned-under-gate"]
+        with peer_gate.process_start_guard(timeout=0.1):
+            pass
+    finally:
+        workspace.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires the Linux sandbox backend contract")
+def test_post_popen_missing_start_marker_is_ambiguous_not_no_effect(tmp_path, monkeypatch):
+    from workspace import process_sandbox
+    from workspace.cgroup_v2 import CgroupV2Manager
+    from workspace.environment import ProcessSandboxSetupError
+
+    backend = process_sandbox.LinuxBubblewrapBackend()
+    monkeypatch.setattr(
+        backend,
+        "availability",
+        lambda: process_sandbox.SandboxAvailability(True, backend.backend_id),
+    )
+    monkeypatch.setattr(
+        process_sandbox.shutil,
+        "which",
+        lambda name, path=None: f"/usr/bin/{name}",
+    )
+
+    scope_state = {"killed": False, "cleaned": False}
+
+    class FakeScope:
+        path = tmp_path / "fake-cgroup"
+        cgroup_procs = path / "cgroup.procs"
+
+        def kill(self):
+            scope_state["killed"] = True
+
+        def cleanup(self, **_kwargs):
+            scope_state["cleaned"] = True
+
+    scope = FakeScope()
+
+    class FakeManager:
+        def create_scope(self, **_kwargs):
+            return scope
+
+    monkeypatch.setattr(
+        CgroupV2Manager,
+        "from_environment",
+        classmethod(lambda _cls: FakeManager()),
+    )
+
+    class FakeWorkspace:
+        policy = SimpleNamespace(
+            max_temp_bytes=1024 * 1024,
+            max_total_artifact_bytes=1024 * 1024,
+            max_memory_bytes=128 * 1024 * 1024,
+            max_cpu_seconds=10,
+            max_file_bytes=1024 * 1024,
+            max_open_files=32,
+            max_child_processes=8,
+        )
+
+        @staticmethod
+        def _open_dir_fd(_relative):
+            return os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+
+    class FakeProcess:
+        pid = 4242
+        returncode = 0
+        command_was_started = True
+
+        def poll(self):
+            return self.returncode
+
+    process = FakeProcess()
+    popen_calls = []
+    monkeypatch.setattr(
+        process_sandbox.subprocess,
+        "Popen",
+        lambda *args, **kwargs: popen_calls.append((args, kwargs)) or process,
+    )
+    artifact_fd = os.open(tmp_path / "artifact", os.O_CREAT | os.O_RDWR, 0o600)
+    marker_fd = os.open(tmp_path / "start-marker", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(ProcessSandboxSetupError) as caught:
+            backend.spawn(
+                FakeWorkspace(),
+                (sys.executable, "-c", "pass"),
+                cwd=".",
+                artifact_fd=artifact_fd,
+                start_marker_fd=marker_fd,
+                timeout=5,
+                before_spawn=lambda _backend: None,
+            )
+    finally:
+        os.close(marker_fd)
+        os.close(artifact_fd)
+
+    assert len(popen_calls) == 1
+    assert process.command_was_started is True
+    assert scope_state == {"killed": True, "cleaned": True}
+    assert caught.value.detail_code == "sandbox_command_start_unconfirmed"
+    assert caught.value.no_effect_proof is None
+
+
+def test_cgroup_attribution_failure_still_cleans_tree_without_no_effect_proof():
+    from types import SimpleNamespace
+
+    from workspace.environment import ProcessSandboxSetupError, _cleanup_sandbox_scope
+
+    state = {"cleaned": False}
+
+    class BrokenScope:
+        def resource_limit_reason(self):
+            raise OSError("synthetic event file failure")
+
+        def cleanup(self, *, kill_if_populated=True):
+            assert kill_if_populated is True
+            state["cleaned"] = True
+
+    process = SimpleNamespace(
+        _cybersentinel_cgroup_scope=BrokenScope(),
+        _cybersentinel_backend="linux-cgroup-v2",
+    )
+    with pytest.raises(ProcessSandboxSetupError) as caught:
+        _cleanup_sandbox_scope(process)
+
+    assert state["cleaned"] is True
+    assert process._cybersentinel_cgroup_scope is None
+    assert caught.value.detail_code == "cgroup_resource_event_attribution_unavailable"
+    assert caught.value.no_effect_proof is None
+
+
+def test_owner_cancel_commit_waits_for_active_process_dispatch_lock():
     from tools.registry import (
         _register_active_tool_cancellation,
         _unregister_active_tool_cancellation,
@@ -163,13 +352,14 @@ def test_owner_cancel_marker_waits_for_active_process_dispatch_boundary():
     try:
         worker.start()
         assert cancel_started.wait(timeout=2)
-        assert not marker_committed.wait(timeout=0.05)
-        assert not cancellation_event.is_set()
+        assert not marker_committed.wait(timeout=0.1)
+        assert worker.is_alive()
         dispatch_lock.release()
         assert marker_committed.wait(timeout=2)
         worker.join(timeout=2)
         assert not worker.is_alive()
         assert cancellation_event.is_set()
+        assert not dispatch_lock.locked()
     finally:
         if dispatch_lock.locked():
             dispatch_lock.release()
@@ -233,7 +423,7 @@ def test_owner_cancel_marker_serializes_late_tool_registration():
         _unregister_active_tool_cancellation(mission_id, late_event)
 
 
-def test_owner_cancel_cannot_commit_between_local_state_dispatch_and_effect(tmp_path, monkeypatch):
+def test_owner_cancel_commits_promptly_during_local_state_handler(tmp_path, monkeypatch):
     from agent import external_effects
     from tools import registry
 
@@ -343,9 +533,8 @@ def test_owner_cancel_cannot_commit_between_local_state_dispatch_and_effect(tmp_
         worker.start()
         assert handler_entered.wait(timeout=2)
         cancel_thread.start()
-        time.sleep(0.05)
-        assert not marker_committed.is_set()
-        assert ordering == []
+        assert marker_committed.wait(timeout=2)
+        assert ordering == ["owner-cancel-marker"]
 
         release_handler.set()
         worker.join(timeout=2)
@@ -355,7 +544,7 @@ def test_owner_cancel_cannot_commit_between_local_state_dispatch_and_effect(tmp_
         assert not cancel_thread.is_alive()
         assert failures == []
         assert result == [{"success": True, "result": "watch registered"}]
-        assert ordering == ["local-state-effect", "owner-cancel-marker"]
+        assert ordering == ["owner-cancel-marker", "local-state-effect"]
         assert effect_events == ["dispatched", "succeeded"]
 
         with pytest.raises(PermissionError, match="Owner cancellation requested"):

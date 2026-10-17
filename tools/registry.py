@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 from pathlib import Path
@@ -38,7 +39,7 @@ DEFAULT_TOOL_TIMEOUT = 30
 @dataclass
 class _MissionToolCancellationState:
     lock: Any = field(default_factory=threading.RLock, repr=False)
-    active: dict[threading.Event, Any] = field(default_factory=dict)
+    active: dict[threading.Event, tuple[Any, Any, Any, Any]] = field(default_factory=dict)
     references: int = 0
 
 
@@ -50,34 +51,117 @@ def cancel_active_mission_tool_executions(
     mission_id: str,
     *,
     before_signal: Callable[[], Any] | None = None,
+    dispatch_gate: Any = None,
 ) -> int:
-    """Commit an authenticated Owner cancel marker before signaling active tools."""
+    """Fence active dispatches before committing an authenticated cancellation."""
     if not isinstance(mission_id, str) or not mission_id.strip():
         return 0
     state = _retain_mission_tool_cancellation_state(mission_id, create=True)
     assert state is not None
     try:
-        # Serialize this Mission's registrations and dispatch boundaries with
-        # its durable marker, without blocking unrelated Missions.
-        with state.lock:
-            active = tuple(state.active.items())
-            locks = sorted(
-                {id(lock): lock for _event, lock in active if lock is not None}.values(),
-                key=id,
-            )
-            acquired: list[Any] = []
-            try:
-                for lock in locks:
-                    lock.acquire()
-                    acquired.append(lock)
-                if before_signal is not None:
-                    before_signal()
-                for event, _dispatch_lock in active:
-                    event.set()
-            finally:
-                for lock in reversed(acquired):
-                    lock.release()
-            return len(active)
+        cancel_lifecycle_guard = (
+            dispatch_gate.owner_cancel_guard(timeout=60.0)
+            if dispatch_gate is not None
+            else nullcontext()
+        )
+        with cancel_lifecycle_guard:
+            if dispatch_gate is not None:
+                dispatch_gate.reconcile_cancel_request()
+            # Holding this registry lock prevents a late local tool registration
+            # from escaping the Owner-cancel snapshot and durable marker.
+            with state.lock:
+                active = tuple(state.active.items())
+                pending_events = tuple(
+                    pending_event
+                    for _event, (_process_lock, _socket_lock, _request_lock, pending_event) in active
+                    if pending_event is not None
+                )
+                for pending_event in pending_events:
+                    pending_event.set()
+                marker_created = False
+                request_locks = sorted(
+                    {
+                        id(request_lock): request_lock
+                        for _event, (_process_lock, _socket_lock, request_lock, _pending_event) in active
+                        if request_lock is not None
+                    }.values(),
+                    key=id,
+                )
+                process_locks = sorted(
+                    {
+                        id(process_lock): process_lock
+                        for _event, (process_lock, _socket_lock, _request_lock, _pending_event) in active
+                        if process_lock is not None
+                    }.values(),
+                    key=id,
+                )
+                socket_locks = sorted(
+                    {
+                        id(socket_lock): socket_lock
+                        for _event, (_process_lock, socket_lock, _request_lock, _pending_event) in active
+                        if socket_lock is not None
+                    }.values(),
+                    key=id,
+                )
+                acquired_request_locks = []
+                acquired_process_locks = []
+                acquired_socket_locks = []
+                acquired_ids: set[int] = set()
+                should_signal = True
+                durable_commit: bool | None = False
+                try:
+                    # Publish intent so active transports stop promptly; the
+                    # gate waits for any process-start boundary before the final marker.
+                    marker_created = dispatch_gate.request_cancel() if dispatch_gate is not None else False
+                    for request_lock in request_locks:
+                        if not request_lock.acquire(timeout=60.0):
+                            raise TimeoutError("active Mission HTTP request did not close before cancellation")
+                        acquired_request_locks.append(request_lock)
+                        acquired_ids.add(id(request_lock))
+                    for process_lock in process_locks:
+                        if id(process_lock) in acquired_ids:
+                            continue
+                        if not process_lock.acquire(timeout=60.0):
+                            raise TimeoutError("active process-start boundary did not close before cancellation")
+                        acquired_process_locks.append(process_lock)
+                        acquired_ids.add(id(process_lock))
+                    gate_guard = (
+                        dispatch_gate.cancellation_guard(timeout=60.0)
+                        if dispatch_gate is not None
+                        else nullcontext()
+                    )
+                    with gate_guard:
+                        for socket_lock in socket_locks:
+                            if id(socket_lock) in acquired_ids:
+                                continue
+                            if not socket_lock.acquire(timeout=60.0):
+                                raise TimeoutError("active socket write did not stop before cancellation")
+                            acquired_socket_locks.append(socket_lock)
+                            acquired_ids.add(id(socket_lock))
+                        if before_signal is not None:
+                            durable_commit = None
+                            decision = before_signal()
+                            should_signal = decision is not False
+                            durable_commit = should_signal
+                        else:
+                            # Internal task-graph cancellation has no durable
+                            # Owner CAS; its intent must not survive this call.
+                            durable_commit = False
+                        if should_signal:
+                            for event, _locks in state.active.items():
+                                event.set()
+                        return len(active) if should_signal else 0
+                finally:
+                    for socket_lock in reversed(acquired_socket_locks):
+                        socket_lock.release()
+                    for process_lock in reversed(acquired_process_locks):
+                        process_lock.release()
+                    for request_lock in reversed(acquired_request_locks):
+                        request_lock.release()
+                    for pending_event in pending_events:
+                        pending_event.clear()
+                    if dispatch_gate is not None and marker_created and durable_commit is False:
+                        dispatch_gate.clear_cancel_request(created_by_this_call=True)
     finally:
         _release_mission_tool_cancellation_state(mission_id, state)
 
@@ -111,6 +195,10 @@ def _register_active_tool_cancellation(
     mission_id: str,
     event: threading.Event,
     process_dispatch_lock: Any = None,
+    *,
+    socket_write_lock: Any = None,
+    dispatch_request_lock: Any = None,
+    dispatch_cancel_pending_event: Any = None,
 ) -> None:
     if not mission_id:
         return
@@ -121,7 +209,12 @@ def _register_active_tool_cancellation(
         with state.lock:
             if event not in state.active:
                 registered = True
-            state.active[event] = process_dispatch_lock
+            state.active[event] = (
+                process_dispatch_lock,
+                socket_write_lock,
+                dispatch_request_lock,
+                dispatch_cancel_pending_event,
+            )
     finally:
         if not registered:
             _release_mission_tool_cancellation_state(mission_id, state)
@@ -689,6 +782,7 @@ def _run_project_tests(argument, *, workspace=None, execution_context=None):
             "cancelled": result.cancelled,
             "outcome": getattr(result, "outcome", None),
             "reason_code": getattr(result, "reason_code", None),
+            "resource_limit_reason": getattr(result, "resource_limit_reason", None),
             "process_started": getattr(result, "process_id", None) is not None,
             "process_id": getattr(result, "process_id", None),
             "process_started_at_utc": getattr(result, "process_started_at_utc", None),
@@ -709,6 +803,7 @@ def _run_project_tests(argument, *, workspace=None, execution_context=None):
         "cancelled": result.cancelled,
         "outcome": getattr(result, "outcome", None),
         "reason_code": getattr(result, "reason_code", None),
+        "resource_limit_reason": getattr(result, "resource_limit_reason", None),
         "process_started": getattr(result, "process_id", None) is not None,
         "process_id": getattr(result, "process_id", None),
         "process_started_at_utc": getattr(result, "process_started_at_utc", None),
@@ -1353,6 +1448,12 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             authorization_snapshot=mission_authorization,
         )
     cancellation_event = threading.Event()
+    dispatch_cancel_pending_event = threading.Event()
+    dispatch_request_lock = (
+        threading.Lock()
+        if spec.dispatch_boundary == "scope_pinned_http_send"
+        else None
+    )
     process_dispatch_lock = (
         threading.Lock()
         if spec.process_access == "workspace_process_sandboxed" or spec.effect_provider
@@ -1374,6 +1475,24 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             or not isinstance(target_identity, str)
         ):
             raise PermissionError("tool requires the canonical Owner/Mission ExecutionContext")
+        dispatch_gate = None
+        if (
+            spec.dispatch_boundary == "scope_pinned_http_send"
+            or spec.process_access == "workspace_process_sandboxed"
+        ):
+            mission_db_path = getattr(getattr(evidence_store, "mission_store", None), "db_path", None)
+            if not isinstance(mission_db_path, (str, os.PathLike)) or not str(mission_db_path).strip():
+                raise PermissionError("Mission external dispatch requires a durable cross-process gate")
+            from security.dispatch_gate import MissionDispatchGate
+
+            queue_db_path = getattr(getattr(execution_fence, "queue", None), "db_path", None)
+            if not isinstance(queue_db_path, (str, os.PathLike)) or not str(queue_db_path).strip():
+                raise PermissionError("Mission external dispatch requires the durable cancellation queue")
+            dispatch_gate = MissionDispatchGate(
+                mission_db_path,
+                str(mission_id),
+                cancellation_db_path=queue_db_path,
+            )
         artifact_store = None
         if spec.filesystem_access in {"mission_artifact_write", "workspace_read_only_artifact_write"}:
             if not bool(getattr(evidence_store, "require_execution_fence", False)):
@@ -1409,6 +1528,9 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             evidence_store=evidence_store,
             artifact_store=artifact_store,
             cancellation_event=cancellation_event,
+            dispatch_cancel_pending_event=dispatch_cancel_pending_event,
+            dispatch_request_lock=dispatch_request_lock,
+            dispatch_gate=dispatch_gate,
             deadline_monotonic=time.monotonic() + limit,
             delegation_scope=delegated_scope,
             tool_dispatch_lock=process_dispatch_lock,
@@ -1560,6 +1682,9 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
     process_dispatch_committed = (
         threading.Event() if spec.process_access == "workspace_process_sandboxed" else None
     )
+    scope_http_dispatch_committed = (
+        threading.Event() if spec.dispatch_boundary == "scope_pinned_http_send" else None
+    )
     if tool_execution_context is not None and spec.process_access == "workspace_process_sandboxed":
         def authorize_process_dispatch(backend: str) -> None:
             assert_owner_cancellation_not_requested()
@@ -1612,16 +1737,46 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
             process_start_callback=report_process_started,
         )
 
+    if tool_execution_context is not None and scope_http_dispatch_committed is not None:
+        def authorize_scope_pinned_http_dispatch() -> None:
+            if scope_http_dispatch_committed.is_set():
+                return
+            assert_owner_cancellation_not_requested()
+            if execution_fence is not None:
+                execution_fence.assert_dispatch(
+                    mission_id=str(mission_id or ""),
+                    request_id=str(request_id or ""),
+                    execution_id=str(execution_id or ""),
+                    authorization_snapshot=mission_authorization,
+                )
+            tool_execution_context.assert_active()
+            if effect is not None:
+                effect_ledger.mark_dispatched(
+                    effect.effect_id,
+                    execution_fence,
+                    dispatch_id=dispatch_id,
+                    authorization_snapshot=mission_authorization,
+                )
+            scope_http_dispatch_committed.set()
+
+        tool_execution_context = replace(
+            tool_execution_context,
+            scope_pinned_http_dispatch_callback=authorize_scope_pinned_http_dispatch,
+        )
+
+    def dispatch_boundary_committed() -> bool:
+        if process_dispatch_committed is not None:
+            return process_dispatch_committed.is_set()
+        if scope_http_dispatch_committed is not None:
+            return scope_http_dispatch_committed.is_set()
+        return True
+
     def invoke_handler_body(*, workspace_context=None):
         from agent.execution_fence import ExecutionFenceError
         from agent.external_effects import EffectRecoveryRequired, EffectState
 
-        def mark_process_no_effect(exc: Exception) -> None:
-            if (
-                effect is None
-                or process_dispatch_committed is None
-                or process_dispatch_committed.is_set()
-            ):
+        def mark_pre_dispatch_no_effect(exc: Exception) -> None:
+            if effect is None or dispatch_boundary_committed():
                 return
             explicit_reason_code = getattr(exc, "reason_code", None)
             try:
@@ -1666,7 +1821,11 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 )
             if tool_execution_context is not None:
                 tool_execution_context.assert_active()
-            if effect is not None and spec.process_access != "workspace_process_sandboxed":
+            if (
+                effect is not None
+                and spec.process_access != "workspace_process_sandboxed"
+                and spec.dispatch_boundary != "scope_pinned_http_send"
+            ):
                 effect_ledger.mark_dispatched(
                     effect.effect_id,
                     execution_fence,
@@ -1674,7 +1833,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                     authorization_snapshot=mission_authorization,
                 )
         except Exception as exc:
-            mark_process_no_effect(exc)
+            mark_pre_dispatch_no_effect(exc)
             raise
         handler_kwargs = {}
         if spec.workspace_scope_required:
@@ -1692,13 +1851,35 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 else:
                     tool_execution_context.assert_active()
         except Exception as exc:
-            if (
-                process_dispatch_committed is not None
-                and not process_dispatch_committed.is_set()
-            ):
-                mark_process_no_effect(exc)
+            if not dispatch_boundary_committed():
+                mark_pre_dispatch_no_effect(exc)
                 raise
             if effect is None:
+                raise
+            no_effect_proof = getattr(exc, "no_effect_proof", None)
+            if (
+                spec.process_access == "workspace_process_sandboxed"
+                and no_effect_proof is not None
+            ):
+                reason_code = str(getattr(exc, "reason_code", "SANDBOX_LAUNCH_FAILED")).upper()
+                if not re.fullmatch(r"[A-Z0-9_]{1,64}", reason_code):
+                    reason_code = "SANDBOX_LAUNCH_FAILED"
+                try:
+                    effect_ledger.mark_failed(
+                        effect.effect_id,
+                        execution_fence,
+                        reason_code=reason_code,
+                        provider_confirmed_no_effect=True,
+                        dispatch_id=dispatch_id,
+                        no_effect_proof=no_effect_proof,
+                        authorization_snapshot=mission_authorization,
+                    )
+                except Exception as ledger_exc:
+                    raise EffectRecoveryRequired(
+                        effect.effect_id,
+                        EffectState.DISPATCHED,
+                        "OUTCOME_PERSISTENCE_FAILED",
+                    ) from ledger_exc
                 raise
             recovery_reason_code = str(
                 getattr(exc, "reason_code", type(exc).__name__)
@@ -1753,6 +1934,14 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 ) from None
         if effect is not None:
             try:
+                if (
+                    scope_http_dispatch_committed is not None
+                    and not scope_http_dispatch_committed.is_set()
+                ):
+                    mark_pre_dispatch_no_effect(
+                        PermissionError("scope-pinned HTTP send boundary was not reached")
+                    )
+                    raise ExecutionFenceError("scope-pinned HTTP send boundary was not reached")
                 if spec.name == "mcp.invoke" and isinstance(result, dict) and result.get("status") == "remote_tool_error":
                     # A remote error envelope does not prove that a stateful tool
                     # made no partial external changes; do not claim success or replay.
@@ -1782,17 +1971,22 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
         return result
 
     def invoke_handler(*, workspace_context=None):
-        if spec.effect_provider and spec.dispatch_boundary == "handler":
-            if process_dispatch_lock is None:
-                raise PermissionError("effectful handler is missing its Mission dispatch boundary")
-            # Local state changes and ordinary bounded effect handlers run to a
-            # known boundary before Owner cancellation can commit its marker.
-            with process_dispatch_lock:
-                return invoke_handler_body(workspace_context=workspace_context)
+        # The durable effect transition is the dispatch linearization point.
+        # Keep the handler outside local locks so Owner cancellation can commit
+        # and signal promptly even when a provider or process is slow.
         return invoke_handler_body(workspace_context=workspace_context)
 
     _register_active_tool_cancellation(
-        str(mission_id or ""), cancellation_event, process_dispatch_lock
+        str(mission_id or ""),
+        cancellation_event,
+        process_dispatch_lock,
+        socket_write_lock=(
+            process_dispatch_lock
+            if spec.dispatch_boundary == "scope_pinned_http_send"
+            else None
+        ),
+        dispatch_request_lock=dispatch_request_lock,
+        dispatch_cancel_pending_event=dispatch_cancel_pending_event,
     )
     executor = None
     try:
@@ -1838,11 +2032,7 @@ def execute(name: str, argument: Any = None, *, timeout: float | None = None, ma
                 pass
         return result
     except FutureTimeout as exc:
-        if process_dispatch_lock is None or spec.dispatch_boundary == "handler":
-            cancellation_event.set()
-        else:
-            with process_dispatch_lock:
-                cancellation_event.set()
+        cancellation_event.set()
         cancelled = future.cancel()
         if not future.done():
             # A thread running a non-interruptible handler must remain visible

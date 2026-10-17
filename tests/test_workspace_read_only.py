@@ -9,6 +9,7 @@ import pytest
 
 from security.mission_authorization import MissionAuthorizationSnapshot
 from workspace.environment import Workspace, WorkspaceBoundaryError
+from process_sandbox_testutils import require_live_process_sandbox
 
 
 def _authorized_workspace(
@@ -104,6 +105,7 @@ def test_read_bounded_does_not_follow_symlink(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(os.name != "posix", reason="fsmonitor script test requires POSIX")
 def test_git_readonly_disables_repository_fsmonitor_and_optional_writes(tmp_path: Path) -> None:
+    require_live_process_sandbox()
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)

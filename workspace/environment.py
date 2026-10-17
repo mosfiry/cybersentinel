@@ -49,7 +49,14 @@ class ProcessSandboxUnavailable(WorkspacePolicyError):
 class ProcessSandboxSetupError(ProcessSandboxUnavailable):
     """Raised when an approved sandbox exists but cannot be safely initialized."""
 
-    def __init__(self, reason: str, *, detail_code: str, backend: str = "unknown") -> None:
+    def __init__(
+        self,
+        reason: str,
+        *,
+        detail_code: str,
+        backend: str = "unknown",
+        provider_confirmed_no_effect: bool = False,
+    ) -> None:
         availability = SandboxAvailability(
             False,
             backend,
@@ -58,6 +65,11 @@ class ProcessSandboxSetupError(ProcessSandboxUnavailable):
             reason,
         )
         super().__init__(reason, availability=availability)
+        self.no_effect_proof = None
+        if provider_confirmed_no_effect:
+            from agent.external_effects import _new_process_launch_no_effect_proof
+
+            self.no_effect_proof = _new_process_launch_no_effect_proof(backend, detail_code)
 
 
 @dataclass(frozen=True)
@@ -165,7 +177,77 @@ def _join_process_readers(process: Popen, readers: Sequence[Thread]) -> None:
         reader.join(timeout=1)
 
 
+def _cleanup_sandbox_scope(process: Popen, *, kill_if_populated: bool = True) -> str | None:
+    scope = getattr(process, "_cybersentinel_cgroup_scope", None)
+    if scope is None:
+        return None
+    reason = None
+    accounting_error = None
+    cleanup_error = None
+    try:
+        reason = scope.resource_limit_reason()
+    except Exception as exc:
+        accounting_error = exc
+    try:
+        scope.cleanup(kill_if_populated=kill_if_populated)
+    except Exception as exc:
+        cleanup_error = exc
+    finally:
+        process._cybersentinel_cgroup_scope = None
+    backend = getattr(process, "_cybersentinel_backend", "unknown")
+    if cleanup_error is not None:
+        raise ProcessSandboxSetupError(
+            "sandbox process-tree cleanup could not be verified",
+            detail_code="sandbox_process_tree_cleanup_unverified",
+            backend=backend,
+        ) from None
+    if accounting_error is not None:
+        raise ProcessSandboxSetupError(
+            "sandbox resource-limit accounting could not be verified",
+            detail_code="cgroup_resource_event_attribution_unavailable",
+            backend=backend,
+        ) from None
+    return reason
+
+
+def _finalize_process_output(process: Popen, readers: Sequence[Thread]) -> str | None:
+    """Collect resource events, stop any remaining tree, and always close pipe readers."""
+    reason = None
+    failure = None
+    try:
+        reason = _cleanup_sandbox_scope(process)
+    except Exception as exc:
+        failure = exc
+    try:
+        _join_process_readers(process, readers)
+    except Exception as exc:
+        if failure is None:
+            failure = exc
+    finally:
+        for stream in (process.stdout, process.stderr):
+            if stream:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    if failure is not None:
+        raise failure
+    return reason
+
+
 def _stop_process_tree(process: Popen, *, grace_seconds: float = 2.0) -> None:
+    scope = getattr(process, "_cybersentinel_cgroup_scope", None)
+    if scope is not None:
+        scope.kill()
+        if process.poll() is None:
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=grace_seconds)
+        scope.cleanup(kill_if_populated=True, timeout=grace_seconds)
+        process._cybersentinel_cgroup_scope = None
+        return
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -741,6 +823,7 @@ class Workspace:
         *,
         cwd: str | Path,
         artifact_fd: int,
+        start_marker_fd: int,
         timeout: float,
     ) -> Popen[bytes]:
         self._require_process_authority()
@@ -761,14 +844,25 @@ class Workspace:
                 command,
                 cwd=cwd,
                 artifact_fd=artifact_fd,
+                start_marker_fd=start_marker_fd,
                 timeout=timeout,
                 before_spawn=before_spawn if callable(authorize) else None,
             )
 
+        def spawn_with_mission_gate() -> Popen[bytes]:
+            dispatch_gate = getattr(context, "dispatch_gate", None)
+            if dispatch_gate is None:
+                return spawn()
+            # The shared OS lock covers the final authorization/effect-ledger
+            # callback and backend spawn. Owner cancellation must acquire this
+            # same boundary before committing its durable queue marker.
+            with dispatch_gate.process_start_guard():
+                return spawn()
+
         if dispatch_lock is None:
-            return spawn()
+            return spawn_with_mission_gate()
         with dispatch_lock:
-            return spawn()
+            return spawn_with_mission_gate()
 
     def _notify_process_started(self, process: Popen[bytes]) -> str:
         started_at_utc = datetime.now(timezone.utc).isoformat()
@@ -778,7 +872,7 @@ class Workspace:
             return started_at_utc
         try:
             notify(
-                backend=get_process_sandbox_backend().backend_id,
+                backend=getattr(process, "_cybersentinel_backend", get_process_sandbox_backend().backend_id),
                 process_id=process.pid if isinstance(process.pid, int) else None,
                 started_at_utc=started_at_utc,
             )
@@ -893,11 +987,17 @@ class Workspace:
             artifact_flags = os.O_CREAT | os.O_RDWR | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
             artifact_fd = os.open(artifact_path, artifact_flags, 0o600)
             try:
-                process = self._sandbox_popen(
-                    command, cwd=cwd, artifact_fd=artifact_fd,
-                    timeout=float(effective_timeout),
-                )
-                process_started_at_utc = self._notify_process_started(process)
+                start_marker_path = Path(artifact_directory) / ".cybersentinel-process-started"
+                start_marker_fd = os.open(start_marker_path, artifact_flags, 0o600)
+                try:
+                    process = self._sandbox_popen(
+                        command, cwd=cwd, artifact_fd=artifact_fd,
+                        start_marker_fd=start_marker_fd,
+                        timeout=float(effective_timeout),
+                    )
+                    process_started_at_utc = self._notify_process_started(process)
+                finally:
+                    os.close(start_marker_fd)
             finally:
                 os.close(artifact_fd)
             stdout_tail, stderr_tail = bytearray(), bytearray()
@@ -924,11 +1024,7 @@ class Workspace:
                     process.wait(timeout=min(0.1, remaining))
                 except subprocess.TimeoutExpired:
                     continue
-            _join_process_readers(process, readers)
-            if process.stdout:
-                process.stdout.close()
-            if process.stderr:
-                process.stderr.close()
+            resource_limit_reason = _finalize_process_output(process, readers)
             artifacts, capture_truncated = self._capture_artifacts(artifact_directory)
             stdout = bytes(stdout_tail).decode("utf-8", errors="replace")
             stderr = bytes(stderr_tail).decode("utf-8", errors="replace")
@@ -940,6 +1036,8 @@ class Workspace:
                 artifact_capture_truncated=capture_truncated,
                 process_id=process.pid if isinstance(process.pid, int) else None,
                 process_started_at_utc=process_started_at_utc,
+                sandbox_backend=getattr(process, "_cybersentinel_backend", get_process_sandbox_backend().backend_id),
+                resource_limit_reason=resource_limit_reason,
             )
         audit_summary = {
             "exit_code": result.exit_code,
@@ -947,6 +1045,7 @@ class Workspace:
             "cancelled": result.cancelled,
             "outcome": result.outcome,
             "reason_code": result.reason_code,
+            "resource_limit_reason": result.resource_limit_reason,
             "process_id": result.process_id,
             "process_started_at_utc": result.process_started_at_utc,
             "duration_seconds": round(result.duration_seconds, 3),
@@ -1040,37 +1139,37 @@ class ProcessResult:
     timed_out: bool
     duration_seconds: float
     cancelled: bool = False
-    sandbox_backend: str = "bubblewrap+prlimit"
+    sandbox_backend: str = "bubblewrap+prlimit+cgroup-v2"
     artifacts: tuple[ProcessArtifact, ...] = ()
     artifact_capture_truncated: bool = False
     outcome: str | None = None
     reason_code: str | None = None
     process_id: int | None = None
     process_started_at_utc: str | None = None
+    resource_limit_reason: str | None = None
 
     def __post_init__(self) -> None:
-        outcome = self.outcome
-        reason_code = self.reason_code
-        if outcome is None or reason_code is None:
-            if self.timed_out:
-                outcome, reason_code = "TIMED_OUT", "process_timeout"
-            elif self.cancelled:
-                outcome, reason_code = "CANCELLED", "process_cancelled"
-            elif self.exit_code == 0:
-                outcome, reason_code = "SUCCEEDED", "process_exit_zero"
-            elif self.exit_code in {
-                -getattr(signal, "SIGXCPU", 99999),
-                -getattr(signal, "SIGXFSZ", 99998),
-            }:
-                outcome, reason_code = "RESOURCE_LIMIT_EXCEEDED", "resource_limit_signal"
-            else:
-                outcome, reason_code = "COMMAND_FAILED", "command_nonzero_exit"
-            object.__setattr__(self, "outcome", outcome)
-            object.__setattr__(self, "reason_code", reason_code)
+        if self.timed_out:
+            outcome, reason_code = "TIMED_OUT", "process_timeout"
+        elif self.cancelled:
+            outcome, reason_code = "CANCELLED", "process_cancelled"
+        elif self.resource_limit_reason:
+            outcome, reason_code = "RESOURCE_LIMIT_EXCEEDED", self.resource_limit_reason
+        elif self.exit_code == 0:
+            outcome, reason_code = "SUCCEEDED", "process_exit_zero"
+        elif self.exit_code in {
+            -getattr(signal, "SIGXCPU", 99999),
+            -getattr(signal, "SIGXFSZ", 99998),
+        }:
+            outcome, reason_code = "RESOURCE_LIMIT_EXCEEDED", "resource_limit_signal"
+        else:
+            outcome, reason_code = "COMMAND_FAILED", "command_nonzero_exit"
+        object.__setattr__(self, "outcome", outcome)
+        object.__setattr__(self, "reason_code", reason_code)
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out and not self.cancelled
+        return self.exit_code == 0 and not self.timed_out and not self.cancelled and self.resource_limit_reason is None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1082,6 +1181,7 @@ class ProcessResult:
             "cancelled": self.cancelled,
             "outcome": self.outcome,
             "reason_code": self.reason_code,
+            "resource_limit_reason": self.resource_limit_reason,
             "process_started": self.process_id is not None,
             "process_id": self.process_id,
             "process_started_at_utc": self.process_started_at_utc,
@@ -1144,11 +1244,10 @@ class ProcessHandle:
                 self.process.wait(timeout=min(0.1, remaining))
             except subprocess.TimeoutExpired:
                 continue
-        _join_process_readers(self.process, self._readers)
-        if self.process.stdout:
-            self.process.stdout.close()
-        if self.process.stderr:
-            self.process.stderr.close()
+        try:
+            resource_limit_reason = _finalize_process_output(self.process, self._readers)
+        finally:
+            self._cleanup()
         stdout = bytes(self._stdout_tail).decode("utf-8", errors="replace")
         stderr = bytes(self._stderr_tail).decode("utf-8", errors="replace")
         result = ProcessResult(
@@ -1157,8 +1256,9 @@ class ProcessHandle:
             timed_out, time.time() - started, cancelled=self._cancelled,
             process_id=self.process.pid if isinstance(self.process.pid, int) else None,
             process_started_at_utc=self.process_started_at_utc,
+            sandbox_backend=getattr(self.process, "_cybersentinel_backend", get_process_sandbox_backend().backend_id),
+            resource_limit_reason=resource_limit_reason,
         )
-        self._cleanup()
         return result
 
     def terminate(self) -> None:
@@ -1210,15 +1310,25 @@ class ProcessManager:
                 0o600,
             )
             try:
-                process = self.workspace._sandbox_popen(
-                    command, cwd=cwd, artifact_fd=artifact_fd,
-                    timeout=self.workspace.policy.max_timeout_seconds,
+                start_marker_path = Path(temporary_directory.name) / ".cybersentinel-process-started"
+                start_marker_fd = os.open(
+                    start_marker_path,
+                    os.O_CREAT | os.O_RDWR | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
                 )
                 try:
-                    process_started_at_utc = self.workspace._notify_process_started(process)
-                except BaseException:
-                    temporary_directory.cleanup()
-                    raise
+                    process = self.workspace._sandbox_popen(
+                        command, cwd=cwd, artifact_fd=artifact_fd,
+                        start_marker_fd=start_marker_fd,
+                        timeout=self.workspace.policy.max_timeout_seconds,
+                    )
+                    try:
+                        process_started_at_utc = self.workspace._notify_process_started(process)
+                    except BaseException:
+                        temporary_directory.cleanup()
+                        raise
+                finally:
+                    os.close(start_marker_fd)
             finally:
                 os.close(artifact_fd)
         finally:
