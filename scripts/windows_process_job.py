@@ -33,16 +33,25 @@ _SYNCHRONIZE = 0x00100000
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
+_MAX_JOB_WAIT_TIMEOUT_SECONDS = 600.0
+_MAX_JOB_TERMINATION_TIMEOUT_SECONDS = 30.0
+_MAX_PROCESS_RUNTIME_TIMEOUT_SECONDS = 600.0
 
 
-def _validated_timeout_seconds(timeout_seconds: float) -> float:
+def _validated_timeout_seconds(
+    timeout_seconds: object, *, max_seconds: float
+) -> float:
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
         raise ValueError("windows_job_timeout_invalid")
     try:
         normalized = float(timeout_seconds)
     except (OverflowError, TypeError, ValueError):
         raise ValueError("windows_job_timeout_invalid") from None
-    if not math.isfinite(normalized) or normalized < 0:
+    if (
+        not math.isfinite(normalized)
+        or normalized < 0
+        or normalized > max_seconds
+    ):
         raise ValueError("windows_job_timeout_invalid")
     return normalized
 
@@ -271,7 +280,9 @@ class WindowsOwnedJob:
         self._require_open()
         if self.current is None:
             raise RuntimeError("windows_job_process_identity_unavailable")
-        timeout_seconds = _validated_timeout_seconds(timeout_seconds)
+        timeout_seconds = _validated_timeout_seconds(
+            timeout_seconds, max_seconds=_MAX_JOB_WAIT_TIMEOUT_SECONDS
+        )
         timeout_ms = min(int(timeout_seconds * 1000), 0xFFFFFFFE)
         result = self._kernel32.WaitForSingleObject(self.current.process_handle, timeout_ms)
         if result == _WAIT_OBJECT_0:
@@ -301,7 +312,9 @@ class WindowsOwnedJob:
         timeout_seconds: float = 30.0,
     ) -> dict[str, int | bool | str]:
         self._require_open()
-        timeout_seconds = _validated_timeout_seconds(timeout_seconds)
+        timeout_seconds = _validated_timeout_seconds(
+            timeout_seconds, max_seconds=_MAX_JOB_TERMINATION_TIMEOUT_SECONDS
+        )
         identity = self.verify_current(process_id, expected_image)
         initial_members = self.process_count()
         root_stopped = self.wait_current(0)
@@ -333,7 +346,9 @@ class WindowsOwnedJob:
     def terminate_owned_job(self, *, timeout_seconds: float = 30.0) -> dict[str, int | bool | str]:
         """Terminate only this unique job; intended for final owned-job cleanup."""
         self._require_open()
-        timeout_seconds = _validated_timeout_seconds(timeout_seconds)
+        timeout_seconds = _validated_timeout_seconds(
+            timeout_seconds, max_seconds=_MAX_JOB_TERMINATION_TIMEOUT_SECONDS
+        )
         initial_members = self.process_count()
         root_stopped = self.current is None or self.wait_current(0)
         if (initial_members or not root_stopped) and not self._kernel32.TerminateJobObject(
@@ -519,7 +534,13 @@ def run_process_in_owned_job(
     The process and descendants stay in that Job; completion always terminates
     remaining members and records whether the Job became empty before return.
     """
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or timeout_seconds > 3600:
+    try:
+        timeout_seconds = _validated_timeout_seconds(
+            timeout_seconds, max_seconds=_MAX_PROCESS_RUNTIME_TIMEOUT_SECONDS
+        )
+        if timeout_seconds <= 0:
+            raise ValueError("windows_job_timeout_invalid")
+    except ValueError:
         return {
             "status": "launch_failed",
             "process_started": False,

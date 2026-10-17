@@ -56,7 +56,11 @@ class _FakeOwnedJob:
 def test_job_runner_assigns_before_wait_and_verifies_tree_cleanup(tmp_path: Path) -> None:
     job = _FakeOwnedJob(waited=True, exit_code=0, cleanup_succeeded=True)
     result = run_process_in_owned_job(
-        "installer.exe", ["/S"], cwd=tmp_path, timeout_seconds=10, job_factory=lambda: job
+        "installer.exe",
+        ["/S"],
+        cwd=tmp_path,
+        timeout_seconds=windows_job_module._MAX_PROCESS_RUNTIME_TIMEOUT_SECONDS,
+        job_factory=lambda: job,
     )
 
     assert job.events == ["launch", "wait", "exit_code", "terminate_job", "close"]
@@ -77,7 +81,6 @@ def test_installer_helper_uses_fixed_silent_install_arguments(tmp_path: Path) ->
     result = run_installer_in_owned_job(
         installer,
         install_directory,
-        timeout_seconds=10,
         job_factory=lambda: job,
     )
 
@@ -222,13 +225,22 @@ def test_termination_waits_for_root_handle_after_job_becomes_empty(
     "termination_method", ("terminate_current", "terminate_owned_job")
 )
 @pytest.mark.parametrize(
-    "timeout_seconds", (float("inf"), float("-inf"), float("nan"), -1.0)
+    "timeout_seconds",
+    (
+        True,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        -1.0,
+        windows_job_module._MAX_JOB_TERMINATION_TIMEOUT_SECONDS + 0.01,
+        1e300,
+    ),
 )
-def test_termination_rejects_unbounded_or_negative_timeout_before_os_calls(
+def test_termination_rejects_invalid_timeout_before_os_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     termination_method: str,
-    timeout_seconds: float,
+    timeout_seconds: float | bool,
 ) -> None:
     monkeypatch.setattr(windows_job_module, "_kernel32", lambda: object())
     job = WindowsOwnedJob("Local\\invalid-timeout-job", 77)
@@ -242,6 +254,97 @@ def test_termination_rejects_unbounded_or_negative_timeout_before_os_calls(
             job.terminate_owned_job(timeout_seconds=timeout_seconds)
 
     assert job.current is None
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (
+        True,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        -1.0,
+        windows_job_module._MAX_JOB_WAIT_TIMEOUT_SECONDS + 0.01,
+        1e300,
+    ),
+)
+def test_wait_current_rejects_invalid_timeout_before_os_wait(
+    monkeypatch: pytest.MonkeyPatch, timeout_seconds: float | bool
+) -> None:
+    monkeypatch.setattr(windows_job_module, "_kernel32", lambda: object())
+    job = WindowsOwnedJob("Local\\invalid-wait-timeout-job", 77)
+    identity = windows_job_module.WindowsProcessIdentity(
+        process_id=1234,
+        image_path="C:\\CyberSentinel.exe",
+        creation_time=5678,
+        process_handle=99,
+    )
+    job.current = identity
+
+    with pytest.raises(ValueError, match="windows_job_timeout_invalid"):
+        job.wait_current(timeout_seconds)
+
+    assert job.current is identity
+
+
+def test_wait_current_accepts_the_existing_installer_timeout_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeKernel32:
+        timeout_ms: int | None = None
+
+        def WaitForSingleObject(self, handle: int, timeout_ms: int) -> int:
+            assert handle == 99
+            self.timeout_ms = timeout_ms
+            return windows_job_module._WAIT_TIMEOUT
+
+    kernel32 = FakeKernel32()
+    monkeypatch.setattr(windows_job_module, "_kernel32", lambda: kernel32)
+    job = WindowsOwnedJob("Local\\bounded-wait-timeout-job", 77)
+    job.current = windows_job_module.WindowsProcessIdentity(
+        process_id=1234,
+        image_path="C:\\CyberSentinel.exe",
+        creation_time=5678,
+        process_handle=99,
+    )
+
+    assert job.wait_current(windows_job_module._MAX_JOB_WAIT_TIMEOUT_SECONDS) is False
+    assert kernel32.timeout_ms == 600_000
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (
+        True,
+        0.0,
+        -1.0,
+        float("inf"),
+        float("nan"),
+        windows_job_module._MAX_PROCESS_RUNTIME_TIMEOUT_SECONDS + 0.01,
+        1e300,
+    ),
+)
+def test_runner_rejects_invalid_timeout_before_job_creation(
+    tmp_path: Path, timeout_seconds: float | bool
+) -> None:
+    job_factory_calls: list[str] = []
+
+    def job_factory() -> _FakeOwnedJob:
+        job_factory_calls.append("created")
+        return _FakeOwnedJob(waited=True, exit_code=0, cleanup_succeeded=True)
+
+    result = run_process_in_owned_job(
+        "installer.exe",
+        ["/S"],
+        cwd=tmp_path,
+        timeout_seconds=timeout_seconds,
+        job_factory=job_factory,
+    )
+
+    assert job_factory_calls == []
+    assert result["status"] == "launch_failed"
+    assert result["process_started"] is False
+    assert result["error_code"] == "windows_job_timeout_invalid"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
