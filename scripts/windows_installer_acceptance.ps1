@@ -32,6 +32,7 @@ $report = [ordered]@{
         interactive_user_session = $false
     }
     installer = [ordered]@{}
+    installer_process_job = [ordered]@{ status = "NOT_RUN" }
     installation = [ordered]@{}
     application_launch = [ordered]@{}
     installed_desktop_ui = [ordered]@{}
@@ -47,13 +48,12 @@ $profileRoot = Join-Path $env:RUNNER_TEMP ("cybersentinel-disposable-profile-" +
 $outputJson = Join-Path $EvidenceDirectory "installer-acceptance.json"
 $uiJson = Join-Path $EvidenceDirectory "desktop-ui-acceptance.json"
 $e2eJson = Join-Path $EvidenceDirectory "full-e2e-acceptance.json"
+$installerJobJson = Join-Path $EvidenceDirectory "installer-process-job.json"
 $e2eState = $null
 $exePath = Join-Path $installDirectory "CyberSentinel.exe"
-$applicationProcess = $null
+$uiReport = $null
 $originalAppData = $env:APPDATA
 $originalLocalAppData = $env:LOCALAPPDATA
-$originalTestUserDataDir = $env:CYBERSENTINEL_TEST_USER_DATA_DIR
-$originalAcceptanceDiagnostics = $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS
 
 function Save-Report {
     param([string]$Path, [object]$Value)
@@ -151,13 +151,30 @@ try {
     $env:APPDATA = $profileRoot
     $env:LOCALAPPDATA = Join-Path $profileRoot "Local"
     New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
-    $installerProcess = Start-Process -FilePath $InstallerPath -ArgumentList "/S /D=$installDirectory" -PassThru
-    if (-not $installerProcess.WaitForExit(600000)) {
-        Stop-Process -Id $installerProcess.Id -Force -ErrorAction SilentlyContinue
-        throw "Silent installer exceeded the 600-second bound."
+    $python = (Get-Command python -ErrorAction Stop).Source
+    $installerJobArgs = @(
+        (Join-Path $repoRoot "scripts/windows_process_job.py"),
+        "run-installer",
+        "--installer-path", $InstallerPath,
+        "--install-directory", $installDirectory,
+        "--timeout-seconds", "600",
+        "--output", $installerJobJson
+    )
+    & $python @installerJobArgs
+    $installerJobRunnerExitCode = $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath $installerJobJson -PathType Leaf)) {
+        throw "Installer Job Object execution report was not created."
     }
-    $installerProcess.Refresh()
-    $installerExitCode = $installerProcess.ExitCode
+    $installerJobReport = Get-Content -LiteralPath $installerJobJson -Raw | ConvertFrom-Json
+    $report.installer_process_job = $installerJobReport
+    if ($installerJobRunnerExitCode -ne 0 -or
+        $installerJobReport.status -ne "completed" -or
+        $installerJobReport.process_exit_code -ne 0 -or
+        $installerJobReport.job_tree_termination_verified -ne $true -or
+        $installerJobReport.job_remaining_member_count -ne 0) {
+        throw "Installer or its Job-owned process tree did not complete safely."
+    }
+    $installerExitCode = [int]$installerJobReport.process_exit_code
     $env:APPDATA = $originalAppData
     $env:LOCALAPPDATA = $originalLocalAppData
     $installDeadline = [DateTime]::UtcNow.AddSeconds(90)
@@ -186,60 +203,12 @@ try {
     }
     if ($installerExitCode -ne 0 -or -not $installed -or -not $productVersionMatches) { throw "Silent installation or normalized ProductVersion/FileVersion consistency check failed." }
 
-    $tcpListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-    $tcpListener.Start()
-    $cdpPort = [int]$tcpListener.LocalEndpoint.Port
-    $tcpListener.Stop()
-    $cdpUrl = "http://127.0.0.1:$cdpPort"
-    $env:APPDATA = $profileRoot
-    $env:LOCALAPPDATA = Join-Path $profileRoot "Local"
-    $env:CYBERSENTINEL_TEST_USER_DATA_DIR = Join-Path $profileRoot "userData"
-    $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = "1"
-    $applicationProcess = Start-Process -FilePath $exePath -ArgumentList @(
-        "--disable-gpu", "--remote-debugging-port=$cdpPort", "--remote-allow-origins=*"
-    ) -PassThru
-    $env:APPDATA = $originalAppData
-    $env:LOCALAPPDATA = $originalLocalAppData
-    $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
-    $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = $originalAcceptanceDiagnostics
-
-    $debugEndpointReady = $false
-    $debugVersion = $null
-    $launchDeadline = [DateTime]::UtcNow.AddSeconds(150)
-    while ([DateTime]::UtcNow -lt $launchDeadline) {
-        $applicationProcess.Refresh()
-        if ($applicationProcess.HasExited) { break }
-        try {
-            $debugVersion = Invoke-RestMethod -Uri "$cdpUrl/json/version" -TimeoutSec 3
-            if ($debugVersion.Browser) { $debugEndpointReady = $true; break }
-        }
-        catch { Start-Sleep -Seconds 2 }
-    }
-    Start-Sleep -Seconds 8
-    $applicationProcess.Refresh()
-    $windowHandle = if (-not $applicationProcess.HasExited) { [string]$applicationProcess.MainWindowHandle } else { "0" }
-    $windowTitle = if (-not $applicationProcess.HasExited) { $applicationProcess.MainWindowTitle } else { "" }
-    $report.application_launch = [ordered]@{
-        process_id = $applicationProcess.Id
-        process_alive_after_startup = (-not $applicationProcess.HasExited)
-        main_window_handle = $windowHandle
-        main_window_title = $windowTitle
-        cdp_endpoint_ready = $debugEndpointReady
-        cdp_browser = if ($debugVersion) { $debugVersion.Browser } else { $null }
-        startup_bound_seconds = 150
-    }
-    if ($applicationProcess.HasExited -or -not $debugEndpointReady) {
-        throw "Installed Desktop did not stay running with a reachable renderer within the 150-second bound."
-    }
-
-    $python = (Get-Command python -ErrorAction Stop).Source
     $uiArgs = @(
         (Join-Path $repoRoot "scripts/windows_desktop_acceptance.py"),
-        "--cdp-port", [string]$cdpPort,
         "--expected-version", $expectedVersion,
         "--profile-root", $profileRoot,
         "--installed-executable", $exePath,
-        "--application-pid", [string]$applicationProcess.Id,
+        "--launch-in-owned-job",
         "--mode", $Mode,
         "--output", $uiJson
     )
@@ -348,8 +317,14 @@ try {
 }
 catch {
     $report.status = "FAIL"
-    $report.error_type = $_.Exception.GetType().FullName
-    $report.error = [string]$_.Exception.Message
+    $knownErrorTypes = @(
+        "ArgumentException", "InvalidOperationException", "IOException", "UnauthorizedAccessException",
+        "TimeoutException", "WebException", "Win32Exception", "ApplicationException", "RuntimeException",
+        "FileNotFoundException", "DirectoryNotFoundException", "SecurityException", "Exception"
+    )
+    $errorType = $_.Exception.GetType().Name
+    $report.error_type = if ($knownErrorTypes -contains $errorType) { $errorType } else { "UnknownError" }
+    $report.error = "failure_details_omitted_for_secret_safety"
     if ($Mode -eq "full" -and $report.full_mission_e2e.status -eq "NOT_RUN") {
         $report.full_mission_e2e = [ordered]@{ status = "BLOCKED"; reason = "Acceptance stopped before the full mission stage." }
     }
@@ -357,36 +332,64 @@ catch {
 finally {
     $env:APPDATA = $originalAppData
     $env:LOCALAPPDATA = $originalLocalAppData
-    $env:CYBERSENTINEL_TEST_USER_DATA_DIR = $originalTestUserDataDir
-    $env:CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS = $originalAcceptanceDiagnostics
-    $initialProcessObservation = Inspect-ApplicationProcess -Process $applicationProcess
-    $restartProcessId = 0
-    if ($report.installed_desktop_ui.application_restart.current_process_id) {
-        $restartProcessId = [int]$report.installed_desktop_ui.application_restart.current_process_id
+    $uiCleanup = $report.installed_desktop_ui.cleanup
+    $ownedJobStopped = ($null -ne $uiCleanup) -and ($uiCleanup.final_job_shutdown_verified -eq $true)
+    $installerJobReport = $report.installer_process_job
+    $installerJobStopped = ($null -ne $installerJobReport) -and
+        ($installerJobReport.job_tree_termination_verified -eq $true) -and
+        ($installerJobReport.job_remaining_member_count -eq 0)
+    if ($null -ne $report.installed_desktop_ui.application_launch) {
+        $report.application_launch = $report.installed_desktop_ui.application_launch
     }
-    $report.cleanup.initial_application_process_stopped = $initialProcessObservation.exited
-    $report.cleanup.initial_application_process_alive = $initialProcessObservation.alive
-    $report.cleanup.initial_application_process_query_failed = $initialProcessObservation.query_failed
-    $report.cleanup.restarted_application_process_stopped = if ($restartProcessId -gt 0) { $false } else { $null }
+    $report.cleanup.job_object_name = if ($uiCleanup) { $uiCleanup.job_object_name } else { $null }
+    $report.cleanup.job_termination_attempted = if ($uiCleanup) { $uiCleanup.job_termination_attempted } else { $false }
+    $report.cleanup.initial_application_process_stopped = if ($uiCleanup) { $uiCleanup.root_process_stopped } else { $null }
+    $report.cleanup.initial_application_process_alive = if ($uiCleanup) { -not $uiCleanup.root_process_stopped } else { $null }
+    $report.cleanup.initial_application_process_query_failed = $false
+    $report.cleanup.restarted_application_process_stopped = if ($uiCleanup) { $uiCleanup.root_process_stopped } else { $null }
     $report.cleanup.taskkill_attempted = $false
-    $report.cleanup.process_termination_attempted = $false
-    $report.cleanup.process_tree_termination_verified = $false
-    $report.cleanup.process_tree_termination_reason = "launch_bound_job_unavailable"
-    $report.cleanup.application_process_tree_stopped = $false
-    $report.cleanup.installed_path_processes_stopped = $false
-    $report.cleanup.installed_path_process_inspection = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
+    $report.cleanup.process_termination_attempted = ($null -ne $uiCleanup) -and ($uiCleanup.job_termination_attempted -eq $true)
+    $report.cleanup.process_tree_termination_verified = $ownedJobStopped
+    $report.cleanup.process_tree_termination_reason = if ($ownedJobStopped) { "owned_job_empty_after_termination" } else { "windows_job_shutdown_unverified" }
+    $report.cleanup.process_tree_initial_member_count = if ($uiCleanup) { $uiCleanup.initial_member_count } else { $null }
+    $report.cleanup.process_tree_remaining_member_count = if ($uiCleanup) { $uiCleanup.remaining_member_count } else { $null }
+    $report.cleanup.installer_process_tree_termination_verified = $installerJobStopped
+    $report.cleanup.installer_process_tree_remaining_member_count = if ($installerJobReport) { $installerJobReport.job_remaining_member_count } else { $null }
+    $report.cleanup.application_process_tree_stopped = $ownedJobStopped
+    $report.cleanup.installed_path_processes_stopped = $ownedJobStopped
+    $report.cleanup.installed_path_process_inspection = if ($ownedJobStopped) { "OWNED_JOB_MEMBERSHIP_COUNT" } else { "NOT_VERIFIED" }
     $report.cleanup.installed_path_process_ids = $null
-    $report.cleanup.remaining_installed_process_ids = $null
+    $report.cleanup.remaining_installed_process_ids = if ($ownedJobStopped) { @() } else { $null }
     $report.cleanup.install_directory_removed = $false
-    $report.cleanup.install_directory_cleanup_status = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
+    $report.cleanup.install_directory_cleanup_status = "BLOCKED_UNTIL_OWNED_JOB_SHUTDOWN"
     $report.cleanup.disposable_profile_removed = $false
-    $report.cleanup.disposable_profile_cleanup_status = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
+    $report.cleanup.disposable_profile_cleanup_status = "BLOCKED_UNTIL_OWNED_JOB_SHUTDOWN"
     $report.cleanup.full_e2e_state_removed = ($null -eq $e2eState)
-    if ($null -ne $e2eState) {
-        $report.cleanup.full_e2e_state_cleanup_status = "NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"
+    if ($ownedJobStopped) {
+        try {
+            if (Test-Path -LiteralPath $installDirectory) {
+                Remove-Item -LiteralPath $installDirectory -Recurse -Force
+            }
+            $report.cleanup.install_directory_removed = -not (Test-Path -LiteralPath $installDirectory)
+            $report.cleanup.install_directory_cleanup_status = if ($report.cleanup.install_directory_removed) { "REMOVED_AFTER_JOB_EMPTY" } else { "REMOVAL_UNVERIFIED" }
+            if (Test-Path -LiteralPath $profileRoot) {
+                Remove-Item -LiteralPath $profileRoot -Recurse -Force
+            }
+            $report.cleanup.disposable_profile_removed = -not (Test-Path -LiteralPath $profileRoot)
+            $report.cleanup.disposable_profile_cleanup_status = if ($report.cleanup.disposable_profile_removed) { "REMOVED_AFTER_JOB_EMPTY" } else { "REMOVAL_UNVERIFIED" }
+            if ($null -ne $e2eState -and (Test-Path -LiteralPath $e2eState)) {
+                Remove-Item -LiteralPath $e2eState -Recurse -Force
+            }
+            $report.cleanup.full_e2e_state_removed = ($null -eq $e2eState) -or (-not (Test-Path -LiteralPath $e2eState))
+            $report.cleanup.full_e2e_state_cleanup_status = if ($report.cleanup.full_e2e_state_removed) { "REMOVED_AFTER_JOB_EMPTY" } else { "REMOVAL_UNVERIFIED" }
+        }
+        catch {
+            $report.cleanup.cleanup_error_type = "CleanupFailure"
+        }
     }
     if ($report.status -eq "PASS" -and
         ($report.cleanup.application_process_tree_stopped -ne $true -or
+         $report.cleanup.installer_process_tree_termination_verified -ne $true -or
          $report.cleanup.install_directory_removed -ne $true -or
          $report.cleanup.disposable_profile_removed -ne $true -or
          $report.cleanup.full_e2e_state_removed -ne $true)) {
@@ -400,4 +403,5 @@ finally {
 
 Write-Host ("Windows acceptance {0}: {1}" -f $Mode, $report.status)
 Write-Host ("Evidence: {0}" -f $outputJson)
-exit 0
+$exitCode = if ($report.status -eq "PASS") { 0 } else { 1 }
+exit $exitCode

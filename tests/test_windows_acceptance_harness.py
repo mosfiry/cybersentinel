@@ -19,7 +19,13 @@ from scripts.run_full_e2e_gate_acceptance import (
     _safe_action_names,
     find_llama_server_binary,
 )
-from scripts.acceptance_evidence import safe_acceptance_error, safe_mission_failure_snapshot
+from scripts.acceptance_evidence import (
+    safe_acceptance_error,
+    safe_exception_type,
+    safe_mission_failure_snapshot,
+    safe_opaque_identifier,
+    safe_static_code,
+)
 import scripts.windows_desktop_acceptance as windows_acceptance
 from scripts.windows_desktop_acceptance import (
     EXPECTED_QWEN3_4B_INSTALL_IDENTITY,
@@ -42,6 +48,7 @@ from scripts.windows_desktop_acceptance import (
     _mission_project_test_execution_proof,
     _model_runtime_after_restart,
     _owner_auth_after_restart,
+    _process_start_fields_match,
     _process_tree_termination_status,
     _process_tree_termination_from_alive_probe,
     _qwen_installed_digest_report,
@@ -112,8 +119,7 @@ def test_simulated_github_full_acceptance_binds_installed_executable_fingerprint
             str(tmp_path / "profile"),
             "--installed-executable",
             str(executable),
-            "--application-pid",
-            "12345",
+            "--launch-in-owned-job",
             "--mode",
             "full",
             "--output",
@@ -152,12 +158,18 @@ def _linked_project_test_snapshot(*, include_unrelated_prior: bool = False) -> t
         "record_type": "UNTRUSTED_SANDBOX_PROCESS_RESULT",
         "trust": "untrusted_data",
         "authority": "none",
-        "sandbox_backend": "bubblewrap+prlimit",
+        "sandbox_backend": "bubblewrap+prlimit+cgroup-v2",
         "network": "disabled",
         "workspace_mode": "read_only",
+        "outcome": "SUCCEEDED",
+        "reason_code": "process_exit_zero",
+        "resource_limit_reason": None,
         "exit_code": 0,
         "timed_out": False,
         "cancelled": False,
+        "process_started": True,
+        "process_id": 4242,
+        "process_started_at_utc": "2026-10-16T14:00:00+00:00",
         "output_sha256": "c" * 64,
         "artifact_refs": [],
         "artifact_capture_truncated": False,
@@ -212,13 +224,19 @@ def _linked_project_test_snapshot(*, include_unrelated_prior: bool = False) -> t
         "ok": True,
         "timed_out": False,
         "cancelled": False,
+        "outcome": "SUCCEEDED",
+        "reason_code": "process_exit_zero",
+        "resource_limit_reason": None,
         "returncode": 0,
         "output": "1 passed in 0.02s",
         "trust": "untrusted_data",
         "authority": "none",
-        "sandbox_backend": "bubblewrap+prlimit",
+        "sandbox_backend": "bubblewrap+prlimit+cgroup-v2",
         "network": "disabled",
         "workspace_mode": "read_only",
+        "process_started": True,
+        "process_id": 4242,
+        "process_started_at_utc": "2026-10-16T14:00:00+00:00",
         "artifact_refs": [],
         "artifact_capture_truncated": False,
         "evidence_ref": process_evidence_ref,
@@ -592,6 +610,11 @@ def test_status_scanner_rejects_unrecognized_scalar_values(record: dict) -> None
 )
 def test_status_scanner_allows_known_producer_values(record: dict) -> None:
     assert _contains_blocked_or_unverified_status(record) is False
+
+
+def test_status_scanner_allows_only_known_success_reason_code() -> None:
+    assert _contains_blocked_or_unverified_status({"reason_code": "process_exit_zero"}) is False
+    assert _contains_blocked_or_unverified_status({"reason_code": "unrecognized_success_code"}) is True
 
 
 @pytest.mark.parametrize("field", ["reason_code", "error_code", "code", "failure_class"])
@@ -987,6 +1010,73 @@ def test_exception_diagnostics_never_emit_exception_text_or_credentials() -> Non
     assert password not in repr(diagnostics)
 
 
+def test_acceptance_browser_and_hardware_diagnostics_exclude_raw_text() -> None:
+    canary = "acceptance-canary-secret-token"
+    renderer = f"http://user:{canary}@127.0.0.1:9443/app?token={canary}#private"
+    diagnostics = {
+        "renderer_origin_class": windows_acceptance._safe_renderer_origin_class(renderer),
+        "hardware": windows_acceptance._safe_hardware_diagnostics(f"Device details {canary}"),
+        "invalid_login_error_code": safe_static_code("error_code", canary),
+    }
+
+    serialized = json.dumps(diagnostics)
+    source = Path(windows_acceptance.__file__).read_text(encoding="utf-8")
+    assert diagnostics["renderer_origin_class"] == "invalid"
+    assert diagnostics["hardware"]["detected"] is True
+    assert diagnostics["hardware"]["text_sha256"] == hashlib.sha256(
+        f"Device details {canary}".encode("utf-8")
+    ).hexdigest()
+    assert diagnostics["invalid_login_error_code"] is None
+    assert canary not in serialized
+    assert "display_text" not in serialized
+    assert '"renderer_url": page.url' not in source
+    assert '"display_text": hardware_text' not in source
+    assert '"invalid_login_error": invalid_body.get("error")' not in source
+    assert '"renderer_origin_class": _safe_renderer_origin_class(page.url)' in source
+    assert 'report["hardware"] = _safe_hardware_diagnostics(hardware_text)' in source
+    assert '"invalid_login_error_code": _safe_static_code("error_code", invalid_body.get("error"))' in source
+    assert windows_acceptance._safe_renderer_origin_class("http://127.0.0.1:9443/app") == "loopback"
+    assert windows_acceptance._safe_renderer_origin_class("https://example.invalid/app") == "non_loopback"
+
+
+def test_acceptance_report_writer_atomically_replaces_complete_json(tmp_path: Path, monkeypatch) -> None:
+    report_path = tmp_path / "acceptance.json"
+    report_path.write_text('{"old": true}\n', encoding="utf-8")
+
+    windows_acceptance._write_json_atomically(report_path, {"status": "PASS", "complete": True})
+
+    assert json.loads(report_path.read_text(encoding="utf-8")) == {"status": "PASS", "complete": True}
+    assert list(tmp_path.glob(".acceptance.json.*.tmp")) == []
+
+    original = report_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(windows_acceptance.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("blocked")))
+    with pytest.raises(OSError):
+        windows_acceptance._write_json_atomically(report_path, {"status": "FAIL"})
+    assert report_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".acceptance.json.*.tmp")) == []
+
+
+def test_model_manager_operation_error_is_allowlisted_before_progress_serialization(monkeypatch) -> None:
+    canary = "Bearer acceptance-canary-token-value"
+    progress: list[dict] = []
+    monkeypatch.setattr(
+        windows_acceptance,
+        "_model_state",
+        lambda _page: {"manager": {"operation": {"status": "failed", "kind": "download", "error": canary}}},
+    )
+    monkeypatch.setattr(windows_acceptance, "_find_qwen", lambda _state: None)
+
+    with pytest.raises(RuntimeError, match="^model_manager_operation_failed$"):
+        windows_acceptance._wait_for_model(
+            object(), lambda *_args: False, timeout=10, phase="model_download", progress=progress
+        )
+
+    assert len(progress) == 1
+    assert progress[0]["error_code"] == "unclassified_model_manager_error"
+    assert canary not in json.dumps(progress)
+    assert windows_acceptance._safe_model_manager_error_code("backend_unavailable") == "backend_unavailable"
+
+
 def test_tool_result_summary_reads_nested_model_loop_and_redacts_payloads() -> None:
     summary, source = _safe_tool_result_summary({
         "progress": {"model_loop": {"tool_results": [{
@@ -1037,7 +1127,8 @@ def test_tool_result_summary_keeps_sandbox_start_and_outcome_metadata() -> None:
             "result": {
                 "outcome": "CANCELLED",
                 "reason_code": "process_cancelled",
-                "sandbox_backend": "bubblewrap+prlimit",
+                "sandbox_backend": "bubblewrap+prlimit+cgroup-v2",
+                "resource_limit_reason": None,
                 "process_started": True,
                 "process_id": 4242,
                 "process_started_at_utc": "2026-10-16T14:00:00+00:00",
@@ -1053,12 +1144,65 @@ def test_tool_result_summary_keeps_sandbox_start_and_outcome_metadata() -> None:
         "tool_call_id": "call_42",
         "outcome": "CANCELLED",
         "reason_code": "process_cancelled",
-        "sandbox_backend": "bubblewrap+prlimit",
+        "sandbox_backend": "bubblewrap+prlimit+cgroup-v2",
         "process_started": True,
         "process_id": 4242,
         "process_started_at_utc": "2026-10-16T14:00:00+00:00",
     }]
     assert "untrusted output" not in repr(summary)
+
+
+def test_acceptance_rejects_tool_executed_without_backend_process_start_identity() -> None:
+    mission_id, snapshot = _linked_project_test_snapshot()
+    status = snapshot["status"]
+    result = status["progress"]["model_loop"]["tool_results"][0]["result"]
+    process_payload = snapshot["report"]["evidence"]["execution_chain"][0]["evidence"]
+    assert _process_start_fields_match(process_payload, result) is windows_acceptance.sys.platform.startswith("linux")
+
+    missing_pid = dict(result)
+    missing_pid.pop("process_id")
+    mismatched_time = {**result, "process_started_at_utc": "2026-10-16T14:01:00+00:00"}
+    untrusted_backend = {**result, "sandbox_backend": "bubblewrap+prlimit"}
+    not_started = {**result, "process_started": False}
+    for candidate in (missing_pid, mismatched_time, untrusted_backend, not_started):
+        assert _process_start_fields_match(process_payload, candidate) is False
+
+    result["process_started"] = False
+    proof = _mission_project_test_execution_proof(
+        status, snapshot["timeline"], snapshot["evidence"],
+        snapshot["report"]["evidence"]["goal"],
+        snapshot["report"]["evidence"]["execution_chain"],
+        mission_id, "request-acceptance-1",
+        snapshot["report"]["evidence"]["execution_chain_integrity"],
+        full_execution_chain=snapshot["full_execution_chain"],
+    )
+    assert proof["tool_executed_event_count"] == 1
+    assert proof["actual_process_start_verified"] is False
+    assert proof["verified"] is False
+
+
+def test_acceptance_rejects_unimplemented_windows_sandbox_backend(monkeypatch) -> None:
+    mission_id, snapshot = _linked_project_test_snapshot()
+    status = snapshot["status"]
+    result = status["progress"]["model_loop"]["tool_results"][0]["result"]
+    process_payload = snapshot["report"]["evidence"]["execution_chain"][0]["evidence"]
+    monkeypatch.setattr(windows_acceptance, "sys", SimpleNamespace(platform="win32"))
+
+    for backend in ("windows-appcontainer-job", "bubblewrap+prlimit+cgroup-v2"):
+        result["sandbox_backend"] = backend
+        process_payload["sandbox_backend"] = backend
+        assert _process_start_fields_match(process_payload, result) is False
+
+    proof = _mission_project_test_execution_proof(
+        status, snapshot["timeline"], snapshot["evidence"],
+        snapshot["report"]["evidence"]["goal"],
+        snapshot["report"]["evidence"]["execution_chain"],
+        mission_id, "request-acceptance-1",
+        snapshot["report"]["evidence"]["execution_chain_integrity"],
+        full_execution_chain=snapshot["full_execution_chain"],
+    )
+    assert proof["actual_process_start_verified"] is False
+    assert proof["verified"] is False
 
 
 def test_mission_event_trace_preserves_order_codes_and_hash_but_redacts_free_text() -> None:
@@ -1106,6 +1250,34 @@ def test_mission_event_trace_preserves_order_codes_and_hash_but_redacts_free_tex
         }),
     }]
     assert "private diagnostic text" not in repr(trace)
+    assert "raw-secret-token" not in repr(trace)
+
+
+def test_mission_event_trace_keeps_safe_process_start_metadata_and_raw_payload_digest() -> None:
+    raw_data = {
+        "phase": "process-started",
+        "process_started": True,
+        "sandbox_backend": "bubblewrap+prlimit+cgroup-v2",
+        "process_id": 4242,
+        "started_at_utc": "2026-10-16T14:00:00+00:00",
+        "reason_code": "process_exit_zero",
+        "resource_limit_reason": "memory_max",
+        "token": "raw-secret-token",
+    }
+    trace, _truncated = _safe_mission_event_trace([{
+        "sequence": 9, "event": "ToolCalled", "data": raw_data,
+    }])
+
+    assert trace[0]["data"] == {
+        "process_started": True,
+        "sandbox_backend": "bubblewrap+prlimit+cgroup-v2",
+        "process_id": 4242,
+        "started_at_utc": "2026-10-16T14:00:00+00:00",
+        "reason_code": "process_exit_zero",
+        "resource_limit_reason": "memory_max",
+    }
+    assert trace[0]["raw_data_available"] is True
+    assert trace[0]["raw_data_sha256"] == _canonical_sha256(raw_data)
     assert "raw-secret-token" not in repr(trace)
 
 
@@ -1169,6 +1341,42 @@ def test_safe_acceptance_error_keeps_machine_codes_and_redacts_arbitrary_text() 
         RuntimeError("integrated_mission_did_not_reach_goal_completed:RESOURCE_BLOCKED")
     ) == "integrated_mission_did_not_reach_goal_completed:RESOURCE_BLOCKED"
     assert safe_acceptance_error(RuntimeError("private token=do-not-export")) == "failure_details_omitted_for_secret_safety"
+    assert safe_acceptance_error(RuntimeError("sk_test_51CompactSecretValue")) == "failure_details_omitted_for_secret_safety"
+
+
+def test_acceptance_evidence_allowlists_drop_compact_token_shaped_codes_and_ids() -> None:
+    token = "sk_test_" + "51CompactSecretValue"
+    github_token = "github_pat_" + "CompactSecretValue123"
+    assert safe_opaque_identifier(token) is None
+    assert safe_static_code("reason_code", "process_exit_zero") == "process_exit_zero"
+    assert safe_static_code("reason_code", "cgroup_memory_limit") == "cgroup_memory_limit"
+    assert safe_static_code("resource_limit_reason", "cgroup_process_count_limit") == "cgroup_process_count_limit"
+    assert safe_static_code("detail_code", "cgroup_resource_event_attribution_unavailable") == "cgroup_resource_event_attribution_unavailable"
+    assert safe_static_code("reason_code", token) is None
+    assert safe_exception_type(token) == "UnknownError"
+    trace, _truncated = _safe_mission_event_trace([{
+        "sequence": 1,
+        "event": "ToolCalled",
+        "mission_id": token,
+        "request_id": "request-safe-1",
+        "data": {
+            "kind": "PROCESS_SANDBOX_UNAVAILABLE",
+            "reason_code": token,
+            "detail_code": github_token,
+            "tool_call_id": "ghp_" + "CompactSecretValue123456789",
+        },
+    }])
+
+    assert trace[0]["event"] == "ToolCalled"
+    assert "mission_id" not in trace[0]
+    assert trace[0]["request_id"] == "request-safe-1"
+    assert trace[0]["data"] == {"kind": "PROCESS_SANDBOX_UNAVAILABLE"}
+    assert token not in repr(trace)
+    assert github_token not in repr(trace)
+    summary, _source = _safe_tool_result_summary({
+        "tool_results": [{"name": token, "error": token, "result": {"reason_code": token}}]
+    })
+    assert summary == []
 
 
 def test_early_restart_failure_projection_keeps_safe_timeline_and_chain_digests() -> None:
@@ -2818,6 +3026,7 @@ def test_mission_audit_projection_requires_mission_bound_validation_evidence_and
     assert projection["project_test_evidence_source_verified"] is True
     assert projection["project_test_evidence_sources"] == ["sandboxed-process:run_project_tests"]
     assert projection["project_test_execution_proof"]["exactly_one_actual_execution_verified"] is True
+    assert projection["project_test_execution_proof"]["actual_process_start_verified"] is True
     assert projection["project_test_execution_proof"]["sandbox_process_evidence_record_count"] == 1
     assert projection["project_test_execution_proof"]["native_tool_result_record_count"] == 1
     assert projection["project_test_execution_proof"]["linked_result_record_count"] == 1
@@ -3142,29 +3351,60 @@ def test_non_scalar_tool_executed_status_fails_closed() -> None:
     assert proof["unaccounted_tool_executed_event_count"] == 1
 
 
-def test_acceptance_restart_fails_closed_without_launch_bound_tree_termination() -> None:
+def test_acceptance_restart_uses_owned_windows_job_and_never_pid_sweep() -> None:
     driver = (ROOT / "scripts" / "windows_desktop_acceptance.py").read_text(encoding="utf-8")
     powershell = (ROOT / "scripts" / "windows_installer_acceptance.ps1").read_text(encoding="utf-8")
+    job_module = (ROOT / "scripts" / "windows_process_job.py").read_text(encoding="utf-8")
 
     assert "launch_bound_process_identity_unavailable" in driver
     assert "taskkill.exe\", \"/PID\", str(process_id), \"/T\", \"/F\"" not in driver
     assert "--installed-executable" in powershell
-    assert "--application-pid" in powershell
+    assert "--launch-in-owned-job" in powershell
+    assert "Start-Process -FilePath $exePath" not in powershell
     assert "installed_executable_fingerprint_unavailable" in driver
     assert "source_commit_identity_unavailable" in driver
     assert "process_tree_termination_verified" in driver
     assert "initial_application_process_not_running_from_installed_path" in driver
-    assert "--mode full requires --installed-executable and --application-pid" in driver
+    assert "--mode full requires --installed-executable and --launch-in-owned-job" in driver
     assert '"renderer_reload_used": False' in driver
     assert "page.reload(" not in driver
-    assert "Inspect-ApplicationProcess" in powershell
     assert "taskkill.exe" not in powershell
     assert "Get-CimInstance" not in powershell
     assert "Stop-InstalledProcessTrees" not in powershell
     assert '$report.cleanup.taskkill_attempted = $false' in powershell
-    assert '$report.cleanup.process_tree_termination_verified = $false' in powershell
-    assert '"launch_bound_job_unavailable"' in powershell
-    assert '"NOT_ATTEMPTED_NO_LAUNCH_BOUND_JOB"' in powershell
+    assert "$report.cleanup.process_tree_termination_verified = $ownedJobStopped" in powershell
+    assert "if ($ownedJobStopped)" in powershell
+    for api in (
+        "CreateProcessW", "AssignProcessToJobObject", "ResumeThread",
+        "TerminateJobObject", "IsProcessInJob", "GetProcessTimes",
+        "QueryInformationJobObject",
+    ):
+        assert api in job_module
+    assert "_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in job_module
+    assert "_CREATE_SUSPENDED" in job_module
+
+
+def test_installer_is_started_and_cleaned_up_inside_its_owned_job() -> None:
+    powershell = (ROOT / "scripts" / "windows_installer_acceptance.ps1").read_text(encoding="utf-8")
+    job_module = (ROOT / "scripts" / "windows_process_job.py").read_text(encoding="utf-8")
+
+    assert '"run-installer"' in powershell
+    assert "windows_process_job.py" in powershell
+    assert "Start-Process -FilePath $InstallerPath" not in powershell
+    assert "Stop-Process -Id $installerProcess.Id" not in powershell
+    assert "job_tree_termination_verified" in powershell
+    assert "installer_process_tree_termination_verified" in powershell
+    assert "def run_installer_in_owned_job(" in job_module
+    assert "def run_process_in_owned_job(" in job_module
+    assert "GetExitCodeProcess" in job_module
+
+
+def test_windows_acceptance_script_returns_failure_exit_code_for_non_pass_status() -> None:
+    powershell = (ROOT / "scripts" / "windows_installer_acceptance.ps1").read_text(encoding="utf-8")
+
+    assert '$exitCode = if ($report.status -eq "PASS") { 0 } else { 1 }' in powershell
+    assert "exit $exitCode" in powershell
+    assert "exit 0" not in powershell
 
 
 def test_checkpoint_diagnostics_expose_only_safe_budget_metadata() -> None:

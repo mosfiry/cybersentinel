@@ -13,9 +13,11 @@ import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +33,13 @@ from agent.evidence import verify_chain as _verify_evidence_chain
 from agent.mission import Mission as _Mission
 from agent.reporting import build_mission_report as _build_mission_report
 from agent.trajectory import EventType as _TrajectoryEventType, verify_trajectory as _verify_trajectory
-from scripts.acceptance_evidence import safe_mission_event_trace as _safe_mission_event_trace
+from scripts.acceptance_evidence import (
+    safe_exception_type as _safe_exception_type,
+    safe_mission_event_trace as _safe_mission_event_trace,
+    safe_opaque_identifier as _safe_opaque_identifier,
+    safe_static_code as _safe_static_code,
+)
+from scripts.windows_process_job import WindowsOwnedJob
 
 # This is only the harness's HTTP-response wait; AgentCore remains bounded by the
 # 300-second Owner mission limit, with a 30-second response-finalization margin.
@@ -66,6 +74,51 @@ def _sha256(value: bytes | str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _safe_renderer_origin_class(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 4096:
+        return "unavailable"
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port
+    except (ValueError, AttributeError):
+        return "invalid"
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        return "invalid"
+    if parsed.username is not None or parsed.password is not None:
+        return "invalid"
+    if hostname.lower() in {"localhost", "127.0.0.1", "::1"}:
+        return "loopback"
+    return "non_loopback"
+
+
+def _safe_hardware_diagnostics(value: object) -> dict[str, object]:
+    text = value if isinstance(value, str) else ""
+    return {
+        "detected": bool(text and "جارٍ فحص" not in text),
+        "text_length": len(text),
+        "text_sha256": _sha256(text),
+    }
+
+
+def _write_json_atomically(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary_path = stream.name
+            stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -74,8 +127,44 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-_SAFE_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,79}\Z")
-_SAFE_MACHINE_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]{0,127}\Z")
+_LINUX_PROCESS_SANDBOX_BACKEND = "bubblewrap+prlimit+cgroup-v2"
+
+
+def _process_sandbox_backend_supported(backend: object) -> bool:
+    # The Windows backend intentionally remains blocked until its real native
+    # isolation has been implemented and verified on Windows.
+    return sys.platform.startswith("linux") and backend == _LINUX_PROCESS_SANDBOX_BACKEND
+
+
+def _normalized_utc_timestamp(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > 80:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _process_start_fields_match(process_payload: object, result: object) -> bool:
+    if not isinstance(process_payload, dict) or not isinstance(result, dict):
+        return False
+    process_id = process_payload.get("process_id")
+    result_process_id = result.get("process_id")
+    process_started_at = _normalized_utc_timestamp(process_payload.get("process_started_at_utc"))
+    result_started_at = _normalized_utc_timestamp(result.get("process_started_at_utc"))
+    backend = process_payload.get("sandbox_backend")
+    return (
+        process_payload.get("process_started") is True
+        and result.get("process_started") is True
+        and type(process_id) is int and 0 < process_id <= 2_147_483_647
+        and type(result_process_id) is int and result_process_id == process_id
+        and process_started_at is not None and result_started_at == process_started_at
+        and _process_sandbox_backend_supported(backend)
+        and result.get("sandbox_backend") == backend
+    )
 
 
 def _safe_failure_reason_code(value: object) -> str | None:
@@ -88,6 +177,12 @@ def _safe_failure_reason_code(value: object) -> str | None:
     if value.startswith("mission runtime budget exceeded: "):
         return "mission_runtime_budget_exceeded"
     return None
+
+
+def _safe_model_manager_error_code(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    return _safe_static_code("error_code", value) or "unclassified_model_manager_error"
 
 
 def _verify_durable_execution_chain(records: object) -> bool:
@@ -166,22 +261,24 @@ def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
             summary.append({"name": "<invalid_action_name>", "ok": None})
             continue
         raw_name = item.get("name")
-        name = raw_name if isinstance(raw_name, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(raw_name) else "<invalid_action_name>"
+        name = _safe_static_code("name", raw_name) or "<invalid_action_name>"
         safe_item = {"name": name, "ok": item.get("ok") if isinstance(item.get("ok"), bool) else None}
         call_id = item.get("tool_call_id")
-        if isinstance(call_id, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(call_id):
-            safe_item["tool_call_id"] = call_id
+        safe_call_id = _safe_opaque_identifier(call_id)
+        if safe_call_id is not None:
+            safe_item["tool_call_id"] = safe_call_id
         error_code = _safe_failure_reason_code(item.get("error"))
         if error_code:
             safe_item["error_code"] = error_code
         result = item.get("result")
         if isinstance(result, dict):
             for key in (
-                "failure_class", "reason_code", "code", "kind", "outcome", "sandbox_backend",
+                "failure_class", "reason_code", "resource_limit_reason", "code", "kind", "outcome", "sandbox_backend",
             ):
                 value = result.get(key)
-                if isinstance(value, str) and _SAFE_MACHINE_CODE.fullmatch(value):
-                    safe_item[key] = value
+                safe_code = _safe_static_code(key, value)
+                if safe_code is not None:
+                    safe_item[key] = safe_code
             if type(result.get("process_started")) is bool:
                 safe_item["process_started"] = result["process_started"]
             process_id = result.get("process_id")
@@ -195,8 +292,8 @@ def _safe_tool_result_summary(mission_state: dict) -> tuple[list[dict], str]:
                         safe_item["process_started_at_utc"] = parsed_started_at.astimezone(timezone.utc).isoformat()
                 except ValueError:
                     pass
-            exception_type = result.get("exception")
-            if isinstance(exception_type, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(exception_type):
+            exception_type = _safe_exception_type(result.get("exception", ""))
+            if exception_type != "UnknownError":
                 safe_item["exception_type"] = exception_type
         summary.append(safe_item)
     return summary, source
@@ -215,18 +312,20 @@ def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
                 continue
             step_id = step.get("step_id")
             action = step.get("action")
-            if isinstance(step_id, str) and step_id and isinstance(action, str) and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(action):
+            if _safe_opaque_identifier(step_id) is not None and _safe_static_code("name", action) is not None:
                 step_actions[step_id] = (index, action)
     summary = []
     for failure in failures[-5:]:
         if not isinstance(failure, dict):
             continue
         item = {
-            key: value
-            for key in ("class", "budget", "kind", "reason_code", "recovery")
-            if isinstance((value := failure.get(key)), str)
-            and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value)
+            key: safe_code
+            for key in ("class", "kind", "reason_code", "recovery")
+            if (safe_code := _safe_static_code(key, failure.get(key))) is not None
         }
+        budget = _safe_static_code("budget", failure.get("budget"))
+        if budget is not None:
+            item["budget"] = budget
         limit = failure.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= 1_000_000_000:
             item["limit"] = limit
@@ -244,7 +343,7 @@ def _safe_failure_diagnostics(mission_state: dict) -> list[dict]:
 def _safe_exception_diagnostics(exc: BaseException) -> dict[str, str]:
     """Omit exception text because it may contain credentials or submitted form data."""
     return {
-        "error_type": type(exc).__name__,
+        "error_type": _safe_exception_type(exc),
         "error": "failure details omitted for secret safety",
     }
 
@@ -254,11 +353,13 @@ def _safe_checkpoint_diagnostics(mission_state: dict) -> dict:
     if not isinstance(checkpoint, dict):
         return {}
     summary = {
-        key: value
-        for key in ("status", "budget", "reason_code", "recovery")
-        if isinstance((value := checkpoint.get(key)), str)
-        and _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(value)
+        key: safe_code
+        for key in ("status", "reason_code", "recovery")
+        if (safe_code := _safe_static_code(key, checkpoint.get(key))) is not None
     }
+    budget = _safe_static_code("budget", checkpoint.get("budget"))
+    if budget is not None:
+        summary["budget"] = budget
     limit = checkpoint.get("limit")
     if isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= 1_000_000_000:
         summary["limit"] = limit
@@ -540,6 +641,7 @@ _STATUS_FAILURE_PHRASE_PREFIXES = (_UNVERIFIED_STATUS_VALUES - frozenset({"ERROR
     "EXECUTION_FAILED", "AUTHORIZATION_DENIED", "SCOPE_DENIED", "ERROR_OCCURRED",
     "ERROR_DETECTED", "ERROR_ENCOUNTERED", "ERROR_DURING", "ERROR_WHILE",
 })
+_SAFE_SUCCESS_REASON_CODES = frozenset({"PROCESS_EXIT_ZERO", "SUCCESS", "NONE", "NO_FAILURE"})
 
 
 def _canonical_report_body_sha256(report: dict) -> str:
@@ -708,7 +810,9 @@ def _contains_blocked_or_unverified_status(value: object) -> bool:
             if field in _BLOCKED_STATUS_FIELDS:
                 if isinstance(child, str):
                     normalized = child.strip().upper().replace("-", "_").replace(" ", "_")
-                    if field in {"reason_code", "error_code", "code", "failure_class"} and normalized:
+                    if field in {"error_code", "code", "failure_class"} and normalized:
+                        return True
+                    if field == "reason_code" and normalized and normalized not in _SAFE_SUCCESS_REASON_CODES:
                         return True
                     if (
                         normalized in _UNVERIFIED_STATUS_VALUES
@@ -827,10 +931,8 @@ def _durable_tool_result_linkage(record: object, mission_id: str, request_id: st
     result = record.get("result")
     error = record.get("error")
     if (
-        not isinstance(name, str)
-        or _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(name) is None
-        or not isinstance(call_id, str)
-        or _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(call_id) is None
+        _safe_static_code("name", name) is None
+        or _safe_opaque_identifier(call_id) is None
         or not isinstance(raw_action_id, str)
         or not isinstance(raw_step_id, str)
         or type(record.get("ok")) is not bool
@@ -1285,17 +1387,24 @@ def _mission_project_test_execution_proof(
         if not isinstance(process_payload, dict) or not isinstance(native_payload, dict) or digest is None:
             continue
         digest_sha256, digest_bytes = digest
+        process_start_verified = _process_start_fields_match(process_payload, result)
         process_payload_valid = (
             process_payload.get("record_type") == "UNTRUSTED_SANDBOX_PROCESS_RESULT"
             and process_payload.get("trust") == "untrusted_data"
             and process_payload.get("authority") == "none"
-            and process_payload.get("sandbox_backend") == "bubblewrap+prlimit"
+            and _process_sandbox_backend_supported(process_payload.get("sandbox_backend"))
             and process_payload.get("network") == "disabled"
             and process_payload.get("workspace_mode") == "read_only"
+            and process_start_verified
+            and process_payload.get("outcome") == "SUCCEEDED"
+            and process_payload.get("reason_code") == "process_exit_zero"
+            and "resource_limit_reason" in process_payload
+            and process_payload.get("resource_limit_reason") is None
             and type(process_payload.get("exit_code")) is int
             and process_payload.get("exit_code") == 0
             and process_payload.get("timed_out") is False
             and process_payload.get("cancelled") is False
+            and process_payload.get("resource_limit_reason") is None
             and re.fullmatch(r"[0-9a-f]{64}", str(process_payload.get("output_sha256", ""))) is not None
             and isinstance(process_payload.get("artifact_refs"), list)
             and isinstance(process_payload.get("artifact_capture_truncated"), bool)
@@ -1322,7 +1431,12 @@ def _mission_project_test_execution_proof(
             and result.get("returncode") == 0
             and result.get("timed_out") is False
             and result.get("cancelled") is False
-            and result.get("sandbox_backend") == "bubblewrap+prlimit"
+            and result.get("outcome") == "SUCCEEDED"
+            and result.get("reason_code") == "process_exit_zero"
+            and "resource_limit_reason" in result
+            and result.get("resource_limit_reason") is None
+            and _process_sandbox_backend_supported(result.get("sandbox_backend"))
+            and process_start_verified
             and result.get("network") == "disabled"
             and result.get("workspace_mode") == "read_only"
             and result.get("trust") == "untrusted_data"
@@ -1441,7 +1555,11 @@ def _mission_project_test_execution_proof(
             for item in (*process_records, *native_records)
         ),
         "sandbox_record_type": "UNTRUSTED_SANDBOX_PROCESS_RESULT" if verified else None,
-        "sandbox_backend": "bubblewrap+prlimit" if verified else None,
+        "sandbox_backend": (
+            verified_candidates[0]["process_record"].get("evidence", {}).get("sandbox_backend")
+            if verified else None
+        ),
+        "actual_process_start_verified": bool(verified and verified_candidates),
         "network": "disabled" if verified else None,
         "workspace_mode": "read_only" if verified else None,
         "successful_exit_code": 0 if verified else None,
@@ -1994,8 +2112,27 @@ def _cdp_version(port: int) -> dict | None:
         return None
 
 
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _wait_for_cdp(port: int, timeout_seconds: float = 150.0) -> dict | None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        value = _cdp_version(port)
+        if value is not None:
+            return value
+        time.sleep(0.5)
+    return None
+
+
 def _terminate_installed_process_tree(
-    process_id: int, cdp_port: int, installed_executable: Path
+    process_id: int,
+    cdp_port: int,
+    installed_executable: Path,
+    process_job: WindowsOwnedJob | None = None,
 ) -> dict:
     if os.name != "nt":
         raise RuntimeError("native_windows_process_restart_required")
@@ -2015,6 +2152,48 @@ def _terminate_installed_process_tree(
             "old_cdp_endpoint_unavailable": None,
             "installed_process_identity_verified": False,
             "termination_refusal_reason": reason,
+        }
+
+    if process_job is not None:
+        try:
+            job_result = process_job.terminate_current(
+                process_id, installed_executable,
+                timeout_seconds=APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return refuse_termination("windows_job_identity_or_termination_failed")
+        cdp_deadline = time.monotonic() + APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS
+        cdp_endpoint_unavailable = False
+        while time.monotonic() < cdp_deadline:
+            if _cdp_version(cdp_port) is None:
+                cdp_endpoint_unavailable = True
+                break
+            time.sleep(0.1)
+        remaining = job_result.get("remaining_member_count")
+        tree_stopped = (
+            job_result.get("identity_verified") is True
+            and job_result.get("termination_succeeded") is True
+            and remaining == 0
+            and cdp_endpoint_unavailable
+        )
+        return {
+            "taskkill_attempted": False,
+            "taskkill_succeeded": False,
+            "taskkill_exit_code": None,
+            "taskkill_error_type": None,
+            "process_termination_attempted": True,
+            "job_object_name": job_result.get("job_name"),
+            "job_termination_attempted": True,
+            "job_termination_succeeded": job_result.get("termination_succeeded") is True,
+            "process_tree_termination_status": "VERIFIED" if tree_stopped else "NOT_VERIFIED",
+            "process_tree_termination_verified": tree_stopped,
+            "process_tree_initial_member_count": job_result.get("initial_member_count"),
+            "process_tree_remaining_member_count": remaining,
+            "descendant_termination_verified": remaining == 0,
+            "process_id_stopped": job_result.get("root_process_stopped"),
+            "old_cdp_endpoint_unavailable": cdp_endpoint_unavailable,
+            "installed_process_identity_verified": job_result.get("identity_verified") is True,
+            "termination_refusal_reason": None if tree_stopped else "windows_job_tree_termination_unverified",
         }
 
     before_snapshot = _windows_process_snapshot()
@@ -2062,9 +2241,17 @@ def _terminate_installed_process_tree(
         _release_pinned_windows_process_tree(pinned_tree)
 
 
-def _launch_installed_application(executable: Path, profile_root: Path, cdp_port: int) -> subprocess.Popen:
+def _launch_installed_application(
+    executable: Path,
+    profile_root: Path,
+    cdp_port: int,
+    *,
+    process_job: WindowsOwnedJob | None = None,
+):
     if os.name != "nt":
         raise RuntimeError("native_windows_process_restart_required")
+    if process_job is None:
+        raise RuntimeError("launch_bound_job_unavailable")
     executable = executable.expanduser().resolve(strict=True)
     user_data = profile_root.expanduser().resolve() / "userData"
     appdata = profile_root.expanduser().resolve()
@@ -2078,21 +2265,15 @@ def _launch_installed_application(executable: Path, profile_root: Path, cdp_port
         "CYBERSENTINEL_TEST_USER_DATA_DIR": str(user_data),
         "CYBERSENTINEL_ACCEPTANCE_DIAGNOSTICS": "1",
     })
-    creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    return subprocess.Popen(
+    return process_job.launch(
+        executable,
         [
-            str(executable),
             "--disable-gpu",
             f"--remote-debugging-port={cdp_port}",
             "--remote-allow-origins=*",
         ],
-        cwd=str(executable.parent),
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        creationflags=creation_flags,
+        cwd=executable.parent,
+        environment=environment,
     )
 
 
@@ -2124,7 +2305,7 @@ def _connect_to_relaunched_application(playwright, cdp_port: int, expected_versi
                         return browser, page, cdp, health
                     last_error = "relaunch_health_or_version_mismatch"
             except Exception as exc:
-                last_error = type(exc).__name__
+                last_error = _safe_exception_type(exc)
             if browser is not None:
                 try:
                     browser.close()
@@ -2168,7 +2349,7 @@ def _installed_runtime_binary_evidence(executable: Path) -> dict:
         if match:
             result["version"] = match.group(1)
     except Exception as exc:
-        result["version_command_error_type"] = type(exc).__name__
+        result["version_command_error_type"] = _safe_exception_type(exc)
     return result
 
 
@@ -2271,7 +2452,7 @@ def _owner_auth_after_restart(
             "valid_login_error_code": ui_login.get("error_code"),
         })
     except Exception as exc:
-        result["error_type"] = type(exc).__name__
+        result["error_type"] = _safe_exception_type(exc)
     result["status"] = "PASS" if all(
         result.get(key) is True for key in (
             "invalid_credentials_rejected", "invalid_login_authorization_state_unchanged",
@@ -2402,9 +2583,7 @@ def _login_owner_after_restart(page, username: str, password: str) -> dict:
             "credentials_submitted": credentials_submitted,
             "submitted_username_matches": submitted_username_matches,
             "submitted_password_matches": submitted_password_matches,
-            "error_code": error_code
-            if isinstance(error_code, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,79}", error_code)
-            else None,
+            "error_code": _safe_static_code("error_code", error_code),
         }
     except Exception as exc:
         return {
@@ -2413,7 +2592,7 @@ def _login_owner_after_restart(page, username: str, password: str) -> dict:
             "credentials_submitted": credentials_submitted,
             "submitted_username_matches": submitted_username_matches,
             "submitted_password_matches": submitted_password_matches,
-            "error_type": type(exc).__name__,
+            "error_type": _safe_exception_type(exc),
         }
 
 
@@ -2443,7 +2622,7 @@ def _model_runtime_after_restart(page, executable: Path, progress: list[dict], *
                 progress=progress,
             )
         except Exception as exc:
-            result["restore_error_type"] = type(exc).__name__
+            result["restore_error_type"] = _safe_exception_type(exc)
             state = _model_state(page)
         qwen = _find_qwen(state)
         manager = state.get("manager") if isinstance(state.get("manager"), dict) else {}
@@ -2519,7 +2698,7 @@ def _model_runtime_after_restart(page, executable: Path, progress: list[dict], *
             result["inference_after_restart"] = {"status": "NOT_RUN", "reason": "verified_on_first_restart_cycle"}
         result["status"] = "PASS" if ready and result["inference_after_restart"]["status"] in ("PASS", "NOT_RUN") else "FAIL"
     except Exception as exc:
-        result["error_type"] = type(exc).__name__
+        result["error_type"] = _safe_exception_type(exc)
         result["status"] = "FAIL"
     return result
 
@@ -2613,7 +2792,7 @@ _STATUS_GENERIC_VALUES = (
 _STATUS_SCALAR_ALLOWLISTS = {
     "status": _STATUS_GENERIC_VALUES,
     "mission_status": _REPORT_MISSION_STATUSES,
-    "outcome": _REPORT_OUTCOMES,
+    "outcome": _REPORT_OUTCOMES | frozenset({"SUCCEEDED"}),
     "state": _STATUS_GENERIC_VALUES,
     "result_status": _STATUS_GENERIC_VALUES,
     "verification": _REPORT_GOAL_VERIFICATION_STATUSES
@@ -3565,14 +3744,15 @@ def _installed_app_mission(
     project_response = project_response_info.value
     project_body = project_response.json()
     project = project_body.get("project") if isinstance(project_body, dict) else None
-    project_id = str(project.get("project_id", "")) if isinstance(project, dict) else ""
+    project_id_raw = project.get("project_id", "") if isinstance(project, dict) else ""
+    project_id = _safe_opaque_identifier(project_id_raw) or ""
     response_error = project_body.get("error") if isinstance(project_body, dict) else None
     progress.append({
         "phase": "installed_app_project_creation_response",
         "http_status": project_response.status,
         "response_ok": project_body.get("ok") is True if isinstance(project_body, dict) else False,
         "project_id_present": bool(project_id),
-        "error_code": str(response_error)[:96] if response_error is not None else "",
+        "error_code": _safe_static_code("error_code", response_error) or "",
     })
     if project_response.status != 201 or not project_id:
         raise RuntimeError("installed_app_disposable_project_creation_failed")
@@ -3611,15 +3791,16 @@ def _installed_app_mission(
         page.locator("#createMission").click(timeout=30_000)
     create_response = mission_response_info.value
     create_body = create_response.json()
-    mission_id = str(create_body.get("mission_id", "")) if isinstance(create_body, dict) else ""
+    mission_id_raw = create_body.get("mission_id", "") if isinstance(create_body, dict) else ""
+    mission_id = _safe_opaque_identifier(mission_id_raw) or ""
     create_error = create_body.get("error") if isinstance(create_body, dict) else None
     create_diagnostic = create_body.get("acceptance_diagnostic", {}) if isinstance(create_body, dict) else {}
     if not isinstance(create_diagnostic, dict):
         create_diagnostic = {}
-    diagnostic_stage = create_diagnostic.get("stage", "")
-    exception_type = create_diagnostic.get("exception_type", "")
-    diagnostic_stage = diagnostic_stage if isinstance(diagnostic_stage, str) and diagnostic_stage.isidentifier() else ""
-    exception_type = exception_type if isinstance(exception_type, str) and exception_type.isidentifier() else ""
+    diagnostic_stage = _safe_static_code("stage", create_diagnostic.get("stage")) or ""
+    exception_type = _safe_exception_type(create_diagnostic.get("exception_type", ""))
+    if exception_type == "UnknownError":
+        exception_type = ""
     diagnostic_frames = []
     raw_frames = create_diagnostic.get("traceback_frames", [])
     if isinstance(raw_frames, list):
@@ -3632,8 +3813,9 @@ def _installed_app_mission(
             if (
                 isinstance(filename, str)
                 and Path(filename).name == filename
+                and _safe_opaque_identifier(filename) is not None
                 and isinstance(function, str)
-                and function.isidentifier()
+                and _safe_opaque_identifier(function) is not None
                 and isinstance(line, int)
                 and not isinstance(line, bool)
                 and line > 0
@@ -3644,7 +3826,7 @@ def _installed_app_mission(
         "http_status": create_response.status,
         "response_ok": create_body.get("ok") is True if isinstance(create_body, dict) else False,
         "mission_id_present": bool(mission_id),
-        "error_code": str(create_error)[:96] if create_error is not None else "",
+        "error_code": _safe_static_code("error_code", create_error) or "",
         "diagnostic_stage": diagnostic_stage,
         "exception_type": exception_type,
         "diagnostic_traceback_frames": diagnostic_frames,
@@ -4147,9 +4329,7 @@ def _wait_for_model(page, predicate, *, timeout: float, phase: str, progress: li
         except Exception as exc:
             consecutive_fetch_failures += 1
             total_fetch_failures += 1
-            exception_type = type(exc).__name__
-            if not _SAFE_DIAGNOSTIC_IDENTIFIER.fullmatch(exception_type):
-                exception_type = "Error"
+            exception_type = _safe_exception_type(exc)
             progress.append({
                 "phase": phase + "_api_fetch_retry",
                 "at_utc": datetime.now(timezone.utc).isoformat(),
@@ -4177,7 +4357,7 @@ def _wait_for_model(page, predicate, *, timeout: float, phase: str, progress: li
         model = _find_qwen(state)
         operation = (state.get("manager") or {}).get("operation") or {}
         marker = (operation.get("status"), operation.get("kind"), operation.get("progress"),
-                  operation.get("error"), bool(model and model.get("installed")),
+                  _safe_model_manager_error_code(operation.get("error")), bool(model and model.get("installed")),
                   bool(model and model.get("active")),
                   ((state.get("manager") or {}).get("runtime") or {}).get("status"))
         if marker != last:
@@ -4192,11 +4372,11 @@ def _wait_for_model(page, predicate, *, timeout: float, phase: str, progress: li
                 "model_installed": bool(model and model.get("installed")),
                 "model_active": bool(model and model.get("active")),
                 "runtime_status": ((state.get("manager") or {}).get("runtime") or {}).get("status"),
-                "error": operation.get("error"),
+                "error_code": _safe_model_manager_error_code(operation.get("error")),
             })
             last = marker
         if operation.get("status") == "failed":
-            raise RuntimeError("model_manager_operation_failed:" + str(operation.get("error", "unknown"))[:200])
+            raise RuntimeError("model_manager_operation_failed")
         if operation.get("status") == "interrupted":
             raise RuntimeError("model_manager_operation_interrupted")
         if predicate(state, model, operation):
@@ -4207,11 +4387,12 @@ def _wait_for_model(page, predicate, *, timeout: float, phase: str, progress: li
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cdp-port", required=True, type=int)
+    parser.add_argument("--cdp-port", type=int)
     parser.add_argument("--expected-version", required=True)
     parser.add_argument("--profile-root", required=True, type=Path)
     parser.add_argument("--installed-executable", type=Path)
     parser.add_argument("--application-pid", type=int)
+    parser.add_argument("--launch-in-owned-job", action="store_true")
     parser.add_argument("--mode", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--model-timeout-seconds", type=int, default=2400)
@@ -4223,8 +4404,12 @@ def main() -> int:
     args = parser.parse_args()
     if args.authorize_qwen3_4b_test_download and args.mode != "full":
         parser.error("--authorize-qwen3-4b-test-download requires --mode full")
-    if args.mode == "full" and (args.installed_executable is None or not args.application_pid):
-        parser.error("--mode full requires --installed-executable and --application-pid for real process restart coverage")
+    if args.mode == "full" and (args.installed_executable is None or not args.launch_in_owned_job):
+        parser.error("--mode full requires --installed-executable and --launch-in-owned-job for launch-bound process coverage")
+    if args.launch_in_owned_job and args.installed_executable is None:
+        parser.error("--launch-in-owned-job requires --installed-executable")
+    if not args.launch_in_owned_job and args.cdp_port is None:
+        parser.error("--cdp-port is required unless --launch-in-owned-job is used")
     started = time.monotonic()
     installed_executable_sha256 = None
     if args.installed_executable is not None:
@@ -4267,7 +4452,7 @@ def main() -> int:
         "installed_executable_launch": {"status": "NOT_RUN"},
         "application_restart": {
             "status": "NOT_RUN",
-            "close_method": "NOT_RUN: PID-only tree termination is not safely bound to the launched process",
+            "close_method": "Windows Job Object membership, process image, and creation-time verified",
             "graceful_quit_claimed": False,
             "renderer_reload_used": False,
             "cycles": [],
@@ -4280,6 +4465,8 @@ def main() -> int:
         "progress": [],
     }
     browser = None
+    process_job: WindowsOwnedJob | None = None
+    initial_process_identity = None
     inference_api_result: dict | None = None
     inference_response_status: int | None = None
     inference_response_fields: list[str] = []
@@ -4289,6 +4476,39 @@ def main() -> int:
             raise RuntimeError("installed_executable_fingerprint_unavailable")
         if args.mode == "full" and source_commit is None:
             raise RuntimeError("source_commit_identity_unavailable")
+        if args.launch_in_owned_job:
+            if os.name != "nt":
+                raise RuntimeError("native_windows_process_restart_required")
+            if args.installed_executable is None:
+                raise RuntimeError("installed_executable_required_for_owned_job")
+            args.cdp_port = args.cdp_port or _allocate_loopback_port()
+            process_job = WindowsOwnedJob.create()
+            initial_process_identity = _launch_installed_application(
+                args.installed_executable,
+                args.profile_root,
+                args.cdp_port,
+                process_job=process_job,
+            )
+            args.application_pid = initial_process_identity.process_id
+            report["cdp_port"] = args.cdp_port
+            report["initial_application_pid"] = args.application_pid
+            report["application_launch"] = {
+                "status": "IN_PROGRESS",
+                "process_id": initial_process_identity.process_id,
+                "image_path": initial_process_identity.image_path,
+                "creation_time": initial_process_identity.creation_time,
+                "job_object_name": process_job.name,
+                "job_membership_verified": True,
+                "created_suspended_assigned_then_resumed": True,
+            }
+            debug_version = _wait_for_cdp(args.cdp_port, timeout_seconds=150)
+            if debug_version is None:
+                raise RuntimeError("installed_desktop_cdp_endpoint_unavailable_after_owned_job_launch")
+            report["application_launch"].update({
+                "status": "PASS",
+                "cdp_endpoint_ready": True,
+                "cdp_browser": debug_version.get("Browser"),
+            })
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
         with sync_playwright() as playwright:
@@ -4313,6 +4533,16 @@ def main() -> int:
                     "expected_image_path": expected_image,
                     "actual_image_path": actual_image,
                     "matches_installed_path": image_matches,
+                    "job_membership_verified": bool(
+                        process_job is not None
+                        and process_job.verify_current(
+                            args.application_pid, args.installed_executable
+                        )
+                    ),
+                    "process_creation_time": (
+                        initial_process_identity.creation_time
+                        if initial_process_identity is not None else None
+                    ),
                 }
                 if not image_matches:
                     raise RuntimeError("initial_application_process_not_running_from_installed_path")
@@ -4350,6 +4580,7 @@ def main() -> int:
             )
             overlay_visible = page.locator("#firstRunOverlay").is_visible()
             hardware_text = page.locator("#setupHardware").inner_text().strip()
+            first_run_title = page.title()
             model_cards = page.locator("#setupModelList .model-card").count()
             model_list_text = page.locator("#setupModelList").inner_text().strip()
             owner_form_visible = page.locator("#ownerSetupForm").is_visible()
@@ -4361,17 +4592,14 @@ def main() -> int:
             report["first_run"] = {
                 "overlay_visible": overlay_visible,
                 "owner_setup_form_visible": owner_form_visible,
-                "title": page.title(),
-                "renderer_url": page.url,
+                "title_length": len(first_run_title),
+                "title_sha256": _sha256(first_run_title),
+                "renderer_origin_class": _safe_renderer_origin_class(page.url),
                 "model_card_count": model_cards,
                 "model_list_text_sha256": _sha256(model_list_text),
-                "screenshot": first_run_screenshot,
+                "screenshot_created": first_run_screenshot is not None,
             }
-            report["hardware"] = {
-                "detected": bool(hardware_text and "جارٍ فحص" not in hardware_text),
-                "display_text": hardware_text,
-                "sha256": _sha256(hardware_text),
-            }
+            report["hardware"] = _safe_hardware_diagnostics(hardware_text)
             state = _model_state(page)
             report["model_manager"] = {"catalog_loaded": bool(model_cards > 0)}
             qwen = _refresh_qwen_model_snapshot(report, state, phase="initial_catalog_state")
@@ -4734,7 +4962,7 @@ def main() -> int:
                     "invalid_credentials_rejected": invalid_rejected,
                     "invalid_login_request_target_matches": invalid_login_request_target_matches,
                     "invalid_login_http_status": invalid_response.status,
-                    "invalid_login_error": invalid_body.get("error"),
+                    "invalid_login_error_code": _safe_static_code("error_code", invalid_body.get("error")),
                     "invalid_login_left_owner_unauthenticated": "غير مسجل الدخول" in page.locator("#authStateSide").inner_text(),
                 })
                 if not invalid_rejected:
@@ -4780,7 +5008,7 @@ def main() -> int:
                     cycle = {
                         "cycle": cycle_name,
                         "status": "FAIL",
-                        "close_method": "NOT_RUN: PID-only tree termination is not safely bound to the launched process",
+                        "close_method": "TerminateJobObject after retained process-handle, image, creation-time, and membership checks",
                         "execution_chain_storage_status": "NOT_READ",
                         "restoration_status": "NOT_RUN",
                         "reconciliation_status": "NOT_RUN",
@@ -4797,30 +5025,42 @@ def main() -> int:
                             try:
                                 browser.close()
                             except Exception as exc:
-                                cycle["browser_detach_error_type"] = type(exc).__name__
+                                cycle["browser_detach_error_type"] = _safe_exception_type(exc)
                             finally:
                                 browser = None
                                 page = None
                         termination = _terminate_installed_process_tree(
-                            active_application_pid, args.cdp_port, args.installed_executable
+                            active_application_pid,
+                            args.cdp_port,
+                            args.installed_executable,
+                            process_job=process_job,
                         )
                         cycle.update(termination)
                         if termination.get("process_tree_termination_verified") is not True:
                             raise RuntimeError("installed_application_process_tree_did_not_stop")
 
                         relaunched_application_process = _launch_installed_application(
-                            args.installed_executable, args.profile_root, args.cdp_port
+                            args.installed_executable,
+                            args.profile_root,
+                            args.cdp_port,
+                            process_job=process_job,
                         )
                         active_application_pid = relaunched_application_process.pid
                         cycle["new_process_id"] = active_application_pid
-                        actual_image = _windows_process_image_path(active_application_pid)
+                        actual_image = relaunched_application_process.image_path
                         expected_image = str(args.installed_executable.expanduser().resolve(strict=True))
                         image_matches = bool(
                             actual_image
                             and os.path.normcase(actual_image) == os.path.normcase(expected_image)
                         )
                         cycle["new_process_image_path"] = actual_image
-                        cycle["relaunch_from_installed_path_verified"] = image_matches
+                        cycle["new_process_creation_time"] = relaunched_application_process.creation_time
+                        cycle["relaunch_job_membership_verified"] = process_job.verify_current(
+                            active_application_pid, args.installed_executable
+                        ) is not None
+                        cycle["relaunch_from_installed_path_verified"] = (
+                            image_matches and cycle["relaunch_job_membership_verified"]
+                        )
                         cycle["same_profile_user_data_dir"] = str(
                             (args.profile_root.expanduser().resolve() / "userData")
                         )
@@ -4908,7 +5148,7 @@ def main() -> int:
                                 cycle["final_state_screenshot"] = None
                     except Exception as exc:
                         cycle["status"] = "FAIL"
-                        cycle["restart_error_type"] = type(exc).__name__
+                        cycle["restart_error_type"] = _safe_exception_type(exc)
                         if isinstance(exc, _MissionAuditSnapshotError):
                             cycle["restart_failure_class"] = exc.failure_class
                             cycle["restart_error_code"] = exc.reason_code
@@ -5030,8 +5270,7 @@ def main() -> int:
                 return_code = 0 if report["status"] == "PASS" else 2
             report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
             report["elapsed_seconds"] = round(time.monotonic() - started, 3)
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            _write_json_atomically(args.output, report)
             return return_code
     except Exception as exc:
         report["failure_stage"] = stage
@@ -5045,17 +5284,46 @@ def main() -> int:
         if isinstance(mission_report, dict) and mission_report.get("status") == "IN_PROGRESS":
             mission_report["status"] = "FAIL"
             mission_report["incomplete_operation_reported_truthfully"] = True
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_json_atomically(args.output, report)
         print(json.dumps({"status": report["status"], **safe_error}, ensure_ascii=False), file=sys.stderr)
         return 2
     finally:
-        # A CDP disconnect must not close the installed Electron process; the
-        # PowerShell wrapper stops its full process tree after evidence is saved.
         if browser is not None:
             try:
                 browser.close()
             except Exception:
+                pass
+        if process_job is not None:
+            cleanup: dict[str, object] = {
+                "job_object_name": process_job.name,
+                "job_termination_attempted": True,
+                "final_job_shutdown_verified": False,
+            }
+            try:
+                job_result = process_job.terminate_owned_job(
+                    timeout_seconds=APPLICATION_PROCESS_EXIT_TIMEOUT_SECONDS
+                )
+                cleanup.update({
+                    "initial_member_count": job_result.get("initial_member_count"),
+                    "remaining_member_count": job_result.get("remaining_member_count"),
+                    "root_process_stopped": job_result.get("root_process_stopped"),
+                    "final_job_shutdown_verified": job_result.get("termination_succeeded") is True,
+                })
+            except Exception as exc:
+                cleanup["shutdown_error_type"] = _safe_exception_type(exc)
+                cleanup["shutdown_error_code"] = "windows_job_shutdown_unverified"
+            finally:
+                process_job.close()
+            report["cleanup"] = cleanup
+            if cleanup.get("final_job_shutdown_verified") is not True:
+                report["status"] = "FAIL"
+                report.setdefault("failure_stage", "application_job_shutdown")
+                report["cleanup"]["job_close_kill_on_close_fallback"] = True
+            report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+            report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            try:
+                _write_json_atomically(args.output, report)
+            except OSError:
                 pass
 
 
