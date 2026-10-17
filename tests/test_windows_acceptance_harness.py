@@ -4060,7 +4060,7 @@ def _public_project_scope_snapshot(snapshot: dict) -> dict:
         )
         public_scope_tools = _public_project_owner_tool_scope(mission.owner_instruction)
         authorized_tools = tuple(dict.fromkeys(
-            (*public_scope_tools, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
+            (*plan_actions, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
         ))
         authorization = replace(
             authorization,
@@ -4229,8 +4229,11 @@ def test_preflight_restart_basis_accepts_bound_public_project_scope_without_exte
     plan_actions = [step["action"] for step in status["plan"]["steps"]]
     owner_scope_tools = status["scope_snapshot"]["allowed_tools"]
     authorized_tools = status["authorization_snapshot"]["allowed_tools"]
-    assert set(plan_actions) < set(authorized_tools)
-    assert authorized_tools == [*owner_scope_tools, *OWNER_UI_CONTROL_PLANE_CAPABILITIES]
+    assert set(plan_actions).issubset(set(owner_scope_tools))
+    assert authorized_tools == list(dict.fromkeys(
+        (*plan_actions, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
+    ))
+    assert set(authorized_tools).issubset(set(owner_scope_tools) | set(OWNER_UI_CONTROL_PLANE_CAPABILITIES))
 
     unbound_basis = windows_acceptance._mission_restart_basis(public_scope_snapshot, mission_id)
     assert unbound_basis["status"] == "BLOCKED"
@@ -4318,6 +4321,7 @@ def test_preflight_public_project_scope_tampering_fails_closed(
         "authorization_hash_mismatch",
         "authorization_allowed_tools_expanded",
         "authorization_allowed_actions_expanded",
+        "api_owner_factory_snapshot",
         "owner_evidence_request_mismatch",
         "owner_session_mismatch",
         "owner_identity_active_session_mismatch",
@@ -4331,6 +4335,7 @@ def test_preflight_public_project_owner_binding_tampering_fails_closed(
 ) -> None:
     from dataclasses import replace
 
+    from bridge import Handler
     from security.mission_authorization import MissionAuthorizationSnapshot
 
     mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
@@ -4352,18 +4357,33 @@ def test_preflight_public_project_owner_binding_tampering_fails_closed(
             mission.authorization_snapshot["allowed_tools"] = ["status"]
         elif corruption == "authorization_allowed_tools_expanded":
             authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+            extra_authorized_tool = next(
+                tool for tool in mission.scope_snapshot["allowed_tools"]
+                if tool not in authorization.allowed_tools
+            )
             mission.authorization_snapshot = replace(
                 authorization,
-                allowed_tools=(*authorization.allowed_tools, "watch"),
+                allowed_tools=(*authorization.allowed_tools, extra_authorized_tool),
                 authorization_hash="",
             ).to_dict()
         elif corruption == "authorization_allowed_actions_expanded":
             authorization = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot))
+            extra_authorized_action = next(
+                tool for tool in mission.scope_snapshot["allowed_tools"]
+                if tool not in authorization.allowed_actions
+            )
             mission.authorization_snapshot = replace(
                 authorization,
-                allowed_actions=(*authorization.allowed_actions, "watch"),
+                allowed_actions=(*authorization.allowed_actions, extra_authorized_action),
                 authorization_hash="",
             ).to_dict()
+        elif corruption == "api_owner_factory_snapshot":
+            api_authorization_factory = Handler._mission_snapshot_factory(
+                None,
+                mission.owner_identity_ref,
+                mission.scope_snapshot,
+            )
+            mission.authorization_snapshot = api_authorization_factory(mission).to_dict()
         elif corruption == "owner_evidence_request_mismatch":
             mission.authorization_context["owner_evidence"]["request_id"] = "different-request"
         elif corruption == "owner_session_mismatch":
@@ -4388,6 +4408,8 @@ def test_preflight_public_project_owner_binding_tampering_fails_closed(
     assert basis["kind"] == "NOT_RUN"
     if corruption in {"authorization_allowed_tools_expanded", "authorization_allowed_actions_expanded"}:
         assert basis["diagnostic_code"] == "public_scope_allowlist_mismatch"
+    if corruption == "api_owner_factory_snapshot":
+        assert basis["diagnostic_code"] == "public_project_owner_binding_invalid"
 
 
 def test_preflight_public_project_basis_requires_active_owner_session(
