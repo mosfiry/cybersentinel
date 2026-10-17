@@ -87,8 +87,10 @@ def native_acl_root(record_property):
     """Do not require traversal of the broker's private user-profile path."""
     if sys.platform != "win32":
         pytest.fail("native root fixture was requested off Windows")
-    parent = Path(os.environ["SystemRoot"]) / "Temp"
-    assert parent.is_dir(), "Windows system temporary directory is unavailable"
+    system_root = Path(os.environ["SystemRoot"])
+    assert system_root.is_absolute() and not system_root.drive.startswith("\\\\"), "Windows system root must be local and absolute"
+    parent = Path(system_root.anchor)
+    assert parent.is_dir(), "Windows system volume root is unavailable"
     root = parent / f"cs-native-lpac-{uuid.uuid4().hex}"
     root.mkdir()  # Atomic collision rejection; never adopt a preexisting path.
     try:
