@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from agent.conversation import ConversationContext, ConversationInput, IntentType
-from agent.conversation_provider import ConversationSchemaError, LocalModelConversationProvider
+from evaluation.legacy_conversation import ConversationContext, ConversationInput, IntentType
+from evaluation.legacy_conversation_provider import ConversationSchemaError, LocalModelConversationProvider
 from agent.provider_api import ProviderCapabilities, ProviderResponse, ToolCall
 from agent.model_router import ModelRouter
 from agent.task_runtime import AgentTaskRuntime

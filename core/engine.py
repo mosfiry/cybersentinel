@@ -6,7 +6,6 @@ from .db import add_event, recent, counts, watches, save_reasoning_memory
 from .policy import evaluate
 from .trust import owner_request
 from agent.runtime import AgentRuntime
-from agent.conversation import ConversationParser
 from agent.evidence import observed
 from security.authorization import authorize_plan, public_plan
 from security.authorization_context import AuthorizationContext
@@ -93,7 +92,8 @@ def _handle_once(text, source="web", presented_token=None, owner_session_token=N
         instruction_text = text.split(":", 1)[1].strip()
         set_current_owner_instruction(instruction_text, source, auth_evidence=auth_evidence, request_id=request_id)
     policy_snapshot = capture_policy_snapshot(request_id, auth_evidence)
-    conversation_intent = ConversationParser().understand(text)
+    from agent.model_intelligence.conversation import NaturalLanguageUnderstanding
+    conversation_intent = NaturalLanguageUnderstanding().understand(text)
     req = owner_request(text, source)
     decision = evaluate(req)
     policy_event = add_event("policy", "Policy evaluation", decision.reason, source, "info" if decision.allowed else "warning", decision.allowed, {"request_id": request_id, "decision": "allow" if decision.allowed else "deny", "parent_event": auth_event})

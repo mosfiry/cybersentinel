@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
-from agent.conversation import ConversationContext, ConversationInput, ConversationParser, IntentType
+from .legacy_conversation import ConversationContext, ConversationInput, ConversationParser, IntentType
 
 
 @dataclass(frozen=True)

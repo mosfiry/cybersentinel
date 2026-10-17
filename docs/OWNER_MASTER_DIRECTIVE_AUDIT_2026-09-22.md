@@ -1,5 +1,7 @@
 # CyberSentinel X — Owner Master Directive Audit (2026-09-22)
 
+> **Historical snapshot:** findings below describe `main` at the recorded 2026-09-22 baseline, not today's runtime. For current reachability and the later legacy-module removal, see [CURRENT_RUNTIME_TRUTH.md](CURRENT_RUNTIME_TRUTH.md) and [AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md).
+
 Auditor: EXPERT-A (automated, tool-driven static + CI-verified audit)
 Branch: `main`
 Baseline before this audit: `38328ddbab7f4157ac54ed24c9b3086dd4a415bc` (CI success, run 35707542167)

@@ -1,3 +1,9 @@
+"""Historical AgentLoop retained for isolated compatibility tests only.
+
+It is not imported by the application runtime or included in release payloads.
+Current request handling uses AgentCore/MissionRuntime.
+"""
+
 from __future__ import annotations
 
 import json
@@ -9,7 +15,7 @@ from core.db import add_conversation_message, conversation_messages, ensure_conv
 from security.authorization import authorize_tool
 from security.owner_policy import current_owner_policy_context
 from tools.registry import REGISTRY
-from .context import (
+from agent.context import (
     ContextEngine,
     ExecutionState,
     RuntimeLimits,

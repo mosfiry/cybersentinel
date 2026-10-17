@@ -1,9 +1,11 @@
+"""Legacy model adapter kept for isolated contract benchmarks and tests only."""
+
 from __future__ import annotations
 
 import json
 from typing import Any, Callable
 
-from .conversation import ConversationActionProposal, ConversationContext, ConversationInput, ConversationIntent, ConversationParser, ConversationProvider, ConversationResponse, IntentType
+from .legacy_conversation import ConversationActionProposal, ConversationContext, ConversationInput, ConversationIntent, ConversationParser, ConversationProvider, ConversationResponse, IntentType
 
 
 FORBIDDEN_MODEL_FIELDS = frozenset({"authority_granted", "owner_authenticated", "authorization_granted", "scope_approved", "policy_approved"})

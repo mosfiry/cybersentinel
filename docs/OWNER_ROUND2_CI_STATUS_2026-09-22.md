@@ -1,5 +1,7 @@
 # Round 2 — CI Status Addendum (2026-09-22)
 
+> **Historical snapshot:** CI outcomes below apply only to the listed 2026-09-22 commits. They are not the status of the current review branch; see [CURRENT_RUNTIME_TRUTH.md](CURRENT_RUNTIME_TRUTH.md) for current paths.
+
 This addendum records the final CI state for the Round 2 execution-proofs
 work. It supplements `docs/OWNER_ROUND2_EXECUTION_PROOFS_2026-09-22.md`
 (which cannot be losslessly rewritten through the available read channel).

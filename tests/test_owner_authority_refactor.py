@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from agent.conversation import ConversationContext, ConversationInput, ConversationParser
-from agent.conversation_provider import ConversationSchemaError, LocalModelConversationProvider
+from evaluation.legacy_conversation import ConversationContext, ConversationInput, ConversationParser
+from evaluation.legacy_conversation_provider import ConversationSchemaError, LocalModelConversationProvider
 from agent.mission import MissionStatus, MissionStore
 from agent.mission_runtime import MissionRuntime
 from agent.planning import Plan, PlanStep

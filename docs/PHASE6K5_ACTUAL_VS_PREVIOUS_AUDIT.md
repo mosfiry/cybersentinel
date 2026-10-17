@@ -1,5 +1,7 @@
 # Phase 6K.5 Internal Audit: Actual Code vs Previous Report
 
+> **Historical snapshot:** findings below describe the cited audit point only. For the current runtime path and legacy-module status, see [CURRENT_RUNTIME_TRUTH.md](CURRENT_RUNTIME_TRUTH.md) and [AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md).
+
 **Audit point:** commit `ab10a4d` on `main`  
 **Base:** `9899054`  
 **Purpose:** verify the Phase 6K.4 report against executable code before extending the architecture.

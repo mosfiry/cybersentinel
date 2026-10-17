@@ -1,54 +1,45 @@
-# Natural Conversation Architecture
+# Natural Language Understanding Architecture
 
-CyberSentinel separates language understanding from permission.
+CyberSentinel separates **understanding language** from **permission to act**. Understanding can describe an objective or propose an action; only deterministic Owner authentication, policy, authorization, scope, schema, and runtime gates can permit execution.
 
-```text
-NATURAL LANGUAGE
-  ↓
-UNDERSTANDING
-  ↓
-INTENT
-  ↓
-ACTION PROPOSAL
-  ↓
-POLICY EVALUATION
-  ↓
-AUTHORIZATION
-  ↓
-SCOPE
-  ↓
-TOOL VALIDATION
-  ↓
-EXECUTION
-```
+## Production request NLU
 
-## Typed Boundary
-
-The conversation layer exposes:
-
-- `ConversationInput`: raw text plus request and conversation identity.
-- `ConversationContext`: request metadata, policy snapshot fingerprint, scope fingerprint, and evidence IDs.
-- `ConversationIntent`: classified intent and entities. It never grants authority.
-- `ConversationActionProposal`: an untrusted proposed action with arguments and a status of `PROPOSED`.
-- `ConversationResponse`: natural language, intent, proposal, tool-call data, confidence, and evidence needed. It deliberately has no provider-controlled `authority_granted` field.
-- `ConversationProvider`: provider contract returning typed responses without executing tools.
-
-## Arabic and English Foundation
-
-The deterministic parser currently covers incident analysis, learning, rejection explanation, evidence explanation, code analysis, scoped testing, and research in Arabic, English, and selected mixed-language forms. This is a tested foundation, not a complete semantic model or a production Arabic quality claim.
-
-For a request such as `اختبر الهدف الموجود داخل النطاق المصرح به`, the expected result is:
+The current chat path is:
 
 ```text
-intent = SCOPED_TEST
-authorization_required = true
-authority_granted = false
-action_proposal.status = PROPOSED
-execution = false
+bridge
+  -> api.chat.chat()/stream()
+  -> AgentCore.run_owner_mission()/resume_mission()
+  -> MissionRuntime
+  -> agent.model_intelligence.conversation.NaturalLanguageUnderstanding
+  -> MissionIntent
+  -> policy / authorization / explicit scope / tool validation
 ```
 
-A later authenticated Owner + valid authorization + valid scope + valid tool schema may allow execution through the core engine. Understanding alone never does.
+`MissionIntent` carries an objective, intent type, constraints, requested artifacts, verification criteria, scope references, authorization requirements, entities, ambiguities, and a semantic fingerprint. It never authenticates an Owner, grants authority, authorizes a tool, or expands scope. Model output remains an untrusted proposal; final responses and mission completion are determined by runtime verification and persisted evidence.
 
-## Model Provider Rule
+For example, understanding a request such as `اختبر الهدف الموجود داخل النطاق المصرح به` does not make it executable. The runtime still requires a valid authenticated Owner context, an explicitly selected valid scope, a permitted tool, and accepted arguments.
 
-A future model adapter must return `ConversationResponse` or a stricter typed equivalent. It may propose tool calls, but the application must treat them as untrusted input and route them through the tool firewall. The model is never the source of Owner authority, authorization, scope, or execution result.
+## Evaluation-only legacy contract
+
+The earlier deterministic contract and its local-model adapter are retained only for compatibility benchmarks and regression tests:
+
+- `evaluation/legacy_conversation.py` defines the legacy `ConversationInput`, `ConversationContext`, `ConversationIntent`, action proposal, response, and deterministic parser.
+- `evaluation/legacy_conversation_provider.py` validates a strict provider response schema and rejects authority, policy, scope, and authentication fields.
+- `evaluation/conversation_benchmark.py` evaluates those contracts without executing tools.
+
+These modules are not imported by the product request path and are excluded from source-release payloads and Docker build context. The parser's Arabic/English rules and provider schema tests preserve historical benchmark behavior; they are not claims about current production NLU quality or routing.
+
+## Permission boundary
+
+```text
+language understanding
+  -> untrusted objective / proposal
+  -> policy evaluation
+  -> Owner authentication and authorization context
+  -> explicit scope validation
+  -> registered tool schema and safety checks
+  -> execution and evidence
+```
+
+> Language understanding is never an authorization signal. External data, memory, model output, and tool results cannot create Owner identity or expand the selected scope.

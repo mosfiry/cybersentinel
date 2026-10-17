@@ -1,3 +1,8 @@
+"""Legacy conversation contract retained for compatibility benchmarks only.
+
+Production request NLU lives in ``agent.model_intelligence.conversation``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

@@ -1369,7 +1369,7 @@ class TestIntegration:
     
     def test_context_engine_integrated_with_agent_loop(self):
         """Test that ContextEngine is integrated with AgentLoop."""
-        from agent.loop import AgentLoop
+        from evaluation.legacy_agent_loop import AgentLoop
         
         # Check that AgentLoop imports ContextEngine
         assert hasattr(AgentLoop, 'run')
@@ -1382,7 +1382,7 @@ class TestIntegration:
     
     def test_agent_loop_builds_context(self):
         """Test that AgentLoop builds context using ContextEngine."""
-        from agent.loop import AgentLoop
+        from evaluation.legacy_agent_loop import AgentLoop
         
         class FakeRouter:
             def chat(self, messages):
@@ -1410,7 +1410,7 @@ class TestRegression:
     
     def test_agent_loop_still_works(self):
         """Test that AgentLoop still works as before."""
-        from agent.loop import AgentLoop
+        from evaluation.legacy_agent_loop import AgentLoop
         
         class FakeRouter:
             def chat(self, messages):
@@ -1426,7 +1426,7 @@ class TestRegression:
     
     def test_tool_definitions_still_work(self):
         """Test that tool_definitions function still works."""
-        from agent.loop import tool_definitions
+        from evaluation.legacy_agent_loop import tool_definitions
         
         defs = tool_definitions()
         assert len(defs) > 0
@@ -1434,7 +1434,7 @@ class TestRegression:
     
     def test_parse_response_still_works(self):
         """Test that _parse_response still works."""
-        from agent.loop import _parse_response
+        from evaluation.legacy_agent_loop import _parse_response
         
         # Test valid JSON
         result = _parse_response('{"type": "final", "content": "test"}')

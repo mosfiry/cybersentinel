@@ -1,24 +1,23 @@
 # CyberSentinel X Agent Architecture
 
-CyberSentinel X is a local defensive agent. The active request path is:
+CyberSentinel X is a local defensive agent. The active chat request path is:
 
 ```text
 Bridge authentication
   -> Owner authentication
-  -> current Owner policy
-  -> AgentRuntime planner
-  -> ModelRouter / provider fallback
-  -> JSON extraction and schema validation
-  -> deterministic tool authorization
-  -> bounded tool execution
-  -> evidence and audit response
+  -> api.chat.chat()/stream()
+  -> AgentCore and live MissionIntent understanding
+  -> MissionRuntime
+  -> Owner policy, authorization, and explicit scope checks
+  -> registered tool schema and bounded execution
+  -> evidence, verification, and audit response
 ```
 
 `X-CyberSentinel-Token` authenticates only the local bridge transport. Owner identity is established through the username/password bootstrap and login flow and a server-managed session. Protected internal mission routes revalidate that session through `X-CyberSentinel-Owner-Session`; the Desktop/public API uses HttpOnly session cookies and CSRF protection for writes. There is no runtime `OWNER_TOKEN` credential, and bridge transport authentication never grants Owner authority.
 
-`AgentRuntime.plan()` is the only planner entry point. It supplies the authenticated Owner policy context to an optional OpenAI-compatible model. A model can propose a plan, but it cannot execute tools or authorize itself. `tools/registry.py` is the single source of tool metadata, handlers, risk classes, and argument schemas; `security/authorization.py` applies the registry policy, maximum argument length, and maximum plan size before execution.
+`AgentCore` and `MissionRuntime` use the configured model router to propose mission reasoning and actions. A model can propose a plan, but it cannot execute tools, authenticate an Owner, or authorize itself. `tools/registry.py` is the single source of tool metadata, handlers, risk classes, and argument schemas; deterministic authorization and scope checks apply before execution.
 
-Each accepted request receives an `ExecutionContext` containing the request ID, authenticated Owner identity, policy fingerprint, and provider/model provenance. Planner responses use a closed schema and accepted plans are canonicalized and hashed before execution. The same hash is checked immediately before each handler call. Every tool receives an explicit authorization decision record containing its risk class, Owner requirement, policy version, and decision reason.
+Each current mission preserves its request ID, authenticated Owner identity, policy and scope snapshots, and provider/model provenance. Tool proposals are schema-validated and authorized before execution; evidence and verification are persisted with the mission. The separate legacy `core.engine.handle()` path maintains its own `ExecutionContext` and plan-integrity checks but is not the current `/api/chat` or `/api/command` entrypoint.
 
 Audit event IDs link authentication, policy, plan, authorization, execution, and response. Evidence objects carry the same request ID and a tamper-evident chain of `sequence`, `previous_hash`, and `current_hash`; `verify_chain()` detects later modification.
 
@@ -91,36 +90,31 @@ Semantics and hard boundaries:
 - OS sandbox capabilities, host/network policy, and provider-side limits are enforced as execution facts, not silently changed by a policy rank. There is no runtime `OWNER_TOKEN` credential.
 - `security/authority.py` publishes the closed tier order and explicitly reports that Owner rank grants no execution permission; the live authorization code does not use tier numbers to permit tools.
 
-## Runtime inventory — canonical vs compatibility status (2026-09-22 audit)
+## Runtime inventory — canonical vs evaluation-only status (verified 2026-10-17)
 
 The audit established the live call graph (bridge → api → agent → tools) by
 reading every entrypoint. Status:
 
 | Module | Role | Live reachability |
 | --- | --- | --- |
-| `agent/mission_runtime.py` (`MissionRuntime`) | Canonical persistent mission engine | `AgentCore.run_owner_mission` / `resume_mission` — mission mode of `/api/chat` |
-| `agent/agent_core.py` (`AgentCore`) | Facade/orchestration boundary over `MissionRuntime` | `api/chat.py` mission mode |
-| `agent/task_runtime.py` (`AgentTaskRuntime`) | Live compatibility task engine | `api/chat.py` **default** mode (`create_task` / `run_to_completion`); each step routes through `core.engine.handle()` |
-| `agent/runtime.py` (`AgentRuntime`) | Planner for the command engine | `core/engine.py` `handle()` (`/api/command`), also the planner under the task path |
-| `agent/loop.py` (`AgentLoop`) | Legacy conversational loop and unused duplicate `tool_definitions()` | No production import/instantiation found in bridge/api/runtime; current `bridge.py` uses `tools.registry.tool_definitions()`; legacy tests may still import it |
-| `agent/conversation.py` (`ConversationParser`) | Deterministic intent baseline | Live: `core/engine.py::_handle_once()` calls `ConversationParser().understand(text)` |
-| `agent/conversation_provider.py` | Validating model adapter for the conversation schema | No production consumer found; referenced by tests only |
+| `agent/mission_runtime.py` (`MissionRuntime`) | Canonical persistent mission engine | `AgentCore.run_owner_mission` / `resume_mission` — `/api/chat` and mission routes |
+| `agent/agent_core.py` (`AgentCore`) | Facade/orchestration boundary over `MissionRuntime` | `api/chat.py` chat/mission entrypoints |
+| `agent/task_runtime.py` (`AgentTaskRuntime`) | Compatibility task runtime | No current `api.chat` caller; `api.chat._runtime()` returns `MissionTaskAdapter` |
+| `agent/runtime.py` (`AgentRuntime`) | Planner/status component retained by `core.engine` | `core.engine` uses its `RUNTIME` for status and the legacy handler; `/api/command` routes through `api.chat.chat()` |
+| `agent/loop.py` (`AgentLoop`) | Removed from the product tree | Historical implementation is retained only as `evaluation/legacy_agent_loop.py` for tests; the file is excluded from release/Docker artifacts |
+| `agent/conversation.py` (`ConversationParser`) | Removed from the product tree | Legacy deterministic contract moved to `evaluation/legacy_conversation.py` for tests and benchmarks; the file is excluded from release/Docker artifacts |
+| `agent/conversation_provider.py` | Removed from the product tree | Legacy schema adapter moved to `evaluation/legacy_conversation_provider.py` for contract tests; the file is excluded from release/Docker artifacts |
 | `agent/model_intelligence/conversation.py` | Live NLU (`NaturalLanguageUnderstanding` → `MissionIntent`) | `AgentCore.understand_mission_intent` / `run_owner_mission` |
 
-Honest gaps against the "one canonical runtime" goal:
+Verified path and compatibility notes:
 
-1. `/api/chat` in **default** (non-mission) mode executes through
-   `AgentTaskRuntime` + `core.engine.handle()`, **not** `MissionRuntime`. The
-   directive target (chat → AgentCore → MissionRuntime only) is therefore
-   **not yet satisfied**; mission mode is opt-in via `{"mission": true}` or
-   `mode: "mission"`.
-2. `agent/loop.py` still contains a legacy `AgentLoop.run` implementation, but
-   the inspected bridge imports tool metadata from `tools.registry`, and no
-   production caller constructs `AgentLoop`. The duplicate `tool_definitions()`
-   is not the source used by `/api/tools`. Keep this file classified as legacy
-   until its test/compatibility consumers are deliberately migrated; its
-   presence is not evidence of a second live execution path.
-3. No `owner_authenticated=True` trust path exists anymore:
+1. `/api/chat` and `/api/command` both use the current `api.chat` entrypoint,
+   which delegates chat requests through `AgentCore` and `MissionRuntime`.
+   `core.engine.handle()` has no in-repository production caller.
+2. The old `AgentLoop`, parser, and provider implementations are no longer
+   under `agent/`; only explicitly named evaluation copies remain for historical
+   tests/benchmarks and are excluded from runtime artifacts.
+3. No `owner_authenticated=True` trust path exists:
    `security/authorization.py` explicitly rejects a bare boolean
    ("typed Owner authentication evidence required") and forbids mixing legacy
    evidence arguments with a typed `AuthorizationContext`.
@@ -140,14 +134,13 @@ always an untrusted model proposal. Final assistant text is produced only after
 deterministic verification, and mission completion is decided by
 `GoalVerification` over persisted evidence, never by the model's own claim.
 
-Do not confuse the three similarly named modules:
+Do not confuse the live mission NLU with the legacy evaluation contract:
 
-- `agent/conversation.py` — deterministic `ConversationParser` intent baseline
-  used by the command engine (live, no authority).
-- `agent/conversation_provider.py` — model adapter producing validated
-  untrusted proposals (tests only today).
 - `agent/model_intelligence/conversation.py` — live NLU for owner
   instructions in the mission path.
+- `evaluation/legacy_conversation.py` and
+  `evaluation/legacy_conversation_provider.py` — historical parser/provider
+  contracts for tests and benchmarks only; not imported by product runtime.
 
 ## Web search provider status — no synthetic success
 

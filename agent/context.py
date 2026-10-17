@@ -1,17 +1,9 @@
 """
-CyberSentinel X - Phase 3: Agent Context Engine
+CyberSentinel X Context Engine
 
-Context Engine provides a clear separation between:
-- AgentLoop (consumer)
-- ContextEngine (builder)
-- Provider (recipient)
-
-Architecture:
-    AgentLoop
-        ↓
-    ContextEngine.build()
-        ↓
-    Provider.chat()
+ContextEngine separates the active runtime consumer from context assembly and
+provider delivery:
+    Runtime -> ContextEngine.build() -> Provider
 
 Key Components:
 - AgentContext: The final context object with provenance
@@ -1135,7 +1127,7 @@ class ContextEngine:
     """Main context engine for CyberSentinel X.
     
     Provides clear separation:
-        AgentLoop -> ContextEngine.build() -> Provider
+        Runtime -> ContextEngine.build() -> Provider
     """
     
     SYSTEM_INSTRUCTIONS = (

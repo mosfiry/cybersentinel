@@ -1,5 +1,7 @@
 # CyberSentinel X - Round 2 Execution Proofs (2026-09-22)
 
+> **Historical snapshot:** this records the Round 2 code and proofs as of 2026-09-22. Later routing and module disposition are documented in [CURRENT_RUNTIME_TRUTH.md](CURRENT_RUNTIME_TRUTH.md) and [AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md).
+
 Owner directive round 2: canonical execution + real long-horizon. This file is
 the honest record of what was proven, what is mock-verified, and what remains
 UNVERIFIED. Round 1 report: docs/OWNER_MASTER_DIRECTIVE_AUDIT_2026-09-22.md.

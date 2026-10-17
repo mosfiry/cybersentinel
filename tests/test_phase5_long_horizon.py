@@ -65,7 +65,7 @@ class TestPhase5A_RuntimeLimits:
     
     def test_agent_loop_uses_runtime_limits(self):
         """Test that AgentLoop uses RuntimeLimits instead of hard-coded max_steps."""
-        from agent.loop import AgentLoop
+        from evaluation.legacy_agent_loop import AgentLoop
         from agent.context import RuntimeLimits
         
         # Create AgentLoop with default limits
@@ -77,7 +77,7 @@ class TestPhase5A_RuntimeLimits:
     
     def test_agent_loop_custom_runtime_limits(self):
         """Test that AgentLoop can use custom RuntimeLimits."""
-        from agent.loop import AgentLoop
+        from evaluation.legacy_agent_loop import AgentLoop
         from agent.context import RuntimeLimits
         
         custom_limits = RuntimeLimits(
@@ -856,7 +856,7 @@ class TestPhase5_Integration:
     
     def test_agent_loop_runtime_limits_integration(self):
         """Test AgentLoop integration with RuntimeLimits."""
-        from agent.loop import AgentLoop
+        from evaluation.legacy_agent_loop import AgentLoop
         from agent.context import RuntimeLimits
         
         # Test default construction
@@ -958,7 +958,7 @@ class TestPhase5_Regression:
         from core import db
         monkeypatch.setattr(db, "DB_PATH", tmp_path / "conversation.sqlite3")
         
-        from agent.loop import AgentLoop
+        from evaluation.legacy_agent_loop import AgentLoop
         
         class FakeRouter:
             def chat(self, messages):

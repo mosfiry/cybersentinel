@@ -4,7 +4,7 @@ import json
 import core.db as db
 from owner_session_testutils import allow_owner_sessions
 import security.owner_policy as owner_policy
-from agent.loop import AgentLoop, tool_definitions
+from evaluation.legacy_agent_loop import AgentLoop, tool_definitions
 
 
 class FakeRouter:

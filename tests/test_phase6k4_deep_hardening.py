@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.conversation import ConversationParser, IntentType
+from evaluation.legacy_conversation import ConversationParser, IntentType
 from knowledge.corpus import AttributionStatus, ClaimType
 from knowledge.foundation import KnowledgeKind, KnowledgeObject, TransformationPolicy, TrustClass
 from knowledge.graph import GraphNode, GraphRelation, LearningPlan, ProvenanceEdge, ProvenanceGraph, RedBluePurpleCase

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from agent.conversation import (
+from evaluation.legacy_conversation import (
     ConversationActionProposal,
     ConversationContext,
     ConversationInput,
