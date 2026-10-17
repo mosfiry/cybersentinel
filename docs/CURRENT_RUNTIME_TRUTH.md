@@ -1,81 +1,46 @@
-# CyberSentinel X — Current Runtime Truth
+# CyberSentinel X — Runtime Reachability (verified 2026-10-17)
 
-**Audit date:** 2026-09-22  
-**Starting commit:** `534e604`  
-**Branch:** `main`  
-**Basis:** direct inspection of the checked-out source, imports, entrypoints, and tests.
+**Compared:** `main` at `8a3fd109c0e586db13ed48a7371ac9ad06465b74` and review branch `fix/blocker-d-review-20261010` at `d486742f41daf6cc2c38586f023a46162eab9ec5` (plus its current working tree). The three named modules are byte-identical between main and the review-branch HEAD. Conclusions below come from source imports/call sites; older runtime-truth notes were not used as evidence.
 
-## Actual entrypoint graph
+## Current request path
 
 ```text
 bridge.py
 ├── GET /api/tools
-│   └── agent.loop.tool_definitions()
-├── POST /api/chat
-│   └── api.chat.chat()
-│       ├── mission=true or mode=mission
-│       │   └── AgentCore.run_owner_mission()/resume_mission()
-│       │       └── MissionRuntime
-│       │           ├── persistent MissionStore (SQLite)
-│       │           ├── typed authorization boundary
-│       │           ├── model turn / native tool-call proposals
-│       │           ├── deterministic authorization and replay checks
-│       │           ├── tools.registry.execute()
-│       │           ├── observations/evidence/trajectory
-│       │           ├── recovery/reconciliation
-│       │           └── deterministic goal verification
-│       └── default mode
-│           ├── configured provider
-│           │   └── AgentTaskRuntime.create_task()/run_to_completion()
-│           │       └── core.engine.handle()
-│           │           └── AgentRuntime planner
-│           │               └── tools.registry.execute()
-│           └── no configured provider
-│               └── core.engine.handle()
-│                   └── AgentRuntime planner
-│                       └── tools.registry.execute()
-└── POST /api/command
-    └── core.engine.handle()
-        └── AgentRuntime planner
-            └── tools.registry.execute()
+│   └── tools.registry.tool_definitions()
+├── GET /api/status
+│   └── core.engine.status()             # imports core.engine and its globals
+├── POST /api/chat / chat stream
+│   └── api.chat.chat()/stream()
+│       └── AgentCore.run_owner_mission()/resume_mission()
+│           └── MissionRuntime
+│               ├── authorization + explicit scope
+│               ├── tools.registry.execute()
+│               ├── external-effect ledger and cancellation fencing
+│               └── evidence and deterministic verification
+└── mission worker/API routes
+    └── MissionRuntime / MissionService
 ```
 
-## Runtime inventory
+The review branch also imports `core.engine.status` from a MissionRuntime status path. This loads `core.engine` and its top-level `ConversationParser` import, but does not call `core.engine.handle()` or the parser. The current `api.chat.chat()` implementation documents and implements all chat modes through `MissionRuntime`; no production caller of `core.engine.handle()` was found in bridge, API, agent, or core source. Likewise, no production importer or constructor of `AgentTaskRuntime` was found.
 
-| Component | Current role | Status against one-runtime requirement |
-|---|---|---|
-| `agent/mission_runtime.py::MissionRuntime` | Durable mission lifecycle, native model loop, recovery, evidence, deterministic verification | Canonical mission engine |
-| `agent/agent_core.py::AgentCore` | Mission orchestration facade | Active mission entry boundary |
-| `agent/task_runtime.py::AgentTaskRuntime` | Durable compatibility task lifecycle for provider-backed default chat | **Still a second live execution path** |
-| `core/engine.py` / `agent/runtime.py` | Command planner and local/default chat execution | **Still live for `/api/command` and default chat** |
-| `agent/loop.py::AgentLoop` | Legacy conversational loop; also exports tool metadata | **Still present and independently executable** |
-| `tools/registry.py` | Tool metadata, validation, authorization-decision revalidation, execution | Shared registry and execution boundary |
-| `security/authorization.py` | Typed authorization and decision issuance | Active security boundary |
-| `security/authorization_context.py` | Typed immutable context and signed decision | Active for sensitive mission execution |
-| `security/scope*.py` | Scope snapshot persistence/resolution/firewall | Active for scope-bound tools |
-| `core/lifecycle.py` | Request lifecycle persistence for command path | Active in compatibility path |
-| `agent/mission.py::MissionStore` | Durable SQLite mission state and integrity hash | Active in canonical mission path |
+## Requested module-by-module comparison
 
-## Security facts observed in source
+| File | `main`: module import / behavior | Review branch: module import / behavior | Assessment |
+|---|---|---|---|
+| `agent/loop.py` | No production import or `AgentLoop` construction found / no loop execution | Same / same | The module and its duplicate `tool_definitions()` are internally unreachable from production. `/api/tools` imports `tools.registry.tool_definitions()`. Legacy tests still use `AgentLoop`; retain pending compatibility review rather than deleting feature code automatically. |
+| `agent/conversation.py` | Eagerly imported by `core.engine` / parser call is inside `core.engine.handle()` and no production caller of `handle()` was found | Same / same | The module is loaded as an import side effect, but its parser behavior is not part of current request execution. Evaluation/tests also use it. Treat as legacy command-path code, not active chat NLU. |
+| `agent/conversation_provider.py` | No production importer / no provider construction | Same / same | Test-only adapter/prototype. Its sibling import of `agent.conversation` is internal to the module and does not make the provider live. Keep until compatibility consumers are reviewed. |
 
-The canonical mission loop does not accept a bare `owner_authenticated=True` as authority. Sensitive tools require an `AuthorizationContext` and `tools.registry.execute()` revalidates an `AuthorizationDecision` against tool name, request ID, and argument hash. Mission tool proposals carry mission/run/turn/tool-call identity and duplicate or stale identities are rejected.
+The three target source files have no content delta between the compared main and branch revisions. The bridge in both uses `tools.registry.tool_definitions`; `core.engine` imports `ConversationParser`, but its `handle()` entry has no internal production caller. Unit tests and evaluation scripts are not counted as production reachability.
 
-The model cannot directly set completion status. `MissionRuntime` invokes deterministic verification and only then transitions to `GOAL_COMPLETED`. Crash recovery records an ambiguous in-flight side effect as `RECOVERY_REQUIRED`; it does not infer success or retry blindly.
+## Other runtime facts relevant to the comparison
 
-## Remaining gaps observed in source
+- `agent.model_intelligence.conversation` is a separate, live MissionRuntime NLU component; it is not `agent.conversation` or `agent.conversation_provider`.
+- `agent.loop.py` must not be confused with `agent/context.py` or with the canonical tool registry. A docstring reference to `AgentLoop` is not a call site.
+- The legacy modules remain present because tests/compatibility consumers exist. This audit did not delete them or claim that external consumers are impossible.
+- `OwnerAuthenticationEvidence`, explicit `ScopeSnapshot`, tool authorization, process sandboxing, cancellation fencing, and evidence integrity remain independent runtime controls. Instruction-order metadata does not grant access.
 
-1. `/api/chat` still has a mission path and a default compatibility path; they do not share one canonical mission lifecycle.
-2. `agent/loop.py::AgentLoop` still exists and is imported by `bridge.py` and `agent/context.py`; legacy tests also import it.
-3. Live-provider acceptance is gated and currently skipped when credentials/factory are absent; deterministic long-horizon tests are not REAL-PROVIDER evidence.
-4. The current checkout contains no CI run for `534e604` because the commit is a diagnostics-only commit covered by the workflow's `paths-ignore` rule. The latest successful GitHub Actions run observed before this audit was for `5d29375b1f35`.
+## Superseded documentation
 
-## Deterministic local baseline
-
-Executed from `/home/ubuntu/cybersentinel` in a fresh shell using the declared requirements:
-
-```text
-471 passed, 1 skipped in 9.14s
-TEST_EXIT_CODE=0
-```
-
-The skipped test is the live-provider long-horizon acceptance test and is explicitly labeled unavailable when provider credentials/factory are absent. This baseline is not evidence that the remaining architecture gaps are complete.
+The 2026-09-22 runtime inventory incorrectly described `AgentLoop` as imported by the bridge and `/api/chat` default mode as an `AgentTaskRuntime`/`core.engine.handle()` path. Current source shows the bridge imports tool metadata from `tools.registry` and chat enters `MissionRuntime`. This file supersedes those reachability statements; it does not claim the legacy files were removed.

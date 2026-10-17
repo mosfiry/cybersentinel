@@ -60,11 +60,11 @@ The assessment is based on current GitHub documentation, including:
 
 ## CyberSentinel-specific security conclusion
 
-The GitHub mechanism must not bypass the existing chain:
+The GitHub mechanism must preserve Owner-first instruction precedence without bypassing independent execution gates:
 
-> `SYSTEM_PLATFORM → OWNER_POLICY → OWNER_INSTRUCTION → DETERMINISTIC_ENFORCEMENT → AUTHORIZATION_SCOPE → TOOL_RUNTIME → MODEL_OUTPUT → EXTERNAL_DATA`
+> `OWNER_INSTRUCTION (900) → SYSTEM_PLATFORM (800) → OWNER_POLICY → DETERMINISTIC_ENFORCEMENT → AUTHORIZATION_SCOPE → TOOL_RUNTIME → MODEL_OUTPUT → EXTERNAL_DATA`
 
-A Pages asset cannot contain `OWNER_TOKEN`, `BRIDGE_TOKEN`, provider keys, session secrets, or HMAC material. An Actions secret can be used only within a bounded workflow and must never be emitted into logs, artifacts, generated JavaScript, or Pages output. A workflow completion is not a MissionRuntime completion; the proof must show the process, runtime, provider, tool execution, evidence, and verification independently.
+The numeric order is instruction precedence, not an execution grant. Owner authentication, explicitly selected scope, tool authorization, sandboxing, cancellation fencing, and evidence integrity remain required independently. A Pages asset cannot contain `OWNER_TOKEN`, `BRIDGE_TOKEN`, provider keys, session secrets, or HMAC material. An Actions secret can be used only within a bounded workflow and must never be emitted into logs, artifacts, generated JavaScript, or Pages output. A workflow completion is not a MissionRuntime completion; the proof must show the process, runtime, provider, tool execution, evidence, and verification independently.
 
 ## Closest executable architecture
 

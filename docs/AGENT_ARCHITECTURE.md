@@ -69,13 +69,13 @@ The adaptive loop is fail-closed. Provider failure, invalid JSON, identity misma
 The stable CVE fixture at `knowledge/fixtures/incident_cve_x.json` contains a primary advisory, counter-evidence showing a patched asset version, a low-confidence IOC report, and an unverified public claim. It is used only for defensive hypothesis evaluation and does not grant exploit or network-execution authority.
 
 
-## Owner authority tiers — current binding semantics (updated 2026-10-06)
+## Owner instruction precedence and execution gates (updated 2026-10-17)
 
-The internal authority hierarchy of CyberSentinel X is fixed:
+The normative instruction-source order reflects the Owner's explicit direction:
 
 ```text
-SYSTEM_PLATFORM (900)
-  > OWNER_INSTRUCTION (800)
+OWNER_INSTRUCTION (900)
+  > SYSTEM_PLATFORM (800)
   > OWNER_POLICY (600)
   > DETERMINISTIC_ENFORCEMENT
   > AUTHORIZATION_SCOPE
@@ -84,21 +84,12 @@ SYSTEM_PLATFORM (900)
   > EXTERNAL_DATA
 ```
 
-Semantics:
+Semantics and hard boundaries:
 
-- `SYSTEM_PLATFORM` is the immutable outer system/platform boundary. It
-  outranks every application authority and cannot be redefined by Owner text,
-  model output, knowledge, memory, tools, or external data. There is no runtime
-  `OWNER_TOKEN` credential.
-- External constraints CyberSentinel does not control (OS sandbox, host
-  network policy, provider-side limits) are outside application control and
-  likewise cannot be overridden by any Owner Instruction.
-- `OWNER_INSTRUCTION` is the highest **application-configurable** authority:
-  it governs OwnerPolicy and derived application rules, but remains below
-  `SYSTEM_PLATFORM`.
-- Components that read `AuthorityTier` values treat them as descriptive
-  metadata, not an execution input. Numeric tiers and snapshots must still
-  represent the same strict system-first precedence.
+- `OWNER_INSTRUCTION` is the highest normative instruction source; `SYSTEM_PLATFORM` is second. The numeric order is descriptive precedence metadata only, not an execution input or grant of permission.
+- Authentication, explicitly Owner-selected scope, tool authorization, process sandbox, cancellation fencing, and evidence integrity are separate unconditional execution gates. Every applicable gate must pass; no instruction may bypass or relax a failed gate.
+- OS sandbox capabilities, host/network policy, and provider-side limits are enforced as execution facts, not silently changed by a policy rank. There is no runtime `OWNER_TOKEN` credential.
+- `security/authority.py` publishes the closed tier order and explicitly reports that Owner rank grants no execution permission; the live authorization code does not use tier numbers to permit tools.
 
 ## Runtime inventory — canonical vs compatibility status (2026-09-22 audit)
 
@@ -111,9 +102,9 @@ reading every entrypoint. Status:
 | `agent/agent_core.py` (`AgentCore`) | Facade/orchestration boundary over `MissionRuntime` | `api/chat.py` mission mode |
 | `agent/task_runtime.py` (`AgentTaskRuntime`) | Live compatibility task engine | `api/chat.py` **default** mode (`create_task` / `run_to_completion`); each step routes through `core.engine.handle()` |
 | `agent/runtime.py` (`AgentRuntime`) | Planner for the command engine | `core/engine.py` `handle()` (`/api/command`), also the planner under the task path |
-| `agent/loop.py` (`AgentLoop`) | Legacy conversational loop | Not reachable from bridge/api except `tool_definitions()` imported by `bridge.py` for `/api/tools`; still imported by legacy tests |
-| `agent/conversation.py` (`ConversationParser`) | Deterministic intent baseline (not dead) | `core/engine.py` `_handle_once()` |
-| `agent/conversation_provider.py` | Model adapter for the conversation schema | Tests only (not imported by bridge/api/engine) |
+| `agent/loop.py` (`AgentLoop`) | Legacy conversational loop and unused duplicate `tool_definitions()` | No production import/instantiation found in bridge/api/runtime; current `bridge.py` uses `tools.registry.tool_definitions()`; legacy tests may still import it |
+| `agent/conversation.py` (`ConversationParser`) | Deterministic intent baseline | Live: `core/engine.py::_handle_once()` calls `ConversationParser().understand(text)` |
+| `agent/conversation_provider.py` | Validating model adapter for the conversation schema | No production consumer found; referenced by tests only |
 | `agent/model_intelligence/conversation.py` | Live NLU (`NaturalLanguageUnderstanding` → `MissionIntent`) | `AgentCore.understand_mission_intent` / `run_owner_mission` |
 
 Honest gaps against the "one canonical runtime" goal:
@@ -123,14 +114,12 @@ Honest gaps against the "one canonical runtime" goal:
    directive target (chat → AgentCore → MissionRuntime only) is therefore
    **not yet satisfied**; mission mode is opt-in via `{"mission": true}` or
    `mode: "mission"`.
-2. `agent/loop.py` still contains an independent conversational loop
-   (`AgentLoop.run`). It holds no independent security authority —
-   `authorize_tool(item)` there is a structural preflight and real
-   authentication happens inside `core.engine.handle()` via typed
-   `OwnerAuthenticationEvidence` — but it remains a second loop that legacy
-   tests depend on. Removing it requires migrating those tests, moving
-   `tool_definitions()` into `tools/registry.py`, and updating the
-   `bridge.py` import.
+2. `agent/loop.py` still contains a legacy `AgentLoop.run` implementation, but
+   the inspected bridge imports tool metadata from `tools.registry`, and no
+   production caller constructs `AgentLoop`. The duplicate `tool_definitions()`
+   is not the source used by `/api/tools`. Keep this file classified as legacy
+   until its test/compatibility consumers are deliberately migrated; its
+   presence is not evidence of a second live execution path.
 3. No `owner_authenticated=True` trust path exists anymore:
    `security/authorization.py` explicitly rejects a bare boolean
    ("typed Owner authentication evidence required") and forbids mixing legacy

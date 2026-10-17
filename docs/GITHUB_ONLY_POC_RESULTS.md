@@ -139,9 +139,11 @@ Consequently:
 
 ## Security outcome
 
-The POC preserves the CyberSentinel security boundary conceptually and in the workflow design:
+The POC preserves the CyberSentinel security boundary conceptually and in the workflow design. The instruction precedence is Owner-first; execution gates remain separately mandatory:
 
-> `SYSTEM_PLATFORM → OWNER_POLICY → OWNER_INSTRUCTION → DETERMINISTIC_ENFORCEMENT → AUTHORIZATION_SCOPE → TOOL_RUNTIME → MODEL_OUTPUT → EXTERNAL_DATA`
+> `OWNER_INSTRUCTION (900) → SYSTEM_PLATFORM (800) → OWNER_POLICY → DETERMINISTIC_ENFORCEMENT → AUTHORIZATION_SCOPE → TOOL_RUNTIME → MODEL_OUTPUT → EXTERNAL_DATA`
+
+This rank is descriptive precedence only. It does not grant permission or bypass Owner authentication, explicitly selected scope, tool authorization, sandbox, cancellation, or evidence-integrity checks.
 
 The workflow does not:
 

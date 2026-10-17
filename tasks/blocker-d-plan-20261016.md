@@ -17,8 +17,8 @@
 
 1. لا Windows `Popen` عادي ولا تفعيل للـbackend قبل AppContainer/LPAC + ACL/ملفات + شبكة default-deny + disk/resource limits مثبتة + Job Object وإثبات Windows أصلي.
 2. Linux `RLIMIT_AS` يبقى حدًا لكل عملية فقط؛ لا يعلن backend متاحًا دون cgroup v2 مفوضة ذات memory/pids aggregate limits وlauncher يدخل cgroup قبل `exec` وتنظيف موثوق. غياب التفويض يعني عدم التنفيذ.
-3. مصدر الحقيقة لإلغاء Owner والـdispatch وحالة Mission هو CAS دائم وفنس التنفيذ في SQLite، لا locks/events محلية. لا يعاد الأثر الخارجي الملتبس تلقائيًا.
-4. MCP deadline يشمل طابور executor ويتحقق مجددًا عند send boundary؛ إلغاء queued future ومنع الإرسال المتأخر، مع إبقاء الأثر الذي بدأ إرساله ملتبسًا دون retry.
+3. مصدر الحقيقة لحالة Mission وقرار الإلغاء/dispatch هو CAS دائم وفنس التنفيذ في SQLite؛ قفلا OS للطلب والكتابة ينسقان النقل فقط ولا يحلان محل CAS. يُنشر cancel marker النهائي تحت قفل الكتابة نفسه المستخدم لكل socket write؛ لا يعاد الأثر الخارجي الملتبس تلقائيًا.
+4. MCP deadline يشمل طابور executor وDNS وقفل الطلب والنقل؛ يبدأ `request_guard` بعد DNS، ثم يبقى حتى إغلاق socket. resolver bounded ومراقب للإلغاء؛ لا يعاد إرسال أثر بدأ إرساله.
 5. أدلة القبول تعتمد receipt بدء OS حقيقي مربوطًا بالـMission والنداء والنتيجة. لا تسمح ببيانات أسرار أو نصوص exceptions الخام، ولا تصطنع نجاحًا أو أحداثًا.
 6. Lifecycle acceptance يطلق التطبيق المثبت تحت Job مملوك للاختبار، ويتحقق من identity/creation time والـtree، وينهي Job المقصود فقط، ثم يستعيد Mission من الحالة الدائمة.
 
@@ -43,9 +43,9 @@
 
 ### المرحلة 3 — حماية MCP executor من الإرسال المتأخر
 
-- deadline من قبل `submit` حتى حد إرسال socket؛ future cancellation عند الانتظار/الإلغاء؛ token/deadline عند worker boundary.
-- لا retry لأثر بدأ إرساله. إرسال notification الإلغاء مستقل مع إعادة فحص Owner/Mission/Scope/Fence حتى بعد deadline التنفيذ.
-- الاختبارات: ازدحام كل worker؛ RPC ينتهي في الطابور ولا يرسل بعد تحريره؛ race عند send؛ إرسال واحد فقط؛ رفض cancel notification المنتهك للنطاق.
+- deadline من `submit` عبر DNS bounded وقفل request حتى أول إرسال/اكتمال النقل؛ token يعاد فحصه عند worker وsend boundary. DNS يسبق قفل الطلب، وخانات resolver محدودة؛ الإلغاء/المهلة تعيدان المستدعي قبل اكتمال resolver المحجوز دون إنشاء socket متأخر.
+- يوقظ `.intent` watcher لإغلاق الاتصال فورًا، لكنه ليس commit دائمًا؛ يثبت `.cancel` تحت send lock بعد خروج أي socket write نشط. بعدها ينتظر Owner request gate حتى الإغلاق ثم يُنفذ CAS؛ لا retry لأثر بدأ إرساله، وnotification الإلغاء تبقى خاضعة لإعادة فحص Owner/Mission/Scope/Fence.
+- الاختبارات: ازدحام كل worker؛ RPC ينتهي في الطابور؛ Owner cancel أثناء DNS/الاتصال/الكتابة/قراءة الرد؛ marker بعد الإغلاق؛ race عند أول send؛ إرسال واحد فقط؛ رفض notification المنتهك للنطاق.
 
 ### المرحلة 4 — عقد sandbox والحد الإجمالي وprocess receipts
 
@@ -87,9 +87,21 @@
 | لا يوجد cgroup delegation في runner الحالي | لا تنفذ process sandbox محليًا؛ لا تدّعِ إثبات aggregate limits |
 | اختلاف terminal/cancel عبر مخازن SQLite | transaction واحدة/attached DB مع rollback journal أو رفض آمن؛ لا Python lock كضمان |
 | MCP أثر خارجي بدأ قبل timeout | نتيجة ambiguous بلا replay، وnotification إلغاء منفصلة بعد authorization/scope checks |
+| OS DNS resolver لا يقبل الإنهاء عند التعليق | لا يُمسك قفلًا أثناء DNS؛ أربعة daemon slots كحد أقصى، وإلا fail-closed عند امتلائها؛ لا socket من نتيجة متأخرة |
+| اختلاف دلالات lock عبر أنظمة الملفات/المضيفين | قصر التشغيل على filesystem محلي ذي دلالات قفل متحققة؛ لا ادعاء distributed locking، وWindows `msvcrt.locking` يحتاج قبولًا أصليًا |
+| crash بعد `.intent` وقبل/أثناء cancel CAS | fail-closed ومنع dispatch؛ لا مسح تلقائي، والتعافي يتطلب مطابقة marker مع SQLite وOwner authority قبل أي رفع للحظر |
 | تلاعب أو تسريب عبر acceptance artifacts | receipts مربوطة، إسقاط allowlist، حذف النص الحر، ورفض السلسلة غير المكتملة |
 | harness غير قادر على إثبات العملية التي أطلقها | لا قتل أو restart بالاسم/PID وحده؛ الاختبار يفشل بوضوح |
 
 ## معيار الاكتمال
 
 لا تكتمل المهمة باكتمال الكود فقط. يجب أن تتوافق النتيجة مع سجلات التنفيذ والأحداث الفعلية، نجاح اختبارات Linux، وجود دليل Windows أصلي عند ادعاء نجاحه، سلامة checkpoints والـOwner/scope/fence، وعدم تعديل `main` أو tags/releases المحمية.
+
+## حالة التنفيذ والتحقق — 2026-10-17
+
+- **نفذ برمجيًا:** CAS دائمة للإلغاء/dispatch/terminal/recovery؛ bounded DNS cancellation؛ `.intent` للإيقاظ و`.cancel` النهائي المتسلسل مع كل socket write عبر per-Mission OS send gate؛ request gate ممتد لدورة HTTP؛ Linux cgroup-v2 aggregate limits مع fail-closed إذا لم يوجد delegation؛ process receipts؛ verifier وallowlists للأدلة؛ harness lifecycle مملوك عبر Win32 Job Object.
+- **الاختبارات المركزة بعد إصلاح السباق:** `tests/test_dispatch_gate.py tests/test_mcp_client.py tests/test_pinned_http.py tests/test_external_effect_ledger.py` → `73 passed`.
+- **Linux full suite النهائي الحالي:** `python -m pytest -q` → `1992 passed, 25 skipped, 4 warnings` (exit 0)، ثم `compileall` للملفات المتغيرة و`git diff --check` دون أخطاء. بقيت اختبارات التكامل المعتمدة على capability الفعلية gated؛ probe سابق أعاد `cgroup_v2_delegation_unavailable`. تحذيرات multiprocessing/fork لا تفشل الاختبارات.
+- **المراجعة المستقلة:** لا findings بمستوى P1/P2 في مسار إلغاء Owner وكتابة MCP بعد إضافة send gate. حدود المراجعة: لم يُشغّل Windows native؛ وقد تصل بايتات سبق أن قبلها kernel socket buffer إلى النظير بعد لحظة marker، لكن لا تبدأ كتابة تطبيقية جديدة بعد `.cancel` النهائي ولا يحدث Owner SQLite CAS قبل إغلاق الطلب.
+- **الحالة:** **PARTIALLY VERIFIED**؛ لا توجد أدلة قبول Windows أصلية. لا يتوفر backend Windows AppContainer/LPAC، لذلك يظل Windows process execution fail-closed (`windows_appcontainer_backend_unimplemented`). `WindowsOwnedJob` يدير lifecycle المقبول فقط ولا يثبت عزل Mission process. Linux `cgroup_v2_delegation_unavailable` يمنع إثبات تشغيل sandbox فعلي في هذه البيئة.
+- **المتبقي:** secret scan، commits ذرية، push fast-forward لفرع المراجعة فقط بعد فحص العمل؛ Windows build/Job acceptance لا يمكن إثباتهما دون Windows أصلي؛ لا دمج إلى `main` ولا tag/release `v5.2`.
