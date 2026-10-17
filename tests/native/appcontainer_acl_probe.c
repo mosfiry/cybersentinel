@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <sddl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 #include <stdint.h>
 #include <string.h>
