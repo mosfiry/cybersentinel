@@ -28,8 +28,16 @@ _SE_FILE_OBJECT = 1
 
 def _run_compile_command(command: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run only the test's fixed VS developer setup and cl compile command."""
+    # cmd.exe does not parse Python list2cmdline's backslash-escaped embedded
+    # quotes. Keep the trusted fixed command in a batch file and pass only its
+    # path through argv, preserving spaces in the Visual Studio installation.
+    script = cwd / "compile-native-probe.cmd"
+    # The ASCII prefix changes cmd's active code page before it reads the next
+    # UTF-8 command line, including non-ASCII account/temp/repository paths.
+    prefix = "@echo off\r\nchcp 65001 >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\n"
+    script.write_bytes((prefix + command + "\r\nexit /b %errorlevel%\r\n").encode("utf-8"))
     return subprocess.run(
-        ["cmd.exe", "/d", "/c", command],
+        ["cmd.exe", "/d", "/c", str(script)],
         cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
         shell=False, timeout=120, check=False,

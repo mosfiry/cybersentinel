@@ -40,3 +40,30 @@ def test_appcontainer_gate_requires_exact_native_tests_and_no_soft_failures():
     assert "if: always()" in upload
     assert "if-no-files-found: error" in upload
     assert "${{ github.sha }}" in upload
+
+
+def test_native_compiler_uses_batch_path_not_escaped_nested_cmd_quotes(tmp_path, monkeypatch):
+    import importlib.util
+    import subprocess
+
+    spec = importlib.util.spec_from_file_location("native_compile_regression", ROOT / "tests/test_windows_appcontainer_workspace_native.py")
+    fixture_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture_module)
+    build = tmp_path / "path with spaces"
+    build.mkdir()
+    command = r'call "C:\Program Files\Visual Studio\VsDevCmd.bat" -arch=amd64 && cl "مصدر probe.c" /MT'
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured.update(argv=argv, kwargs=kwargs)
+        return subprocess.CompletedProcess(argv, 7, stdout="compiler failure remains a failure")
+
+    monkeypatch.setattr(fixture_module.subprocess, "run", fake_run)
+    result = fixture_module._run_compile_command(command, build)
+    script = build / "compile-native-probe.cmd"
+    assert captured["argv"] == ["cmd.exe", "/d", "/c", str(script)]
+    assert captured["kwargs"]["shell"] is False
+    assert captured["kwargs"]["timeout"] == 120
+    prefix = "@echo off\r\nchcp 65001 >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\n"
+    assert script.read_bytes() == (prefix + command + "\r\nexit /b %errorlevel%\r\n").encode("utf-8")
+    assert result.returncode == 7
