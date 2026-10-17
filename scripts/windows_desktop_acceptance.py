@@ -3040,15 +3040,36 @@ def _goal_completion_events_verified(status: object, timeline: object) -> bool:
 
 def _mission_record_integrity_verified(status: object) -> bool:
     """Verify the persisted Mission envelope returned by status, excluding its API-only queue view."""
+    return _mission_record_integrity_diagnostic(status) is None
+
+
+def _mission_record_integrity_diagnostic(status: object) -> str | None:
+    """Return only a fixed, non-sensitive integrity failure code for a Mission status record."""
     if not isinstance(status, dict):
-        return False
+        return "mission_status_invalid"
     record = dict(status)
     record.pop("queue", None)
+    supplied_hash = record.get("integrity_hash")
+    if not isinstance(supplied_hash, str) or not supplied_hash:
+        return "mission_integrity_hash_missing"
     try:
         mission = _Mission.from_dict(record)
-        return mission.verify_integrity() is True
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+        if exc.args == ("mission_integrity_hash_mismatch",):
+            return "mission_integrity_hash_mismatch"
+        if exc.args == ("trajectory_integrity_mismatch",):
+            return "mission_trajectory_hash_mismatch"
+        return "mission_record_schema_invalid"
     except Exception:
-        return False
+        return "mission_record_integrity_invalid"
+    try:
+        if mission.verify_integrity() is not True:
+            return "mission_integrity_hash_mismatch"
+    except (TypeError, ValueError, KeyError, IndexError, AttributeError):
+        return "mission_record_schema_invalid"
+    except Exception:
+        return "mission_record_integrity_invalid"
+    return None
 
 
 _PROCESS_SANDBOX_PREFLIGHT_REASON_KINDS = {
@@ -3137,6 +3158,10 @@ _MISSION_RESTART_DIAGNOSTIC_CODES = frozenset(
         "mission_timeline_invalid",
         "trajectory_timeline_mismatch",
         "mission_record_integrity_invalid",
+        "mission_integrity_hash_missing",
+        "mission_integrity_hash_mismatch",
+        "mission_trajectory_hash_mismatch",
+        "mission_record_schema_invalid",
         "trajectory_integrity_invalid",
     }
 )
@@ -4245,8 +4270,8 @@ def _mission_restart_basis(
         diagnostic_code = "mission_timeline_invalid"
     elif status.get("trajectory") != timeline:
         diagnostic_code = "trajectory_timeline_mismatch"
-    elif not _mission_record_integrity_verified(status):
-        diagnostic_code = "mission_record_integrity_invalid"
+    elif (integrity_diagnostic := _mission_record_integrity_diagnostic(status)) is not None:
+        diagnostic_code = integrity_diagnostic
     elif not _trajectory_timeline_integrity(timeline, mission_id, status.get("request_id")):
         diagnostic_code = "trajectory_integrity_invalid"
     else:

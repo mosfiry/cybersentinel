@@ -5529,3 +5529,88 @@ def test_preflight_restart_basis_fails_closed_without_type_error_for_unhashable_
     basis = windows_acceptance._mission_restart_basis(corrupted, mission_id)
     assert basis["status"] == "BLOCKED"
     assert basis["kind"] == "NOT_RUN"
+
+
+
+def test_mission_integrity_diagnostics_are_fixed_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+    import json
+
+    mission_id, _ready_snapshot, snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+    status = snapshot["status"]
+    assert windows_acceptance._mission_record_integrity_diagnostic(status) is None
+    assert windows_acceptance._mission_record_integrity_verified(status) is True
+
+    missing_hash = json.loads(json.dumps(status))
+    missing_hash.pop("integrity_hash", None)
+    assert windows_acceptance._mission_record_integrity_diagnostic(missing_hash) == "mission_integrity_hash_missing"
+    assert windows_acceptance._mission_record_integrity_verified(missing_hash) is False
+
+    hash_mismatch = json.loads(json.dumps(status))
+    hash_mismatch["integrity_hash"] = "0" * 64
+    assert windows_acceptance._mission_record_integrity_diagnostic(hash_mismatch) == "mission_integrity_hash_mismatch"
+    assert windows_acceptance._safe_mission_restart_diagnostic_code(
+        windows_acceptance._mission_record_integrity_diagnostic(hash_mismatch)
+    ) == "mission_integrity_hash_mismatch"
+    basis_snapshot = json.loads(json.dumps(snapshot))
+    basis_snapshot["status"]["integrity_hash"] = "0" * 64
+    basis = windows_acceptance._mission_restart_basis(basis_snapshot, mission_id)
+    assert basis["status"] == "BLOCKED"
+    assert basis["diagnostic_code"] == "mission_integrity_hash_mismatch"
+
+    def resign_envelope(record: dict) -> dict:
+        queue = record.pop("queue", None)
+        record.pop("integrity_hash", None)
+        record["integrity_hash"] = hashlib.sha256(
+            json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+        ).hexdigest()
+        if queue is not None:
+            record["queue"] = queue
+        return record
+
+    trajectory_mismatch = json.loads(json.dumps(status))
+    trajectory_mismatch["trajectory"][0]["data"]["objective"] = "tampered"
+    resign_envelope(trajectory_mismatch)
+    assert windows_acceptance._mission_record_integrity_diagnostic(trajectory_mismatch) == "mission_trajectory_hash_mismatch"
+    assert windows_acceptance._mission_record_integrity_verified(trajectory_mismatch) is False
+
+    malformed = json.loads(json.dumps(status))
+    malformed.pop("plan")
+    resign_envelope(malformed)
+    assert windows_acceptance._mission_record_integrity_diagnostic(malformed) == "mission_record_schema_invalid"
+    assert windows_acceptance._mission_record_integrity_verified(malformed) is False
+
+
+
+def test_unexpected_mission_integrity_error_uses_generic_safe_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mission_id, _ready_snapshot, snapshot = _durable_preflight_acceptance_snapshots(
+        tmp_path,
+        monkeypatch,
+    )
+
+    def raise_unexpected_error(_cls, _record):
+        raise RuntimeError("sensitive exception details must not escape")
+
+    monkeypatch.setattr(
+        windows_acceptance._Mission,
+        "from_dict",
+        classmethod(raise_unexpected_error),
+    )
+    assert windows_acceptance._mission_record_integrity_diagnostic(snapshot["status"]) == "mission_record_integrity_invalid"
+    assert windows_acceptance._mission_record_integrity_verified(snapshot["status"]) is False
+    assert mission_id == snapshot["status"]["mission_id"]
