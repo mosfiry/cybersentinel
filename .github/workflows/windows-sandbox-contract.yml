@@ -1,0 +1,116 @@
+name: windows-sandbox-contract
+
+on:
+  push:
+    branches: [fix/blocker-d-review-20261010]
+    paths:
+      - "workspace/**"
+      - "security/**"
+      - "agent/**"
+      - "core/**"
+      - "tools/**"
+      - "api/**"
+      - "scripts/windows_process_job.py"
+      - "tests/**"
+      - "requirements*.txt"
+      - ".github/workflows/windows-sandbox-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-sandbox-contract-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  native-contract:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install test dependencies (no model or inference)
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      # Trusted harness fixtures only. Job lifecycle is NOT Mission sandboxing.
+      - name: Native Job lifecycle and governed fail-closed tests
+        run: >-
+          python -m pytest -q
+          tests/test_windows_process_job.py::test_native_job_assigns_suspended_process_and_terminates_descendants
+          tests/test_windows_process_job.py::test_native_job_runner_kills_descendant_after_root_exits
+          tests/test_windows_process_job.py::test_native_job_runner_timeout_terminates_root_and_descendants
+          tests/test_process_sandbox_contract.py::test_native_windows_process_execution_fails_closed_until_appcontainer_backend_exists
+          tests/test_process_sandbox_contract.py::test_native_windows_unimplemented_backend_refuses_spawn_before_dispatch
+          tests/test_windows_sandbox_governed_refusal.py::test_native_windows_governed_refusal_is_durable
+          --junitxml=native-sandbox-contract.xml -o junit_family=xunit1
+      - name: Reject missing or skipped native coverage and record bounded evidence
+        if: always()
+        run: |
+          @'
+          import json
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          from workspace.process_sandbox import get_process_sandbox_backend
+
+          expected = {
+              "test_native_job_assigns_suspended_process_and_terminates_descendants",
+              "test_native_job_runner_kills_descendant_after_root_exits",
+              "test_native_job_runner_timeout_terminates_root_and_descendants",
+              "test_native_windows_process_execution_fails_closed_until_appcontainer_backend_exists",
+              "test_native_windows_unimplemented_backend_refuses_spawn_before_dispatch",
+              "test_native_windows_governed_refusal_is_durable",
+          }
+          junit = Path("native-sandbox-contract.xml")
+          cases = list(ET.parse(junit).iter("testcase")) if junit.is_file() else []
+          names = [case.get("name") for case in cases]
+          bad = sum(any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
+          availability = get_process_sandbox_backend().availability()
+          native = sys.platform == "win32" and os.name == "nt"
+          blocked = not availability.available and availability.backend == "windows-appcontainer-job" and availability.detail_code == "windows_appcontainer_backend_unimplemented"
+          verified = native and blocked and len(cases) == len(expected) and set(names) == expected and bad == 0
+          report = {
+              "schema": "windows-sandbox-contract-v1",
+              "source_commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "runner_image": os.environ.get("ImageOS"),
+              "runner_image_version": os.environ.get("ImageVersion"),
+              "windows_version": list(sys.getwindowsversion()[:3]) if native else None,
+              "gate_status": "PASS" if verified else "FAIL",
+              "native_test_count": len(cases),
+              "nonpassing_test_count": bad,
+              "backend_available": availability.available,
+              "backend": availability.backend,
+              "reason_code": availability.reason_code,
+              "detail_code": availability.detail_code,
+              "mission_acceptance": "BLOCKED" if blocked else "NOT_VALIDATED",
+              "verified_scope": ["trusted_harness_job_lifecycle", "governed_preflight_refusal"] if verified else [],
+              "not_validated": ["appcontainer_lpac", "workspace_acl", "network_denial", "aggregate_resource_bounds", "sandboxed_mission_dispatch"],
+          }
+          Path("native-sandbox-contract.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          if not verified:
+              raise SystemExit("native_contract_coverage_failed")
+          '@ | python -
+      - name: Upload native contract evidence (not sandbox acceptance)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-sandbox-contract-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-sandbox-contract.xml
+            native-sandbox-contract.json
+          if-no-files-found: error
+          retention-days: 30
