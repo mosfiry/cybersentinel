@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.windows_process_job as windows_job_module
 from scripts.windows_process_job import (
     WindowsOwnedJob,
     run_installer_in_owned_job,
@@ -111,6 +112,72 @@ def test_job_runner_fails_closed_when_tree_emptiness_cannot_be_verified(tmp_path
     assert result["status"] == "cleanup_failed"
     assert result["job_tree_termination_verified"] is False
     assert result["job_remaining_member_count"] == 1
+
+
+@pytest.mark.parametrize("termination_method", ["terminate_current", "terminate_owned_job"])
+@pytest.mark.parametrize(
+    ("initial_members", "process_counts", "wait_results"),
+    [
+        (1, (1, 0, 0), (windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_OBJECT_0)),
+        (0, (0, 0), (windows_job_module._WAIT_TIMEOUT, windows_job_module._WAIT_OBJECT_0)),
+    ],
+)
+def test_termination_waits_for_root_handle_after_job_becomes_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    termination_method: str,
+    initial_members: int,
+    process_counts: tuple[int, ...],
+    wait_results: tuple[int, ...],
+) -> None:
+    executable = tmp_path / "CyberSentinel.exe"
+    executable.write_bytes(b"fixture executable")
+    identity = windows_job_module.WindowsProcessIdentity(
+        process_id=1234,
+        image_path=str(executable.resolve()),
+        creation_time=5678,
+        process_handle=99,
+    )
+
+    class FakeKernel32:
+        def __init__(self) -> None:
+            self.wait_results = iter(wait_results)
+            self.terminated_jobs: list[tuple[int, int]] = []
+            self.closed_handles: list[int] = []
+
+        def TerminateJobObject(self, handle: int, exit_code: int) -> int:
+            self.terminated_jobs.append((handle, exit_code))
+            return 1
+
+        def WaitForSingleObject(self, handle: int, _timeout_ms: int) -> int:
+            assert handle == identity.process_handle
+            return next(self.wait_results)
+
+        def CloseHandle(self, handle: int) -> int:
+            self.closed_handles.append(handle)
+            return 1
+
+    kernel32 = FakeKernel32()
+    monkeypatch.setattr(windows_job_module, "_kernel32", lambda: kernel32)
+    monkeypatch.setattr(windows_job_module, "_identity_from_handle", lambda *_args: identity)
+    monkeypatch.setattr(windows_job_module, "_is_process_in_job", lambda *_args: True)
+    monkeypatch.setattr(windows_job_module.time, "sleep", lambda _seconds: None)
+    job = WindowsOwnedJob("Local\\fixture-job", 77)
+    job.current = identity
+    member_counts = iter(process_counts)
+    monkeypatch.setattr(job, "process_count", lambda: next(member_counts))
+
+    if termination_method == "terminate_current":
+        result = job.terminate_current(1234, executable, timeout_seconds=10)
+    else:
+        result = job.terminate_owned_job(timeout_seconds=10)
+
+    assert result["initial_member_count"] == initial_members
+    assert result["remaining_member_count"] == 0
+    assert result["root_process_stopped"] is True
+    assert result["termination_succeeded"] is True
+    assert kernel32.terminated_jobs == [(77, 0xD)]
+    assert job.current is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")

@@ -291,23 +291,20 @@ class WindowsOwnedJob:
     ) -> dict[str, int | bool | str]:
         identity = self.verify_current(process_id, expected_image)
         initial_members = self.process_count()
-        if initial_members <= 0:
+        root_stopped = self.wait_current(0)
+        if initial_members <= 0 and root_stopped:
             return {
                 "job_name": self.name,
                 "initial_member_count": 0,
                 "remaining_member_count": 0,
+                "root_process_stopped": True,
                 "identity_verified": True,
                 "termination_succeeded": True,
             }
         if not self._kernel32.TerminateJobObject(self._handle, 0xD):
             raise _win_error("windows_job_termination_failed")
         deadline = time.monotonic() + max(0.0, timeout_seconds)
-        while time.monotonic() < deadline:
-            if self.process_count() == 0:
-                break
-            time.sleep(0.05)
-        remaining = self.process_count()
-        root_stopped = self._kernel32.WaitForSingleObject(identity.process_handle, 0) == _WAIT_OBJECT_0
+        remaining, root_stopped = self._wait_for_job_and_root_exit(deadline=deadline)
         result: dict[str, int | bool | str] = {
             "job_name": self.name,
             "initial_member_count": initial_members,
@@ -324,20 +321,13 @@ class WindowsOwnedJob:
         """Terminate only this unique job; intended for final owned-job cleanup."""
         self._require_open()
         initial_members = self.process_count()
-        if initial_members and not self._kernel32.TerminateJobObject(self._handle, 0xD):
+        root_stopped = self.current is None or self.wait_current(0)
+        if (initial_members or not root_stopped) and not self._kernel32.TerminateJobObject(
+            self._handle, 0xD
+        ):
             raise _win_error("windows_job_termination_failed")
         deadline = time.monotonic() + max(0.0, timeout_seconds)
-        while time.monotonic() < deadline:
-            if self.process_count() == 0:
-                break
-            time.sleep(0.05)
-        remaining = self.process_count()
-        root_stopped = True
-        if self.current is not None:
-            root_stopped = (
-                self._kernel32.WaitForSingleObject(self.current.process_handle, 0)
-                == _WAIT_OBJECT_0
-            )
+        remaining, root_stopped = self._wait_for_job_and_root_exit(deadline=deadline)
         result: dict[str, int | bool | str] = {
             "job_name": self.name,
             "initial_member_count": initial_members,
@@ -348,6 +338,18 @@ class WindowsOwnedJob:
         if result["termination_succeeded"]:
             self._close_current()
         return result
+
+    def _wait_for_job_and_root_exit(self, *, deadline: float) -> tuple[int, bool]:
+        """Wait for both Job Object emptiness and the retained root handle signal."""
+        while True:
+            remaining = self.process_count()
+            root_stopped = self.current is None or self.wait_current(0)
+            if remaining == 0 and root_stopped:
+                return remaining, root_stopped
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                return remaining, root_stopped
+            time.sleep(min(0.05, remaining_seconds))
 
     def process_count(self) -> int:
         self._require_open()
