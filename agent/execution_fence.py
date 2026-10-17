@@ -304,6 +304,8 @@ class ExecutionFence:
             execution_id=execution_id,
             authorization_snapshot=authorization_snapshot,
         )
+        if self.queue.owner_cancellation_requested(mission_id):
+            raise ExecutionFenceError("Owner cancellation marker blocks new tool dispatch")
         if not self.queue.require_execution_fence:
             return self
         mission_store = getattr(self.queue, "mission_store", None)

@@ -762,8 +762,18 @@ class MissionRuntime:
     def request_agent_task_cancellation(self, mission: Mission) -> int:
         """Record graph cancellation after the caller has authenticated Owner control."""
         from tools.registry import cancel_active_mission_tool_executions
+        from security.dispatch_gate import MissionDispatchGate
 
-        signaled = cancel_active_mission_tool_executions(mission.mission_id)
+        queue = getattr(self.execution_fence, "queue", None)
+        dispatch_gate = MissionDispatchGate(
+            self.store.db_path,
+            mission.mission_id,
+            cancellation_db_path=getattr(queue, "db_path", None),
+        )
+        signaled = cancel_active_mission_tool_executions(
+            mission.mission_id,
+            dispatch_gate=dispatch_gate,
+        )
         if self.task_graph_adapter is None:
             return signaled
         try:

@@ -310,6 +310,20 @@ class MissionStore:
                 # The queue DB is attached to this write transaction, preventing
                 # lease recovery/reclaim between fence validation and mission CAS.
                 execution_fence.assert_current(mission=mission, db=db, allow_claimed=allow_claimed)
+                if mission.status is MissionStatus.GOAL_COMPLETED:
+                    from pathlib import Path
+
+                    queue_schema = (
+                        '"main"'
+                        if str(Path(self.db_path).resolve()) == str(Path(execution_fence.queue.db_path).resolve())
+                        else '"execution_queue"'
+                    )
+                    cancel_row = db.execute(
+                        f"SELECT owner_cancel_requested FROM {queue_schema}.mission_queue WHERE mission_id=?",
+                        (mission.mission_id,),
+                    ).fetchone()
+                    if cancel_row is not None and bool(cancel_row[0]):
+                        raise ExecutionFenceError("Owner cancellation won before terminal Mission save")
             payload = mission.to_dict()
             encoded = json.dumps(payload, ensure_ascii=False)
             existing = db.execute("SELECT payload FROM missions WHERE mission_id=?", (mission.mission_id,)).fetchone()

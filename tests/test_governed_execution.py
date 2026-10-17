@@ -1,6 +1,7 @@
 from __future__ import annotations
 from runtime_authorization import make_test_snapshot
 from owner_session_testutils import allow_owner_sessions
+from process_sandbox_testutils import require_live_process_sandbox
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,7 @@ def auth(root: str, *, mission_id: str = "m1", owner: str = "owner-proof", actio
 
 
 def test_run_project_tests_uses_workspace_and_persists_evidence(tmp_path, monkeypatch):
+    require_live_process_sandbox()
     import hashlib
     import socket
     from owner_session_testutils import allow_owner_sessions
@@ -289,7 +291,13 @@ def test_file_size_abuse_hits_the_kernel_limit():
         assert result["ok"] is True, {key: result.get(key) for key in ("returncode", "output", "artifact_refs")}
         assert result["returncode"] == 0
         assert "8 passed" in result["output"]
-        assert result["sandbox_backend"] == "bubblewrap+prlimit"
+        assert result["sandbox_backend"] == "bubblewrap+prlimit+cgroup-v2"
+        assert result["outcome"] == "SUCCEEDED"
+        assert result["reason_code"] == "process_exit_zero"
+        assert result["resource_limit_reason"] is None
+        assert result["process_started"] is True
+        assert type(result["process_id"]) is int and result["process_id"] > 0
+        assert result["process_started_at_utc"]
         assert result["artifact_refs"]
         assert not (tmp_path / "write-outside-workspace.txt").exists()
         records = store.list(request_id=request_id)
@@ -302,6 +310,9 @@ def test_file_size_abuse_hits_the_kernel_limit():
         assert evidence_payload["trust"] == "untrusted_data"
         assert evidence_payload["authority"] == "none"
         assert evidence_payload["network"] == "disabled"
+        assert evidence_payload["process_started"] is True
+        assert evidence_payload["process_id"] == result["process_id"]
+        assert evidence_payload["process_started_at_utc"] == result["process_started_at_utc"]
         assert result["artifact_refs"][0]["validation"] == "unvalidated"
         assert "synthetic-test-only-value" not in repr(workspace.audit)
         assert process_record["mission_id"] == mission_id

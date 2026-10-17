@@ -49,12 +49,16 @@ class ExecutionContext:
     evidence_store: Any = field(default=None, repr=False, compare=False)
     artifact_store: Any = field(default=None, repr=False, compare=False)
     cancellation_event: Event | None = field(default=None, repr=False, compare=False)
+    dispatch_cancel_pending_event: Event | None = field(default=None, repr=False, compare=False)
+    dispatch_request_lock: Any = field(default=None, repr=False, compare=False)
+    dispatch_gate: Any = field(default=None, repr=False, compare=False)
     deadline_monotonic: float | None = field(default=None, repr=False, compare=False)
     delegation_scope: Any = field(default=None, repr=False, compare=False)
     tool_dispatch_lock: Any = field(default=None, repr=False, compare=False)
     process_dispatch_lock: Any = field(default=None, repr=False, compare=False)
     process_dispatch_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
     process_start_callback: Callable[[str, int | None, str | None], None] | None = field(default=None, repr=False, compare=False)
+    scope_pinned_http_dispatch_callback: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     def authorize_process_dispatch(self, *, backend: str) -> None:
         """Commit the fenced dispatch immediately before the approved backend starts a child."""
@@ -71,6 +75,8 @@ class ExecutionContext:
         allow_deadline_expired: bool = False,
     ):
         """Linearize an external dispatch boundary against Owner cancellation."""
+        if self.dispatch_cancel_pending_event is not None and self.dispatch_cancel_pending_event.is_set():
+            raise PermissionError("Owner cancellation is being committed; dispatch stopped")
         lock = self.tool_dispatch_lock or self.process_dispatch_lock
         if lock is None:
             self.assert_active(
@@ -80,6 +86,8 @@ class ExecutionContext:
             yield
             return
         with lock:
+            if self.dispatch_cancel_pending_event is not None and self.dispatch_cancel_pending_event.is_set():
+                raise PermissionError("Owner cancellation is being committed; dispatch stopped")
             self.assert_active(
                 allow_cancelled=allow_cancelled,
                 allow_deadline_expired=allow_deadline_expired,

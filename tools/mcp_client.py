@@ -8,6 +8,7 @@ trust server-provided descriptions/annotations. Discovery is data; invocation
 is possible only for a TRUSTED server and an Owner-approved schema revision.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,32 @@ class MCPRequestTimeout(MCPClientError):
 
 class MCPRequestCancelled(MCPClientError):
     pass
+
+
+class MCPDispatchToken:
+    """Per-request deadline/cancellation guard used immediately before HTTP send."""
+
+    def __init__(self, deadline: float, cancellation_event: Any = None, *, allow_cancelled: bool = False):
+        self.deadline = float(deadline)
+        self.cancellation_event = cancellation_event
+        self.allow_cancelled = bool(allow_cancelled)
+        self.sent = threading.Event()
+
+    def assert_sendable(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise MCPRequestTimeout("mcp_request_deadline_expired_before_send")
+        if (
+            not self.allow_cancelled
+            and self.cancellation_event is not None
+            and bool(getattr(self.cancellation_event, "is_set", lambda: False)())
+        ):
+            raise MCPRequestCancelled("mcp_request_cancelled_before_send")
+
+    def remaining(self) -> float:
+        value = self.deadline - time.monotonic()
+        if value <= 0:
+            raise MCPRequestTimeout("mcp_request_deadline_expired_before_send")
+        return value
 
 
 @dataclass(frozen=True)
@@ -661,14 +688,19 @@ class MCPRemoteClient:
     def response_transcript_sha256(self) -> str:
         return _sha256("\0".join(self._response_digests))
 
-    def _authorize_scope(self, *, ignore_cancel: bool = False) -> None:
+    def _authorize_scope(self, *, ignore_cancel: bool = False, consume_rate: bool = True) -> None:
         context = self.context
         if ignore_cancel:
             try:
-                context = replace(context, cancellation_event=None)
+                context.assert_active(allow_cancelled=True, allow_deadline_expired=True)
             except Exception:
-                raise PermissionError("canonical_execution_context_required") from None
-        context.assert_active()
+                try:
+                    context = replace(context, cancellation_event=None)
+                    context.assert_active()
+                except Exception:
+                    raise PermissionError("canonical_execution_context_required") from None
+        else:
+            context.assert_active()
         scope = context.scope_snapshot
         required = {"program_id", "target_id", "scope_snapshot_id"}
         if not isinstance(scope, dict) or not required.issubset(scope):
@@ -676,12 +708,26 @@ class MCPRemoteClient:
         from security.scope_resolver import resolve
         decision = resolve(
             str(scope["scope_snapshot_id"]), str(scope["target_id"]), self.endpoint,
-            method="POST", expected_program_id=str(scope["program_id"]), consume_rate=True,
+            method="POST", expected_program_id=str(scope["program_id"]), consume_rate=consume_rate,
         )
         if not decision.allowed:
             raise PermissionError("mcp_scope_denied: " + str(decision.reason))
 
-    def _post(self, message: dict[str, Any], *, ignore_cancel: bool = False, timeout: float | None = None):
+    def _post(
+        self,
+        message: dict[str, Any],
+        *,
+        ignore_cancel: bool = False,
+        timeout: float | None = None,
+        dispatch_token: MCPDispatchToken | None = None,
+    ):
+        request_timeout = self.timeout if timeout is None else float(timeout)
+        token = dispatch_token or MCPDispatchToken(
+            time.monotonic() + request_timeout,
+            getattr(self.context, "cancellation_event", None),
+            allow_cancelled=ignore_cancel,
+        )
+        token.assert_sendable()
         self._authorize_scope(ignore_cancel=ignore_cancel)
         headers = {
             "Accept": "application/json, text/event-stream",
@@ -692,25 +738,108 @@ class MCPRemoteClient:
         if self._protocol_version:
             headers["MCP-Protocol-Version"] = self._protocol_version
         dispatch_guard_factory = getattr(self.context, "dispatch_guard", None)
-        dispatch_guard = None
-        if callable(dispatch_guard_factory):
-            dispatch_guard = lambda: dispatch_guard_factory(
-                allow_cancelled=ignore_cancel,
-                allow_deadline_expired=ignore_cancel,
-            )
+
+        def authorize_http_send() -> None:
+            token.assert_sendable()
+            # Charge the scoped rate limit above, then revalidate Owner/Mission/
+            # Scope immediately before the first socket write without charging twice.
+            self._authorize_scope(ignore_cancel=ignore_cancel, consume_rate=False)
+            callback = getattr(self.context, "scope_pinned_http_dispatch_callback", None)
+            if callable(callback):
+                callback()
+            token.sent.set()
+
+        @contextmanager
+        def guarded_dispatch():
+            from contextlib import ExitStack
+
+            if callable(dispatch_guard_factory):
+                local_guard = dispatch_guard_factory(
+                    allow_cancelled=ignore_cancel,
+                    allow_deadline_expired=ignore_cancel,
+                )
+            else:
+                from contextlib import nullcontext
+
+                local_guard = nullcontext()
+            gate = getattr(self.context, "dispatch_gate", None)
+            with ExitStack() as stack:
+                if gate is not None:
+                    from security.dispatch_gate import DispatchGateCancelled
+
+                    try:
+                        stack.enter_context(
+                            gate.send_guard(
+                                allow_cancelled=ignore_cancel,
+                                timeout=token.remaining(),
+                            )
+                        )
+                    except DispatchGateCancelled:
+                        raise MCPRequestCancelled("mcp_request_cancelled_before_send") from None
+                    except TimeoutError:
+                        raise MCPRequestTimeout("mcp_send_gate_timeout") from None
+                with local_guard:
+                    token.assert_sendable()
+                    yield
+
+        @contextmanager
+        def guarded_request():
+            request_lock = getattr(self.context, "dispatch_request_lock", None)
+            if request_lock is not None:
+                remaining = token.remaining()
+                if not request_lock.acquire(timeout=remaining):
+                    raise MCPRequestTimeout("mcp_request_gate_timeout")
+            try:
+                gate = getattr(self.context, "dispatch_gate", None)
+                if gate is None:
+                    token.assert_sendable()
+                    yield
+                    return
+                from security.dispatch_gate import DispatchGateCancelled
+
+                try:
+                    with gate.request_guard(
+                        allow_cancelled=ignore_cancel,
+                        timeout=token.remaining(),
+                    ):
+                        token.assert_sendable()
+                        yield
+                except DispatchGateCancelled:
+                    raise MCPRequestCancelled("mcp_request_cancelled_before_send") from None
+                except TimeoutError:
+                    raise MCPRequestTimeout("mcp_request_gate_timeout") from None
+            finally:
+                if request_lock is not None:
+                    request_lock.release()
+
         request_kwargs = {
             "headers": headers,
             "json_body": message,
-            "timeout": self.timeout if timeout is None else timeout,
+            "timeout": token.remaining(),
         }
-        if dispatch_guard is not None and isinstance(self._session, PinnedSession):
+        if isinstance(self._session, PinnedSession):
+            gate = getattr(self.context, "dispatch_gate", None)
+            cancel_intent_event = None
+            if not token.allow_cancelled:
+                cancel_intent_event = getattr(gate, "cancel_signal", None)
+                if cancel_intent_event is None:
+                    cancel_intent_event = getattr(
+                        self.context, "dispatch_cancel_pending_event", None
+                    )
             return self._session.request(
-                "POST", self.endpoint, dispatch_guard=dispatch_guard, **request_kwargs,
+                "POST", self.endpoint,
+                dispatch_guard=guarded_dispatch,
+                request_guard=guarded_request,
+                send_guard=authorize_http_send,
+                cancellation_event=None if token.allow_cancelled else token.cancellation_event,
+                cancel_intent_event=cancel_intent_event,
+                **request_kwargs,
             )
-        if dispatch_guard is not None:
-            with dispatch_guard():
-                return self._session.request("POST", self.endpoint, **request_kwargs)
-        return self._session.request("POST", self.endpoint, **request_kwargs)
+        with guarded_dispatch():
+            # Adapter/test transports lack a socket-send primitive; entering
+            # request() is their closest observable dispatch boundary.
+            authorize_http_send()
+            return self._session.request("POST", self.endpoint, **request_kwargs)
 
     @staticmethod
     def _event_messages(body: bytes) -> list[dict[str, Any]]:
@@ -805,16 +934,22 @@ class MCPRemoteClient:
     def _rpc(self, method: str, params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
         request_id = uuid.uuid4().hex
         message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        future = _REMOTE_EXECUTOR.submit(self._post, message)
         deadline = time.monotonic() + self.timeout
         cancellation = getattr(self.context, "cancellation_event", None)
+        token = MCPDispatchToken(deadline, cancellation)
+        future = _REMOTE_EXECUTOR.submit(self._post, message, dispatch_token=token)
         while True:
             if cancellation is not None and cancellation.is_set():
-                self._send_cancelled(request_id)
-                raise MCPRequestCancelled("mcp_request_cancelled_outcome_ambiguous")
+                future.cancel()
+                if token.sent.is_set():
+                    self._send_cancelled(request_id)
+                    raise MCPRequestCancelled("mcp_request_cancelled_outcome_ambiguous")
+                raise MCPRequestCancelled("mcp_request_cancelled_before_send")
             if future.done():
                 try:
                     response = future.result()
+                except (MCPRequestTimeout, MCPRequestCancelled):
+                    raise
                 except Exception:
                     raise MCPTransportError("mcp_transport_failure") from None
                 result = self._decode_response(response, request_id)
@@ -823,26 +958,34 @@ class MCPRemoteClient:
                 return result, normalized_headers
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._send_cancelled(request_id)
-                raise MCPRequestTimeout("mcp_request_timeout_outcome_ambiguous")
+                future.cancel()
+                if token.sent.is_set():
+                    self._send_cancelled(request_id)
+                    raise MCPRequestTimeout("mcp_request_timeout_outcome_ambiguous")
+                raise MCPRequestTimeout("mcp_request_timeout_before_send")
             time.sleep(min(0.025, remaining))
 
     def _notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             message["params"] = params
-        future = _REMOTE_EXECUTOR.submit(self._post, message)
         deadline = time.monotonic() + self.timeout
         cancellation = getattr(self.context, "cancellation_event", None)
+        token = MCPDispatchToken(deadline, cancellation)
+        future = _REMOTE_EXECUTOR.submit(self._post, message, dispatch_token=token)
         while not future.done():
             if cancellation is not None and cancellation.is_set():
+                future.cancel()
                 raise MCPRequestCancelled("mcp_request_cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                future.cancel()
                 raise MCPRequestTimeout("mcp_notification_timeout")
             time.sleep(min(0.025, remaining))
         try:
             response = future.result()
+        except (MCPRequestTimeout, MCPRequestCancelled):
+            raise
         except Exception:
             raise MCPTransportError("mcp_transport_failure") from None
         if int(getattr(response, "status", 0)) != 202 or getattr(response, "body", b""):

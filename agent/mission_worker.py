@@ -76,6 +76,13 @@ class QueueItem:
 
 
 @dataclass(frozen=True)
+class OwnerCancellationResult:
+    disposition: str
+    mission: Any
+    queue_item: QueueItem | None
+
+
+@dataclass(frozen=True)
 class WorkerIdentity:
     worker_id: str
     worker_instance_id: str
@@ -316,6 +323,126 @@ class MissionQueue:
                 (owner_identity_ref.strip(), requested_at, mission_id, WorkerMissionState.EXECUTING.value),
             )
             return updated.rowcount == 1
+
+    def cancel_as_owner(
+        self,
+        mission_id: str,
+        owner_identity_ref: str,
+        *,
+        mission_store: Any | None = None,
+    ) -> OwnerCancellationResult:
+        """Linearize Owner cancellation against Mission saves and tool dispatch."""
+        from pathlib import Path
+        from .mission import Mission, MissionStatus
+
+        if not isinstance(mission_id, str) or not mission_id.strip():
+            raise ValueError("mission_id required")
+        if not isinstance(owner_identity_ref, str) or not owner_identity_ref.strip() or len(owner_identity_ref) > 256:
+            raise ValueError("authenticated Owner identity reference required")
+        store = mission_store or self.mission_store
+        if store is None:
+            raise ExecutionFenceError("Owner cancellation requires the authoritative MissionStore")
+
+        queue_path = str(Path(self.db_path).resolve())
+        mission_path = str(Path(store.db_path).resolve())
+        queue_schema = '"main"' if queue_path == mission_path else '"execution_queue"'
+        requested_at = _utc_text(datetime.now(timezone.utc))
+        with sqlite3.connect(mission_path, timeout=30) as db:
+            if queue_path != mission_path:
+                db.execute("ATTACH DATABASE ? AS execution_queue", (queue_path,))
+            mission_schema = '"main"'
+            for schema in (mission_schema, queue_schema):
+                mode = str(db.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
+                if mode not in {"delete", "truncate", "persist"}:
+                    raise ExecutionFenceError("Owner cancellation requires rollback-journal mode for both durable stores")
+
+            # Use MissionStore as the primary database, matching fenced saves;
+            # this gives cross-store writers a consistent lock acquisition order.
+            db.execute("BEGIN IMMEDIATE")
+            mission_row = db.execute(
+                f"SELECT payload FROM {mission_schema}.missions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            if mission_row is None:
+                raise KeyError("unknown mission")
+            try:
+                encoded_before = str(mission_row[0])
+                mission = Mission.from_dict(json.loads(encoded_before))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ExecutionFenceError("MissionStore record is invalid during Owner cancellation") from exc
+            if mission.owner_identity_ref != owner_identity_ref.strip():
+                raise PermissionError("Owner identity does not match the mission")
+
+            queue_row = db.execute(
+                f"SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id,owner_cancel_requested "
+                f"FROM {queue_schema}.mission_queue WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            queue_item = self._item_from_row(queue_row[:13]) if queue_row is not None else None
+            if mission.is_terminal and mission.status not in {
+                MissionStatus.OWNER_INPUT_REQUIRED,
+                MissionStatus.OWNER_REAUTH_REQUIRED,
+                MissionStatus.RECOVERY_REQUIRED,
+            }:
+                return OwnerCancellationResult("already_terminal", mission, queue_item)
+
+            if queue_item is not None and queue_item.state is WorkerMissionState.EXECUTING:
+                db.execute(
+                    f"UPDATE {queue_schema}.mission_queue SET owner_cancel_requested=1,"
+                    "owner_cancel_requested_by=CASE WHEN owner_cancel_requested=0 THEN ? ELSE owner_cancel_requested_by END,"
+                    "owner_cancel_requested_at=CASE WHEN owner_cancel_requested=0 THEN ? ELSE owner_cancel_requested_at END "
+                    "WHERE mission_id=? AND state=?",
+                    (owner_identity_ref.strip(), requested_at, mission_id, WorkerMissionState.EXECUTING.value),
+                )
+                return OwnerCancellationResult("active", mission, queue_item)
+
+            mission.progress["owner_cancel_requested"] = True
+            recovery_required = mission.status is MissionStatus.RECOVERY_REQUIRED
+            if recovery_required:
+                if not mission.recovery_events or mission.recovery_events[-1].get("event") != "owner_cancel_requested":
+                    mission.recovery_events.append({"event": "owner_cancel_requested", "reason": "ambiguous effect remains auditable"})
+                queue_state = WorkerMissionState.WAITING_FOR_TOOL
+                disposition = "recovery"
+            else:
+                if not mission.is_terminal:
+                    mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
+                else:
+                    mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
+                mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+                queue_state = WorkerMissionState.CANCELLED
+                disposition = "pending"
+
+            encoded_after = json.dumps(mission.to_dict(), ensure_ascii=False)
+            saved = db.execute(
+                f"UPDATE {mission_schema}.missions SET payload=? WHERE mission_id=? AND payload=?",
+                (encoded_after, mission_id, encoded_before),
+            )
+            if saved.rowcount != 1:
+                raise LeaseLostError("Mission changed during Owner cancellation")
+
+            if queue_row is None:
+                db.execute(
+                    f"INSERT INTO {queue_schema}.mission_queue(mission_id,state,attempts,available_at,last_error,owner_cancel_requested,owner_cancel_requested_by,owner_cancel_requested_at) "
+                    "VALUES(?,?,0,?,?,1,?,?)",
+                    (mission_id, queue_state.value, requested_at, "Owner cancellation", owner_identity_ref.strip(), requested_at),
+                )
+            else:
+                db.execute(
+                    f"UPDATE {queue_schema}.mission_queue SET state=?,last_error=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='',owner_cancel_requested=1,"
+                    "owner_cancel_requested_by=CASE WHEN owner_cancel_requested=0 THEN ? ELSE owner_cancel_requested_by END,"
+                    "owner_cancel_requested_at=CASE WHEN owner_cancel_requested=0 THEN ? ELSE owner_cancel_requested_at END "
+                    "WHERE mission_id=? AND state<>?",
+                    (queue_state.value, "Owner cancellation", owner_identity_ref.strip(), requested_at, mission_id, WorkerMissionState.EXECUTING.value),
+                )
+            final_row = db.execute(
+                f"SELECT mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id FROM {queue_schema}.mission_queue WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()
+            return OwnerCancellationResult(
+                disposition,
+                Mission.from_dict(json.loads(encoded_after)),
+                self._item_from_row(final_row) if final_row is not None else None,
+            )
 
     def owner_cancellation_requested(self, mission_id: str) -> bool:
         with sqlite3.connect(self.db_path) as db:
@@ -729,24 +856,19 @@ class MissionQueue:
         moment = _utc_text(_utc_datetime(now, field_name="now"))
         queue_path = str(Path(self.db_path).resolve())
         mission_path = str(Path(self.mission_store.db_path).resolve())
-        with sqlite3.connect(self.db_path, timeout=30) as db:
+        queue_schema = '"main"' if queue_path == mission_path else '"execution_queue"'
+        with sqlite3.connect(mission_path, timeout=30) as db:
             if queue_path != mission_path:
-                db.execute("ATTACH DATABASE ? AS mission_store_db", (mission_path,))
-            mission_schema = None
-            for _sequence, name, path in db.execute("PRAGMA database_list"):
-                if path and str(Path(path).resolve()) == mission_path:
-                    mission_schema = '"' + str(name).replace('"', '""') + '"'
-                    break
-            if mission_schema is None:
-                raise ExecutionFenceError("MissionStore is not attached to the restart recovery transaction")
-            for schema in ("main", mission_schema):
+                db.execute("ATTACH DATABASE ? AS execution_queue", (queue_path,))
+            mission_schema = '"main"'
+            for schema in (mission_schema, queue_schema):
                 mode = str(db.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
                 if mode not in {"delete", "truncate", "persist"}:
                     raise ExecutionFenceError("restart recovery requires rollback-journal mode for queue and mission stores")
 
             db.execute("BEGIN IMMEDIATE")
             execution_fence.assert_current(db=db)
-            columns = "mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id"
+            columns = "mission_id,state,attempts,available_at,claimed_at,last_error,lease_owner,lease_expires_at,lease_epoch,worker_instance_id,runtime_generation,claim_phase,claim_fence_id,owner_cancel_requested"
             if include_pending:
                 pending_states = (
                     WorkerMissionState.QUEUED.value,
@@ -759,13 +881,13 @@ class MissionQueue:
                 )
                 placeholders = ",".join("?" for _ in pending_states)
                 query = (
-                    f"SELECT {columns} FROM mission_queue WHERE state IN ({placeholders}) "
+                    f"SELECT {columns} FROM {queue_schema}.mission_queue WHERE state IN ({placeholders}) "
                     "OR (state=? AND lease_expires_at IS NOT NULL AND lease_expires_at<=?) ORDER BY available_at,mission_id"
                 )
                 args = (*pending_states, WorkerMissionState.EXECUTING.value, moment)
             else:
                 query = (
-                    f"SELECT {columns} FROM mission_queue WHERE state=? "
+                    f"SELECT {columns} FROM {queue_schema}.mission_queue WHERE state=? "
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY available_at,mission_id"
                 )
                 args = (WorkerMissionState.EXECUTING.value, moment)
@@ -794,8 +916,25 @@ class MissionQueue:
                 in_flight = checkpoint_status in {"in_flight", "in_flight_parallel"}
                 recovery_required = in_flight or mission.status is MissionStatus.RECOVERY_REQUIRED
                 mission_changed = False
+                owner_cancel_requested = bool(queue_row[13])
+                if owner_cancel_requested:
+                    mission.progress["owner_cancel_requested"] = True
+                    mission_changed = True
+                    if recovery_required:
+                        if mission.status not in TERMINAL_MISSION_STATUSES:
+                            mission.error = "Owner cancellation followed by restart with an in-flight execution; effect reconciliation required"
+                            mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, restart_recovery=True, owner_cancel_requested=True)
+                        if mission.status is MissionStatus.RECOVERY_REQUIRED:
+                            mission.recovery_events.append({"event": "owner_cancel_requested", "reason": "in-flight effect remains auditable after restart"})
+                    elif not mission.is_terminal or mission.status in {
+                        MissionStatus.OWNER_INPUT_REQUIRED,
+                        MissionStatus.OWNER_REAUTH_REQUIRED,
+                    }:
+                        mission.transition(MissionStatus.CANCELLED, "Owner cancellation recovered after worker restart", restart_recovery=True)
+                        mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+                        recovery_required = False
                 if recovery_required:
-                    if mission.status not in TERMINAL_MISSION_STATUSES:
+                    if not owner_cancel_requested and mission.status not in TERMINAL_MISSION_STATUSES:
                         mission.error = "worker restarted with an in-flight execution; effect reconciliation required"
                         mission.transition(MissionStatus.RECOVERY_REQUIRED, mission.error, restart_recovery=True)
                         mission_changed = True
@@ -803,7 +942,7 @@ class MissionQueue:
                         # A genuinely terminal mission is not rewritten merely because a stale checkpoint remains.
                         recovery_required = False
 
-                if not recovery_required and not mission.is_terminal:
+                if not owner_cancel_requested and not recovery_required and not mission.is_terminal:
                     mission.error = "Owner reauthorization required after worker restart"
                     mission.transition(MissionStatus.OWNER_REAUTH_REQUIRED, mission.error, restart_recovery=True)
                     mission.recovery_events.append({"event": "owner_reauthorization_required", "reason": "worker_restart"})
@@ -849,12 +988,12 @@ class MissionQueue:
                 )
                 epoch = item.lease_epoch + 1 if expired_claim else item.lease_epoch
                 updated_queue = db.execute(
-                    "UPDATE mission_queue SET state=?,lease_epoch=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='',last_error=? WHERE mission_id=? AND state=? AND lease_epoch=?",
+                    f"UPDATE {queue_schema}.mission_queue SET state=?,lease_epoch=?,claimed_at=NULL,lease_owner=NULL,lease_expires_at=NULL,worker_instance_id=NULL,runtime_generation=0,claim_phase='NONE',claim_fence_id='',last_error=? WHERE mission_id=? AND state=? AND lease_epoch=?",
                     (next_state.value, epoch, str(reason)[:500], item.mission_id, item.state.value, item.lease_epoch),
                 )
                 if updated_queue.rowcount != 1:
                     raise LeaseLostError("queue item changed during strict restart recovery")
-                final_row = db.execute(f"SELECT {columns} FROM mission_queue WHERE mission_id=?", (item.mission_id,)).fetchone()
+                final_row = db.execute(f"SELECT {columns} FROM {queue_schema}.mission_queue WHERE mission_id=?", (item.mission_id,)).fetchone()
                 if final_row is None:
                     raise KeyError("unknown queued mission")
                 recovered.append(self._item_from_row(final_row))

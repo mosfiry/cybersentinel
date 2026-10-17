@@ -36,7 +36,12 @@ def _runtime(tmp_path: Path, executor, **kwargs) -> MissionRuntime:
 
 
 def _service_for(rt: MissionRuntime, mission_id: str) -> MissionService:
-    service = MissionService(rt, _Queue())
+    queue = MissionQueue(
+        Path(rt.store.db_path).with_name(f"{mission_id}-owner-cancel-queue.sqlite3"),
+        mission_store=rt.store,
+    )
+    queue.enqueue(mission_id)
+    service = MissionService(rt, queue)
     service._authorized_mission = lambda requested_id, owner_session_token: (rt.store.load(requested_id), "test-owner")
     return service
 

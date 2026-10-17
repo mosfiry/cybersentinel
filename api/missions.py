@@ -532,42 +532,43 @@ class MissionService:
     def cancel_mission(
         self, mission_id: str, *, owner_session_token: str | None = None
     ) -> dict[str, Any]:
-        mission, _owner_ref = self._authorized_mission(mission_id, owner_session_token)
-        if mission.is_terminal and mission.status not in {
-            MissionStatus.OWNER_INPUT_REQUIRED,
-            MissionStatus.OWNER_REAUTH_REQUIRED,
-            MissionStatus.RECOVERY_REQUIRED,
-        }:
-            return mission.to_dict()
-        queued = self.queue.enqueue(mission_id, state=WorkerMissionState.CANCELLED)
-        if queued.state is WorkerMissionState.EXECUTING:
-            from tools.registry import cancel_active_mission_tool_executions
+        _mission, owner_ref = self._authorized_mission(mission_id, owner_session_token)
+        from tools.registry import cancel_active_mission_tool_executions
+        from security.dispatch_gate import MissionDispatchGate
 
-            def record_owner_cancellation() -> None:
-                if not self.queue.request_owner_cancellation(mission_id, mission.owner_identity_ref):
-                    raise PermissionError("active worker lease changed before Owner cancellation was recorded")
+        cancellation: dict[str, Any] = {}
+        dispatch_gate = MissionDispatchGate(
+            self.runtime.store.db_path,
+            mission_id,
+            cancellation_db_path=self.queue.db_path,
+        )
 
-            signaled = cancel_active_mission_tool_executions(
+        def commit_owner_cancellation() -> bool:
+            decision = self.queue.cancel_as_owner(
                 mission_id,
-                before_signal=record_owner_cancellation,
+                owner_ref,
+                mission_store=self.runtime.store,
             )
-            result = mission.to_dict()
+            cancellation["decision"] = decision
+            return decision.disposition == "active"
+
+        signaled = cancel_active_mission_tool_executions(
+            mission_id,
+            before_signal=commit_owner_cancellation,
+            dispatch_gate=dispatch_gate,
+        )
+        decision = cancellation["decision"]
+        if decision.disposition == "already_terminal":
+            return decision.mission.to_dict()
+        if decision.disposition == "active":
+            result = decision.mission.to_dict()
             result["cancel_requested"] = True
             result["active_tool_cancellation_signals"] = signaled
             return result
+
         if self.scheduler is not None:
             self.scheduler.cancel_scheduled(mission_id)
-        if mission.status is MissionStatus.RECOVERY_REQUIRED:
-            # Keep the recovery status and checkpoint available to V7 reconciliation.
-            # Cancellation prevents dispatch; it does not assert an effect outcome.
-            mission.progress["owner_cancel_requested"] = True
-            mission.recovery_events.append({"event": "owner_cancel_requested", "reason": "ambiguous effect remains auditable"})
-        elif not mission.is_terminal:
-            mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
-            mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
-        elif mission.status in {MissionStatus.OWNER_INPUT_REQUIRED, MissionStatus.OWNER_REAUTH_REQUIRED}:
-            mission.transition(MissionStatus.CANCELLED, "Owner requested mission cancellation")
-            mission.checkpoint = {**mission.checkpoint, "status": "cancelled"}
+        mission = decision.mission
         self.runtime.request_agent_task_cancellation(mission)
         return self.runtime.store.save(mission).to_dict()
 

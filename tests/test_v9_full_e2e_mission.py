@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+from process_sandbox_testutils import require_live_process_sandbox
 
 from test_v13_e2e import _SITECUSTOMIZE
 
@@ -17,6 +18,7 @@ RUNNER = ROOT / "tests" / "v9_scenario_runner.py"
 
 
 def _run_v9_scenario(tmp_path: Path, scenario: str) -> dict:
+    require_live_process_sandbox()
     state_root = tmp_path / "isolated-state"
     state_root.mkdir(parents=True, exist_ok=True)
     home = state_root / "home"

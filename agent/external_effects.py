@@ -33,6 +33,24 @@ _KNOWN_STATES = frozenset(state.value for state in EffectState)
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_PROCESS_LAUNCH_PROOF_SEAL = object()
+
+
+class ProcessLaunchNoEffectProof:
+    """Internal proof that sandbox setup failed before untrusted code started."""
+
+    __slots__ = ("backend", "detail_code", "_seal")
+
+    def __init__(self, backend: str, detail_code: str, *, _seal: object):
+        if _seal is not _PROCESS_LAUNCH_PROOF_SEAL:
+            raise TypeError("process launch proof cannot be constructed directly")
+        self.backend = backend
+        self.detail_code = detail_code
+        self._seal = _seal
+
+
+def _new_process_launch_no_effect_proof(backend: str, detail_code: str) -> ProcessLaunchNoEffectProof:
+    return ProcessLaunchNoEffectProof(backend, detail_code, _seal=_PROCESS_LAUNCH_PROOF_SEAL)
 
 
 class EffectLedgerError(RuntimeError):
@@ -726,6 +744,12 @@ class ExternalEffectLedger:
                 raise EffectDispatchBlocked(record.effect_id, record.state)
             if record.fence_ref != str(stamped["fence_id"]):
                 raise EffectDispatchBlocked(record.effect_id, record.state)
+            cancel_row = db.execute(
+                "SELECT owner_cancel_requested FROM mission_queue WHERE mission_id=?",
+                (record.mission_id,),
+            ).fetchone()
+            if cancel_row is None or bool(cancel_row[0]):
+                raise EffectDispatchBlocked(record.effect_id, "OWNER_CANCEL_REQUESTED")
             now = self._now()
             changed = db.execute(
                 """UPDATE external_effects SET state='DISPATCHED',dispatch_id=?,updated_at=?
@@ -926,6 +950,7 @@ class ExternalEffectLedger:
         reason_code: str,
         provider_confirmed_no_effect: bool,
         dispatch_id: str = "",
+        no_effect_proof: Any = None,
         authorization_snapshot: Any | None = None,
     ) -> ExternalEffect:
         if provider_confirmed_no_effect is not True:
@@ -946,7 +971,23 @@ class ExternalEffectLedger:
                 operation_fingerprint=record.operation_fingerprint,
             )
             stamped = fence.assert_effect_reservation(reservation, db=db)
-            if record.state != EffectState.RESERVED or dispatch_id:
+            if record.state == EffectState.RESERVED and not dispatch_id:
+                event_type = "FAILED_CONFIRMED_NO_EFFECT"
+            elif (
+                record.state == EffectState.DISPATCHED
+                and isinstance(dispatch_id, str)
+                and dispatch_id
+                and record.dispatch_id == dispatch_id
+                and isinstance(no_effect_proof, ProcessLaunchNoEffectProof)
+                and no_effect_proof._seal is _PROCESS_LAUNCH_PROOF_SEAL
+                and no_effect_proof.backend
+                and no_effect_proof.detail_code
+            ):
+                # A durable write-ahead dispatch record may precede process
+                # creation. Only a trusted launcher error that proves no
+                # untrusted code started may close that attempt as no-effect.
+                event_type = "FAILED_CONFIRMED_NO_EFFECT_AFTER_START_FAILURE"
+            else:
                 raise EffectTransitionError("FAILED is only valid when provider dispatch was provably cancelled before start")
             now = self._now()
             db.execute(
@@ -958,7 +999,7 @@ class ExternalEffectLedger:
                 effect_id=effect_id,
                 from_state=record.state,
                 to_state=EffectState.FAILED.value,
-                event_type="FAILED_CONFIRMED_NO_EFFECT",
+                event_type=event_type,
                 fence_ref=str(stamped["fence_id"]),
                 dispatch_id=dispatch_id,
                 error_code=safe_reason,

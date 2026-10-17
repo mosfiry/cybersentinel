@@ -32,6 +32,7 @@ from security.owner_password import OWNER_USERNAME, create_owner_account, login,
 from security.mission_authorization import MissionAuthorizationSnapshot
 from tools.registry import REGISTRY
 from owner_session_testutils import persist_canonical_scope, workspace_scope_context
+from process_sandbox_testutils import require_live_process_sandbox
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -752,6 +753,7 @@ def test_sigkill_after_effect_dispatch_before_handler_outcome_preserves_ambiguit
 def test_sigkill_after_evidence_commit_keeps_chain_and_does_not_replay(
     tmp_path, v10_env, children
 ):
+    require_live_process_sandbox()
     (v10_env.workspace / "test_v10_process_evidence.py").write_text(
         "def test_v10_process_evidence():\n    assert 2 + 2 == 4\n",
         encoding="utf-8",

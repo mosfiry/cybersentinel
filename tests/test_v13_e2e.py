@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+from process_sandbox_testutils import require_live_process_sandbox
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +92,7 @@ except BaseException as exc:
 
 
 def _run_scenario(tmp_path: Path, scenario: str) -> dict:
+    require_live_process_sandbox()
     state_root = tmp_path / "isolated-state"
     state_root.mkdir(parents=True, exist_ok=True)
     home = state_root / "home"

@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from security.pinned_http import (
+    PinnedRequestCancelled,
     PinnedRequestError,
     _PinnedHTTPConnection,
     pinned_http_request,
@@ -63,20 +64,243 @@ def test_http_connection_uses_the_validated_ip_without_resolving_again(monkeypat
     observed = {}
 
     class FakeSocket:
+        def settimeout(self, timeout):
+            observed["timeout"] = timeout
+
+        def connect(self, address):
+            observed["address"] = address
+
         def close(self):
             pass
 
-    def fake_create_connection(address, timeout, source_address):
-        observed["address"] = address
-        observed["timeout"] = timeout
+    def fake_socket(*args):
+        observed["family"] = args[0]
         return FakeSocket()
 
-    monkeypatch.setattr("security.pinned_http.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("security.pinned_http.socket.socket", fake_socket)
     connection = _PinnedHTTPConnection("api.example", 80, "93.184.216.34", timeout=4)
     connection.connect()
     connection.close()
 
-    assert observed == {"address": ("93.184.216.34", 80), "timeout": 4.0}
+    assert observed == {
+        "address": ("93.184.216.34", 80),
+        "timeout": 4.0,
+        "family": socket.AF_INET,
+    }
+
+
+@pytest.mark.parametrize("interrupt_kind", ["owner_cancel", "deadline"])
+def test_dns_resolution_wait_is_bounded_and_cancellable(monkeypatch, interrupt_kind):
+    from security import pinned_http
+
+    dns_started = threading.Event()
+    release_dns = threading.Event()
+    connection_created = threading.Event()
+    cancellation_event = threading.Event()
+    outcome = []
+
+    def blocked_resolver(*_args, **_kwargs):
+        dns_started.set()
+        release_dns.wait(timeout=3)
+        return ["93.184.216.34"]
+
+    class UnexpectedConnection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def connect(self):
+            connection_created.set()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", blocked_resolver)
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", UnexpectedConnection)
+
+    def make_request():
+        try:
+            pinned_http.pinned_http_request(
+                "https://public.example/",
+                timeout=2.0 if interrupt_kind == "owner_cancel" else 0.05,
+                cancellation_event=cancellation_event,
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=make_request)
+    worker.start()
+    try:
+        assert dns_started.wait(timeout=1)
+        if interrupt_kind == "owner_cancel":
+            cancellation_event.set()
+            expected = PinnedRequestCancelled
+        else:
+            expected = socket.timeout
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert outcome and isinstance(outcome[0], expected)
+        assert not connection_created.is_set()
+    finally:
+        release_dns.set()
+        worker.join(timeout=1)
+
+
+def test_total_deadline_closes_raw_socket_during_tls_handshake(monkeypatch):
+    from security import pinned_http
+
+    handshake_started = threading.Event()
+    socket_closed = threading.Event()
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def connect(self, _address):
+            return None
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    raw_socket = FakeSocket()
+
+    class FakeSSLSocket:
+        def do_handshake(self):
+            assert connections and connections[0].sock is self
+            assert socket_closed.wait(timeout=2)
+            raise OSError("handshake interrupted by request deadline")
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    connections = []
+    original_connection = pinned_http._PinnedHTTPSConnection
+
+    def make_connection(*args, **kwargs):
+        connection = original_connection(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", make_connection)
+
+    class BlockingTLSContext:
+        def wrap_socket(self, raw, *, server_hostname, do_handshake_on_connect):
+            assert raw is raw_socket
+            assert server_hostname == "public.example"
+            assert do_handshake_on_connect is False
+            handshake_started.set()
+            wrapped = FakeSSLSocket()
+            assert connections and connections[0].sock is raw
+            return wrapped
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http.socket, "socket", lambda *_args, **_kwargs: raw_socket)
+    monkeypatch.setattr(pinned_http.ssl, "create_default_context", BlockingTLSContext)
+    started = time.monotonic()
+    with pytest.raises(socket.timeout, match="total wall-clock deadline"):
+        pinned_http.pinned_http_request("https://public.example/data", timeout=0.1)
+    assert handshake_started.is_set()
+    assert socket_closed.is_set()
+    assert time.monotonic() - started < 0.75
+
+
+@pytest.mark.parametrize("phase", ["tcp_connect", "tls_handshake"])
+def test_owner_cancellation_closes_socket_during_connect_or_tls_handshake(monkeypatch, phase):
+    from security import pinned_http
+
+    cancellation = threading.Event()
+    socket_started = threading.Event()
+    socket_closed = threading.Event()
+    handshake_started = threading.Event()
+    outcome = []
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def bind(self, _address):
+            return None
+
+        def connect(self, _address):
+            socket_started.set()
+            if phase == "tcp_connect":
+                assert socket_closed.wait(timeout=2)
+                raise OSError("connect interrupted by Owner cancellation")
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    raw_socket = FakeSocket()
+
+    class FakeSSLSocket:
+        def do_handshake(self):
+            assert connections and connections[0].sock is self
+            handshake_started.set()
+            assert socket_closed.wait(timeout=2)
+            raise OSError("handshake interrupted by Owner cancellation")
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    connections = []
+    original_connection = pinned_http._PinnedHTTPSConnection
+
+    def make_connection(*args, **kwargs):
+        connection = original_connection(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", make_connection)
+
+    class BlockingTLSContext:
+        def wrap_socket(self, raw, *, server_hostname, do_handshake_on_connect):
+            assert raw is raw_socket
+            assert server_hostname == "public.example"
+            assert do_handshake_on_connect is False
+            wrapped = FakeSSLSocket()
+            assert connections and connections[0].sock is raw
+            return wrapped
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: [
+        "127.0.0.1" if phase == "tcp_connect" else "93.184.216.34"
+    ])
+    monkeypatch.setattr(pinned_http.socket, "socket", lambda *_args, **_kwargs: raw_socket)
+    if phase == "tls_handshake":
+        monkeypatch.setattr(pinned_http.ssl, "create_default_context", BlockingTLSContext)
+
+    def request():
+        try:
+            pinned_http.pinned_http_request(
+                "http://127.0.0.1/local" if phase == "tcp_connect" else "https://public.example/mcp",
+                timeout=2,
+                allow_loopback=phase == "tcp_connect",
+                cancellation_event=cancellation,
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=request)
+    worker.start()
+    assert socket_started.wait(timeout=1)
+    if phase == "tls_handshake":
+        assert handshake_started.wait(timeout=1)
+    cancellation.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert socket_closed.is_set()
+    assert outcome and isinstance(outcome[0], PinnedRequestCancelled)
 
 
 def test_http_is_denied_for_remote_hosts_even_if_dns_is_public(monkeypatch):
@@ -172,3 +396,138 @@ def test_slow_drip_response_obeys_total_wall_clock_deadline():
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_owner_cancellation_aborts_partial_http_request_before_body_send(monkeypatch):
+    from security import pinned_http
+
+    cancellation = threading.Event()
+    header_send_started = threading.Event()
+    socket_closed = threading.Event()
+    body_send_attempted = threading.Event()
+    sent_chunks = []
+
+    class FakeSocket:
+        def sendall(self, data):
+            if socket_closed.is_set():
+                raise OSError("socket is already closed")
+            sent_chunks.append(data)
+            if data == b"request-headers":
+                header_send_started.set()
+                assert cancellation.wait(timeout=2)
+            if data == b"request-body":
+                body_send_attempted.set()
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    class SendingConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+
+        def connect(self):
+            self.sock = FakeSocket()
+
+        def send(self, data):
+            self.sock.sendall(data)
+
+        def request(self, *_args, **_kwargs):
+            self.send(b"request-headers")
+            self.send(b"request-body")
+
+        def close(self):
+            if self.sock is not None:
+                self.sock.close()
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", SendingConnection)
+    outcome = []
+
+    def send_request():
+        try:
+            pinned_http.pinned_http_request(
+                "https://public.example/mcp",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                body=b"{}",
+                timeout=2,
+                send_guard=lambda: None,
+                cancellation_event=cancellation,
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=send_request)
+    worker.start()
+    assert header_send_started.wait(timeout=1)
+    cancellation.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert outcome and isinstance(outcome[0], PinnedRequestCancelled)
+    assert socket_closed.is_set()
+    assert sent_chunks == [b"request-headers"]
+    assert not body_send_attempted.is_set()
+
+
+def test_deadline_expiring_inside_dispatch_callback_still_performs_first_write(monkeypatch):
+    from security import pinned_http
+
+    sent_chunks = []
+    socket_closed = threading.Event()
+    callback_calls = []
+
+    class FakeSocket:
+        def sendall(self, data):
+            if socket_closed.is_set():
+                raise OSError("socket closed before first write")
+            sent_chunks.append(data)
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    class SendingConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+
+        def connect(self):
+            self.sock = FakeSocket()
+
+        def send(self, data):
+            self.sock.sendall(data)
+
+        def request(self, *_args, **_kwargs):
+            self.send(b"request-headers")
+
+        def getresponse(self):
+            raise AssertionError("expired deadline must stop before response read")
+
+        def close(self):
+            if self.sock is not None:
+                self.sock.close()
+
+    def slow_dispatch_commit():
+        callback_calls.append("committed")
+        time.sleep(0.04)
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", SendingConnection)
+
+    with pytest.raises(socket.timeout, match="total wall-clock deadline"):
+        pinned_http.pinned_http_request(
+            "https://public.example/mcp",
+            method="POST",
+            body=b"{}",
+            timeout=0.01,
+            send_guard=slow_dispatch_commit,
+        )
+
+    assert callback_calls == ["committed"]
+    assert sent_chunks == [b"request-headers"]
+    assert socket_closed.is_set()

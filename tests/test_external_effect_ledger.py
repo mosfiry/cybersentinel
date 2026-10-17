@@ -280,6 +280,179 @@ def test_mcp_remote_tool_error_keeps_external_effect_ambiguous(tmp_path, monkeyp
         _execute(monkeypatch, spec, mission, snapshot, fence)
 
 
+@pytest.mark.parametrize("fail_connect", [False, True])
+def test_mcp_effect_ledger_dispatches_at_first_socket_write_only(
+    tmp_path, monkeypatch, fail_connect,
+):
+    import hashlib
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    import security.pinned_http as pinned_http
+    import security.scope_resolver as scope_resolver
+    from core.context import ExecutionContext
+    from security.authorization import authorize_tool
+    from security.authorization_context import AuthorizationContext
+    from security.owner_policy import OwnerPolicySnapshot, _issue_evidence
+    from security.scope import ProgramAuthorization, ScopeSnapshot, TargetIdentity
+    from tools.mcp_client import MCPRemoteClient
+
+    _mission_store, mission, snapshot, queue, _identity, _claim, fence = _leased_fence(
+        tmp_path, tool_name="mcp.discover"
+    )
+    ledger = ExternalEffectLedger(queue.db_path)
+    created = datetime.now(timezone.utc)
+    captured_at = created.isoformat()
+    expires_at = (created + timedelta(minutes=10)).isoformat()
+    session_id = "session-mcp-dispatch-test"
+    owner_evidence = _issue_evidence(
+        "username_password", mission.request_id, session_id, session_id
+    )
+    owner_policy = OwnerPolicySnapshot(
+        request_id=mission.request_id,
+        owner_instruction="Owner-approved MCP transport boundary test",
+        owner_instruction_fingerprint=hashlib.sha256(
+            b"Owner-approved MCP transport boundary test"
+        ).hexdigest(),
+        owner_policy_fingerprint="mcp-dispatch-test-policy",
+        authority_snapshot={},
+        authentication={},
+        captured_at=captured_at,
+    )
+    canonical_scope = ScopeSnapshot(
+        "scope-mcp-dispatch-test",
+        ProgramAuthorization(
+            program_id="program-test",
+            platform="test",
+            scope_version="1",
+            retrieved_at=captured_at,
+            in_scope_assets=({"host": "mcp.example.test", "schemes": ["https"], "ports": [443], "paths": ["/"]},),
+            owner_session_id=session_id,
+        ),
+        (TargetIdentity("target-test", "program-test", "mcp.example.test", allowed_ports=(443,), allowed_paths=("/",)),),
+        created_at=captured_at,
+        expires_at=expires_at,
+    )
+    owner_auth = AuthorizationContext(
+        mission.request_id, owner_evidence, owner_policy, canonical_scope,
+        session_id=session_id,
+    )
+    scope_context = {
+        "program_id": "program-test",
+        "target_id": "target-test",
+        "scope_snapshot_id": "scope-mcp-dispatch-test",
+        "url": "https://mcp.example.test/mcp",
+        "method": "POST",
+    }
+    argument = {"server_id": "mcp_" + "a" * 32}
+    original_spec = registry_module.get_tool("mcp.discover")
+    assert original_spec is not None
+
+    entry_states = []
+    send_states = []
+
+    class FakeResponse:
+        status = 200
+
+        def read(self, _limit):
+            return b"{}"
+
+        def getheaders(self):
+            return [("content-type", "application/json")]
+
+        def close(self):
+            return None
+
+    class FakeSocket:
+        def sendall(self, _data):
+            return None
+
+        def shutdown(self, *_args):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+
+        def connect(self):
+            if fail_connect:
+                raise OSError("fixture connect failure")
+            self.sock = FakeSocket()
+
+        def send(self, _data):
+            records = ledger.list_effects(mission_id=mission.mission_id)
+            send_states.append(records[0].state)
+            self.sock.sendall(_data)
+
+        def request(self, *_args, **_kwargs):
+            self.send(b"request-headers")
+            self.send(b"request-body")
+
+        def getresponse(self):
+            return FakeResponse()
+
+        def close(self):
+            if self.sock is not None:
+                self.sock.close()
+
+    def handler(_argument, *, execution_context):
+        entry_states.append(ledger.list_effects(mission_id=mission.mission_id)[0].state)
+        with MCPRemoteClient("https://mcp.example.test/mcp", execution_context) as client:
+            client._post({"jsonrpc": "2.0", "method": "tools/list"})
+        return {"ok": True}
+
+    monkeypatch.setattr(ExecutionContext, "assert_active", lambda self, **_kwargs: None)
+    monkeypatch.setitem(
+        registry_module.REGISTRY,
+        "mcp.discover",
+        replace(original_spec, handler=handler),
+    )
+    allowed = SimpleNamespace(allowed=True, reason="allowed")
+    monkeypatch.setattr(scope_resolver, "resolve", lambda *_args, **_kwargs: allowed)
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", FakeConnection)
+
+    decision = authorize_tool(["mcp.discover", argument], context=owner_auth)
+    assert decision.allowed and decision.decision is not None
+    execute_kwargs = dict(
+        authorization_decision=decision.decision,
+        scope_context=scope_context,
+        request_id=mission.request_id,
+        mission_authorization=snapshot,
+        mission_authorization_version=snapshot.version,
+        owner_authorization=owner_auth,
+        owner_authorization_record=owner_auth.to_dict(),
+        evidence_store=SimpleNamespace(mission_store=queue.mission_store),
+        mission_id=mission.mission_id,
+        target_identity=snapshot.target_identity,
+        execution_fence=fence,
+        execution_id=fence.execution_id,
+    )
+
+    if fail_connect:
+        with pytest.raises(OSError, match="fixture connect failure"):
+            registry_module.execute("mcp.discover", argument, **execute_kwargs)
+    else:
+        assert registry_module.execute("mcp.discover", argument, **execute_kwargs) == {"ok": True}
+
+    records = ledger.list_effects(mission_id=mission.mission_id)
+    assert len(records) == 1
+    assert entry_states == [EffectState.RESERVED]
+    if fail_connect:
+        assert send_states == []
+        assert records[0].state == EffectState.FAILED
+        assert "DISPATCHED" not in [item["to_state"] for item in ledger.history(records[0].effect_id)]
+    else:
+        assert send_states == [EffectState.DISPATCHED, EffectState.DISPATCHED]
+        assert records[0].state == EffectState.SUCCEEDED
+        assert [item["to_state"] for item in ledger.history(records[0].effect_id)] == [
+            "PLANNED", "RESERVED", "DISPATCHED", "SUCCEEDED"
+        ]
+
+
 def test_oversized_effect_result_is_summarized_before_ledger_persistence(tmp_path, monkeypatch):
     _store, mission, snapshot, queue, _identity, _claim, fence = _leased_fence(
         tmp_path,

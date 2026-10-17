@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from types import SimpleNamespace
 import json
@@ -56,13 +57,24 @@ class DummyContext:
     evidence_store: object | None = None
     execution_fence: object | None = None
     dispatch_lock: Any = None
+    dispatch_cancel_pending_event: threading.Event | None = None
+    dispatch_request_lock: Any = None
+    dispatch_gate: Any = None
+    deadline_monotonic: float | None = None
 
-    def assert_active(self):
-        if self.cancellation_event is not None and self.cancellation_event.is_set():
+    def assert_active(self, *, allow_cancelled=False, allow_deadline_expired=False):
+        if self.cancellation_event is not None and self.cancellation_event.is_set() and not allow_cancelled:
             raise RuntimeError("cancelled")
+        if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic and not allow_deadline_expired:
+            raise RuntimeError("deadline expired")
 
     @contextmanager
     def dispatch_guard(self, *, allow_cancelled=False, allow_deadline_expired=False):
+        if (
+            self.dispatch_cancel_pending_event is not None
+            and self.dispatch_cancel_pending_event.is_set()
+        ):
+            raise RuntimeError("Owner cancellation is being committed")
         lock = self.dispatch_lock
         if lock is None:
             if not allow_cancelled:
@@ -70,6 +82,11 @@ class DummyContext:
             yield
             return
         with lock:
+            if (
+                self.dispatch_cancel_pending_event is not None
+                and self.dispatch_cancel_pending_event.is_set()
+            ):
+                raise RuntimeError("Owner cancellation is being committed")
             if not allow_cancelled:
                 self.assert_active()
             yield
@@ -80,6 +97,19 @@ def _context() -> DummyContext:
         threading.Event(),
         {"program_id": "program-safe", "target_id": "target-safe", "scope_snapshot_id": "scope-safe"},
         execution_fence=SimpleNamespace(task_id="task-safe"),
+        dispatch_cancel_pending_event=threading.Event(),
+        dispatch_request_lock=threading.Lock(),
+    )
+
+
+def _register_context_cancellation(context):
+    _register_active_tool_cancellation(
+        MISSION,
+        context.cancellation_event,
+        context.dispatch_lock,
+        socket_write_lock=context.dispatch_lock,
+        dispatch_request_lock=context.dispatch_request_lock,
+        dispatch_cancel_pending_event=context.dispatch_cancel_pending_event,
     )
 
 
@@ -211,7 +241,9 @@ def test_mcp_protocol_uses_streamable_http_and_withholds_server_descriptions(mon
         assert all(item[0] == "POST" and item[1] == ENDPOINT for item in fake.calls)
         assert all("Authorization" not in item[2] for item in fake.calls)
         assert any(item[2].get("MCP-Protocol-Version") == MCP_PROTOCOL_VERSION for item in fake.calls[1:])
-        assert len(scope_calls) == len(fake.calls)
+        assert len(scope_calls) == 2 * len(fake.calls)
+        assert sum(1 for _args, kwargs in scope_calls if kwargs["consume_rate"]) == len(fake.calls)
+        assert sum(1 for _args, kwargs in scope_calls if not kwargs["consume_rate"]) == len(fake.calls)
         assert all(event[1]["method"] == "POST" for event in scope_calls)
     finally:
         client.close()
@@ -412,8 +444,9 @@ def test_mcp_pinned_http_rechecks_owner_cancel_at_socket_send_boundary(monkeypat
     _allow_scope(monkeypatch)
     context = _context()
     context.dispatch_lock = threading.Lock()
+    context.dispatch_request_lock = None
     marker_commits = []
-    _register_active_tool_cancellation(MISSION, context.cancellation_event, context.dispatch_lock)
+    _register_context_cancellation(context)
     connections = []
 
     class NeverSendConnection:
@@ -425,6 +458,9 @@ def test_mcp_pinned_http_rechecks_owner_cancel_at_socket_send_boundary(monkeypat
         def request(self, *_args, **_kwargs):
             self.request_called = True
             raise AssertionError("MCP HTTP request was sent after Owner cancellation committed")
+
+        def connect(self):
+            self.connect_called = True
 
         def close(self):
             return None
@@ -440,13 +476,486 @@ def test_mcp_pinned_http_rechecks_owner_cancel_at_socket_send_boundary(monkeypat
     monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", NeverSendConnection)
     client = MCPRemoteClient(ENDPOINT, context)
     try:
-        with pytest.raises(RuntimeError, match="cancelled"):
+        with pytest.raises(pinned_http.PinnedRequestCancelled, match="cancelled"):
             client._post({"jsonrpc": "2.0", "method": "tools/call"})
         assert marker_commits == ["committed"]
         assert context.cancellation_event.is_set()
-        assert connections and all(not connection.request_called for connection in connections)
+        assert all(not connection.request_called for connection in connections)
     finally:
         _unregister_active_tool_cancellation(MISSION, context.cancellation_event)
+        client.close()
+
+
+def test_owner_cancellation_during_dns_does_not_wait_for_request_gate(monkeypatch, tmp_path):
+    from security.dispatch_gate import MissionDispatchGate
+
+    _allow_scope(monkeypatch)
+    context = _context()
+    context.dispatch_lock = threading.Lock()
+    context.dispatch_gate = MissionDispatchGate(tmp_path / "mission.sqlite3", MISSION)
+    _register_context_cancellation(context)
+    dns_started = threading.Event()
+    release_dns = threading.Event()
+    connection_created = threading.Event()
+    marker_commits = []
+    cancel_result = []
+    outcome = []
+
+    def blocked_resolver(*_args, **_kwargs):
+        dns_started.set()
+        release_dns.wait(timeout=3)
+        return ["93.184.216.34"]
+
+    class UnexpectedConnection:
+        def __init__(self, *_args, **_kwargs):
+            connection_created.set()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", blocked_resolver)
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", UnexpectedConnection)
+    client = MCPRemoteClient(ENDPOINT, context, timeout=2.0)
+
+    def run_request():
+        try:
+            client._post({"jsonrpc": "2.0", "method": "tools/call"})
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run_request)
+    worker.start()
+
+    def commit_owner_marker():
+        assert not connection_created.is_set()
+        marker_commits.append("committed")
+        return True
+
+    canceller = threading.Thread(
+        target=lambda: cancel_result.append(
+            cancel_active_mission_tool_executions(
+                MISSION,
+                before_signal=commit_owner_marker,
+                dispatch_gate=context.dispatch_gate,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        assert dns_started.wait(timeout=1)
+        canceller.start()
+        canceller.join(timeout=1)
+        assert not canceller.is_alive()
+        assert cancel_result == [1]
+        assert marker_commits == ["committed"]
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert outcome and isinstance(outcome[0], pinned_http.PinnedRequestCancelled)
+        assert not connection_created.is_set()
+    finally:
+        release_dns.set()
+        if worker.is_alive():
+            worker.join(timeout=2)
+        if canceller.is_alive():
+            canceller.join(timeout=2)
+        _unregister_active_tool_cancellation(MISSION, context.cancellation_event)
+        client.close()
+
+
+def test_mcp_pinned_http_aborts_body_write_when_owner_cancellation_commits(monkeypatch):
+    _allow_scope(monkeypatch)
+    context = _context()
+    context.dispatch_lock = threading.Lock()
+    marker_commits = []
+    _register_context_cancellation(context)
+    header_send_started = threading.Event()
+    socket_closed = threading.Event()
+    body_send_attempted = threading.Event()
+    sent_chunks = []
+    allow_send_exit = threading.Event()
+    send_finished = threading.Event()
+
+    class FakeSocket:
+        def sendall(self, data):
+            sent_chunks.append(data)
+            if data == b"request-headers":
+                header_send_started.set()
+                assert allow_send_exit.wait(timeout=2)
+                send_finished.set()
+            if data == b"request-body":
+                body_send_attempted.set()
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    class SendingConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+
+        def connect(self):
+            self.sock = FakeSocket()
+
+        def send(self, data):
+            self.sock.sendall(data)
+
+        def request(self, *_args, **_kwargs):
+            self.send(b"request-headers")
+            self.send(b"request-body")
+
+        def close(self):
+            if self.sock is not None:
+                self.sock.close()
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", SendingConnection)
+    client = MCPRemoteClient(ENDPOINT, context)
+    outcome = []
+
+    def send_request():
+        try:
+            client._post({"jsonrpc": "2.0", "method": "tools/call"})
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=send_request)
+    worker.start()
+    try:
+        assert header_send_started.wait(timeout=1)
+        cancel_result = []
+
+        def commit_marker_after_write_gate():
+            assert send_finished.is_set()
+            marker_commits.append("committed")
+
+        canceller = threading.Thread(
+            target=lambda: cancel_result.append(
+                cancel_active_mission_tool_executions(
+                    MISSION,
+                    before_signal=commit_marker_after_write_gate,
+                )
+            ),
+            daemon=True,
+        )
+        canceller.start()
+        assert not socket_closed.wait(timeout=0.05)
+        assert not marker_commits
+        allow_send_exit.set()
+        assert send_finished.wait(timeout=1)
+        canceller.join(timeout=1)
+        assert not canceller.is_alive()
+        assert cancel_result == [1]
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert marker_commits == ["committed"]
+        assert outcome and isinstance(outcome[0], pinned_http.PinnedRequestCancelled)
+        assert socket_closed.is_set()
+        assert sent_chunks == [b"request-headers"]
+        assert not body_send_attempted.is_set()
+    finally:
+        _unregister_active_tool_cancellation(MISSION, context.cancellation_event)
+        client.close()
+
+
+def test_owner_cancel_linearizes_marker_after_first_send_guard(monkeypatch, tmp_path):
+    from security.dispatch_gate import MissionDispatchGate
+
+    _allow_scope(monkeypatch)
+    context = _context()
+    context.dispatch_lock = threading.Lock()
+    context.dispatch_gate = MissionDispatchGate(tmp_path / "mission.sqlite3", MISSION)
+    _register_context_cancellation(context)
+    authorization_entered = threading.Event()
+    release_authorization = threading.Event()
+    socket_closed = threading.Event()
+    sent_chunks = []
+
+    def pause_first_send_after_scope_revalidation():
+        authorization_entered.set()
+        assert release_authorization.wait(timeout=3)
+
+    context.scope_pinned_http_dispatch_callback = pause_first_send_after_scope_revalidation
+
+    class FakeSocket:
+        def sendall(self, data):
+            if socket_closed.is_set():
+                raise OSError("socket closed before the first send")
+            sent_chunks.append(data)
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    class SendingConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+
+        def connect(self):
+            self.sock = FakeSocket()
+
+        def send(self, data):
+            self.sock.sendall(data)
+
+        def request(self, *_args, **_kwargs):
+            self.send(b"request-headers")
+            self.send(b"request-body")
+
+        def close(self):
+            if self.sock is not None:
+                self.sock.close()
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", SendingConnection)
+    client = MCPRemoteClient(ENDPOINT, context)
+    request_outcome = []
+
+    def send_request():
+        try:
+            client._post({"jsonrpc": "2.0", "method": "tools/call"})
+        except BaseException as exc:
+            request_outcome.append(exc)
+
+    worker = threading.Thread(target=send_request)
+    worker.start()
+    cancel_results = []
+    canceller = None
+    try:
+        assert authorization_entered.wait(timeout=1)
+        canceller = threading.Thread(
+            target=lambda: cancel_results.append(
+                cancel_active_mission_tool_executions(
+                    MISSION,
+                    before_signal=lambda: True,
+                    dispatch_gate=context.dispatch_gate,
+                )
+            ),
+            daemon=True,
+        )
+        canceller.start()
+        deadline = time.monotonic() + 2
+        while not context.dispatch_gate.intent_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert context.dispatch_gate.intent_path.exists()
+        assert not socket_closed.wait(timeout=0.05)
+        # The write-ahead callback and the immediately following first write
+        # complete under the same gate; intent cannot close the socket in between.
+        assert not context.dispatch_gate.cancel_path.exists()
+        assert canceller.is_alive()
+        release_authorization.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        canceller.join(timeout=2)
+        assert not canceller.is_alive()
+        assert cancel_results == [1]
+        assert context.dispatch_gate.cancel_path.exists()
+        assert socket_closed.is_set()
+        assert sent_chunks == [b"request-headers"]
+        assert request_outcome and isinstance(request_outcome[0], pinned_http.PinnedRequestCancelled)
+    finally:
+        release_authorization.set()
+        if canceller is not None and canceller.is_alive():
+            canceller.join(timeout=2)
+        if worker.is_alive():
+            worker.join(timeout=2)
+        _unregister_active_tool_cancellation(MISSION, context.cancellation_event)
+        client.close()
+
+
+def test_owner_cancel_closes_response_wait_socket_before_durable_marker(monkeypatch, tmp_path):
+    from security.dispatch_gate import MissionDispatchGate
+
+    _allow_scope(monkeypatch)
+    context = _context()
+    context.dispatch_lock = threading.Lock()
+    context.dispatch_gate = MissionDispatchGate(tmp_path / "mission.sqlite3", MISSION)
+    marker_commits = []
+    _register_context_cancellation(context)
+    response_waiting = threading.Event()
+    socket_closed = threading.Event()
+    connection_closed = threading.Event()
+    allow_response_exit = threading.Event()
+
+    class FakeSocket:
+        def sendall(self, _data):
+            return None
+
+        def shutdown(self, *_args):
+            socket_closed.set()
+
+        def close(self):
+            socket_closed.set()
+
+    class WaitingResponseConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+
+        def connect(self):
+            self.sock = FakeSocket()
+
+        def send(self, data):
+            self.sock.sendall(data)
+
+        def request(self, *_args, **_kwargs):
+            self.send(b"request-headers")
+            self.send(b"request-body")
+
+        def getresponse(self):
+            response_waiting.set()
+            assert socket_closed.wait(timeout=2)
+            assert allow_response_exit.wait(timeout=2)
+            raise OSError("response read interrupted by Owner cancellation")
+
+        def close(self):
+            socket_closed.set()
+            connection_closed.set()
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", WaitingResponseConnection)
+    client = MCPRemoteClient(ENDPOINT, context)
+    outcome = []
+
+    def run_request():
+        try:
+            client._post({"jsonrpc": "2.0", "method": "tools/call"})
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run_request)
+    worker.start()
+    cancel_result = []
+
+    def commit_after_connection_closed():
+        assert connection_closed.is_set()
+        marker_commits.append("committed")
+
+    canceller = threading.Thread(
+        target=lambda: cancel_result.append(
+            cancel_active_mission_tool_executions(
+                MISSION,
+                before_signal=commit_after_connection_closed,
+                dispatch_gate=context.dispatch_gate,
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        assert response_waiting.wait(timeout=2)
+        canceller.start()
+        assert socket_closed.wait(timeout=1)
+        assert not marker_commits
+        assert not connection_closed.is_set()
+        allow_response_exit.set()
+        canceller.join(timeout=2)
+        worker.join(timeout=2)
+        assert not canceller.is_alive()
+        assert not worker.is_alive()
+        assert cancel_result == [1]
+        assert connection_closed.is_set()
+        assert marker_commits == ["committed"]
+        assert outcome and isinstance(outcome[0], pinned_http.PinnedRequestCancelled)
+    finally:
+        allow_response_exit.set()
+        if worker.is_alive():
+            worker.join(timeout=2)
+        if canceller.is_alive():
+            canceller.join(timeout=2)
+        _unregister_active_tool_cancellation(MISSION, context.cancellation_event)
+        client.close()
+
+
+@pytest.mark.parametrize("interrupt_kind", ["cancel", "deadline"])
+def test_mcp_pinned_http_never_sends_when_connect_finishes_after_cancel_or_deadline(
+    monkeypatch, interrupt_kind,
+):
+    import socket
+
+    _allow_scope(monkeypatch)
+    context = _context()
+    context.dispatch_lock = threading.Lock()
+    context.dispatch_request_lock = None
+    connect_started = threading.Event()
+    release_connect = threading.Event()
+    marker_commits = []
+
+    class FakeSocket:
+        def shutdown(self, *_args):
+            return None
+
+        def close(self):
+            return None
+
+    class ConnectingConnection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = None
+            self.request_called = False
+            self.closed = False
+
+        def connect(self):
+            connect_started.set()
+            assert release_connect.wait(timeout=2)
+            self.sock = FakeSocket()
+
+        def request(self, *_args, **_kwargs):
+            self.request_called = True
+            raise AssertionError("MCP HTTP request crossed a cancelled/expired connect")
+
+        def close(self):
+            self.closed = True
+
+    connections = []
+
+    def make_connection(*args, **kwargs):
+        connection = ConnectingConnection(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(pinned_http, "resolve_public_addresses", lambda *_args, **_kwargs: ["93.184.216.34"])
+    monkeypatch.setattr(pinned_http, "_PinnedHTTPSConnection", make_connection)
+
+    if interrupt_kind == "cancel":
+        _register_context_cancellation(context)
+        request_timeout = 2.0
+    else:
+        request_timeout = 0.2
+
+    client = MCPRemoteClient(ENDPOINT, context, timeout=request_timeout)
+    outcome = []
+
+    def run_request():
+        try:
+            client._post({"jsonrpc": "2.0", "method": "tools/call"})
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run_request)
+    worker.start()
+    try:
+        assert connect_started.wait(timeout=2)
+        if interrupt_kind == "cancel":
+            assert cancel_active_mission_tool_executions(
+                MISSION,
+                before_signal=lambda: marker_commits.append("committed"),
+            ) == 1
+            assert marker_commits == ["committed"]
+            assert context.cancellation_event.is_set()
+        else:
+            time.sleep(request_timeout + 0.1)
+        release_connect.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert outcome
+        assert connections and all(not connection.request_called for connection in connections)
+        if interrupt_kind == "deadline":
+            assert isinstance(outcome[0], socket.timeout)
+    finally:
+        release_connect.set()
+        worker.join(timeout=2)
+        if interrupt_kind == "cancel":
+            _unregister_active_tool_cancellation(MISSION, context.cancellation_event)
         client.close()
 
 
@@ -465,6 +974,78 @@ def test_mcp_internal_timeout_is_bounded_and_not_retried(monkeypatch):
         client.close()
     call_count = sum(1 for item in fake.calls if (item[3] or {}).get("method") == "tools/call")
     assert call_count == 1
+
+
+def test_mcp_rpc_timeout_cancels_future_while_queued_before_send(monkeypatch):
+    from tools import mcp_client
+
+    _allow_scope(monkeypatch)
+    executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(mcp_client, "_REMOTE_EXECUTOR", executor)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    blocker = executor.submit(lambda: (blocker_started.set(), release_blocker.wait(timeout=2)))
+    assert blocker_started.wait(timeout=1)
+    fake = FakeMCPHTTP()
+    client = MCPRemoteClient(ENDPOINT, _context(), timeout=0.12, session_factory=lambda **_kwargs: fake)
+    client._session_id = "session-safe"
+    client._protocol_version = MCP_PROTOCOL_VERSION
+    try:
+        with pytest.raises(MCPRequestTimeout, match="before_send"):
+            client._rpc("tools/call", {"name": "lookup_record", "arguments": {"query": "safe"}})
+        release_blocker.set()
+        blocker.result(timeout=1)
+        time.sleep(0.05)
+        assert not any((item[3] or {}).get("method") == "tools/call" for item in fake.calls)
+    finally:
+        release_blocker.set()
+        client.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_mcp_timeout_while_scope_resolution_is_in_flight_still_blocks_late_send(monkeypatch):
+    _allow_scope(monkeypatch)
+    resolver_entered = threading.Event()
+    release_resolver = threading.Event()
+
+    def slow_scope_resolver(*args, **kwargs):
+        resolver_entered.set()
+        assert release_resolver.wait(timeout=2)
+        return SimpleNamespace(allowed=True, reason="allowed")
+
+    monkeypatch.setattr(scope_resolver, "resolve", slow_scope_resolver)
+    fake = FakeMCPHTTP()
+    client = MCPRemoteClient(ENDPOINT, _context(), timeout=0.12, session_factory=lambda **_kwargs: fake)
+    client._session_id = "session-safe"
+    client._protocol_version = MCP_PROTOCOL_VERSION
+    try:
+        with pytest.raises(MCPRequestTimeout, match="before_send"):
+            client._rpc("tools/call", {"name": "lookup_record", "arguments": {"query": "safe"}})
+        assert resolver_entered.is_set()
+        release_resolver.set()
+        time.sleep(0.1)
+        assert not any((item[3] or {}).get("method") == "tools/call" for item in fake.calls)
+    finally:
+        release_resolver.set()
+        client.close()
+
+
+def test_mcp_cancel_notification_remains_authorized_after_execution_deadline(monkeypatch):
+    _allow_scope(monkeypatch)
+    context = _context()
+    context.deadline_monotonic = time.monotonic() - 1
+    context.cancellation_event.set()
+    fake = FakeMCPHTTP()
+    client = MCPRemoteClient(ENDPOINT, context, timeout=0.2, session_factory=lambda **_kwargs: fake)
+    client._session_id = "session-safe"
+    client._protocol_version = MCP_PROTOCOL_VERSION
+    try:
+        client._send_cancelled("request-expired")
+        sent = [item[3] for item in fake.calls if (item[3] or {}).get("method") == "notifications/cancelled"]
+        assert len(sent) == 1
+        assert sent[0]["params"]["requestId"] == "request-expired"
+    finally:
+        client.close()
 
 
 def test_mcp_tool_registry_rejects_untrusted_or_unapproved_invocation(tmp_path):

@@ -14,14 +14,18 @@ from security.owner_policy import authority_snapshot, load_state, set_current_ow
 
 def test_authority_tiers_are_closed_and_ordered():
     assert_authority_invariant()
-    assert AuthorityTier.SYSTEM_PLATFORM > AuthorityTier.OWNER_INSTRUCTION
+    assert AuthorityTier.OWNER_INSTRUCTION == 900
+    assert AuthorityTier.SYSTEM_PLATFORM == 800
+    assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.SYSTEM_PLATFORM
     assert AuthorityTier.OWNER_INSTRUCTION > AuthorityTier.OWNER_POLICY
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.MODEL_OUTPUT
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.EXTERNAL_DATA
     assert AuthorityTier.OWNER_POLICY > AuthorityTier.TOOL_RUNTIME
     assert AuthorityTier.AUTHORIZATION_SCOPE > AuthorityTier.MODEL_OUTPUT
     snapshot = authority_snapshot()["invariant"]
-    assert snapshot["authority_order"][:3] == ["SYSTEM_PLATFORM", "OWNER_INSTRUCTION", "OWNER_POLICY"]
+    assert snapshot["authority_order"][:3] == ["OWNER_INSTRUCTION", "SYSTEM_PLATFORM", "OWNER_POLICY"]
+    assert snapshot["owner_instruction_grants_execution_permission"] is False
+    assert snapshot["execution_gates_unconditionally_required"] is True
     with pytest.raises(ValueError, match="closed"):
         validate_tier_name("MODEL_MADE_POLICY")
     assert snapshot["closed_world"] is True
