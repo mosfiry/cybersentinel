@@ -3416,11 +3416,14 @@ def test_acceptance_restart_uses_owned_windows_job_and_never_pid_sweep() -> None
     assert "$report.cleanup.process_tree_termination_verified = $ownedJobStopped" in powershell
     assert "if ($ownedJobStopped)" in powershell
     for api in (
-        "CreateProcessW", "AssignProcessToJobObject", "ResumeThread",
+        "CreateProcessW", "UpdateProcThreadAttribute", "ResumeThread",
         "TerminateJobObject", "IsProcessInJob", "GetProcessTimes",
         "QueryInformationJobObject",
     ):
         assert api in job_module
+    assert "AssignProcessToJobObject" not in job_module
+    assert "_PROC_THREAD_ATTRIBUTE_JOB_LIST" in job_module
+    assert "_EXTENDED_STARTUPINFO_PRESENT" in job_module
     assert "_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in job_module
     assert "_CREATE_SUSPENDED" in job_module
 

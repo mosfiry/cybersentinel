@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,9 @@ _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _CREATE_SUSPENDED = 0x00000004
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+_PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
+_ERROR_INSUFFICIENT_BUFFER = 122
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _SYNCHRONIZE = 0x00100000
 _WAIT_OBJECT_0 = 0x00000000
@@ -128,6 +132,41 @@ class _StartupInfo(ctypes.Structure):
     ]
 
 
+class _StartupInfoEx(ctypes.Structure):
+    _fields_ = [("StartupInfo", _StartupInfo), ("lpAttributeList", ctypes.c_void_p)]
+
+
+@contextmanager
+def _job_attribute_list(kernel32, job_handle: int):
+    """Keep the opaque list and its HANDLE value alive through CreateProcessW.
+
+    Windows 10 / Server 2016 or newer is required. Any setup/assignment failure
+    refuses launch; there is deliberately no post-creation assignment fallback.
+    The Job handle is referenced by the attribute, never inherited by the child.
+    """
+    size = ctypes.c_size_t()
+    if (
+        kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        or ctypes.get_last_error() != _ERROR_INSUFFICIENT_BUFFER
+        or not size.value
+    ):
+        raise _win_error("windows_job_attribute_size_failed")
+    storage = ctypes.create_string_buffer(size.value)
+    attribute_list = ctypes.cast(storage, ctypes.c_void_p)
+    jobs = (wintypes.HANDLE * 1)(job_handle)
+    if not kernel32.InitializeProcThreadAttributeList(attribute_list, 1, 0, ctypes.byref(size)):
+        raise _win_error("windows_job_attribute_init_failed")
+    try:
+        if not kernel32.UpdateProcThreadAttribute(
+            attribute_list, 0, _PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            ctypes.cast(jobs, ctypes.c_void_p), ctypes.sizeof(jobs), None, None,
+        ):
+            raise _win_error("windows_job_attribute_update_failed")
+        yield attribute_list
+    finally:
+        kernel32.DeleteProcThreadAttributeList(attribute_list)
+
+
 class _ProcessInformation(ctypes.Structure):
     _fields_ = [
         ("hProcess", wintypes.HANDLE),
@@ -154,7 +193,7 @@ class WindowsProcessIdentity:
 
 
 class WindowsOwnedJob:
-    """A unique Job Object whose only direct assignment is the app we launch."""
+    """A unique Job Object bound to the app at creation, before it can execute."""
 
     def __init__(self, name: str, handle: int) -> None:
         self.name = name
@@ -191,35 +230,39 @@ class WindowsOwnedJob:
         cwd: str | Path,
         environment: Mapping[str, str] | None = None,
     ) -> WindowsProcessIdentity:
+        """Create in this Job suspended; validate identity/membership, then resume.
+
+        Launch fails closed on unsupported attributes or rejected Job binding.
+        This trusted-harness primitive is not a Mission isolation backend.
+        """
         self._require_open()
         image = str(Path(executable).expanduser().resolve(strict=True))
         workdir = str(Path(cwd).expanduser().resolve(strict=True))
         command_line = subprocess.list2cmdline([image, *(str(arg) for arg in arguments)])
         command_buffer = ctypes.create_unicode_buffer(command_line)
-        startup = _StartupInfo()
-        startup.cb = ctypes.sizeof(startup)
+        startup = _StartupInfoEx()
+        startup.StartupInfo.cb = ctypes.sizeof(startup)
         process_info = _ProcessInformation()
         env_buffer = _environment_block(environment) if environment is not None else None
         env_pointer = ctypes.cast(env_buffer, ctypes.c_void_p) if env_buffer is not None else None
-        created = self._kernel32.CreateProcessW(
-            image,
-            command_buffer,
-            None,
-            None,
-            False,
-            _CREATE_SUSPENDED | _CREATE_UNICODE_ENVIRONMENT,
-            env_pointer,
-            workdir,
-            ctypes.byref(startup),
-            ctypes.byref(process_info),
-        )
-        if not created:
-            raise _win_error("windows_job_process_create_failed")
-        process_handle = process_info.hProcess
-        thread_handle = process_info.hThread
         try:
-            if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
-                raise _win_error("windows_job_process_assignment_failed")
+            with _job_attribute_list(self._kernel32, self._handle) as attribute_list:
+                startup.lpAttributeList = attribute_list
+                created = self._kernel32.CreateProcessW(
+                    image,
+                    command_buffer,
+                    None,
+                    None,
+                    False,
+                    _CREATE_SUSPENDED | _CREATE_UNICODE_ENVIRONMENT | _EXTENDED_STARTUPINFO_PRESENT,
+                    env_pointer,
+                    workdir,
+                    ctypes.byref(startup.StartupInfo),
+                    ctypes.byref(process_info),
+                )
+                if not created:
+                    raise _win_error("windows_job_process_create_failed")
+            process_handle = process_info.hProcess
             identity = _identity_from_handle(
                 self._kernel32, process_handle, int(process_info.dwProcessId)
             )
@@ -227,18 +270,27 @@ class WindowsOwnedJob:
                 raise RuntimeError("windows_job_process_image_mismatch")
             if not _is_process_in_job(self._kernel32, process_handle, self._handle):
                 raise RuntimeError("windows_job_membership_unverified")
-            resume_result = self._kernel32.ResumeThread(thread_handle)
+            resume_result = self._kernel32.ResumeThread(process_info.hThread)
             if resume_result == 0xFFFFFFFF:
                 raise _win_error("windows_job_process_resume_failed")
             self.current = identity
             return identity
-        except Exception:
-            self._kernel32.TerminateProcess(process_handle, 1)
-            self._kernel32.WaitForSingleObject(process_handle, 5000)
-            self._kernel32.CloseHandle(process_handle)
+        except BaseException:
+            # CreateProcessW may have filled these handles before cancellation was
+            # delivered. Never strand a suspended or just-resumed owned child.
+            if process_info.hProcess:
+                try:
+                    self._kernel32.TerminateJobObject(self._handle, 1)
+                    self._kernel32.TerminateProcess(process_info.hProcess, 1)
+                    self._kernel32.WaitForSingleObject(process_info.hProcess, 5000)
+                finally:
+                    self._kernel32.CloseHandle(process_info.hProcess)
+                    if self.current is not None and self.current.process_handle == process_info.hProcess:
+                        self.current = None
             raise
         finally:
-            self._kernel32.CloseHandle(thread_handle)
+            if process_info.hThread:
+                self._kernel32.CloseHandle(process_info.hThread)
 
     def bind_existing(self, process_id: int, expected_image: str | Path) -> WindowsProcessIdentity:
         self._require_open()
@@ -479,8 +531,17 @@ def _kernel32():
         ctypes.POINTER(_StartupInfo), ctypes.POINTER(_ProcessInformation),
     ]
     kernel32.CreateProcessW.restype = wintypes.BOOL
-    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.InitializeProcThreadAttributeList.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+    kernel32.UpdateProcThreadAttribute.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p,
+        ctypes.c_size_t, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+    kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+    kernel32.DeleteProcThreadAttributeList.restype = None
     kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
     kernel32.ResumeThread.restype = wintypes.DWORD
     kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
@@ -529,7 +590,7 @@ def run_process_in_owned_job(
     timeout_seconds: float,
     job_factory: Callable[[], WindowsOwnedJob] | None = None,
 ) -> dict[str, object]:
-    """Run a process suspended until it is assigned to a unique owned Job.
+    """Run a process created in a unique owned Job, suspended until validated.
 
     The process and descendants stay in that Job; completion always terminates
     remaining members and records whether the Job became empty before return.
@@ -564,29 +625,33 @@ def run_process_in_owned_job(
     waited: bool | None = None
     process_exit_code: int | None = None
     error_code: str | None = None
-    try:
-        identity = job.launch(executable, arguments, cwd=cwd)
-    except Exception:
-        error_code = "windows_job_process_launch_failed"
-    if identity is not None:
-        try:
-            waited = job.wait_current(timeout_seconds)
-            if waited:
-                process_exit_code = job.exit_code_current()
-            else:
-                error_code = "windows_job_process_timeout"
-        except Exception:
-            error_code = "windows_job_process_wait_failed"
-
     cleanup: dict[str, object] = {}
     try:
-        cleanup = job.terminate_owned_job(timeout_seconds=30.0)
-    except Exception:
-        error_code = error_code or "windows_job_tree_termination_failed"
-    try:
-        job.close()
-    except Exception:
-        error_code = error_code or "windows_job_close_failed"
+        try:
+            identity = job.launch(executable, arguments, cwd=cwd)
+        except Exception:
+            error_code = "windows_job_process_launch_failed"
+        if identity is not None:
+            try:
+                waited = job.wait_current(timeout_seconds)
+                if waited:
+                    process_exit_code = job.exit_code_current()
+                else:
+                    error_code = "windows_job_process_timeout"
+            except Exception:
+                error_code = "windows_job_process_wait_failed"
+    finally:
+        # Cancellation propagates, but never bypasses owned-tree cleanup/close.
+        try:
+            try:
+                cleanup = job.terminate_owned_job(timeout_seconds=30.0)
+            except Exception:
+                error_code = error_code or "windows_job_tree_termination_failed"
+        finally:
+            try:
+                job.close()
+            except Exception:
+                error_code = error_code or "windows_job_close_failed"
 
     remaining_members = cleanup.get("remaining_member_count")
     tree_terminated = (

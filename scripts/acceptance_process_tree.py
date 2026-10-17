@@ -1,7 +1,7 @@
 """Owned process-tree lifecycle for bounded local acceptance helpers.
 
-Windows launches are created suspended and assigned to a unique Job Object
-before resume. Linux can use an explicitly configured delegated cgroup v2 root;
+Windows launches are bound to a unique Job Object at creation and validated
+while suspended before resume. Linux can use a delegated cgroup v2 root;
 otherwise fixtures use a dedicated process group and verified group teardown.
 """
 from __future__ import annotations
@@ -258,20 +258,21 @@ def start_owned_process(
     if os.name == "nt":
         from scripts.windows_process_job import WindowsOwnedJob
 
-        # WindowsOwnedJob uses a suspended CreateProcess/AssignProcessToJob
-        # sequence; its public launcher does not redirect standard handles.
+        # WindowsOwnedJob binds the Job at creation, then validates while suspended;
+        # its public launcher does not redirect standard handles.
         job = WindowsOwnedJob.create()
         try:
             identity = job.launch(
                 argv[0], argv[1:], cwd=working_directory, environment=environment
             )
             return _WindowsOwnedProcess(job, identity)
-        except Exception:
+        except BaseException:
             try:
                 job.terminate_owned_job(timeout_seconds=2.0)
             except Exception:
                 pass
-            job.close()
+            finally:
+                job.close()
             raise
 
     cgroup_scope = None

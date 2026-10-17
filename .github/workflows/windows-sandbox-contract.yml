@@ -50,9 +50,11 @@ jobs:
           tests/test_windows_process_job.py::test_native_job_assigns_suspended_process_and_terminates_descendants
           tests/test_windows_process_job.py::test_native_job_runner_kills_descendant_after_root_exits
           tests/test_windows_process_job.py::test_native_job_runner_timeout_terminates_root_and_descendants
+          tests/test_windows_job_launch_binding.py
           tests/test_process_sandbox_contract.py::test_native_windows_process_execution_fails_closed_until_appcontainer_backend_exists
           tests/test_process_sandbox_contract.py::test_native_windows_unimplemented_backend_refuses_spawn_before_dispatch
           tests/test_windows_sandbox_governed_refusal.py::test_native_windows_governed_refusal_is_durable
+          -k native
           --junitxml=native-sandbox-contract.xml -o junit_family=xunit1
       - name: Reject missing or skipped native coverage and record bounded evidence
         if: always()
@@ -73,6 +75,19 @@ jobs:
               "test_native_windows_unimplemented_backend_refuses_spawn_before_dispatch",
               "test_native_windows_governed_refusal_is_durable",
           }
+          expected.add("test_native_job_list_binds_child_before_resume_and_runs_marker")
+          expected.update(
+              f"test_native_job_launch_failures_never_run_marker_and_leave_empty_job[{stage}]"
+              for stage in ("initialize", "update", "create-process", "identity", "membership", "resume")
+          )
+          expected.update(
+              f"test_native_job_launch_cancellation_closes_root_and_empties_job[{stage}]"
+              for stage in ("create-return", "identity-validation", "resume-return")
+          )
+          expected.update(
+              f"test_native_job_runner_cancellation_verifies_empty_tree_and_closes[{stage}]"
+              for stage in ("create-return", "resume-return", "wait")
+          )
           junit = Path("native-sandbox-contract.xml")
           cases = list(ET.parse(junit).iter("testcase")) if junit.is_file() else []
           names = [case.get("name") for case in cases]
