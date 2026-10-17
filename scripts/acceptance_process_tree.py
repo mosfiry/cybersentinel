@@ -6,6 +6,7 @@ otherwise fixtures use a dedicated process group and verified group teardown.
 """
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 import signal
@@ -13,6 +14,45 @@ import subprocess
 import sys
 import time
 from typing import Mapping, Sequence, TextIO
+
+
+MAX_ACCEPTANCE_PROCESS_TIMEOUT_SECONDS = 300.0
+MAX_ACCEPTANCE_COMMAND_TIMEOUT_SECONDS = 30.0
+MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+def _validated_execution_timeout(
+    timeout_seconds: object,
+    *,
+    maximum_seconds: float,
+    allow_zero: bool = True,
+) -> float:
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        raise ValueError("acceptance_process_timeout_invalid")
+    try:
+        normalized = float(timeout_seconds)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("acceptance_process_timeout_invalid") from None
+    if (
+        not math.isfinite(normalized)
+        or normalized < 0
+        or normalized > maximum_seconds
+        or (not allow_zero and normalized == 0)
+    ):
+        raise ValueError("acceptance_process_timeout_invalid")
+    return normalized
+
+
+def _bounded_cleanup_timeout(timeout_seconds: object) -> float:
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        return MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS
+    try:
+        normalized = float(timeout_seconds)
+    except (OverflowError, TypeError, ValueError):
+        return MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS
+    if not math.isfinite(normalized):
+        return MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS
+    return min(MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS, max(0.0, normalized))
 
 
 class _PosixOwnedProcess:
@@ -28,20 +68,28 @@ class _PosixOwnedProcess:
         return self.process.poll()
 
     def wait(self, timeout: float | None = None):
-        return self.process.wait(timeout=timeout)
+        duration = (
+            MAX_ACCEPTANCE_PROCESS_TIMEOUT_SECONDS
+            if timeout is None
+            else _validated_execution_timeout(
+                timeout, maximum_seconds=MAX_ACCEPTANCE_PROCESS_TIMEOUT_SECONDS
+            )
+        )
+        return self.process.wait(timeout=duration)
 
     def terminate(self) -> None:
-        if not self.terminate_tree(timeout_seconds=5.0):
+        if not self.terminate_tree(timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS):
             raise RuntimeError("acceptance_process_tree_stop_unverified")
 
     def kill(self) -> None:
-        if not self.terminate_tree(timeout_seconds=5.0):
+        if not self.terminate_tree(timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS):
             raise RuntimeError("acceptance_process_tree_stop_unverified")
 
     def terminate_tree(self, *, timeout_seconds: float = 5.0) -> bool:
         if self._closed:
             return self._stop_verified
-        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        timeout_seconds = _bounded_cleanup_timeout(timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
         cleanup_verified = True
         if self._cgroup_scope is not None:
             if not self._cgroup_removed:
@@ -89,7 +137,7 @@ class _PosixOwnedProcess:
         return self._stop_verified
 
     def close(self) -> bool:
-        return self.terminate_tree(timeout_seconds=5.0)
+        return self.terminate_tree(timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS)
 
     def _signal_group(self, sig: int) -> None:
         try:
@@ -135,14 +183,20 @@ class _WindowsOwnedProcess:
     def wait(self, timeout: float | None = None):
         if self._closed:
             return self._exit_code if self._exit_code is not None else 1
-        duration = 24 * 60 * 60 if timeout is None else max(0.0, float(timeout))
+        duration = (
+            MAX_ACCEPTANCE_PROCESS_TIMEOUT_SECONDS
+            if timeout is None
+            else _validated_execution_timeout(
+                timeout, maximum_seconds=MAX_ACCEPTANCE_PROCESS_TIMEOUT_SECONDS
+            )
+        )
         if not self._job.wait_current(duration):
             raise subprocess.TimeoutExpired(["acceptance-owned-process", str(self.pid)], timeout)
         self._exit_code = self._job.exit_code_current()
         return self._exit_code
 
     def terminate(self) -> None:
-        if not self.terminate_tree(timeout_seconds=5.0):
+        if not self.terminate_tree(timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS):
             raise RuntimeError("acceptance_process_tree_stop_unverified")
 
     def kill(self) -> None:
@@ -152,7 +206,9 @@ class _WindowsOwnedProcess:
         if self._closed:
             return self._stop_verified
         try:
-            result = self._job.terminate_owned_job(timeout_seconds=max(0.0, timeout_seconds))
+            result = self._job.terminate_owned_job(
+                timeout_seconds=_bounded_cleanup_timeout(timeout_seconds)
+            )
             self._stop_verified = result.get("termination_succeeded") is True
         except Exception:
             self._stop_verified = False
@@ -173,7 +229,7 @@ class _WindowsOwnedProcess:
         return self._stop_verified
 
     def close(self) -> bool:
-        return self.terminate_tree(timeout_seconds=5.0)
+        return self.terminate_tree(timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS)
 
 
 def start_owned_process(
@@ -264,6 +320,11 @@ def run_owned_command(
     stderr: int | TextIO | None = subprocess.DEVNULL,
 ):
     """Run a short acceptance helper with a timeout and verified tree cleanup."""
+    timeout_seconds = _validated_execution_timeout(
+        timeout_seconds,
+        maximum_seconds=MAX_ACCEPTANCE_COMMAND_TIMEOUT_SECONDS,
+        allow_zero=False,
+    )
     if os.name == "nt":
         # WindowsOwnedJob currently inherits the caller's standard handles.
         stdout = None
@@ -279,9 +340,13 @@ def run_owned_command(
         try:
             return_code = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            process.terminate_tree(timeout_seconds=5.0)
+            process.terminate_tree(
+                timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS
+            )
             raise subprocess.TimeoutExpired([str(part) for part in command], timeout_seconds) from None
-        if not process.terminate_tree(timeout_seconds=5.0):
+        if not process.terminate_tree(
+            timeout_seconds=MAX_ACCEPTANCE_CLEANUP_TIMEOUT_SECONDS
+        ):
             raise RuntimeError("acceptance_process_tree_stop_unverified")
         if check and return_code != 0:
             raise subprocess.CalledProcessError(return_code, [str(part) for part in command])
