@@ -66,3 +66,12 @@
 - [x] فحص remote refs قبل التسليم: `main` و`v5.1.0` كما هما، ولا `v5.2*` tag، وفرع المراجعة ما زال هدف التغييرات.
 - [x] تقسيم التغييرات إلى commits ذرية، ثم normal fast-forward push لفرع `fix/blocker-d-review-20261010` فقط؛ لا merge أو force-push أو release.
 - [x] نتيجة الأدلة الحالية **PARTIALLY VERIFIED** لا PASS؛ لا ادعاء قبول Windows.
+
+## متابعة 2026-10-17: Windows sandbox fail-closed
+- [x] فحص أدلة Windows الأصلية من التشغيل `39002439803`؛ ميّزت بين نجاح ملكية/تنظيف Job للتطبيق وبين عدم وجود sandbox وتنفيذ Mission.
+- [x] وثّقت الحاجز الفعلي: AppContainer/LPAC وACL workspace-only ومنع الشبكة وحدود الكتابة/القرص وJob-bound dispatch/receipt غير منفذة أو غير مثبتة؛ بقي Windows execution fail-closed.
+- [x] أضفت اختباراً أصلياً لرفض `spawn` قبل callback الخاص بـdispatch، وأي `Popen` أو start marker؛ سيعمل ضمن اختبارات Windows المحمولة في desktop-build.
+- [ ] لا تفعيل ولا ادعاء قبول Windows حتى تنفذ الضوابط كاملة وتنجح اختبارات Windows الأصلية الإيجابية والسلبية وقبول Mission المتكامل.
+- **النتيجة الحالية:** `RESOURCE_BLOCKED` عند `run_project_tests` متوقع وآمن وفق الدليل؛ لا يجوز تحويله إلى نجاح. استعادة المهمة ذات السلسلة الغائبة تظل غير مثبتة.
+- [x] التحقق المحلي المركّز: `365 passed, 7 skipped`؛ المجموعة الكاملة: `2081 passed, 28 skipped, 4 warnings`.
+- [x] `compileall` و`git diff --check` اجتازا؛ strict secret/sensitive-file scan: صفر ملفات حساسة متتبعة وصفر أنماط أسرار.

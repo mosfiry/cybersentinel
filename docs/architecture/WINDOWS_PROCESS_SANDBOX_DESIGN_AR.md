@@ -114,6 +114,10 @@ Windows backend `windows-appcontainer-job` في الشيفرة الحالية ي
 
 يبقى `WindowsAppContainerBackend` محجوبًا fail-closed حتى اكتمال backend حقيقي ونجاح اختبارات Windows أصلية. الاسم الحالي `windows-appcontainer-job` لا يثبت وجود Job أو AppContainer؛ التنفيذ الحالي يصرح `windows_appcontainer_backend_unimplemented` حتى على Windows. لا يُستبدل ذلك بـ`Popen` عادي أو تشغيل بصلاحيات المستخدم أو Job Object منفرد.
 
+في قبول Windows الأصلي `39002439803` للالتزام `e70706209fe06202b634458b4feb73ceccd8078c`، نجح إثبات Job Object لشجرة التطبيق المثبتة والإغلاق وإعادة الإطلاق من المسار المثبت؛ لكنه لا يثبت sandbox لأوامر Mission. الـfull-E2E وصل إلى `run_project_tests` وانتهى `RESOURCE_BLOCKED` مع `windows_appcontainer_backend_unimplemented` و`dispatch_attempted=false` و`process_started=false`، بلا process receipt أو execution evidence. وفي سيناريو المهمة المتوقفة كانت السلسلة `NOT_PRESENT` وعدد سجلات الأدلة صفرًا قبل restart، ثم تعذرت المصالحة بعده. هذه فجوة تنفيذ/استمرارية فعلية وليست خطأ عرض، ولا تبرر تصنيع أدلة أو تخفيف التحقق.
+
+الموانع التنفيذية الحالية محددة: لا يوجد إنشاء/إطلاق فعلي لهوية AppContainer أو LPAC، ولا ACL مثبتة تقصر القراءة على workspace وتمنع ملفات المستخدم/الأسرار، ولا اختبار يثبت حظر الشبكة، ولا backend يربط تشغيل المهمة بـJob Object للإلغاء والتنظيف وإثبات بدء العملية. كما لا توجد حصة كتابة/قرص إجمالية موثوقة؛ Job Object وحده لا يفرضها. لذلك يظل التشغيل غير متاح حتى يُنفذ كل حد ويُثبت على Windows أصلي، بما في ذلك الاختبار السلبي قبل dispatch والقبول المتكامل.
+
 التنفيذ المقترح عند توفر Windows runner:
 
 1. إنشاء AppContainer أو LPAC مخصص لكل profile أمني مع capabilities أقل ما يمكن. السياسة الافتراضية لا تمنح `internetClient` أو `privateNetworkClientServer` أو server capabilities. يجب أن تثبت اختبارات sockets حظر الشبكة الفعلية، لا مجرد حذف متغيرات البيئة.

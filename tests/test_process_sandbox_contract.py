@@ -666,3 +666,40 @@ def test_native_windows_process_execution_fails_closed_until_appcontainer_backen
     assert availability.backend == "windows-appcontainer-job"
     assert availability.reason_code == "backend_unavailable"
     assert availability.detail_code == "windows_appcontainer_backend_unimplemented"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a native Windows runner")
+def test_native_windows_unimplemented_backend_refuses_spawn_before_dispatch(monkeypatch, tmp_path):
+    from workspace import process_sandbox
+    from workspace.environment import ProcessSandboxUnavailable
+
+    backend = process_sandbox.WindowsAppContainerBackend()
+    process_launches = []
+    dispatch_fences = []
+    marker_path = tmp_path / "process-start.marker"
+    marker_path.write_bytes(b"")
+    marker_fd = os.open(marker_path, os.O_RDWR)
+    monkeypatch.setattr(
+        process_sandbox.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process_launches.append((args, kwargs)),
+    )
+    try:
+        with pytest.raises(ProcessSandboxUnavailable) as blocked:
+            backend.spawn(
+                object(),
+                ("python", "-c", "pass"),
+                cwd=tmp_path,
+                artifact_fd=marker_fd,
+                start_marker_fd=marker_fd,
+                timeout=5,
+                before_spawn=lambda backend_id: dispatch_fences.append(backend_id),
+            )
+        assert blocked.value.reason_code == "backend_unavailable"
+        assert blocked.value.detail_code == "windows_appcontainer_backend_unimplemented"
+        assert blocked.value.sandbox_backend == "windows-appcontainer-job"
+        assert dispatch_fences == []
+        assert process_launches == []
+        assert os.fstat(marker_fd).st_size == 0
+    finally:
+        os.close(marker_fd)
