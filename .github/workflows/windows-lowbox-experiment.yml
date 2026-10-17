@@ -1,0 +1,71 @@
+name: windows-lowbox-experiment
+
+on:
+  push:
+    branches: [fix/blocker-d-review-20261010]
+    paths:
+      - "tests/**"
+      - ".github/workflows/windows-lowbox-experiment.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-lowbox-experiment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  documented-profile-free-lowbox:
+    if: github.repository == 'mosfiry/cybersentinel' && github.ref == 'refs/heads/fix/blocker-d-review-20261010'
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install isolated test dependency
+        run: python -m pip install --disable-pip-version-check "pytest>=8,<9"
+      # Trusted static test executable only. Diagnostic PASS is NOT launch support.
+      - name: Run documented API experiment without profiles or ACL changes
+        run: >-
+          python -m pytest -q tests/test_windows_lowbox_launch.py::test_native_profile_free_lowbox_launch
+          --junitxml=native-lowbox-launch.xml -o junit_family=xunit1
+      - name: Verify exact-SHA native diagnostic evidence (not Mission acceptance)
+        if: always()
+        shell: pwsh
+        run: |
+          @'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          import runpy
+          _validate_report = runpy.run_path("tests/test_windows_lowbox_launch.py")["_validate_report"]
+
+          report = json.loads(Path("native-lowbox-launch.json").read_text())
+          assert report["source_commit"] == os.environ["GITHUB_SHA"]
+          assert report["mission_acceptance"] == "BLOCKED"
+          assert report["backend_enabled_by_slice"] is False
+          assert report["classification"] in {"supported", "blocked", "inconclusive"}
+          assert report["unexpected_profile_artifacts"] is False
+          _validate_report(report["native"])
+          cases = list(ET.parse("native-lowbox-launch.xml").iter("testcase"))
+          assert len(cases) == 1 and cases[0].get("name") == "test_native_profile_free_lowbox_launch"
+          assert not any(cases[0].find(tag) is not None for tag in ("failure", "error", "skipped"))
+          print("Diagnostic evidence complete; launch classification:", report["classification"])
+          '@ | python -
+      - name: Upload bounded native diagnostics even when blocked
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-lowbox-launch-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-lowbox-launch.json
+            native-lowbox-launch.xml
+          if-no-files-found: error
+          retention-days: 30
