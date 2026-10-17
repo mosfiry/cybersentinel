@@ -6,12 +6,42 @@ from hashlib import sha256
 import ipaddress
 import json
 import hmac
+import re
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 class ScopeError(ValueError):
     pass
+
+
+_MAX_PATH_DECODE_ROUNDS = 8
+_BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9a-fA-F]{2})")
+_ENCODED_PATH_SEPARATOR = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
+
+
+def _validate_url_path(path: str) -> None:
+    """Reject path forms whose effective segments vary across HTTP stacks."""
+    candidate = path
+    for depth in range(_MAX_PATH_DECODE_ROUNDS + 1):
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in candidate):
+            raise ScopeError("control_character_in_path")
+        if "\\" in candidate or _ENCODED_PATH_SEPARATOR.search(candidate):
+            raise ScopeError("ambiguous_path_separator")
+        if any(segment in {".", ".."} for segment in candidate.split("/")):
+            raise ScopeError("path_traversal_not_allowed")
+        if _BAD_PERCENT_ESCAPE.search(candidate):
+            raise ScopeError("invalid_path_encoding")
+        try:
+            decoded = unquote(candidate, errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ScopeError("invalid_path_encoding") from exc
+        if decoded == candidate:
+            return
+        if depth == _MAX_PATH_DECODE_ROUNDS:
+            raise ScopeError("ambiguous_path_encoding")
+        candidate = decoded
+    raise ScopeError("ambiguous_path_encoding")
 
 
 def _utc() -> str:
@@ -46,6 +76,7 @@ def canonical_url(value: str, *, allowed_schemes: tuple[str, ...] = ("http", "ht
     if port is not None and not ((parts.scheme.lower() == "http" and port == 80) or (parts.scheme.lower() == "https" and port == 443)):
         netloc = f"{netloc}:{port}"
     path = parts.path or "/"
+    _validate_url_path(path)
     if not path.startswith("/"):
         path = "/" + path
     return urlunsplit((parts.scheme.lower(), netloc, path, parts.query, ""))

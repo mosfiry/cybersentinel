@@ -183,6 +183,47 @@ def test_research_fetches_only_in_scope_and_records_scrubbed_fenced_citations(lo
     assert len(local_page.active_checks) >= 4
 
 
+def test_encoded_path_traversal_is_rejected_before_http_transport(local_page, monkeypatch):
+    _PageHandler.body = b"<html><body>must not be fetched</body></html>"
+    program_id, target_id = "program:web-test", "target:web-test"
+    snapshot_id = "scope:web-test"
+    authorization = ProgramAuthorization(
+        program_id=program_id,
+        platform="controlled-test",
+        scope_version="1",
+        retrieved_at="2026-10-05T00:00:00+00:00",
+        in_scope_assets=({
+            "host": "127.0.0.1",
+            "schemes": ["http"],
+            "ports": [local_page.server.server_port],
+            "paths": ["/api"],
+        },),
+        out_of_scope_assets=({"host": "127.0.0.1", "paths": ["/admin"]},),
+    )
+    target = TargetIdentity(
+        target_id,
+        program_id,
+        "127.0.0.1",
+        allowed_ports=(local_page.server.server_port,),
+        allowed_paths=("/api",),
+    )
+    snapshot = ScopeSnapshot(snapshot_id, authorization, (target,))
+    monkeypatch.setattr(
+        "security.scope_resolver.get_snapshot",
+        lambda candidate: snapshot if candidate == snapshot_id else None,
+    )
+    searcher = _Searcher([_result(local_page.origin + "/api/%2e%2e/admin")])
+
+    result = WebResearchService(searcher=searcher, fetcher=local_page.fetcher).run(
+        {"query": "authorized target advisory"}, local_page.context
+    )
+
+    assert result["status"] == "no_in_scope_sources"
+    assert result["rejected_out_of_scope"] == 1
+    assert _PageHandler.request_paths == []
+    assert local_page.evidence.records == []
+
+
 def test_out_of_scope_and_secret_bearing_source_urls_are_never_fetched(local_page):
     _PageHandler.body = b"<html><body>must not arrive</body></html>"
     searcher = _Searcher([

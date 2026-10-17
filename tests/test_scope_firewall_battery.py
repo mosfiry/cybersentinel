@@ -81,6 +81,24 @@ def test_canonical_url_rejects_bad_ports_and_keeps_explicit_ports():
 def test_canonical_url_normalizes_path_and_drops_fragment():
     assert canonical_url("HTTPS://TARGET.EXAMPLE.COM") == "https://target.example.com/"
     assert canonical_url("https://target.example.com/api#frag") == "https://target.example.com/api"
+    assert canonical_url("https://target.example.com/api/file%20name") == "https://target.example.com/api/file%20name"
+
+
+@pytest.mark.parametrize("path", [
+    "/api/../admin",
+    "/api/%2e%2e/admin",
+    "/api/%2E./admin",
+    "/api/.%2e/admin",
+    "/api/%252e%252e/admin",
+    "/api/%25252e%25252e/admin",
+    "/api/%2e%2e%2fadmin",
+    "/api%2f..%2fadmin",
+    "/api/%5c..%5cadmin",
+    "/api/%252f..%252fadmin",
+])
+def test_canonical_url_rejects_ambiguous_path_traversal(path):
+    with pytest.raises(ScopeError):
+        canonical_url("https://target.example.com" + path)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +227,18 @@ def test_resolve_scheme_port_and_path_violations_fail_closed(battery_snapshot):
     ):
         decision = resolve(battery_snapshot.snapshot_id, "target-1", url, consume_rate=False)
         assert decision.allowed is False, url
+
+
+def test_resolve_rejects_encoded_dot_segments_before_scope_prefix_checks(battery_snapshot):
+    decision = resolve(
+        battery_snapshot.snapshot_id,
+        "target-1",
+        "https://target.example.com/api/%2e%2e/admin",
+        consume_rate=False,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "path_traversal_not_allowed"
+    assert decision.canonical_url is None
 
 
 def test_resolve_prohibited_methods_fail_closed(battery_snapshot):
