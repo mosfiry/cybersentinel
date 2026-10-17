@@ -3252,8 +3252,10 @@ def _mission_restart_authority_projection(
             from bridge import _public_project_owner_tool_scope
 
             expected_public_scope_tools = _public_project_owner_tool_scope(owner_instruction)
+            # The persisted snapshot holds the full Owner-approved tool scope;
+            # plan_actions were already required to be a subset above.
             expected_authorized_tools = list(dict.fromkeys(
-                (*plan_actions, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
+                (*expected_public_scope_tools, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
             ))
             # Cross-process attribution only; this neither reauthorizes nor
             # resumes a Mission requiring Owner reauthentication.

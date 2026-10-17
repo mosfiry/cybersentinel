@@ -4044,6 +4044,7 @@ def _public_project_scope_snapshot(snapshot: dict) -> dict:
 
     from agent.agent_core import OWNER_UI_CONTROL_PLANE_CAPABILITIES
     from agent.mission import Mission
+    from bridge import _public_project_owner_tool_scope
     from security.authorization_context import AuthorizationContext
     from security.mission_authorization import MissionAuthorizationSnapshot
 
@@ -4057,8 +4058,9 @@ def _public_project_scope_snapshot(snapshot: dict) -> dict:
         plan_actions = tuple(
             step.action for step in mission.plan.steps if step.action != "__planning_failure__"
         )
+        public_scope_tools = _public_project_owner_tool_scope(mission.owner_instruction)
         authorized_tools = tuple(dict.fromkeys(
-            (*plan_actions, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
+            (*public_scope_tools, *OWNER_UI_CONTROL_PLANE_CAPABILITIES)
         ))
         authorization = replace(
             authorization,
@@ -4075,13 +4077,11 @@ def _public_project_scope_snapshot(snapshot: dict) -> dict:
         )
         mission.authorization_snapshot = authorization.to_dict()
         mission.authorization_context = replace(context, scope_snapshot=None).to_dict()
-        from bridge import _public_project_owner_tool_scope
-
         mission.scope_snapshot = {
             "target_id": target_identity,
             "workspace_root": workspace_root,
             "scope": ["workspace"],
-            "allowed_tools": _public_project_owner_tool_scope(mission.owner_instruction),
+            "allowed_tools": public_scope_tools,
             "allowed_networks": [],
             "allowed_credentials": [],
         }
@@ -4171,6 +4171,8 @@ def test_preflight_restart_basis_accepts_bound_public_project_scope_without_exte
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from agent.agent_core import OWNER_UI_CONTROL_PLANE_CAPABILITIES
+
     mission_id, _ready_snapshot, blocked_snapshot = _durable_preflight_acceptance_snapshots(
         tmp_path,
         monkeypatch,
@@ -4178,6 +4180,12 @@ def test_preflight_restart_basis_accepts_bound_public_project_scope_without_exte
     )
     public_scope_snapshot = _public_project_scope_snapshot(blocked_snapshot)
     expected_binding = _public_project_expected_binding(public_scope_snapshot)
+    status = public_scope_snapshot["status"]
+    plan_actions = [step["action"] for step in status["plan"]["steps"]]
+    owner_scope_tools = status["scope_snapshot"]["allowed_tools"]
+    authorized_tools = status["authorization_snapshot"]["allowed_tools"]
+    assert set(plan_actions) < set(authorized_tools)
+    assert authorized_tools == [*owner_scope_tools, *OWNER_UI_CONTROL_PLANE_CAPABILITIES]
 
     unbound_basis = windows_acceptance._mission_restart_basis(public_scope_snapshot, mission_id)
     assert unbound_basis["status"] == "BLOCKED"
