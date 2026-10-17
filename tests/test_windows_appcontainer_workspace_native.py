@@ -82,6 +82,23 @@ def native_probe_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return exe
 
 
+@pytest.fixture
+def native_acl_root(record_property):
+    """Do not require traversal of the broker's private user-profile path."""
+    if sys.platform != "win32":
+        pytest.fail("native root fixture was requested off Windows")
+    parent = Path(os.environ["SystemRoot"]) / "Temp"
+    assert parent.is_dir(), "Windows system temporary directory is unavailable"
+    root = parent / f"cs-native-lpac-{uuid.uuid4().hex}"
+    root.mkdir()  # Atomic collision rejection; never adopt a preexisting path.
+    try:
+        _create_protected_test_root(root)
+        record_property("native_control_root", str(root))
+        yield root
+    finally:
+        shutil.rmtree(root)
+
+
 def _win_dll(name: str):
     dll = ctypes.WinDLL(name, use_last_error=True)
     handle = ctypes.c_void_p
@@ -404,10 +421,10 @@ def _assert_check(evidence: dict[str, Any], name: str, ok: bool = True, error: i
 
 
 @_WINDOWS_NATIVE
-def test_native_lpac_identity_and_workspace_read_write(tmp_path: Path, native_probe_template: Path, record_property) -> None:
+def test_native_lpac_identity_and_workspace_read_write(native_acl_root: Path, native_probe_template: Path, record_property) -> None:
     from workspace.windows_appcontainer_workspace import WindowsAppContainerWorkspace, AppContainerWorkspaceError
 
-    root = tmp_path / "native-root"
+    root = native_acl_root
     _create_protected_test_root(root)
     workspace = WindowsAppContainerWorkspace.create(root)
     try:
@@ -465,10 +482,10 @@ def test_native_lpac_identity_and_workspace_read_write(tmp_path: Path, native_pr
 
 
 @_WINDOWS_NATIVE
-def test_native_lpac_denies_outside_write_and_create(tmp_path: Path, native_probe_template: Path, record_property) -> None:
+def test_native_lpac_denies_outside_write_and_create(native_acl_root: Path, native_probe_template: Path, record_property) -> None:
     from workspace.windows_appcontainer_workspace import WindowsAppContainerWorkspace
 
-    root = tmp_path / "native-root"
+    root = native_acl_root
     _create_protected_test_root(root)
     workspace = WindowsAppContainerWorkspace.create(root)
     try:
@@ -499,10 +516,10 @@ def test_native_lpac_denies_outside_write_and_create(tmp_path: Path, native_prob
 
 
 @_WINDOWS_NATIVE
-def test_native_lpac_denies_other_run_workspace(tmp_path: Path, native_probe_template: Path, record_property) -> None:
+def test_native_lpac_denies_other_run_workspace(native_acl_root: Path, native_probe_template: Path, record_property) -> None:
     from workspace.windows_appcontainer_workspace import WindowsAppContainerWorkspace
 
-    root = tmp_path / "native-root"
+    root = native_acl_root
     _create_protected_test_root(root)
     first = WindowsAppContainerWorkspace.create(root)
     second = None
@@ -530,12 +547,12 @@ def test_native_lpac_denies_other_run_workspace(tmp_path: Path, native_probe_tem
 
 
 @_WINDOWS_NATIVE
-def test_native_lpac_exit_cleanup_revokes_workspace(tmp_path: Path, native_probe_template: Path, record_property, monkeypatch) -> None:
+def test_native_lpac_exit_cleanup_revokes_workspace(native_acl_root: Path, native_probe_template: Path, record_property, monkeypatch) -> None:
     from types import SimpleNamespace
     from workspace import windows_appcontainer_workspace as acl_module
     from workspace.windows_appcontainer_workspace import WindowsAppContainerWorkspace, AppContainerWorkspaceError
 
-    root = tmp_path / "native-root"
+    root = native_acl_root
     _create_protected_test_root(root)
     workspace = WindowsAppContainerWorkspace.create(root)
     old_path = workspace.workspace_path
