@@ -3105,15 +3105,57 @@ def _mission_active_owner_session_binding_is_valid(
     return True
 
 
+_MISSION_RESTART_DIAGNOSTIC_CODES = frozenset(
+    {
+        "mission_status_invalid",
+        "mission_identity_or_authority_shape_invalid",
+        "scope_authorization_fields_invalid",
+        "authorization_snapshot_invalid",
+        "workspace_root_binding_invalid",
+        "expected_project_root_mismatch",
+        "mission_plan_invalid",
+        "mission_plan_action_invalid",
+        "plan_action_outside_authorized_allowlist",
+        "public_project_owner_binding_invalid",
+        "active_owner_session_binding_invalid",
+        "public_scope_policy_unavailable",
+        "public_scope_allowlist_mismatch",
+        "persisted_scope_snapshot_binding_invalid",
+        "persisted_scope_owner_binding_invalid",
+        "model_authorization_context_binding_missing",
+        "model_scope_binding_missing",
+        "authority_projection_rejected",
+        "mission_timeline_invalid",
+        "trajectory_timeline_mismatch",
+        "mission_record_integrity_invalid",
+        "trajectory_integrity_invalid",
+    }
+)
+
+
+def _safe_mission_restart_diagnostic_code(value: object) -> str | None:
+    if isinstance(value, str) and value in _MISSION_RESTART_DIAGNOSTIC_CODES:
+        return value
+    return None
+
+
 def _mission_restart_authority_projection(
     status: object,
     mission_id: str,
     *,
     expected_project_id: str | None = None,
     expected_project_root: str | Path | None = None,
+    diagnostics: list[str] | None = None,
 ) -> dict | None:
-    if not isinstance(status, dict):
+    def reject(code: str) -> None:
+        if diagnostics is not None:
+            diagnostics.append(
+                code if code in _MISSION_RESTART_DIAGNOSTIC_CODES else "authority_projection_rejected"
+            )
         return None
+
+    if not isinstance(status, dict):
+        return reject("mission_status_invalid")
     request_id = status.get("request_id")
     owner_identity_ref = status.get("owner_identity_ref")
     scope = status.get("scope_snapshot")
@@ -3127,7 +3169,7 @@ def _mission_restart_authority_projection(
         or not isinstance(authorization, dict)
         or not isinstance(context, dict)
     ):
-        return None
+        return reject("mission_identity_or_authority_shape_invalid")
     target_identity = authorization.get("target_identity")
     scope_id = scope.get("scope_snapshot_id")
     context_scope = context.get("scope_snapshot")
@@ -3173,7 +3215,7 @@ def _mission_restart_authority_projection(
         or not isinstance(scope_credentials, list)
         or scope_credentials
     ):
-        return None
+        return reject("scope_authorization_fields_invalid")
     try:
         from security.mission_authorization import MissionAuthorizationSnapshot
 
@@ -3183,31 +3225,31 @@ def _mission_restart_authority_projection(
             or verified_authorization.owner_identity != owner_identity_ref
             or verified_authorization.target_identity != target_identity
         ):
-            return None
+            return reject("authorization_snapshot_invalid")
         scope_root = Path(scope["workspace_root"]).resolve(strict=True)
         authorization_root = Path(workspace_boundary["root"]).resolve(strict=True)
         if scope_root != authorization_root or not scope_root.is_dir():
-            return None
+            return reject("workspace_root_binding_invalid")
         if expected_project_root is not None:
             independently_bound_root = Path(expected_project_root).resolve(strict=True)
             if not independently_bound_root.is_dir() or scope_root != independently_bound_root:
-                return None
+                return reject("expected_project_root_mismatch")
     except Exception:
-        return None
+        return reject("workspace_root_binding_invalid")
 
     plan = status.get("plan")
     steps = plan.get("steps") if isinstance(plan, dict) else None
     if not isinstance(steps, list):
-        return None
+        return reject("mission_plan_invalid")
     plan_actions: list[str] = []
     for step in steps:
         if not isinstance(step, dict) or not isinstance(step.get("action"), str):
-            return None
+            return reject("mission_plan_action_invalid")
         action = step["action"]
         if action != "__planning_failure__":
             plan_actions.append(action)
     if not plan_actions or not set(plan_actions).issubset(set(allowed_tools)) or not set(plan_actions).issubset(set(allowed_actions)):
-        return None
+        return reject("plan_action_outside_authorized_allowlist")
 
     scope_binding_kind: str
     if scope_id is None and context_scope_id is None and context_scope is None:
@@ -3246,7 +3288,7 @@ def _mission_restart_authority_projection(
             or not isinstance(owner_instruction, str)
             or not owner_instruction.strip()
         ):
-            return None
+            return reject("public_project_owner_binding_invalid")
         try:
             from agent.agent_core import OWNER_UI_CONTROL_PLANE_CAPABILITIES
             from bridge import _public_project_owner_tool_scope
@@ -3265,15 +3307,15 @@ def _mission_restart_authority_projection(
                 authorization,
                 context,
             ):
-                return None
+                return reject("active_owner_session_binding_invalid")
         except Exception:
-            return None
+            return reject("public_scope_policy_unavailable")
         if (
             public_scope_tools != expected_public_scope_tools
             or allowed_tools != expected_authorized_tools
             or allowed_actions != expected_authorized_tools
         ):
-            return None
+            return reject("public_scope_allowlist_mismatch")
         scope_binding_kind = "public_local_project_workspace"
     else:
         if (
@@ -3284,7 +3326,7 @@ def _mission_restart_authority_projection(
             or not isinstance(context_scope, dict)
             or context_scope.get("snapshot_id") != scope_id
         ):
-            return None
+            return reject("persisted_scope_snapshot_binding_invalid")
         raw_scope_authorization = context_scope.get("authorization")
         context_session_id = context.get("session_id")
         if (
@@ -3298,18 +3340,18 @@ def _mission_restart_authority_projection(
                 context,
             )
         ):
-            return None
+            return reject("persisted_scope_owner_binding_invalid")
         scope_binding_kind = "persisted_owner_scope_snapshot"
     model_authorization_context_id = context.get("owner_evidence_fingerprint")
     if not isinstance(model_authorization_context_id, str) or not model_authorization_context_id:
-        return None
+        return reject("model_authorization_context_binding_missing")
     model_scope_snapshot_id = (
         scope_id
         if scope_binding_kind == "persisted_owner_scope_snapshot"
         else f"public-local-project-scope:{_canonical_sha256(scope)}"
     )
     if not isinstance(model_scope_snapshot_id, str) or not model_scope_snapshot_id:
-        return None
+        return reject("model_scope_binding_missing")
     return {
         "mission_id": mission_id,
         "request_id": request_id,
@@ -4165,21 +4207,40 @@ def _mission_restart_basis(
         return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "snapshot_unavailable"}
     status = snapshot.get("status")
     timeline = snapshot.get("timeline")
+    authority_diagnostics: list[str] = []
     authority = _mission_restart_authority_projection(
         status,
         mission_id,
         expected_project_id=expected_project_id,
         expected_project_root=expected_project_root,
+        diagnostics=authority_diagnostics,
     )
-    if (
-        authority is None
-        or not isinstance(status, dict)
-        or not isinstance(timeline, list)
-        or status.get("trajectory") != timeline
-        or not _mission_record_integrity_verified(status)
-        or not _trajectory_timeline_integrity(timeline, mission_id, status.get("request_id"))
-    ):
-        return {"status": "BLOCKED", "kind": "NOT_RUN", "reason": "mission_integrity_or_scope_binding_invalid"}
+    if authority is None:
+        return {
+            "status": "BLOCKED",
+            "kind": "NOT_RUN",
+            "reason": "mission_integrity_or_scope_binding_invalid",
+            "diagnostic_code": authority_diagnostics[0] if authority_diagnostics else "authority_projection_rejected",
+        }
+    if not isinstance(status, dict):
+        diagnostic_code = "mission_status_invalid"
+    elif not isinstance(timeline, list):
+        diagnostic_code = "mission_timeline_invalid"
+    elif status.get("trajectory") != timeline:
+        diagnostic_code = "trajectory_timeline_mismatch"
+    elif not _mission_record_integrity_verified(status):
+        diagnostic_code = "mission_record_integrity_invalid"
+    elif not _trajectory_timeline_integrity(timeline, mission_id, status.get("request_id")):
+        diagnostic_code = "trajectory_integrity_invalid"
+    else:
+        diagnostic_code = ""
+    if diagnostic_code:
+        return {
+            "status": "BLOCKED",
+            "kind": "NOT_RUN",
+            "reason": "mission_integrity_or_scope_binding_invalid",
+            "diagnostic_code": diagnostic_code,
+        }
     preflight = _mission_preflight_block_projection(
         snapshot,
         mission_id,
@@ -5642,6 +5703,9 @@ def _installed_app_mission(
             "status": restart_basis.get("status"),
             "kind": restart_basis.get("kind"),
             "reason": restart_basis.get("reason"),
+            "diagnostic_code": _safe_mission_restart_diagnostic_code(
+                restart_basis.get("diagnostic_code")
+            ),
             "projection_sha256": _canonical_sha256(restart_basis.get("projection"))
             if isinstance(restart_basis.get("projection"), dict) else None,
         },

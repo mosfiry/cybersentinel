@@ -4165,6 +4165,19 @@ def test_installed_app_restart_cycles_bind_expected_project_identity() -> None:
         assert ast.unparse(keyword_values["expected_project_root"]) == "project_root"
 
 
+def test_restart_diagnostic_code_is_restricted_to_static_allowlist() -> None:
+    assert (
+        windows_acceptance._safe_mission_restart_diagnostic_code("public_scope_allowlist_mismatch")
+        == "public_scope_allowlist_mismatch"
+    )
+    assert windows_acceptance._safe_mission_restart_diagnostic_code(
+        "Owner instruction: sensitive text"
+    ) is None
+    assert windows_acceptance._safe_mission_restart_diagnostic_code(
+        "/private/workspace/project"
+    ) is None
+
+
 @pytest.mark.parametrize("attempt_source", ["mission_slice", "model_turn"])
 def test_preflight_restart_basis_accepts_bound_public_project_scope_without_external_snapshot(
     attempt_source: str,
@@ -4262,6 +4275,8 @@ def test_preflight_public_project_scope_tampering_fails_closed(
     basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
     assert basis["status"] == "BLOCKED"
     assert basis["kind"] == "NOT_RUN"
+    if field == "allowed_tools" and isinstance(value, list) and "watch" in value:
+        assert basis["diagnostic_code"] == "public_scope_allowlist_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -4339,6 +4354,8 @@ def test_preflight_public_project_owner_binding_tampering_fails_closed(
     basis = windows_acceptance._mission_restart_basis(tampered, mission_id, **expected_binding)
     assert basis["status"] == "BLOCKED"
     assert basis["kind"] == "NOT_RUN"
+    if corruption in {"authorization_allowed_tools_expanded", "authorization_allowed_actions_expanded"}:
+        assert basis["diagnostic_code"] == "public_scope_allowlist_mismatch"
 
 
 def test_preflight_public_project_basis_requires_active_owner_session(
