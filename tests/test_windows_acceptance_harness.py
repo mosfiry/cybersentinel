@@ -923,7 +923,7 @@ def test_mission_audit_endpoint_failure_is_classified_as_restoration_failure(tmp
     class UnavailableAuditPage:
         @staticmethod
         def evaluate(_script: str, _arguments: dict) -> dict:
-            return {"http_status": 503, "body": {}}
+            return {"http_status": 503, "body_text": "{}"}
 
     with pytest.raises(windows_acceptance._MissionAuditSnapshotError) as error:
         windows_acceptance._mission_audit_snapshot(
@@ -5614,3 +5614,68 @@ def test_unexpected_mission_integrity_error_uses_generic_safe_code(
     assert windows_acceptance._mission_record_integrity_diagnostic(snapshot["status"]) == "mission_record_integrity_invalid"
     assert windows_acceptance._mission_record_integrity_verified(snapshot["status"]) is False
     assert mission_id == snapshot["status"]["mission_id"]
+
+
+def test_public_api_preserves_integrity_numbers_from_raw_json_text() -> None:
+    unsigned = {"fraction": 1.0, "large_integer": 9007199254740993}
+    record = dict(unsigned)
+    record["integrity_hash"] = windows_acceptance._canonical_sha256(unsigned)
+    body_text = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+    class RawResponsePage:
+        script = ""
+
+        def evaluate(self, script, _arguments):
+            self.script = script
+            return {"http_status": 200, "body_text": body_text}
+
+    page = RawResponsePage()
+    response = windows_acceptance._public_api(page, "GET", "/api/public/test")
+    parsed_record = response["body"]
+    supplied_hash = parsed_record.pop("integrity_hash")
+
+    assert response["http_status"] == 200
+    assert "response.text()" in page.script
+    assert "response.json()" not in page.script
+    assert type(parsed_record["fraction"]) is float
+    assert parsed_record["large_integer"] == 9007199254740993
+    assert windows_acceptance._canonical_sha256(parsed_record) == supplied_hash
+
+
+def test_public_api_rejects_nonstandard_or_invalid_json_text() -> None:
+    for body_text in (
+        '{"value":NaN}',
+        '{"value":Infinity}',
+        '{"value":-Infinity}',
+        '{"value":}',
+    ):
+        class InvalidJsonPage:
+            def evaluate(self, _script, _arguments):
+                return {"http_status": 200, "body_text": body_text}
+
+        response = windows_acceptance._public_api(
+            InvalidJsonPage(),
+            "GET",
+            "/api/public/test",
+        )
+        assert response["body"] == {}
+
+
+def test_public_api_rejects_non_object_json_body() -> None:
+    class NonObjectJsonPage:
+        @staticmethod
+        def evaluate(_script, _arguments):
+            return {"http_status": 200, "body_text": "[]"}
+
+    with pytest.raises(RuntimeError, match="installed_app_api_response_invalid"):
+        windows_acceptance._public_api(
+            NonObjectJsonPage(),
+            "GET",
+            "/api/public/test",
+        )

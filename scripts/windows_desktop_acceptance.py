@@ -584,6 +584,7 @@ def _new_csrf_token(page) -> str:
 
 
 def _public_api(page, method: str, path: str, *, csrf: str = "", payload: dict | None = None) -> dict:
+    # Preserve numeric JSON tokens across CDP so Mission integrity hashes remain reproducible.
     value = page.evaluate("""async ({method, path, csrf, payload}) => {
       const headers = {};
       if (payload !== null) headers['Content-Type'] = 'application/json';
@@ -592,12 +593,26 @@ def _public_api(page, method: str, path: str, *, csrf: str = "", payload: dict |
         method, credentials: 'include', headers,
         ...(payload === null ? {} : {body: JSON.stringify(payload)})
       });
-      const body = await response.json().catch(() => ({}));
-      return {http_status: response.status, body};
+      const body_text = await response.text().catch(() => '');
+      return {http_status: response.status, body_text};
     }""", {"method": method, "path": path, "csrf": csrf, "payload": payload})
-    if not isinstance(value, dict) or not isinstance(value.get("body"), dict):
+    if not isinstance(value, dict) or not isinstance(value.get("body_text"), str):
         raise RuntimeError("installed_app_api_response_invalid")
-    return value
+
+    def reject_nonstandard_constant(_value: str) -> None:
+        raise ValueError("non_standard_json_constant")
+
+    try:
+        body = (
+            json.loads(value["body_text"], parse_constant=reject_nonstandard_constant)
+            if value["body_text"]
+            else {}
+        )
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        raise RuntimeError("installed_app_api_response_invalid")
+    return {"http_status": value.get("http_status"), "body": body}
 
 
 def _canonical_sha256(value: object) -> str:
