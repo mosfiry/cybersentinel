@@ -129,3 +129,78 @@ jobs:
             native-sandbox-contract.json
           if-no-files-found: error
           retention-days: 30
+
+  native-vhd-workspace:
+    if: github.repository == 'mosfiry/cybersentinel' && github.ref == 'refs/heads/fix/blocker-d-review-20261010'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install isolated primitive test dependency
+        run: python -m pip install --disable-pip-version-check "pytest>=8,<9"
+      # Privileged trusted fixture only; never execute untrusted project code.
+      - name: Native fixed-capacity workspace lifecycle tests
+        run: >-
+          python -m pytest -q tests/test_windows_vhd_workspace.py
+          --junitxml=native-vhd-workspace.xml -o junit_family=xunit1
+      - name: Reject missing or skipped VHD coverage and record bounded evidence
+        if: always()
+        run: |
+          @'
+          import json
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          expected = {
+              "test_native_vhd_capacity_is_hard_for_direct_writes",
+              "test_native_vhd_aggregate_children_stay_within_fixed_image_bound",
+              "test_native_vhd_runs_are_unique_and_isolated_when_first_is_full",
+              "test_native_vhd_cleanup_is_complete_idempotent_and_unassociated",
+              "test_native_vhd_cleanup_failure_is_visible_and_retryable",
+              "test_native_vhd_writer_timeout_leaves_no_children",
+          }
+          junit = Path("native-vhd-workspace.xml")
+          cases = list(ET.parse(junit).iter("testcase")) if junit.is_file() else []
+          native_cases = [case for case in cases if case.get("name", "").startswith("test_native_vhd_")]
+          names = {case.get("name", "").split("[", 1)[0] for case in native_cases}
+          bad = sum(any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
+          native = sys.platform == "win32" and os.name == "nt"
+          verified = native and len(native_cases) == len(expected) and names == expected and bad == 0
+          report = {
+              "schema": "windows-vhd-workspace-v1",
+              "source_commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "runner_image": os.environ.get("ImageOS"),
+              "runner_image_version": os.environ.get("ImageVersion"),
+              "windows_version": list(sys.getwindowsversion()[:3]) if native else None,
+              "gate_status": "PASS" if verified else "FAIL",
+              "native_test_count": len(native_cases),
+              "nonpassing_test_count": bad,
+              "mission_acceptance": "BLOCKED",
+              "backend_enabled_by_slice": False,
+              "verified_scope": ["trusted_fixed_capacity_storage_primitive"] if verified else [],
+              "not_validated": ["privileged_product_broker", "appcontainer_lpac", "workspace_acl", "network_denial", "all_process_writes_confined", "sandboxed_mission_dispatch", "broker_crash_recovery"],
+          }
+          Path("native-vhd-workspace.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          if not verified:
+              raise SystemExit("native_vhd_workspace_coverage_failed")
+          '@ | python -
+      - name: Upload fixed-capacity primitive evidence (not sandbox acceptance)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-vhd-workspace-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            native-vhd-workspace.xml
+            native-vhd-workspace.json
+          if-no-files-found: error
+          retention-days: 30
