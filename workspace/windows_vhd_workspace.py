@@ -30,11 +30,13 @@ _CAPACITY_ALIGNMENT = 1024 * 1024
 # text or argv; paths and scalar values are supplied through JSON stdin.
 _FORMAT_SCRIPT = r'''
 $ErrorActionPreference = 'Stop'
+$phase = 'image_lookup'
 try {
   $r = [Console]::In.ReadToEnd() | ConvertFrom-Json
   $image = Get-DiskImage -ImagePath ([string]$r.image_path) -ErrorAction Stop
   if (@($image).Count -ne 1 -or -not $image.Attached -or
       [string]$image.DevicePath -ine [string]$r.disk_path) { throw 'IMAGE_IDENTITY' }
+  $phase = 'disk_association'
   $d = $image | Get-Disk -ErrorAction Stop
   if (@($d).Count -ne 1) { throw 'DISK_IDENTITY' }
   $d = @($d)[0]
@@ -44,29 +46,37 @@ try {
       [bool]$d.IsSystem -or [bool]$d.IsBoot -or
       [string]$d.PartitionStyle -ne 'RAW' -or
       [bool]$d.IsOffline -or [bool]$d.IsReadOnly) { throw 'DISK_IDENTITY' }
+  $phase = 'initialize'
   $disk = Initialize-Disk -InputObject $d -PartitionStyle GPT -PassThru -ErrorAction Stop
+  $phase = 'partition'
   $p = New-Partition -InputObject $disk -UseMaximumSize -AssignDriveLetter:$false -ErrorAction Stop
+  $phase = 'partition_flags'
   Set-Partition -InputObject $p -NoDefaultDriveLetter $true -ErrorAction Stop | Out-Null
+  $phase = 'format'
   $v = Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel 'CSWS' -AllocationUnitSize 4096 -Confirm:$false -Force -ErrorAction Stop
+  $phase = 'mount'
   Add-PartitionAccessPath -InputObject $p -AccessPath ([string]$r.mount_path) -ErrorAction Stop | Out-Null
+  $phase = 'mount_verify'
   $p2 = @(Get-Partition -Disk $disk -ErrorAction Stop | Where-Object { $_.ObjectId -eq $p.ObjectId })
   if ($p2.Count -ne 1 -or -not (@($p2[0].AccessPaths) -contains [string]$r.mount_path)) { throw 'MOUNT_VERIFY' }
   if ([string]$v.FileSystem -ne 'NTFS') { throw 'FORMAT_VERIFY' }
   @{ok=$true} | ConvertTo-Json -Compress
   exit 0
 } catch {
-  @{ok=$false;code='STORAGE_OPERATION_FAILED'} | ConvertTo-Json -Compress
+  @{ok=$false;code=$phase} | ConvertTo-Json -Compress
   exit 1
 }
 '''
 
 _UNMOUNT_SCRIPT = r'''
 $ErrorActionPreference = 'Stop'
+$phase = 'image_lookup'
 try {
   $r = [Console]::In.ReadToEnd() | ConvertFrom-Json
   $image = Get-DiskImage -ImagePath ([string]$r.image_path) -ErrorAction Stop
   if (@($image).Count -ne 1 -or -not $image.Attached -or
       [string]$image.DevicePath -ine [string]$r.disk_path) { throw 'IMAGE_IDENTITY' }
+  $phase = 'disk_association'
   $d = $image | Get-Disk -ErrorAction Stop
   if (@($d).Count -ne 1) { throw 'DISK_IDENTITY' }
   $d = @($d)[0]
@@ -78,17 +88,20 @@ try {
     @{ok=$true} | ConvertTo-Json -Compress
     exit 0
   }
+  $phase = 'unmount_lookup'
   $p = @(Get-Partition -Disk $d -ErrorAction Stop | Where-Object { @($_.AccessPaths) -contains [string]$r.mount_path })
   if ($p.Count -gt 1) { throw 'MOUNT_IDENTITY' }
   if ($p.Count -eq 1) {
+    $phase = 'unmount'
     Remove-PartitionAccessPath -InputObject $p[0] -AccessPath ([string]$r.mount_path) -ErrorAction Stop | Out-Null
   }
+  $phase = 'unmount_verify'
   $left = @(Get-Partition -Disk $d -ErrorAction Stop | Where-Object { @($_.AccessPaths) -contains [string]$r.mount_path })
   if ($left.Count -ne 0) { throw 'MOUNT_VERIFY' }
   @{ok=$true} | ConvertTo-Json -Compress
   exit 0
 } catch {
-  @{ok=$false;code='UNMOUNT_FAILED'} | ConvertTo-Json -Compress
+  @{ok=$false;code=$phase} | ConvertTo-Json -Compress
   exit 1
 }
 '''
@@ -97,11 +110,13 @@ try {
 class VhdWorkspaceError(RuntimeError):
     """Sanitized lifecycle error; cleanup_required means cleanup is unconfirmed."""
 
-    def __init__(self, code: str, *, cleanup_required: bool = False) -> None:
+    def __init__(self, code: str, *, cleanup_required: bool = False, system_error: int | None = None) -> None:
         self.code = code
         self.cleanup_required = cleanup_required
+        self.system_error = system_error
         self.workspace: WindowsVhdWorkspace | None = None
-        super().__init__(f"Windows VHD workspace operation failed ({code}); cleanup_required={cleanup_required}")
+        suffix = "" if system_error is None else f"; system_error={system_error}"
+        super().__init__(f"Windows VHD workspace operation failed ({code}); cleanup_required={cleanup_required}{suffix}")
 
 
 class _Guid(ctypes.Structure):
@@ -136,6 +151,7 @@ class _NativeVhd:
     _VIRTUAL_DISK_ACCESS_ATTACH_RW = 0x00020000
     _VIRTUAL_DISK_ACCESS_DETACH = 0x00040000
     _VIRTUAL_DISK_ACCESS_GET_INFO = 0x00080000
+    _VIRTUAL_DISK_ACCESS_CREATE = 0x00100000
     _CREATE_FULL_PHYSICAL_ALLOCATION = 0x00000001
     _ATTACH_NO_DRIVE_LETTER = 0x00000002
     _GET_INFO_SIZE = 1
@@ -184,8 +200,8 @@ class _NativeVhd:
 
     def _check(self, status: int, op: str) -> None:
         if status != self._ERROR_SUCCESS:
-            # Error numbers and paths are intentionally not propagated to callers.
-            raise VhdWorkspaceError(op)
+            # A numeric Win32 result is useful evidence, unlike raw error text/paths.
+            raise VhdWorkspaceError(op, system_error=int(status))
 
     def create(self, path: Path, capacity: int) -> Any:
         params = self._CreateParams()
@@ -197,9 +213,10 @@ class _NativeVhd:
         params.u.Version1.ParentPath = None
         params.u.Version1.SourcePath = None
         handle = ctypes.c_void_p()
-        status = self._dll.CreateVirtualDisk(ctypes.byref(self._storage_type()), str(path), self._VIRTUAL_DISK_ACCESS_ATTACH_RW | self._VIRTUAL_DISK_ACCESS_DETACH | self._VIRTUAL_DISK_ACCESS_GET_INFO, None, self._CREATE_FULL_PHYSICAL_ALLOCATION, 0, ctypes.byref(params), None, ctypes.byref(handle))
+        access = self._VIRTUAL_DISK_ACCESS_CREATE | self._VIRTUAL_DISK_ACCESS_ATTACH_RW | self._VIRTUAL_DISK_ACCESS_DETACH | self._VIRTUAL_DISK_ACCESS_GET_INFO
+        status = self._dll.CreateVirtualDisk(ctypes.byref(self._storage_type()), str(path), access, None, self._CREATE_FULL_PHYSICAL_ALLOCATION, 0, ctypes.byref(params), None, ctypes.byref(handle))
         if status != self._ERROR_SUCCESS:
-            raise VhdWorkspaceError("create_failed")
+            raise VhdWorkspaceError("create_failed", system_error=int(status))
         return handle
 
     def attach(self, handle: Any) -> None:
@@ -281,7 +298,10 @@ def _run_storage_script(script: str, payload: dict[str, Any], stage: str) -> Non
     except (TypeError, ValueError):
         raise VhdWorkspaceError(stage) from None
     if result.returncode != 0 or not isinstance(response, dict) or response.get("ok") is not True:
-        raise VhdWorkspaceError(stage)
+        phases = {"image_lookup", "disk_association", "initialize", "partition", "partition_flags", "format", "mount", "mount_verify", "unmount_lookup", "unmount", "unmount_verify"}
+        phase = response.get("code") if isinstance(response, dict) else None
+        safe_stage = f"{stage}_{phase}" if isinstance(phase, str) and phase in phases else stage
+        raise VhdWorkspaceError(safe_stage)
 
 
 def _validate_root(root: Path) -> Path:
@@ -401,7 +421,7 @@ class WindowsVhdWorkspace:
                 error.workspace = instance
                 raise error from None
             if isinstance(exc, VhdWorkspaceError):
-                raise VhdWorkspaceError(exc.code) from None
+                raise VhdWorkspaceError(exc.code, system_error=exc.system_error) from None
             raise VhdWorkspaceError("provision_failed") from None
 
     @property
@@ -456,8 +476,8 @@ class WindowsVhdWorkspace:
                     "image_path": str(self._image_path),
                     "capacity_bytes": self.capacity_bytes, "mount_path": str(self._mount_path) + "\\",
                 }, "unmount_failed")
-            except VhdWorkspaceError:
-                raise VhdWorkspaceError("unmount_failed", cleanup_required=True) from None
+            except VhdWorkspaceError as exc:
+                raise VhdWorkspaceError(exc.code, cleanup_required=True, system_error=exc.system_error) from None
             self._mounted = False
         if self._attach_attempted:
             if self._handle is None:

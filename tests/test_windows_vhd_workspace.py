@@ -452,7 +452,7 @@ def test_native_create_requests_explicit_detach_right_and_fixed_allocation(tmp_p
     native._dll = SimpleNamespace(CreateVirtualDisk=create)
     handle = native.create(tmp_path / "fixed.vhd", vhd.MIN_CAPACITY_BYTES)
     assert handle.value == 123
-    assert observed["access"] == 0x000E0000  # SDK ATTACH_RW | DETACH | GET_INFO.
+    assert observed["access"] == 0x001E0000  # SDK CREATE | ATTACH_RW | DETACH | GET_INFO.
     assert observed["flags"] == native._CREATE_FULL_PHYSICAL_ALLOCATION
     assert observed["params"].Version == 1
     assert observed["params"].u.Version1.MaximumSize == vhd.MIN_CAPACITY_BYTES
@@ -510,3 +510,52 @@ def test_native_vhd_writer_timeout_leaves_no_children(tmp_path, record_property,
     assert all(process.poll() is not None for process in children)
     record_property("trusted_hanging_child_count", len(children))
     record_property("remaining_child_count", sum(process.poll() is None for process in children))
+
+
+def test_create_win32_status_remains_visible_after_successful_rollback(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    native = object.__new__(vhd._NativeVhd)
+    native._dll = SimpleNamespace(CreateVirtualDisk=lambda *args: 5)
+    monkeypatch.setattr(vhd, "_validate_root", lambda root: root)
+    monkeypatch.setattr(vhd, "_NativeVhd", lambda: native)
+    with pytest.raises(vhd.VhdWorkspaceError) as failure:
+        vhd.WindowsVhdWorkspace.create(tmp_path, vhd.MIN_CAPACITY_BYTES)
+    assert failure.value.code == "create_failed"
+    assert failure.value.system_error == 5
+    assert "system_error=5" in str(failure.value)
+    assert str(tmp_path) not in str(failure.value)
+    assert not failure.value.cleanup_required
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("phase,expected", [("initialize", "format_or_mount_failed_initialize"), ("private/path & sensitive stderr", "format_or_mount_failed"), (["initialize"], "format_or_mount_failed")])
+def test_storage_diagnostics_allow_only_fixed_phase_names(monkeypatch, phase, expected) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(vhd, "_powershell_executable", lambda: Path("/trusted/powershell.exe"))
+    monkeypatch.setattr(vhd.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=json.dumps({"ok": False, "code": phase}), stderr="sensitive stderr"))
+    with pytest.raises(vhd.VhdWorkspaceError) as failure:
+        vhd._run_storage_script(vhd._FORMAT_SCRIPT, {}, "format_or_mount_failed")
+    assert failure.value.code == expected
+    assert "private/path" not in str(failure.value)
+    assert "stderr" not in str(failure.value)
+
+
+def test_unmount_phase_remains_visible_with_cleanup_required(tmp_path, monkeypatch) -> None:
+    workspace, native = _mocked_workspace(tmp_path, monkeypatch)
+
+    def fail(*args):
+        raise vhd.VhdWorkspaceError("unmount_failed_unmount_lookup")
+
+    monkeypatch.setattr(vhd, "_run_storage_script", fail)
+    with pytest.raises(vhd.VhdWorkspaceError) as failure:
+        workspace.close()
+    assert failure.value.code == "unmount_failed_unmount_lookup"
+    assert failure.value.cleanup_required
+    assert failure.value.workspace is workspace
+    assert workspace.image_path.is_file()
+    assert "detach" not in native.events
+    monkeypatch.setattr(vhd, "_run_storage_script", lambda *args: None)
+    workspace.close()
+    assert not workspace.cleanup_required
