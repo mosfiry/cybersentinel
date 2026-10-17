@@ -96,7 +96,8 @@ _SAFE_ACCEPTANCE_STAGES = frozenset({
     "owner_logout_request", "HypothesisUpdated",
 })
 _SAFE_BUDGET_CODES = frozenset({
-    "model_loop_state", "max_execution_steps", "mission_runtime_seconds", "tool_call_count",
+    "model_loop_state", "max_execution_steps", "max_execution_time_seconds", "max_context_chars",
+    "max_context_messages", "max_total_output_chars", "mission_runtime_seconds", "tool_call_count",
     "model_turn_count", "parallel_task_count",
 })
 _SAFE_CODE_ALLOWLISTS = {
@@ -145,7 +146,7 @@ _SAFE_EVENT_TRACE_DATA_FIELDS = frozenset({
     "budget", "cancelled", "detail_code", "dispatch_attempted", "dispatch_boundary",
     "exit_code", "failure_class", "kind", "mission_id", "name", "outcome",
     "process_id", "process_start_confirmed", "process_started", "process_started_at_utc",
-    "reason_code", "resource_limit_reason", "recovery", "request_id", "run_id", "sandbox_backend",
+    "limit", "reason_code", "resource_limit_reason", "recovery", "request_id", "run_id", "sandbox_backend",
     "scope_snapshot_id", "sequence", "status", "step_id", "target_identity",
     "started_at_utc", "timed_out", "tool_call_id", "turn_id",
 })
@@ -154,7 +155,7 @@ _ID_FIELDS = frozenset({
     "scope_snapshot_id", "step_id", "task_id", "tool_call_id", "turn_id",
 })
 _CODE_FIELDS = frozenset({
-    "class", "detail_code", "dispatch_boundary", "error_type", "event", "failure_class",
+    "budget", "class", "detail_code", "dispatch_boundary", "error_type", "event", "failure_class",
     "kind", "name", "outcome", "reason_code", "resource_limit_reason", "recovery", "sandbox_backend", "status",
 })
 _BOOL_FIELDS = frozenset({
@@ -164,8 +165,8 @@ _BOOL_FIELDS = frozenset({
 _INT_FIELDS = frozenset({"budget", "exit_code", "process_id", "sequence", "attempts", "current_step", "limit"})
 _TIMESTAMP_FIELDS = frozenset({"process_started_at_utc", "started_at_utc", "timestamp_utc"})
 _FAILURE_FIELDS = frozenset({
-    "action_id", "blocked_tool_call_ids", "class", "detail_code", "dispatch_attempted",
-    "error_type", "exit_code", "failure_class", "kind", "outcome", "process_id",
+    "action_id", "blocked_tool_call_ids", "budget", "class", "detail_code", "dispatch_attempted",
+    "error_type", "exit_code", "failure_class", "kind", "limit", "outcome", "process_id",
     "process_start_confirmed", "process_started", "reason_code", "resource_limit_reason", "recovery", "run_id",
     "sandbox_backend", "status", "step_id", "timed_out", "tool_call_id", "turn_id",
 })

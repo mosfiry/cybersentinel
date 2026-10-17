@@ -1337,6 +1337,46 @@ def test_safe_mission_failure_snapshot_preserves_block_reason_and_redacts_free_t
     assert "PRIVATE_" not in repr(snapshot)
 
 
+def test_safe_mission_failure_snapshot_preserves_allowlisted_runtime_budget_only() -> None:
+    plan = Plan.initial("safe budget fixture").replan(
+        steps=(PlanStep("step-1", "bounded work", action="mcp.invoke"),),
+        reason="fixture",
+    )
+    mission = Mission.create(
+        "PRIVATE_OWNER_REQUEST", "PRIVATE_OBJECTIVE", plan,
+        mission_id="budget-mission", request_id="budget-request", owner_identity_ref="owner:fixture",
+    )
+    failure = {
+        "class": "RESOURCE",
+        "reason": "PRIVATE_RUNTIME_BUDGET_DETAIL",
+        "budget": "max_execution_time_seconds",
+        "limit": 300,
+        "token": "PRIVATE_TOKEN_VALUE",
+    }
+    mission.failures.append(failure)
+    mission.emit(EventType.FAILURE_DIAGNOSED, data={
+        "class": "RESOURCE",
+        "budget": "max_execution_time_seconds",
+        "limit": 300,
+        "recovery": "RESOURCE_BLOCKED",
+        "reason": "PRIVATE_RUNTIME_BUDGET_DETAIL",
+    })
+
+    snapshot = safe_mission_failure_snapshot(mission)
+
+    assert snapshot["failure_diagnostics"][-1] == {
+        "class": "RESOURCE",
+        "budget": "max_execution_time_seconds",
+        "limit": 300,
+    }
+    diagnosed = next(item for item in snapshot["trajectory_event_trace"] if item["event"] == "FailureDiagnosed")
+    assert diagnosed["data"]["budget"] == "max_execution_time_seconds"
+    assert diagnosed["data"]["limit"] == 300
+    assert "PRIVATE_RUNTIME_BUDGET_DETAIL" not in repr(snapshot)
+    assert "PRIVATE_TOKEN_VALUE" not in repr(snapshot)
+    assert safe_static_code("budget", "unapproved_private_budget") is None
+
+
 def test_safe_acceptance_error_keeps_machine_codes_and_redacts_arbitrary_text() -> None:
     assert safe_acceptance_error(
         RuntimeError("integrated_mission_did_not_reach_goal_completed:RESOURCE_BLOCKED")
