@@ -7,16 +7,147 @@ import json
 import re
 from typing import Any
 
-_SAFE_MACHINE_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]{0,127}\Z")
 _SAFE_OPAQUE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_SECRET_SHAPE_PATTERNS = (
+    re.compile(r"(?i)(?:^|[^a-z0-9])(?:sk|rk|pk|ghp|gho|ghu|ghs|github_pat|xox[baprs]|AIza|AKIA|ASIA|token|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|bearer)[_-][A-Za-z0-9._~+-]{6,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+)
+_SAFE_EVENT_NAMES = frozenset({
+    "MissionStarted", "PlanCreated", "PlanRevised", "StepSelected", "ToolProposed",
+    "AuthorizationChecked", "ToolExecuted", "ObservationReceived", "ObservationInterpreted",
+    "EvidenceAdded", "HypothesisUpdated", "StrategyDecided", "FailureDetected", "FailureDiagnosed",
+    "RecoveryAttempted", "ReplanTriggered", "OwnerInputRequired", "GoalVerificationStarted",
+    "GoalVerified", "MissionCompleted", "FinalReportApproved", "RecoveryRequired", "ModelTurn",
+    "MissionCreated", "TaskStarted", "TaskCompleted", "AgentStarted", "AgentCompleted", "ToolCalled",
+    "EvidenceCreated", "FindingCreated", "SkillUsed", "SkillLearned", "ProviderChanged",
+    "RuntimeStarted", "RuntimeStopped", "MissionPaused", "MissionResumed", "HookInvoked", "HookBlocked",
+    "HookFailed", "ProcessStarted",
+})
+_SAFE_TOOL_NAMES = frozenset({
+    "status", "latest_intel", "refresh_intel", "local_security_check", "local_system_info", "search",
+    "watch", "unwatch", "run_project_tests", "red_team_assess", "scoped_http_probe", "browser",
+    "browser.fill", "web_research", "mcp.discover", "mcp.invoke",
+})
+_SAFE_REASON_CODES = frozenset({
+    "authorization_expired", "authorization_refused", "backend_unavailable", "bubblewrap_missing",
+    "command_nonzero_exit", "cgroup_memory_limit", "cgroup_process_count_limit", "cgroup_scope_missing",
+    "cgroup_scope_setup_failed", "cpu_time_limit",
+    "file_size_limit", "memory_max", "memory_oom_group_kill", "pids_max", "process_limit",
+    "process_cancelled", "process_exit_zero", "process_timeout", "prlimit_missing",
+    "sandbox_command_start_unconfirmed", "sandbox_launcher_failed", "sandbox_setup_failed",
+    "process_sandbox_unavailable", "process_sandbox_setup_failed", "process_authorization_refused",
+    "process_start_not_authorized", "process_cancelled_before_start",
+    "windows_appcontainer_backend_unimplemented", "working_directory_fd_unavailable",
+    "working_directory_unavailable", "workspace_fd_unavailable", "workspace_root_unavailable",
+    "AUTHENTICATION_FAILURE", "AUTHORIZATION_REFUSED", "CANCELLED_BEFORE_DISPATCH", "DISPATCH_CANCELLED",
+    "EFFECT_ALREADY_SUCCEEDED", "HANDLER_EXCEPTION", "INVALID_PROVIDER_PROOF", "NO_EFFECT_ALREADY_CONFIRMED",
+    "NO_EFFECT_CONFIRMED_RETRY_POLICY", "OWNER_CANCELLED_BEFORE_DISPATCH", "OWNER_CONFIRMED_APPLIED",
+    "OWNER_CONFIRMED_NO_EFFECT", "OWNER_CONFIRM_APPLIED", "OWNER_CONFIRM_NO_EFFECT",
+    "PROCESS_AUTHORIZATION_REFUSED", "PROCESS_CANCELLED_BEFORE_START", "PROCESS_SANDBOX_SETUP_FAILED",
+    "PROCESS_SANDBOX_UNAVAILABLE", "PROCESS_START_NOT_AUTHORIZED", "PROVIDER_DISPATCH_NOT_STARTED",
+    "PROVIDER_FAILURE", "PROVIDER_LOOKUP_FAILED", "PROVIDER_SAYS_FAILED", "PROVIDER_STATUS_LOOKUP_UNAVAILABLE",
+    "REMOTE_TOOL_ERROR", "REQUEST_REJECTED", "RESOURCE_LIMIT_EXCEEDED", "RESULT_BOUNDARY_FAILED",
+    "SANDBOX_LAUNCH_FAILED", "STATUS_LOOKUP_UNAVAILABLE", "STATUS_UNAVAILABLE", "TOOL_TIMEOUT",
+    "TOOL_TIMEOUT_BEFORE_PROCESS_START", "UNAUTHORIZED_TOOL", "UNKNOWN", "completed_tool_sequence_exceeds_limit",
+    "invalid_credentials",
+    "completed_tool_sequence_not_fully_evidenced", "completion_trajectory_not_qualified", "no_completed_tool_steps",
+    "ready_for_owner_authored_candidate", "fenced_evidence_unavailable", "mission_not_terminal",
+    "mission_not_verified", "mission_cancelled", "mission_failed", "owner_intervention_required",
+    "mission_not_successfully_verified", "repeated_read_only_tool_call",
+})
+_SAFE_OUTCOMES = frozenset({
+    "SUCCEEDED", "COMMAND_FAILED", "TIMED_OUT", "CANCELLED", "RESOURCE_LIMIT_EXCEEDED",
+    "VERIFIED", "NOT_VERIFIED", "PARTIALLY_VERIFIED", "in_progress", "verified_success",
+    "unverified_completion", "cancelled", "failed", "blocked", "owner_intervention",
+})
+_SAFE_STATUSES = frozenset({
+    "CREATED", "PLANNING", "READY", "RUNNING", "OBSERVING", "VERIFYING", "REPLANNING",
+    "GOAL_COMPLETED", "OWNER_INPUT_REQUIRED", "OWNER_REAUTH_REQUIRED", "AUTHORIZATION_BLOCKED",
+    "SCOPE_BLOCKED", "RESOURCE_BLOCKED", "RECOVERY_REQUIRED", "SAFETY_BLOCKED", "FAILED_RETRY_EXHAUSTED",
+    "CANCELLED", "IN_PROGRESS", "PASS", "FAIL", "NOT_RUN", "BLOCKED", "queued", "executing",
+    "paused", "needs_input", "completed", "failed", "active", "ready", "stopped", "not_dispatched",
+    "budget_blocked",
+})
+_SAFE_FAILURE_CLASSES = frozenset({
+    "TRANSIENT", "DEPENDENCY", "COMPILATION", "TEST_FAILURE", "NETWORK", "PROVIDER", "TOOL",
+    "AUTHORIZATION", "SCOPE", "RESOURCE", "LOGIC", "UNKNOWN",
+})
+_SAFE_RECOVERY_CODES = frozenset({
+    "RETRY", "REPLAN", "OWNER_INPUT_REQUIRED", "SCOPE_BLOCKED", "RESOURCE_BLOCKED", "FAIL",
+    "recovery_required", "recovery_attempted", "no_retry", "retryable", "not_retryable",
+})
+_SAFE_DETAIL_CODES = frozenset({
+    "windows_appcontainer_backend_unimplemented", "backend_unavailable", "bubblewrap_missing",
+    "prlimit_missing", "cgroup_scope_missing", "cgroup_scope_setup_failed", "sandbox_setup_failed",
+    "cgroup_resource_event_attribution_unavailable", "sandbox_process_tree_cleanup_unverified",
+    "working_directory_unavailable", "workspace_root_unavailable", "process_start_unconfirmed",
+    "unclassified_model_manager_error",
+})
+_SAFE_ERROR_TYPES = frozenset({
+    "Exception", "RuntimeError", "TimeoutError", "ValueError", "TypeError", "KeyError", "IndexError",
+    "OSError", "PermissionError", "FileNotFoundError", "IsADirectoryError", "NotADirectoryError",
+    "ConnectionError", "ConnectionRefusedError", "ConnectionResetError", "HTTPError", "URLError",
+    "JSONDecodeError", "AssertionError", "ImportError", "ModuleNotFoundError", "CalledProcessError",
+    "ProcessLookupError", "NotImplementedError", "AttributeError", "OverflowError", "UnicodeDecodeError",
+})
+_SAFE_ACCEPTANCE_STAGES = frozenset({
+    "initialize_acceptance", "acceptance_complete", "installed_app_full_mission",
+    "invalid_owner_login_renderer_state", "invalid_owner_login_request", "owner_logout_renderer_state",
+    "owner_logout_request", "HypothesisUpdated",
+})
+_SAFE_BUDGET_CODES = frozenset({
+    "model_loop_state", "max_execution_steps", "mission_runtime_seconds", "tool_call_count",
+    "model_turn_count", "parallel_task_count",
+})
+_SAFE_CODE_ALLOWLISTS = {
+    "event": _SAFE_EVENT_NAMES,
+    "name": _SAFE_TOOL_NAMES,
+    "reason_code": _SAFE_REASON_CODES,
+    "detail_code": _SAFE_DETAIL_CODES | _SAFE_REASON_CODES,
+    "code": _SAFE_REASON_CODES | _SAFE_DETAIL_CODES,
+    "kind": _SAFE_REASON_CODES | _SAFE_FAILURE_CLASSES | frozenset({"PROCESS_SANDBOX_UNAVAILABLE", "OWNER_CANCELLATION", "RESOURCE_LIMIT"}),
+    "failure_class": _SAFE_FAILURE_CLASSES,
+    "class": _SAFE_FAILURE_CLASSES | frozenset({"authorization", "scope", "resource", "tool", "provider", "dependency", "transient", "logic"}),
+    "outcome": _SAFE_OUTCOMES,
+    "status": _SAFE_STATUSES,
+    "recovery": _SAFE_RECOVERY_CODES,
+    "budget": _SAFE_BUDGET_CODES,
+    "resource_limit_reason": frozenset({
+        "cgroup_memory_limit", "cgroup_process_count_limit", "memory_max", "memory_oom_group_kill",
+        "pids_max", "cpu_time_limit", "file_size_limit", "process_limit", "resource_limit_signal",
+    }),
+    "sandbox_backend": frozenset({"bubblewrap+prlimit+cgroup-v2", "windows-appcontainer-job", "unsupported"}),
+    "dispatch_boundary": frozenset({"workspace_process_start", "scope_pinned_http_send", "none"}),
+    "error_type": _SAFE_ERROR_TYPES,
+    "error_code": _SAFE_REASON_CODES | _SAFE_DETAIL_CODES,
+    "stage": _SAFE_ACCEPTANCE_STAGES,
+}
+
+
+def safe_opaque_identifier(value: object) -> str | None:
+    if not isinstance(value, str) or not _SAFE_OPAQUE_IDENTIFIER.fullmatch(value):
+        return None
+    if any(pattern.search(value) for pattern in _SECRET_SHAPE_PATTERNS):
+        return None
+    return value
+
+
+def safe_static_code(field: str, value: object) -> str | None:
+    allowed = _SAFE_CODE_ALLOWLISTS.get(field)
+    return value if isinstance(value, str) and allowed is not None and value in allowed else None
+
+
+def safe_exception_type(exc_or_name: BaseException | str) -> str:
+    name = type(exc_or_name).__name__ if isinstance(exc_or_name, BaseException) else exc_or_name
+    return name if isinstance(name, str) and name in _SAFE_ERROR_TYPES else "UnknownError"
 _SAFE_EVENT_TRACE_DATA_FIELDS = frozenset({
     "action_id", "allowed", "authorization_context_id", "blocked_tool_call_ids",
     "budget", "cancelled", "detail_code", "dispatch_attempted", "dispatch_boundary",
     "exit_code", "failure_class", "kind", "mission_id", "name", "outcome",
     "process_id", "process_start_confirmed", "process_started", "process_started_at_utc",
-    "reason_code", "recovery", "request_id", "run_id", "sandbox_backend",
+    "reason_code", "resource_limit_reason", "recovery", "request_id", "run_id", "sandbox_backend",
     "scope_snapshot_id", "sequence", "status", "step_id", "target_identity",
-    "timed_out", "tool_call_id", "turn_id",
+    "started_at_utc", "timed_out", "tool_call_id", "turn_id",
 })
 _ID_FIELDS = frozenset({
     "action_id", "authorization_context_id", "mission_id", "request_id", "run_id",
@@ -24,18 +155,18 @@ _ID_FIELDS = frozenset({
 })
 _CODE_FIELDS = frozenset({
     "class", "detail_code", "dispatch_boundary", "error_type", "event", "failure_class",
-    "kind", "name", "outcome", "reason_code", "recovery", "sandbox_backend", "status",
+    "kind", "name", "outcome", "reason_code", "resource_limit_reason", "recovery", "sandbox_backend", "status",
 })
 _BOOL_FIELDS = frozenset({
     "allowed", "cancelled", "dispatch_attempted", "process_start_confirmed",
     "process_started", "timed_out", "ok", "retryable",
 })
 _INT_FIELDS = frozenset({"budget", "exit_code", "process_id", "sequence", "attempts", "current_step", "limit"})
-_TIMESTAMP_FIELDS = frozenset({"process_started_at_utc", "timestamp_utc"})
+_TIMESTAMP_FIELDS = frozenset({"process_started_at_utc", "started_at_utc", "timestamp_utc"})
 _FAILURE_FIELDS = frozenset({
     "action_id", "blocked_tool_call_ids", "class", "detail_code", "dispatch_attempted",
     "error_type", "exit_code", "failure_class", "kind", "outcome", "process_id",
-    "process_start_confirmed", "process_started", "reason_code", "recovery", "run_id",
+    "process_start_confirmed", "process_started", "reason_code", "resource_limit_reason", "recovery", "run_id",
     "sandbox_backend", "status", "step_id", "timed_out", "tool_call_id", "turn_id",
 })
 _SAFE_MISSION_STATUSES = frozenset({
@@ -71,15 +202,15 @@ def _safe_record(record: object, *, allowed_fields: frozenset[str] | None = None
     for key in fields:
         value = record.get(key)
         if key == "blocked_tool_call_ids" and isinstance(value, list):
-            result[key] = [item for item in value[:32] if isinstance(item, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(item)]
+            result[key] = [safe_id for item in value[:32] if (safe_id := safe_opaque_identifier(item)) is not None]
         elif key in _TIMESTAMP_FIELDS:
             timestamp = _safe_timestamp(value)
             if timestamp:
                 result[key] = timestamp
-        elif key in _ID_FIELDS and isinstance(value, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(value):
-            result[key] = value
-        elif key in _CODE_FIELDS and isinstance(value, str) and _SAFE_MACHINE_CODE.fullmatch(value):
-            result[key] = value
+        elif key in _ID_FIELDS and (safe_id := safe_opaque_identifier(value)) is not None:
+            result[key] = safe_id
+        elif key in _CODE_FIELDS and (safe_code := safe_static_code(key, value)) is not None:
+            result[key] = safe_code
         elif key in _BOOL_FIELDS and type(value) is bool:
             result[key] = value
         elif key in _INT_FIELDS and type(value) is int and -1_000_000_000 <= value <= 2_147_483_647:
@@ -101,12 +232,12 @@ def safe_mission_event_trace(timeline: object, *, limit: int = 2_000) -> tuple[l
         item: dict[str, object] = {
             "timeline_index": index,
             "sequence": event.get("sequence") if type(event.get("sequence")) is int else index,
-            "event": event_name if isinstance(event_name, str) and _SAFE_MACHINE_CODE.fullmatch(event_name) else "<invalid_event>",
+            "event": safe_static_code("event", event_name) or "<invalid_event>",
         }
         for key in ("mission_id", "request_id", "step_id", "task_id"):
-            value = event.get(key)
-            if isinstance(value, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(value):
-                item[key] = value
+            safe_id = safe_opaque_identifier(event.get(key))
+            if safe_id is not None:
+                item[key] = safe_id
         timestamp_value = next((
             event.get(key) for key in ("timestamp", "created_at_utc", "created_at", "occurred_at")
             if isinstance(event.get(key), str)
@@ -123,15 +254,15 @@ def safe_mission_event_trace(timeline: object, *, limit: int = 2_000) -> tuple[l
             for key in _SAFE_EVENT_TRACE_DATA_FIELDS:
                 value = data.get(key)
                 if key == "blocked_tool_call_ids" and isinstance(value, list):
-                    safe_data[key] = [entry for entry in value[:32] if isinstance(entry, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(entry)]
-                elif key == "process_started_at_utc":
+                    safe_data[key] = [safe_id for entry in value[:32] if (safe_id := safe_opaque_identifier(entry)) is not None]
+                elif key in {"process_started_at_utc", "started_at_utc"}:
                     parsed_timestamp = _safe_timestamp(value)
                     if parsed_timestamp:
                         safe_data[key] = parsed_timestamp
-                elif key in _ID_FIELDS and isinstance(value, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(value):
-                    safe_data[key] = value
-                elif isinstance(value, str) and _SAFE_MACHINE_CODE.fullmatch(value):
-                    safe_data[key] = value
+                elif key in _ID_FIELDS and (safe_id := safe_opaque_identifier(value)) is not None:
+                    safe_data[key] = safe_id
+                elif key in _CODE_FIELDS and (safe_code := safe_static_code(key, value)) is not None:
+                    safe_data[key] = safe_code
                 elif type(value) is bool:
                     safe_data[key] = value
                 elif type(value) is int and -1_000_000_000 <= value <= 2_147_483_647:
@@ -165,26 +296,27 @@ def _safe_tool_results(progress: object) -> tuple[list[dict], str]:
         if not isinstance(record, dict):
             continue
         item: dict[str, Any] = {}
-        name = record.get("name")
-        if isinstance(name, str) and _SAFE_MACHINE_CODE.fullmatch(name):
+        name = safe_static_code("name", record.get("name"))
+        if name is not None:
             item["name"] = name
         for key in ("tool_call_id", "action_id"):
-            value = record.get(key)
-            if isinstance(value, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(value):
-                item[key] = value
+            safe_id = safe_opaque_identifier(record.get(key))
+            if safe_id is not None:
+                item[key] = safe_id
         if type(record.get("ok")) is bool:
             item["ok"] = record["ok"]
-        error = record.get("error")
-        if isinstance(error, str) and _SAFE_MACHINE_CODE.fullmatch(error):
-            item["error_code"] = error
+        error_code = safe_static_code("error_code", record.get("error"))
+        if error_code is not None:
+            item["error_code"] = error_code
         result = record.get("result")
         if isinstance(result, dict):
             item.update(_safe_record(result, allowed_fields=frozenset({
                 "dispatch_attempted", "exit_code", "outcome", "process_id", "process_start_confirmed",
-                "process_started", "process_started_at_utc", "reason_code", "sandbox_backend", "timed_out",
+                "process_started", "process_started_at_utc", "reason_code", "resource_limit_reason",
+                "sandbox_backend", "timed_out",
             })))
-            result_error = result.get("error")
-            if isinstance(result_error, str) and _SAFE_MACHINE_CODE.fullmatch(result_error):
+            result_error = safe_static_code("error_code", result.get("error"))
+            if result_error is not None:
                 item["error_code"] = result_error
         if item:
             summary.append(item)
@@ -226,8 +358,8 @@ def safe_mission_failure_snapshot(mission: object) -> dict[str, Any]:
         integrity_valid = bool(mission.verify_integrity())
     except Exception:
         integrity_valid = False
-    safe_mission_id = mission_id if isinstance(mission_id, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(mission_id) else None
-    safe_request_id = request_id if isinstance(request_id, str) and _SAFE_OPAQUE_IDENTIFIER.fullmatch(request_id) else None
+    safe_mission_id = safe_opaque_identifier(mission_id)
+    safe_request_id = safe_opaque_identifier(request_id)
     return {
         "mission_id": safe_mission_id,
         "request_id": safe_request_id,
@@ -254,8 +386,6 @@ def safe_mission_failure_snapshot(mission: object) -> dict[str, Any]:
 def safe_acceptance_error(exc: BaseException) -> str:
     """Preserve only a machine-readable static error code; redact arbitrary exception text."""
     text = str(exc)
-    if _SAFE_MACHINE_CODE.fullmatch(text):
-        return text
     prefix = "integrated_mission_did_not_reach_goal_completed:"
     if text.startswith(prefix) and text[len(prefix):] in _SAFE_MISSION_STATUSES:
         return text

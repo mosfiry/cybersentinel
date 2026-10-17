@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -140,3 +141,11 @@ def test_qwen_diagnostics_capture_safe_attempt_codes_without_internal_failure_st
     ]
     assert "not a safe code to report" not in repr(result)
     assert "external error with private text" not in repr(result)
+
+
+def test_full_e2e_failure_artifact_omits_raw_traceback_sidecar() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "run_full_e2e_gate_acceptance.py").read_text(encoding="utf-8")
+
+    assert 'result["error"] = safe_acceptance_error(exc)' in source
+    assert 'result["failure_traceback_available"] = False' in source
+    assert "failure-traceback.txt" not in source

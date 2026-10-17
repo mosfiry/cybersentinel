@@ -30,6 +30,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
+from scripts.acceptance_process_tree import run_owned_command, start_owned_process
 
 TOOL_NAME = "read_acceptance_record"
 PLACEHOLDER_SERVER_ID = "mcp_" + "0" * 32
@@ -130,43 +131,57 @@ def _start_fixture(*, script: Path, run_dir: Path, path: str, cert: Path, key: P
         "--cert", str(cert), "--key", str(key),
         "--request-log", str(request_log), "--ready-file", str(ready),
     ]
-    output = server_log.open("w", encoding="utf-8")
-    try:
-        process = subprocess.Popen(command, cwd=str(ROOT), stdout=output, stderr=subprocess.STDOUT, text=True)
-    finally:
-        output.close()
+    if os.name == "nt":
+        process = start_owned_process(command, cwd=ROOT, use_cgroup_if_configured=True)
+    else:
+        with server_log.open("w", encoding="utf-8") as output:
+            process = start_owned_process(
+                command,
+                cwd=ROOT,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                use_cgroup_if_configured=True,
+            )
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline:
         if ready.exists():
-            return process, ready, json.loads(ready.read_text(encoding="utf-8"))
+            try:
+                payload = json.loads(ready.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                _stop_fixture(process, ready)
+                raise RuntimeError("fixture_readiness_record_invalid") from None
+            return process, ready, payload
         if process.poll() is not None:
+            _stop_fixture(process, ready)
             raise RuntimeError("fixture_server_failed_to_start")
         time.sleep(0.05)
-    process.terminate()
-    try:
-        process.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2.0)
+    _stop_fixture(process, ready)
     raise RuntimeError("fixture_server_readiness_timeout")
 
 
 def _stop_fixture(process, ready: Path) -> bool:
     if process is None:
         return True
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3.0)
+    stop_tree = getattr(process, "terminate_tree", None)
+    if callable(stop_tree):
+        stopped = stop_tree(timeout_seconds=5.0)
+    else:
+        # Compatibility for direct test doubles: production launches always use
+        # the owned-process helper above.
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3.0)
+        stopped = process.poll() is not None
     if process.poll() is not None and ready.exists():
         try:
             ready.unlink()
         except OSError:
             pass
-    return process.poll() is not None and not ready.exists()
+    return stopped and process.poll() is not None and not ready.exists()
 
 
 def main() -> int:
@@ -241,7 +256,12 @@ def main() -> int:
             "-days", "1", "-keyout", str(key), "-out", str(cert),
             "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
         ]
-        subprocess.run(openssl_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_owned_command(
+            openssl_command,
+            cwd=ROOT,
+            timeout_seconds=30.0,
+            check=True,
+        )
         key.chmod(0o600)
         cert.chmod(0o644)
         endpoint_path = "/mcp/" + os.urandom(20).hex()

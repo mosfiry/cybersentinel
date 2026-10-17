@@ -28,14 +28,20 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 from urllib.parse import urlsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.acceptance_result import apply_cleanup_gate
-from scripts.acceptance_evidence import safe_acceptance_error, safe_mission_failure_snapshot
+from scripts.acceptance_process_tree import run_owned_command
+from scripts.acceptance_evidence import (
+    safe_acceptance_error,
+    safe_exception_type,
+    safe_mission_failure_snapshot,
+    safe_opaque_identifier,
+    safe_static_code,
+)
 
 DEFAULT_RUNTIME_DIR = Path("/workspace/cybersentinel-acceptance-runtime/extracted/llama-b11146")
 DEFAULT_MODEL_PATH = Path(
@@ -484,11 +490,11 @@ def main() -> int:
             openssl = next((str(candidate) for candidate in candidates if candidate.is_file()), None)
         if openssl is None:
             raise RuntimeError("openssl_cli_unavailable_for_local_tls_fixture")
-        subprocess.run([
+        run_owned_command([
             openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
             "-days", "1", "-keyout", str(key), "-out", str(cert),
             "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ], cwd=ROOT, timeout_seconds=30.0, check=True)
         key.chmod(0o600)
         cert.chmod(0o644)
         endpoint_path = "/mcp/" + secrets.token_hex(20)
@@ -687,9 +693,9 @@ def main() -> int:
             finally:
                 if session.last_block_code:
                     browser_route_diagnostics.append({
-                        "block_code": str(session.last_block_code),
+                        "block_code": safe_static_code("reason_code", session.last_block_code) or "unknown",
                         "session_id_sha256": sha256(session.session_id),
-                        "mission_id": session.mission_id,
+                        "mission_id": safe_opaque_identifier(session.mission_id),
                     })
 
         browser_service._route = diagnostic_browser_route
@@ -704,7 +710,7 @@ def main() -> int:
                 for _ in range(6):
                     if current is None:
                         break
-                    error_chain.append({"type": type(current).__name__, "message": str(current)[:500]})
+                    error_chain.append({"type": safe_exception_type(current), "message_redacted": True})
                     current = current.__cause__ or current.__context__
                 (run_dir / "browser-operation-diagnostic.json").write_text(
                     json.dumps({"error_chain": error_chain, "route_diagnostics": browser_route_diagnostics}, indent=2) + "\n",
@@ -1545,7 +1551,7 @@ def main() -> int:
         failure_phase = "cleanup"
     except Exception as exc:
         result["failure_phase"] = failure_phase
-        result["error_type"] = type(exc).__name__
+        result["error_type"] = safe_exception_type(exc)
         result["error"] = safe_acceptance_error(exc)
         if mission is not None:
             try:
@@ -1565,12 +1571,10 @@ def main() -> int:
                 })
             except Exception as evidence_exc:
                 result["mission"]["failure_snapshot_captured"] = False
-                result["mission"]["failure_snapshot_error_type"] = type(evidence_exc).__name__
-        try:
-            (run_dir / "failure-traceback.txt").write_text(traceback.format_exc(), encoding="utf-8")
-            result["failure_traceback"] = str(run_dir / "failure-traceback.txt")
-        except Exception:
-            pass
+                result["mission"]["failure_snapshot_error_type"] = safe_exception_type(evidence_exc)
+        # Raw traceback sidecars are deliberately omitted; only the static,
+        # sanitized error fields above are emitted.
+        result["failure_traceback_available"] = False
     finally:
         if browser_service is not None:
             try:
@@ -1578,7 +1582,7 @@ def main() -> int:
                 result["cleanup"]["browser_shutdown"] = True
             except Exception as exc:
                 result["cleanup"]["browser_shutdown"] = False
-                result["cleanup"]["browser_shutdown_error"] = type(exc).__name__
+                result["cleanup"]["browser_shutdown_error"] = safe_exception_type(exc)
         if browser_module is not None:
             browser_module._DEFAULT_SERVICE = previous_browser_service
         if mcp_module is not None:
@@ -1590,14 +1594,14 @@ def main() -> int:
                 result["cleanup"]["fixture_stopped"] = bool(_stop_fixture(fixture_process, fixture_ready))
             except Exception as exc:
                 result["cleanup"]["fixture_stopped"] = False
-                result["cleanup"]["fixture_stop_error"] = type(exc).__name__
+                result["cleanup"]["fixture_stop_error"] = safe_exception_type(exc)
         if runtime is not None:
             try:
                 runtime.stop()
                 result["cleanup"]["qwen_runtime_stopped"] = True
             except Exception as exc:
                 result["cleanup"]["qwen_runtime_stopped"] = False
-                result["cleanup"]["qwen_stop_error"] = type(exc).__name__
+                result["cleanup"]["qwen_stop_error"] = safe_exception_type(exc)
         if original_ssl_cert_file is None:
             os.environ.pop("SSL_CERT_FILE", None)
         else:
