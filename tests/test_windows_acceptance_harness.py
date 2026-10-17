@@ -5653,6 +5653,8 @@ def test_public_api_rejects_nonstandard_or_invalid_json_text() -> None:
         '{"value":NaN}',
         '{"value":Infinity}',
         '{"value":-Infinity}',
+        '{"value":1e999}',
+        '{"value":-1e999}',
         '{"value":}',
     ):
         class InvalidJsonPage:

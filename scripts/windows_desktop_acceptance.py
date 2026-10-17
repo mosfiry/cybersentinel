@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -602,9 +603,19 @@ def _public_api(page, method: str, path: str, *, csrf: str = "", payload: dict |
     def reject_nonstandard_constant(_value: str) -> None:
         raise ValueError("non_standard_json_constant")
 
+    def parse_finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non_finite_json_number")
+        return parsed
+
     try:
         body = (
-            json.loads(value["body_text"], parse_constant=reject_nonstandard_constant)
+            json.loads(
+                value["body_text"],
+                parse_constant=reject_nonstandard_constant,
+                parse_float=parse_finite_float,
+            )
             if value["body_text"]
             else {}
         )
