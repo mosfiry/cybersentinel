@@ -168,3 +168,12 @@ The independent review of this SHA found one low-severity parsing edge: a valid 
 ## Follow-up validation update
 
 The overflow-guard worktree passes the full suite (**2,204 passed, 28 skipped, 4 existing multiprocessing `fork()` deprecation warnings**). `compileall`, `git diff --check`, and the sensitive-file/secret-pattern scans also pass. Independent read-only review of this patch is **PASS** with no findings. The remaining validation is CI and an independent read-only review on the exact follow-up commit SHA.
+
+
+## Follow-up commit CI and independent review on SHA `71719ab4e1377512a2e8d2166a4e1444344009ca`
+
+The [Linux tests workflow](https://github.com/mosfiry/cybersentinel/actions/runs/39027367396) and [Owner charter audit](https://github.com/mosfiry/cybersentinel/actions/runs/39027367374) passed. The [Windows desktop-build workflow](https://github.com/mosfiry/cybersentinel/actions/runs/39027367460) completed and uploaded `CyberSentinel-Windows-acceptance-evidence-71719ab4e1377512a2e8d2166a4e1444344009ca`, then failed its final acceptance gate. Independent read-only review of this exact SHA is **PASS** with no findings; it also confirms the overflow guard and that Scope Firewall, Owner reauthentication, and dispatch gates were not changed.
+
+The downloaded Windows artifact confirms the dedicated installed-app restart cycle is **PASS**: `restart_basis_before=VERIFIED` and `restart_basis_after=VERIFIED`; the Mission is `RESOURCE_BLOCKED` both before and after restart with Mission-record integrity verified; preflight failure storage and preflight-block reconciliation are verified; reconciliation is `PASS`; completion events are absent; and `dispatch_attempted=false` / `process_started=false`. Owner authentication is **PASS**, including `valid_login_after_restart=true`, matching Owner identity, and authorized Mission read. `scope_firewall_verified=true`.
+
+The aggregate `full_mission_e2e` is still **FAIL**: its safe diagnostic is `PROCESS_SANDBOX_UNAVAILABLE` / `backend_unavailable` for `run_project_tests`; its tool-result summary is empty, so the false `mission_tools_within_authorized_allowlist` flag does not represent an executed unauthorized tool. The dedicated blocked-state persistence and truthful restart reconciliation are **SUCCESS**; AppContainer/process-sandbox execution and full end-to-end completion remain **FAIL**. This section records results on `71719ab`; the documentation-only commit that adds this section still requires CI and independent review on its own exact SHA.
