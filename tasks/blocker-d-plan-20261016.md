@@ -105,3 +105,14 @@
 - **المراجعة المستقلة:** لا findings بمستوى P1/P2 في مسار إلغاء Owner وكتابة MCP بعد إضافة send gate. حدود المراجعة: لم يُشغّل Windows native؛ وقد تصل بايتات سبق أن قبلها kernel socket buffer إلى النظير بعد لحظة marker، لكن لا تبدأ كتابة تطبيقية جديدة بعد `.cancel` النهائي ولا يحدث Owner SQLite CAS قبل إغلاق الطلب.
 - **الحالة:** **PARTIALLY VERIFIED**؛ لا توجد أدلة قبول Windows أصلية. لا يتوفر backend Windows AppContainer/LPAC، لذلك يظل Windows process execution fail-closed (`windows_appcontainer_backend_unimplemented`). `WindowsOwnedJob` يدير lifecycle المقبول فقط ولا يثبت عزل Mission process. Linux `cgroup_v2_delegation_unavailable` يمنع إثبات تشغيل sandbox فعلي في هذه البيئة.
 - **المتبقي:** secret scan، commits ذرية، push fast-forward لفرع المراجعة فقط بعد فحص العمل؛ Windows build/Job acceptance لا يمكن إثباتهما دون Windows أصلي؛ لا دمج إلى `main` ولا tag/release `v5.2`.
+
+## متابعة محدودة: إثبات بوابة Windows الأصلية — 2026-10-17
+
+البدء من `328d9d491b4f556f75abb4e31d531fe772929db5`، وهو ابن `a6204fb` بتقييم توثيقي فقط؛ تطابق المحلي والبعيد وحالة العمل نظيفة. تبقى خطط M3 وBlocker D وبنود التمكين السابقة محفوظة وغير مكتملة.
+
+1. **شريحة CI مستقلة (صغيرة):** تشغيل اختبارات Job lifecycle الأصلية الثلاثة واختباري رفض Windows مباشرة على `windows-latest`، دون `continue-on-error`، مع JUnit وهوية SHA/image وبوابة ترفض skip/اختفاء اختبار. لا نشر، لا Qwen أو inference، ولا تغيير workflow قبول المثبت أو شروط نجاحه.
+2. **شريحة اختبار محكوم (صغيرة):** اختبار رفض `run_project_tests` ببيانات Owner مؤقتة حقيقية، ScopeStore وقائمة أدوات وqueue/worker/fence دائمة. إثبات `RESOURCE_BLOCKED/not_dispatched` بعد إعادة فتح المخزن، وعدم وجود dispatch/process receipt أو أدلة نجاح. نسخة اختيار Windows الصريح على Linux تختبر العقد فقط؛ الإثبات الأصلي يأتي من Windows دون تبديل backend أو محاكاته.
+3. **تقرير جدوى محدد:** Windows CI موجود وقادر على تشغيل اختبارات أصلية بصلاحيات إدارة؛ لا دليل على استحالة التركيب، لكن لا backend كامل ولا حصة قرص/مراقب معتمدان. AppContainer/LPAC + ACL + Job + مساحة كتابة محدودة OS + supervisor تحتاج شرائح مستقلة واختبارات سلبية وإجمالية قبل التمكين. لا تفعيل جزئي ولا تعديل لحالة RESOURCE_BLOCKED.
+4. **نقطة تحقق:** focused/full pytest، compileall، secret scan، مراجعة مستقلة، commits صغيرة وnormal push لفرع المراجعة فقط. تشغيل CI المطلوب وفحص artifacts على SHA النهائي. أي FAIL في قبول Windows يبقى FAIL ويمنع توصية الدمج؛ لا تعديل main/tags/releases/Cloudflare.
+
+**معيار قبول هذه المتابعة:** إثبات أصلي قابل للفحص للحجب وJob lifecycle، لا ادعاء إثبات عزل Mission. يبقى معيار التمكين الكامل أعلاه مفتوحًا حتى اختبار منع الملفات والشبكة والحدود الإجمالية وإلغاء الأبناء وتنفيذ Mission حقيقي بأدلة دائمة.

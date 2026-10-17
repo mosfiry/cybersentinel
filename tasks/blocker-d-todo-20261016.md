@@ -75,3 +75,12 @@
 - **النتيجة الحالية:** `RESOURCE_BLOCKED` عند `run_project_tests` متوقع وآمن وفق الدليل؛ لا يجوز تحويله إلى نجاح. استعادة المهمة ذات السلسلة الغائبة تظل غير مثبتة.
 - [x] التحقق المحلي المركّز: `365 passed, 7 skipped`؛ المجموعة الكاملة: `2081 passed, 28 skipped, 4 warnings`.
 - [x] `compileall` و`git diff --check` اجتازا؛ strict secret/sensitive-file scan: صفر ملفات حساسة متتبعة وصفر أنماط أسرار.
+
+## متابعة محدودة: بوابة Windows أصلية مستقلة — 2026-10-17
+- [x] فحص المصدر والتصميم وتقييم API؛ تأكيد أن `328d9d4` سلف متقدم توثيقي فقط وأن Windows CI متاح، لا افتراض غيابه بسبب Linux.
+- [x] إعداد شريحة CI: اختبارات Job lifecycle ورفض Windows الأصلية لازمة، مع artifacts JUnit وهوية SHA/image ورفض skip/غياب اختبار؛ إثبات التشغيل الأصلي ينتظر CI على SHA المرفوع.
+- [x] شريحة اختبار: Owner password/session حقيقيان مع scope دائم وqueue/worker/fence؛ RESOURCE_BLOCKED محفوظ بعد إعادة فتح المخزن؛ فحص ledger في queue.db_path وEvidenceChain المنفصلة، لا قواعد بديلة فارغة. نجح عقد اختيار Windows على Linux فقط حتى الآن.
+- [x] focused tests: `2 passed, 1 skipped`؛ full Linux suite بعد تصحيحات المراجعة: `2206 passed, 29 skipped, 4 warnings`، exit 0؛ compileall وsecret scan (صفر) وdiff hygiene. المراجعة المستقلة النهائية: لا P1/P2 باقية؛ إبطال الجلسة بعد الإدراج في الطابور ليس ضمن ادعاء الاختبار الجديد.
+- [ ] normal commits/push لفرع المراجعة فقط؛ فحص required CI وartifacts على SHA النهائي.
+- [x] تقرير جدوى محدود يميز قابلية CI لاختبار APIs من اكتمال backend، ويحدد حاجز القرص/المراقب وبوابات التفعيل: `docs/architecture/WINDOWS_SANDBOX_CI_FEASIBILITY_2026-10-17_AR.md`.
+- [ ] **يبقى مفتوحًا:** backend Windows كامل وOS enforcement مثبت ومنع ملفات/شبكة وحدود إجمالية وإلغاء وتنفيذ run_project_tests فعلي بأدلة دائمة؛ لا تعديل main ولا توصية merge قبل نجاح البوابات المطلوبة.
