@@ -109,6 +109,28 @@ def test_queue_worker_and_restart_recovery(tmp_path):
     assert result.state is WorkerMissionState.COMPLETED
 
 
+def test_worker_maps_cancelled_mission_to_terminal_cancelled_queue_state(tmp_path):
+    queue = MissionQueue(Path(tmp_path) / "queue-cancelled.sqlite3")
+    queue.enqueue("mission-cancelled", available_at="2026-01-01T00:00:00+00:00")
+
+    class Mission:
+        status = MissionStatus.CANCELLED
+        evidence = []
+        error = "owner cancellation"
+
+    class Runtime:
+        def run_to_completion(self, mission_id, max_slices=None, heartbeat=None):
+            assert mission_id == "mission-cancelled"
+            return Mission()
+
+    result = MissionWorker(queue, lambda: Runtime(), worker_id="cancelled-worker").run_once(now="2026-01-01T00:00:00+00:00")
+
+    assert result.state is WorkerMissionState.CANCELLED
+    assert result.last_error == "owner cancellation"
+    assert result.lease_owner is None
+    assert queue.claim_next(now="2026-01-01T00:00:01+00:00") is None
+
+
 def test_reenqueue_clears_stale_lease_and_error(tmp_path):
     queue = MissionQueue(Path(tmp_path) / "queue.sqlite3")
     queue.enqueue("mission-requeued", available_at="2026-01-01T00:00:00+00:00")
