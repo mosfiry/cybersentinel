@@ -131,7 +131,8 @@ def test_simulated_github_full_acceptance_binds_installed_executable_fingerprint
     assert windows_acceptance.main() == 2
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "FAIL"  # Deliberate: no real installed app/CDP in this simulation.
+    # A mocked runner label is not a native Windows environment or an installed app.
+    assert report["status"] == ("FAIL" if sys.platform == "win32" else "BLOCKED")
     assert report["run_identity"] == {
         "provider": "github-actions",
         "repository": "mosfiry/cybersentinel",
@@ -5684,3 +5685,172 @@ def test_public_api_rejects_non_object_json_body() -> None:
             "GET",
             "/api/public/test",
         )
+
+
+def _synthetic_full_acceptance_contract():
+    """Unit-only report: never evidence of a real Windows acceptance run."""
+    identity = {
+        "provider": "github-actions", "repository": "mosfiry/cybersentinel",
+        "run_id": "123456", "run_attempt": "2", "source_commit": "a" * 40,
+        "ref": "refs/heads/fix/blocker-d-review-20261010", "runner_os": "Windows",
+    }
+    started = "2026-10-19T10:00:00+00:00"
+    executable_sha256 = "b" * 64
+    fingerprint = {
+        "source_commit": identity["source_commit"],
+        "installed_executable_sha256": executable_sha256,
+        "expected_version": "5.2.0-rc1", "reported_version": "5.2.0-rc1",
+    }
+    fingerprint["sha256"] = _canonical_sha256(fingerprint)
+    report = {
+        "mode": "full", "status": "FAIL", "expected_version": "5.2.0-rc1",
+        "started_at_utc": started, "completed_at_utc": "2026-10-19T10:05:00+00:00",
+        "run_identity": dict(identity), "application_fingerprint": fingerprint,
+        "checks": {name: True for name in windows_acceptance._FULL_ACCEPTANCE_REQUIRED_CHECKS},
+        "application_restart": {"status": "PASS"},
+        "installed_app_mission": {
+            "status": "PASS", "mission_status": "GOAL_COMPLETED", "mission_id": "mission-unit",
+            "blocked_or_unverified_status_present": False,
+            "timeline_event_trace_truncated": False,
+            "timeline_event_count": 1,
+            "timeline_event_trace": [{"mission_id": "mission-unit", "request_id": "request-unit",
+                                      "timestamp_utc": "2026-10-19T10:01:00+00:00"}],
+            "project_test_execution_proof": {
+                "verified": True, "exactly_one_actual_execution_verified": True,
+                "actual_process_start_verified": True, "verified_linked_execution_count": 1,
+                "sandbox_backend": "unit-only-native-backend",
+            },
+        },
+    }
+    return report, identity, started, executable_sha256
+
+
+def _synthetic_full_verdict(report, identity, started, executable_sha256):
+    return windows_acceptance._full_acceptance_evidence_verdict(
+        report, expected_run_identity=identity, expected_started_at=started,
+        expected_executable_sha256=executable_sha256,
+    )
+
+
+def _stub_native_acceptance_contract(monkeypatch):
+    # Stubs test the validator only; they never enable the runtime Windows backend.
+    monkeypatch.setattr(windows_acceptance, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(windows_acceptance, "_process_sandbox_backend_supported",
+                        lambda backend: backend == "unit-only-native-backend")
+
+
+def test_d4_synthetic_complete_contract_is_not_an_actual_acceptance_claim(monkeypatch):
+    _stub_native_acceptance_contract(monkeypatch)
+    report, identity, started, digest = _synthetic_full_acceptance_contract()
+    assert _synthetic_full_verdict(report, identity, started, digest)["status"] == "PASS"
+
+
+@pytest.mark.parametrize("field", ["run_id", "run_attempt", "source_commit", "repository", "ref"])
+def test_d4_rejects_evidence_from_another_run_or_sha(monkeypatch, field):
+    _stub_native_acceptance_contract(monkeypatch)
+    report, identity, started, digest = _synthetic_full_acceptance_contract()
+    report["run_identity"][field] = "9" * 40 if field == "source_commit" else "old-run"
+    assert _synthetic_full_verdict(report, identity, started, digest)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("tamper", ["start", "completed", "old_event", "future_event", "missing_event_time",
+                                   "wrong_mission", "wrong_request", "truncated", "missing_trace"])
+def test_d4_rejects_stale_or_misbound_event_log(monkeypatch, tamper):
+    _stub_native_acceptance_contract(monkeypatch)
+    report, identity, started, digest = _synthetic_full_acceptance_contract()
+    mission = report["installed_app_mission"]
+    event = mission["timeline_event_trace"][0]
+    if tamper == "start":
+        report["started_at_utc"] = "2026-10-17T10:00:00+00:00"
+    elif tamper == "completed":
+        report["completed_at_utc"] = "2026-10-19T09:59:00+00:00"
+    elif tamper == "old_event":
+        event["timestamp_utc"] = "2026-10-17T10:01:00+00:00"
+    elif tamper == "future_event":
+        event["timestamp_utc"] = "2026-10-19T10:06:00+00:00"
+    elif tamper == "missing_event_time":
+        event.pop("timestamp_utc")
+    elif tamper == "wrong_mission":
+        event["mission_id"] = "old-mission"
+    elif tamper == "wrong_request":
+        mission["timeline_event_trace"].append({**event, "request_id": "old-request"})
+        mission["timeline_event_count"] = 2
+    elif tamper == "truncated":
+        mission["timeline_event_trace_truncated"] = True
+    else:
+        mission.pop("timeline_event_trace")
+    assert _synthetic_full_verdict(report, identity, started, digest)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("field", ["application_fingerprint", "checks", "application_restart", "installed_app_mission"])
+def test_d4_rejects_missing_acceptance_evidence(monkeypatch, field):
+    _stub_native_acceptance_contract(monkeypatch)
+    report, identity, started, digest = _synthetic_full_acceptance_contract()
+    report.pop(field)
+    assert _synthetic_full_verdict(report, identity, started, digest)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("tamper", ["wrong_executable", "wrong_fingerprint_sha", "wrong_version", "missing_check",
+                                   "truthy_check", "tests_only", "missing_process_proof", "failed_mission"])
+def test_d4_tests_pass_is_not_mission_acceptance(monkeypatch, tamper):
+    _stub_native_acceptance_contract(monkeypatch)
+    report, identity, started, digest = _synthetic_full_acceptance_contract()
+    if tamper == "wrong_executable":
+        digest = "c" * 64
+    elif tamper == "wrong_fingerprint_sha":
+        report["application_fingerprint"]["source_commit"] = "d" * 40
+    elif tamper == "wrong_version":
+        report["application_fingerprint"]["reported_version"] = "5.1.0"
+    elif tamper == "missing_check":
+        report["checks"].pop("installed_app_full_mission")
+    elif tamper == "truthy_check":
+        report["checks"]["installed_app_full_mission"] = "PASS"
+    elif tamper == "tests_only":
+        report["installed_app_mission"]["mission_status"] = "RUNNING"
+    elif tamper == "missing_process_proof":
+        report["installed_app_mission"]["project_test_execution_proof"].pop("actual_process_start_verified")
+    else:
+        report["installed_app_mission"]["status"] = "FAIL"
+    assert _synthetic_full_verdict(report, identity, started, digest)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("block", ["non_windows", "backend", "mission"])
+def test_d4_preserves_blocked_when_windows_or_isolation_is_unavailable(monkeypatch, block):
+    _stub_native_acceptance_contract(monkeypatch)
+    report, identity, started, digest = _synthetic_full_acceptance_contract()
+    if block == "non_windows":
+        monkeypatch.setattr(windows_acceptance, "sys", SimpleNamespace(platform="linux"))
+    elif block == "backend":
+        monkeypatch.setattr(windows_acceptance, "_process_sandbox_backend_supported", lambda backend: False)
+    else:
+        report["installed_app_mission"]["mission_status"] = "RESOURCE_BLOCKED"
+        report["installed_app_mission"]["status"] = "BLOCKED"
+    assert _synthetic_full_verdict(report, identity, started, digest)["status"] == "BLOCKED"
+
+
+def test_d4_full_main_without_windows_writes_blocked_not_pass(tmp_path, monkeypatch):
+    executable = tmp_path / "CyberSentinel.exe"
+    executable.write_bytes(b"unit-test-not-a-windows-executable")
+    output = tmp_path / "acceptance.json"
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+    monkeypatch.setattr(windows_acceptance, "sys", SimpleNamespace(
+        platform="linux", stderr=sys.stderr,
+        argv=["windows_desktop_acceptance.py", "--expected-version", "5.2.0-rc1",
+              "--profile-root", str(tmp_path / "profile"), "--installed-executable", str(executable),
+              "--launch-in-owned-job", "--mode", "full", "--output", str(output)],
+    ))
+    # argparse reads the real sys module, not this module's platform stub.
+    monkeypatch.setattr(sys, "argv", windows_acceptance.sys.argv)
+    assert windows_acceptance.main() == 2
+    report = json.loads(output.read_text())
+    assert report["status"] == "BLOCKED"
+    assert report["installed_app_mission"]["status"] == "NOT_RUN"
+
+
+@pytest.mark.parametrize("field", ["repository", "ref", "run_id", "run_attempt", "source_commit"])
+def test_d4_rejects_identity_fields_missing_from_both_report_and_invocation(monkeypatch, field):
+    _stub_native_acceptance_contract(monkeypatch)
+    report, identity, started, digest = _synthetic_full_acceptance_contract()
+    identity.pop(field)
+    report["run_identity"].pop(field)
+    assert _synthetic_full_verdict(report, identity, started, digest)["status"] == "FAIL"

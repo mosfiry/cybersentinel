@@ -69,6 +69,125 @@ EXPECTED_QWEN3_4B_INSTALL_IDENTITY = {
 }
 
 
+_FULL_ACCEPTANCE_REQUIRED_CHECKS = frozenset({
+    "fresh_first_run", "hardware_detection", "qwen3_4b_model_manager",
+    "qwen3_4b_installed_digest_matches_catalog_and_pin", "qwen3_4b_runtime_active",
+    "local_runtime_initialization", "real_qwen_local_inference", "owner_valid_login",
+    "owner_invalid_login_rejected", "installed_app_full_mission",
+    "installed_executable_launch_from_installed_path",
+    "application_restart_and_durable_mission_recovery", "runtime_shutdown",
+})
+
+
+def _full_acceptance_evidence_verdict(
+    report: dict, *, expected_run_identity: dict, expected_started_at: str,
+    expected_executable_sha256: str | None,
+) -> dict[str, str]:
+    """Bind a full-mode verdict to this invocation, not a reusable PASS summary.
+
+    These expected values must come from the invocation, never an imported log.
+    This gate supplements, and cannot replace, the mission's raw-evidence checks.
+    """
+    def verdict(status: str, reason: str) -> dict[str, str]:
+        return {"status": status, "reason_code": reason}
+
+    if sys.platform != "win32":
+        return verdict("BLOCKED", "native_windows_unavailable")
+    if report.get("mode") != "full":
+        return verdict("FAIL", "full_acceptance_evidence_required")
+    fingerprint = report.get("application_fingerprint")
+    mission = report.get("installed_app_mission")
+    checks = report.get("checks")
+    restart = report.get("application_restart")
+    if not all(isinstance(value, dict) for value in (fingerprint, mission, checks, restart)):
+        return verdict("FAIL", "full_acceptance_evidence_missing")
+    source_commit = expected_run_identity.get("source_commit")
+    provider = expected_run_identity.get("provider")
+    if provider not in {"github-actions", "local"} or (
+        provider == "github-actions" and (
+            any(not isinstance(expected_run_identity.get(key), str) or not expected_run_identity[key]
+                for key in ("repository", "ref", "run_id", "run_attempt"))
+            or any(re.fullmatch(r"[1-9][0-9]*", str(expected_run_identity.get(key))) is None
+                   for key in ("run_id", "run_attempt"))
+        )
+    ):
+        return verdict("FAIL", "acceptance_invocation_identity_missing")
+    if (
+        report.get("run_identity") != expected_run_identity
+        or not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40,64}", source_commit) is None
+        or fingerprint.get("source_commit") != source_commit
+        or not isinstance(expected_executable_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_executable_sha256) is None
+        or fingerprint.get("installed_executable_sha256") != expected_executable_sha256
+        or not isinstance(report.get("expected_version"), str)
+        or not report["expected_version"]
+        or fingerprint.get("expected_version") != report["expected_version"]
+        or fingerprint.get("reported_version") != report["expected_version"]
+        or fingerprint.get("sha256") != _canonical_sha256({
+            key: value for key, value in fingerprint.items() if key != "sha256"
+        })
+    ):
+        return verdict("FAIL", "acceptance_invocation_binding_mismatch")
+    started = _normalized_utc_timestamp(expected_started_at)
+    completed = _normalized_utc_timestamp(report.get("completed_at_utc"))
+    if (
+        started is None or completed is None
+        or report.get("started_at_utc") != expected_started_at
+        or datetime.fromisoformat(completed) < datetime.fromisoformat(started)
+    ):
+        return verdict("FAIL", "acceptance_time_window_invalid")
+    mission_status = mission.get("mission_status")
+    if isinstance(mission_status, str) and mission_status.endswith("_BLOCKED"):
+        return verdict("BLOCKED", "mission_execution_blocked")
+    proof = mission.get("project_test_execution_proof")
+    if (
+        mission.get("status") != "PASS" or mission_status != "GOAL_COMPLETED"
+        or mission.get("blocked_or_unverified_status_present") is not False
+        or not isinstance(proof, dict)
+        or any(proof.get(key) is not True for key in (
+            "verified", "exactly_one_actual_execution_verified", "actual_process_start_verified",
+        ))
+        or type(proof.get("verified_linked_execution_count")) is not int
+        or proof["verified_linked_execution_count"] != 1
+    ):
+        return verdict("FAIL", "mission_acceptance_not_verified")
+    if not _process_sandbox_backend_supported(proof.get("sandbox_backend")):
+        return verdict("BLOCKED", "process_isolation_not_verified")
+    trace = mission.get("timeline_event_trace")
+    if (
+        not isinstance(trace, list) or not trace
+        or mission.get("timeline_event_trace_truncated") is not False
+        or type(mission.get("timeline_event_count")) is not int
+        or mission["timeline_event_count"] != len(trace)
+        or not isinstance(mission.get("mission_id"), str) or not mission["mission_id"]
+    ):
+        return verdict("FAIL", "mission_event_log_incomplete")
+    request_ids = set()
+    for event in trace:
+        if not isinstance(event, dict):
+            return verdict("FAIL", "mission_event_log_invalid")
+        timestamp = _normalized_utc_timestamp(event.get("timestamp_utc"))
+        request_id = event.get("request_id")
+        if (
+            event.get("mission_id") != mission["mission_id"]
+            or not isinstance(request_id, str) or not request_id
+            or timestamp is None
+            or not datetime.fromisoformat(started) <= datetime.fromisoformat(timestamp) <= datetime.fromisoformat(completed)
+        ):
+            return verdict("FAIL", "mission_event_log_binding_mismatch")
+        request_ids.add(request_id)
+    if len(request_ids) != 1:
+        return verdict("FAIL", "mission_request_binding_mismatch")
+    if (
+        not _FULL_ACCEPTANCE_REQUIRED_CHECKS.issubset(checks)
+        or any(value is not True for value in checks.values())
+        or restart.get("status") != "PASS"
+    ):
+        return verdict("FAIL", "full_acceptance_checks_incomplete")
+    return verdict("PASS", "current_run_full_acceptance_verified")
+
+
 def _sha256(value: bytes | str) -> str:
     if isinstance(value, str):
         value = value.encode("utf-8")
@@ -5777,7 +5896,10 @@ def _installed_app_mission(
         and completed_mission_inspectable_after_restart
     )
     result = {
-        "status": "PASS" if mission_pass else "FAIL",
+        "status": "PASS" if mission_pass else (
+            "BLOCKED" if isinstance(mission_state.get("status"), str)
+            and mission_state["status"].endswith("_BLOCKED") else "FAIL"
+        ),
         "provenance": "installed_CyberSentinel_Desktop_public_API_and_bundled_backend",
         "mission_id": mission_id,
         "project_id": project_id,
@@ -6020,6 +6142,8 @@ def main() -> int:
         "installed_app_mission": {"status": "NOT_RUN"},
         "progress": [],
     }
+    expected_run_identity = dict(report["run_identity"])
+    expected_started_at = report["started_at_utc"]
     browser = None
     process_job: WindowsOwnedJob | None = None
     initial_process_identity = None
@@ -6028,6 +6152,8 @@ def main() -> int:
     inference_response_fields: list[str] = []
     stage = "initialize_acceptance"
     try:
+        if args.mode == "full" and sys.platform != "win32":
+            raise RuntimeError("native_windows_process_restart_required")
         if args.mode == "full" and installed_executable_sha256 is None:
             raise RuntimeError("installed_executable_fingerprint_unavailable")
         if args.mode == "full" and source_commit is None:
@@ -6901,7 +7027,13 @@ def main() -> int:
                     "application_restart_and_durable_mission_recovery": report["application_restart"].get("status") == "PASS",
                     "runtime_shutdown": report["model_manager"].get("runtime_shutdown_verified") is True,
                 }
-                report["status"] = "PASS" if all(report["checks"].values()) else "FAIL"
+                report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+                report["evidence_gate"] = _full_acceptance_evidence_verdict(
+                    report, expected_run_identity=expected_run_identity,
+                    expected_started_at=expected_started_at,
+                    expected_executable_sha256=installed_executable_sha256,
+                )
+                report["status"] = report["evidence_gate"]["status"]
                 stage = "acceptance_complete"
                 return_code = 0 if report["status"] == "PASS" else 2
             report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -6913,7 +7045,10 @@ def main() -> int:
         safe_error = _safe_exception_diagnostics(exc)
         report.update(safe_error)
         report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
-        report["status"] = "FAIL"
+        report["status"] = "BLOCKED" if args.mode == "full" and (
+            sys.platform != "win32"
+            or report.get("installed_app_mission", {}).get("status") == "BLOCKED"
+        ) else "FAIL"
         if report.get("application_restart", {}).get("status") == "IN_PROGRESS":
             report["application_restart"]["status"] = "FAIL"
         mission_report = report.get("installed_app_mission")
