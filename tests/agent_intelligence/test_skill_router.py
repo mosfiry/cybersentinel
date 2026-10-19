@@ -221,6 +221,32 @@ def test_missing_strongest_candidate_falls_back_to_eligible_positive_match(tmp_p
     assert decision.eligible_count == 1
 
 
+def test_missing_tool_chooses_alternative_without_invoking_either_tool(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    registry.tool_specs["status"] = REGISTRY["status"]
+    register(registry, make_definition(
+        "strong-search", name="Host research", capabilities=("investigation",),
+    ))
+    fallback = make_definition("status-fallback", name="Host", capabilities=("inventory",))
+    fallback = replace(
+        fallback,
+        required_tools=("status",),
+        procedure=(SkillStep("search-step", "status", "status", expects_evidence=False),),
+        tests=(replace(fallback.tests[0], expected_tool_sequence=("status",)),),
+        content_hash="",
+    )
+    register(registry, fallback)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("routing must not invoke registered tools")
+
+    monkeypatch.setattr("tools.registry.execute", forbidden)
+    decision = route(registry, "host research", available_tools=("status",))
+    assert decision.skill_id == fallback.skill_id
+    assert decision.eligible_count == 1
+    assert decision.matched_count == 2
+
+
 def test_unavailable_when_positive_matches_fail_tool_scope_or_requested_tool_constraints(tmp_path):
     registry = make_registry(tmp_path)
     register(registry, make_definition("scanner", name="Network scan", capabilities=("inventory",)))

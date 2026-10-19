@@ -798,9 +798,13 @@ class AgentCore:
             raise KeyError("unknown_mission")
         return result
 
-    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True, skill_id: str | None = None, planning_requirements: list[str] | tuple[str, ...] | None = None) -> Mission:
+    def run_owner_mission(self, instruction: str, *, owner_session_token: str, request_id: str | None = None, scope_context: dict[str, Any] | None = None, completion_criteria: list[dict[str, Any]] | None = None, run: bool = True, skill_id: str | None = None, planning_requirements: list[str] | tuple[str, ...] | None = None, auto_skill: bool = False) -> Mission:
         request_id = request_id or uuid.uuid4().hex
         authorization_context, policy_context = self._auth(instruction, owner_session_token, request_id)
+        if not isinstance(auto_skill, bool):
+            raise ValueError("invalid_auto_skill_selection")
+        if auto_skill and skill_id is not None:
+            raise ValueError("conflicting_skill_selection")
         if isinstance(scope_context, dict) and scope_context.get("scope_snapshot_id"):
             snapshot = get_snapshot(scope_context["scope_snapshot_id"])
             if snapshot is None:
@@ -836,21 +840,47 @@ class AgentCore:
                 )
         skill_binding = None
         skill_context_payload = None
+        routing_metadata = None
+        planning_tool_names = self._planning_tool_allowlist(scope_context)
+        required_planning_tools = self._normalize_planning_requirements(
+            planning_requirements, planning_tool_names
+        )
+        if auto_skill:
+            from .intelligence_layer.skill_router import route_skill
+            from .intelligence_layer.skills import SkillAuthorizationError
+            if self.skill_registry is None:
+                raise SkillAuthorizationError("automatic Skill selection requires a configured Skill registry")
+            available = {
+                item["function"]["name"] for item in self._schemas()
+            }
+            if planning_tool_names is not None:
+                available.intersection_update(planning_tool_names)
+            decision = route_skill(
+                self.skill_registry,
+                owner_identity_ref=self._canonical_owner_ref_from_context(authorization_context),
+                objective=instruction,
+                available_tools=available,
+                allowed_scope=tuple((scope_context or {}).get("scope", ("workspace",))),
+                required_tools=required_planning_tools,
+            )
+            routing_metadata = decision.to_dict()
+            skill_id = decision.skill_id
         if skill_id is not None:
             from .intelligence_layer.skills import SkillAuthorizationError
             if self.skill_registry is None:
                 raise SkillAuthorizationError("explicit Skill selection requires a configured Skill registry")
             canonical_owner = self._canonical_owner_ref_from_context(authorization_context)
             skill_binding = self.skill_registry.bind_mission(canonical_owner, mission_id, str(skill_id))
+            if routing_metadata is not None and (
+                routing_metadata.get("skill_version") != skill_binding.version
+                or routing_metadata.get("content_hash") != skill_binding.content_hash
+            ):
+                raise SkillAuthorizationError("routed Skill revision changed before Mission binding")
             effective_scope = tuple((scope_context or {}).get("scope", ("workspace",)))
             if skill_binding.allowed_scope and not set(skill_binding.allowed_scope).issubset(set(effective_scope)):
                 raise SkillAuthorizationError("selected Skill scope exceeds the Owner-requested Mission scope")
             skill_context_payload = self.skill_registry.guidance_for_binding(skill_binding).to_untrusted_context()
         runtime_limits = self._context_runtime_limits()
-        planning_tool_names = self._planning_tool_allowlist(scope_context)
-        required_planning_tools = self._normalize_planning_requirements(
-            planning_requirements, planning_tool_names
-        )
         if skill_binding is not None and not set(required_planning_tools).issubset(
             set(skill_binding.required_tools)
         ):
@@ -1179,6 +1209,7 @@ class AgentCore:
                 },
                 **({"planning_requirements": list(required_planning_tools)} if required_planning_tools else {}),
                 **({"mission_memory_scope_ref": memory_scope_key} if memory_scope_key else {}),
+                **({"skill_routing": routing_metadata} if routing_metadata is not None else {}),
             },
             authorization_snapshot_factory=authorization_snapshot_factory,
             planning_failures=planning_failures or None,

@@ -228,7 +228,11 @@ class MissionRuntime:
         from .intelligence_layer.models import DelegationScope
         from security.mission_authorization import MissionAuthorizationSnapshot
         snapshot = MissionAuthorizationSnapshot.from_dict(dict(mission.authorization_snapshot or {}))
-        parent = DelegationScope.from_snapshot(snapshot, owner_identity_ref=mission.owner_identity_ref)
+        parent = DelegationScope.from_snapshot(
+            snapshot,
+            owner_identity_ref=mission.owner_identity_ref,
+            authorization_version=MissionTaskGraphAdapter._expected_authorization_version(mission),
+        )
         return skill_context.narrow_task_scope(parent, tool_name=tool_name)
 
     def _block_on_skill_context(self, mission: Mission) -> Mission:
