@@ -56,7 +56,7 @@ function renderMissionSkillOptions() {
     selector.appendChild(option);
   });
   if (approved.some((skill) => skill.skill_id === previous)) selector.value = previous;
-  selector.disabled = !state.ownerAuthenticated || !approved.length;
+  selector.disabled = !!document.querySelector("#missionAutoSkill")?.checked || !state.ownerAuthenticated || !approved.length;
 }
 
 async function loadSkills() {
@@ -1095,6 +1095,37 @@ function renderMissionView(view) {
     block.className = "result";
     block.textContent = `تعليمات المالك\n${mission.owner_instruction || mission.owner_request || "غير متاحة"}\n\nالمرحلة / العملية الحالية\n${step ? `${step.step_id || ""} · ${step.action || "عملية غير محددة"}` : "لا توجد خطوة حالية في الخطة"}\n\nالتفويض\n${authSnapshot}\n\nسبب الإخفاق / التوقف\n${mission.error || "لا يوجد سبب مسجل"}\n\nنقاط الاستعادة\n${JSON.stringify(mission.checkpoint || {}, null, 2)}\n\nمعايير التحقق المفقودة\n${missing.length ? missing.join(", ") : (verification.verified === true ? "لا توجد معايير مفقودة وفق الخادم" : "غير محددة")}`;
     target.appendChild(block);
+    const routing = mission.skill_routing;
+    const binding = mission.skill_binding;
+    if ((routing && typeof routing === "object") || (binding && typeof binding === "object")) {
+      const outcomes = { selected: "تم اختيار مهارة", ambiguous: "تطابق ملتبس؛ لم تُختر مهارة", no_match: "لا يوجد تطابق؛ لم تُختر مهارة", unavailable: "التوجيه غير متاح؛ لم تُختر مهارة" };
+      const reasons = {
+        eligible_positive_match: "أعلى تطابق كلمات مؤهل دون تعادل",
+        top_score_tie: "تعادل بين أفضل التطابقات",
+        no_positive_match: "لم يوجد تطابق إيجابي",
+        registry_unavailable: "سجل المهارات غير متاح",
+        catalog_limit_exceeded: "تجاوز كتالوج المهارات الحد المسموح",
+        invalid_active_skill: "تعذر التحقق من مهارة نشطة",
+        constraints_unsatisfied: "المهارات المطابقة لا تلائم قيود المهمة",
+      };
+      const routingBlock = document.createElement("div");
+      routingBlock.className = "result";
+      const lines = ["توجيه المهارات"];
+      if (routing && typeof routing === "object") {
+        lines.push(`النتيجة: ${outcomes[routing.outcome] || "غير متاحة"}`);
+        lines.push(`السبب: ${reasons[routing.reason_code] || "غير متاح"}`);
+        if (typeof routing.skill_id === "string" && routing.skill_id.length <= 128) {
+          lines.push(`المهارة المرشحة: ${routing.skill_id}${Number.isInteger(routing.version) ? ` · الإصدار ${routing.version}` : ""}`);
+        }
+      } else {
+        lines.push("النتيجة: لم يُسجّل توجيه تلقائي");
+      }
+      if (binding && typeof binding === "object" && typeof binding.skill_id === "string" && binding.skill_id.length <= 128) {
+        lines.push(`المهارة المرتبطة بالمهمة: ${binding.skill_id}${Number.isInteger(binding.version) ? ` · الإصدار ${binding.version}` : ""}`);
+      }
+      routingBlock.textContent = lines.join("\n");
+      target.appendChild(routingBlock);
+    }
     if (mission.status === "RECOVERY_REQUIRED" && ["in_flight", "in_flight_parallel"].includes(mission.checkpoint?.status)) {
       const notice = document.createElement("div");
       notice.className = "notice warn";
@@ -2157,11 +2188,14 @@ $("#missionForm").onsubmit = async (event) => {
       body: JSON.stringify({
         objective: $("#missionObjective").value.trim(),
         project_id: state.activeProjectId,
-        ...($("#missionSkill").value ? { skill_id: $("#missionSkill").value } : {}),
+        auto_skill: $("#missionAutoSkill").checked,
+        ...(!$("#missionAutoSkill").checked && $("#missionSkill").value ? { skill_id: $("#missionSkill").value } : {}),
       }),
     });
     $("#missionObjective").value = "";
     $("#missionSkill").value = "";
+    $("#missionAutoSkill").checked = false;
+    renderMissionSkillOptions();
     state.selectedMissionId = data.mission_id || data.mission?.mission_id || "";
     setNotice(`أُنشئت المهمة من الخادم. الحالة الحالية: ${data.mission?.status || "غير متاحة"} · ${data.queue?.state || "حالة الطابور غير متاحة"}`, "ok");
     pushActivity(`أُنشئت مهمة: ${state.selectedMissionId || "معرّف غير متاح"}`, "ok");
@@ -2173,6 +2207,11 @@ $("#missionForm").onsubmit = async (event) => {
     button.disabled = false;
   }
 };
+
+$("#missionAutoSkill")?.addEventListener("change", () => {
+  if ($("#missionAutoSkill").checked) $("#missionSkill").value = "";
+  renderMissionSkillOptions();
+});
 
 $$("[data-mission-action]").forEach((button) => button.addEventListener("click", () => runMissionAction(button.dataset.missionAction)));
 

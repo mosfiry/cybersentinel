@@ -77,6 +77,8 @@
             <option value="">بدون مهارة</option>
           </select>
           <small>الاختيار اختياري وصريح لكل مهمة؛ المهارة تضيف إرشادًا غير موثوق ولا تنفّذ إجراءاتها.</small>
+          <label for="missionAutoSkill"><input id="missionAutoSkill" type="checkbox"> اختيار مهارة معتمدة عند وجود تطابق كلمات مؤهل وفريد</label>
+          <small>مطابقة كلمات وليست فهمًا للمعنى أو النفي. عند التعادل أو غياب تطابق مؤهل يمتنع التوجيه؛ ويتعطل الاختيار الصريح عند تفعيل هذا الخيار.</small>
           <label for="missionObjective">ماذا تريد أن تنجز؟</label>
           <textarea id="missionObjective" rows="3" maxlength="12000" required placeholder="صف هدف المهمة بلغة طبيعية…"></textarea>
           <button id="createMission" type="submit">إنشاء المهمة</button>

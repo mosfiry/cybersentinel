@@ -122,6 +122,18 @@ def _public_project_owner_tool_scope(owner_instruction: str) -> list[str]:
         allowed.add("unwatch")
 
     return sorted(allowed)
+
+
+def _validate_auto_skill_selection(payload: dict, selected_skill: object) -> bool:
+    """Validate the opt-in flag and prohibit combining explicit and automatic routing."""
+    auto_skill = payload.get("auto_skill", False)
+    if type(auto_skill) is not bool:
+        raise ValueError("invalid_auto_skill")
+    if auto_skill and selected_skill is not None:
+        raise ValueError("conflicting_skill_selection")
+    return auto_skill
+
+
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
 PUBLIC_SESSIONS = PublicSessionManager(ttl_seconds=PUBLIC_SESSION_TTL_SECONDS)
 PUBLIC_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -586,6 +598,72 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     @staticmethod
+    def _public_skill_routing(mission: dict) -> dict | None:
+        provenance = mission.get("provenance")
+        routing = provenance.get("skill_routing") if isinstance(provenance, dict) else None
+        if not isinstance(routing, dict):
+            return None
+        outcomes = {"selected", "ambiguous", "no_match", "unavailable"}
+        reasons = {
+            "eligible_positive_match", "top_score_tie", "no_positive_match",
+            "registry_unavailable", "catalog_limit_exceeded", "invalid_active_skill",
+            "constraints_unsatisfied",
+        }
+        outcome = routing.get("outcome")
+        reason_code = routing.get("reason_code")
+        if not isinstance(outcome, str) or outcome not in outcomes:
+            return None
+        if not isinstance(reason_code, str) or reason_code not in reasons:
+            return None
+        routing_version = routing.get("version")
+        if type(routing_version) is not int or routing_version != 1:
+            return None
+        result = {
+            "routing_version": 1,
+            "outcome": outcome,
+            "reason_code": reason_code,
+        }
+        for key in ("catalog_count", "eligible_count", "matched_count"):
+            value = routing.get(key)
+            if type(value) is int and 0 <= value <= 500:
+                result[key] = value
+        score = routing.get("score")
+        if type(score) is int and 0 <= score <= 10_000:
+            result["score"] = score
+        if outcome == "selected":
+            skill_id = routing.get("skill_id")
+            version = routing.get("skill_version")
+            content_hash = routing.get("content_hash")
+            if (
+                not isinstance(skill_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", skill_id)
+                or type(version) is not int or not 1 <= version <= 1_000_000
+                or not isinstance(content_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", content_hash)
+            ):
+                return None
+            result.update({"skill_id": skill_id, "version": version, "content_hash": content_hash})
+        return result
+
+    @staticmethod
+    def _public_skill_binding(mission: dict) -> dict | None:
+        binding = mission.get("skill_binding")
+        if not isinstance(binding, dict):
+            return None
+        skill_id = binding.get("skill_id")
+        version = binding.get("version")
+        content_hash = binding.get("content_hash")
+        if (
+            not isinstance(skill_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", skill_id)
+            or type(version) is not int or not 1 <= version <= 1_000_000
+            or not isinstance(content_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", content_hash)
+        ):
+            return None
+        return {"skill_id": skill_id, "version": version, "content_hash": content_hash}
+
+    @staticmethod
     def _public_mission_summary(mission: dict, project_id: str = "") -> dict:
         fields = (
             "mission_id", "objective", "owner_request", "status", "request_id",
@@ -593,6 +671,24 @@ class Handler(BaseHTTPRequestHandler):
         )
         result = {key: mission[key] for key in fields if key in mission}
         result["project_id"] = str(project_id or "")
+        routing = Handler._public_skill_routing(mission)
+        if routing is not None:
+            result["skill_routing"] = routing
+        binding = Handler._public_skill_binding(mission)
+        if binding is not None:
+            result["skill_binding"] = binding
+        return result
+
+    @staticmethod
+    def _public_mission_detail(mission: dict) -> dict:
+        """Preserve mission view fields while withholding raw provenance and skill content."""
+        result = {key: value for key, value in mission.items() if key not in {"provenance", "skill_binding"}}
+        routing = Handler._public_skill_routing(mission)
+        if routing is not None:
+            result["skill_routing"] = routing
+        binding = Handler._public_skill_binding(mission)
+        if binding is not None:
+            result["skill_binding"] = binding
         return result
 
     def _send_sse(self, events):
@@ -930,6 +1026,8 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) != 2 or action not in values:
                     return self._send(404, {"ok": False, "error": "unknown_mission_action"})
                 value = values[action](mission_id, owner_session_token=owner["session_token"])
+                if action == "status" and isinstance(value, dict):
+                    value = self._public_mission_detail(value)
                 return self._send(200, {"ok": True, "mission_id": mission_id, action: value})
             except PermissionError as exc:
                 return self._send(403, {"ok": False, "error": str(exc)})
@@ -1416,6 +1514,7 @@ class Handler(BaseHTTPRequestHandler):
                 selected_skill = payload.get("skill_id")
                 if selected_skill is not None and (not isinstance(selected_skill, str) or not selected_skill.strip() or len(selected_skill) > 128):
                     raise ValueError("invalid_skill_selection")
+                auto_skill = _validate_auto_skill_selection(payload, selected_skill)
                 diagnostic_stage = "agent_core_initialization"
                 core = AgentCore(
                     RUNTIME.router,
@@ -1430,6 +1529,7 @@ class Handler(BaseHTTPRequestHandler):
                     scope_context=scope_context,
                     run=False,
                     skill_id=selected_skill,
+                    auto_skill=auto_skill,
                 )
                 diagnostic_stage = "project_mission_assignment"
                 store.assign_mission(int(owner["owner_id"]), mission.mission_id, project.project_id)
