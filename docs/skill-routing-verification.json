@@ -1,0 +1,48 @@
+{
+  "verdict": "PARTIALLY VERIFIED",
+  "branch": "feature/skill-routing-20261019",
+  "base_commit": "bb1148f9caf91dc6511718e7869ae57861dc211a",
+  "implementation_commit": "522652af3b294254afc818df915e611b996eea0f",
+  "reference_commit": "cab634bd855fc287f6e420c1f36fd1a6b9245960",
+  "baseline_python": {"passed": 2291, "failed": 0, "errors": 0, "skipped": 53, "warnings": 4},
+  "final_python_local": {"passed": 2326, "failed": 0, "errors": 0, "skipped": 53, "warnings": 4},
+  "final_python_ci": {"passed": 2326, "failed": 0, "skipped": 53, "warnings": 4},
+  "added_passing_python_tests": 35,
+  "identical_skip_test_names_and_reasons": true,
+  "feature_graph_http_tests": {"passed": 103, "failed": 0, "skipped": 0},
+  "security_recovery_separate_process": {"passed": 149, "failed": 0, "skipped": 0},
+  "v9_crash_separate_process": {"passed": 10, "failed": 0, "skipped": 0},
+  "inherited_combined_order_failure": {
+    "base": {"passed": 158, "failed": 1, "skipped": 0},
+    "feature": {"passed": 158, "failed": 1, "skipped": 0},
+    "test": "tests/test_lease_fencing.py::test_worker_renews_fenced_claim_during_long_provider_call",
+    "cause": "Three prior simulated BaseException crash cases leave daemon lease keepalive threads; a later assertion checks all threads globally.",
+    "fixed": false
+  },
+  "desktop_baseline_prepared": {"passed": 13, "failed": 0, "skipped": 0},
+  "desktop_final": {"passed": 16, "failed": 0, "skipped": 0},
+  "ci": {
+    "tests": {"conclusion": "success", "url": "https://github.com/mosfiry/cybersentinel/actions/runs/39227033781"},
+    "owner_charter_audit": {"conclusion": "success", "url": "https://github.com/mosfiry/cybersentinel/actions/runs/39227033790"},
+    "workers_builds": {"conclusion": "failure", "url": "https://github.com/mosfiry/cybersentinel/runs/117975865858", "current_failure_logs_inspected": false},
+    "release_artifact_job": "skipped by existing branch condition; no release created"
+  },
+  "protected_refs_unchanged": {
+    "refs/heads/main": "8a3fd109c0e586db13ed48a7371ac9ad06465b74",
+    "refs/tags/v5.1.0": "684b344c183da1dee8dfd229c93cef0fd29396a5",
+    "refs/tags/v5.1.0^{}": "26739d9b01b3b1ff492854e7e21789be20b1be0e"
+  },
+  "windows_installed_acceptance_executed_for_feature": false,
+  "blocker_d_resolved": false,
+  "dependencies_added": [],
+  "paid_apis_used": false,
+  "source_copied_from_reference": false,
+  "new_tags_or_releases_created": false,
+  "limitations": [
+    "Lexical matching is not semantic or negation understanding.",
+    "Feature resume tests reopen SQLite-backed stores in the same test process, not Windows OS restart.",
+    "Router reads the registry private active-head connection; a public bounded active-list API remains a maintenance improvement.",
+    "A live local model and Windows installed-product acceptance were not exercised by this feature task.",
+    "External Workers Builds failure and inherited crash/lease test-order pollution remain unresolved."
+  ]
+}
