@@ -1,0 +1,23 @@
+Native Windows run 39579691012, attempt 1, source feeb6236c70520931bb9e92c022b517aef77dd58
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+lpac_launch_system_message: The system cannot find the file specified.
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+lpac_launch_diagnostic: {"version":1,"win32_error":2,"image_is_file":true,"image_attributes_error":0,"cwd_is_directory":true,"cwd_attributes_error":0,"module_matches_image":true,"ntstatus_available":true,"ntstatus_advisory":"0xC000000F"}
+Native outcome: 4 LPAC tests failed, 17 other tests passed; separate Job gate 19 native passed; separate VHD gate 6 native passed.
+
+Linux run 39579691217, attempt 1, same source SHA
+FAILED tests/test_acceptance_process_tree.py::test_fixture_stop_terminates_owned_process_group_and_removes_readiness_file
+tests/test_acceptance_process_tree.py:52: ValueError: invalid literal for int() with base 10: empty string
+1 failed, 2329 passed, 53 skipped, 4 warnings
+Required Linux gate 'pytest' ended as 'failure'.
+
+file_exists_when_wait_returns: True
+content_empty_before_publication: True
+same_failure: ValueError invalid literal for int() with base 10: ''
+writer_later_published_valid_integer: True
+scope: deterministic mechanism reproduction only; no timing claim for original CI

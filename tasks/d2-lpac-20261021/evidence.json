@@ -1,0 +1,57 @@
+{
+  "schema": "d2-investigation-evidence-v1",
+  "base_commit": "77515ed87435b051faf0d16a04ee89246eeff1aa",
+  "diagnostic_commit": "feeb6236c70520931bb9e92c022b517aef77dd58",
+  "d4_files_unchanged": {
+    "scripts/windows_desktop_acceptance.py": true,
+    "tests/test_windows_acceptance_harness.py": true
+  },
+  "local_os": "Linux",
+  "native_interactive_windows_available": false,
+  "production_backend_enabled": false,
+  "mission_acceptance": "BLOCKED",
+  "local_regression": {
+    "baseline_passed": 2327,
+    "diagnostic_passed": 2330,
+    "skipped": 53,
+    "warnings": 4
+  },
+  "focused_final_passed": 459,
+  "native_cross_compile": "PASS_NOT_NATIVE_EXECUTION",
+  "root_cause": "UNRESOLVED_MISSING_OBJECT",
+  "known_failure_stage": "CreateProcessW LPAC",
+  "win32_error": 2,
+  "native_ci": {
+    "run_id": 39579691012,
+    "attempt": 1,
+    "source_commit": "feeb6236c70520931bb9e92c022b517aef77dd58",
+    "conclusion": "failure",
+    "lpac_failures": 4,
+    "lpac_other_passes": 17,
+    "job_native_passes": 19,
+    "vhd_native_passes": 6,
+    "image_is_file": true,
+    "cwd_is_directory": true,
+    "module_matches_image": true,
+    "ntstatus_advisory": "0xC000000F"
+  },
+  "linux_ci": {
+    "run_id": 39579691217,
+    "conclusion": "failure",
+    "passed": 2329,
+    "failed": 1,
+    "skipped": 53,
+    "test": "test_fixture_stop_terminates_owned_process_group_and_removes_readiness_file",
+    "failure": "ValueError on empty PID file; existence is not publication",
+    "mechanism_reproduced": true,
+    "unrelated_test_unchanged": true
+  },
+  "protected_refs_unchanged": true,
+  "logs_sha256": {
+    "windows-diagnostic.log": "3ff81ac8038ab21a5811177fcb18682ababc13616a61a426e670c3b8bb50cba6",
+    "linux-ci.log": "541f2729aa42ab0eaac589731999681caa9e8fbeaad45be9ed70105d708ce5e6",
+    "regression-d4-isolated.log": "950381f89b948e8a7de74f9d26db923cb5dcd6d6b5d07f8429ee617ccb8b8359",
+    "regression-final.log": "269dc60ef1f12ae32b3f26a7420d5b1a44fee47a69c737ba0901f70d5469e4c9",
+    "linux-readiness-race-repro.log": "0cde5e2b63a9182572a5283ec6ba4bc79be4ff4eee75cfc47ca7288acb684fb9"
+  }
+}
