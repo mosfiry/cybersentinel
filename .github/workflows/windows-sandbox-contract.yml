@@ -2,7 +2,7 @@ name: windows-sandbox-contract
 
 on:
   push:
-    branches: [fix/blocker-d-review-20261010]
+    branches: [fix/blocker-d-review-20261010, fix/blocker-d2-lpac-20261021]
     paths:
       - "workspace/**"
       - "security/**"
@@ -131,7 +131,7 @@ jobs:
           retention-days: 30
 
   native-vhd-workspace:
-    if: github.repository == 'mosfiry/cybersentinel' && github.ref == 'refs/heads/fix/blocker-d-review-20261010'
+    if: github.repository == 'mosfiry/cybersentinel' && (github.ref == 'refs/heads/fix/blocker-d-review-20261010' || github.ref == 'refs/heads/fix/blocker-d2-lpac-20261021')
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -206,7 +206,7 @@ jobs:
           retention-days: 30
 
   native-appcontainer-workspace:
-    if: github.repository == 'mosfiry/cybersentinel' && github.ref == 'refs/heads/fix/blocker-d-review-20261010'
+    if: github.repository == 'mosfiry/cybersentinel' && (github.ref == 'refs/heads/fix/blocker-d-review-20261010' || github.ref == 'refs/heads/fix/blocker-d2-lpac-20261021')
     runs-on: windows-latest
     timeout-minutes: 15
     steps:

@@ -12,7 +12,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/windows-sand
 def test_windows_sandbox_gate_requires_exact_native_tests_without_soft_failure():
     source = WORKFLOW.read_text(encoding="utf-8")
     assert "permissions:\n  contents: read\n" in source
-    assert "branches: [fix/blocker-d-review-20261010]" in source
+    assert "branches: [fix/blocker-d-review-20261010, fix/blocker-d2-lpac-20261021]" in source
     assert "runs-on: windows-latest" in source
     assert "timeout-minutes: 15" in source
     assert "continue-on-error" not in source

@@ -409,6 +409,39 @@ static BOOL append_quoted(wchar_t *dst, size_t cap, size_t *used, const wchar_t 
     return TRUE;
 }
 
+typedef LONG (WINAPI *LastNtStatusFn)(void);
+
+/* Broker-side observations only. Neither existence nor a last NTSTATUS proves
+ * child access or identifies the missing kernel object. Never log paths/SIDs. */
+static void report_launch_failure(const wchar_t *image, const wchar_t *cwd,
+                                  DWORD error, BOOL nt_available, LONG nt_status) {
+    DWORD image_attrs, cwd_attrs, image_error, cwd_error, module_length;
+    wchar_t module[32768], message[512];
+    BOOL module_matches = FALSE;
+    image_attrs = GetFileAttributesW(image);
+    image_error = image_attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    cwd_attrs = GetFileAttributesW(cwd);
+    cwd_error = cwd_attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    module_length = GetModuleFileNameW(NULL, module, (DWORD)_countof(module));
+    if (module_length && module_length < (DWORD)_countof(module))
+        module_matches = _wcsicmp(module, image) == 0;
+    fwprintf(stderr,
+        L"lpac_launch_diagnostic: {\"version\":1,\"win32_error\":%lu,"
+        L"\"image_is_file\":%ls,\"image_attributes_error\":%lu,"
+        L"\"cwd_is_directory\":%ls,\"cwd_attributes_error\":%lu,"
+        L"\"module_matches_image\":%ls,\"ntstatus_available\":%ls,"
+        L"\"ntstatus_advisory\":\"0x%08lX\"}\n",
+        (unsigned long)error,
+        image_attrs != INVALID_FILE_ATTRIBUTES && !(image_attrs & FILE_ATTRIBUTE_DIRECTORY) ? L"true" : L"false",
+        (unsigned long)image_error,
+        cwd_attrs != INVALID_FILE_ATTRIBUTES && (cwd_attrs & FILE_ATTRIBUTE_DIRECTORY) ? L"true" : L"false",
+        (unsigned long)cwd_error, module_matches ? L"true" : L"false",
+        nt_available ? L"true" : L"false", (unsigned long)nt_status);
+    if (FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, error, 0, message, (DWORD)_countof(message), NULL))
+        fwprintf(stderr, L"lpac_launch_system_message: %ls\n", message);
+}
+
 static int launch_child(int argc, wchar_t **argv) {
     STARTUPINFOEXW startup;
     PROCESS_INFORMATION process;
@@ -427,6 +460,14 @@ static int launch_child(int argc, wchar_t **argv) {
     size_t env_used = 0;
     ProbeJobExtendedLimitInformation job_limits;
     int status = 20;
+    LastNtStatusFn last_nt_status = NULL;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll) {
+        FARPROC address = GetProcAddress(ntdll, "RtlGetLastNtStatus");
+        /* Both are function pointers under the Windows ABI. Diagnostic-only:
+         * unavailable is explicitly reported; no launch decision uses it. */
+        memcpy(&last_nt_status, &address, sizeof(last_nt_status));
+    }
     if (argc != 8) return 21;
     if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());
     memset(&startup, 0, sizeof(startup)); memset(&process, 0, sizeof(process)); memset(&caps, 0, sizeof(caps));
@@ -471,7 +512,12 @@ static int launch_child(int argc, wchar_t **argv) {
     }
     if (!CreateProcessW(argv[0], command, NULL, NULL, FALSE,
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                        env_block, argv[4], &startup.StartupInfo, &process)) { status = fail(L"CreateProcessW LPAC", GetLastError()); goto done; }
+                        env_block, argv[4], &startup.StartupInfo, &process)) {
+        DWORD launch_error = GetLastError();
+        LONG nt_status = last_nt_status ? last_nt_status() : 0;
+        report_launch_failure(argv[0], argv[4], launch_error, last_nt_status != NULL, nt_status);
+        status = fail(L"CreateProcessW LPAC", launch_error); goto done;
+    }
     if (!AssignProcessToJobObject(job, process.hProcess)) {
         DWORD error = GetLastError();
         TerminateProcess(process.hProcess, 28); WaitForSingleObject(process.hProcess, 5000);
