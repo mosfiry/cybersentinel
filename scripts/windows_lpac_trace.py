@@ -61,7 +61,9 @@ def main(command: list[str]) -> int:
         report["download_sha256"] = hashlib.sha256(data).hexdigest()
         with zipfile.ZipFile(archive) as bundle:
             exe.write_bytes(bundle.read("Procmon64.exe"))
-        signature = bounded(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+        # Use the workflow host: Windows PowerShell inherits pwsh's PSModulePath
+        # and can fail to load its own security module before verification.
+        signature = bounded(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
                              "$s=Get-AuthenticodeSignature -LiteralPath '" + str(exe) + "'; "
                              "@{status=[string]$s.Status;subject=$s.SignerCertificate.Subject;"
                              "version=(Get-Item -LiteralPath '" + str(exe) + "').VersionInfo.FileVersion} | ConvertTo-Json -Compress"])
