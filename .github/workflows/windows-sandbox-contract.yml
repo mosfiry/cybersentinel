@@ -11,6 +11,7 @@ on:
       - "tools/**"
       - "api/**"
       - "scripts/windows_process_job.py"
+      - "scripts/windows_lpac_trace.py"
       - "tests/**"
       - "requirements*.txt"
       - ".github/workflows/windows-sandbox-contract.yml"
@@ -226,6 +227,9 @@ jobs:
           python -m pytest -q tests/test_windows_appcontainer_workspace.py
           tests/test_windows_appcontainer_workspace_native.py
           --junitxml=native-appcontainer-workspace.xml -o junit_family=xunit1
+      - name: Verify original native trace evidence independently of test outcome
+        if: always()
+        run: python scripts/windows_lpac_trace.py --verify
       - name: Reject missing or skipped LPAC coverage and record bounded evidence
         if: always()
         run: |

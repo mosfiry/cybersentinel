@@ -34,7 +34,6 @@ def main(command: list[str]) -> int:
     if sys.platform != "win32" or not command:
         raise SystemExit("native Windows and an explicit test command are required")
     output = Path("lpac-forensics")
-    output.mkdir(exist_ok=False)
     report = {"source_commit": os.environ.get("GITHUB_SHA"),
               "run_id": os.environ.get("GITHUB_RUN_ID"),
               "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
@@ -47,6 +46,7 @@ def main(command: list[str]) -> int:
     capture = None
     test_code = 125
     try:
+        output.mkdir(exist_ok=False)
         # Never terminate or attach to somebody else's ProcMon instance.
         existing = bounded(["tasklist", "/FI", "IMAGENAME eq Procmon64.exe", "/FO", "CSV", "/NH"])
         report["existing_procmon"] = existing
@@ -89,6 +89,14 @@ def main(command: list[str]) -> int:
         report["test_timeout"] = True
         test_code = 124
     finally:
+        try:
+            finalize(output, report, capture, exe, pml, test_code)
+        except Exception as exc:
+            print("Trace finalization failed independently:", type(exc).__name__, flush=True)
+    return test_code
+
+
+def finalize(output, report, capture, exe, pml, test_code):
         if capture is not None:
             report["terminate"] = bounded([str(exe), "/AcceptEula", "/Terminate"], 20)
             try:
@@ -111,13 +119,36 @@ def main(command: list[str]) -> int:
                     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                         digest.update(chunk)
                 report["hashes"][path.name] = digest.hexdigest()
+        csv_path = output / "launch.csv"
+        report["trace_status"] = "CAPTURED" if (
+            "capture_setup_error" not in report
+            and report.get("wait_for_idle", {}).get("exit_code") == 0
+            and report.get("capture_process_exit_before_tests") is None
+            and not report.get("capture_forced_stop")
+            and report.get("export", {}).get("exit_code") == 0
+            and pml.is_file() and pml.stat().st_size > 0
+            and csv_path.is_file() and csv_path.stat().st_size > 100
+        ) else "UNAVAILABLE"
         (output / "capability.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print("LPAC tracing capability:", json.dumps(report), flush=True)
-    return test_code
+
+
+def verify_trace():
+    report = json.loads(Path("lpac-forensics/capability.json").read_text(encoding="utf-8"))
+    if report.get("trace_status") != "CAPTURED":
+        raise SystemExit("native_trace_evidence_unavailable: inspect capability.json; not proof tracing is prohibited")
+    for name in ("launch.pml", "launch.csv"):
+        path = Path("lpac-forensics") / name
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != report["hashes"].get(name):
+            raise SystemExit("native_trace_hash_mismatch")
+    print("Native trace captured and hash-verified; causal interpretation still required")
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
+    if args == ["--verify"]:
+        verify_trace()
+        raise SystemExit(0)
     if args[:1] == ["--"]:
         args = args[1:]
     raise SystemExit(main(args))

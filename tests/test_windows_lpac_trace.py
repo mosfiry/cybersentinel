@@ -43,3 +43,35 @@ def test_trace_does_not_change_security_or_gate_and_verifies_vendor():
     workflow = (ROOT / ".github/workflows/windows-sandbox-contract.yml").read_text()
     assert "python scripts/windows_lpac_trace.py --" in workflow
     assert "lpac-forensics/launch.pml" in workflow
+
+
+def test_existing_capture_directory_does_not_bypass_tests(tmp_path, monkeypatch):
+    module = load()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "lpac-forensics").mkdir()
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=3))
+    assert module.main(["unchanged-test-command"]) == 3
+    import json
+    report = json.loads((tmp_path / "lpac-forensics/capability.json").read_text())
+    assert report["trace_status"] == "UNAVAILABLE"
+
+
+def test_trace_finalization_failure_does_not_replace_test_exit(tmp_path, monkeypatch):
+    module = load()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(module, "bounded", lambda *a, **kw: {"error": "PermissionError"})
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=7))
+    def broken(*args):
+        raise OSError("injected trace write failure")
+    monkeypatch.setattr(module, "finalize", broken)
+    assert module.main(["unchanged-test-command"]) == 7
+
+
+def test_trace_has_independent_required_postcondition():
+    workflow = (ROOT / ".github/workflows/windows-sandbox-contract.yml").read_text()
+    assert '"scripts/windows_lpac_trace.py"' in workflow
+    assert "run: python scripts/windows_lpac_trace.py --verify" in workflow
+    module = load()
+    assert callable(module.verify_trace)
