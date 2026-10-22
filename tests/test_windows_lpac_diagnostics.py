@@ -16,16 +16,35 @@ def test_lpac_launch_failure_captures_error_before_diagnostics_and_stays_failed(
 def test_failure_diagnostics_are_bounded_redacted_and_do_not_claim_child_identity():
     source = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
     diagnostic = source.split("static void report_launch_failure(", 1)[1].split("static int launch_child(", 1)[0]
-    for field in ("image_attributes_error", "cwd_attributes_error", "module_matches_image", "win32_error", "ntstatus_available", "ntstatus_advisory"):
+    for field in (
+        "scope\\\":\\\"broker_only", "image_is_absolute", "image_attributes_error",
+        "parent_can_read_image", "image_open_error", "image_size_bytes",
+        "cwd_is_absolute", "cwd_attributes_error", "module_matches_image",
+        "known_dependency_mask", "known_dependency_expected_mask",
+        "broker_pid", "broker_bitness", "launch_flags", "win32_error",
+        "ntstatus_available", "ntstatus_advisory",
+    ):
         assert field in diagnostic
     assert "FormatMessageW(" in diagnostic
     assert "FORMAT_MESSAGE_IGNORE_INSERTS" in diagnostic
     assert "GetFileAttributesW(image)" in diagnostic
     assert "GetFileAttributesW(cwd)" in diagnostic
+    assert "is_absolute_windows_path(image)" in diagnostic
+    assert "is_absolute_windows_path(cwd)" in diagnostic
+    assert "CreateFileW(image, GENERIC_READ" in diagnostic
+    assert "GetSystemDirectoryW(" in source
     assert "GetModuleFileNameW(" in diagnostic
     assert 'L"%ls' not in diagnostic  # Never format image/cwd/SID/argv or environment values.
     for forbidden in ("CreateProcessW(", "ResumeThread(", "CreateAppContainerProfile(", "SetNamedSecurityInfo", "SetFileSecurity", "token_verified\\\":true"):
         assert forbidden not in diagnostic
+
+
+def test_broker_open_is_explicitly_not_evidence_of_lpac_image_access():
+    source = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
+    diagnostic = source.split("static void report_launch_failure(", 1)[1].split("static int launch_child(", 1)[0]
+    assert "Parent readability is not LPAC access" in source
+    assert "parent_can_read_image" in diagnostic
+    assert "known_system_dependency_mask" in source
 
 
 def test_d2_branch_uses_the_existing_strict_windows_gate():

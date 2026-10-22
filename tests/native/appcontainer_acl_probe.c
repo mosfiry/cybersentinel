@@ -411,31 +411,105 @@ static BOOL append_quoted(wchar_t *dst, size_t cap, size_t *used, const wchar_t 
 
 typedef LONG (WINAPI *LastNtStatusFn)(void);
 
-/* Broker-side observations only. Neither existence nor a last NTSTATUS proves
- * child access or identifies the missing kernel object. Never log paths/SIDs. */
+static BOOL is_absolute_windows_path(const wchar_t *path) {
+    BOOL drive_absolute = path &&
+        (((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
+         path[1] == L':' && (path[2] == L'\\' || path[2] == L'/'));
+    BOOL unc_absolute = path && (path[0] == L'\\' || path[0] == L'/') &&
+        (path[1] == L'\\' || path[1] == L'/') && path[2] &&
+        path[2] != L'\\' && path[2] != L'/';
+    return drive_absolute || unc_absolute;
+}
+
+/* Check only fixed, expected OS DLL names; never emit their containing path. */
+static DWORD known_system_dependency_mask(DWORD *directory_error) {
+    static const wchar_t *names[] = {
+        L"kernel32.dll", L"kernelbase.dll", L"ntdll.dll", L"advapi32.dll"
+    };
+    wchar_t system_dir[MAX_PATH], dependency[MAX_PATH * 2];
+    UINT length;
+    DWORD mask = 0;
+    size_t i;
+    length = GetSystemDirectoryW(system_dir, (UINT)_countof(system_dir));
+    if (!length || length >= _countof(system_dir)) {
+        *directory_error = length ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
+        return 0;
+    }
+    *directory_error = ERROR_SUCCESS;
+    for (i = 0; i < _countof(names); ++i) {
+        DWORD attributes;
+        if (_snwprintf_s(dependency, _countof(dependency), _TRUNCATE,
+                         L"%ls\\%ls", system_dir, names[i]) < 0) continue;
+        attributes = GetFileAttributesW(dependency);
+        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            mask |= (DWORD)1U << i;
+    }
+    return mask;
+}
+
+/* Broker-side observations only. Parent readability is not LPAC access, and
+ * neither file presence nor NTSTATUS identifies the missing internal object.
+ * Never log paths, SIDs, argv, or environment values. */
 static void report_launch_failure(const wchar_t *image, const wchar_t *cwd,
-                                  DWORD error, BOOL nt_available, LONG nt_status) {
+                                  DWORD error, DWORD launch_flags,
+                                  BOOL nt_available, LONG nt_status) {
     DWORD image_attrs, cwd_attrs, image_error, cwd_error, module_length;
+    DWORD image_open_error = ERROR_SUCCESS, image_size_error = ERROR_SUCCESS;
+    DWORD system_directory_error = ERROR_SUCCESS, dependency_mask;
+    BOOL parent_can_read_image = FALSE, image_size_available = FALSE;
+    LONGLONG image_size = 0;
+    HANDLE image_handle;
     wchar_t module[32768], message[512];
     BOOL module_matches = FALSE;
     image_attrs = GetFileAttributesW(image);
     image_error = image_attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
     cwd_attrs = GetFileAttributesW(cwd);
     cwd_error = cwd_attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    image_handle = CreateFileW(image, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (image_handle == INVALID_HANDLE_VALUE) {
+        image_open_error = GetLastError();
+    } else {
+        LARGE_INTEGER size;
+        parent_can_read_image = GetFileType(image_handle) == FILE_TYPE_DISK;
+        if (parent_can_read_image && GetFileSizeEx(image_handle, &size)) {
+            image_size = size.QuadPart;
+            image_size_available = TRUE;
+        } else if (parent_can_read_image) {
+            image_size_error = GetLastError();
+        }
+        CloseHandle(image_handle);
+    }
+    dependency_mask = known_system_dependency_mask(&system_directory_error);
     module_length = GetModuleFileNameW(NULL, module, (DWORD)_countof(module));
     if (module_length && module_length < (DWORD)_countof(module))
         module_matches = _wcsicmp(module, image) == 0;
     fwprintf(stderr,
-        L"lpac_launch_diagnostic: {\"version\":1,\"win32_error\":%lu,"
+        L"lpac_launch_diagnostic: {\"version\":2,\"scope\":\"broker_only\","
+        L"\"win32_error\":%lu,\"image_is_absolute\":%ls,"
         L"\"image_is_file\":%ls,\"image_attributes_error\":%lu,"
+        L"\"parent_can_read_image\":%ls,\"image_open_error\":%lu,"
+        L"\"image_size_available\":%ls,\"image_size_bytes\":%llu,"
+        L"\"image_size_error\":%lu,\"cwd_is_absolute\":%ls,"
         L"\"cwd_is_directory\":%ls,\"cwd_attributes_error\":%lu,"
-        L"\"module_matches_image\":%ls,\"ntstatus_available\":%ls,"
+        L"\"module_matches_image\":%ls,\"known_dependency_mask\":%lu,"
+        L"\"known_dependency_expected_mask\":15,\"system_directory_error\":%lu,"
+        L"\"broker_pid\":%lu,\"broker_bitness\":%u,\"launch_flags\":%lu,"
+        L"\"ntstatus_available\":%ls,"
         L"\"ntstatus_advisory\":\"0x%08lX\"}\n",
         (unsigned long)error,
+        is_absolute_windows_path(image) ? L"true" : L"false",
         image_attrs != INVALID_FILE_ATTRIBUTES && !(image_attrs & FILE_ATTRIBUTE_DIRECTORY) ? L"true" : L"false",
-        (unsigned long)image_error,
+        (unsigned long)image_error, parent_can_read_image ? L"true" : L"false",
+        (unsigned long)image_open_error, image_size_available ? L"true" : L"false",
+        (unsigned long long)image_size, (unsigned long)image_size_error,
+        is_absolute_windows_path(cwd) ? L"true" : L"false",
         cwd_attrs != INVALID_FILE_ATTRIBUTES && (cwd_attrs & FILE_ATTRIBUTE_DIRECTORY) ? L"true" : L"false",
         (unsigned long)cwd_error, module_matches ? L"true" : L"false",
+        (unsigned long)dependency_mask, (unsigned long)system_directory_error,
+        (unsigned long)GetCurrentProcessId(), (unsigned)(sizeof(void *) * 8U),
+        (unsigned long)launch_flags,
         nt_available ? L"true" : L"false", (unsigned long)nt_status);
     if (FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                        NULL, error, 0, message, (DWORD)_countof(message), NULL))
@@ -515,7 +589,9 @@ static int launch_child(int argc, wchar_t **argv) {
                         env_block, argv[4], &startup.StartupInfo, &process)) {
         DWORD launch_error = GetLastError();
         LONG nt_status = last_nt_status ? last_nt_status() : 0;
-        report_launch_failure(argv[0], argv[4], launch_error, last_nt_status != NULL, nt_status);
+        report_launch_failure(argv[0], argv[4], launch_error,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            last_nt_status != NULL, nt_status);
         status = fail(L"CreateProcessW LPAC", launch_error); goto done;
     }
     if (!AssignProcessToJobObject(job, process.hProcess)) {
