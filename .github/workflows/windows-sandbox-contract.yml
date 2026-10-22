@@ -12,6 +12,7 @@ on:
       - "api/**"
       - "scripts/windows_process_job.py"
       - "scripts/windows_lpac_trace.py"
+      - "scripts/windows_lpac_experiments.py"
       - "tests/**"
       - "requirements*.txt"
       - ".github/workflows/windows-sandbox-contract.yml"
@@ -230,6 +231,16 @@ jobs:
       - name: Verify original native trace evidence independently of test outcome
         if: always()
         run: python scripts/windows_lpac_trace.py --verify
+      - name: One-variable suspended LPAC launch controls (not acceptance)
+        if: always()
+        env:
+          LPAC_TRACE_OUTPUT: lpac-experiment-trace
+        run: python scripts/windows_lpac_trace.py -- python scripts/windows_lpac_experiments.py
+      - name: Verify control trace independently
+        if: always()
+        env:
+          LPAC_TRACE_OUTPUT: lpac-experiment-trace
+        run: python scripts/windows_lpac_trace.py --verify
       - name: Reject missing or skipped LPAC coverage and record bounded evidence
         if: always()
         run: |
@@ -285,5 +296,11 @@ jobs:
             lpac-forensics/capability.json
             lpac-forensics/launch.pml
             lpac-forensics/launch.csv
+            lpac-experiment-trace/capability.json
+            lpac-experiment-trace/launch.pml
+            lpac-experiment-trace/launch.csv
+            lpac-experiments/results.json
+            lpac-experiments/*/source.diff
+            lpac-experiments/*/compile.log
           if-no-files-found: error
           retention-days: 30

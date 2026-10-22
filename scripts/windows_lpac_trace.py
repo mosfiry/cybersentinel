@@ -33,7 +33,7 @@ def bounded(argv: list[str], timeout: int = 30) -> dict:
 def main(command: list[str]) -> int:
     if sys.platform != "win32" or not command:
         raise SystemExit("native Windows and an explicit test command are required")
-    output = Path("lpac-forensics")
+    output = Path(os.environ.get("LPAC_TRACE_OUTPUT", "lpac-forensics"))
     report = {"source_commit": os.environ.get("GITHUB_SHA"),
               "run_id": os.environ.get("GITHUB_RUN_ID"),
               "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
@@ -134,11 +134,12 @@ def finalize(output, report, capture, exe, pml, test_code):
 
 
 def verify_trace():
-    report = json.loads(Path("lpac-forensics/capability.json").read_text(encoding="utf-8"))
+    output = Path(os.environ.get("LPAC_TRACE_OUTPUT", "lpac-forensics"))
+    report = json.loads((output / "capability.json").read_text(encoding="utf-8"))
     if report.get("trace_status") != "CAPTURED":
         raise SystemExit("native_trace_evidence_unavailable: inspect capability.json; not proof tracing is prohibited")
     for name in ("launch.pml", "launch.csv"):
-        path = Path("lpac-forensics") / name
+        path = output / name
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != report["hashes"].get(name):
             raise SystemExit("native_trace_hash_mismatch")
     print("Native trace captured and hash-verified; causal interpretation still required")
