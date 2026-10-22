@@ -222,6 +222,7 @@ jobs:
       # Trusted static native probe only; not a product process launcher.
       - name: Native LPAC identity and workspace ACL lifecycle tests
         run: >-
+          python scripts/windows_lpac_trace.py --
           python -m pytest -q tests/test_windows_appcontainer_workspace.py
           tests/test_windows_appcontainer_workspace_native.py
           --junitxml=native-appcontainer-workspace.xml -o junit_family=xunit1
@@ -277,5 +278,8 @@ jobs:
           path: |
             native-appcontainer-workspace.xml
             native-appcontainer-workspace.json
+            lpac-forensics/capability.json
+            lpac-forensics/launch.pml
+            lpac-forensics/launch.csv
           if-no-files-found: error
           retention-days: 30
