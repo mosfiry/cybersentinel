@@ -74,7 +74,7 @@ def native_probe_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     command = (
         f'call "{devcmd}" -no_logo -arch=amd64 -host_arch=amd64 && '
         f'cl /nologo /W4 /WX /MT /DUNICODE /D_UNICODE /TC '
-        f'"{source}" /Fo:"{obj_file}" /Fe:"{exe}" /link advapi32.lib'
+        f'"{source}" /Fo:"{obj_file}" /Fe:"{exe}" /link advapi32.lib userenv.lib'
     )
     compiled = _run_compile_command(command, build_dir)
     if compiled.returncode != 0 or not exe.is_file():
@@ -396,7 +396,7 @@ def _assert_profileless(workspace: Any, phase: str, record_property) -> None:
     assert not (folder_api["lookup_succeeded"] and folder_api["folder_exists"]), f"GetAppContainerFolderPath exists during {phase}: {artifacts}"
 
 
-def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, report: Path) -> dict[str, Any]:
+def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, report: Path, record_property) -> dict[str, Any]:
     argv = [str(probe), "--launch", workspace.sid_string, mode, str(workspace.workspace_path), str(arg1), str(arg2), str(report)]
     process = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -412,7 +412,19 @@ def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, repo
     assert process.returncode == 0, f"LPAC launcher/child failed ({process.returncode}); stdout={stdout[-1000:]}; stderr={stderr[-2000:]}"
     assert report.is_file(), f"LPAC child produced no bounded JSON evidence at {report}"
     evidence = json.loads(report.read_text(encoding="utf-8"))
-    assert evidence["version"] == 1 and evidence["token_verified"] is True
+    assert evidence["version"] == 2 and evidence["token_verified"] is True
+    pre_prefix = "pre_resume_attestation: "
+    post_prefix = "post_exit_job_attestation: "
+    pre = next((json.loads(line[len(pre_prefix):]) for line in stderr.splitlines() if line.startswith(pre_prefix)), None)
+    post = next((json.loads(line[len(post_prefix):]) for line in stderr.splitlines() if line.startswith(post_prefix)), None)
+    assert isinstance(pre, dict) and all(pre.get(field) is True for field in (
+        "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
+        "expected_sid_match", "zero_capabilities", "job_membership_verified",
+    )), "pre-resume token/Job attestation missing or invalid"
+    assert isinstance(post, dict) and post.get("active_processes") == 0 and post.get("total_processes") == 1, \
+        "post-exit Job-empty attestation missing or invalid"
+    record_property("parent_pre_resume_attestation", json.dumps(pre, sort_keys=True))
+    record_property("parent_post_exit_job_attestation", json.dumps(post, sort_keys=True))
     return evidence
 
 
@@ -454,7 +466,7 @@ def test_native_lpac_identity_and_workspace_read_write(native_acl_root: Path, na
         record_property("workspace_acl_appcontainer_masks", ",".join(hex(e["mask"]) for e in app_aces))
 
         report = workspace.workspace_path / "native-evidence.json"
-        evidence = _launch(probe, workspace, "rw", Path("ignored-file"), Path("ignored-dir"), report)
+        evidence = _launch(probe, workspace, "rw", Path("ignored-file"), Path("ignored-dir"), report, record_property)
         _assert_check(evidence, "environment_minimal")
         for check in ("workspace_write", "workspace_read", "nested_directory_create", "nested_file_write"):
             _assert_check(evidence, check)
@@ -505,7 +517,7 @@ def test_native_lpac_denies_outside_write_and_create(native_acl_root: Path, nati
         assert file_labels == [("S-1-16-4096", 1)], f"outside file is not low-labeled: {file_labels}"
         assert not any(e["sid"] == "S-1-15-2-1" for e in (*dir_entries, *file_entries))
         report = workspace.workspace_path / "outside-evidence.json"
-        evidence = _launch(probe, workspace, "outside", victim, outside, report)
+        evidence = _launch(probe, workspace, "outside", victim, outside, report, record_property)
         _assert_check(evidence, "environment_minimal")
         for check in ("outside_existing_file_write", "outside_new_file_create", "outside_directory_create"):
             _assert_check(evidence, check, error=_ERROR_ACCESS_DENIED)
@@ -534,7 +546,7 @@ def test_native_lpac_denies_other_run_workspace(native_acl_root: Path, native_pr
         other_file = second.workspace_path / "cross-run-sentinel.bin"
         _make_file(other_file, b"second run stays intact", f"D:P(A;;FA;;;SY)(A;;FA;;;{_broker_sid()})(A;;0x{_FILE_REPORT:08X};;;{second.sid_string})S:(ML;;NW;;;LW)")
         first_report = first.workspace_path / "isolation-evidence.json"
-        evidence = _launch(probe, first, "isolation", other_file, Path("ignored"), first_report)
+        evidence = _launch(probe, first, "isolation", other_file, Path("ignored"), first_report, record_property)
         _assert_check(evidence, "environment_minimal")
         _assert_check(evidence, "other_workspace_read_denied", error=_ERROR_ACCESS_DENIED)
         _assert_check(evidence, "other_workspace_write_denied", error=_ERROR_ACCESS_DENIED)
@@ -564,7 +576,7 @@ def test_native_lpac_exit_cleanup_revokes_workspace(native_acl_root: Path, nativ
     try:
         probe = _prepare_root_and_probe(root, workspace, native_probe_template)
         report = old_path / "before-close.json"
-        live = _launch(probe, workspace, "rw", Path("ignored"), Path("ignored"), report)
+        live = _launch(probe, workspace, "rw", Path("ignored"), Path("ignored"), report, record_property)
         assert any(item["name"] == "workspace_write" and item["ok"] for item in live["checks"])
         # The native launcher has waited/reaped the child before returning. close()
         # may revoke the DACL and remove files now; it does not revoke open handles.
@@ -590,7 +602,7 @@ def test_native_lpac_exit_cleanup_revokes_workspace(native_acl_root: Path, nativ
             # prove the retained FILE's revoked DACL, not a denied parent walk.
             _apply_sddl(old_path, f"D:P(A;OICI;RC;;;OW)(A;;FA;;;SY)(A;;FA;;;{broker})(A;;0x{_FILE_TRAVERSE:08X};;;{stale_sid})")
             revoked_context = SimpleNamespace(sid_string=stale_sid, workspace_path=evidence_dir)
-            revoked_result = _launch(probe, revoked_context, "revoked", old_path / "probe.txt", Path("ignored"), evidence_dir / "revoked.json")
+            revoked_result = _launch(probe, revoked_context, "revoked", old_path / "probe.txt", Path("ignored"), evidence_dir / "revoked.json", record_property)
             for check in ("other_workspace_read_denied", "other_workspace_write_denied", "revoked_write_dac_denied", "revoked_write_owner_denied"):
                 _assert_check(revoked_result, check, error=_ERROR_ACCESS_DENIED)
             record_property("post_revoke_retained_file_evidence", json.dumps(revoked_result, sort_keys=True))
@@ -605,7 +617,7 @@ def test_native_lpac_exit_cleanup_revokes_workspace(native_acl_root: Path, nativ
         sentinel_payload = b"new broker-only object after revocation"
         _make_file(sentinel, sentinel_payload, f"D:P(A;;FA;;;SY)(A;;FA;;;{broker})S:(ML;;NW;;;LW)")
         stale_report = evidence_dir / "stale-evidence.json"
-        stale_result = _launch(probe, workspace, "stale", sentinel, Path("ignored"), stale_report)
+        stale_result = _launch(probe, workspace, "stale", sentinel, Path("ignored"), stale_report, record_property)
         _assert_check(stale_result, "environment_minimal")
         _assert_check(stale_result, "other_workspace_read_denied", error=_ERROR_ACCESS_DENIED)
         _assert_check(stale_result, "other_workspace_write_denied", error=_ERROR_ACCESS_DENIED)

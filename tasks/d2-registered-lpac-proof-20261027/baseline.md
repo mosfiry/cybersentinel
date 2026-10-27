@@ -16,3 +16,14 @@
 - Official API references consulted: [CreateAppContainerProfile](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createappcontainerprofile), [GetAppContainerFolderPath](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-getappcontainerfolderpath), [DeleteAppContainerProfile](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-deleteappcontainerprofile), and [Launch an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer).
 
 The Windows registered-profile storage boundary has not yet been run or proven at this snapshot.
+
+
+### Additional official registry API reference
+
+[GetAppContainerRegistryLocation](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-getappcontainerregistrylocation) returns a registry-storage `HKEY` for the current profile and takes desired access; the documentation says access for another user requires impersonation. The prototype must not enumerate or write private AppContainer registry mappings as a provisioning interface. The native storage gate will treat registry storage as unresolved unless exercised inside the verified AppContainer context through this documented API.
+
+### Experimental branch status before the first Windows run
+
+- The branch now contains a tests-only registered-profile storage gate and an exact-branch Windows Actions workflow that runs the four original native acceptance cases plus the new registered-storage case. It publishes sanitized JSON only; private JUnit is removed after extracting per-case outcomes and allowlisted parent token/Job attestations.
+- Local focused checks: `80 passed, 12 skipped` on Linux. The skips are Windows-native cases and are not acceptance evidence. MinGW cross-compilation produced a PE32+ x64 executable; MSVC compilation and native Windows runtime remain unverified.
+- The Windows workflow has not yet run for this branch. D2 acceptance remains `BLOCKED` until the exact-SHA Windows run is inspected. Network denial, true simultaneous task execution, crash/host-reboot recovery, and production integration also remain unvalidated; the ownership journal is per-run temporary storage, not reboot-persistent evidence.

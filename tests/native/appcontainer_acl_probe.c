@@ -1,6 +1,7 @@
 #define _WIN32_WINNT 0x0A00
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <userenv.h>
 #include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "userenv.lib")
 
 #ifndef PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
 #define PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES 0x00020009
@@ -94,6 +96,30 @@ static BOOL verify_token(HANDLE token, PSID expected_sid) {
     if (!container_info->TokenAppContainer || !EqualSid(container_info->TokenAppContainer, expected_sid)) goto done;
     needed = 0;
     SetLastError(ERROR_SUCCESS);
+    if (GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &needed) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(TOKEN_MANDATORY_LABEL)) goto done;
+    {
+        BYTE *integrity_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+        TOKEN_MANDATORY_LABEL *integrity;
+        PUCHAR subauthority_count;
+        DWORD integrity_rid;
+        if (!integrity_buffer) goto done;
+        if (!GetTokenInformation(token, TokenIntegrityLevel, integrity_buffer, needed, &needed)) {
+            HeapFree(GetProcessHeap(), 0, integrity_buffer);
+            goto done;
+        }
+        integrity = (TOKEN_MANDATORY_LABEL *)integrity_buffer;
+        if (!integrity->Label.Sid || !IsValidSid(integrity->Label.Sid) ||
+            !(subauthority_count = GetSidSubAuthorityCount(integrity->Label.Sid)) || *subauthority_count == 0) {
+            HeapFree(GetProcessHeap(), 0, integrity_buffer);
+            goto done;
+        }
+        integrity_rid = *GetSidSubAuthority(integrity->Label.Sid, (DWORD)(*subauthority_count - 1));
+        HeapFree(GetProcessHeap(), 0, integrity_buffer);
+        if (integrity_rid != SECURITY_MANDATORY_LOW_RID) goto done;
+    }
+    needed = 0;
+    SetLastError(ERROR_SUCCESS);
     if (GetTokenInformation(token, TokenCapabilities, NULL, 0, &needed)) goto done;
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(DWORD)) goto done;
     {
@@ -119,8 +145,12 @@ static BOOL write_report(const wchar_t *path, const wchar_t *mode, BOOL token_ok
     DWORD used, i, written;
     int n;
     n = _snwprintf_s(json, MAX_REPORT, _TRUNCATE,
-        L"{\"version\":1,\"mode\":\"%ls\",\"token_verified\":%ls,\"checks\":[",
-        mode, token_ok ? L"true" : L"false");
+        L"{\"version\":2,\"mode\":\"%ls\",\"token_verified\":%ls,"
+        L"\"is_appcontainer\":%ls,\"is_lpac\":%ls,\"low_integrity\":%ls,"
+        L"\"expected_sid_match\":%ls,\"zero_capabilities\":%ls,\"checks\":[",
+        mode, token_ok ? L"true" : L"false", token_ok ? L"true" : L"false",
+        token_ok ? L"true" : L"false", token_ok ? L"true" : L"false",
+        token_ok ? L"true" : L"false", token_ok ? L"true" : L"false");
     if (n < 0) return FALSE;
     used = (DWORD)n;
     for (i = 0; i < count; ++i) {
@@ -195,6 +225,21 @@ done:
     return result;
 }
 
+static ProbeResult verify_temp_api_path(const wchar_t *workspace) {
+    ProbeResult result = { L"temp_api_points_to_workspace", FALSE, ERROR_SUCCESS };
+    wchar_t temp_path[MAX_PATH * 4];
+    DWORD length = GetTempPathW((DWORD)_countof(temp_path), temp_path);
+    if (!length || length >= _countof(temp_path)) {
+        result.error = length ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
+        return result;
+    }
+    while (length && (temp_path[length - 1] == L'\\' || temp_path[length - 1] == L'/'))
+        temp_path[--length] = L'\0';
+    result.ok = _wcsicmp(temp_path, workspace) == 0;
+    if (!result.ok) result.error = ERROR_INVALID_DATA;
+    return result;
+}
+
 static ProbeResult attempt_write(const wchar_t *name, const wchar_t *path, const char *payload, DWORD disposition) {
     ProbeResult result = { name, FALSE, ERROR_SUCCESS };
     HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, disposition,
@@ -255,13 +300,14 @@ static ProbeResult require_read_denied(const wchar_t *name, const wchar_t *path)
     return result;
 }
 
-static ProbeResult require_denied(const wchar_t *name, const wchar_t *path, BOOL directory) {
+static ProbeResult require_denied(const wchar_t *name, const wchar_t *path, BOOL directory, BOOL existing_file) {
     ProbeResult result = { name, FALSE, ERROR_SUCCESS };
     if (directory) {
         if (CreateDirectoryW(path, NULL)) { result.error = ERROR_SUCCESS; return result; }
         result.error = GetLastError();
     } else {
-        HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+        HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                                  existing_file ? OPEN_EXISTING : CREATE_NEW,
                                   FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE) { CloseHandle(file); result.error = ERROR_SUCCESS; return result; }
         result.error = GetLastError();
@@ -332,10 +378,66 @@ static ProbeResult require_security_open_denied(const wchar_t *name, const wchar
     return result;
 }
 
+static DWORD append_registered_registry_checks(ProbeResult *results, DWORD count) {
+    static const wchar_t value_name[] = L"CyberSentinelRegisteredLPACProbe";
+    static const BYTE payload[] = { 0x43, 0x53, 0x4C, 0x50, 0x41, 0x43, 0x01 };
+    ProbeResult api = { L"registered_registry_api_available", FALSE, ERROR_SUCCESS };
+    ProbeResult absent = { L"registered_registry_value_absent_before", FALSE, ERROR_SUCCESS };
+    ProbeResult value_set = { L"registered_registry_value_set", FALSE, ERROR_SUCCESS };
+    ProbeResult verified = { L"registered_registry_write_verified", FALSE, ERROR_SUCCESS };
+    HKEY root = NULL;
+    HRESULT hr;
+    LONG status;
+    DWORD old_size = 0, old_type = 0;
+    hr = GetAppContainerRegistryLocation(KEY_READ | KEY_WRITE, &root);
+    if (SUCCEEDED(hr) && root) {
+        api.ok = TRUE;
+    } else {
+        api.error = FAILED(hr) ? (DWORD)HRESULT_CODE(hr) : ERROR_INVALID_HANDLE;
+    }
+    if (api.ok) {
+        status = RegQueryValueExW(root, value_name, NULL, &old_type, NULL, &old_size);
+        if (status == ERROR_FILE_NOT_FOUND) {
+            absent.ok = TRUE;
+        } else if (status == ERROR_SUCCESS) {
+            absent.error = ERROR_ALREADY_EXISTS;
+        } else {
+            absent.error = (DWORD)status;
+        }
+    } else {
+        absent.error = api.error;
+    }
+    if (api.ok && absent.ok) {
+        status = RegSetValueExW(root, value_name, 0, REG_BINARY, payload, (DWORD)sizeof(payload));
+        if (status != ERROR_SUCCESS) {
+            value_set.error = verified.error = (DWORD)status;
+        } else {
+            value_set.ok = TRUE;
+            BYTE observed[sizeof(payload)];
+            DWORD observed_size = (DWORD)sizeof(observed), observed_type = 0;
+            status = RegQueryValueExW(root, value_name, NULL, &observed_type, observed, &observed_size);
+            if (status == ERROR_SUCCESS && observed_type == REG_BINARY &&
+                observed_size == (DWORD)sizeof(payload) && memcmp(observed, payload, sizeof(payload)) == 0) {
+                verified.ok = TRUE;
+            } else {
+                verified.error = status == ERROR_SUCCESS ? ERROR_INVALID_DATA : (DWORD)status;
+            }
+        }
+    } else {
+        value_set.error = verified.error = api.ok ? absent.error : api.error;
+    }
+    if (root) RegCloseKey(root);
+    results[count++] = api;
+    results[count++] = absent;
+    results[count++] = value_set;
+    results[count++] = verified;
+    return count;
+}
+
 static int child_main(int argc, wchar_t **argv) {
     PSID sid = NULL;
     HANDLE token = NULL;
-    ProbeResult results[8];
+    ProbeResult results[12];
     DWORD count = 0;
     BOOL token_ok = FALSE;
     const wchar_t *mode, *workspace, *arg1, *arg2, *report;
@@ -347,6 +449,7 @@ static int child_main(int argc, wchar_t **argv) {
     CloseHandle(token);
     if (!token_ok) { LocalFree(sid); return fail(L"child LPAC token verification", ERROR_INVALID_TOKEN); }
     results[count++] = verify_minimal_environment(workspace);
+    results[count++] = verify_temp_api_path(workspace);
     if (wcscmp(mode, L"rw") == 0) {
         wchar_t file[MAX_PATH * 4], nested[MAX_PATH * 4], nested_file[MAX_PATH * 4];
         if (swprintf_s(file, _countof(file), L"%ls\\probe.txt", workspace) < 0 ||
@@ -358,16 +461,35 @@ static int child_main(int argc, wchar_t **argv) {
         results[count++] = attempt_write(L"nested_file_write", nested_file, "nested-proof", CREATE_ALWAYS);
         results[count++] = require_dacl_tamper_denied(L"workspace_file_dacl_tamper_denied", file);
         results[count++] = require_owner_change_denied(L"workspace_file_owner_change_denied", file);
-    } else if (wcscmp(mode, L"outside") == 0) {
+    } else if (wcscmp(mode, L"outside") == 0 || wcscmp(mode, L"registered-storage") == 0) {
         wchar_t created[MAX_PATH * 4], subdir[MAX_PATH * 4];
         if (swprintf_s(created, _countof(created), L"%ls\\new.bin", arg2) < 0 ||
             swprintf_s(subdir, _countof(subdir), L"%ls\\newdir", arg2) < 0) { LocalFree(sid); return 23; }
-        results[count++] = require_denied(L"outside_existing_file_write", arg1, FALSE);
-        results[count++] = require_denied(L"outside_new_file_create", created, FALSE);
-        results[count++] = require_denied(L"outside_directory_create", subdir, TRUE);
+        results[count++] = require_denied(L"outside_existing_file_write", arg1, FALSE, TRUE);
+        results[count++] = require_denied(L"outside_new_file_create", created, FALSE, FALSE);
+        results[count++] = require_denied(L"outside_directory_create", subdir, TRUE, FALSE);
+        if (wcscmp(mode, L"registered-storage") == 0) {
+            wchar_t temp_file[MAX_PATH * 4];
+            ProbeResult temp_write = { L"temp_api_write_inside_workspace", FALSE, ERROR_SUCCESS };
+            ProbeResult temp_read = { L"temp_api_read_inside_workspace", FALSE, ERROR_SUCCESS };
+            ProbeResult temp_path_check = verify_temp_api_path(workspace);
+            if (!temp_path_check.ok) {
+                temp_write.error = temp_read.error = temp_path_check.error ? temp_path_check.error : ERROR_INVALID_DATA;
+            } else if (swprintf_s(temp_file, _countof(temp_file), L"%ls\\CyberSentinel-temp-probe.bin", workspace) < 0) {
+                temp_write.error = temp_read.error = ERROR_INSUFFICIENT_BUFFER;
+            } else {
+                temp_write = attempt_write(L"temp_api_write_inside_workspace", temp_file,
+                                           "registered-lpac-temp-proof", CREATE_NEW);
+                temp_read = attempt_read(L"temp_api_read_inside_workspace", temp_file,
+                                         "registered-lpac-temp-proof");
+            }
+            results[count++] = temp_write;
+            results[count++] = temp_read;
+            count = append_registered_registry_checks(results, count);
+        }
     } else if (wcscmp(mode, L"isolation") == 0 || wcscmp(mode, L"stale") == 0 || wcscmp(mode, L"revoked") == 0) {
         results[count++] = require_read_denied(L"other_workspace_read_denied", arg1);
-        results[count++] = require_denied(L"other_workspace_write_denied", arg1, FALSE);
+        results[count++] = require_denied(L"other_workspace_write_denied", arg1, FALSE, TRUE);
         if (wcscmp(mode, L"revoked") == 0) {
             results[count++] = require_security_open_denied(L"revoked_write_dac_denied", arg1, WRITE_DAC);
             results[count++] = require_security_open_denied(L"revoked_write_owner_denied", arg1, WRITE_OWNER);
@@ -529,6 +651,8 @@ static int launch_child(int argc, wchar_t **argv) {
     size_t used = 0;
     DWORD wait_status, child_exit = 0;
     BOOL initialized = FALSE;
+    BOOL in_job = FALSE;
+    BOOL job_query_ok = FALSE;
     HANDLE job = NULL;
     wchar_t windows_dir[MAX_PATH], path_env[MAX_PATH * 2], env_block[MAX_PATH * 6];
     size_t env_used = 0;
@@ -599,6 +723,12 @@ static int launch_child(int argc, wchar_t **argv) {
         TerminateProcess(process.hProcess, 28); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"assign LPAC child to kill-on-close job", error); goto done;
     }
+    job_query_ok = IsProcessInJob(process.hProcess, job, &in_job);
+    if (!job_query_ok || !in_job) {
+        DWORD error = job_query_ok ? ERROR_INVALID_DATA : GetLastError();
+        TerminateProcess(process.hProcess, 28); WaitForSingleObject(process.hProcess, 5000);
+        status = fail(L"verify suspended LPAC child job membership", error); goto done;
+    }
     if (!OpenProcessToken(process.hProcess, TOKEN_QUERY, &process_token) || !verify_token(process_token, sid)) {
         DWORD error = GetLastError();
         if (process_token) { CloseHandle(process_token); process_token = NULL; }
@@ -606,6 +736,11 @@ static int launch_child(int argc, wchar_t **argv) {
         status = fail(L"suspended LPAC child token verification", error ? error : ERROR_INVALID_TOKEN); goto done;
     }
     CloseHandle(process_token); process_token = NULL;
+    fwprintf(stderr,
+        L"pre_resume_attestation: {\"version\":1,\"token_verified\":true,"
+        L"\"is_appcontainer\":true,\"is_lpac\":true,\"low_integrity\":true,"
+        L"\"expected_sid_match\":true,\"zero_capabilities\":true,"
+        L"\"job_membership_verified\":true}\n");
     if (ResumeThread(process.hThread) == (DWORD)-1) { status = fail(L"resume LPAC child", GetLastError()); TerminateProcess(process.hProcess, 26); WaitForSingleObject(process.hProcess, 5000); goto done; }
     wait_status = WaitForSingleObject(process.hProcess, CHILD_TIMEOUT_MS);
     if (wait_status != WAIT_OBJECT_0) {
@@ -614,6 +749,20 @@ static int launch_child(int argc, wchar_t **argv) {
         status = fail(L"bounded LPAC child wait", error); goto done;
     }
     if (!GetExitCodeProcess(process.hProcess, &child_exit)) { status = fail(L"read child exit code", GetLastError()); goto done; }
+    {
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+        if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                       &accounting, (DWORD)sizeof(accounting), NULL)) {
+            status = fail(L"query completed LPAC job accounting", GetLastError()); goto done;
+        }
+        fwprintf(stderr,
+            L"post_exit_job_attestation: {\"version\":1,\"active_processes\":%llu,\"total_processes\":%llu}\n",
+            (unsigned long long)accounting.ActiveProcesses,
+            (unsigned long long)accounting.TotalProcesses);
+        if (accounting.ActiveProcesses != 0 || accounting.TotalProcesses != 1) {
+            status = fail(L"LPAC job did not become empty", ERROR_INVALID_DATA); goto done;
+        }
+    }
     status = child_exit == 0 ? 0 : (int)child_exit;
     CloseHandle(process.hThread); CloseHandle(process.hProcess); process.hThread = NULL; process.hProcess = NULL;
 done:

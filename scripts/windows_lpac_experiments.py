@@ -70,7 +70,7 @@ def main():
             exe = build / "appcontainer_acl_probe.exe"
             command = (f'call "{devcmd}" -no_logo -arch=amd64 -host_arch=amd64 && '
                        f'cl /nologo /W4 /WX /MT /DUNICODE /D_UNICODE /TC "{c}" '
-                       f'/Fo:"{build / "probe.obj"}" /Fe:"{exe}" /link advapi32.lib')
+                       f'/Fo:"{build / "probe.obj"}" /Fe:"{exe}" /link advapi32.lib userenv.lib')
             compiled = helpers._run_compile_command(command, build)
             (build / "compile.log").write_text(compiled.stdout, encoding="utf-8")
             if compiled.returncode:

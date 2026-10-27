@@ -1,0 +1,235 @@
+"""Run the experimental registered-LPAC storage gate without publishing raw logs."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+NATIVE_CASE = "test_native_lpac_registered_profile_storage_boundary"
+LEGACY_NATIVE_CASES = [
+    "test_native_lpac_identity_and_workspace_read_write",
+    "test_native_lpac_denies_outside_write_and_create",
+    "test_native_lpac_denies_other_run_workspace",
+    "test_native_lpac_exit_cleanup_revokes_workspace",
+]
+EXPECTED_NATIVE_CASES = [*LEGACY_NATIVE_CASES, NATIVE_CASE]
+
+
+def _junit_counts(path: Path) -> dict[str, object]:
+    try:
+        cases = list(ET.parse(path).iter("testcase"))
+    except (OSError, ET.ParseError):
+        return {"test_count": 0, "failed_count": 0, "error_count": 0, "skipped_count": 0,
+                "native_case_names": [], "native_nonpassing_count": 0,
+                "native_case_results": [], "legacy_parent_attestations": []}
+    native = [case for case in cases if (case.get("name") or "").split("[", 1)[0] in EXPECTED_NATIVE_CASES]
+    failed = sum(case.find("failure") is not None for case in cases)
+    errors = sum(case.find("error") is not None for case in cases)
+    skipped = sum(case.find("skipped") is not None for case in cases)
+    native_nonpassing = sum(any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in native)
+    case_results = []
+    legacy_attestations = []
+    for case in native:
+        name = (case.get("name") or "").split("[", 1)[0]
+        if case.find("failure") is not None:
+            outcome = "FAIL"
+        elif case.find("error") is not None:
+            outcome = "ERROR"
+        elif case.find("skipped") is not None:
+            outcome = "SKIP"
+        else:
+            outcome = "PASS"
+        case_results.append({"name": name, "outcome": outcome})
+        if name not in LEGACY_NATIVE_CASES:
+            continue
+        attestation_sets = {"pre_resume": [], "post_exit_job": []}
+        properties = case.find("properties")
+        if properties is not None:
+            for prop in properties.findall("property"):
+                property_name = prop.get("name")
+                if property_name not in {"parent_pre_resume_attestation", "parent_post_exit_job_attestation"}:
+                    continue
+                try:
+                    value = json.loads(prop.get("value", ""))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                if property_name == "parent_pre_resume_attestation":
+                    required = ("token_verified", "is_appcontainer", "is_lpac", "low_integrity",
+                                "expected_sid_match", "zero_capabilities", "job_membership_verified")
+                    if type(value.get("version")) is int and value.get("version") == 1 and all(value.get(field) is True for field in required):
+                        attestation_sets["pre_resume"].append({"version": 1, **{field: True for field in required}})
+                elif (type(value.get("version")) is int and value.get("version") == 1
+                      and type(value.get("active_processes")) is int and value.get("active_processes") == 0
+                      and type(value.get("total_processes")) is int and value.get("total_processes") == 1):
+                    attestation_sets["post_exit_job"].append({
+                        "version": 1, "active_processes": 0, "total_processes": 1,
+                    })
+        legacy_attestations.append({"name": name, **attestation_sets})
+    return {
+        "test_count": len(cases),
+        "failed_count": failed,
+        "error_count": errors,
+        "skipped_count": skipped,
+        "native_case_names": [(case.get("name") or "").split("[", 1)[0] for case in native],
+        "native_nonpassing_count": native_nonpassing,
+        "native_case_results": case_results,
+        "legacy_parent_attestations": legacy_attestations,
+    }
+
+
+def main() -> int:
+    output_dir = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    evidence_path = output_dir / "registered-lpac-storage-gate.json"
+    validation_path = output_dir / "registered-lpac-validation.json"
+    junit_path = output_dir / "registered-lpac-private-junit.xml"
+    for path in (evidence_path, validation_path, junit_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    source_commit = os.environ.get("GITHUB_SHA", "local-unpinned")
+    evidence_path.write_text(json.dumps({
+        "schema": "registered-lpac-storage-gate-v1",
+        "source_commit": source_commit,
+        "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "gate_status": "INCONCLUSIVE",
+        "result_code": "native_gate_did_not_write_evidence",
+        "mission_started": False,
+        "network_gate": "NOT_RUN",
+        "profile_ids": [],
+        "profile_cleanup_confirmed_count": 0,
+        "profile_quarantined_count": 0,
+        "vhd_cleanup_confirmed": False,
+        "process_tree_state": "no_child_resumed",
+    }, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    command = [
+        sys.executable, "-m", "pytest", "-q",
+        "tests/test_windows_appcontainer_workspace_native.py",
+        "tests/test_registered_lpac_prototype.py",
+        "tests/test_windows_registered_lpac_prototype.py",
+        f"--junitxml={junit_path}", "-o", "junit_family=xunit1",
+    ]
+    runner_exception = None
+    try:
+        result = subprocess.run(
+            command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            shell=False, timeout=900, check=False,
+        )
+        exit_code = result.returncode
+    except subprocess.TimeoutExpired:
+        exit_code = 124
+        runner_exception = "pytest_timeout"
+    except OSError as exc:
+        exit_code = 125
+        runner_exception = type(exc).__name__
+
+    counts = _junit_counts(junit_path)
+    try:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        if not isinstance(evidence, dict):
+            evidence = None
+    except (OSError, json.JSONDecodeError):
+        evidence = None
+    native_names = counts["native_case_names"]
+    expected_native = EXPECTED_NATIVE_CASES
+    exact_coverage = native_names == expected_native and counts["native_nonpassing_count"] == 0
+    no_test_failures = counts["failed_count"] == 0 and counts["error_count"] == 0 and counts["skipped_count"] == 0
+    legacy_attestations = counts["legacy_parent_attestations"]
+    legacy_attestation_coverage = (
+        [item["name"] for item in legacy_attestations] == LEGACY_NATIVE_CASES
+        and all(item["pre_resume"] and item["post_exit_job"] for item in legacy_attestations)
+    )
+    profile_ids = evidence.get("profile_ids") if isinstance(evidence, dict) else None
+    cleanup_proven = (
+        isinstance(evidence, dict)
+        and isinstance(profile_ids, list)
+        and len(profile_ids) == 3
+        and evidence.get("profile_cleanup_confirmed_count") == len(profile_ids)
+        and evidence.get("profile_quarantined_count") == 0
+        and evidence.get("vhd_cleanup_confirmed") is True
+        and evidence.get("process_tree_state") == "job_active_processes_zero_child_exit_observed"
+        and evidence.get("child_exit_code") == 0
+        and evidence.get("mission_started") is False
+        and evidence.get("profile_folder_outside_vhd") is True
+        and evidence.get("get_temp_path_points_to_workspace") is True
+        and evidence.get("simultaneous_profiles_had_distinct_sids") is True
+        and evidence.get("retired_sid_not_reused") is True
+    )
+    evidence_pass = isinstance(evidence, dict) and evidence.get("gate_status") == "PASS" and cleanup_proven
+    exact_sha = isinstance(evidence, dict) and evidence.get("source_commit") == source_commit
+    valid = (exit_code == 0 and exact_coverage and no_test_failures and legacy_attestation_coverage
+             and evidence_pass and exact_sha)
+    evidence_gate_status = evidence.get("gate_status") if isinstance(evidence, dict) else None
+    final_gate_status = "PASS" if valid else ("FAIL" if evidence_gate_status == "FAIL" else "INCONCLUSIVE")
+    validation = {
+        "schema": "registered-lpac-validation-v1",
+        "source_commit": source_commit,
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "runner_image": os.environ.get("ImageOS"),
+        "runner_image_version": os.environ.get("ImageVersion"),
+        "pytest_exit_code": exit_code,
+        "runner_exception": runner_exception,
+        "gate_status": final_gate_status,
+        "validation_status": "PASS" if valid else ("FAIL" if final_gate_status == "FAIL" else "INCONCLUSIVE"),
+        "native_case_count": len(native_names),
+        "native_case_names": native_names,
+        "native_nonpassing_count": counts["native_nonpassing_count"],
+        "native_case_results": counts["native_case_results"],
+        "legacy_parent_attestations": legacy_attestations,
+        "legacy_parent_attestation_coverage": legacy_attestation_coverage,
+        "total_test_count": counts["test_count"],
+        "failed_count": counts["failed_count"],
+        "error_count": counts["error_count"],
+        "skipped_count": counts["skipped_count"],
+        "exact_sha_evidence": exact_sha,
+        "cleanup_and_process_evidence_proven": cleanup_proven,
+        "mission_acceptance": "BLOCKED",
+        "backend_enabled_by_slice": False,
+        "not_validated": [
+            "network_denial", "host_file_and_registry_confinement_beyond_profile_store",
+            "combined_vhd_job_lpac_mission", "aggregate_resource_bounds",
+            "crash_and_host_reboot_recovery", "production_broker",
+        ],
+    }
+    if isinstance(evidence, dict):
+        validation["result_code"] = evidence.get("result_code")
+        if not cleanup_proven and evidence.get("gate_status") == "PASS":
+            validation["result_code"] = "cleanup_or_process_attestation_unconfirmed"
+        validation["windows_version"] = evidence.get("windows_version")
+        validation["windows_build"] = evidence.get("windows_build")
+        validation["profile_cleanup_confirmed_count"] = evidence.get("profile_cleanup_confirmed_count")
+        validation["profile_quarantined_count"] = evidence.get("profile_quarantined_count")
+        validation["vhd_cleanup_confirmed"] = evidence.get("vhd_cleanup_confirmed")
+        validation["process_tree_state"] = evidence.get("process_tree_state")
+    validation_path.write_text(json.dumps(validation, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    try:
+        junit_path.unlink()
+    except FileNotFoundError:
+        pass
+    print(json.dumps({
+        "schema": validation["schema"],
+        "validation_status": validation["validation_status"],
+        "gate_status": validation["gate_status"],
+        "result_code": validation.get("result_code"),
+        "native_case_count": validation["native_case_count"],
+        "skipped_count": validation["skipped_count"],
+        "mission_acceptance": validation["mission_acceptance"],
+    }, sort_keys=True))
+    return 0 if valid else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

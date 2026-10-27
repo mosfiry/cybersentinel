@@ -1,0 +1,53 @@
+name: windows-registered-lpac-storage
+
+on:
+  push:
+    branches: [experiment/d2-registered-lpac-proof-20261027]
+    paths:
+      - "tests/native/appcontainer_acl_probe.c"
+      - "tests/registered_lpac_prototype.py"
+      - "tests/test_registered_lpac_prototype.py"
+      - "tests/test_windows_appcontainer_workspace_native.py"
+      - "tests/test_windows_registered_lpac_prototype.py"
+      - "tests/test_windows_registered_lpac_workflow.py"
+      - "workspace/windows_appcontainer_workspace.py"
+      - "workspace/windows_vhd_workspace.py"
+      - "scripts/run_windows_registered_lpac_gate.py"
+      - ".github/workflows/windows-registered-lpac-storage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-registered-lpac-storage-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  registered-profile-storage-gate:
+    if: github.repository == 'mosfiry/cybersentinel' && github.ref == 'refs/heads/experiment/d2-registered-lpac-proof-20261027'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install isolated native test dependency
+        run: python -m pip install --disable-pip-version-check "pytest>=8,<9"
+      # The wrapper captures pytest's raw output and publishes only sanitized JSON.
+      - name: Run registered-LPAC storage boundary gate
+        run: python scripts/run_windows_registered_lpac_gate.py
+      - name: Upload exact-SHA sanitized storage evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-registered-LPAC-storage-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/registered-lpac-storage-gate.json
+            ${{ runner.temp }}/registered-lpac-validation.json
+          if-no-files-found: error
+          retention-days: 30
