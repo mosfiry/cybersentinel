@@ -30,6 +30,19 @@ LEGACY_NATIVE_CASES = [
     "test_native_lpac_exit_cleanup_revokes_workspace",
 ]
 EXPECTED_NATIVE_CASES = [*LEGACY_NATIVE_CASES, NATIVE_CASE]
+TOKEN_FAILURE_STAGES = frozenset({
+    "not_run", "invalid_token_or_expected_sid", "OpenProcessToken",
+    "TokenIsAppContainer_query", "TokenIsAppContainer_return_length", "TokenIsAppContainer_false",
+    "TokenIsLessPrivilegedAppContainer_query", "TokenIsLessPrivilegedAppContainer_return_length",
+    "TokenIsLessPrivilegedAppContainer_false", "TokenAppContainerSid_size_query", "TokenAppContainerSid_size",
+    "TokenAppContainerSid_allocate", "TokenAppContainerSid_query", "TokenAppContainerSid_return_length",
+    "expected_sid_mismatch", "TokenIntegrityLevel_size_query", "TokenIntegrityLevel_size",
+    "TokenIntegrityLevel_allocate", "TokenIntegrityLevel_query", "TokenIntegrityLevel_return_length",
+    "TokenIntegrityLevel_sid_invalid", "TokenIntegrityLevel_authority_invalid", "integrity_not_low",
+    "TokenCapabilities_size_query",
+    "TokenCapabilities_size", "TokenCapabilities_allocate", "TokenCapabilities_query",
+    "TokenCapabilities_return_length", "capabilities_nonzero", "complete",
+})
 LEGACY_LAUNCH_FAILURE_STEPS = {
     "parse child SID", "open child token", "child LPAC token verification", "write bounded evidence report",
     "parse launcher SID", "allocate process attribute list", "set LPAC process attributes",
@@ -53,12 +66,23 @@ LAUNCH_DIAGNOSTIC_INT_FIELDS = (
 ENVIRONMENT_CONTROL_BOOL_FIELDS = (
     "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
     "attempted", "create_succeeded", "create_ntstatus_available",
-    "job_membership_verified", "token_verified", "terminated", "job_empty", "cleanup_confirmed",
+    "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
+    "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
+    "token_is_lpac_query_succeeded", "terminated", "job_empty", "cleanup_confirmed",
 )
 ENVIRONMENT_CONTROL_INT_FIELDS = (
     "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
-    "token_verification_error",
+    "token_verification_error", "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
+    "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
     "job_active_processes", "job_total_processes", "cleanup_error",
+)
+TOKEN_DIAGNOSTIC_BOOL_FIELDS = (
+    "token_verified", "is_appcontainer", "is_lpac", "low_integrity", "expected_sid_match",
+    "zero_capabilities", "token_is_appcontainer_query_succeeded", "token_is_lpac_query_succeeded",
+)
+TOKEN_DIAGNOSTIC_INT_FIELDS = (
+    "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
+    "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
 )
 
 
@@ -87,24 +111,49 @@ def _sanitize_environment_control(value: object) -> dict[str, object] | None:
     for field in ENVIRONMENT_CONTROL_INT_FIELDS:
         if type(value.get(field)) is int:
             control[field] = value[field]
+    token_failure_stage = value.get("token_failure_stage")
+    if isinstance(token_failure_stage, str) and token_failure_stage in TOKEN_FAILURE_STAGES:
+        control["token_failure_stage"] = token_failure_stage
     ntstatus = value.get("create_ntstatus_advisory")
     if isinstance(ntstatus, str) and len(ntstatus) == 10 and ntstatus.startswith("0x") and all(char in "0123456789abcdefABCDEF" for char in ntstatus[2:]):
         control["create_ntstatus_advisory"] = ntstatus
     required_true = (
         "diagnostic_only", "lp_environment_null", "parent_environment_filtered", "attempted",
-        "create_succeeded", "job_membership_verified", "token_verified", "terminated",
-        "job_empty", "cleanup_confirmed",
+        "create_succeeded", "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac",
+        "low_integrity", "expected_sid_match", "zero_capabilities",
+        "token_is_appcontainer_query_succeeded", "token_is_lpac_query_succeeded",
+        "terminated", "job_empty", "cleanup_confirmed",
     )
     required_zero = (
         "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
-        "token_verification_error", "cleanup_error", "job_active_processes",
+        "token_verification_error", "token_is_appcontainer_api_error", "token_is_lpac_api_error",
+        "token_api_error", "cleanup_error", "job_active_processes",
     )
     control["comparison_complete"] = (
         all(control.get(field) is True for field in required_true)
         and all(control.get(field) == 0 for field in required_zero)
+        and control.get("token_failure_stage") == "complete"
+        and control.get("token_is_appcontainer_return_length") == 4
+        and control.get("token_is_lpac_return_length") == 4
         and control.get("job_total_processes") == 1
     )
     return control
+
+
+def _sanitize_token_diagnostic(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value.get("version") != 1 or value.get("scope") != "broker_only":
+        return None
+    diagnostic: dict[str, object] = {"version": 1, "scope": "broker_only"}
+    for field in TOKEN_DIAGNOSTIC_BOOL_FIELDS:
+        if type(value.get(field)) is bool:
+            diagnostic[field] = value[field]
+    for field in TOKEN_DIAGNOSTIC_INT_FIELDS:
+        if type(value.get(field)) is int:
+            diagnostic[field] = value[field]
+    token_failure_stage = value.get("token_failure_stage")
+    if isinstance(token_failure_stage, str) and token_failure_stage in TOKEN_FAILURE_STAGES:
+        diagnostic["token_failure_stage"] = token_failure_stage
+    return diagnostic if len(diagnostic) > 2 else None
 
 
 def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
@@ -133,6 +182,9 @@ def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
     control = _sanitize_environment_control(value.get("environment_control"))
     if control is not None:
         safe["environment_control"] = control
+    token_diagnostic = _sanitize_token_diagnostic(value.get("token_diagnostic"))
+    if token_diagnostic is not None:
+        safe["token_diagnostic"] = token_diagnostic
     return safe or None
 
 

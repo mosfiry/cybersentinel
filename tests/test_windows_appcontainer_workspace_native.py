@@ -447,7 +447,7 @@ def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, repo
     assert process.returncode == 0, f"LPAC launcher/child failed ({process.returncode}); stdout={stdout[-1000:]}; stderr={stderr[-2000:]}"
     assert report.is_file(), f"LPAC child produced no bounded JSON evidence at {report}"
     evidence = json.loads(report.read_text(encoding="utf-8"))
-    assert evidence["version"] == 2 and evidence["token_verified"] is True
+    assert evidence["version"] == 3 and evidence["token_verified"] is True
     pre_prefix = "pre_resume_attestation: "
     post_prefix = "post_exit_job_attestation: "
     pre = next((json.loads(line[len(pre_prefix):]) for line in stderr.splitlines() if line.startswith(pre_prefix)), None)
@@ -486,12 +486,36 @@ _LAUNCH_DIAGNOSTIC_INT_FIELDS = (
 _ENVIRONMENT_CONTROL_BOOL_FIELDS = (
     "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
     "attempted", "create_succeeded", "create_ntstatus_available",
-    "job_membership_verified", "token_verified", "terminated", "job_empty", "cleanup_confirmed",
+    "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
+    "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
+    "token_is_lpac_query_succeeded", "terminated", "job_empty", "cleanup_confirmed",
 )
 _ENVIRONMENT_CONTROL_INT_FIELDS = (
     "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
-    "token_verification_error",
+    "token_verification_error", "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
+    "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
     "job_active_processes", "job_total_processes", "cleanup_error",
+)
+_TOKEN_FAILURE_STAGES = frozenset({
+    "not_run", "invalid_token_or_expected_sid", "OpenProcessToken",
+    "TokenIsAppContainer_query", "TokenIsAppContainer_return_length", "TokenIsAppContainer_false",
+    "TokenIsLessPrivilegedAppContainer_query", "TokenIsLessPrivilegedAppContainer_return_length",
+    "TokenIsLessPrivilegedAppContainer_false", "TokenAppContainerSid_size_query", "TokenAppContainerSid_size",
+    "TokenAppContainerSid_allocate", "TokenAppContainerSid_query", "TokenAppContainerSid_return_length",
+    "expected_sid_mismatch", "TokenIntegrityLevel_size_query", "TokenIntegrityLevel_size",
+    "TokenIntegrityLevel_allocate", "TokenIntegrityLevel_query", "TokenIntegrityLevel_return_length",
+    "TokenIntegrityLevel_sid_invalid", "TokenIntegrityLevel_authority_invalid", "integrity_not_low",
+    "TokenCapabilities_size_query",
+    "TokenCapabilities_size", "TokenCapabilities_allocate", "TokenCapabilities_query",
+    "TokenCapabilities_return_length", "capabilities_nonzero", "complete",
+})
+_TOKEN_DIAGNOSTIC_BOOL_FIELDS = (
+    "token_verified", "is_appcontainer", "is_lpac", "low_integrity", "expected_sid_match",
+    "zero_capabilities", "token_is_appcontainer_query_succeeded", "token_is_lpac_query_succeeded",
+)
+_TOKEN_DIAGNOSTIC_INT_FIELDS = (
+    "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
+    "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
 )
 
 
@@ -499,6 +523,7 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
     """Extract only fixed failure labels and broker-only scalar diagnostics."""
     result: dict[str, Any] = {}
     prefix = "lpac_launch_diagnostic: "
+    token_prefix = "lpac_token_diagnostic: "
     environment_prefix = "lpac_environment_control: "
     for line in stderr.splitlines():
         match = re.fullmatch(r"probe failure: ([A-Za-z0-9 _-]+) \(([0-9]{1,10})\)", line.strip())
@@ -506,6 +531,27 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
             result["failure_step"] = match.group(1)
             result["failure_win32_error"] = int(match.group(2))
         if not line.startswith(prefix):
+            if line.startswith(token_prefix):
+                try:
+                    value = json.loads(line[len(token_prefix):])
+                except (TypeError, ValueError):
+                    continue
+                if (not isinstance(value, dict) or type(value.get("version")) is not int
+                        or value.get("version") != 1 or value.get("scope") != "broker_only"):
+                    continue
+                token_diagnostic: dict[str, Any] = {"version": 1, "scope": "broker_only"}
+                for field in _TOKEN_DIAGNOSTIC_BOOL_FIELDS:
+                    if type(value.get(field)) is bool:
+                        token_diagnostic[field] = value[field]
+                for field in _TOKEN_DIAGNOSTIC_INT_FIELDS:
+                    if type(value.get(field)) is int:
+                        token_diagnostic[field] = value[field]
+                token_failure_stage = value.get("token_failure_stage")
+                if isinstance(token_failure_stage, str) and token_failure_stage in _TOKEN_FAILURE_STAGES:
+                    token_diagnostic["token_failure_stage"] = token_failure_stage
+                if len(token_diagnostic) > 2:
+                    result["token_diagnostic"] = token_diagnostic
+                continue
             if line.startswith(environment_prefix):
                 try:
                     value = json.loads(line[len(environment_prefix):])
@@ -523,19 +569,28 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
                 for field in _ENVIRONMENT_CONTROL_INT_FIELDS:
                     if type(value.get(field)) is int:
                         control[field] = value[field]
+                token_failure_stage = value.get("token_failure_stage")
+                if isinstance(token_failure_stage, str) and token_failure_stage in _TOKEN_FAILURE_STAGES:
+                    control["token_failure_stage"] = token_failure_stage
                 ntstatus = value.get("create_ntstatus_advisory")
                 if isinstance(ntstatus, str) and re.fullmatch(r"0x[0-9A-Fa-f]{8}", ntstatus):
                     control["create_ntstatus_advisory"] = ntstatus
                 control["comparison_complete"] = (
                     all(control.get(field) is True for field in (
                         "diagnostic_only", "lp_environment_null", "parent_environment_filtered", "attempted",
-                        "create_succeeded", "job_membership_verified", "token_verified", "terminated",
-                        "job_empty", "cleanup_confirmed",
+                        "create_succeeded", "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac",
+                        "low_integrity", "expected_sid_match", "zero_capabilities",
+                        "token_is_appcontainer_query_succeeded", "token_is_lpac_query_succeeded",
+                        "terminated", "job_empty", "cleanup_confirmed",
                     ))
                     and all(control.get(field) == 0 for field in (
                         "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
-                        "token_verification_error", "cleanup_error", "job_active_processes",
+                        "token_verification_error", "token_is_appcontainer_api_error", "token_is_lpac_api_error",
+                        "token_api_error", "cleanup_error", "job_active_processes",
                     ))
+                    and control.get("token_failure_stage") == "complete"
+                    and control.get("token_is_appcontainer_return_length") == 4
+                    and control.get("token_is_lpac_return_length") == 4
                     and control.get("job_total_processes") == 1
                 )
                 result["environment_control"] = control
@@ -579,14 +634,32 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "create_ntstatus_available": False, "create_ntstatus_advisory": "0x00000000",
         "job_attribute_error": 0, "job_membership_verified": True, "job_membership_error": 0,
         "token_verified": True,
-        "token_verification_error": 0, "terminated": True, "job_active_processes": 0,
+        "token_verification_error": 0, "is_appcontainer": True, "is_lpac": True,
+        "low_integrity": True, "expected_sid_match": True, "zero_capabilities": True,
+        "token_is_appcontainer_query_succeeded": True, "token_is_appcontainer_return_length": 4,
+        "token_is_appcontainer_api_error": 0, "token_is_lpac_query_succeeded": True,
+        "token_is_lpac_return_length": 4, "token_is_lpac_api_error": 0,
+        "token_failure_stage": "complete", "token_api_error": 0, "token_return_length": 4,
+        "terminated": True, "job_active_processes": 0,
         "job_total_processes": 1, "job_empty": True, "cleanup_confirmed": True,
         "cleanup_error": 0, "raw_windows_path": r"C:\private\sensitive",
         "raw_environment": "ACTIONS_RUNTIME_TOKEN=sentinel-secret",
     }
+    token_diagnostic = {
+        "version": 1, "scope": "broker_only", "token_verified": False,
+        "is_appcontainer": True, "is_lpac": False, "low_integrity": False,
+        "expected_sid_match": False, "zero_capabilities": False,
+        "token_is_appcontainer_query_succeeded": True, "token_is_appcontainer_return_length": 4,
+        "token_is_appcontainer_api_error": 0, "token_is_lpac_query_succeeded": False,
+        "token_is_lpac_return_length": 0, "token_is_lpac_api_error": 87,
+        "token_failure_stage": "TokenIsLessPrivilegedAppContainer_query",
+        "token_api_error": 87, "token_return_length": 0,
+        "raw_sid": "S-1-15-2-private",
+    }
     parsed = _launch_failure_diagnostic(
         "probe failure: CreateProcessW LPAC (17)\n"
         "lpac_environment_control: " + json.dumps(environment_control) + "\n"
+        "lpac_token_diagnostic: " + json.dumps(token_diagnostic) + "\n"
         "lpac_launch_diagnostic: " + json.dumps(diagnostic)
     )
     assert parsed is not None
@@ -600,8 +673,12 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
     assert parsed["environment_control"]["parent_environment_filtered"] is True
     assert parsed["environment_control"]["job_membership_verified"] is True
     assert parsed["environment_control"]["cleanup_confirmed"] is True
+    assert parsed["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query"
+    assert parsed["token_diagnostic"]["token_api_error"] == 87
+    assert parsed["token_diagnostic"]["token_is_lpac_query_succeeded"] is False
     assert "broker_pid" not in json.dumps(parsed) and "raw_windows_path" not in json.dumps(parsed)
     assert "raw_environment" not in json.dumps(parsed)
+    assert "raw_sid" not in json.dumps(parsed) and "S-1-15-2-private" not in json.dumps(parsed)
     assert "sensitive" not in json.dumps(parsed)
     assert "sentinel-secret" not in json.dumps(parsed)
 

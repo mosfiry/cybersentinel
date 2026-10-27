@@ -515,9 +515,17 @@ def test_native_lpac_registered_profile_storage_boundary(tmp_path: Path, registe
         checks = _check_map(probe_report)
         required_token_fields = (
             "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
-            "expected_sid_match", "zero_capabilities",
+            "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
+            "token_is_lpac_query_succeeded",
         )
-        if probe_report.get("version") != 2 or any(probe_report.get(field) is not True for field in required_token_fields):
+        if (
+            probe_report.get("version") != 3
+            or any(probe_report.get(field) is not True for field in required_token_fields)
+            or probe_report.get("token_failure_stage") != "complete"
+            or probe_report.get("token_is_appcontainer_return_length") != 4
+            or probe_report.get("token_is_lpac_return_length") != 4
+            or probe_report.get("token_api_error") != 0
+        ):
             raise PrototypeError("registered_child_token_not_verified")
         if not isinstance(attestation, dict) or any(attestation.get(field) is not True for field in (
             "token_verified", "is_appcontainer", "is_lpac", "low_integrity",

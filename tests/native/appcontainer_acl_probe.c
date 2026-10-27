@@ -27,12 +27,30 @@
 
 #define MAX_REPORT 2048
 #define CHILD_TIMEOUT_MS 30000
+#define TOKEN_INFO_MAX_BYTES 65536U
 
 typedef struct ProbeResult {
     const wchar_t *name;
     BOOL ok;
     DWORD error;
 } ProbeResult;
+
+typedef struct TokenVerification {
+    BOOL is_appcontainer;
+    BOOL is_lpac;
+    BOOL expected_sid_match;
+    BOOL low_integrity;
+    BOOL zero_capabilities;
+    BOOL token_is_appcontainer_query_succeeded;
+    BOOL token_is_lpac_query_succeeded;
+    DWORD token_is_appcontainer_return_length;
+    DWORD token_is_appcontainer_api_error;
+    DWORD token_is_lpac_return_length;
+    DWORD token_is_lpac_api_error;
+    const wchar_t *failure_stage;
+    DWORD api_error;
+    DWORD return_length;
+} TokenVerification;
 
 typedef struct SecurityCapabilitiesCompat {
     PSID AppContainerSid;
@@ -71,86 +89,213 @@ static int fail(const wchar_t *where, DWORD error) {
     return 20;
 }
 
-static BOOL token_bool(HANDLE token, TOKEN_INFORMATION_CLASS cls, BOOL *value) {
-    DWORD bytes = 0;
-    DWORD result = 0;
-    if (!GetTokenInformation(token, cls, &result, sizeof(result), &bytes)) return FALSE;
-    *value = result != 0;
-    return TRUE;
+static BOOL token_verification_fail(TokenVerification *verification,
+                                    const wchar_t *stage, DWORD error, DWORD return_length) {
+    verification->failure_stage = stage;
+    verification->api_error = error ? error : ERROR_INVALID_DATA;
+    verification->return_length = return_length;
+    return FALSE;
 }
 
-static BOOL verify_token(HANDLE token, PSID expected_sid) {
-    BOOL is_container = FALSE, is_lpac = FALSE;
-    DWORD needed = 0;
-    BYTE *buffer = NULL;
-    TOKEN_APPCONTAINER_INFORMATION *container_info;
+static void report_token_diagnostic(BOOL verified, const TokenVerification *checks) {
+    fwprintf(stderr,
+        L"lpac_token_diagnostic: {\"version\":1,\"scope\":\"broker_only\",\"token_verified\":%ls,"
+        L"\"is_appcontainer\":%ls,\"is_lpac\":%ls,\"low_integrity\":%ls,"
+        L"\"expected_sid_match\":%ls,\"zero_capabilities\":%ls,"
+        L"\"token_is_appcontainer_query_succeeded\":%ls,\"token_is_appcontainer_return_length\":%lu,"
+        L"\"token_is_appcontainer_api_error\":%lu,\"token_is_lpac_query_succeeded\":%ls,"
+        L"\"token_is_lpac_return_length\":%lu,\"token_is_lpac_api_error\":%lu,"
+        L"\"token_failure_stage\":\"%ls\",\"token_api_error\":%lu,\"token_return_length\":%lu}\n",
+        verified ? L"true" : L"false",
+        checks->is_appcontainer ? L"true" : L"false",
+        checks->is_lpac ? L"true" : L"false",
+        checks->low_integrity ? L"true" : L"false",
+        checks->expected_sid_match ? L"true" : L"false",
+        checks->zero_capabilities ? L"true" : L"false",
+        checks->token_is_appcontainer_query_succeeded ? L"true" : L"false",
+        (unsigned long)checks->token_is_appcontainer_return_length,
+        (unsigned long)checks->token_is_appcontainer_api_error,
+        checks->token_is_lpac_query_succeeded ? L"true" : L"false",
+        (unsigned long)checks->token_is_lpac_return_length,
+        (unsigned long)checks->token_is_lpac_api_error,
+        checks->failure_stage ? checks->failure_stage : L"not_run",
+        (unsigned long)checks->api_error,
+        (unsigned long)checks->return_length);
+}
+
+static BOOL verify_token(HANDLE token, PSID expected_sid, TokenVerification *verification) {
+    DWORD value = 0, bytes = 0, needed = 0, error = ERROR_SUCCESS;
+    BYTE *buffer = NULL, *integrity_buffer = NULL, *capabilities_buffer = NULL;
+    BOOL size_query_succeeded;
     BOOL ok = FALSE;
-    if (!token_bool(token, TokenIsAppContainer, &is_container) || !is_container) return FALSE;
-    if (!token_bool(token, TokenIsLessPrivilegedAppContainer, &is_lpac) || !is_lpac) return FALSE;
-    if (!GetTokenInformation(token, TokenAppContainerSid, NULL, 0, &needed) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) return FALSE;
-    if (needed < sizeof(*container_info)) return FALSE;
+    if (!verification) return FALSE;
+    ZeroMemory(verification, sizeof(*verification));
+    verification->failure_stage = L"not_run";
+    if (!token || !expected_sid || !IsValidSid(expected_sid)) {
+        token_verification_fail(verification, L"invalid_token_or_expected_sid", ERROR_INVALID_DATA, 0);
+        return FALSE;
+    }
+
+#define TOKEN_VERIFY_FAIL(stage, code, length) \
+    do { token_verification_fail(verification, (stage), (code), (length)); goto done; } while (0)
+
+    if (!GetTokenInformation(token, TokenIsAppContainer, &value, sizeof(value), &bytes)) {
+        error = GetLastError();
+        verification->token_is_appcontainer_api_error = error;
+        TOKEN_VERIFY_FAIL(L"TokenIsAppContainer_query", error, bytes);
+    }
+    verification->token_is_appcontainer_query_succeeded = TRUE;
+    verification->token_is_appcontainer_return_length = bytes;
+    verification->return_length = bytes;
+    if (bytes != sizeof(value)) TOKEN_VERIFY_FAIL(L"TokenIsAppContainer_return_length", ERROR_INVALID_DATA, bytes);
+    verification->is_appcontainer = value != 0;
+    if (!verification->is_appcontainer)
+        TOKEN_VERIFY_FAIL(L"TokenIsAppContainer_false", ERROR_INVALID_DATA, bytes);
+
+    value = 0;
+    bytes = 0;
+    if (!GetTokenInformation(token, TokenIsLessPrivilegedAppContainer, &value, sizeof(value), &bytes)) {
+        error = GetLastError();
+        verification->token_is_lpac_api_error = error;
+        TOKEN_VERIFY_FAIL(L"TokenIsLessPrivilegedAppContainer_query", error, bytes);
+    }
+    verification->token_is_lpac_query_succeeded = TRUE;
+    verification->token_is_lpac_return_length = bytes;
+    verification->return_length = bytes;
+    if (bytes != sizeof(value))
+        TOKEN_VERIFY_FAIL(L"TokenIsLessPrivilegedAppContainer_return_length", ERROR_INVALID_DATA, bytes);
+    verification->is_lpac = value != 0;
+    if (!verification->is_lpac)
+        TOKEN_VERIFY_FAIL(L"TokenIsLessPrivilegedAppContainer_false", ERROR_INVALID_DATA, bytes);
+
+    needed = 0;
+    size_query_succeeded = GetTokenInformation(token, TokenAppContainerSid, NULL, 0, &needed);
+    error = size_query_succeeded ? ERROR_SUCCESS : GetLastError();
+    verification->return_length = needed;
+    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER)
+        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_size_query", error, needed);
+    if (needed < sizeof(TOKEN_APPCONTAINER_INFORMATION) || needed > TOKEN_INFO_MAX_BYTES)
+        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_size", needed > TOKEN_INFO_MAX_BYTES ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA, needed);
     buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-    if (!buffer) return FALSE;
-    if (!GetTokenInformation(token, TokenAppContainerSid, buffer, needed, &needed)) goto done;
-    container_info = (TOKEN_APPCONTAINER_INFORMATION *)buffer;
-    if (!container_info->TokenAppContainer || !EqualSid(container_info->TokenAppContainer, expected_sid)) goto done;
-    needed = 0;
-    SetLastError(ERROR_SUCCESS);
-    if (GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &needed) ||
-        GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(TOKEN_MANDATORY_LABEL)) goto done;
+    if (!buffer) TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
+    bytes = needed;
+    if (!GetTokenInformation(token, TokenAppContainerSid, buffer, bytes, &needed)) {
+        error = GetLastError();
+        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_query", error, needed);
+    }
+    verification->return_length = needed;
+    if (needed < sizeof(TOKEN_APPCONTAINER_INFORMATION))
+        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_return_length", ERROR_INVALID_DATA, needed);
     {
-        BYTE *integrity_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-        TOKEN_MANDATORY_LABEL *integrity;
+        TOKEN_APPCONTAINER_INFORMATION *container_info = (TOKEN_APPCONTAINER_INFORMATION *)buffer;
+        if (!container_info->TokenAppContainer || !IsValidSid(container_info->TokenAppContainer) ||
+            !EqualSid(container_info->TokenAppContainer, expected_sid))
+            TOKEN_VERIFY_FAIL(L"expected_sid_mismatch", ERROR_INVALID_DATA, needed);
+        verification->expected_sid_match = TRUE;
+    }
+
+    needed = 0;
+    size_query_succeeded = GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &needed);
+    error = size_query_succeeded ? ERROR_SUCCESS : GetLastError();
+    verification->return_length = needed;
+    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER)
+        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_size_query", error, needed);
+    if (needed < sizeof(TOKEN_MANDATORY_LABEL) || needed > TOKEN_INFO_MAX_BYTES)
+        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_size", needed > TOKEN_INFO_MAX_BYTES ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA, needed);
+    integrity_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+    if (!integrity_buffer) TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
+    bytes = needed;
+    if (!GetTokenInformation(token, TokenIntegrityLevel, integrity_buffer, bytes, &needed)) {
+        error = GetLastError();
+        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_query", error, needed);
+    }
+    verification->return_length = needed;
+    if (needed < sizeof(TOKEN_MANDATORY_LABEL))
+        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_return_length", ERROR_INVALID_DATA, needed);
+    {
+        TOKEN_MANDATORY_LABEL *integrity = (TOKEN_MANDATORY_LABEL *)integrity_buffer;
+        SID_IDENTIFIER_AUTHORITY mandatory_authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+        PSID_IDENTIFIER_AUTHORITY observed_authority;
         PUCHAR subauthority_count;
-        DWORD integrity_rid;
-        if (!integrity_buffer) goto done;
-        if (!GetTokenInformation(token, TokenIntegrityLevel, integrity_buffer, needed, &needed)) {
-            HeapFree(GetProcessHeap(), 0, integrity_buffer);
-            goto done;
-        }
-        integrity = (TOKEN_MANDATORY_LABEL *)integrity_buffer;
+        DWORD *integrity_rid;
         if (!integrity->Label.Sid || !IsValidSid(integrity->Label.Sid) ||
-            !(subauthority_count = GetSidSubAuthorityCount(integrity->Label.Sid)) || *subauthority_count == 0) {
-            HeapFree(GetProcessHeap(), 0, integrity_buffer);
-            goto done;
-        }
-        integrity_rid = *GetSidSubAuthority(integrity->Label.Sid, (DWORD)(*subauthority_count - 1));
-        HeapFree(GetProcessHeap(), 0, integrity_buffer);
-        if (integrity_rid != SECURITY_MANDATORY_LOW_RID) goto done;
+            !(subauthority_count = GetSidSubAuthorityCount(integrity->Label.Sid)) || *subauthority_count == 0)
+            TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_sid_invalid", ERROR_INVALID_DATA, needed);
+        observed_authority = GetSidIdentifierAuthority(integrity->Label.Sid);
+        if (!observed_authority || *subauthority_count != 1 ||
+            memcmp(observed_authority, &mandatory_authority, sizeof(mandatory_authority)) != 0)
+            TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_authority_invalid", ERROR_INVALID_DATA, needed);
+        integrity_rid = GetSidSubAuthority(integrity->Label.Sid, (DWORD)(*subauthority_count - 1));
+        if (!integrity_rid) TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_sid_invalid", ERROR_INVALID_DATA, needed);
+        verification->low_integrity = *integrity_rid == SECURITY_MANDATORY_LOW_RID;
+        if (!verification->low_integrity)
+            TOKEN_VERIFY_FAIL(L"integrity_not_low", ERROR_INVALID_DATA, needed);
     }
+
     needed = 0;
-    SetLastError(ERROR_SUCCESS);
-    if (GetTokenInformation(token, TokenCapabilities, NULL, 0, &needed)) goto done;
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(DWORD)) goto done;
-    {
-        BYTE *caps = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-        if (!caps) goto done;
-        if (!GetTokenInformation(token, TokenCapabilities, caps, needed, &needed) ||
-            ((TOKEN_GROUPS *)caps)->GroupCount != 0) {
-            HeapFree(GetProcessHeap(), 0, caps);
-            goto done;
-        }
-        HeapFree(GetProcessHeap(), 0, caps);
+    size_query_succeeded = GetTokenInformation(token, TokenCapabilities, NULL, 0, &needed);
+    error = size_query_succeeded ? ERROR_SUCCESS : GetLastError();
+    verification->return_length = needed;
+    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER)
+        TOKEN_VERIFY_FAIL(L"TokenCapabilities_size_query", error, needed);
+    if (needed > TOKEN_INFO_MAX_BYTES)
+        TOKEN_VERIFY_FAIL(L"TokenCapabilities_size", ERROR_BUFFER_OVERFLOW, needed);
+    if (needed < sizeof(TOKEN_GROUPS)) needed = sizeof(TOKEN_GROUPS);
+    capabilities_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+    if (!capabilities_buffer) TOKEN_VERIFY_FAIL(L"TokenCapabilities_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
+    bytes = needed;
+    if (!GetTokenInformation(token, TokenCapabilities, capabilities_buffer, bytes, &needed)) {
+        error = GetLastError();
+        TOKEN_VERIFY_FAIL(L"TokenCapabilities_query", error, needed);
     }
+    verification->return_length = needed;
+    if (needed < sizeof(DWORD))
+        TOKEN_VERIFY_FAIL(L"TokenCapabilities_return_length", ERROR_INVALID_DATA, needed);
+    verification->zero_capabilities = ((TOKEN_GROUPS *)capabilities_buffer)->GroupCount == 0;
+    if (!verification->zero_capabilities)
+        TOKEN_VERIFY_FAIL(L"capabilities_nonzero", ERROR_INVALID_DATA, needed);
+
+    verification->failure_stage = L"complete";
+    verification->api_error = ERROR_SUCCESS;
     ok = TRUE;
 done:
-    HeapFree(GetProcessHeap(), 0, buffer);
+    if (capabilities_buffer) HeapFree(GetProcessHeap(), 0, capabilities_buffer);
+    if (integrity_buffer) HeapFree(GetProcessHeap(), 0, integrity_buffer);
+    if (buffer) HeapFree(GetProcessHeap(), 0, buffer);
+#undef TOKEN_VERIFY_FAIL
     return ok;
 }
 
 static BOOL write_report(const wchar_t *path, const wchar_t *mode, BOOL token_ok,
+                         const TokenVerification *token_checks,
                          const ProbeResult *results, DWORD count) {
     HANDLE file = INVALID_HANDLE_VALUE;
     wchar_t json[MAX_REPORT];
     DWORD used, i, written;
     int n;
     n = _snwprintf_s(json, MAX_REPORT, _TRUNCATE,
-        L"{\"version\":2,\"mode\":\"%ls\",\"token_verified\":%ls,"
+        L"{\"version\":3,\"mode\":\"%ls\",\"token_verified\":%ls,"
         L"\"is_appcontainer\":%ls,\"is_lpac\":%ls,\"low_integrity\":%ls,"
-        L"\"expected_sid_match\":%ls,\"zero_capabilities\":%ls,\"checks\":[",
-        mode, token_ok ? L"true" : L"false", token_ok ? L"true" : L"false",
-        token_ok ? L"true" : L"false", token_ok ? L"true" : L"false",
-        token_ok ? L"true" : L"false", token_ok ? L"true" : L"false");
+        L"\"expected_sid_match\":%ls,\"zero_capabilities\":%ls,"
+        L"\"token_is_appcontainer_query_succeeded\":%ls,\"token_is_appcontainer_return_length\":%lu,"
+        L"\"token_is_appcontainer_api_error\":%lu,\"token_is_lpac_query_succeeded\":%ls,"
+        L"\"token_is_lpac_return_length\":%lu,\"token_is_lpac_api_error\":%lu,"
+        L"\"token_failure_stage\":\"%ls\",\"token_api_error\":%lu,\"token_return_length\":%lu,\"checks\":[",
+        mode, token_ok ? L"true" : L"false",
+        token_checks->is_appcontainer ? L"true" : L"false",
+        token_checks->is_lpac ? L"true" : L"false",
+        token_checks->low_integrity ? L"true" : L"false",
+        token_checks->expected_sid_match ? L"true" : L"false",
+        token_checks->zero_capabilities ? L"true" : L"false",
+        token_checks->token_is_appcontainer_query_succeeded ? L"true" : L"false",
+        (unsigned long)token_checks->token_is_appcontainer_return_length,
+        (unsigned long)token_checks->token_is_appcontainer_api_error,
+        token_checks->token_is_lpac_query_succeeded ? L"true" : L"false",
+        (unsigned long)token_checks->token_is_lpac_return_length,
+        (unsigned long)token_checks->token_is_lpac_api_error,
+        token_checks->failure_stage ? token_checks->failure_stage : L"not_run",
+        (unsigned long)token_checks->api_error,
+        (unsigned long)token_checks->return_length);
     if (n < 0) return FALSE;
     used = (DWORD)n;
     for (i = 0; i < count; ++i) {
@@ -437,6 +582,7 @@ static DWORD append_registered_registry_checks(ProbeResult *results, DWORD count
 static int child_main(int argc, wchar_t **argv) {
     PSID sid = NULL;
     HANDLE token = NULL;
+    TokenVerification token_checks;
     ProbeResult results[12];
     DWORD count = 0;
     BOOL token_ok = FALSE;
@@ -444,10 +590,23 @@ static int child_main(int argc, wchar_t **argv) {
     if (argc != 8) return 21;
     if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse child SID", GetLastError());
     mode = argv[3]; workspace = argv[4]; arg1 = argv[5]; arg2 = argv[6]; report = argv[7];
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) { LocalFree(sid); return fail(L"open child token", GetLastError()); }
-    token_ok = verify_token(token, sid);
+    ZeroMemory(&token_checks, sizeof(token_checks));
+    token_checks.failure_stage = L"not_run";
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        DWORD error = GetLastError();
+        token_verification_fail(&token_checks, L"OpenProcessToken", error, 0);
+        report_token_diagnostic(FALSE, &token_checks);
+        LocalFree(sid);
+        return fail(L"open child token", error);
+    }
+    token_ok = verify_token(token, sid, &token_checks);
     CloseHandle(token);
-    if (!token_ok) { LocalFree(sid); return fail(L"child LPAC token verification", ERROR_INVALID_TOKEN); }
+    if (!token_ok) {
+        DWORD error = token_checks.api_error;
+        report_token_diagnostic(FALSE, &token_checks);
+        LocalFree(sid);
+        return fail(L"child LPAC token verification", error);
+    }
     results[count++] = verify_minimal_environment(workspace);
     results[count++] = verify_temp_api_path(workspace);
     if (wcscmp(mode, L"rw") == 0) {
@@ -498,7 +657,7 @@ static int child_main(int argc, wchar_t **argv) {
         LocalFree(sid);
         return 24;
     }
-    if (!write_report(report, mode, token_ok, results, count)) { LocalFree(sid); return fail(L"write bounded evidence report", GetLastError()); }
+    if (!write_report(report, mode, token_ok, &token_checks, results, count)) { LocalFree(sid); return fail(L"write bounded evidence report", GetLastError()); }
     LocalFree(sid);
     for (DWORD i = 0; i < count; ++i) if (!results[i].ok) return 25;
     return 0;
@@ -547,6 +706,7 @@ typedef struct EnvironmentControlResult {
     DWORD job_membership_error;
     BOOL token_verified;
     DWORD token_verification_error;
+    TokenVerification token_details;
     BOOL terminated;
     DWORD job_active_processes;
     DWORD job_total_processes;
@@ -634,6 +794,7 @@ static BOOL run_lp_environment_null_control(
     *control_job_out = NULL;
     ZeroMemory(control_process_out, sizeof(*control_process_out));
     result->diagnostic_only = TRUE;
+    result->token_details.failure_stage = L"not_run";
     {
         wchar_t marker[8];
         DWORD marker_length = GetEnvironmentVariableW(
@@ -707,9 +868,14 @@ static BOOL run_lp_environment_null_control(
         result->create_win32_error = create_error;
         DeleteProcThreadAttributeList(control_attrs);
         attrs_initialized = FALSE;
-        HeapFree(GetProcessHeap(), 0, control_attrs);
+        if (!HeapFree(GetProcessHeap(), 0, control_attrs))
+            result->cleanup_error = GetLastError();
         control_attrs = NULL;
-        if (!CloseHandle(control_job)) result->cleanup_error = GetLastError();
+        if (!CloseHandle(control_job)) {
+            if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = GetLastError();
+            *control_job_out = control_job;
+        }
+        result->cleanup_confirmed = result->cleanup_error == ERROR_SUCCESS;
         return TRUE;
     }
     DeleteProcThreadAttributeList(control_attrs);
@@ -727,12 +893,14 @@ static BOOL run_lp_environment_null_control(
     else
         result->job_membership_error = ERROR_INVALID_DATA;
     if (OpenProcessToken(control_process.hProcess, TOKEN_QUERY, &process_token)) {
-        result->token_verified = verify_token(process_token, expected_sid);
-        if (!result->token_verified) result->token_verification_error = ERROR_INVALID_TOKEN;
+        result->token_verified = verify_token(process_token, expected_sid, &result->token_details);
+        result->token_verification_error = result->token_details.api_error;
         CloseHandle(process_token);
         process_token = NULL;
     } else {
-        result->token_verification_error = GetLastError();
+        DWORD error = GetLastError();
+        token_verification_fail(&result->token_details, L"OpenProcessToken", error, 0);
+        result->token_verification_error = error;
     }
     if (!TerminateProcess(control_process.hProcess, 0xE5))
         result->cleanup_error = GetLastError();
@@ -757,15 +925,30 @@ static BOOL run_lp_environment_null_control(
     } else if (result->cleanup_error == ERROR_SUCCESS) {
         result->cleanup_error = GetLastError();
     }
-    result->cleanup_confirmed = result->terminated && result->job_empty;
-    if (!result->cleanup_confirmed && result->cleanup_error == ERROR_SUCCESS)
+    if (!(result->terminated && result->job_empty) && result->cleanup_error == ERROR_SUCCESS)
         result->cleanup_error = ERROR_INVALID_DATA;
+    if (result->cleanup_error != ERROR_SUCCESS) return FALSE;
+    if (!CloseHandle(control_process.hThread)) {
+        result->cleanup_error = GetLastError();
+    } else {
+        control_process_out->hThread = NULL;
+    }
+    if (!CloseHandle(control_process.hProcess)) {
+        if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = GetLastError();
+    } else {
+        control_process_out->hProcess = NULL;
+    }
+    if (!CloseHandle(control_job)) {
+        if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = GetLastError();
+    } else {
+        *control_job_out = NULL;
+    }
+    result->cleanup_confirmed = result->terminated && result->job_empty &&
+                                result->cleanup_error == ERROR_SUCCESS &&
+                                !control_process_out->hThread && !control_process_out->hProcess &&
+                                !*control_job_out;
     if (!result->cleanup_confirmed) return FALSE;
-    CloseHandle(control_process.hThread);
-    CloseHandle(control_process.hProcess);
     ZeroMemory(control_process_out, sizeof(*control_process_out));
-    CloseHandle(control_job);
-    *control_job_out = NULL;
     return TRUE;
 
 control_setup_failed:
@@ -779,7 +962,18 @@ control_setup_failed:
 static void report_environment_control(const EnvironmentControlResult *result) {
     BOOL comparison_complete = result->diagnostic_only && result->parent_environment_filtered &&
         result->attempted && result->create_succeeded && result->job_membership_verified &&
-        result->token_verified && result->terminated && result->job_empty && result->cleanup_confirmed &&
+        result->token_verified && result->token_details.is_appcontainer && result->token_details.is_lpac &&
+        result->token_details.expected_sid_match && result->token_details.low_integrity &&
+        result->token_details.zero_capabilities &&
+        result->token_details.token_is_appcontainer_query_succeeded &&
+        result->token_details.token_is_lpac_query_succeeded &&
+        result->token_details.token_is_appcontainer_return_length == sizeof(DWORD) &&
+        result->token_details.token_is_lpac_return_length == sizeof(DWORD) &&
+        result->token_details.token_is_appcontainer_api_error == ERROR_SUCCESS &&
+        result->token_details.token_is_lpac_api_error == ERROR_SUCCESS &&
+        result->token_details.failure_stage && wcscmp(result->token_details.failure_stage, L"complete") == 0 &&
+        result->token_details.api_error == ERROR_SUCCESS &&
+        result->terminated && result->job_empty && result->cleanup_confirmed &&
         result->setup_error == ERROR_SUCCESS && result->create_win32_error == ERROR_SUCCESS &&
         result->job_attribute_error == ERROR_SUCCESS && result->job_membership_error == ERROR_SUCCESS &&
         result->token_verification_error == ERROR_SUCCESS &&
@@ -794,6 +988,12 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         L"\"create_ntstatus_available\":%ls,\"create_ntstatus_advisory\":\"0x%08lX\","
         L"\"job_attribute_error\":%lu,\"job_membership_verified\":%ls,\"job_membership_error\":%lu,"
         L"\"token_verified\":%ls,\"token_verification_error\":%lu,"
+        L"\"is_appcontainer\":%ls,\"is_lpac\":%ls,\"low_integrity\":%ls,"
+        L"\"expected_sid_match\":%ls,\"zero_capabilities\":%ls,"
+        L"\"token_is_appcontainer_query_succeeded\":%ls,\"token_is_appcontainer_return_length\":%lu,"
+        L"\"token_is_appcontainer_api_error\":%lu,\"token_is_lpac_query_succeeded\":%ls,"
+        L"\"token_is_lpac_return_length\":%lu,\"token_is_lpac_api_error\":%lu,"
+        L"\"token_failure_stage\":\"%ls\",\"token_api_error\":%lu,\"token_return_length\":%lu,"
         L"\"terminated\":%ls,\"job_active_processes\":%lu,\"job_total_processes\":%lu,"
         L"\"job_empty\":%ls,\"cleanup_confirmed\":%ls,\"cleanup_error\":%lu}\n",
         result->diagnostic_only ? L"true" : L"false",
@@ -805,6 +1005,20 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         (unsigned long)result->job_attribute_error,
         result->job_membership_verified ? L"true" : L"false", (unsigned long)result->job_membership_error,
         result->token_verified ? L"true" : L"false", (unsigned long)result->token_verification_error,
+        result->token_details.is_appcontainer ? L"true" : L"false",
+        result->token_details.is_lpac ? L"true" : L"false",
+        result->token_details.low_integrity ? L"true" : L"false",
+        result->token_details.expected_sid_match ? L"true" : L"false",
+        result->token_details.zero_capabilities ? L"true" : L"false",
+        result->token_details.token_is_appcontainer_query_succeeded ? L"true" : L"false",
+        (unsigned long)result->token_details.token_is_appcontainer_return_length,
+        (unsigned long)result->token_details.token_is_appcontainer_api_error,
+        result->token_details.token_is_lpac_query_succeeded ? L"true" : L"false",
+        (unsigned long)result->token_details.token_is_lpac_return_length,
+        (unsigned long)result->token_details.token_is_lpac_api_error,
+        result->token_details.failure_stage ? result->token_details.failure_stage : L"not_run",
+        (unsigned long)result->token_details.api_error,
+        (unsigned long)result->token_details.return_length,
         result->terminated ? L"true" : L"false", (unsigned long)result->job_active_processes,
         (unsigned long)result->job_total_processes, result->job_empty ? L"true" : L"false",
         result->cleanup_confirmed ? L"true" : L"false", (unsigned long)result->cleanup_error);
@@ -933,6 +1147,9 @@ static int launch_child(int argc, wchar_t **argv) {
     BOOL initialized = FALSE;
     BOOL in_job = FALSE;
     BOOL job_query_ok = FALSE;
+    BOOL parent_token_verified = FALSE;
+    DWORD parent_token_error = ERROR_SUCCESS;
+    TokenVerification parent_token_checks;
     HANDLE job = NULL;
     HANDLE job_list[1] = { NULL }; /* Referenced by the process attribute list until it is destroyed. */
     HANDLE control_job = NULL;
@@ -956,6 +1173,8 @@ static int launch_child(int argc, wchar_t **argv) {
     memset(&startup, 0, sizeof(startup)); memset(&process, 0, sizeof(process));
     memset(&control_process, 0, sizeof(control_process));
     memset(&environment_control, 0, sizeof(environment_control)); memset(&caps, 0, sizeof(caps));
+    memset(&parent_token_checks, 0, sizeof(parent_token_checks));
+    parent_token_checks.failure_stage = L"not_run";
     InitializeProcThreadAttributeList(NULL, 3, 0, &attr_size);
     attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
     if (!attrs || !InitializeProcThreadAttributeList(attrs, 3, 0, &attr_size)) { status = fail(L"allocate process attribute list", GetLastError()); goto done; }
@@ -1045,14 +1264,22 @@ static int launch_child(int argc, wchar_t **argv) {
         TerminateProcess(process.hProcess, 28); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"verify suspended LPAC child job membership", error); goto done;
     }
-    if (!OpenProcessToken(process.hProcess, TOKEN_QUERY, &process_token) || !verify_token(process_token, sid)) {
-        DWORD error = GetLastError();
-        if (process_token) { CloseHandle(process_token); process_token = NULL; }
+    if (!OpenProcessToken(process.hProcess, TOKEN_QUERY, &process_token)) {
+        parent_token_error = GetLastError();
+        token_verification_fail(&parent_token_checks, L"OpenProcessToken", parent_token_error, 0);
+    } else {
+        parent_token_verified = verify_token(process_token, sid, &parent_token_checks);
+        parent_token_error = parent_token_checks.api_error;
+        CloseHandle(process_token);
+        process_token = NULL;
+    }
+    if (!parent_token_verified) {
+        report_token_diagnostic(FALSE, &parent_token_checks);
         TerminateJobObject(job, 26);
         TerminateProcess(process.hProcess, 26); WaitForSingleObject(process.hProcess, 5000);
-        status = fail(L"suspended LPAC child token verification", error ? error : ERROR_INVALID_TOKEN); goto done;
+        status = fail(L"suspended LPAC child token verification",
+                      parent_token_error ? parent_token_error : ERROR_INVALID_DATA); goto done;
     }
-    CloseHandle(process_token); process_token = NULL;
     fwprintf(stderr,
         L"pre_resume_attestation: {\"version\":1,\"token_verified\":true,"
         L"\"is_appcontainer\":true,\"is_lpac\":true,\"low_integrity\":true,"

@@ -89,6 +89,12 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert "verify_token" in control_source and "TerminateProcess" in control_source
     assert "TerminateJobObject" in control_source
     assert "cleanup_confirmed" in control_source
+    assert 'L"TokenIsLessPrivilegedAppContainer_query"' in native_probe
+    assert "token_details.api_error" in control_source
+    assert "ERROR_INVALID_TOKEN" not in native_probe
+    assert "GetSidIdentifierAuthority" in native_probe
+    assert "SECURITY_MANDATORY_LABEL_AUTHORITY" in native_probe
+    assert "*subauthority_count != 1" in native_probe
     assert "ResumeThread" not in control_source
     assert 'L"lpac_environment_control:' in native_probe
     assert "diagnostic_only" in native_probe and "comparison_complete" in native_probe
@@ -130,10 +136,27 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
             "create_ntstatus_advisory": "0x00000000", "job_attribute_error": 0,
             "job_membership_verified": True, "job_membership_error": 0,
             "token_verified": True, "token_verification_error": 0,
+            "is_appcontainer": True, "is_lpac": True, "low_integrity": True,
+            "expected_sid_match": True, "zero_capabilities": True,
+            "token_is_appcontainer_query_succeeded": True, "token_is_appcontainer_return_length": 4,
+            "token_is_appcontainer_api_error": 0, "token_is_lpac_query_succeeded": True,
+            "token_is_lpac_return_length": 4, "token_is_lpac_api_error": 0,
+            "token_failure_stage": "complete", "token_api_error": 0, "token_return_length": 4,
             "terminated": True, "job_active_processes": 0, "job_total_processes": 1,
             "job_empty": True, "cleanup_confirmed": True, "cleanup_error": 0,
             "raw_windows_path": "C:\\sensitive\\private",
             "raw_environment": "ACTIONS_RUNTIME_TOKEN=sentinel-secret",
+            "token_raw": "sensitive-token-data",
+        },
+        "token_diagnostic": {
+            "version": 1, "scope": "broker_only", "token_verified": False,
+            "is_appcontainer": True, "is_lpac": False, "low_integrity": False,
+            "expected_sid_match": False, "zero_capabilities": False,
+            "token_is_appcontainer_query_succeeded": True, "token_is_appcontainer_return_length": 4,
+            "token_is_appcontainer_api_error": 0, "token_is_lpac_query_succeeded": False,
+            "token_is_lpac_return_length": 0, "token_is_lpac_api_error": 87,
+            "token_failure_stage": "TokenIsLessPrivilegedAppContainer_query",
+            "token_api_error": 87, "token_return_length": 0, "raw_sid": "private-sid",
         },
     }
     for name in runner.LEGACY_NATIVE_CASES:
@@ -160,16 +183,41 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert all(item["launcher_failures"][0]["create_process"]["drive_current_directory_env_present"] is True for item in attestations)
     assert all(item["launcher_failures"][0]["environment_control"]["create_succeeded"] is True for item in attestations)
     assert all(item["launcher_failures"][0]["environment_control"]["cleanup_confirmed"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query" for item in attestations)
+    assert all(item["launcher_failures"][0]["token_diagnostic"]["token_api_error"] == 87 for item in attestations)
     assert all(item["environment_controls"][0]["comparison_complete"] is True for item in attestations)
+    assert all(item["environment_controls"][0]["token_failure_stage"] == "complete" for item in attestations)
     incomplete = dict(launcher_failure["environment_control"], token_verified=False, comparison_complete=True)
     safe_incomplete = runner._sanitize_environment_control(incomplete)
     assert safe_incomplete is not None and safe_incomplete["comparison_complete"] is False
+    lpac_query_failed = dict(
+        launcher_failure["environment_control"],
+        token_is_lpac_query_succeeded=False,
+        token_is_lpac_return_length=0,
+        token_is_lpac_api_error=87,
+        token_failure_stage="TokenIsLessPrivilegedAppContainer_query",
+        token_api_error=87,
+        token_verification_error=87,
+        comparison_complete=True,
+    )
+    safe_lpac_failure = runner._sanitize_environment_control(lpac_query_failed)
+    assert safe_lpac_failure is not None
+    assert safe_lpac_failure["comparison_complete"] is False
+    assert safe_lpac_failure["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query"
+    assert safe_lpac_failure["token_api_error"] == 87
+    assert safe_lpac_failure["token_is_lpac_return_length"] == 0
+    unknown_stage = dict(launcher_failure["environment_control"], token_failure_stage="C:\\private\\token")
+    safe_unknown_stage = runner._sanitize_environment_control(unknown_stage)
+    assert safe_unknown_stage is not None and "token_failure_stage" not in safe_unknown_stage
+    assert safe_unknown_stage["comparison_complete"] is False
     serialized = json.dumps(counts)
     assert "raw_windows_path" not in serialized
     assert "broker_pid" not in serialized
     assert "sensitive" not in serialized
     assert "C:\\\\sensitive" not in serialized
     assert "raw_environment" not in serialized and "sentinel-secret" not in serialized
+    assert "token_raw" not in serialized and "sensitive-token-data" not in serialized
+    assert "raw_sid" not in serialized and "private-sid" not in serialized
 
 
 def test_pytest_child_environment_uses_explicit_allowlist():
