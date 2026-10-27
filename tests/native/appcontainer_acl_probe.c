@@ -693,12 +693,20 @@ static int launch_child(int argc, wchar_t **argv) {
     }
 #define APPEND_ENV(value) do { size_t env_len = wcslen(value) + 1; if (env_used + env_len >= _countof(env_block)) { status = fail(L"child environment too large", ERROR_INSUFFICIENT_BUFFER); goto done; } memcpy(env_block + env_used, value, env_len * sizeof(wchar_t)); env_used += env_len; } while (0)
     {
-        wchar_t item[MAX_PATH * 2];
-        _snwprintf_s(item, _countof(item), _TRUNCATE, L"SystemRoot=%ls", windows_dir); APPEND_ENV(item);
-        _snwprintf_s(item, _countof(item), _TRUNCATE, L"windir=%ls", windows_dir); APPEND_ENV(item);
+        wchar_t system_root_env[MAX_PATH * 2], temp_env[MAX_PATH * 2];
+        wchar_t tmp_env[MAX_PATH * 2], windir_env[MAX_PATH * 2];
+        if (_snwprintf_s(system_root_env, _countof(system_root_env), _TRUNCATE, L"SystemRoot=%ls", windows_dir) < 0 ||
+            _snwprintf_s(temp_env, _countof(temp_env), _TRUNCATE, L"TEMP=%ls", argv[4]) < 0 ||
+            _snwprintf_s(tmp_env, _countof(tmp_env), _TRUNCATE, L"TMP=%ls", argv[4]) < 0 ||
+            _snwprintf_s(windir_env, _countof(windir_env), _TRUNCATE, L"windir=%ls", windows_dir) < 0) {
+            status = fail(L"build restricted child environment", ERROR_INSUFFICIENT_BUFFER); goto done;
+        }
+        /* CreateProcess requires environment entries sorted case-insensitively in Unicode order. */
         APPEND_ENV(path_env);
-        _snwprintf_s(item, _countof(item), _TRUNCATE, L"TEMP=%ls", argv[4]); APPEND_ENV(item);
-        _snwprintf_s(item, _countof(item), _TRUNCATE, L"TMP=%ls", argv[4]); APPEND_ENV(item);
+        APPEND_ENV(system_root_env);
+        APPEND_ENV(temp_env);
+        APPEND_ENV(tmp_env);
+        APPEND_ENV(windir_env);
     }
     env_block[env_used] = L'\0';
 #undef APPEND_ENV

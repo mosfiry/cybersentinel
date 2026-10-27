@@ -124,3 +124,21 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert "broker_pid" not in serialized
     assert "sensitive" not in serialized
     assert "C:\\\\sensitive" not in serialized
+
+
+def test_native_environment_block_uses_sorted_case_insensitive_order():
+    native_probe = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
+    start = native_probe.index("#define APPEND_ENV")
+    end = native_probe.index("#undef APPEND_ENV", start)
+    block = native_probe[start:end]
+    ordered_entries = [
+        "APPEND_ENV(path_env);",
+        "APPEND_ENV(system_root_env);",
+        "APPEND_ENV(temp_env);",
+        "APPEND_ENV(tmp_env);",
+        "APPEND_ENV(windir_env);",
+    ]
+    positions = [block.index(entry) for entry in ordered_entries]
+    assert positions == sorted(positions)
+    assert "CREATE_UNICODE_ENVIRONMENT" in native_probe
+    assert "case-insensitively in Unicode order" in block
