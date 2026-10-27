@@ -574,7 +574,8 @@ static DWORD known_system_dependency_mask(DWORD *directory_error) {
  * Never log paths, SIDs, argv, or environment values. */
 static void report_launch_failure(const wchar_t *image, const wchar_t *cwd,
                                   DWORD error, DWORD launch_flags,
-                                  BOOL nt_available, LONG nt_status) {
+                                  BOOL nt_available, LONG nt_status,
+                                  BOOL drive_environment_present) {
     DWORD image_attrs, cwd_attrs, image_error, cwd_error, module_length;
     DWORD image_open_error = ERROR_SUCCESS, image_size_error = ERROR_SUCCESS;
     DWORD system_directory_error = ERROR_SUCCESS, dependency_mask;
@@ -609,7 +610,7 @@ static void report_launch_failure(const wchar_t *image, const wchar_t *cwd,
         module_matches = _wcsicmp(module, image) == 0;
     fwprintf(stderr,
         L"lpac_launch_diagnostic: {\"version\":2,\"scope\":\"broker_only\","
-        L"\"win32_error\":%lu,\"image_is_absolute\":%ls,"
+        L"\"drive_current_directory_env_present\":%ls,\"win32_error\":%lu,\"image_is_absolute\":%ls,"
         L"\"image_is_file\":%ls,\"image_attributes_error\":%lu,"
         L"\"parent_can_read_image\":%ls,\"image_open_error\":%lu,"
         L"\"image_size_available\":%ls,\"image_size_bytes\":%llu,"
@@ -620,6 +621,7 @@ static void report_launch_failure(const wchar_t *image, const wchar_t *cwd,
         L"\"broker_pid\":%lu,\"broker_bitness\":%u,\"launch_flags\":%lu,"
         L"\"ntstatus_available\":%ls,"
         L"\"ntstatus_advisory\":\"0x%08lX\"}\n",
+        drive_environment_present ? L"true" : L"false",
         (unsigned long)error,
         is_absolute_windows_path(image) ? L"true" : L"false",
         image_attrs != INVALID_FILE_ATTRIBUTES && !(image_attrs & FILE_ATTRIBUTE_DIRECTORY) ? L"true" : L"false",
@@ -654,8 +656,10 @@ static int launch_child(int argc, wchar_t **argv) {
     BOOL in_job = FALSE;
     BOOL job_query_ok = FALSE;
     HANDLE job = NULL;
-    wchar_t windows_dir[MAX_PATH], path_env[MAX_PATH * 2], env_block[MAX_PATH * 6];
+    wchar_t windows_dir[MAX_PATH], drive_env[MAX_PATH * 2];
+    wchar_t path_env[MAX_PATH * 2], env_block[MAX_PATH * 6];
     size_t env_used = 0;
+    BOOL drive_environment_present = FALSE;
     ProbeJobExtendedLimitInformation job_limits;
     int status = 20;
     LastNtStatusFn last_nt_status = NULL;
@@ -695,13 +699,23 @@ static int launch_child(int argc, wchar_t **argv) {
     {
         wchar_t system_root_env[MAX_PATH * 2], temp_env[MAX_PATH * 2];
         wchar_t tmp_env[MAX_PATH * 2], windir_env[MAX_PATH * 2];
+        if (((argv[4][0] >= L'A' && argv[4][0] <= L'Z') ||
+             (argv[4][0] >= L'a' && argv[4][0] <= L'z')) &&
+            argv[4][1] == L':' && (argv[4][2] == L'\\' || argv[4][2] == L'/')) {
+            if (_snwprintf_s(drive_env, _countof(drive_env), _TRUNCATE,
+                             L"=%c:=%ls", (int)argv[4][0], argv[4]) < 0) {
+                status = fail(L"build restricted child environment", ERROR_INSUFFICIENT_BUFFER); goto done;
+            }
+            drive_environment_present = TRUE;
+        }
         if (_snwprintf_s(system_root_env, _countof(system_root_env), _TRUNCATE, L"SystemRoot=%ls", windows_dir) < 0 ||
             _snwprintf_s(temp_env, _countof(temp_env), _TRUNCATE, L"TEMP=%ls", argv[4]) < 0 ||
             _snwprintf_s(tmp_env, _countof(tmp_env), _TRUNCATE, L"TMP=%ls", argv[4]) < 0 ||
             _snwprintf_s(windir_env, _countof(windir_env), _TRUNCATE, L"windir=%ls", windows_dir) < 0) {
             status = fail(L"build restricted child environment", ERROR_INSUFFICIENT_BUFFER); goto done;
         }
-        /* CreateProcess requires environment entries sorted case-insensitively in Unicode order. */
+        /* CreateProcess requires sorted entries; pass the per-drive CWD entry explicitly. */
+        if (drive_environment_present) APPEND_ENV(drive_env);
         APPEND_ENV(path_env);
         APPEND_ENV(system_root_env);
         APPEND_ENV(temp_env);
@@ -723,7 +737,7 @@ static int launch_child(int argc, wchar_t **argv) {
         LONG nt_status = last_nt_status ? last_nt_status() : 0;
         report_launch_failure(argv[0], argv[4], launch_error,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            last_nt_status != NULL, nt_status);
+            last_nt_status != NULL, nt_status, drive_environment_present);
         status = fail(L"CreateProcessW LPAC", launch_error); goto done;
     }
     if (!AssignProcessToJobObject(job, process.hProcess)) {

@@ -446,6 +446,7 @@ _LAUNCH_FAILURE_STEPS = frozenset({
 _LAUNCH_DIAGNOSTIC_BOOL_FIELDS = (
     "image_is_absolute", "image_is_file", "parent_can_read_image", "image_size_available",
     "cwd_is_absolute", "cwd_is_directory", "module_matches_image", "ntstatus_available",
+    "drive_current_directory_env_present",
 )
 _LAUNCH_DIAGNOSTIC_INT_FIELDS = (
     "win32_error", "image_attributes_error", "image_open_error", "image_size_bytes",
@@ -488,6 +489,7 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
 def test_launch_failure_diagnostic_is_allowlisted() -> None:
     diagnostic = {
         "version": 2, "scope": "broker_only", "win32_error": 17,
+        "drive_current_directory_env_present": True,
         "image_is_absolute": True, "image_is_file": True, "parent_can_read_image": True,
         "image_size_available": True, "image_size_bytes": 4096, "cwd_is_absolute": True,
         "cwd_is_directory": True, "module_matches_image": True, "known_dependency_mask": 15,
@@ -503,6 +505,7 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
     assert parsed["failure_step"] == "CreateProcessW LPAC"
     assert parsed["failure_win32_error"] == 17
     assert parsed["create_process"]["win32_error"] == 17
+    assert parsed["create_process"]["drive_current_directory_env_present"] is True
     assert "broker_pid" not in json.dumps(parsed) and "raw_windows_path" not in json.dumps(parsed)
     assert "sensitive" not in json.dumps(parsed)
 

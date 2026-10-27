@@ -30,6 +30,7 @@ LEGACY_LAUNCH_FAILURE_STEPS = {
 LAUNCH_DIAGNOSTIC_BOOL_FIELDS = (
     "image_is_absolute", "image_is_file", "parent_can_read_image", "image_size_available",
     "cwd_is_absolute", "cwd_is_directory", "module_matches_image", "ntstatus_available",
+    "drive_current_directory_env_present",
 )
 LAUNCH_DIAGNOSTIC_INT_FIELDS = (
     "win32_error", "image_attributes_error", "image_open_error", "image_size_bytes",

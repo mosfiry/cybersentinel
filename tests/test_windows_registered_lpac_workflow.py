@@ -95,6 +95,7 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
         "failure_step": "CreateProcessW LPAC", "failure_win32_error": 17,
         "create_process": {
             "version": 2, "scope": "broker_only", "win32_error": 17,
+            "drive_current_directory_env_present": True,
             "image_is_file": True, "broker_pid": 1234,
             "raw_windows_path": "C:\\sensitive\\private",
         },
@@ -119,6 +120,7 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert all(item["launcher_return_codes"] == [20] for item in attestations)
     assert all(item["launcher_failures"][0]["failure_win32_error"] == 17 for item in attestations)
     assert all(item["launcher_failures"][0]["create_process"]["image_is_file"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["create_process"]["drive_current_directory_env_present"] is True for item in attestations)
     serialized = json.dumps(counts)
     assert "raw_windows_path" not in serialized
     assert "broker_pid" not in serialized
@@ -132,6 +134,7 @@ def test_native_environment_block_uses_sorted_case_insensitive_order():
     end = native_probe.index("#undef APPEND_ENV", start)
     block = native_probe[start:end]
     ordered_entries = [
+        "APPEND_ENV(drive_env);",
         "APPEND_ENV(path_env);",
         "APPEND_ENV(system_root_env);",
         "APPEND_ENV(temp_env);",
@@ -141,4 +144,5 @@ def test_native_environment_block_uses_sorted_case_insensitive_order():
     positions = [block.index(entry) for entry in ordered_entries]
     assert positions == sorted(positions)
     assert "CREATE_UNICODE_ENVIRONMENT" in native_probe
-    assert "case-insensitively in Unicode order" in block
+    assert 'L"=%c:=%ls"' in block
+    assert "drive_current_directory_env_present" in native_probe
