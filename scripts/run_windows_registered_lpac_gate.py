@@ -10,6 +10,18 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SAFE_TEST_ENV_KEYS = frozenset({
+    "PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE",
+    "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "ALLUSERSPROFILE", "PUBLIC",
+    "OS", "USERNAME", "USERDOMAIN", "USERDOMAIN_ROAMINGPROFILE",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+    "NUMBER_OF_PROCESSORS", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+    "RUNNER_TEMP", "IMAGEOS", "IMAGEVERSION",
+})
+SENSITIVE_ENV_MARKERS = (
+    "TOKEN", "SECRET", "PASS", "CREDENTIAL", "KEY", "AUTH", "COOKIE", "CERT",
+)
 NATIVE_CASE = "test_native_lpac_registered_profile_storage_boundary"
 LEGACY_NATIVE_CASES = [
     "test_native_lpac_identity_and_workspace_read_write",
@@ -22,7 +34,8 @@ LEGACY_LAUNCH_FAILURE_STEPS = {
     "parse child SID", "open child token", "child LPAC token verification", "write bounded evidence report",
     "parse launcher SID", "allocate process attribute list", "set LPAC process attributes",
     "build child command line", "build restricted child environment", "child environment too large",
-    "create bounded child job", "CreateProcessW LPAC", "assign LPAC child to kill-on-close job",
+    "create bounded child job", "set LPAC child job attribute", "CreateProcessW LPAC",
+    "environment control cleanup unconfirmed",
     "verify suspended LPAC child job membership", "suspended LPAC child token verification",
     "resume LPAC child", "bounded LPAC child wait", "read child exit code",
     "query completed LPAC job accounting", "LPAC job did not become empty",
@@ -37,6 +50,61 @@ LAUNCH_DIAGNOSTIC_INT_FIELDS = (
     "image_size_error", "cwd_attributes_error", "known_dependency_mask",
     "known_dependency_expected_mask", "system_directory_error", "broker_bitness", "launch_flags",
 )
+ENVIRONMENT_CONTROL_BOOL_FIELDS = (
+    "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
+    "attempted", "create_succeeded", "create_ntstatus_available",
+    "job_membership_verified", "token_verified", "terminated", "job_empty", "cleanup_confirmed",
+)
+ENVIRONMENT_CONTROL_INT_FIELDS = (
+    "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
+    "token_verification_error",
+    "job_active_processes", "job_total_processes", "cleanup_error",
+)
+
+
+def _safe_test_environment(source: dict[str, str]) -> dict[str, str]:
+    """Pass only required Windows OS and run metadata into the pytest subprocess."""
+    safe: dict[str, str] = {}
+    for key, value in source.items():
+        upper = key.upper()
+        if upper not in SAFE_TEST_ENV_KEYS:
+            continue
+        if any(marker in upper for marker in SENSITIVE_ENV_MARKERS):
+            continue
+        safe[key] = value
+    return safe
+
+
+def _sanitize_environment_control(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value.get("version") != 1 or value.get("scope") != "broker_only":
+        return None
+    control: dict[str, object] = {"version": 1, "scope": "broker_only"}
+    for field in ENVIRONMENT_CONTROL_BOOL_FIELDS:
+        if field == "comparison_complete":
+            continue
+        if type(value.get(field)) is bool:
+            control[field] = value[field]
+    for field in ENVIRONMENT_CONTROL_INT_FIELDS:
+        if type(value.get(field)) is int:
+            control[field] = value[field]
+    ntstatus = value.get("create_ntstatus_advisory")
+    if isinstance(ntstatus, str) and len(ntstatus) == 10 and ntstatus.startswith("0x") and all(char in "0123456789abcdefABCDEF" for char in ntstatus[2:]):
+        control["create_ntstatus_advisory"] = ntstatus
+    required_true = (
+        "diagnostic_only", "lp_environment_null", "parent_environment_filtered", "attempted",
+        "create_succeeded", "job_membership_verified", "token_verified", "terminated",
+        "job_empty", "cleanup_confirmed",
+    )
+    required_zero = (
+        "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
+        "token_verification_error", "cleanup_error", "job_active_processes",
+    )
+    control["comparison_complete"] = (
+        all(control.get(field) is True for field in required_true)
+        and all(control.get(field) == 0 for field in required_zero)
+        and control.get("job_total_processes") == 1
+    )
+    return control
 
 
 def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
@@ -62,6 +130,9 @@ def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
         if isinstance(ntstatus, str) and len(ntstatus) == 10 and ntstatus.startswith("0x") and all(char in "0123456789abcdefABCDEF" for char in ntstatus[2:]):
             diagnostic["ntstatus_advisory"] = ntstatus
         safe["create_process"] = diagnostic
+    control = _sanitize_environment_control(value.get("environment_control"))
+    if control is not None:
+        safe["environment_control"] = control
     return safe or None
 
 
@@ -94,7 +165,7 @@ def _junit_counts(path: Path) -> dict[str, object]:
             continue
         attestation_sets = {
             "pre_resume": [], "post_exit_job": [],
-            "launcher_return_codes": [], "launcher_failures": [],
+            "launcher_return_codes": [], "launcher_failures": [], "environment_controls": [],
         }
         properties = case.find("properties")
         if properties is not None:
@@ -117,6 +188,15 @@ def _junit_counts(path: Path) -> dict[str, object]:
                     safe_failure = _sanitize_parent_launch_failure(raw_failure)
                     if safe_failure is not None:
                         attestation_sets["launcher_failures"].append(safe_failure)
+                    continue
+                if property_name == "parent_environment_control":
+                    try:
+                        raw_control = json.loads(prop.get("value", ""))
+                    except json.JSONDecodeError:
+                        continue
+                    safe_control = _sanitize_environment_control(raw_control)
+                    if safe_control is not None:
+                        attestation_sets["environment_controls"].append(safe_control)
                     continue
                 if property_name not in {"parent_pre_resume_attestation", "parent_post_exit_job_attestation"}:
                     continue
@@ -191,7 +271,7 @@ def main() -> int:
         result = subprocess.run(
             command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-            shell=False, timeout=900, check=False,
+            shell=False, timeout=900, check=False, env=_safe_test_environment(dict(os.environ)),
         )
         exit_code = result.returncode
     except subprocess.TimeoutExpired:
@@ -262,6 +342,8 @@ def main() -> int:
         "skipped_count": counts["skipped_count"],
         "exact_sha_evidence": exact_sha,
         "cleanup_and_process_evidence_proven": cleanup_proven,
+        "diagnostic_environment_control_required_for_storage_acceptance": False,
+        "diagnostic_environment_control_status": "NOT_RECORDED",
         "mission_acceptance": "BLOCKED",
         "backend_enabled_by_slice": False,
         "not_validated": [
@@ -272,6 +354,12 @@ def main() -> int:
     }
     if isinstance(evidence, dict):
         validation["result_code"] = evidence.get("result_code")
+        registered_control = _sanitize_environment_control(evidence.get("environment_control"))
+        if registered_control is not None:
+            validation["registered_environment_control"] = registered_control
+            validation["diagnostic_environment_control_status"] = (
+                "COMPLETED" if registered_control["comparison_complete"] else "INCOMPLETE"
+            )
         if not cleanup_proven and evidence.get("gate_status") == "PASS":
             validation["result_code"] = "cleanup_or_process_attestation_unconfirmed"
         validation["windows_version"] = evidence.get("windows_version")

@@ -42,13 +42,19 @@ def main():
     variants["cwd_control_directory"] = common.replace('env_block, argv[4], &startup.StartupInfo, &process)', 'env_block, control_dir, &startup.StartupInfo, &process)').replace('    if (argc != 8) return 21;\n    if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());', '    wchar_t control_dir[32768];\n    wchar_t *last_slash;\n    if (argc != 8) return 21;\n    wcscpy_s(control_dir, _countof(control_dir), argv[0]);\n    last_slash = wcsrchr(control_dir, L\'\\\\\');\n    if (!last_slash) return 21;\n    *last_slash = L\'\\0\';\n    if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());')
     variants["system32_image"] = common.replace('if (!CreateProcessW(argv[0], command,', 'if (!CreateProcessW(L"C:\\\\Windows\\\\System32\\\\whoami.exe", command,')
     variants["no_create_no_window"] = common.replace(' | CREATE_NO_WINDOW', '')
-    # Sort only the same five keys; values and double-NUL termination unchanged.
-    lines = common.splitlines(keepends=True)
-    first = next(i for i, line in enumerate(lines) if 'L"SystemRoot=%ls", windows_dir); APPEND_ENV(item);' in line)
-    block = lines[first:first+5]
-    assert 'windir' in block[1] and 'APPEND_ENV(path_env)' in block[2] and 'TEMP' in block[3] and 'TMP' in block[4]
-    lines[first:first+5] = [block[2], block[0], block[3], block[4], block[1]]
-    variants["sorted_same_environment"] = ''.join(lines)
+    # The checked-in launcher already sorts the same bounded environment.
+    # Keep the historical named control as an explicit no-op and guard its order.
+    sorted_entries = (
+        "if (drive_environment_present) APPEND_ENV(drive_env);",
+        "APPEND_ENV(path_env);",
+        "APPEND_ENV(system_root_env);",
+        "APPEND_ENV(temp_env);",
+        "APPEND_ENV(tmp_env);",
+        "APPEND_ENV(windir_env);",
+    )
+    positions = [common.index(entry) for entry in sorted_entries]
+    assert positions == sorted(positions)
+    variants["sorted_same_environment"] = common
     vswhere = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
     located = subprocess.run([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"], capture_output=True, text=True, timeout=30, check=True)
     devcmd = Path(located.stdout.strip().splitlines()[-1]) / "Common7/Tools/VsDevCmd.bat"

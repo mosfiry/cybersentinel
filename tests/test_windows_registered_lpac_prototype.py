@@ -453,6 +453,7 @@ def test_native_lpac_registered_profile_storage_boundary(tmp_path: Path, registe
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace", shell=False, timeout=45, check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=helpers._safe_native_environment(dict(os.environ)),
             )
         except subprocess.TimeoutExpired:
             probe_timed_out = True
@@ -474,7 +475,11 @@ def test_native_lpac_registered_profile_storage_boundary(tmp_path: Path, registe
             }
         launch_diagnostic = helpers._launch_failure_diagnostic(process_result.stderr)
         if launch_diagnostic is not None:
-            summary["launcher_failure_diagnostic"] = launch_diagnostic
+            environment_control = launch_diagnostic.get("environment_control")
+            if isinstance(environment_control, dict):
+                summary["environment_control"] = environment_control
+            if process_result.returncode != 0:
+                summary["launcher_failure_diagnostic"] = launch_diagnostic
         post_exit = _post_exit_attestation(process_result.stderr)
         post_exit_valid = (
             isinstance(post_exit, dict)

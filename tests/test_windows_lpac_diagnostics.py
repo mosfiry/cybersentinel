@@ -6,7 +6,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_lpac_launch_failure_captures_error_before_diagnostics_and_stays_failed():
     source = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
-    launch = source.split("if (!CreateProcessW(argv[0]", 1)[1].split("if (!AssignProcessToJobObject", 1)[0]
+    binding = source.split("job_list[0] = job;", 1)[1].split("if (!CreateProcessW(argv[0]", 1)[0]
+    launch = source.split("if (!CreateProcessW(argv[0]", 1)[1].split("job_query_ok = IsProcessInJob", 1)[0]
+    assert "UpdateProcThreadAttribute" in binding and "PROC_THREAD_ATTRIBUTE_JOB_LIST" in binding
     assert "DWORD launch_error = GetLastError();" in launch
     assert launch.index("DWORD launch_error = GetLastError();") < launch.index("report_launch_failure(")
     assert 'status = fail(L"CreateProcessW LPAC", launch_error); goto done;' in launch

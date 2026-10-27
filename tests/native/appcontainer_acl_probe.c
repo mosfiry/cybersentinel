@@ -533,6 +533,283 @@ static BOOL append_quoted(wchar_t *dst, size_t cap, size_t *used, const wchar_t 
 
 typedef LONG (WINAPI *LastNtStatusFn)(void);
 
+typedef struct EnvironmentControlResult {
+    BOOL diagnostic_only;
+    BOOL parent_environment_filtered;
+    BOOL attempted;
+    DWORD setup_error;
+    BOOL create_succeeded;
+    DWORD create_win32_error;
+    BOOL create_ntstatus_available;
+    LONG create_ntstatus;
+    DWORD job_attribute_error;
+    BOOL job_membership_verified;
+    DWORD job_membership_error;
+    BOOL token_verified;
+    DWORD token_verification_error;
+    BOOL terminated;
+    DWORD job_active_processes;
+    DWORD job_total_processes;
+    BOOL job_empty;
+    BOOL cleanup_confirmed;
+    DWORD cleanup_error;
+} EnvironmentControlResult;
+
+static BOOL control_environment_is_filtered(void) {
+    static const wchar_t *safe_names[] = {
+        L"ALLUSERSPROFILE", L"APPDATA", L"COMSPEC", L"HOMEDRIVE", L"HOMEPATH",
+        L"LOCALAPPDATA", L"NUMBER_OF_PROCESSORS", L"OS", L"PATH", L"PATHEXT",
+        L"PROCESSOR_ARCHITECTURE", L"PROCESSOR_IDENTIFIER", L"PROCESSOR_LEVEL",
+        L"PROCESSOR_REVISION", L"PROGRAMDATA", L"PROGRAMFILES", L"PROGRAMFILES(X86)",
+        L"PROGRAMW6432", L"PUBLIC", L"SYSTEMDRIVE", L"SYSTEMROOT", L"TEMP", L"TMP",
+        L"USERDOMAIN", L"USERDOMAIN_ROAMINGPROFILE", L"USERNAME", L"USERPROFILE", L"WINDIR",
+        L"CYBERSENTINEL_TEST_ENV_SANITIZED"
+    };
+    static const wchar_t *sensitive_markers[] = {
+        L"TOKEN", L"SECRET", L"PASS", L"CREDENTIAL", L"KEY", L"AUTH", L"COOKIE", L"CERT"
+    };
+    LPWCH block = GetEnvironmentStringsW();
+    const wchar_t *entry;
+    BOOL safe = TRUE;
+    size_t i;
+    if (!block) return FALSE;
+    for (entry = block; *entry; entry += wcslen(entry) + 1) {
+        const wchar_t *separator = entry[0] == L'=' ? wcschr(entry + 1, L'=') : wcschr(entry, L'=');
+        wchar_t name[256];
+        size_t name_length;
+        BOOL allowed = FALSE;
+        if (!separator) { safe = FALSE; break; }
+        name_length = (size_t)(separator - entry);
+        if (!name_length || name_length >= _countof(name) ||
+            wcsncpy_s(name, _countof(name), entry, name_length) != 0) {
+            safe = FALSE;
+            break;
+        }
+        for (i = 0; name[i]; ++i) {
+            if (name[i] >= L'a' && name[i] <= L'z') name[i] = (wchar_t)(name[i] - L'a' + L'A');
+        }
+        for (i = 0; i < _countof(safe_names); ++i) {
+            if (_wcsicmp(name, safe_names[i]) == 0) { allowed = TRUE; break; }
+        }
+        if (name[0] == L'=' && name[1] >= L'A' && name[1] <= L'Z' &&
+            name[2] == L':' && name[3] == L'\0')
+            allowed = TRUE;
+        if (!allowed && (!_wcsnicmp(name, L"ACTIONS_", 8) ||
+                         !_wcsnicmp(name, L"GITHUB_", 7) ||
+                         !_wcsnicmp(name, L"RUNNER_", 7))) {
+            safe = FALSE;
+            break;
+        }
+        for (i = 0; i < _countof(sensitive_markers); ++i) {
+            if (wcsstr(name, sensitive_markers[i])) { safe = FALSE; break; }
+        }
+        if (!allowed) safe = FALSE;
+        if (!safe) break;
+    }
+    FreeEnvironmentStringsW(block);
+    return safe;
+}
+
+static BOOL run_lp_environment_null_control(
+    const wchar_t *image, const wchar_t *command, const wchar_t *cwd,
+    const STARTUPINFOEXW *startup, const SECURITY_CAPABILITIES *caps,
+    const DWORD *all_packages_policy, DWORD launch_flags, PSID expected_sid,
+    LastNtStatusFn last_nt_status, EnvironmentControlResult *result,
+    HANDLE *control_job_out, PROCESS_INFORMATION *control_process_out) {
+    ProbeJobExtendedLimitInformation job_limits;
+    wchar_t control_command[32768];
+    HANDLE control_job = NULL, process_token = NULL;
+    PROCESS_INFORMATION control_process;
+    SIZE_T attr_size = 0;
+    LPPROC_THREAD_ATTRIBUTE_LIST control_attrs = NULL;
+    STARTUPINFOEXW control_startup;
+    HANDLE control_job_list[1] = { NULL };
+    BOOL attrs_initialized = FALSE, in_job = FALSE;
+    DWORD wait_status, attr_error;
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+    ZeroMemory(result, sizeof(*result));
+    ZeroMemory(&control_process, sizeof(control_process));
+    ZeroMemory(&accounting, sizeof(accounting));
+    ZeroMemory(&control_startup, sizeof(control_startup));
+    *control_job_out = NULL;
+    ZeroMemory(control_process_out, sizeof(*control_process_out));
+    result->diagnostic_only = TRUE;
+    {
+        wchar_t marker[8];
+        DWORD marker_length = GetEnvironmentVariableW(
+            L"CYBERSENTINEL_TEST_ENV_SANITIZED", marker, (DWORD)_countof(marker));
+        result->parent_environment_filtered =
+            marker_length == 1 && marker[0] == L'1' && control_environment_is_filtered();
+    }
+    if (!result->parent_environment_filtered) {
+        result->setup_error = ERROR_ACCESS_DENIED;
+        return TRUE;
+    }
+    if (wcscpy_s(control_command, _countof(control_command), command) != 0) {
+        result->setup_error = ERROR_INSUFFICIENT_BUFFER;
+        return TRUE;
+    }
+    ZeroMemory(&job_limits, sizeof(job_limits));
+    job_limits.BasicLimitInformation.LimitFlags = 0x00002000; /* JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE */
+    control_job = CreateJobObjectW(NULL, NULL);
+    if (!control_job || !SetInformationJobObject(control_job, (JOBOBJECTINFOCLASS)9,
+                                                  &job_limits, (DWORD)sizeof(job_limits))) {
+        result->setup_error = GetLastError();
+        if (control_job) CloseHandle(control_job);
+        return TRUE;
+    }
+    if (InitializeProcThreadAttributeList(NULL, 3, 0, &attr_size)) {
+        result->setup_error = ERROR_INVALID_DATA;
+        if (!CloseHandle(control_job)) result->cleanup_error = GetLastError();
+        return TRUE;
+    }
+    attr_error = GetLastError();
+    if (attr_error != ERROR_INSUFFICIENT_BUFFER || !attr_size) {
+        result->setup_error = attr_error ? attr_error : ERROR_INVALID_DATA;
+        if (!CloseHandle(control_job)) result->cleanup_error = GetLastError();
+        return TRUE;
+    }
+    control_attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
+    if (!control_attrs) {
+        result->setup_error = ERROR_NOT_ENOUGH_MEMORY;
+        if (!CloseHandle(control_job)) result->cleanup_error = GetLastError();
+        return TRUE;
+    }
+    if (!InitializeProcThreadAttributeList(control_attrs, 3, 0, &attr_size)) {
+        result->setup_error = GetLastError();
+        HeapFree(GetProcessHeap(), 0, control_attrs);
+        if (!CloseHandle(control_job)) result->cleanup_error = GetLastError();
+        return TRUE;
+    }
+    attrs_initialized = TRUE;
+    control_job_list[0] = control_job;
+    if (!UpdateProcThreadAttribute(control_attrs, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                                   (PVOID)caps, sizeof(*caps), NULL, NULL) ||
+        !UpdateProcThreadAttribute(control_attrs, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+                                   (PVOID)all_packages_policy, sizeof(*all_packages_policy), NULL, NULL)) {
+        result->setup_error = GetLastError();
+        goto control_setup_failed;
+    }
+    if (!UpdateProcThreadAttribute(control_attrs, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                                   control_job_list, sizeof(control_job_list), NULL, NULL)) {
+        result->job_attribute_error = GetLastError();
+        result->setup_error = result->job_attribute_error;
+        goto control_setup_failed;
+    }
+    control_startup = *startup;
+    control_startup.lpAttributeList = control_attrs;
+    result->attempted = TRUE;
+    if (!CreateProcessW(image, control_command, NULL, NULL, FALSE, launch_flags,
+                        NULL, cwd, &control_startup.StartupInfo, &control_process)) {
+        DWORD create_error = GetLastError();
+        result->create_ntstatus_available = last_nt_status != NULL;
+        result->create_ntstatus = last_nt_status ? last_nt_status() : 0;
+        result->create_win32_error = create_error;
+        DeleteProcThreadAttributeList(control_attrs);
+        attrs_initialized = FALSE;
+        HeapFree(GetProcessHeap(), 0, control_attrs);
+        control_attrs = NULL;
+        if (!CloseHandle(control_job)) result->cleanup_error = GetLastError();
+        return TRUE;
+    }
+    DeleteProcThreadAttributeList(control_attrs);
+    attrs_initialized = FALSE;
+    if (!HeapFree(GetProcessHeap(), 0, control_attrs) && result->cleanup_error == ERROR_SUCCESS)
+        result->cleanup_error = GetLastError();
+    control_attrs = NULL;
+    result->create_succeeded = TRUE;
+    *control_job_out = control_job;
+    *control_process_out = control_process;
+    if (!IsProcessInJob(control_process.hProcess, control_job, &in_job))
+        result->job_membership_error = GetLastError();
+    else if (in_job)
+        result->job_membership_verified = TRUE;
+    else
+        result->job_membership_error = ERROR_INVALID_DATA;
+    if (OpenProcessToken(control_process.hProcess, TOKEN_QUERY, &process_token)) {
+        result->token_verified = verify_token(process_token, expected_sid);
+        if (!result->token_verified) result->token_verification_error = ERROR_INVALID_TOKEN;
+        CloseHandle(process_token);
+        process_token = NULL;
+    } else {
+        result->token_verification_error = GetLastError();
+    }
+    if (!TerminateProcess(control_process.hProcess, 0xE5))
+        result->cleanup_error = GetLastError();
+    wait_status = WaitForSingleObject(control_process.hProcess, 5000);
+    if (wait_status != WAIT_OBJECT_0) {
+        DWORD wait_error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+        if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = wait_error;
+        if (!TerminateJobObject(control_job, 0xE5) && result->cleanup_error == ERROR_SUCCESS)
+            result->cleanup_error = GetLastError();
+        if (!TerminateProcess(control_process.hProcess, 0xE5) && result->cleanup_error == ERROR_SUCCESS)
+            result->cleanup_error = GetLastError();
+        wait_status = WaitForSingleObject(control_process.hProcess, 5000);
+    }
+    result->terminated = wait_status == WAIT_OBJECT_0;
+    if (!result->terminated && result->cleanup_error == ERROR_SUCCESS)
+        result->cleanup_error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+    if (QueryInformationJobObject(control_job, JobObjectBasicAccountingInformation,
+                                  &accounting, (DWORD)sizeof(accounting), NULL)) {
+        result->job_active_processes = accounting.ActiveProcesses;
+        result->job_total_processes = accounting.TotalProcesses;
+        result->job_empty = accounting.ActiveProcesses == 0;
+    } else if (result->cleanup_error == ERROR_SUCCESS) {
+        result->cleanup_error = GetLastError();
+    }
+    result->cleanup_confirmed = result->terminated && result->job_empty;
+    if (!result->cleanup_confirmed && result->cleanup_error == ERROR_SUCCESS)
+        result->cleanup_error = ERROR_INVALID_DATA;
+    if (!result->cleanup_confirmed) return FALSE;
+    CloseHandle(control_process.hThread);
+    CloseHandle(control_process.hProcess);
+    ZeroMemory(control_process_out, sizeof(*control_process_out));
+    CloseHandle(control_job);
+    *control_job_out = NULL;
+    return TRUE;
+
+control_setup_failed:
+    if (attrs_initialized) DeleteProcThreadAttributeList(control_attrs);
+    if (control_attrs) HeapFree(GetProcessHeap(), 0, control_attrs);
+    if (!CloseHandle(control_job) && result->cleanup_error == ERROR_SUCCESS)
+        result->cleanup_error = GetLastError();
+    return TRUE;
+}
+
+static void report_environment_control(const EnvironmentControlResult *result) {
+    BOOL comparison_complete = result->diagnostic_only && result->parent_environment_filtered &&
+        result->attempted && result->create_succeeded && result->job_membership_verified &&
+        result->token_verified && result->terminated && result->job_empty && result->cleanup_confirmed &&
+        result->setup_error == ERROR_SUCCESS && result->create_win32_error == ERROR_SUCCESS &&
+        result->job_attribute_error == ERROR_SUCCESS && result->job_membership_error == ERROR_SUCCESS &&
+        result->token_verification_error == ERROR_SUCCESS &&
+        result->cleanup_error == ERROR_SUCCESS && result->job_active_processes == 0 &&
+        result->job_total_processes == 1;
+    fwprintf(stderr,
+        L"lpac_environment_control: {\"version\":1,\"scope\":\"broker_only\","
+        L"\"diagnostic_only\":%ls,\"comparison_complete\":%ls,"
+        L"\"lp_environment_null\":true,\"parent_environment_filtered\":%ls,"
+        L"\"attempted\":%ls,\"setup_error\":%lu,"
+        L"\"create_succeeded\":%ls,\"create_win32_error\":%lu,"
+        L"\"create_ntstatus_available\":%ls,\"create_ntstatus_advisory\":\"0x%08lX\","
+        L"\"job_attribute_error\":%lu,\"job_membership_verified\":%ls,\"job_membership_error\":%lu,"
+        L"\"token_verified\":%ls,\"token_verification_error\":%lu,"
+        L"\"terminated\":%ls,\"job_active_processes\":%lu,\"job_total_processes\":%lu,"
+        L"\"job_empty\":%ls,\"cleanup_confirmed\":%ls,\"cleanup_error\":%lu}\n",
+        result->diagnostic_only ? L"true" : L"false",
+        comparison_complete ? L"true" : L"false",
+        result->parent_environment_filtered ? L"true" : L"false",
+        result->attempted ? L"true" : L"false", (unsigned long)result->setup_error,
+        result->create_succeeded ? L"true" : L"false", (unsigned long)result->create_win32_error,
+        result->create_ntstatus_available ? L"true" : L"false", (unsigned long)result->create_ntstatus,
+        (unsigned long)result->job_attribute_error,
+        result->job_membership_verified ? L"true" : L"false", (unsigned long)result->job_membership_error,
+        result->token_verified ? L"true" : L"false", (unsigned long)result->token_verification_error,
+        result->terminated ? L"true" : L"false", (unsigned long)result->job_active_processes,
+        (unsigned long)result->job_total_processes, result->job_empty ? L"true" : L"false",
+        result->cleanup_confirmed ? L"true" : L"false", (unsigned long)result->cleanup_error);
+}
+
 static BOOL is_absolute_windows_path(const wchar_t *path) {
     BOOL drive_absolute = path &&
         (((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
@@ -643,6 +920,7 @@ static void report_launch_failure(const wchar_t *image, const wchar_t *cwd,
 static int launch_child(int argc, wchar_t **argv) {
     STARTUPINFOEXW startup;
     PROCESS_INFORMATION process;
+    PROCESS_INFORMATION control_process;
     SIZE_T attr_size = 0;
     LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
     SECURITY_CAPABILITIES caps;
@@ -656,10 +934,13 @@ static int launch_child(int argc, wchar_t **argv) {
     BOOL in_job = FALSE;
     BOOL job_query_ok = FALSE;
     HANDLE job = NULL;
+    HANDLE job_list[1] = { NULL }; /* Referenced by the process attribute list until it is destroyed. */
+    HANDLE control_job = NULL;
     wchar_t windows_dir[MAX_PATH], drive_env[MAX_PATH * 2];
     wchar_t path_env[MAX_PATH * 2], env_block[MAX_PATH * 6];
     size_t env_used = 0;
     BOOL drive_environment_present = FALSE;
+    EnvironmentControlResult environment_control;
     ProbeJobExtendedLimitInformation job_limits;
     int status = 20;
     LastNtStatusFn last_nt_status = NULL;
@@ -672,10 +953,12 @@ static int launch_child(int argc, wchar_t **argv) {
     }
     if (argc != 8) return 21;
     if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());
-    memset(&startup, 0, sizeof(startup)); memset(&process, 0, sizeof(process)); memset(&caps, 0, sizeof(caps));
-    InitializeProcThreadAttributeList(NULL, 2, 0, &attr_size);
+    memset(&startup, 0, sizeof(startup)); memset(&process, 0, sizeof(process));
+    memset(&control_process, 0, sizeof(control_process));
+    memset(&environment_control, 0, sizeof(environment_control)); memset(&caps, 0, sizeof(caps));
+    InitializeProcThreadAttributeList(NULL, 3, 0, &attr_size);
     attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
-    if (!attrs || !InitializeProcThreadAttributeList(attrs, 2, 0, &attr_size)) { status = fail(L"allocate process attribute list", GetLastError()); goto done; }
+    if (!attrs || !InitializeProcThreadAttributeList(attrs, 3, 0, &attr_size)) { status = fail(L"allocate process attribute list", GetLastError()); goto done; }
     initialized = TRUE;
     caps.AppContainerSid = sid; caps.Capabilities = NULL; caps.CapabilityCount = 0; caps.Reserved = 0;
     if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &caps, sizeof(caps), NULL, NULL) ||
@@ -724,11 +1007,26 @@ static int launch_child(int argc, wchar_t **argv) {
     }
     env_block[env_used] = L'\0';
 #undef APPEND_ENV
+    if (!run_lp_environment_null_control(
+            argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            sid, last_nt_status, &environment_control, &control_job, &control_process)) {
+        report_environment_control(&environment_control);
+        status = fail(L"environment control cleanup unconfirmed",
+                      environment_control.cleanup_error ? environment_control.cleanup_error : ERROR_INVALID_DATA);
+        goto done;
+    }
+    report_environment_control(&environment_control);
     ZeroMemory(&job_limits, sizeof(job_limits));
     job_limits.BasicLimitInformation.LimitFlags = 0x00002000; /* JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE */
     job = CreateJobObjectW(NULL, NULL);
     if (!job || !SetInformationJobObject(job, (JOBOBJECTINFOCLASS)9, &job_limits, (DWORD)sizeof(job_limits))) {
         status = fail(L"create bounded child job", GetLastError()); goto done;
+    }
+    job_list[0] = job;
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                                   job_list, sizeof(HANDLE), NULL, NULL)) {
+        status = fail(L"set LPAC child job attribute", GetLastError()); goto done;
     }
     if (!CreateProcessW(argv[0], command, NULL, NULL, FALSE,
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
@@ -740,20 +1038,17 @@ static int launch_child(int argc, wchar_t **argv) {
             last_nt_status != NULL, nt_status, drive_environment_present);
         status = fail(L"CreateProcessW LPAC", launch_error); goto done;
     }
-    if (!AssignProcessToJobObject(job, process.hProcess)) {
-        DWORD error = GetLastError();
-        TerminateProcess(process.hProcess, 28); WaitForSingleObject(process.hProcess, 5000);
-        status = fail(L"assign LPAC child to kill-on-close job", error); goto done;
-    }
     job_query_ok = IsProcessInJob(process.hProcess, job, &in_job);
     if (!job_query_ok || !in_job) {
         DWORD error = job_query_ok ? ERROR_INVALID_DATA : GetLastError();
+        TerminateJobObject(job, 28);
         TerminateProcess(process.hProcess, 28); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"verify suspended LPAC child job membership", error); goto done;
     }
     if (!OpenProcessToken(process.hProcess, TOKEN_QUERY, &process_token) || !verify_token(process_token, sid)) {
         DWORD error = GetLastError();
         if (process_token) { CloseHandle(process_token); process_token = NULL; }
+        TerminateJobObject(job, 26);
         TerminateProcess(process.hProcess, 26); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"suspended LPAC child token verification", error ? error : ERROR_INVALID_TOKEN); goto done;
     }
@@ -763,10 +1058,11 @@ static int launch_child(int argc, wchar_t **argv) {
         L"\"is_appcontainer\":true,\"is_lpac\":true,\"low_integrity\":true,"
         L"\"expected_sid_match\":true,\"zero_capabilities\":true,"
         L"\"job_membership_verified\":true}\n");
-    if (ResumeThread(process.hThread) == (DWORD)-1) { status = fail(L"resume LPAC child", GetLastError()); TerminateProcess(process.hProcess, 26); WaitForSingleObject(process.hProcess, 5000); goto done; }
+    if (ResumeThread(process.hThread) == (DWORD)-1) { status = fail(L"resume LPAC child", GetLastError()); TerminateJobObject(job, 26); TerminateProcess(process.hProcess, 26); WaitForSingleObject(process.hProcess, 5000); goto done; }
     wait_status = WaitForSingleObject(process.hProcess, CHILD_TIMEOUT_MS);
     if (wait_status != WAIT_OBJECT_0) {
         DWORD error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+        TerminateJobObject(job, 27);
         TerminateProcess(process.hProcess, 27); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"bounded LPAC child wait", error); goto done;
     }
@@ -789,10 +1085,17 @@ static int launch_child(int argc, wchar_t **argv) {
     CloseHandle(process.hThread); CloseHandle(process.hProcess); process.hThread = NULL; process.hProcess = NULL;
 done:
     if (process_token) CloseHandle(process_token);
+    if (control_process.hProcess) {
+        TerminateProcess(control_process.hProcess, 0xE6);
+        WaitForSingleObject(control_process.hProcess, 5000);
+    }
+    if (control_process.hThread) CloseHandle(control_process.hThread);
+    if (control_process.hProcess) CloseHandle(control_process.hProcess);
     if (process.hThread) CloseHandle(process.hThread);
     if (process.hProcess) CloseHandle(process.hProcess);
     if (initialized) DeleteProcThreadAttributeList(attrs);
     if (attrs) HeapFree(GetProcessHeap(), 0, attrs);
+    if (control_job) CloseHandle(control_job); /* Kills any assigned suspended diagnostic process. */
     if (job) CloseHandle(job); /* Kills any unexpected surviving child before the launcher exits. */
     if (sid) LocalFree(sid);
     return status;

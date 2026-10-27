@@ -38,5 +38,11 @@ def test_control_deltas_are_independent():
     assert controls["no_create_no_window"] == baseline.replace(" | CREATE_NO_WINDOW", "")
     assert "env_block, control_dir," in controls["cwd_control_directory"]
     assert 'L"C:\\\\Windows\\\\System32\\\\whoami.exe"' in controls["system32_image"]
-    env = controls["sorted_same_environment"].split("wchar_t item[MAX_PATH * 2];", 1)[1].split("env_block[env_used]", 1)[0]
-    assert env.index("APPEND_ENV(path_env)") < env.index("SystemRoot") < env.index("TEMP") < env.index("TMP") < env.index("windir")
+    assert controls["sorted_same_environment"] == baseline
+    env = baseline.split("wchar_t windows_dir", 1)[1].split("env_block[env_used]", 1)[0]
+    entries = (
+        "APPEND_ENV(drive_env)", "APPEND_ENV(path_env)", "APPEND_ENV(system_root_env)",
+        "APPEND_ENV(temp_env)", "APPEND_ENV(tmp_env)", "APPEND_ENV(windir_env)",
+    )
+    positions = [env.index(entry) for entry in entries]
+    assert positions == sorted(positions)

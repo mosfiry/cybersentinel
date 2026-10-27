@@ -25,6 +25,31 @@ _DACL_SECURITY_INFORMATION = 0x00000004
 _LABEL_SECURITY_INFORMATION = 0x00000010
 _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 _SE_FILE_OBJECT = 1
+_SAFE_NATIVE_ENV_KEYS = frozenset({
+    "ALLUSERSPROFILE", "APPDATA", "COMSPEC", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS", "OS", "PATH", "PATHEXT", "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PUBLIC", "SYSTEMDRIVE",
+    "SYSTEMROOT", "TEMP", "TMP", "USERDOMAIN", "USERDOMAIN_ROAMINGPROFILE", "USERNAME",
+    "USERPROFILE", "WINDIR",
+})
+_NATIVE_ENV_SECRET_MARKERS = (
+    "TOKEN", "SECRET", "PASS", "CREDENTIAL", "KEY", "AUTH", "COOKIE", "CERT",
+)
+
+
+def _safe_native_environment(source: dict[str, str]) -> dict[str, str]:
+    """Pass only allowlisted Windows system variables to the native test probe."""
+    safe: dict[str, str] = {}
+    for key, value in source.items():
+        upper = key.upper()
+        if upper not in _SAFE_NATIVE_ENV_KEYS:
+            continue
+        if any(marker in upper for marker in _NATIVE_ENV_SECRET_MARKERS):
+            continue
+        safe[key] = value
+    safe["CYBERSENTINEL_TEST_ENV_SANITIZED"] = "1"
+    return dict(sorted(safe.items(), key=lambda item: item[0].upper()))
 
 
 def _run_compile_command(command: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -403,6 +428,7 @@ def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, repo
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", shell=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=_safe_native_environment(dict(os.environ)),
     )
     try:
         stdout, stderr = process.communicate(timeout=40)
@@ -410,10 +436,13 @@ def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, repo
         process.kill()
         process.communicate(timeout=5)
         raise AssertionError("native LPAC launcher exceeded its bounded 40-second deadline")
+    diagnostic = _launch_failure_diagnostic(stderr)
     if process.returncode != 0:
         record_property("parent_launch_return_code", str(process.returncode))
-        diagnostic = _launch_failure_diagnostic(stderr)
-        if diagnostic is not None:
+    if diagnostic is not None:
+        if isinstance(diagnostic.get("environment_control"), dict):
+            record_property("parent_environment_control", json.dumps(diagnostic["environment_control"], sort_keys=True))
+        if process.returncode != 0:
             record_property("parent_launch_failure_diagnostic", json.dumps(diagnostic, sort_keys=True))
     assert process.returncode == 0, f"LPAC launcher/child failed ({process.returncode}); stdout={stdout[-1000:]}; stderr={stderr[-2000:]}"
     assert report.is_file(), f"LPAC child produced no bounded JSON evidence at {report}"
@@ -438,7 +467,8 @@ _LAUNCH_FAILURE_STEPS = frozenset({
     "parse child SID", "open child token", "child LPAC token verification", "write bounded evidence report",
     "parse launcher SID", "allocate process attribute list", "set LPAC process attributes",
     "build child command line", "build restricted child environment", "child environment too large",
-    "create bounded child job", "CreateProcessW LPAC", "assign LPAC child to kill-on-close job",
+    "create bounded child job", "set LPAC child job attribute", "CreateProcessW LPAC",
+    "environment control cleanup unconfirmed",
     "verify suspended LPAC child job membership", "suspended LPAC child token verification",
     "resume LPAC child", "bounded LPAC child wait", "read child exit code",
     "query completed LPAC job accounting", "LPAC job did not become empty",
@@ -453,18 +483,62 @@ _LAUNCH_DIAGNOSTIC_INT_FIELDS = (
     "image_size_error", "cwd_attributes_error", "known_dependency_mask",
     "known_dependency_expected_mask", "system_directory_error", "broker_bitness", "launch_flags",
 )
+_ENVIRONMENT_CONTROL_BOOL_FIELDS = (
+    "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
+    "attempted", "create_succeeded", "create_ntstatus_available",
+    "job_membership_verified", "token_verified", "terminated", "job_empty", "cleanup_confirmed",
+)
+_ENVIRONMENT_CONTROL_INT_FIELDS = (
+    "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
+    "token_verification_error",
+    "job_active_processes", "job_total_processes", "cleanup_error",
+)
 
 
 def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
     """Extract only fixed failure labels and broker-only scalar diagnostics."""
     result: dict[str, Any] = {}
     prefix = "lpac_launch_diagnostic: "
+    environment_prefix = "lpac_environment_control: "
     for line in stderr.splitlines():
         match = re.fullmatch(r"probe failure: ([A-Za-z0-9 _-]+) \(([0-9]{1,10})\)", line.strip())
         if match and match.group(1) in _LAUNCH_FAILURE_STEPS:
             result["failure_step"] = match.group(1)
             result["failure_win32_error"] = int(match.group(2))
         if not line.startswith(prefix):
+            if line.startswith(environment_prefix):
+                try:
+                    value = json.loads(line[len(environment_prefix):])
+                except (TypeError, ValueError):
+                    continue
+                if (not isinstance(value, dict) or type(value.get("version")) is not int
+                        or value.get("version") != 1 or value.get("scope") != "broker_only"):
+                    continue
+                control: dict[str, Any] = {"version": 1, "scope": "broker_only"}
+                for field in _ENVIRONMENT_CONTROL_BOOL_FIELDS:
+                    if field == "comparison_complete":
+                        continue
+                    if type(value.get(field)) is bool:
+                        control[field] = value[field]
+                for field in _ENVIRONMENT_CONTROL_INT_FIELDS:
+                    if type(value.get(field)) is int:
+                        control[field] = value[field]
+                ntstatus = value.get("create_ntstatus_advisory")
+                if isinstance(ntstatus, str) and re.fullmatch(r"0x[0-9A-Fa-f]{8}", ntstatus):
+                    control["create_ntstatus_advisory"] = ntstatus
+                control["comparison_complete"] = (
+                    all(control.get(field) is True for field in (
+                        "diagnostic_only", "lp_environment_null", "parent_environment_filtered", "attempted",
+                        "create_succeeded", "job_membership_verified", "token_verified", "terminated",
+                        "job_empty", "cleanup_confirmed",
+                    ))
+                    and all(control.get(field) == 0 for field in (
+                        "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
+                        "token_verification_error", "cleanup_error", "job_active_processes",
+                    ))
+                    and control.get("job_total_processes") == 1
+                )
+                result["environment_control"] = control
             continue
         try:
             value = json.loads(line[len(prefix):])
@@ -497,8 +571,22 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "ntstatus_available": True, "ntstatus_advisory": "0xC0000005",
         "broker_pid": 1234, "raw_windows_path": r"C:\private\sensitive",
     }
+    environment_control = {
+        "version": 1, "scope": "broker_only", "diagnostic_only": True, "comparison_complete": True,
+        "lp_environment_null": True, "attempted": True,
+        "parent_environment_filtered": True,
+        "setup_error": 0, "create_succeeded": True, "create_win32_error": 0,
+        "create_ntstatus_available": False, "create_ntstatus_advisory": "0x00000000",
+        "job_attribute_error": 0, "job_membership_verified": True, "job_membership_error": 0,
+        "token_verified": True,
+        "token_verification_error": 0, "terminated": True, "job_active_processes": 0,
+        "job_total_processes": 1, "job_empty": True, "cleanup_confirmed": True,
+        "cleanup_error": 0, "raw_windows_path": r"C:\private\sensitive",
+        "raw_environment": "ACTIONS_RUNTIME_TOKEN=sentinel-secret",
+    }
     parsed = _launch_failure_diagnostic(
         "probe failure: CreateProcessW LPAC (17)\n"
+        "lpac_environment_control: " + json.dumps(environment_control) + "\n"
         "lpac_launch_diagnostic: " + json.dumps(diagnostic)
     )
     assert parsed is not None
@@ -506,8 +594,33 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
     assert parsed["failure_win32_error"] == 17
     assert parsed["create_process"]["win32_error"] == 17
     assert parsed["create_process"]["drive_current_directory_env_present"] is True
+    assert parsed["environment_control"]["diagnostic_only"] is True
+    assert parsed["environment_control"]["comparison_complete"] is True
+    assert parsed["environment_control"]["create_succeeded"] is True
+    assert parsed["environment_control"]["parent_environment_filtered"] is True
+    assert parsed["environment_control"]["job_membership_verified"] is True
+    assert parsed["environment_control"]["cleanup_confirmed"] is True
     assert "broker_pid" not in json.dumps(parsed) and "raw_windows_path" not in json.dumps(parsed)
+    assert "raw_environment" not in json.dumps(parsed)
     assert "sensitive" not in json.dumps(parsed)
+    assert "sentinel-secret" not in json.dumps(parsed)
+
+
+def test_native_probe_environment_excludes_actions_credentials() -> None:
+    safe = _safe_native_environment({
+        "PATH": r"C:\Windows\System32", "TEMP": r"C:\Temp", "SYSTEMROOT": r"C:\Windows",
+        "GITHUB_SHA": "exact-sha", "GITHUB_RUN_ID": "123", "GITHUB_REPOSITORY": "owner/repo",
+        "RUNNER_TEMP": r"C:\runner-temp", "ImageOS": "windows-2025", "ImageVersion": "20261001.1",
+        "=C:": r"C:\workspace",
+        "ACTIONS_RUNTIME_TOKEN": "runtime-secret", "GITHUB_TOKEN": "github-secret",
+        "DEPLOY_PASSWORD": "password-secret", "DOCKER_AUTH_CONFIG": "docker-secret", "SERVICE_KEY": "key-secret",
+    })
+    assert safe["PATH"] == r"C:\Windows\System32" and safe["TEMP"] == r"C:\Temp"
+    assert safe["SYSTEMROOT"] == r"C:\Windows" and "=C:" not in safe
+    assert safe["CYBERSENTINEL_TEST_ENV_SANITIZED"] == "1"
+    assert "GITHUB_SHA" not in safe and "GITHUB_REPOSITORY" not in safe and "RUNNER_TEMP" not in safe
+    assert "ACTIONS_RUNTIME_TOKEN" not in safe and "GITHUB_TOKEN" not in safe
+    assert "DEPLOY_PASSWORD" not in safe and "DOCKER_AUTH_CONFIG" not in safe and "SERVICE_KEY" not in safe
 
 
 def _assert_check(evidence: dict[str, Any], name: str, ok: bool = True, error: int = 0) -> None:
