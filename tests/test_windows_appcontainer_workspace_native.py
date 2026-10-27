@@ -4,6 +4,7 @@ import ctypes
 from contextlib import contextmanager
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -409,6 +410,11 @@ def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, repo
         process.kill()
         process.communicate(timeout=5)
         raise AssertionError("native LPAC launcher exceeded its bounded 40-second deadline")
+    if process.returncode != 0:
+        record_property("parent_launch_return_code", str(process.returncode))
+        diagnostic = _launch_failure_diagnostic(stderr)
+        if diagnostic is not None:
+            record_property("parent_launch_failure_diagnostic", json.dumps(diagnostic, sort_keys=True))
     assert process.returncode == 0, f"LPAC launcher/child failed ({process.returncode}); stdout={stdout[-1000:]}; stderr={stderr[-2000:]}"
     assert report.is_file(), f"LPAC child produced no bounded JSON evidence at {report}"
     evidence = json.loads(report.read_text(encoding="utf-8"))
@@ -426,6 +432,79 @@ def _launch(probe: Path, workspace: Any, mode: str, arg1: Path, arg2: Path, repo
     record_property("parent_pre_resume_attestation", json.dumps(pre, sort_keys=True))
     record_property("parent_post_exit_job_attestation", json.dumps(post, sort_keys=True))
     return evidence
+
+
+_LAUNCH_FAILURE_STEPS = frozenset({
+    "parse child SID", "open child token", "child LPAC token verification", "write bounded evidence report",
+    "parse launcher SID", "allocate process attribute list", "set LPAC process attributes",
+    "build child command line", "build restricted child environment", "child environment too large",
+    "create bounded child job", "CreateProcessW LPAC", "assign LPAC child to kill-on-close job",
+    "verify suspended LPAC child job membership", "suspended LPAC child token verification",
+    "resume LPAC child", "bounded LPAC child wait", "read child exit code",
+    "query completed LPAC job accounting", "LPAC job did not become empty",
+})
+_LAUNCH_DIAGNOSTIC_BOOL_FIELDS = (
+    "image_is_absolute", "image_is_file", "parent_can_read_image", "image_size_available",
+    "cwd_is_absolute", "cwd_is_directory", "module_matches_image", "ntstatus_available",
+)
+_LAUNCH_DIAGNOSTIC_INT_FIELDS = (
+    "win32_error", "image_attributes_error", "image_open_error", "image_size_bytes",
+    "image_size_error", "cwd_attributes_error", "known_dependency_mask",
+    "known_dependency_expected_mask", "system_directory_error", "broker_bitness", "launch_flags",
+)
+
+
+def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
+    """Extract only fixed failure labels and broker-only scalar diagnostics."""
+    result: dict[str, Any] = {}
+    prefix = "lpac_launch_diagnostic: "
+    for line in stderr.splitlines():
+        match = re.fullmatch(r"probe failure: ([A-Za-z0-9 _-]+) \(([0-9]{1,10})\)", line.strip())
+        if match and match.group(1) in _LAUNCH_FAILURE_STEPS:
+            result["failure_step"] = match.group(1)
+            result["failure_win32_error"] = int(match.group(2))
+        if not line.startswith(prefix):
+            continue
+        try:
+            value = json.loads(line[len(prefix):])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(value, dict) or type(value.get("version")) is not int or value.get("version") != 2 or value.get("scope") != "broker_only":
+            continue
+        diagnostic: dict[str, Any] = {"version": 2, "scope": "broker_only"}
+        for field in _LAUNCH_DIAGNOSTIC_BOOL_FIELDS:
+            if type(value.get(field)) is bool:
+                diagnostic[field] = value[field]
+        for field in _LAUNCH_DIAGNOSTIC_INT_FIELDS:
+            if type(value.get(field)) is int:
+                diagnostic[field] = value[field]
+        ntstatus = value.get("ntstatus_advisory")
+        if isinstance(ntstatus, str) and re.fullmatch(r"0x[0-9A-Fa-f]{8}", ntstatus):
+            diagnostic["ntstatus_advisory"] = ntstatus
+        result["create_process"] = diagnostic
+    return result or None
+
+
+def test_launch_failure_diagnostic_is_allowlisted() -> None:
+    diagnostic = {
+        "version": 2, "scope": "broker_only", "win32_error": 17,
+        "image_is_absolute": True, "image_is_file": True, "parent_can_read_image": True,
+        "image_size_available": True, "image_size_bytes": 4096, "cwd_is_absolute": True,
+        "cwd_is_directory": True, "module_matches_image": True, "known_dependency_mask": 15,
+        "known_dependency_expected_mask": 15, "broker_bitness": 64, "launch_flags": 0x8000,
+        "ntstatus_available": True, "ntstatus_advisory": "0xC0000005",
+        "broker_pid": 1234, "raw_windows_path": r"C:\private\sensitive",
+    }
+    parsed = _launch_failure_diagnostic(
+        "probe failure: CreateProcessW LPAC (17)\n"
+        "lpac_launch_diagnostic: " + json.dumps(diagnostic)
+    )
+    assert parsed is not None
+    assert parsed["failure_step"] == "CreateProcessW LPAC"
+    assert parsed["failure_win32_error"] == 17
+    assert parsed["create_process"]["win32_error"] == 17
+    assert "broker_pid" not in json.dumps(parsed) and "raw_windows_path" not in json.dumps(parsed)
+    assert "sensitive" not in json.dumps(parsed)
 
 
 def _assert_check(evidence: dict[str, Any], name: str, ok: bool = True, error: int = 0) -> None:

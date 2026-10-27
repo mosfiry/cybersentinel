@@ -457,19 +457,56 @@ def test_native_lpac_registered_profile_storage_boundary(tmp_path: Path, registe
         except subprocess.TimeoutExpired:
             probe_timed_out = True
             raise PrototypeError("registered_storage_probe_timeout") from None
+        summary["launcher_exit_code"] = int(process_result.returncode)
+        attestation = _pre_resume_attestation(process_result.stderr)
+        required_parent_fields = (
+            "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
+            "expected_sid_match", "zero_capabilities", "job_membership_verified",
+        )
+        pre_resume_valid = isinstance(attestation, dict) and type(attestation.get("version")) is int and attestation.get("version") == 1 and all(
+            attestation.get(field) is True for field in required_parent_fields
+        )
+        summary["pre_resume_attestation_present"] = isinstance(attestation, dict)
+        if isinstance(attestation, dict):
+            summary["pre_resume_attestation"] = {
+                "version": 1 if type(attestation.get("version")) is int and attestation.get("version") == 1 else None,
+                **{field: attestation.get(field) is True for field in required_parent_fields},
+            }
+        launch_diagnostic = helpers._launch_failure_diagnostic(process_result.stderr)
+        if launch_diagnostic is not None:
+            summary["launcher_failure_diagnostic"] = launch_diagnostic
         post_exit = _post_exit_attestation(process_result.stderr)
-        if (not isinstance(post_exit, dict) or post_exit.get("version") != 1 or
-                post_exit.get("active_processes") != 0 or post_exit.get("total_processes") != 1):
+        post_exit_valid = (
+            isinstance(post_exit, dict)
+            and type(post_exit.get("version")) is int and post_exit.get("version") == 1
+            and type(post_exit.get("active_processes")) is int and post_exit.get("active_processes") == 0
+            and type(post_exit.get("total_processes")) is int and post_exit.get("total_processes") == 1
+        )
+        summary["post_exit_job_attestation_present"] = isinstance(post_exit, dict)
+        if isinstance(post_exit, dict):
+            summary["post_exit_job_attestation"] = {
+                "version": post_exit.get("version") if type(post_exit.get("version")) is int else None,
+                "active_processes": post_exit.get("active_processes") if type(post_exit.get("active_processes")) is int else None,
+                "total_processes": post_exit.get("total_processes") if type(post_exit.get("total_processes")) is int else None,
+            }
+        if post_exit_valid:
+            profile_c.job_is_empty = True
+            profile_c.handles_closed = True
+        if process_result.returncode != 0:
+            if launch_diagnostic is not None or not pre_resume_valid:
+                raise PrototypeError("registered_profile_launcher_failed")
+            if post_exit_valid:
+                raise PrototypeError("registered_profile_child_failed")
+        if not post_exit_valid:
             raise PrototypeError("post_exit_job_empty_attestation_missing")
-        profile_c.job_is_empty = True
-        profile_c.handles_closed = True
+        if process_result.returncode != 0:
+            raise PrototypeError("registered_profile_child_failed")
         if not report_path.is_file():
             raise PrototypeError("registered_storage_evidence_missing")
         probe_report = json.loads(report_path.read_text(encoding="utf-8"))
         if profile_c.journal.state == "PROBE_RUNNING":
             profile_c.journal.transition("PROBE_COMPLETE")
 
-        attestation = _pre_resume_attestation(process_result.stderr)
         checks = _check_map(probe_report)
         required_token_fields = (
             "token_verified", "is_appcontainer", "is_lpac", "low_integrity",

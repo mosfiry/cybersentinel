@@ -18,7 +18,7 @@ Build and run a **separate, non-production Windows experiment** for a unique reg
 1. **Baseline checkpoint** — verify clean D2 start SHA and protected refs; create this experiment branch; save and push baseline + task plan. No code changes in this checkpoint.
 2. **Prototype lifecycle contract** — add isolated tooling/tests for unique run IDs and registered profile creation/ownership states; refuse pre-existing or ambiguous profiles; make cleanup/recovery conservative and document limits. No production integration.
 3. **Native storage gate** — run on Windows, create a dedicated bounded workspace (prefer the existing fixed-capacity VHD primitive), register fresh profiles, capture before/after profile inventory and actual local-data path, and probe only bounded file/registry fixtures as an LPAC child. Validate token and Job membership before resuming the fixture. Confirm all profile handles/child processes are closed before cleanup. If the fixture can write outside the accepted workspace boundary, stop and record the exact failure code; do not continue to Mission or broader workload testing.
-4. **Strict Windows CI and evidence** — use a hosted Windows runner tied to the exact commit SHA; run the original four LPAC tests and the new registered-storage gate together with no skip/xfail/soft-failed native cases; retain sanitized per-case results, allowlisted token/Job attestations and failure artifacts; record Windows build and run URL. Upload no raw JUnit, trace, path or SID data to public artifacts.
+4. **Strict Windows CI and evidence** — use a hosted Windows runner tied to the exact commit SHA; run the original four LPAC tests and the new registered-storage gate together with no skip/xfail/soft-failed native cases; retain sanitized per-case results, allowlisted token/Job attestations, fixed launcher failure codes and failure artifacts; record Windows build and run URL. Upload no raw JUnit, trace, path or SID data to public artifacts.
 5. **Further stages only if gate 3 passes** — evaluate broader file/network denial, true simultaneous task execution, cancellation/timeout, crash recovery and Mission only after an independently reviewed boundary proof. Host reboot recovery requires a persistent Windows environment and remains unproven by a disposable hosted runner. Any unproven condition remains `BLOCKED`, `FAIL`, or `INCONCLUSIVE`; never close D2 on partial evidence.
 
 ## Verification
@@ -37,7 +37,7 @@ Build and run a **separate, non-production Windows experiment** for a unique reg
 | Create/Delete profile APIs may leave partial state or open-handle residue | Append-only fsync lifecycle states; cleanup only after process-tree and handle closure; quarantine ambiguity. Do not claim reboot durability from runner temp storage. |
 | Profile name/SID reuse or concurrent races | Cryptographically random per-run names, unique SID checks and no adoption of existing names. |
 | Public artifacts may disclose SID/paths | Redact raw values; preserve raw traces only in approved private evidence storage. |
-| Baseline workflow branch allowlists may prevent experimental CI | Add only this exact branch to existing triggers/guards; do not alter test inventories or success policy. |
+| Baseline workflow branch allowlists may prevent experimental CI | Use a separate exact-branch workflow and source guards; do not alter legacy triggers, test inventories, or success policy. |
 
 ## Task list
 

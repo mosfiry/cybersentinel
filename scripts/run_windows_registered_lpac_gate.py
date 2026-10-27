@@ -18,6 +18,50 @@ LEGACY_NATIVE_CASES = [
     "test_native_lpac_exit_cleanup_revokes_workspace",
 ]
 EXPECTED_NATIVE_CASES = [*LEGACY_NATIVE_CASES, NATIVE_CASE]
+LEGACY_LAUNCH_FAILURE_STEPS = {
+    "parse child SID", "open child token", "child LPAC token verification", "write bounded evidence report",
+    "parse launcher SID", "allocate process attribute list", "set LPAC process attributes",
+    "build child command line", "build restricted child environment", "child environment too large",
+    "create bounded child job", "CreateProcessW LPAC", "assign LPAC child to kill-on-close job",
+    "verify suspended LPAC child job membership", "suspended LPAC child token verification",
+    "resume LPAC child", "bounded LPAC child wait", "read child exit code",
+    "query completed LPAC job accounting", "LPAC job did not become empty",
+}
+LAUNCH_DIAGNOSTIC_BOOL_FIELDS = (
+    "image_is_absolute", "image_is_file", "parent_can_read_image", "image_size_available",
+    "cwd_is_absolute", "cwd_is_directory", "module_matches_image", "ntstatus_available",
+)
+LAUNCH_DIAGNOSTIC_INT_FIELDS = (
+    "win32_error", "image_attributes_error", "image_open_error", "image_size_bytes",
+    "image_size_error", "cwd_attributes_error", "known_dependency_mask",
+    "known_dependency_expected_mask", "system_directory_error", "broker_bitness", "launch_flags",
+)
+
+
+def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    safe: dict[str, object] = {}
+    step = value.get("failure_step")
+    if isinstance(step, str) and step in LEGACY_LAUNCH_FAILURE_STEPS:
+        safe["failure_step"] = step
+    code = value.get("failure_win32_error")
+    if type(code) is int and 0 <= code <= 0xFFFFFFFF:
+        safe["failure_win32_error"] = code
+    raw_diagnostic = value.get("create_process")
+    if isinstance(raw_diagnostic, dict) and type(raw_diagnostic.get("version")) is int and raw_diagnostic.get("version") == 2 and raw_diagnostic.get("scope") == "broker_only":
+        diagnostic: dict[str, object] = {"version": 2, "scope": "broker_only"}
+        for field in LAUNCH_DIAGNOSTIC_BOOL_FIELDS:
+            if type(raw_diagnostic.get(field)) is bool:
+                diagnostic[field] = raw_diagnostic[field]
+        for field in LAUNCH_DIAGNOSTIC_INT_FIELDS:
+            if type(raw_diagnostic.get(field)) is int:
+                diagnostic[field] = raw_diagnostic[field]
+        ntstatus = raw_diagnostic.get("ntstatus_advisory")
+        if isinstance(ntstatus, str) and len(ntstatus) == 10 and ntstatus.startswith("0x") and all(char in "0123456789abcdefABCDEF" for char in ntstatus[2:]):
+            diagnostic["ntstatus_advisory"] = ntstatus
+        safe["create_process"] = diagnostic
+    return safe or None
 
 
 def _junit_counts(path: Path) -> dict[str, object]:
@@ -47,11 +91,32 @@ def _junit_counts(path: Path) -> dict[str, object]:
         case_results.append({"name": name, "outcome": outcome})
         if name not in LEGACY_NATIVE_CASES:
             continue
-        attestation_sets = {"pre_resume": [], "post_exit_job": []}
+        attestation_sets = {
+            "pre_resume": [], "post_exit_job": [],
+            "launcher_return_codes": [], "launcher_failures": [],
+        }
         properties = case.find("properties")
         if properties is not None:
             for prop in properties.findall("property"):
                 property_name = prop.get("name")
+                if property_name == "parent_launch_return_code":
+                    raw_code = prop.get("value", "")
+                    try:
+                        code = int(raw_code)
+                    except ValueError:
+                        continue
+                    if str(code) == raw_code and -0x80000000 <= code <= 0xFFFFFFFF:
+                        attestation_sets["launcher_return_codes"].append(code)
+                    continue
+                if property_name == "parent_launch_failure_diagnostic":
+                    try:
+                        raw_failure = json.loads(prop.get("value", ""))
+                    except json.JSONDecodeError:
+                        continue
+                    safe_failure = _sanitize_parent_launch_failure(raw_failure)
+                    if safe_failure is not None:
+                        attestation_sets["launcher_failures"].append(safe_failure)
+                    continue
                 if property_name not in {"parent_pre_resume_attestation", "parent_post_exit_job_attestation"}:
                     continue
                 try:

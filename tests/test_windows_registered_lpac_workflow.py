@@ -50,6 +50,8 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert 'native_names == expected_native' in runner
     assert 'counts["skipped_count"] == 0' in runner
     assert 'legacy_parent_attestation_coverage' in runner
+    assert 'parent_launch_failure_diagnostic' in runner
+    assert 'parent_launch_return_code' in runner
     assert '"mission_acceptance": "BLOCKED"' in runner
     assert '"backend_enabled_by_slice": False' in runner
     assert '"network_denial"' in runner
@@ -61,6 +63,10 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert '"registered_registry_value_set"' in test_source
     assert '"temp_api_points_to_workspace"' in test_source
     assert '"post_exit_job_attestation"' in test_source
+    assert '"launcher_failure_diagnostic"' in test_source
+    legacy_source = (ROOT / "tests/test_windows_appcontainer_workspace_native.py").read_text(encoding="utf-8")
+    assert "_launch_failure_diagnostic(stderr)" in legacy_source
+    assert 'record_property("parent_launch_failure_diagnostic"' in legacy_source
     assert "GetFinalPathNameByHandleW" in test_source
     native_probe = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
     assert "existing_file ? OPEN_EXISTING : CREATE_NEW" in native_probe
@@ -85,11 +91,21 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
         "version": 1, "active_processes": 0, "total_processes": 1,
         "raw_windows_path": "C:\\sensitive\\private",
     }
+    launcher_failure = {
+        "failure_step": "CreateProcessW LPAC", "failure_win32_error": 17,
+        "create_process": {
+            "version": 2, "scope": "broker_only", "win32_error": 17,
+            "image_is_file": True, "broker_pid": 1234,
+            "raw_windows_path": "C:\\sensitive\\private",
+        },
+    }
     for name in runner.LEGACY_NATIVE_CASES:
         case = ET.SubElement(root, "testcase", name=name)
         properties = ET.SubElement(case, "properties")
         ET.SubElement(properties, "property", name="parent_pre_resume_attestation", value=json.dumps(pre))
         ET.SubElement(properties, "property", name="parent_post_exit_job_attestation", value=json.dumps(post))
+        ET.SubElement(properties, "property", name="parent_launch_return_code", value="20")
+        ET.SubElement(properties, "property", name="parent_launch_failure_diagnostic", value=json.dumps(launcher_failure))
     ET.SubElement(root, "testcase", name=runner.NATIVE_CASE)
     junit = tmp_path / "private-junit.xml"
     ET.ElementTree(root).write(junit, encoding="utf-8", xml_declaration=True)
@@ -100,6 +116,11 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     attestations = counts["legacy_parent_attestations"]
     assert len(attestations) == 4
     assert all(item["pre_resume"] and item["post_exit_job"] for item in attestations)
+    assert all(item["launcher_return_codes"] == [20] for item in attestations)
+    assert all(item["launcher_failures"][0]["failure_win32_error"] == 17 for item in attestations)
+    assert all(item["launcher_failures"][0]["create_process"]["image_is_file"] is True for item in attestations)
     serialized = json.dumps(counts)
     assert "raw_windows_path" not in serialized
+    assert "broker_pid" not in serialized
+    assert "sensitive" not in serialized
     assert "C:\\\\sensitive" not in serialized
