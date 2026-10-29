@@ -58,15 +58,18 @@ def _derive_unregistered_appcontainer_sid() -> str:
     derive = userenv.DeriveAppContainerSidFromAppContainerName
     derive.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
     derive.restype = ctypes.c_long
+    free_sid = advapi32.FreeSid
+    free_sid.argtypes = [ctypes.c_void_p]
+    free_sid.restype = ctypes.c_void_p
     sid = ctypes.c_void_p()
-    name = f"Cue.CyberSentinel.LpacTokenIdentity.{uuid.uuid4().hex}"
+    name = f"CSLPAC{uuid.uuid4().hex}"
     result = int(derive(name, ctypes.byref(sid)))
     if result != 0 or not sid.value:
         raise DiagnosticFailure("derive_unregistered_appcontainer_sid", result & 0xFFFFFFFF)
     try:
         return _sid_to_string(advapi32, kernel32, sid)
     finally:
-        kernel32.LocalFree(sid)
+        free_sid(sid)
 
 
 def _current_user_sid() -> str:
