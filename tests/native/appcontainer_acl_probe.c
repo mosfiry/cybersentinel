@@ -825,6 +825,14 @@ static void report_cleanup_diagnostic(const ProcessCleanupDiagnostic *cleanup) {
         cleanup->cleanup_confirmed ? L"true" : L"false");
 }
 
+static void record_cleanup_wait_failure(ProcessCleanupDiagnostic *cleanup, DWORD wait_status) {
+    DWORD error;
+    if (!cleanup || wait_status == WAIT_OBJECT_0 || wait_status == WAIT_TIMEOUT) return;
+    if (cleanup->cleanup_error != ERROR_SUCCESS) return;
+    error = wait_status == WAIT_FAILED ? GetLastError() : ERROR_INVALID_DATA;
+    cleanup->cleanup_error = error == ERROR_SUCCESS ? ERROR_INVALID_DATA : error;
+}
+
 static void report_control_cleanup_diagnostic(const EnvironmentControlResult *result) {
     ProcessCleanupDiagnostic cleanup;
     if (!result) return;
@@ -2221,23 +2229,57 @@ done:
     }
     {
         DWORD cleanup_attempt;
+        DWORD termination_error = ERROR_SUCCESS;
+        BOOL job_termination_succeeded = FALSE;
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
         ZeroMemory(&accounting, sizeof(accounting));
         if (process.hProcess) {
             wait_status = WaitForSingleObject(process.hProcess, 0);
+            record_cleanup_wait_failure(&main_cleanup, wait_status);
             main_cleanup.process_signaled = wait_status == WAIT_OBJECT_0;
             if (!main_cleanup.process_signaled) {
                 main_cleanup.termination_requested = TRUE;
-                if (job && !TerminateJobObject(job, 0xE7) &&
-                    main_cleanup.cleanup_error == ERROR_SUCCESS)
-                    main_cleanup.cleanup_error = GetLastError();
-                if (!TerminateProcess(process.hProcess, 0xE7) &&
-                    main_cleanup.cleanup_error == ERROR_SUCCESS)
-                    main_cleanup.cleanup_error = GetLastError();
+                if (job) {
+                    if (TerminateJobObject(job, 0xE7)) {
+                        job_termination_succeeded = TRUE;
+                    } else if (termination_error == ERROR_SUCCESS) {
+                        termination_error = GetLastError();
+                    }
+                }
+                if (!job_termination_succeeded) {
+                    wait_status = WaitForSingleObject(process.hProcess, 0);
+                    record_cleanup_wait_failure(&main_cleanup, wait_status);
+                    if (wait_status != WAIT_OBJECT_0 && !TerminateProcess(process.hProcess, 0xE7)) {
+                        DWORD error = GetLastError();
+                        if (termination_error == ERROR_SUCCESS) termination_error = error;
+                    }
+                }
                 wait_status = WaitForSingleObject(process.hProcess, 5000);
+                record_cleanup_wait_failure(&main_cleanup, wait_status);
                 main_cleanup.process_signaled = wait_status == WAIT_OBJECT_0;
-                if (!main_cleanup.process_signaled && main_cleanup.cleanup_error == ERROR_SUCCESS)
-                    main_cleanup.cleanup_error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+                if (!main_cleanup.process_signaled) {
+                    job_termination_succeeded = FALSE;
+                    if (job) {
+                        if (TerminateJobObject(job, 0xE7)) {
+                            job_termination_succeeded = TRUE;
+                        } else if (termination_error == ERROR_SUCCESS) {
+                            termination_error = GetLastError();
+                        }
+                    }
+                    if (!job_termination_succeeded) {
+                        wait_status = WaitForSingleObject(process.hProcess, 0);
+                        record_cleanup_wait_failure(&main_cleanup, wait_status);
+                        if (wait_status != WAIT_OBJECT_0 && !TerminateProcess(process.hProcess, 0xE7)) {
+                            DWORD error = GetLastError();
+                            if (termination_error == ERROR_SUCCESS) termination_error = error;
+                        }
+                    }
+                    wait_status = WaitForSingleObject(process.hProcess, 5000);
+                    record_cleanup_wait_failure(&main_cleanup, wait_status);
+                    main_cleanup.process_signaled = wait_status == WAIT_OBJECT_0;
+                    if (!main_cleanup.process_signaled && main_cleanup.cleanup_error == ERROR_SUCCESS)
+                        main_cleanup.cleanup_error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : ERROR_INVALID_DATA;
+                }
             }
         }
         if (job) {
@@ -2256,16 +2298,23 @@ done:
                 }
                 if (main_cleanup.job_empty) break;
                 main_cleanup.termination_requested = TRUE;
-                if (!TerminateJobObject(job, 0xE7) &&
-                    main_cleanup.cleanup_error == ERROR_SUCCESS)
-                    main_cleanup.cleanup_error = GetLastError();
+                if (!TerminateJobObject(job, 0xE7) && termination_error == ERROR_SUCCESS)
+                    termination_error = GetLastError();
                 Sleep(50);
             }
         } else if (!main_cleanup.process_created) {
             main_cleanup.job_empty = TRUE;
         }
-        if (process.hProcess && WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0)
-            main_cleanup.process_signaled = TRUE;
+        if (process.hProcess) {
+            wait_status = WaitForSingleObject(process.hProcess, 0);
+            record_cleanup_wait_failure(&main_cleanup, wait_status);
+            if (wait_status == WAIT_OBJECT_0) main_cleanup.process_signaled = TRUE;
+        }
+        if (main_cleanup.process_created && main_cleanup.cleanup_error == ERROR_SUCCESS &&
+            (!main_cleanup.process_signaled || !main_cleanup.job_query_succeeded ||
+             !main_cleanup.job_empty || main_cleanup.job_active_processes != 0))
+            main_cleanup.cleanup_error = termination_error != ERROR_SUCCESS ?
+                termination_error : ERROR_INVALID_DATA;
         if (process.hThread) {
             if (CloseHandle(process.hThread)) {
                 process.hThread = NULL;

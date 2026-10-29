@@ -49,6 +49,40 @@ def test_broker_open_is_explicitly_not_evidence_of_lpac_image_access():
     assert "known_system_dependency_mask" in source
 
 
+def test_main_cleanup_waits_for_job_termination_before_process_fallback():
+    source = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
+    launch = source.split("static int launch_child(", 1)[1].split("\nint wmain(", 1)[0]
+    cleanup = launch.split("\ndone:\n", 1)[1]
+    start = cleanup.index("DWORD cleanup_attempt;\n        DWORD termination_error")
+    main_cleanup = cleanup[start:].split("if (process.hThread)", 1)[0]
+    assert "BOOL job_termination_succeeded = FALSE;" in main_cleanup
+    assert main_cleanup.count("if (TerminateJobObject(job, 0xE7))") == 2
+    assert main_cleanup.count("if (!job_termination_succeeded) {") == 2
+    assert main_cleanup.count("TerminateProcess(process.hProcess, 0xE7)") == 2
+    assert "job_termination_succeeded = TRUE;" in main_cleanup
+    assert main_cleanup.count("WaitForSingleObject(process.hProcess, 5000)") == 2
+    assert main_cleanup.index("if (TerminateJobObject(job, 0xE7))") < main_cleanup.index("if (!job_termination_succeeded) {")
+    assert "main_cleanup.job_empty = accounting.ActiveProcesses == 0;" in cleanup
+    assert "main_cleanup.cleanup_error == ERROR_SUCCESS" in cleanup
+
+
+def test_main_cleanup_records_wait_failed_before_retries():
+    source = (ROOT / "tests/native/appcontainer_acl_probe.c").read_text(encoding="utf-8")
+    wait_guard = source.split("static void record_cleanup_wait_failure(", 1)[1].split(
+        "static void report_control_cleanup_diagnostic(", 1
+    )[0]
+    launch = source.split("static int launch_child(", 1)[1].split("\nint wmain(", 1)[0]
+    cleanup = launch.split("\ndone:\n", 1)[1]
+    start = cleanup.index("DWORD cleanup_attempt;\n        DWORD termination_error")
+    main_cleanup = cleanup[start:].split("if (process.hThread)", 1)[0]
+    assert "wait_status == WAIT_FAILED" in wait_guard
+    assert "GetLastError()" in wait_guard
+    assert "ERROR_INVALID_DATA" in wait_guard
+    assert main_cleanup.count("WaitForSingleObject(process.hProcess") == 6
+    assert main_cleanup.count("record_cleanup_wait_failure(&main_cleanup, wait_status);") == 6
+    assert "wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : ERROR_INVALID_DATA" in main_cleanup
+
+
 def test_d2_branch_uses_the_existing_strict_windows_gate():
     source = (ROOT / ".github/workflows/windows-sandbox-contract.yml").read_text(encoding="utf-8")
     assert "branches: [fix/blocker-d-review-20261010, fix/blocker-d2-lpac-20261021]" in source
