@@ -487,7 +487,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     if (!CreateProcessW(image, command, NULL, NULL, FALSE,
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
                             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                        environment, windows_directory,
+                        environment, current_directory,
                         &startup.StartupInfo, &process)) {
         error = GetLastError();
         report->create_error = error;
