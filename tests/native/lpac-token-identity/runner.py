@@ -138,6 +138,21 @@ def _set_protected_dacl(path: Path, sddl: str) -> None:
         kernel32.LocalFree(descriptor)
 
 
+def _run_compile_command(command: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    # cmd.exe misparses list2cmdline's backslash-escaped embedded quotes. Match
+    # the repository's native-test fixture: put the trusted command in a UTF-8
+    # batch file and pass only its path through argv.
+    script = cwd / "compile-token-identity-probe.cmd"
+    prefix = "@echo off\r\nchcp 65001 >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\n"
+    script.write_bytes((prefix + command + "\r\nexit /b %errorlevel%\r\n").encode("utf-8"))
+    return subprocess.run(
+        ["cmd.exe", "/d", "/c", str(script)], cwd=str(cwd),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", shell=False,
+        timeout=120, check=False,
+    )
+
+
 def _compile_probe(build_dir: Path) -> tuple[Path, str, str]:
     program_files = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
     vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
@@ -160,17 +175,13 @@ def _compile_probe(build_dir: Path) -> tuple[Path, str, str]:
     executable = build_dir / "lpac_token_identity_probe.exe"
     object_file = build_dir / "lpac_token_identity_probe.obj"
     command = (
-        f'call "{devcmd}" -no_logo -arch=amd64 -host_arch=amd64 && '
-        'echo WINDOWS_SDK_VERSION=%WindowsSDKVersion% && '
+        f'call "{devcmd}" -no_logo -arch=amd64 -host_arch=amd64\r\n'
+        'if errorlevel 1 exit /b %errorlevel%\r\n'
+        'echo WINDOWS_SDK_VERSION=%WindowsSDKVersion%\r\n'
         f'cl /nologo /W4 /WX /MT /DUNICODE /D_UNICODE /TC "{source}" '
         f'/Fo:"{object_file}" /Fe:"{executable}" /link advapi32.lib userenv.lib'
     )
-    compiled = subprocess.run(
-        ["cmd.exe", "/d", "/c", command], cwd=str(build_dir),
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", shell=False,
-        timeout=120, check=False,
-    )
+    compiled = _run_compile_command(command, build_dir)
     output = compiled.stdout
     sdk_match = re.search(r"WINDOWS_SDK_VERSION=([^\s]+)", output, flags=re.IGNORECASE)
     compiler_match = re.search(r"Microsoft.*?Version\s+([^\s]+)", output, flags=re.IGNORECASE)
