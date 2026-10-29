@@ -16,10 +16,15 @@ from typing import Any
 
 
 class DiagnosticFailure(RuntimeError):
-    def __init__(self, stage: str, code: int | None = None):
+    def __init__(self, stage: str, code: int | None = None,
+                 details: list[str] | None = None, sdk_version: str | None = None,
+                 compiler_version: str | None = None):
         super().__init__(stage)
         self.stage = stage
         self.code = code
+        self.details = details or []
+        self.sdk_version = sdk_version
+        self.compiler_version = compiler_version
 
 
 def _win_api() -> tuple[Any, Any, Any]:
@@ -167,12 +172,24 @@ def _compile_probe(build_dir: Path) -> tuple[Path, str, str]:
         timeout=120, check=False,
     )
     output = compiled.stdout
-    if compiled.returncode != 0 or not executable.is_file():
-        raise DiagnosticFailure("native_probe_compile_failed", compiled.returncode)
     sdk_match = re.search(r"WINDOWS_SDK_VERSION=([^\s]+)", output, flags=re.IGNORECASE)
     compiler_match = re.search(r"Microsoft.*?Version\s+([^\s]+)", output, flags=re.IGNORECASE)
     sdk_version = sdk_match.group(1) if sdk_match else "not_reported"
     compiler_version = compiler_match.group(1) if compiler_match else "not_reported"
+    if compiled.returncode != 0 or not executable.is_file():
+        diagnostics: list[str] = []
+        for line in output.splitlines():
+            match = re.search(r"(?i)(?:(?:fatal\s+)?error|warning)\s+((?:C|LNK|MSB)\d+):\s*(.*)", line)
+            if match:
+                message = re.sub(r"[A-Za-z]:\\[^\r\n]*", "<path>", match.group(2)).strip()
+                diagnostics.append(f"{match.group(1)}: {message[:300]}")
+        if not diagnostics:
+            for line in output.splitlines():
+                stripped = line.strip()
+                if stripped and re.search(r"(?i)(not found|cannot find|not recognized|failed|error)", stripped):
+                    diagnostics.append(re.sub(r"[A-Za-z]:\\[^\r\n]*", "<path>", stripped)[:300])
+        raise DiagnosticFailure("native_probe_compile_failed", compiled.returncode,
+                                diagnostics[-12:], sdk_version, compiler_version)
     return executable, sdk_version, compiler_version
 
 
@@ -242,6 +259,7 @@ def main() -> int:
         "windows_build": (sys.getwindowsversion().build if sys.platform == "win32" else None),
         "windows_sdk_version": None,
         "compiler_version": None,
+        "compile_diagnostics": [],
         "mission_started": False,
         "network_tests_run": False,
         "storage_tests_run": False,
@@ -314,6 +332,14 @@ def main() -> int:
     except DiagnosticFailure as exc:
         evidence["setup_failure_stage"] = exc.stage
         evidence["setup_failure_code"] = exc.code
+        if exc.sdk_version is not None:
+            evidence["windows_sdk_version"] = exc.sdk_version
+        if exc.compiler_version is not None:
+            evidence["compiler_version"] = exc.compiler_version
+        if exc.details:
+            evidence["compile_diagnostics"] = exc.details
+            for diagnostic in exc.details:
+                print(f"Sanitized compiler diagnostic: {diagnostic}")
     except subprocess.TimeoutExpired:
         evidence["setup_failure_stage"] = "native_probe_timeout"
     except Exception as exc:  # Keep artifacts bounded and avoid copying paths or raw output.
