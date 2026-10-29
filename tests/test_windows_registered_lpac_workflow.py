@@ -111,6 +111,18 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert 'L"lpac_environment_control"' in native_probe
     assert 'L"lpac_environment_snapshot_control"' in native_probe
     assert 'L"lpac_main_environment_block_control"' in native_probe
+    assert 'L"lpac_main_environment_variant_control"' in native_probe
+    assert "build_environment_block_omitting_entry" in native_probe
+    assert "_sanitize_environment_variant_controls" in runner
+    variant_start = native_probe.index('if (wcscmp(argv[3], L"registered-storage") == 0')
+    variant_end = native_probe.index("ZeroMemory(&job_limits", variant_start)
+    variant_source = native_probe[variant_start:variant_end]
+    assert 'wcscmp(argv[3], L"registered-storage") == 0' in variant_source
+    assert "build_environment_block_omitting_entry(" in variant_source
+    assert "variant_index + 1" in variant_source
+    assert "run_lp_environment_control(" in variant_source
+    assert "CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW" in variant_source
+    assert "ResumeThread" not in variant_source
     assert "diagnostic_only" in native_probe and "comparison_complete" in native_probe
     assert 'L"CYBERSENTINEL_TEST_ENV_SANITIZED"' in control_source
     assert "parent_environment_filtered" in native_probe
@@ -198,6 +210,28 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
             "cleanup_confirmed": True, "private_value": "must be dropped",
             "raw_environment": "private-value", "raw_variable_names": ["PRIVATE_NAME"],
         },
+        "main_environment_variant_controls": [
+            {
+                "version": 1, "scope": "broker_only", "diagnostic_only": True,
+                "comparison_complete": True, "lp_environment_null": False,
+                "main_environment_block": True, "main_environment_block_safe": True,
+                "main_environment_variant": True, "main_environment_variant_id": 1,
+                "main_environment_entry_count": 5, "attempted": True, "setup_error": 0,
+                "create_succeeded": False, "create_win32_error": 203,
+                "cleanup_confirmed": True, "cleanup_error": 0,
+                "raw_environment": "private-value", "raw_variable_names": ["SECRET_KEY"],
+            },
+            {
+                "version": 1, "scope": "broker_only", "diagnostic_only": True,
+                "comparison_complete": True, "lp_environment_null": False,
+                "main_environment_block": True, "main_environment_block_safe": True,
+                "main_environment_variant": True, "main_environment_variant_id": 2,
+                "main_environment_entry_count": 5, "attempted": True, "setup_error": 0,
+                "create_succeeded": True, "create_win32_error": 0,
+                "terminated": True, "job_empty": True, "cleanup_confirmed": True,
+                "cleanup_error": 0, "private_field": "must be dropped",
+            },
+        ],
         "token_diagnostic": {
             "version": 1, "scope": "broker_only", "token_verified": False,
             "is_appcontainer": True, "is_lpac": False, "low_integrity": False,
@@ -241,6 +275,8 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert all(item["launcher_failures"][0]["main_environment_block_control"]["main_environment_entry_count"] == 6 for item in attestations)
     assert all(item["launcher_failures"][0]["main_environment_block_control"]["create_win32_error"] == 203 for item in attestations)
     assert all(item["launcher_failures"][0]["main_environment_block_control"]["comparison_complete"] is False for item in attestations)
+    assert all([v["main_environment_variant_id"] for v in item["launcher_failures"][0]["main_environment_variant_controls"]] == [1, 2] for item in attestations)
+    assert all(all(v["comparison_complete"] is False for v in item["launcher_failures"][0]["main_environment_variant_controls"]) for item in attestations)
     assert all(item["launcher_failures"][0]["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query" for item in attestations)
     assert all(item["launcher_failures"][0]["token_diagnostic"]["token_api_error"] == 87 for item in attestations)
     assert all(item["environment_controls"][0]["comparison_complete"] is True for item in attestations)
@@ -286,6 +322,17 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     safe_unknown_stage = runner._sanitize_environment_control(unknown_stage)
     assert safe_unknown_stage is not None and "token_failure_stage" not in safe_unknown_stage
     assert safe_unknown_stage["comparison_complete"] is False
+    duplicate_variants = dict(
+        launcher_failure,
+        main_environment_variant_controls=[
+            dict(launcher_failure["main_environment_variant_controls"][0]),
+            dict(launcher_failure["main_environment_variant_controls"][0]),
+            dict(launcher_failure["main_environment_variant_controls"][0], main_environment_variant_id=99),
+        ],
+    )
+    safe_duplicate_variants = runner._sanitize_parent_launch_failure(duplicate_variants)
+    assert safe_duplicate_variants is not None
+    assert [v["main_environment_variant_id"] for v in safe_duplicate_variants["main_environment_variant_controls"]] == [1]
     serialized = json.dumps(counts)
     assert "raw_windows_path" not in serialized
     assert "broker_pid" not in serialized
@@ -294,9 +341,9 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert "raw_environment" not in serialized and "sentinel-secret" not in serialized
     assert "private-value" not in serialized and "PRIVATE_NAME" not in serialized
     assert "must be dropped" not in serialized
+    assert "SECRET_KEY" not in serialized
     assert "token_raw" not in serialized and "sensitive-token-data" not in serialized
     assert "raw_sid" not in serialized and "private-sid" not in serialized
-    assert "SECRET_KEY" not in serialized
 
 
 def test_pytest_child_environment_uses_explicit_allowlist():

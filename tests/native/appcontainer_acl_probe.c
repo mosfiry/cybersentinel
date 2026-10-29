@@ -702,6 +702,8 @@ typedef struct EnvironmentControlResult {
     BOOL main_environment_block;
     BOOL main_environment_block_safe;
     DWORD main_environment_entry_count;
+    BOOL main_environment_variant;
+    DWORD main_environment_variant_id;
     BOOL attempted;
     DWORD setup_error;
     BOOL create_succeeded;
@@ -777,6 +779,31 @@ static BOOL control_environment_block_is_filtered(const wchar_t *block, DWORD *e
     }
     if (entry_count_out) *entry_count_out = entry_count;
     return safe;
+}
+
+static BOOL build_environment_block_omitting_entry(
+    const wchar_t *source, DWORD omit_index, wchar_t *destination,
+    size_t destination_capacity, DWORD *entry_count_out) {
+    const wchar_t *entry;
+    size_t used = 0;
+    DWORD source_index = 0, kept_count = 0;
+    if (entry_count_out) *entry_count_out = 0;
+    if (!source || !destination || !entry_count_out || destination_capacity < 2)
+        return FALSE;
+    for (entry = source; *entry; entry += wcslen(entry) + 1, ++source_index) {
+        size_t entry_length = wcslen(entry);
+        if (source_index != omit_index) {
+            if (used + entry_length + 2 > destination_capacity) return FALSE;
+            memcpy(destination + used, entry, (entry_length + 1) * sizeof(wchar_t));
+            used += entry_length + 1;
+            ++kept_count;
+        }
+    }
+    if (omit_index >= source_index || kept_count == 0 || used >= destination_capacity)
+        return FALSE;
+    destination[used] = L'\0';
+    *entry_count_out = kept_count;
+    return kept_count + 1 == source_index;
 }
 
 static BOOL control_environment_is_filtered(DWORD *entry_count_out) {
@@ -1081,7 +1108,8 @@ control_setup_failed:
 }
 
 static void report_environment_control(const EnvironmentControlResult *result) {
-    const wchar_t *prefix = result->lp_environment_null ?
+    const wchar_t *prefix = result->main_environment_variant ?
+        L"lpac_main_environment_variant_control" : result->lp_environment_null ?
         L"lpac_environment_control" : result->main_environment_block ?
         L"lpac_main_environment_block_control" : L"lpac_environment_snapshot_control";
     BOOL comparison_complete = result->diagnostic_only && result->lp_environment_null &&
@@ -1111,7 +1139,8 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         L"\"parent_environment_entry_count\":%lu,"
         L"\"explicit_environment_snapshot_safe\":%ls,\"explicit_environment_entry_count\":%lu,"
         L"\"main_environment_block\":%ls,\"main_environment_block_safe\":%ls,"
-        L"\"main_environment_entry_count\":%lu,"
+        L"\"main_environment_entry_count\":%lu,\"main_environment_variant\":%ls,"
+        L"\"main_environment_variant_id\":%lu,"
         L"\"attempted\":%ls,\"setup_error\":%lu,"
         L"\"create_succeeded\":%ls,\"create_win32_error\":%lu,"
         L"\"create_ntstatus_available\":%ls,\"create_ntstatus_advisory\":\"0x%08lX\","
@@ -1136,6 +1165,8 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         result->main_environment_block ? L"true" : L"false",
         result->main_environment_block_safe ? L"true" : L"false",
         (unsigned long)result->main_environment_entry_count,
+        result->main_environment_variant ? L"true" : L"false",
+        (unsigned long)result->main_environment_variant_id,
         result->attempted ? L"true" : L"false", (unsigned long)result->setup_error,
         result->create_succeeded ? L"true" : L"false", (unsigned long)result->create_win32_error,
         result->create_ntstatus_available ? L"true" : L"false", (unsigned long)result->create_ntstatus,
@@ -1292,11 +1323,14 @@ static int launch_child(int argc, wchar_t **argv) {
     HANDLE control_job = NULL;
     wchar_t windows_dir[MAX_PATH], drive_env[MAX_PATH * 2];
     wchar_t path_env[MAX_PATH * 2], env_block[MAX_PATH * 6];
+    wchar_t variant_env_block[MAX_PATH * 6];
     size_t env_used = 0;
+    DWORD variant_index, variant_entry_count;
     BOOL drive_environment_present = FALSE;
     EnvironmentControlResult environment_control;
     EnvironmentControlResult explicit_environment_control;
     EnvironmentControlResult main_environment_block_control;
+    EnvironmentControlResult variant_control;
     ProbeJobExtendedLimitInformation job_limits;
     int status = 20;
     LastNtStatusFn last_nt_status = NULL;
@@ -1405,6 +1439,49 @@ static int launch_child(int argc, wchar_t **argv) {
         goto done;
     }
     report_environment_control(&main_environment_block_control);
+    if (wcscmp(argv[3], L"registered-storage") == 0 &&
+        main_environment_block_control.main_environment_block_safe &&
+        main_environment_block_control.main_environment_entry_count > 0) {
+        for (variant_index = 0;
+             variant_index < main_environment_block_control.main_environment_entry_count;
+             ++variant_index) {
+            if (!build_environment_block_omitting_entry(
+                    env_block, variant_index, variant_env_block,
+                    _countof(variant_env_block), &variant_entry_count)) {
+                ZeroMemory(&variant_control, sizeof(variant_control));
+                variant_control.diagnostic_only = TRUE;
+                variant_control.parent_environment_filtered = main_environment_block_control.parent_environment_filtered;
+                variant_control.lp_environment_null = FALSE;
+                variant_control.main_environment_block = TRUE;
+                variant_control.main_environment_block_safe = TRUE;
+                variant_control.main_environment_entry_count = variant_entry_count;
+                variant_control.main_environment_variant = TRUE;
+                variant_control.main_environment_variant_id = variant_index + 1;
+                variant_control.setup_error = ERROR_INVALID_DATA;
+                variant_control.cleanup_confirmed = TRUE;
+                variant_control.token_details.failure_stage = L"not_run";
+                report_environment_control(&variant_control);
+                status = fail(L"build main environment variant", ERROR_INVALID_DATA);
+                goto done;
+            }
+            if (!run_lp_environment_control(
+                    argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    FALSE, variant_env_block,
+                    sid, last_nt_status, &variant_control, &control_job, &control_process,
+                    &process_token)) {
+                variant_control.main_environment_variant = TRUE;
+                variant_control.main_environment_variant_id = variant_index + 1;
+                report_environment_control(&variant_control);
+                status = fail(L"main environment variant control cleanup unconfirmed",
+                              variant_control.cleanup_error ? variant_control.cleanup_error : ERROR_INVALID_DATA);
+                goto done;
+            }
+            variant_control.main_environment_variant = TRUE;
+            variant_control.main_environment_variant_id = variant_index + 1;
+            report_environment_control(&variant_control);
+        }
+    }
     ZeroMemory(&job_limits, sizeof(job_limits));
     job_limits.BasicLimitInformation.LimitFlags = 0x00002000; /* JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE */
     job = CreateJobObjectW(NULL, NULL);

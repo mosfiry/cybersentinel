@@ -49,7 +49,8 @@ LEGACY_LAUNCH_FAILURE_STEPS = {
     "build child command line", "build restricted child environment", "child environment too large",
     "create bounded child job", "set LPAC child job attribute", "CreateProcessW LPAC",
     "environment control cleanup unconfirmed", "explicit environment control cleanup unconfirmed",
-    "main environment block control cleanup unconfirmed",
+    "main environment block control cleanup unconfirmed", "build main environment variant",
+    "main environment variant control cleanup unconfirmed",
     "verify suspended LPAC child job membership", "suspended LPAC child token verification",
     "resume LPAC child", "bounded LPAC child wait", "read child exit code",
     "query completed LPAC job accounting", "LPAC job did not become empty",
@@ -67,13 +68,14 @@ LAUNCH_DIAGNOSTIC_INT_FIELDS = (
 ENVIRONMENT_CONTROL_BOOL_FIELDS = (
     "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
     "explicit_environment_snapshot_safe", "main_environment_block", "main_environment_block_safe",
-    "attempted", "create_succeeded", "create_ntstatus_available",
+    "main_environment_variant", "attempted", "create_succeeded", "create_ntstatus_available",
     "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
     "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
     "token_is_lpac_query_succeeded", "terminated", "job_empty", "cleanup_confirmed",
 )
 ENVIRONMENT_CONTROL_INT_FIELDS = (
     "parent_environment_entry_count", "explicit_environment_entry_count", "main_environment_entry_count",
+    "main_environment_variant_id",
     "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
     "token_verification_error", "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
     "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
@@ -165,6 +167,32 @@ def _sanitize_token_diagnostic(value: object) -> dict[str, object] | None:
     return diagnostic if len(diagnostic) > 2 else None
 
 
+def _sanitize_environment_variant_controls(value: object) -> list[dict[str, object]] | None:
+    if not isinstance(value, list):
+        return None
+    safe: list[dict[str, object]] = []
+    seen: set[int] = set()
+    for raw in value[:6]:
+        control = _sanitize_environment_control(raw, allow_comparison_complete=False)
+        if control is None:
+            continue
+        variant_id = control.get("main_environment_variant_id")
+        entry_count = control.get("main_environment_entry_count")
+        if (type(variant_id) is not int or not 1 <= variant_id <= 6 or variant_id in seen
+                or control.get("diagnostic_only") is not True
+                or control.get("lp_environment_null") is not False
+                or control.get("main_environment_block") is not True
+                or control.get("main_environment_block_safe") is not True
+                or control.get("main_environment_variant") is not True
+                or type(entry_count) is not int or not 0 <= entry_count <= 6):
+            continue
+        control["comparison_complete"] = False
+        seen.add(variant_id)
+        safe.append(control)
+    safe.sort(key=lambda item: int(item["main_environment_variant_id"]))
+    return safe or None
+
+
 def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
@@ -201,6 +229,11 @@ def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
     )
     if main_environment_block_control is not None:
         safe["main_environment_block_control"] = main_environment_block_control
+    main_environment_variant_controls = _sanitize_environment_variant_controls(
+        value.get("main_environment_variant_controls")
+    )
+    if main_environment_variant_controls is not None:
+        safe["main_environment_variant_controls"] = main_environment_variant_controls
     token_diagnostic = _sanitize_token_diagnostic(value.get("token_diagnostic"))
     if token_diagnostic is not None:
         safe["token_diagnostic"] = token_diagnostic
