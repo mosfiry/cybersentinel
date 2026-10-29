@@ -112,6 +112,11 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert 'L"lpac_environment_snapshot_control"' in native_probe
     assert 'L"lpac_main_environment_block_control"' in native_probe
     assert 'L"lpac_main_environment_variant_control"' in native_probe
+    assert 'L"lpac_merged_environment_control"' in native_probe
+    assert "build_merged_environment_block(" in native_probe
+    assert "CompareStringOrdinal(" in native_probe
+    assert "merged_environment_builder_self_test(" in native_probe
+    assert "merged_environment_block" in runner
     assert "build_environment_block_omitting_entry" in native_probe
     assert "_sanitize_environment_variant_controls" in runner
     variant_start = native_probe.index('if (wcscmp(argv[3], L"registered-storage") == 0')
@@ -210,6 +215,18 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
             "cleanup_confirmed": True, "private_value": "must be dropped",
             "raw_environment": "private-value", "raw_variable_names": ["PRIVATE_NAME"],
         },
+        "merged_environment_control": {
+            "version": 1, "scope": "broker_only", "diagnostic_only": True,
+            "comparison_complete": True, "lp_environment_null": False,
+            "parent_environment_filtered": True, "main_environment_block": True,
+            "main_environment_block_safe": True, "merged_environment_block": True,
+            "merged_environment_builder_selftest_passed": True,
+            "merged_environment_entry_count": 29, "main_environment_entry_count": 29,
+            "attempted": True, "setup_error": 0, "create_succeeded": True,
+            "create_win32_error": 0, "terminated": True, "job_empty": True,
+            "cleanup_confirmed": True, "cleanup_error": 0,
+            "raw_environment": "private-value", "raw_variable_names": ["PRIVATE_NAME"],
+        },
         "main_environment_variant_controls": [
             {
                 "version": 1, "scope": "broker_only", "diagnostic_only": True,
@@ -275,6 +292,10 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert all(item["launcher_failures"][0]["main_environment_block_control"]["main_environment_entry_count"] == 6 for item in attestations)
     assert all(item["launcher_failures"][0]["main_environment_block_control"]["create_win32_error"] == 203 for item in attestations)
     assert all(item["launcher_failures"][0]["main_environment_block_control"]["comparison_complete"] is False for item in attestations)
+    assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_environment_block"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_environment_builder_selftest_passed"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_environment_entry_count"] == 29 for item in attestations)
+    assert all(item["launcher_failures"][0]["merged_environment_control"]["comparison_complete"] is False for item in attestations)
     assert all([v["main_environment_variant_id"] for v in item["launcher_failures"][0]["main_environment_variant_controls"]] == [1, 2] for item in attestations)
     assert all(all(v["comparison_complete"] is False for v in item["launcher_failures"][0]["main_environment_variant_controls"]) for item in attestations)
     assert all(item["launcher_failures"][0]["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query" for item in attestations)
@@ -302,6 +323,12 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     forged_main_block = dict(launcher_failure["main_environment_block_control"], lp_environment_null=True, comparison_complete=True)
     safe_main_block = runner._sanitize_environment_control(forged_main_block)
     assert safe_main_block is not None and safe_main_block["comparison_complete"] is False
+    forged_merged = dict(
+        launcher_failure["merged_environment_control"], lp_environment_null=True,
+        main_environment_block=False, comparison_complete=True,
+    )
+    safe_merged = runner._sanitize_environment_control(forged_merged)
+    assert safe_merged is not None and safe_merged["comparison_complete"] is False
     lpac_query_failed = dict(
         launcher_failure["environment_control"],
         token_is_lpac_query_succeeded=False,
@@ -340,6 +367,7 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert "C:\\\\sensitive" not in serialized
     assert "raw_environment" not in serialized and "sentinel-secret" not in serialized
     assert "private-value" not in serialized and "PRIVATE_NAME" not in serialized
+    assert "merged_environment_control" in serialized
     assert "must be dropped" not in serialized
     assert "SECRET_KEY" not in serialized
     assert "token_raw" not in serialized and "sensitive-token-data" not in serialized

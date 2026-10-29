@@ -8,6 +8,7 @@
 #include <wchar.h>
 #include <stdint.h>
 #include <string.h>
+#include <limits.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "userenv.lib")
@@ -704,6 +705,9 @@ typedef struct EnvironmentControlResult {
     DWORD main_environment_entry_count;
     BOOL main_environment_variant;
     DWORD main_environment_variant_id;
+    BOOL merged_environment_block;
+    BOOL merged_environment_builder_selftest_passed;
+    DWORD merged_environment_entry_count;
     BOOL attempted;
     DWORD setup_error;
     BOOL create_succeeded;
@@ -779,6 +783,216 @@ static BOOL control_environment_block_is_filtered(const wchar_t *block, DWORD *e
     }
     if (entry_count_out) *entry_count_out = entry_count;
     return safe;
+}
+
+#define MAX_MERGED_ENVIRONMENT_ENTRIES 128
+#define MAX_MERGED_ENVIRONMENT_CHARS 32768
+
+typedef struct EnvironmentEntryView {
+    const wchar_t *text;
+    size_t length;
+    size_t name_length;
+} EnvironmentEntryView;
+
+static BOOL environment_block_has_double_null(const wchar_t *block, size_t block_capacity) {
+    size_t i;
+    if (!block || block_capacity < 2) return FALSE;
+    for (i = 0; i + 1 < block_capacity; ++i) {
+        if (block[i] == L'\0' && block[i + 1] == L'\0') return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL environment_entry_name_length(const wchar_t *entry, size_t *name_length_out) {
+    const wchar_t *separator;
+    if (!entry || !name_length_out) return FALSE;
+    if (entry[0] == L'=') {
+        separator = wcschr(entry + 1, L'=');
+        if (!separator || (size_t)(separator - entry) != 3 || entry[2] != L':' ||
+            !((entry[1] >= L'A' && entry[1] <= L'Z') ||
+              (entry[1] >= L'a' && entry[1] <= L'z'))) return FALSE;
+    } else {
+        separator = wcschr(entry, L'=');
+        if (!separator || separator == entry) return FALSE;
+    }
+    *name_length_out = (size_t)(separator - entry);
+    return TRUE;
+}
+
+static int compare_environment_entry_names(const EnvironmentEntryView *left,
+                                           const EnvironmentEntryView *right) {
+    if (!left || !right || left->name_length > INT_MAX || right->name_length > INT_MAX)
+        return 0;
+    return CompareStringOrdinal(left->text, (int)left->name_length,
+                                right->text, (int)right->name_length, TRUE);
+}
+
+static BOOL environment_block_to_views(const wchar_t *block,
+                                       EnvironmentEntryView *views,
+                                       DWORD *entry_count_out,
+                                       size_t block_capacity) {
+    const wchar_t *entry;
+    DWORD count = 0;
+    if (entry_count_out) *entry_count_out = 0;
+    if (!block || !views || !entry_count_out ||
+        !environment_block_has_double_null(block, block_capacity))
+        return FALSE;
+    if (!control_environment_block_is_filtered(block, NULL)) return FALSE;
+    for (entry = block; *entry; entry += wcslen(entry) + 1) {
+        size_t name_length, entry_length = wcslen(entry);
+        EnvironmentEntryView candidate;
+        DWORD i;
+        if (count >= MAX_MERGED_ENVIRONMENT_ENTRIES ||
+            !environment_entry_name_length(entry, &name_length) ||
+            !entry_length || name_length >= entry_length) return FALSE;
+        candidate.text = entry;
+        candidate.length = entry_length;
+        candidate.name_length = name_length;
+        for (i = 0; i < count; ++i) {
+            int comparison = compare_environment_entry_names(&views[i], &candidate);
+            if (!comparison || comparison == CSTR_EQUAL) return FALSE;
+        }
+        views[count++] = candidate;
+    }
+    if (!count) return FALSE;
+    *entry_count_out = count;
+    return TRUE;
+}
+
+static BOOL environment_block_is_sorted_unique(const wchar_t *block,
+                                               DWORD expected_count,
+                                               size_t block_capacity) {
+    EnvironmentEntryView views[MAX_MERGED_ENVIRONMENT_ENTRIES];
+    DWORD count = 0, i;
+    if (!environment_block_to_views(block, views, &count, block_capacity) ||
+        count != expected_count)
+        return FALSE;
+    for (i = 1; i < count; ++i) {
+        if (compare_environment_entry_names(&views[i - 1], &views[i]) != CSTR_LESS_THAN)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL build_merged_environment_block(const wchar_t *snapshot,
+                                          size_t snapshot_capacity,
+                                          const wchar_t *custom_block,
+                                          size_t custom_capacity,
+                                          wchar_t *destination,
+                                          size_t destination_capacity,
+                                          DWORD *entry_count_out) {
+    EnvironmentEntryView snapshot_entries[MAX_MERGED_ENVIRONMENT_ENTRIES];
+    EnvironmentEntryView custom_entries[MAX_MERGED_ENVIRONMENT_ENTRIES];
+    EnvironmentEntryView merged_entries[MAX_MERGED_ENVIRONMENT_ENTRIES];
+    DWORD snapshot_count = 0, custom_count = 0, merged_count = 0, i, j;
+    size_t used = 0;
+    if (entry_count_out) *entry_count_out = 0;
+    if (!destination || !entry_count_out || destination_capacity < 2 ||
+        destination_capacity > MAX_MERGED_ENVIRONMENT_CHARS ||
+        !environment_block_to_views(snapshot, snapshot_entries, &snapshot_count,
+                                    snapshot_capacity) ||
+        !environment_block_to_views(custom_block, custom_entries, &custom_count,
+                                    custom_capacity))
+        return FALSE;
+    for (i = 0; i < snapshot_count; ++i) merged_entries[merged_count++] = snapshot_entries[i];
+    for (i = 0; i < custom_count; ++i) {
+        BOOL replaced = FALSE;
+        for (j = 0; j < merged_count; ++j) {
+            int comparison = compare_environment_entry_names(&merged_entries[j], &custom_entries[i]);
+            if (!comparison) return FALSE;
+            if (comparison == CSTR_EQUAL) {
+                merged_entries[j] = custom_entries[i];
+                replaced = TRUE;
+                break;
+            }
+        }
+        if (!replaced) {
+            if (merged_count >= MAX_MERGED_ENVIRONMENT_ENTRIES) return FALSE;
+            merged_entries[merged_count++] = custom_entries[i];
+        }
+    }
+    for (i = 1; i < merged_count; ++i) {
+        EnvironmentEntryView key = merged_entries[i];
+        j = i;
+        while (j > 0) {
+            int comparison = compare_environment_entry_names(&merged_entries[j - 1], &key);
+            if (!comparison || comparison == CSTR_EQUAL) return FALSE;
+            if (comparison == CSTR_LESS_THAN) break;
+            merged_entries[j] = merged_entries[j - 1];
+            --j;
+        }
+        merged_entries[j] = key;
+    }
+    for (i = 0; i < merged_count; ++i) {
+        if (used + merged_entries[i].length + 2 > destination_capacity) return FALSE;
+        memcpy(destination + used, merged_entries[i].text,
+               (merged_entries[i].length + 1) * sizeof(wchar_t));
+        used += merged_entries[i].length + 1;
+    }
+    if (used + 1 >= destination_capacity) return FALSE;
+    destination[used++] = L'\0';
+    *entry_count_out = merged_count;
+    return environment_block_is_sorted_unique(destination, merged_count,
+                                              destination_capacity);
+}
+
+static BOOL environment_block_has_value(const wchar_t *block,
+                                        size_t block_capacity,
+                                        const wchar_t *expected_name,
+                                        const wchar_t *expected_value) {
+    EnvironmentEntryView views[MAX_MERGED_ENVIRONMENT_ENTRIES];
+    DWORD count = 0, i;
+    size_t expected_name_length;
+    if (!expected_name || !expected_value ||
+        !environment_block_to_views(block, views, &count, block_capacity)) return FALSE;
+    expected_name_length = wcslen(expected_name);
+    for (i = 0; i < count; ++i) {
+        int comparison = CompareStringOrdinal(views[i].text, (int)views[i].name_length,
+                                              expected_name, (int)expected_name_length, TRUE);
+        const wchar_t *separator;
+        if (!comparison) return FALSE;
+        if (comparison != CSTR_EQUAL) continue;
+        separator = views[i].text[0] == L'=' ?
+            wcschr(views[i].text + 1, L'=') : wcschr(views[i].text, L'=');
+        return separator && wcscmp(separator + 1, expected_value) == 0;
+    }
+    return FALSE;
+}
+
+static BOOL merged_environment_builder_self_test(void) {
+    static const wchar_t snapshot[] =
+        L"=C:=old-drive\0path=old-path\0TEMP=old-temp\0TMP=old-tmp\0WINDIR=old-win\0\0";
+    static const wchar_t custom[] =
+        L"=C:=new-drive\0PATH=new-path\0SystemRoot=new-root\0TEMP=new-temp\0TMP=new-tmp\0windir=new-win\0\0";
+    static const wchar_t duplicate_snapshot[] = L"PATH=first\0path=second\0\0";
+    static const wchar_t duplicate_custom[] = L"TEMP=first\0temp=second\0\0";
+    static const wchar_t malformed[] = L"PATH\0\0";
+    static const wchar_t non_ascii_name[] = L"\u03C0=value\0\0";
+    static const wchar_t missing_final_double[] = {
+        L'P', L'A', L'T', L'H', L'=', L'x', L'\0',
+        L'T', L'E', L'M', L'P', L'=', L'y', L'\0', L'Z', L'\0'
+    };
+    wchar_t merged[512], too_small[4];
+    DWORD count = 0;
+    if (!build_merged_environment_block(snapshot, _countof(snapshot), custom, _countof(custom),
+                                        merged, _countof(merged), &count) ||
+        count != 6 || !environment_block_is_sorted_unique(merged, count, _countof(merged)) ||
+        !environment_block_has_value(merged, _countof(merged), L"PATH", L"new-path") ||
+        !environment_block_has_value(merged, _countof(merged), L"=C:", L"new-drive") ||
+        !environment_block_has_value(merged, _countof(merged), L"SystemRoot", L"new-root")) return FALSE;
+    if (build_merged_environment_block(duplicate_snapshot, _countof(duplicate_snapshot),
+                                       custom, _countof(custom), merged, _countof(merged), &count) ||
+        build_merged_environment_block(snapshot, _countof(snapshot), duplicate_custom,
+                                       _countof(duplicate_custom), merged, _countof(merged), &count) ||
+        build_merged_environment_block(malformed, _countof(malformed), custom, _countof(custom),
+                                       merged, _countof(merged), &count) ||
+        build_merged_environment_block(non_ascii_name, _countof(non_ascii_name), custom,
+                                       _countof(custom), merged, _countof(merged), &count) ||
+        build_merged_environment_block(missing_final_double, _countof(missing_final_double),
+                                       custom, _countof(custom), merged, _countof(merged), &count) ||
+        build_merged_environment_block(snapshot, _countof(snapshot), custom, _countof(custom),
+                                       too_small, _countof(too_small), &count)) return FALSE;
+    return TRUE;
 }
 
 static BOOL build_environment_block_omitting_entry(
@@ -1108,7 +1322,8 @@ control_setup_failed:
 }
 
 static void report_environment_control(const EnvironmentControlResult *result) {
-    const wchar_t *prefix = result->main_environment_variant ?
+    const wchar_t *prefix = result->merged_environment_block ?
+        L"lpac_merged_environment_control" : result->main_environment_variant ?
         L"lpac_main_environment_variant_control" : result->lp_environment_null ?
         L"lpac_environment_control" : result->main_environment_block ?
         L"lpac_main_environment_block_control" : L"lpac_environment_snapshot_control";
@@ -1141,6 +1356,9 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         L"\"main_environment_block\":%ls,\"main_environment_block_safe\":%ls,"
         L"\"main_environment_entry_count\":%lu,\"main_environment_variant\":%ls,"
         L"\"main_environment_variant_id\":%lu,"
+        L"\"merged_environment_block\":%ls,"
+        L"\"merged_environment_builder_selftest_passed\":%ls,"
+        L"\"merged_environment_entry_count\":%lu,"
         L"\"attempted\":%ls,\"setup_error\":%lu,"
         L"\"create_succeeded\":%ls,\"create_win32_error\":%lu,"
         L"\"create_ntstatus_available\":%ls,\"create_ntstatus_advisory\":\"0x%08lX\","
@@ -1167,6 +1385,9 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         (unsigned long)result->main_environment_entry_count,
         result->main_environment_variant ? L"true" : L"false",
         (unsigned long)result->main_environment_variant_id,
+        result->merged_environment_block ? L"true" : L"false",
+        result->merged_environment_builder_selftest_passed ? L"true" : L"false",
+        (unsigned long)result->merged_environment_entry_count,
         result->attempted ? L"true" : L"false", (unsigned long)result->setup_error,
         result->create_succeeded ? L"true" : L"false", (unsigned long)result->create_win32_error,
         result->create_ntstatus_available ? L"true" : L"false", (unsigned long)result->create_ntstatus,
@@ -1324,13 +1545,17 @@ static int launch_child(int argc, wchar_t **argv) {
     wchar_t windows_dir[MAX_PATH], drive_env[MAX_PATH * 2];
     wchar_t path_env[MAX_PATH * 2], env_block[MAX_PATH * 6];
     wchar_t variant_env_block[MAX_PATH * 6];
+    wchar_t merged_env_block[MAX_MERGED_ENVIRONMENT_CHARS];
+    LPWCH merged_snapshot = NULL;
     size_t env_used = 0;
-    DWORD variant_index, variant_entry_count;
+    DWORD variant_index, variant_entry_count, merged_environment_entry_count = 0;
     BOOL drive_environment_present = FALSE;
+    BOOL merged_builder_selftest_passed = FALSE;
     EnvironmentControlResult environment_control;
     EnvironmentControlResult explicit_environment_control;
     EnvironmentControlResult main_environment_block_control;
     EnvironmentControlResult variant_control;
+    EnvironmentControlResult merged_environment_control;
     ProbeJobExtendedLimitInformation job_limits;
     int status = 20;
     LastNtStatusFn last_nt_status = NULL;
@@ -1348,6 +1573,7 @@ static int launch_child(int argc, wchar_t **argv) {
     memset(&environment_control, 0, sizeof(environment_control));
     memset(&explicit_environment_control, 0, sizeof(explicit_environment_control));
     memset(&main_environment_block_control, 0, sizeof(main_environment_block_control));
+    memset(&merged_environment_control, 0, sizeof(merged_environment_control));
     memset(&caps, 0, sizeof(caps));
     memset(&parent_token_checks, 0, sizeof(parent_token_checks));
     parent_token_checks.failure_stage = L"not_run";
@@ -1482,6 +1708,95 @@ static int launch_child(int argc, wchar_t **argv) {
             report_environment_control(&variant_control);
         }
     }
+    if (wcscmp(argv[3], L"registered-storage") == 0) {
+        DWORD snapshot_entry_count = 0, custom_entry_count = 0;
+        ZeroMemory(&merged_environment_control, sizeof(merged_environment_control));
+        merged_environment_control.diagnostic_only = TRUE;
+        merged_environment_control.lp_environment_null = FALSE;
+        merged_environment_control.main_environment_block = TRUE;
+        merged_environment_control.merged_environment_block = TRUE;
+        merged_environment_control.parent_environment_filtered =
+            main_environment_block_control.parent_environment_filtered;
+        merged_environment_control.parent_environment_entry_count =
+            main_environment_block_control.parent_environment_entry_count;
+        merged_environment_control.main_environment_entry_count =
+            main_environment_block_control.main_environment_entry_count;
+        merged_environment_control.main_environment_block_safe =
+            main_environment_block_control.main_environment_block_safe;
+        merged_environment_control.token_details.failure_stage = L"not_run";
+        merged_builder_selftest_passed = merged_environment_builder_self_test();
+        merged_environment_control.merged_environment_builder_selftest_passed =
+            merged_builder_selftest_passed;
+        if (!merged_builder_selftest_passed) {
+            merged_environment_control.setup_error = ERROR_INVALID_DATA;
+        } else if (!main_environment_block_control.main_environment_block_safe ||
+                   !main_environment_block_control.main_environment_entry_count) {
+            merged_environment_control.setup_error = ERROR_ACCESS_DENIED;
+        } else {
+            merged_snapshot = GetEnvironmentStringsW();
+            if (!merged_snapshot) {
+                merged_environment_control.setup_error = GetLastError();
+            } else if (!control_environment_block_is_filtered(
+                           merged_snapshot, &snapshot_entry_count) ||
+                       !control_environment_block_is_filtered(
+                           env_block, &custom_entry_count) ||
+                       !snapshot_entry_count || !custom_entry_count ||
+                       !build_merged_environment_block(
+                           merged_snapshot, MAX_MERGED_ENVIRONMENT_CHARS,
+                           env_block, _countof(env_block),
+                           merged_env_block, _countof(merged_env_block),
+                           &merged_environment_entry_count)) {
+                merged_environment_control.setup_error = ERROR_INVALID_DATA;
+            } else {
+                merged_environment_control.main_environment_block_safe = TRUE;
+                merged_environment_control.merged_environment_entry_count =
+                    merged_environment_entry_count;
+            }
+            if (merged_snapshot) {
+                if (!FreeEnvironmentStringsW(merged_snapshot)) {
+                    merged_environment_control.cleanup_error = GetLastError();
+                } else {
+                    merged_snapshot = NULL;
+                }
+            }
+        }
+        if (merged_environment_control.setup_error != ERROR_SUCCESS ||
+            merged_environment_control.cleanup_error != ERROR_SUCCESS) {
+            merged_environment_control.cleanup_confirmed =
+                merged_snapshot == NULL && merged_environment_control.cleanup_error == ERROR_SUCCESS;
+            report_environment_control(&merged_environment_control);
+            if (!merged_environment_control.cleanup_confirmed) {
+                status = fail(L"merged environment control cleanup unconfirmed",
+                              merged_environment_control.cleanup_error ?
+                              merged_environment_control.cleanup_error : ERROR_INVALID_DATA);
+                goto done;
+            }
+        } else {
+            if (!run_lp_environment_control(
+                    argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    FALSE, merged_env_block,
+                    sid, last_nt_status, &merged_environment_control, &control_job,
+                    &control_process, &process_token)) {
+                merged_environment_control.merged_environment_block = TRUE;
+                merged_environment_control.merged_environment_builder_selftest_passed =
+                    merged_builder_selftest_passed;
+                merged_environment_control.merged_environment_entry_count =
+                    merged_environment_entry_count;
+                report_environment_control(&merged_environment_control);
+                status = fail(L"merged environment control cleanup unconfirmed",
+                              merged_environment_control.cleanup_error ?
+                              merged_environment_control.cleanup_error : ERROR_INVALID_DATA);
+                goto done;
+            }
+            merged_environment_control.merged_environment_block = TRUE;
+            merged_environment_control.merged_environment_builder_selftest_passed =
+                merged_builder_selftest_passed;
+            merged_environment_control.merged_environment_entry_count =
+                merged_environment_entry_count;
+            report_environment_control(&merged_environment_control);
+        }
+    }
     ZeroMemory(&job_limits, sizeof(job_limits));
     job_limits.BasicLimitInformation.LimitFlags = 0x00002000; /* JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE */
     job = CreateJobObjectW(NULL, NULL);
@@ -1557,6 +1872,15 @@ static int launch_child(int argc, wchar_t **argv) {
     status = child_exit == 0 ? 0 : (int)child_exit;
     CloseHandle(process.hThread); CloseHandle(process.hProcess); process.hThread = NULL; process.hProcess = NULL;
 done:
+    if (merged_snapshot) {
+        if (!FreeEnvironmentStringsW(merged_snapshot)) {
+            DWORD error = GetLastError();
+            if (status == 0)
+                status = fail(L"retry freeing merged environment snapshot", error);
+        } else {
+            merged_snapshot = NULL;
+        }
+    }
     if (process_token) {
         if (!CloseHandle(process_token) && status == 0)
             status = fail(L"close token handle", GetLastError());
