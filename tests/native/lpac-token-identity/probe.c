@@ -55,6 +55,7 @@ typedef struct TokenDiagnostic {
     BOOL requested_lpac;
     BOOL process_created;
     DWORD create_error;
+    const char *failure_stage_code;
     BOOL job_membership_verified;
     DWORD job_active_before;
     DWORD job_total_before;
@@ -321,6 +322,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     BOOL in_job = FALSE;
     DWORD error = ERROR_SUCCESS;
     DWORD wait_result;
+    const char *stage_code = "initialization";
     DWORD creation_attribute_count = request_lpac ? 3U : 2U;
     wchar_t image[MAX_PATH];
     wchar_t command[32768];
@@ -350,11 +352,17 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     ZeroMemory(&accounting, sizeof(accounting));
     ZeroMemory(environment, sizeof(environment));
 
-    if (!GetModuleFileNameW(NULL, image, (DWORD)_countof(image)) ||
-        !GetWindowsDirectoryW(windows_directory, (UINT)_countof(windows_directory))) {
+    stage_code = "module_path";
+    if (!GetModuleFileNameW(NULL, image, (DWORD)_countof(image))) {
         error = GetLastError();
         goto cleanup;
     }
+    stage_code = "windows_directory";
+    if (!GetWindowsDirectoryW(windows_directory, (UINT)_countof(windows_directory))) {
+        error = GetLastError();
+        goto cleanup;
+    }
+    stage_code = "current_directory";
     current_directory_length = GetCurrentDirectoryW(
         (DWORD)_countof(current_directory), current_directory);
     if (!current_directory_length || current_directory_length >= _countof(current_directory)) {
@@ -362,6 +370,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
         if (error == ERROR_SUCCESS) error = ERROR_INSUFFICIENT_BUFFER;
         goto cleanup;
     }
+    stage_code = "validate_current_directory";
     if (current_directory_length < 3U || current_directory[1] != L':' ||
         (current_directory[2] != L'\\' && current_directory[2] != L'/')) {
         error = ERROR_INVALID_DATA;
@@ -369,6 +378,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     }
     drive_environment_name[1] = current_directory[0];
     drive_environment_name[2] = L':';
+    stage_code = "child_environment";
     if (_snwprintf_s(path_directory, _countof(path_directory), _TRUNCATE,
                      L"%ls\\System32", windows_directory) < 0) {
         error = ERROR_INSUFFICIENT_BUFFER;
@@ -398,6 +408,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     }
     environment[environment_used] = L'\0';
 
+    stage_code = "validate_appcontainer_sid";
     if (!ConvertStringSidToSidW(sid_text, &security_capabilities.AppContainerSid) ||
         !IsValidSid(security_capabilities.AppContainerSid) ||
         !EqualSid(security_capabilities.AppContainerSid, expected_sid)) {
@@ -408,6 +419,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     security_capabilities.CapabilityCount = 0;
     security_capabilities.Reserved = 0;
 
+    stage_code = "create_job";
     job = CreateJobObjectW(NULL, NULL);
     if (!job) {
         error = GetLastError();
@@ -415,18 +427,21 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     }
     report->job_handle_closed = FALSE;
     job_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    stage_code = "configure_job";
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
                                  &job_limits, sizeof(job_limits))) {
         error = GetLastError();
         goto cleanup;
     }
 
+    stage_code = "query_attribute_list_size";
     if (InitializeProcThreadAttributeList(NULL, creation_attribute_count, 0,
                                           &attribute_bytes) ||
         GetLastError() != ERROR_INSUFFICIENT_BUFFER || !attribute_bytes) {
         error = GetLastError() ? GetLastError() : ERROR_INVALID_DATA;
         goto cleanup;
     }
+    stage_code = "allocate_attribute_list";
     attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
         GetProcessHeap(), HEAP_ZERO_MEMORY, attribute_bytes);
     if (!attributes) {
@@ -434,6 +449,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
         goto cleanup;
     }
     report->attributes_deleted = FALSE;
+    stage_code = "initialize_attribute_list";
     if (!InitializeProcThreadAttributeList(attributes, creation_attribute_count,
                                            0, &attribute_bytes)) {
         error = GetLastError();
@@ -441,15 +457,21 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     }
     attributes_initialized = TRUE;
     job_list[0] = job;
+    stage_code = "set_security_capabilities";
     if (!UpdateProcThreadAttribute(attributes, 0,
                                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
                                    &security_capabilities,
-                                   sizeof(security_capabilities), NULL, NULL) ||
-        !UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                                   sizeof(security_capabilities), NULL, NULL)) {
+        error = GetLastError();
+        goto cleanup;
+    }
+    stage_code = "set_job_list";
+    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
                                    job_list, sizeof(job_list), NULL, NULL)) {
         error = GetLastError();
         goto cleanup;
     }
+    stage_code = "set_lpac_policy";
     if (request_lpac && !UpdateProcThreadAttribute(
             attributes, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
             &all_packages_policy, sizeof(all_packages_policy), NULL, NULL)) {
@@ -461,6 +483,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
     startup.StartupInfo.wShowWindow = SW_HIDE;
     startup.lpAttributeList = attributes;
+    stage_code = "create_process";
     if (!CreateProcessW(image, command, NULL, NULL, FALSE,
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
                             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
@@ -473,6 +496,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     report->process_created = TRUE;
     report->process_handle_closed = FALSE;
     report->thread_handle_closed = FALSE;
+    stage_code = "verify_job_membership";
     if (!IsProcessInJob(process.hProcess, job, &in_job)) {
         error = GetLastError();
         report->create_error = error;
@@ -484,6 +508,7 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
         goto cleanup;
     }
     report->job_membership_verified = TRUE;
+    stage_code = "query_job_accounting";
     if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
                                    &accounting, sizeof(accounting), NULL)) {
         error = GetLastError();
@@ -492,18 +517,21 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     }
     report->job_active_before = accounting.ActiveProcesses;
     report->job_total_before = accounting.TotalProcesses;
+    stage_code = "verify_job_accounting";
     if (accounting.ActiveProcesses != 1 || accounting.TotalProcesses != 1) {
         error = ERROR_INVALID_DATA;
         report->create_error = error;
         goto cleanup;
     }
 
+    stage_code = "open_process_token";
     if (!OpenProcessToken(process.hProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &token)) {
         report->token_open_error = GetLastError();
         error = report->token_open_error;
         goto cleanup;
     }
     report->token_opened = TRUE;
+    stage_code = "token_inspection";
     inspect_token(token, expected_sid, report);
     {
         CsLpacAccessCheckResult access_result;
@@ -516,6 +544,9 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     }
 
 cleanup:
+    if (error != ERROR_SUCCESS && !report->failure_stage_code)
+        report->failure_stage_code = stage_code;
+    stage_code = "cleanup";
     if (token && !CloseHandle(token) && error == ERROR_SUCCESS)
         error = GetLastError();
     if (security_capabilities.AppContainerSid &&
@@ -593,6 +624,11 @@ cleanup:
         report->job_handle_closed && report->attributes_deleted;
     if (error != ERROR_SUCCESS) report->create_error = report->create_error ?
         report->create_error : error;
+    if (error != ERROR_SUCCESS && !report->failure_stage_code)
+        report->failure_stage_code = stage_code;
+    if (!report->passed && !report->failure_stage_code)
+        report->failure_stage_code = report->token_opened ?
+            "token_inspection" : "result_validation";
     ok = report->passed;
     return ok;
 }
@@ -616,6 +652,7 @@ static void emit_query(const TokenQueryAttempt *attempt)
 static void emit_control(const TokenDiagnostic *report)
 {
     printf("{\"requested_lpac\":%s,\"process_created\":%s,\"create_error\":%lu,"
+           "\"failure_stage_code\":\"%s\","
            "\"job_membership_verified\":%s,\"job_active_before\":%lu,\"job_total_before\":%lu,"
            "\"token_opened\":%s,\"token_open_error\":%lu,"
            "\"appcontainer_query\":{\"class\":%u,\"buffer_size\":%lu,\"return_length\":%lu,\"success\":%s,\"win32_error\":%lu,\"value\":%lu},"
@@ -623,6 +660,7 @@ static void emit_control(const TokenDiagnostic *report)
            report->requested_lpac ? "true" : "false",
            report->process_created ? "true" : "false",
            (unsigned long)report->create_error,
+           report->failure_stage_code ? report->failure_stage_code : "none",
            report->job_membership_verified ? "true" : "false",
            (unsigned long)report->job_active_before,
            (unsigned long)report->job_total_before,
