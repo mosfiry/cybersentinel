@@ -36,7 +36,8 @@ jobs:
           if ($report.source_commit -ne $env:GITHUB_SHA) { throw 'Evidence SHA does not match this workflow run.' }
           if ($report.status -notin @('PASS', 'INCONCLUSIVE')) { throw 'Unexpected diagnostic status.' }
           if ($null -ne $report.native_probe -and $report.native_probe.resume_attempted -ne $false) { throw 'Diagnostic attempted to resume a child.' }
-          if ($report.mission_started -ne $false -or $report.network_tests_run -ne $false -or $report.storage_tests_run -ne $false -or $report.profile_registration_attempted -ne $false) { throw 'Diagnostic exceeded its approved isolated scope.' }
+          if ($report.mission_started -ne $false -or $report.network_tests_run -ne $false -or $report.storage_tests_run -ne $false) { throw 'Diagnostic exceeded its approved isolated scope.' }
+          if ($report.profile_registration_attempted -ne $true -or $report.profile_created -ne $true -or $report.profile_name_length -le 0 -or $report.profile_name_length -gt 64 -or $report.profile_folder_exists_after_create -ne $true -or $report.profile_delete_confirmed -ne $true -or $report.profile_delete_attempts -lt 1 -or $report.profile_delete_attempts -gt 2 -or $report.profile_folder_removed -ne $true -or $report.profile_cleanup_process_tree_proven -ne $true -or $report.scratch_cleanup_succeeded -ne $true) { throw 'Temporary AppContainer profile or diagnostic scratch was not independently cleaned after process-tree evidence.' }
           if ($null -ne $report.native_probe -and ($report.native_probe.mission_started -ne $false -or $report.native_probe.network_tests_run -ne $false -or $report.native_probe.storage_tests_run -ne $false -or $report.native_probe.profile_registration_attempted -ne $false)) { throw 'Native probe exceeded its isolated scope.' }
           Write-Host "Exact-SHA token-identity evidence recorded: $($report.status)"
       - name: Upload sanitized token-identity evidence

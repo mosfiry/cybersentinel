@@ -27,6 +27,10 @@ class DiagnosticFailure(RuntimeError):
         self.compiler_version = compiler_version
 
 
+PROFILE_PREFIX = "CyberSentinel.LPAC.v1."
+PROFILE_NAME_RE = re.compile(r"[-_. A-Za-z0-9]+\Z")
+
+
 def _win_api() -> tuple[Any, Any, Any]:
     if sys.platform != "win32":
         raise DiagnosticFailure("windows_only")
@@ -53,7 +57,7 @@ def _sid_to_string(advapi32: Any, kernel32: Any, sid: ctypes.c_void_p) -> str:
         kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
 
 
-def _derive_unregistered_appcontainer_sid() -> str:
+def _derive_appcontainer_sid(name: str) -> str:
     kernel32, advapi32, userenv = _win_api()
     derive = userenv.DeriveAppContainerSidFromAppContainerName
     derive.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
@@ -62,14 +66,105 @@ def _derive_unregistered_appcontainer_sid() -> str:
     free_sid.argtypes = [ctypes.c_void_p]
     free_sid.restype = ctypes.c_void_p
     sid = ctypes.c_void_p()
-    name = f"CSLPAC{uuid.uuid4().hex}"
     result = int(derive(name, ctypes.byref(sid)))
     if result != 0 or not sid.value:
-        raise DiagnosticFailure("derive_unregistered_appcontainer_sid", result & 0xFFFFFFFF)
+        if sid.value:
+            free_sid(sid)
+        raise DiagnosticFailure("derive_appcontainer_sid", result & 0xFFFFFFFF)
     try:
         return _sid_to_string(advapi32, kernel32, sid)
     finally:
         free_sid(sid)
+
+
+def _create_appcontainer_profile(name: str, evidence: dict[str, Any]) -> str:
+    if len(name) > 64 or not PROFILE_NAME_RE.fullmatch(name):
+        raise DiagnosticFailure("temporary_profile_name_invalid")
+    kernel32, advapi32, userenv = _win_api()
+    create = userenv.CreateAppContainerProfile
+    create.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                       ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    create.restype = ctypes.c_int32
+    free_sid = advapi32.FreeSid
+    free_sid.argtypes = [ctypes.c_void_p]
+    free_sid.restype = ctypes.c_void_p
+    sid = ctypes.c_void_p()
+    result = int(create(name, name, "Temporary LPAC token identity diagnostic",
+                        None, 0, ctypes.byref(sid))) & 0xFFFFFFFF
+    if result != 0:
+        if sid.value:
+            free_sid(sid)
+        raise DiagnosticFailure("create_temporary_appcontainer_profile", result)
+    evidence["profile_created"] = True
+    if not sid.value:
+        raise DiagnosticFailure("temporary_profile_sid_missing", result)
+    try:
+        return _sid_to_string(advapi32, kernel32, sid)
+    finally:
+        free_sid(sid)
+
+
+def _appcontainer_profile_folder(sid: str) -> Path:
+    _, _, userenv = _win_api()
+    get_path = userenv.GetAppContainerFolderPath
+    get_path.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    get_path.restype = ctypes.c_int32
+    path = ctypes.c_wchar_p()
+    result = int(get_path(sid, ctypes.byref(path))) & 0xFFFFFFFF
+    ole32 = ctypes.WinDLL("ole32.dll", use_last_error=True)
+    free_task_memory = ole32.CoTaskMemFree
+    free_task_memory.argtypes = [ctypes.c_void_p]
+    free_task_memory.restype = None
+    if result != 0 or not path.value:
+        if path.value:
+            free_task_memory(ctypes.cast(path, ctypes.c_void_p))
+        raise DiagnosticFailure("temporary_profile_folder_lookup", result)
+    folder = Path(path.value)
+    free_task_memory(ctypes.cast(path, ctypes.c_void_p))
+    return folder
+
+
+def _delete_appcontainer_profile(name: str) -> int:
+    _, _, userenv = _win_api()
+    delete = userenv.DeleteAppContainerProfile
+    delete.argtypes = [ctypes.c_wchar_p]
+    delete.restype = ctypes.c_int32
+    result = 0
+    for attempt in range(1, 3):
+        result = int(delete(name)) & 0xFFFFFFFF
+        if result == 0:
+            return attempt
+    raise DiagnosticFailure("delete_temporary_appcontainer_profile", result)
+
+
+def _native_cleanup_proven(report: Any) -> bool:
+    if not isinstance(report, dict) or report.get("resume_attempted") is not False:
+        return False
+    for key in ("ordinary_appcontainer", "lpac_candidate"):
+        control = report.get(key)
+        if not isinstance(control, dict):
+            return False
+        cleanup = control.get("cleanup")
+        if not isinstance(cleanup, dict):
+            return False
+        if not all(cleanup.get(field) is True for field in (
+            "job_query_succeeded", "job_empty", "process_handle_closed",
+            "thread_handle_closed", "job_handle_closed", "attributes_deleted",
+        )):
+            return False
+        if cleanup.get("job_active_processes") != 0:
+            return False
+        if control.get("process_created") is True:
+            if (control.get("job_membership_verified") is not True
+                    or cleanup.get("process_signaled") is not True
+                    or cleanup.get("job_total_processes") != 1):
+                return False
+        elif control.get("process_created") is False:
+            if cleanup.get("job_active_processes") != 0 or cleanup.get("job_total_processes") != 0:
+                return False
+        else:
+            return False
+    return True
 
 
 def _current_user_sid() -> str:
@@ -278,12 +373,25 @@ def main() -> int:
         "network_tests_run": False,
         "storage_tests_run": False,
         "profile_registration_attempted": False,
+        "profile_created": False,
+        "profile_name_length": None,
+        "profile_folder_exists_after_create": False,
+        "profile_cleanup_process_tree_proven": False,
+        "profile_delete_confirmed": False,
+        "profile_folder_removed": False,
+        "profile_delete_attempts": 0,
+        "profile_delete_skipped_cleanup_unproven": False,
+        "profile_cleanup_failure_stage": None,
+        "profile_cleanup_failure_code": None,
         "native_probe": None,
         "probe_return_code": None,
         "scratch_cleanup_succeeded": False,
         "status": "INCONCLUSIVE",
     }
     scratch_root: Path | None = None
+    profile_name: str | None = None
+    profile_folder: Path | None = None
+    probe_started = False
     success = False
 
     try:
@@ -294,7 +402,16 @@ def main() -> int:
             evidence["windows_sdk_version"] = sdk_version
             evidence["compiler_version"] = compiler_version
 
-            sid = _derive_unregistered_appcontainer_sid()
+            profile_name = PROFILE_PREFIX + uuid.uuid4().hex
+            evidence["profile_registration_attempted"] = True
+            evidence["profile_name_length"] = len(profile_name)
+            sid = _create_appcontainer_profile(profile_name, evidence)
+            if sid != _derive_appcontainer_sid(profile_name):
+                raise DiagnosticFailure("temporary_profile_sid_mismatch")
+            profile_folder = _appcontainer_profile_folder(sid)
+            evidence["profile_folder_exists_after_create"] = profile_folder.is_dir()
+            if not evidence["profile_folder_exists_after_create"]:
+                raise DiagnosticFailure("temporary_profile_folder_missing")
             user_sid = _current_user_sid()
             system_drive = os.environ.get("SystemDrive") or Path(os.environ["SystemRoot"]).drive
             system_drive_root = Path(system_drive + "\\")
@@ -316,12 +433,17 @@ def main() -> int:
                 "SystemRoot": os.environ["SystemRoot"],
                 "PATH": str(Path(os.environ["SystemRoot"]) / "System32"),
             }
-            process = subprocess.run(
-                [str(probe_path), "--diagnostic", sid], cwd=str(control_dir),
-                env=minimal_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                shell=False, timeout=60, check=False,
-            )
+            probe_started = True
+            try:
+                process = subprocess.run(
+                    [str(probe_path), "--diagnostic", sid], cwd=str(control_dir),
+                    env=minimal_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                    shell=False, timeout=60, check=False,
+                )
+            except OSError:
+                probe_started = False
+                raise
             evidence["probe_return_code"] = process.returncode
             evidence["probe_stderr_nonempty"] = bool(process.stderr.strip())
             try:
@@ -339,6 +461,9 @@ def main() -> int:
                 and probe_report.get("network_tests_run") is False
                 and probe_report.get("storage_tests_run") is False
                 and probe_report.get("profile_registration_attempted") is False
+                and evidence["profile_registration_attempted"] is True
+                and evidence["profile_created"] is True
+                and evidence["profile_folder_exists_after_create"] is True
                 and _control_passes(probe_report.get("ordinary_appcontainer"), False)
                 and _control_passes(probe_report.get("lpac_candidate"), True)
                 and probe_report.get("passed") is True
@@ -359,6 +484,29 @@ def main() -> int:
     except Exception as exc:  # Keep artifacts bounded and avoid copying paths or raw output.
         evidence["setup_failure_stage"] = f"unexpected_{type(exc).__name__}"
     finally:
+        if evidence["profile_created"] and profile_name is not None:
+            cleanup_proven = not probe_started or _native_cleanup_proven(evidence["native_probe"])
+            evidence["profile_cleanup_process_tree_proven"] = cleanup_proven
+            if cleanup_proven:
+                try:
+                    evidence["profile_delete_attempts"] = _delete_appcontainer_profile(profile_name)
+                    evidence["profile_delete_confirmed"] = True
+                except DiagnosticFailure as exc:
+                    evidence["profile_delete_attempts"] = 2
+                    evidence["profile_cleanup_failure_stage"] = exc.stage
+                    evidence["profile_cleanup_failure_code"] = exc.code
+                except Exception as exc:
+                    evidence["profile_cleanup_failure_stage"] = f"unexpected_{type(exc).__name__}"
+                if profile_folder is not None and evidence["profile_delete_confirmed"]:
+                    try:
+                        evidence["profile_folder_removed"] = not profile_folder.exists()
+                    except OSError:
+                        evidence["profile_folder_removed"] = False
+            else:
+                evidence["profile_delete_skipped_cleanup_unproven"] = True
+            if (not evidence["profile_delete_confirmed"]
+                    or not evidence["profile_folder_removed"]):
+                success = False
         if scratch_root is not None:
             try:
                 shutil.rmtree(scratch_root)
