@@ -50,11 +50,25 @@ typedef struct TokenQueryAttempt {
     ULONGLONG raw_value;
 } TokenQueryAttempt;
 
+typedef LONG (WINAPI *LastNtStatusFn)(void);
+
 typedef struct TokenDiagnostic {
     const char *control;
     BOOL requested_lpac;
     BOOL process_created;
     DWORD create_error;
+    DWORD create_win32_error;
+    BOOL create_attempted;
+    BOOL create_ntstatus_getter_available;
+    BOOL create_ntstatus_sampled;
+    LONG create_ntstatus;
+    DWORD creation_flags;
+    BOOL security_capabilities_attribute_set;
+    BOOL job_list_attribute_set;
+    BOOL all_packages_policy_attribute_set;
+    const char *environment_block_mode;
+    const char *application_path_redacted;
+    const char *working_directory_redacted;
     const char *failure_stage_code;
     BOOL job_membership_verified;
     DWORD job_active_before;
@@ -333,14 +347,23 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     wchar_t environment[1024];
     size_t environment_used = 0;
     DWORD current_directory_length;
+    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
+                           CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
     int command_length;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits;
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+    LastNtStatusFn last_nt_status = NULL;
+    HMODULE ntdll = NULL;
+    FARPROC ntstatus_address = NULL;
     BOOL ok = FALSE;
 
     ZeroMemory(report, sizeof(*report));
     report->control = request_lpac ? "lpac_candidate" : "ordinary_appcontainer";
     report->requested_lpac = request_lpac;
+    report->environment_block_mode = "explicit_unicode_sorted";
+    report->application_path_redacted =
+        "<SYSTEM_DRIVE>:\\<SCRATCH>\\control\\lpac_token_identity_probe.exe";
+    report->working_directory_redacted = "<SYSTEM_DRIVE>:\\<SCRATCH>\\control";
     report->process_handle_closed = TRUE;
     report->thread_handle_closed = TRUE;
     report->job_handle_closed = TRUE;
@@ -465,12 +488,14 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
         error = GetLastError();
         goto cleanup;
     }
+    report->security_capabilities_attribute_set = TRUE;
     stage_code = "set_job_list";
     if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
                                    job_list, sizeof(job_list), NULL, NULL)) {
         error = GetLastError();
         goto cleanup;
     }
+    report->job_list_attribute_set = TRUE;
     stage_code = "set_lpac_policy";
     if (request_lpac && !UpdateProcThreadAttribute(
             attributes, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
@@ -478,19 +503,35 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
         error = GetLastError();
         goto cleanup;
     }
+    report->all_packages_policy_attribute_set = request_lpac;
 
     startup.StartupInfo.cb = (DWORD)sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
     startup.StartupInfo.wShowWindow = SW_HIDE;
     startup.lpAttributeList = attributes;
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll) {
+        ntstatus_address = GetProcAddress(ntdll, "RtlGetLastNtStatus");
+        if (ntstatus_address)
+            memcpy(&last_nt_status, &ntstatus_address, sizeof(last_nt_status));
+    }
+    report->create_ntstatus_getter_available = last_nt_status != NULL;
+    report->creation_flags = creation_flags;
     stage_code = "create_process";
+    report->create_attempted = TRUE;
     if (!CreateProcessW(image, command, NULL, NULL, FALSE,
-                        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
-                            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                        creation_flags,
                         environment, current_directory,
                         &startup.StartupInfo, &process)) {
+        /* Snapshot thread NTSTATUS first, then the distinct Win32 last-error;
+         * do not insert cleanup or other API calls between these reads. */
+        if (last_nt_status) {
+            report->create_ntstatus = last_nt_status();
+            report->create_ntstatus_sampled = TRUE;
+        }
         error = GetLastError();
         report->create_error = error;
+        report->create_win32_error = error;
         goto cleanup;
     }
     report->process_created = TRUE;
@@ -651,16 +692,42 @@ static void emit_query(const TokenQueryAttempt *attempt)
 
 static void emit_control(const TokenDiagnostic *report)
 {
-    printf("{\"requested_lpac\":%s,\"process_created\":%s,\"create_error\":%lu,"
-           "\"failure_stage_code\":\"%s\","
+    printf("{\"control\":\"%s\",\"requested_lpac\":%s,\"process_created\":%s,"
+           "\"create_attempted\":%s,\"create_error\":%lu,\"create_win32_error\":%lu,"
+           "\"create_ntstatus_getter_available\":%s,\"create_ntstatus_sampled\":%s,"
+           "\"create_ntstatus_hex\":",
+           report->control,
+           report->requested_lpac ? "true" : "false",
+           report->process_created ? "true" : "false",
+           report->create_attempted ? "true" : "false",
+           (unsigned long)report->create_error,
+           (unsigned long)report->create_win32_error,
+           report->create_ntstatus_getter_available ? "true" : "false",
+           report->create_ntstatus_sampled ? "true" : "false");
+    if (report->create_ntstatus_sampled)
+        printf("\"0x%08lX\"", (unsigned long)(ULONG)report->create_ntstatus);
+    else
+        printf("null");
+    printf(",\"failure_stage_code\":\"%s\",\"create_context\":{"
+           "\"application_path_redacted\":\"%s\","
+           "\"working_directory_redacted\":\"%s\","
+           "\"environment_block_mode\":\"%s\","
+           "\"creation_flags_hex\":\"0x%08lX\","
+           "\"security_capabilities_attribute\":%s,"
+           "\"job_list_attribute\":%s,"
+           "\"all_application_packages_policy_attribute\":%s},"
            "\"job_membership_verified\":%s,\"job_active_before\":%lu,\"job_total_before\":%lu,"
            "\"token_opened\":%s,\"token_open_error\":%lu,"
            "\"appcontainer_query\":{\"class\":%u,\"buffer_size\":%lu,\"return_length\":%lu,\"success\":%s,\"win32_error\":%lu,\"value\":%lu},"
            "\"class46_queries\":[",
-           report->requested_lpac ? "true" : "false",
-           report->process_created ? "true" : "false",
-           (unsigned long)report->create_error,
            report->failure_stage_code ? report->failure_stage_code : "none",
+           report->application_path_redacted,
+           report->working_directory_redacted,
+           report->environment_block_mode,
+           (unsigned long)report->creation_flags,
+           report->security_capabilities_attribute_set ? "true" : "false",
+           report->job_list_attribute_set ? "true" : "false",
+           report->all_packages_policy_attribute_set ? "true" : "false",
            report->job_membership_verified ? "true" : "false",
            (unsigned long)report->job_active_before,
            (unsigned long)report->job_total_before,
