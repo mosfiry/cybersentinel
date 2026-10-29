@@ -362,8 +362,8 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     report->requested_lpac = request_lpac;
     report->environment_block_mode = "explicit_unicode_sorted";
     report->application_path_redacted =
-        "<SYSTEM_DRIVE>:\\<SCRATCH>\\control\\lpac_token_identity_probe.exe";
-    report->working_directory_redacted = "<SYSTEM_DRIVE>:\\<SCRATCH>\\control";
+        "<SYSTEM_DRIVE>:\\\\<SCRATCH>\\\\control\\\\lpac_token_identity_probe.exe";
+    report->working_directory_redacted = "<SYSTEM_DRIVE>:\\\\<SCRATCH>\\\\control";
     report->process_handle_closed = TRUE;
     report->thread_handle_closed = TRUE;
     report->job_handle_closed = TRUE;
