@@ -21,6 +21,10 @@ Build and run a **separate, non-production Windows experiment** for a unique reg
 4. **Strict Windows CI and evidence** — use a hosted Windows runner tied to the exact commit SHA; run the original four LPAC tests and the new registered-storage gate together with no skip/xfail/soft-failed native cases; retain sanitized per-case results, allowlisted token/Job attestations, fixed launcher failure codes and failure artifacts; record Windows build and run URL. Upload no raw JUnit, trace, path or SID data to public artifacts.
 5. **Further stages only if gate 3 passes** — evaluate broader file/network denial, true simultaneous task execution, cancellation/timeout, crash recovery and Mission only after an independently reviewed boundary proof. Host reboot recovery requires a persistent Windows environment and remains unproven by a disposable hosted runner. Any unproven condition remains `BLOCKED`, `FAIL`, or `INCONCLUSIVE`; never close D2 on partial evidence.
 
+## Evidence-driven adjustment after Windows run 6
+
+On the Windows 10.0.26100 hosted runner, the documented `TokenIsAppContainer` query succeeded but the class-46 `TokenIsLessPrivilegedAppContainer` query returned Win32 87 with no `ReturnLength`. Microsoft Learn's Win32 guidance does not define a class-specific output contract; do not infer either LPAC or non-LPAC from this failure. Preserve class 46 as a diagnostic. Separately validate the moderator-suggested `AccessCheck` differential for the two package groups against a paired ordinary-AppContainer control. This is a behavioral cross-check, not a documented `IsLPAC` API, and it cannot substitute for the distinct VHD/profile-storage, host-file, network, process-tree, and recovery gates.
+
 ## Verification
 
 - Baseline remote refs and branch parent match the exact values in `baseline.md`.
