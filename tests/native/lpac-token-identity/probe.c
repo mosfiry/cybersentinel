@@ -325,8 +325,12 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
     wchar_t image[MAX_PATH];
     wchar_t command[32768];
     wchar_t windows_directory[MAX_PATH];
+    wchar_t current_directory[MAX_PATH];
+    wchar_t path_directory[MAX_PATH * 2];
+    wchar_t drive_environment_name[4] = { L'=', L'\0', L'\0', L'\0' };
     wchar_t environment[1024];
     size_t environment_used = 0;
+    DWORD current_directory_length;
     int command_length;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits;
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
@@ -351,13 +355,40 @@ static BOOL run_control(PSID expected_sid, const wchar_t *sid_text,
         error = GetLastError();
         goto cleanup;
     }
+    current_directory_length = GetCurrentDirectoryW(
+        (DWORD)_countof(current_directory), current_directory);
+    if (!current_directory_length || current_directory_length >= _countof(current_directory)) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_INSUFFICIENT_BUFFER;
+        goto cleanup;
+    }
+    if (current_directory_length < 3U || current_directory[1] != L':' ||
+        (current_directory[2] != L'\\' && current_directory[2] != L'/')) {
+        error = ERROR_INVALID_DATA;
+        goto cleanup;
+    }
+    drive_environment_name[1] = current_directory[0];
+    drive_environment_name[2] = L':';
+    if (_snwprintf_s(path_directory, _countof(path_directory), _TRUNCATE,
+                     L"%ls\\System32", windows_directory) < 0) {
+        error = ERROR_INSUFFICIENT_BUFFER;
+        goto cleanup;
+    }
     command_length = _snwprintf_s(command, _countof(command), _TRUNCATE,
                                   L"\"%ls\" --idle-child", image);
     if (command_length < 0 ||
         !append_environment(environment, _countof(environment), &environment_used,
+                            drive_environment_name, current_directory) ||
+        !append_environment(environment, _countof(environment), &environment_used,
+                            L"PATH", path_directory) ||
+        !append_environment(environment, _countof(environment), &environment_used,
                             L"SystemRoot", windows_directory) ||
         !append_environment(environment, _countof(environment), &environment_used,
-                            L"PATH", windows_directory)) {
+                            L"TEMP", current_directory) ||
+        !append_environment(environment, _countof(environment), &environment_used,
+                            L"TMP", current_directory) ||
+        !append_environment(environment, _countof(environment), &environment_used,
+                            L"windir", windows_directory)) {
         error = ERROR_INSUFFICIENT_BUFFER;
         goto cleanup;
     }
