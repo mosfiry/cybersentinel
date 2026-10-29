@@ -1,0 +1,49 @@
+name: windows-lpac-token-identity-diagnostic
+on:
+  push:
+    branches: [experiment/d2-registered-lpac-proof-20261027]
+    paths:
+      - "tests/native/lpac-token-identity/**"
+      - ".github/workflows/windows-lpac-token-identity-diagnostic.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-lpac-token-identity-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  suspended-token-identity-controls:
+    if: github.repository == 'mosfiry/cybersentinel' && github.ref == 'refs/heads/experiment/d2-registered-lpac-proof-20261027'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare ordinary AppContainer and LPAC token controls
+        run: python tests/native/lpac-token-identity/runner.py
+      - name: Verify sanitized exact-SHA evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'lpac-token-identity-diagnostic.json'
+          if (-not (Test-Path $path)) { throw 'Sanitized token-identity evidence was not produced.' }
+          $report = Get-Content -Raw $path | ConvertFrom-Json
+          if ($report.source_commit -ne $env:GITHUB_SHA) { throw 'Evidence SHA does not match this workflow run.' }
+          if ($report.status -notin @('PASS', 'INCONCLUSIVE')) { throw 'Unexpected diagnostic status.' }
+          if ($null -ne $report.native_probe -and $report.native_probe.resume_attempted -ne $false) { throw 'Diagnostic attempted to resume a child.' }
+          if ($report.mission_started -ne $false -or $report.network_tests_run -ne $false -or $report.storage_tests_run -ne $false -or $report.profile_registration_attempted -ne $false) { throw 'Diagnostic exceeded its approved isolated scope.' }
+          if ($null -ne $report.native_probe -and ($report.native_probe.mission_started -ne $false -or $report.native_probe.network_tests_run -ne $false -or $report.native_probe.storage_tests_run -ne $false -or $report.native_probe.profile_registration_attempted -ne $false)) { throw 'Native probe exceeded its isolated scope.' }
+          Write-Host "Exact-SHA token-identity evidence recorded: $($report.status)"
+      - name: Upload sanitized token-identity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-LPAC-token-identity-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lpac-token-identity-diagnostic.json
+          if-no-files-found: error
+          retention-days: 30
