@@ -94,11 +94,12 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert "TerminateJobObject" in control_source
     assert "cleanup_confirmed" in control_source
     assert "return result->cleanup_confirmed;" in control_source
-    assert "if (!result->cleanup_confirmed) return FALSE;" in control_source
+    assert "if (!result->cleanup_confirmed)" in control_source
+    assert "report_control_cleanup_diagnostic(result)" in control_source
     create_failure_source = control_source[
         control_source.index("if (!create_succeeded)"):control_source.index("result->create_succeeded = TRUE")
     ]
-    assert "job_closed = close_control_job_handle" in create_failure_source
+    assert "result->job_handle_closed = close_control_job_handle" in create_failure_source
     assert "return result->cleanup_confirmed;" in create_failure_source
     assert "*job_out = *job;" in native_probe
     assert 'L"TokenIsLessPrivilegedAppContainer_query"' in native_probe
@@ -116,6 +117,7 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert "build_merged_environment_block(" in native_probe
     assert "CompareStringOrdinal(" in native_probe
     assert "merged_environment_builder_self_test(" in native_probe
+    assert "environment_block_preserves_custom_entries(" in native_probe
     assert "merged_environment_block" in runner
     assert "build_environment_block_omitting_entry" in native_probe
     assert "_sanitize_environment_variant_controls" in runner
@@ -135,6 +137,26 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert "Keep process and Job handles for the caller's final retry." in native_probe
     assert "if (control_process_terminated && control_job_empty)" in native_probe
     assert 'L"diagnostic cleanup unconfirmed"' in native_probe
+    assert 'L"lpac_cleanup_diagnostic:' in native_probe
+    verify_start = native_probe.index("static BOOL verify_token(")
+    verify_end = native_probe.index("\nstatic BOOL", verify_start + len("static BOOL verify_token("))
+    verify_source = native_probe[verify_start:verify_end]
+    assert "TOKEN_VERIFY_RECORD_FAIL(L\"TokenIsLessPrivilegedAppContainer_query\"" in verify_source
+    assert verify_source.index("TokenIsLessPrivilegedAppContainer_query") < verify_source.index("TokenAppContainerSid")
+    assert "all_checks_passed" in verify_source and "return all_checks_passed;" in verify_source
+    assert "goto done" not in verify_source
+    launch_start = native_probe.index("static int launch_child(")
+    launch_end = native_probe.index("int wmain(", launch_start)
+    launch_source = native_probe[launch_start:launch_end]
+    create_pos = launch_source.index("CreateProcessW(argv[0], command")
+    membership_pos = launch_source.index("IsProcessInJob(process.hProcess")
+    token_pos = launch_source.index("parent_token_verified = verify_token(")
+    resume_pos = launch_source.index("ResumeThread(process.hThread)")
+    assert create_pos < membership_pos < token_pos < resume_pos
+    assert "main_environment_to_use, argv[4]" in launch_source
+    assert "main_environment_to_use = merged_env_block;" in launch_source
+    assert "merged_environment_selected_for_main = TRUE;" in launch_source
+    assert "report_cleanup_diagnostic(&main_cleanup)" in launch_source
 
 
 def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tmp_path: Path):
@@ -177,8 +199,10 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
             "token_is_appcontainer_api_error": 0, "token_is_lpac_query_succeeded": True,
             "token_is_lpac_return_length": 4, "token_is_lpac_api_error": 0,
             "token_failure_stage": "complete", "token_api_error": 0, "token_return_length": 4,
-            "terminated": True, "job_active_processes": 0, "job_total_processes": 1,
-            "job_empty": True, "cleanup_confirmed": True, "cleanup_error": 0,
+            "terminated": True, "job_query_succeeded": True, "job_active_processes": 0,
+            "job_total_processes": 1, "job_empty": True,
+            "process_handle_closed": True, "thread_handle_closed": True, "job_handle_closed": True,
+            "cleanup_confirmed": True, "cleanup_error": 0,
             "raw_windows_path": "C:\\sensitive\\private",
             "raw_environment": "ACTIONS_RUNTIME_TOKEN=sentinel-secret",
             "token_raw": "sensitive-token-data",
@@ -221,6 +245,7 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
             "parent_environment_filtered": True, "main_environment_block": True,
             "main_environment_block_safe": True, "merged_environment_block": True,
             "merged_environment_builder_selftest_passed": True,
+            "merged_custom_entries_verified": True, "merged_environment_selected_for_main": True,
             "merged_environment_entry_count": 29, "main_environment_entry_count": 29,
             "attempted": True, "setup_error": 0, "create_succeeded": True,
             "create_win32_error": 0, "terminated": True, "job_empty": True,
@@ -259,6 +284,45 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
             "token_failure_stage": "TokenIsLessPrivilegedAppContainer_query",
             "token_api_error": 87, "token_return_length": 0, "raw_sid": "private-sid",
         },
+        "cleanup_diagnostics": [
+            {
+                "version": 1, "scope": "broker_only", "diagnostic_only": True,
+                "attempted": True, "process_created": True, "resume_attempted": False,
+                "resume_succeeded": False, "termination_requested": True,
+                "process_signaled": True, "job_membership_verified": True,
+                "job_query_succeeded": True, "job_active_processes": 0, "job_total_processes": 1,
+                "job_empty": True, "process_handle_closed": True, "thread_handle_closed": True,
+                "job_handle_closed": True, "cleanup_error": 0, "cleanup_confirmed": True,
+                "raw_path": "C:\\sensitive\\private", "raw_sid": "private-sid",
+            },
+            {
+                "version": 1, "scope": "broker_only", "diagnostic_only": True,
+                "attempted": True, "process_created": True, "resume_attempted": False,
+                "resume_succeeded": False, "termination_requested": True,
+                "process_signaled": True, "job_membership_verified": True,
+                "job_query_succeeded": True, "job_active_processes": 1, "job_total_processes": 1,
+                "job_empty": False, "process_handle_closed": True, "thread_handle_closed": True,
+                "job_handle_closed": True, "cleanup_error": 0, "cleanup_confirmed": True,
+            },
+            {
+                "version": 1, "scope": "broker_only", "diagnostic_only": True,
+                "attempted": True, "process_created": False, "resume_attempted": False,
+                "resume_succeeded": False, "termination_requested": False,
+                "process_signaled": False, "job_membership_verified": False,
+                "job_query_succeeded": False, "job_active_processes": 0, "job_total_processes": 0,
+                "job_empty": True, "process_handle_closed": True, "thread_handle_closed": True,
+                "job_handle_closed": True, "cleanup_error": 0, "cleanup_confirmed": True,
+            },
+            {
+                "version": 1, "scope": "broker_only", "diagnostic_only": True,
+                "attempted": True, "process_created": True, "resume_attempted": True,
+                "resume_succeeded": True, "termination_requested": True,
+                "process_signaled": True, "job_membership_verified": True,
+                "job_query_succeeded": True, "job_active_processes": 0, "job_total_processes": 1,
+                "job_empty": True, "process_handle_closed": True, "thread_handle_closed": True,
+                "job_handle_closed": True, "cleanup_error": 0, "cleanup_confirmed": True,
+            },
+        ],
     }
     for name in runner.LEGACY_NATIVE_CASES:
         case = ET.SubElement(root, "testcase", name=name)
@@ -295,7 +359,14 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_environment_block"] is True for item in attestations)
     assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_environment_builder_selftest_passed"] is True for item in attestations)
     assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_environment_entry_count"] == 29 for item in attestations)
+    assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_custom_entries_verified"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["merged_environment_control"]["merged_environment_selected_for_main"] is True for item in attestations)
     assert all(item["launcher_failures"][0]["merged_environment_control"]["comparison_complete"] is False for item in attestations)
+    assert all(item["launcher_failures"][0]["cleanup_diagnostics"][0]["cleanup_confirmed"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["cleanup_diagnostics"][1]["cleanup_confirmed"] is False for item in attestations)
+    assert all(item["launcher_failures"][0]["cleanup_diagnostics"][2]["cleanup_confirmed"] is False for item in attestations)
+    assert all(item["launcher_failures"][0]["cleanup_diagnostics"][3]["cleanup_confirmed"] is False for item in attestations)
+    assert all("raw_path" not in json.dumps(item["launcher_failures"][0]["cleanup_diagnostics"]) for item in attestations)
     assert all([v["main_environment_variant_id"] for v in item["launcher_failures"][0]["main_environment_variant_controls"]] == [1, 2] for item in attestations)
     assert all(all(v["comparison_complete"] is False for v in item["launcher_failures"][0]["main_environment_variant_controls"]) for item in attestations)
     assert all(item["launcher_failures"][0]["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query" for item in attestations)

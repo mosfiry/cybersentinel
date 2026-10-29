@@ -471,6 +471,7 @@ _LAUNCH_FAILURE_STEPS = frozenset({
     "environment control cleanup unconfirmed", "explicit environment control cleanup unconfirmed",
     "main environment block control cleanup unconfirmed", "build main environment variant",
     "main environment variant control cleanup unconfirmed", "merged environment control cleanup unconfirmed",
+    "validate merged environment block",
     "verify suspended LPAC child job membership", "suspended LPAC child token verification",
     "resume LPAC child", "bounded LPAC child wait", "read child exit code",
     "query completed LPAC job accounting", "LPAC job did not become empty",
@@ -489,8 +490,10 @@ _ENVIRONMENT_CONTROL_BOOL_FIELDS = (
     "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
     "explicit_environment_snapshot_safe", "main_environment_block", "main_environment_block_safe",
     "main_environment_variant", "merged_environment_block",
-    "merged_environment_builder_selftest_passed", "attempted", "create_succeeded", "create_ntstatus_available",
-    "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
+    "merged_environment_builder_selftest_passed", "merged_custom_entries_verified",
+    "merged_environment_selected_for_main", "attempted", "create_succeeded", "create_ntstatus_available",
+    "job_membership_verified", "job_query_succeeded", "process_handle_closed",
+    "thread_handle_closed", "job_handle_closed", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
     "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
     "token_is_lpac_query_succeeded", "terminated", "job_empty", "cleanup_confirmed",
 )
@@ -504,6 +507,7 @@ _ENVIRONMENT_CONTROL_INT_FIELDS = (
 )
 _TOKEN_FAILURE_STAGES = frozenset({
     "not_run", "invalid_token_or_expected_sid", "OpenProcessToken",
+    "close suspended LPAC token handle",
     "TokenIsAppContainer_query", "TokenIsAppContainer_return_length", "TokenIsAppContainer_false",
     "TokenIsLessPrivilegedAppContainer_query", "TokenIsLessPrivilegedAppContainer_return_length",
     "TokenIsLessPrivilegedAppContainer_false", "TokenAppContainerSid_size_query", "TokenAppContainerSid_size",
@@ -523,6 +527,66 @@ _TOKEN_DIAGNOSTIC_INT_FIELDS = (
     "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
     "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
 )
+_CLEANUP_DIAGNOSTIC_BOOL_FIELDS = (
+    "diagnostic_only", "attempted", "process_created", "resume_attempted",
+    "resume_succeeded", "termination_requested",
+    "process_signaled", "job_membership_verified", "job_query_succeeded", "job_empty",
+    "process_handle_closed", "thread_handle_closed", "job_handle_closed",
+)
+_CLEANUP_DIAGNOSTIC_INT_FIELDS = (
+    "job_active_processes", "job_total_processes", "cleanup_error",
+)
+
+
+def _sanitize_cleanup_diagnostic(value: object) -> dict[str, Any] | None:
+    if (not isinstance(value, dict) or type(value.get("version")) is not int
+            or value.get("version") != 1 or value.get("scope") != "broker_only"):
+        return None
+    cleanup: dict[str, Any] = {"version": 1, "scope": "broker_only"}
+    for field in _CLEANUP_DIAGNOSTIC_BOOL_FIELDS:
+        if type(value.get(field)) is bool:
+            cleanup[field] = value[field]
+    for field in _CLEANUP_DIAGNOSTIC_INT_FIELDS:
+        number = value.get(field)
+        if type(number) is int and 0 <= number <= 0xFFFFFFFF:
+            cleanup[field] = number
+    handles_closed = all(cleanup.get(field) is True for field in (
+        "process_handle_closed", "thread_handle_closed", "job_handle_closed",
+    ))
+    if cleanup.get("process_created") is True:
+        resume_safe = (
+            cleanup.get("diagnostic_only") is True
+            and cleanup.get("resume_attempted") is False
+            and cleanup.get("resume_succeeded") is False
+        ) or (
+            cleanup.get("diagnostic_only") is False
+            and (cleanup.get("resume_attempted") is False or (
+            cleanup.get("resume_attempted") is True
+            and cleanup.get("resume_succeeded") is True
+            and cleanup.get("job_membership_verified") is True
+            ))
+        )
+        cleanup["cleanup_confirmed"] = (
+            cleanup.get("attempted") is True
+            and cleanup.get("diagnostic_only") in (True, False)
+            and cleanup.get("process_signaled") is True
+            and cleanup.get("job_query_succeeded") is True
+            and cleanup.get("job_empty") is True
+            and cleanup.get("job_active_processes") == 0
+            and cleanup.get("cleanup_error") == 0
+            and handles_closed and resume_safe
+        )
+    else:
+        cleanup["cleanup_confirmed"] = (
+            cleanup.get("process_created") is False and handles_closed
+            and cleanup.get("cleanup_error") == 0
+            and (cleanup.get("attempted") is False or (
+                cleanup.get("job_query_succeeded") is True
+                and cleanup.get("job_empty") is True
+                and cleanup.get("job_active_processes") == 0
+            ))
+        )
+    return cleanup
 
 
 def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
@@ -530,6 +594,7 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
     result: dict[str, Any] = {}
     prefix = "lpac_launch_diagnostic: "
     token_prefix = "lpac_token_diagnostic: "
+    cleanup_prefix = "lpac_cleanup_diagnostic: "
     environment_prefix = "lpac_environment_control: "
     snapshot_prefix = "lpac_environment_snapshot_control: "
     main_block_prefix = "lpac_main_environment_block_control: "
@@ -541,6 +606,18 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
             result["failure_step"] = match.group(1)
             result["failure_win32_error"] = int(match.group(2))
         if not line.startswith(prefix):
+            if line.startswith(cleanup_prefix):
+                try:
+                    cleanup = _sanitize_cleanup_diagnostic(
+                        json.loads(line[len(cleanup_prefix):])
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if cleanup is not None:
+                    diagnostics = result.setdefault("cleanup_diagnostics", [])
+                    if isinstance(diagnostics, list) and len(diagnostics) < 16:
+                        diagnostics.append(cleanup)
+                continue
             if line.startswith(token_prefix):
                 try:
                     value = json.loads(line[len(token_prefix):])
@@ -604,7 +681,9 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
                         "create_succeeded", "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac",
                         "low_integrity", "expected_sid_match", "zero_capabilities",
                         "token_is_appcontainer_query_succeeded", "token_is_lpac_query_succeeded",
-                        "terminated", "job_empty", "cleanup_confirmed",
+                        "terminated", "job_query_succeeded", "job_empty",
+                        "process_handle_closed", "thread_handle_closed", "job_handle_closed",
+                        "cleanup_confirmed",
                     ))
                     and all(control.get(field) == 0 for field in (
                         "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
@@ -686,7 +765,9 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "token_is_appcontainer_api_error": 0, "token_is_lpac_query_succeeded": True,
         "token_is_lpac_return_length": 4, "token_is_lpac_api_error": 0,
         "token_failure_stage": "complete", "token_api_error": 0, "token_return_length": 4,
-        "terminated": True, "job_active_processes": 0,
+        "terminated": True, "job_query_succeeded": True, "job_empty": True,
+        "process_handle_closed": True, "thread_handle_closed": True, "job_handle_closed": True,
+        "job_active_processes": 0,
         "job_total_processes": 1, "job_empty": True, "cleanup_confirmed": True,
         "cleanup_error": 0, "raw_windows_path": r"C:\private\sensitive",
         "raw_environment": "ACTIONS_RUNTIME_TOKEN=sentinel-secret",
@@ -751,6 +832,7 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "parent_environment_filtered": True, "main_environment_block": True,
         "main_environment_block_safe": True, "merged_environment_block": True,
         "merged_environment_builder_selftest_passed": True,
+        "merged_custom_entries_verified": True, "merged_environment_selected_for_main": True,
         "merged_environment_entry_count": 29, "main_environment_entry_count": 29,
         "attempted": True, "setup_error": 0, "create_succeeded": True,
         "create_win32_error": 0, "terminated": True, "job_empty": True,
@@ -768,6 +850,16 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "token_api_error": 87, "token_return_length": 0,
         "raw_sid": "S-1-15-2-private",
     }
+    cleanup_diagnostic = {
+        "version": 1, "scope": "broker_only", "diagnostic_only": True,
+        "attempted": True, "process_created": True, "resume_attempted": False,
+        "resume_succeeded": False, "termination_requested": True,
+        "process_signaled": True, "job_membership_verified": True,
+        "job_query_succeeded": True, "job_active_processes": 0, "job_total_processes": 1,
+        "job_empty": True, "process_handle_closed": True, "thread_handle_closed": True,
+        "job_handle_closed": True, "cleanup_error": 0, "cleanup_confirmed": True,
+        "raw_path": r"C:\private\workspace", "raw_sid": "S-1-15-2-private",
+    }
     parsed = _launch_failure_diagnostic(
         "probe failure: CreateProcessW LPAC (17)\n"
         "lpac_environment_control: " + json.dumps(environment_control) + "\n"
@@ -777,6 +869,7 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "lpac_main_environment_variant_control: " + json.dumps(variant_control_two) + "\n"
         "lpac_merged_environment_control: " + json.dumps(merged_environment_control) + "\n"
         "lpac_token_diagnostic: " + json.dumps(token_diagnostic) + "\n"
+        "lpac_cleanup_diagnostic: " + json.dumps(cleanup_diagnostic) + "\n"
         "lpac_launch_diagnostic: " + json.dumps(diagnostic)
     )
     assert parsed is not None
@@ -809,11 +902,17 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
     merged = parsed["merged_environment_control"]
     assert merged["merged_environment_block"] is True
     assert merged["merged_environment_builder_selftest_passed"] is True
+    assert merged["merged_custom_entries_verified"] is True
+    assert merged["merged_environment_selected_for_main"] is True
     assert merged["merged_environment_entry_count"] == 29
     assert merged["comparison_complete"] is False
     assert parsed["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query"
     assert parsed["token_diagnostic"]["token_api_error"] == 87
     assert parsed["token_diagnostic"]["token_is_lpac_query_succeeded"] is False
+    cleanup = parsed["cleanup_diagnostics"][0]
+    assert cleanup["cleanup_confirmed"] is True
+    assert cleanup["process_signaled"] is True and cleanup["job_empty"] is True
+    assert cleanup["process_handle_closed"] is True and cleanup["job_handle_closed"] is True
     assert "broker_pid" not in json.dumps(parsed) and "raw_windows_path" not in json.dumps(parsed)
     assert "raw_environment" not in json.dumps(parsed)
     assert "raw_variable_names" not in json.dumps(parsed)
@@ -822,6 +921,7 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
     assert "PRIVATE_NAME" not in json.dumps(parsed)
     assert "private_field" not in json.dumps(parsed) and "must be dropped" not in json.dumps(parsed)
     assert "raw_sid" not in json.dumps(parsed) and "S-1-15-2-private" not in json.dumps(parsed)
+    assert "raw_path" not in json.dumps(parsed)
     assert "sensitive" not in json.dumps(parsed)
     assert "sentinel-secret" not in json.dumps(parsed)
     forged_snapshot = dict(environment_control, explicit_environment_snapshot_safe=True)
@@ -832,6 +932,15 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
     assert forged is not None
     assert forged["explicit_environment_control"]["lp_environment_null"] is True
     assert forged["explicit_environment_control"]["comparison_complete"] is False
+
+    forged_cleanup = dict(cleanup_diagnostic, job_active_processes=1, job_empty=False)
+    forged_cleanup["cleanup_confirmed"] = True
+    forged_cleanup_parsed = _launch_failure_diagnostic(
+        "lpac_cleanup_diagnostic: " + json.dumps(forged_cleanup)
+    )
+    assert forged_cleanup_parsed is not None
+    assert forged_cleanup_parsed["cleanup_diagnostics"][0]["cleanup_confirmed"] is False
+    assert forged_cleanup_parsed["cleanup_diagnostics"][0]["job_active_processes"] == 1
 
 
 def test_native_probe_environment_excludes_actions_credentials() -> None:

@@ -34,12 +34,12 @@ def main():
     status = 0; goto done;
     }
 '''
-    anchor = '    if (ResumeThread(process.hThread) == (DWORD)-1)'
+    anchor = '    main_cleanup.resume_attempted = TRUE;\n    wait_status = ResumeThread(process.hThread);'
     assert source.count(anchor) == 1
     common = source.replace(anchor, stop + anchor)
     variants = {"baseline_suspended": common}
     variants["null_application_name"] = common.replace('if (!CreateProcessW(argv[0], command,', 'if (!CreateProcessW(NULL, command,')
-    variants["cwd_control_directory"] = common.replace('env_block, argv[4], &startup.StartupInfo, &process)', 'env_block, control_dir, &startup.StartupInfo, &process)').replace('    if (argc != 8) return 21;\n    if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());', '    wchar_t control_dir[32768];\n    wchar_t *last_slash;\n    if (argc != 8) return 21;\n    wcscpy_s(control_dir, _countof(control_dir), argv[0]);\n    last_slash = wcsrchr(control_dir, L\'\\\\\');\n    if (!last_slash) return 21;\n    *last_slash = L\'\\0\';\n    if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());')
+    variants["cwd_control_directory"] = common.replace('main_environment_to_use, argv[4], &startup.StartupInfo, &process)', 'main_environment_to_use, control_dir, &startup.StartupInfo, &process)').replace('    if (argc != 8) return 21;\n    if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());', '    wchar_t control_dir[32768];\n    wchar_t *last_slash;\n    if (argc != 8) return 21;\n    wcscpy_s(control_dir, _countof(control_dir), argv[0]);\n    last_slash = wcsrchr(control_dir, L\'\\\\\');\n    if (!last_slash) return 21;\n    *last_slash = L\'\\0\';\n    if (!ConvertStringSidToSidW(argv[2], &sid)) return fail(L"parse launcher SID", GetLastError());')
     variants["system32_image"] = common.replace('if (!CreateProcessW(argv[0], command,', 'if (!CreateProcessW(L"C:\\\\Windows\\\\System32\\\\whoami.exe", command,')
     variants["no_create_no_window"] = common.replace(' | CREATE_NO_WINDOW', '')
     # The checked-in launcher already sorts the same bounded environment.

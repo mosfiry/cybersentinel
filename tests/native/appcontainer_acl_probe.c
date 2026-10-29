@@ -126,9 +126,10 @@ static void report_token_diagnostic(BOOL verified, const TokenVerification *chec
 
 static BOOL verify_token(HANDLE token, PSID expected_sid, TokenVerification *verification) {
     DWORD value = 0, bytes = 0, needed = 0, error = ERROR_SUCCESS;
+    DWORD first_failure_error = ERROR_SUCCESS, first_failure_return_length = 0;
+    const wchar_t *first_failure_stage = L"complete";
     BYTE *buffer = NULL, *integrity_buffer = NULL, *capabilities_buffer = NULL;
-    BOOL size_query_succeeded;
-    BOOL ok = FALSE;
+    BOOL size_query_succeeded, all_checks_passed = TRUE;
     if (!verification) return FALSE;
     ZeroMemory(verification, sizeof(*verification));
     verification->failure_stage = L"not_run";
@@ -137,134 +138,173 @@ static BOOL verify_token(HANDLE token, PSID expected_sid, TokenVerification *ver
         return FALSE;
     }
 
-#define TOKEN_VERIFY_FAIL(stage, code, length) \
-    do { token_verification_fail(verification, (stage), (code), (length)); goto done; } while (0)
+#define TOKEN_VERIFY_RECORD_FAIL(stage, code, length) \
+    do { \
+        if (all_checks_passed) { \
+            first_failure_stage = (stage); \
+            first_failure_error = (code); \
+            if (!first_failure_error) first_failure_error = ERROR_INVALID_DATA; \
+            first_failure_return_length = (length); \
+        } \
+        all_checks_passed = FALSE; \
+    } while (0)
 
     if (!GetTokenInformation(token, TokenIsAppContainer, &value, sizeof(value), &bytes)) {
         error = GetLastError();
         verification->token_is_appcontainer_api_error = error;
-        TOKEN_VERIFY_FAIL(L"TokenIsAppContainer_query", error, bytes);
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenIsAppContainer_query", error, bytes);
+    } else {
+        verification->token_is_appcontainer_query_succeeded = TRUE;
+        verification->token_is_appcontainer_return_length = bytes;
+        if (bytes != sizeof(value)) {
+            TOKEN_VERIFY_RECORD_FAIL(L"TokenIsAppContainer_return_length", ERROR_INVALID_DATA, bytes);
+        } else {
+            verification->is_appcontainer = value != 0;
+            if (!verification->is_appcontainer)
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenIsAppContainer_false", ERROR_INVALID_DATA, bytes);
+        }
     }
-    verification->token_is_appcontainer_query_succeeded = TRUE;
-    verification->token_is_appcontainer_return_length = bytes;
-    verification->return_length = bytes;
-    if (bytes != sizeof(value)) TOKEN_VERIFY_FAIL(L"TokenIsAppContainer_return_length", ERROR_INVALID_DATA, bytes);
-    verification->is_appcontainer = value != 0;
-    if (!verification->is_appcontainer)
-        TOKEN_VERIFY_FAIL(L"TokenIsAppContainer_false", ERROR_INVALID_DATA, bytes);
 
     value = 0;
     bytes = 0;
     if (!GetTokenInformation(token, TokenIsLessPrivilegedAppContainer, &value, sizeof(value), &bytes)) {
         error = GetLastError();
         verification->token_is_lpac_api_error = error;
-        TOKEN_VERIFY_FAIL(L"TokenIsLessPrivilegedAppContainer_query", error, bytes);
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenIsLessPrivilegedAppContainer_query", error, bytes);
+    } else {
+        verification->token_is_lpac_query_succeeded = TRUE;
+        verification->token_is_lpac_return_length = bytes;
+        if (bytes != sizeof(value)) {
+            verification->token_is_lpac_api_error = ERROR_INVALID_DATA;
+            TOKEN_VERIFY_RECORD_FAIL(L"TokenIsLessPrivilegedAppContainer_return_length", ERROR_INVALID_DATA, bytes);
+        } else {
+            verification->is_lpac = value != 0;
+            if (!verification->is_lpac)
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenIsLessPrivilegedAppContainer_false", ERROR_INVALID_DATA, bytes);
+        }
     }
-    verification->token_is_lpac_query_succeeded = TRUE;
-    verification->token_is_lpac_return_length = bytes;
-    verification->return_length = bytes;
-    if (bytes != sizeof(value))
-        TOKEN_VERIFY_FAIL(L"TokenIsLessPrivilegedAppContainer_return_length", ERROR_INVALID_DATA, bytes);
-    verification->is_lpac = value != 0;
-    if (!verification->is_lpac)
-        TOKEN_VERIFY_FAIL(L"TokenIsLessPrivilegedAppContainer_false", ERROR_INVALID_DATA, bytes);
 
     needed = 0;
     size_query_succeeded = GetTokenInformation(token, TokenAppContainerSid, NULL, 0, &needed);
     error = size_query_succeeded ? ERROR_SUCCESS : GetLastError();
-    verification->return_length = needed;
-    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER)
-        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_size_query", error, needed);
-    if (needed < sizeof(TOKEN_APPCONTAINER_INFORMATION) || needed > TOKEN_INFO_MAX_BYTES)
-        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_size", needed > TOKEN_INFO_MAX_BYTES ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA, needed);
-    buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-    if (!buffer) TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
-    bytes = needed;
-    if (!GetTokenInformation(token, TokenAppContainerSid, buffer, bytes, &needed)) {
-        error = GetLastError();
-        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_query", error, needed);
-    }
-    verification->return_length = needed;
-    if (needed < sizeof(TOKEN_APPCONTAINER_INFORMATION))
-        TOKEN_VERIFY_FAIL(L"TokenAppContainerSid_return_length", ERROR_INVALID_DATA, needed);
-    {
-        TOKEN_APPCONTAINER_INFORMATION *container_info = (TOKEN_APPCONTAINER_INFORMATION *)buffer;
-        if (!container_info->TokenAppContainer || !IsValidSid(container_info->TokenAppContainer) ||
-            !EqualSid(container_info->TokenAppContainer, expected_sid))
-            TOKEN_VERIFY_FAIL(L"expected_sid_mismatch", ERROR_INVALID_DATA, needed);
-        verification->expected_sid_match = TRUE;
+    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER) {
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenAppContainerSid_size_query", error, needed);
+    } else if (needed < sizeof(TOKEN_APPCONTAINER_INFORMATION) || needed > TOKEN_INFO_MAX_BYTES) {
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenAppContainerSid_size",
+                                needed > TOKEN_INFO_MAX_BYTES ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA,
+                                needed);
+    } else {
+        buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+        if (!buffer) {
+            TOKEN_VERIFY_RECORD_FAIL(L"TokenAppContainerSid_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
+        } else {
+            bytes = needed;
+            if (!GetTokenInformation(token, TokenAppContainerSid, buffer, bytes, &needed)) {
+                error = GetLastError();
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenAppContainerSid_query", error, needed);
+            } else if (needed < sizeof(TOKEN_APPCONTAINER_INFORMATION) || needed > bytes) {
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenAppContainerSid_return_length", ERROR_INVALID_DATA, needed);
+            } else {
+                TOKEN_APPCONTAINER_INFORMATION *container_info = (TOKEN_APPCONTAINER_INFORMATION *)buffer;
+                if (!container_info->TokenAppContainer || !IsValidSid(container_info->TokenAppContainer) ||
+                    !EqualSid(container_info->TokenAppContainer, expected_sid))
+                    TOKEN_VERIFY_RECORD_FAIL(L"expected_sid_mismatch", ERROR_INVALID_DATA, needed);
+                else
+                    verification->expected_sid_match = TRUE;
+            }
+        }
     }
 
     needed = 0;
     size_query_succeeded = GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &needed);
     error = size_query_succeeded ? ERROR_SUCCESS : GetLastError();
-    verification->return_length = needed;
-    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER)
-        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_size_query", error, needed);
-    if (needed < sizeof(TOKEN_MANDATORY_LABEL) || needed > TOKEN_INFO_MAX_BYTES)
-        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_size", needed > TOKEN_INFO_MAX_BYTES ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA, needed);
-    integrity_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-    if (!integrity_buffer) TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
-    bytes = needed;
-    if (!GetTokenInformation(token, TokenIntegrityLevel, integrity_buffer, bytes, &needed)) {
-        error = GetLastError();
-        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_query", error, needed);
-    }
-    verification->return_length = needed;
-    if (needed < sizeof(TOKEN_MANDATORY_LABEL))
-        TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_return_length", ERROR_INVALID_DATA, needed);
-    {
-        TOKEN_MANDATORY_LABEL *integrity = (TOKEN_MANDATORY_LABEL *)integrity_buffer;
-        SID_IDENTIFIER_AUTHORITY mandatory_authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
-        PSID_IDENTIFIER_AUTHORITY observed_authority;
-        PUCHAR subauthority_count;
-        DWORD *integrity_rid;
-        if (!integrity->Label.Sid || !IsValidSid(integrity->Label.Sid) ||
-            !(subauthority_count = GetSidSubAuthorityCount(integrity->Label.Sid)) || *subauthority_count == 0)
-            TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_sid_invalid", ERROR_INVALID_DATA, needed);
-        observed_authority = GetSidIdentifierAuthority(integrity->Label.Sid);
-        if (!observed_authority || *subauthority_count != 1 ||
-            memcmp(observed_authority, &mandatory_authority, sizeof(mandatory_authority)) != 0)
-            TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_authority_invalid", ERROR_INVALID_DATA, needed);
-        integrity_rid = GetSidSubAuthority(integrity->Label.Sid, (DWORD)(*subauthority_count - 1));
-        if (!integrity_rid) TOKEN_VERIFY_FAIL(L"TokenIntegrityLevel_sid_invalid", ERROR_INVALID_DATA, needed);
-        verification->low_integrity = *integrity_rid == SECURITY_MANDATORY_LOW_RID;
-        if (!verification->low_integrity)
-            TOKEN_VERIFY_FAIL(L"integrity_not_low", ERROR_INVALID_DATA, needed);
+    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER) {
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_size_query", error, needed);
+    } else if (needed < sizeof(TOKEN_MANDATORY_LABEL) || needed > TOKEN_INFO_MAX_BYTES) {
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_size",
+                                needed > TOKEN_INFO_MAX_BYTES ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA,
+                                needed);
+    } else {
+        integrity_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+        if (!integrity_buffer) {
+            TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
+        } else {
+            bytes = needed;
+            if (!GetTokenInformation(token, TokenIntegrityLevel, integrity_buffer, bytes, &needed)) {
+                error = GetLastError();
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_query", error, needed);
+            } else if (needed < sizeof(TOKEN_MANDATORY_LABEL) || needed > bytes) {
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_return_length", ERROR_INVALID_DATA, needed);
+            } else {
+                TOKEN_MANDATORY_LABEL *integrity = (TOKEN_MANDATORY_LABEL *)integrity_buffer;
+                SID_IDENTIFIER_AUTHORITY mandatory_authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+                PSID_IDENTIFIER_AUTHORITY observed_authority;
+                PUCHAR subauthority_count;
+                DWORD *integrity_rid;
+                if (!integrity->Label.Sid || !IsValidSid(integrity->Label.Sid) ||
+                    !(subauthority_count = GetSidSubAuthorityCount(integrity->Label.Sid)) || *subauthority_count == 0) {
+                    TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_sid_invalid", ERROR_INVALID_DATA, needed);
+                } else {
+                    observed_authority = GetSidIdentifierAuthority(integrity->Label.Sid);
+                    if (!observed_authority || *subauthority_count != 1 ||
+                        memcmp(observed_authority, &mandatory_authority, sizeof(mandatory_authority)) != 0) {
+                        TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_authority_invalid", ERROR_INVALID_DATA, needed);
+                    } else {
+                        integrity_rid = GetSidSubAuthority(integrity->Label.Sid, (DWORD)(*subauthority_count - 1));
+                        if (!integrity_rid) {
+                            TOKEN_VERIFY_RECORD_FAIL(L"TokenIntegrityLevel_sid_invalid", ERROR_INVALID_DATA, needed);
+                        } else {
+                            verification->low_integrity = *integrity_rid == SECURITY_MANDATORY_LOW_RID;
+                            if (!verification->low_integrity)
+                                TOKEN_VERIFY_RECORD_FAIL(L"integrity_not_low", ERROR_INVALID_DATA, needed);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     needed = 0;
     size_query_succeeded = GetTokenInformation(token, TokenCapabilities, NULL, 0, &needed);
     error = size_query_succeeded ? ERROR_SUCCESS : GetLastError();
-    verification->return_length = needed;
-    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER)
-        TOKEN_VERIFY_FAIL(L"TokenCapabilities_size_query", error, needed);
-    if (needed > TOKEN_INFO_MAX_BYTES)
-        TOKEN_VERIFY_FAIL(L"TokenCapabilities_size", ERROR_BUFFER_OVERFLOW, needed);
-    if (needed < sizeof(TOKEN_GROUPS)) needed = sizeof(TOKEN_GROUPS);
-    capabilities_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
-    if (!capabilities_buffer) TOKEN_VERIFY_FAIL(L"TokenCapabilities_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
-    bytes = needed;
-    if (!GetTokenInformation(token, TokenCapabilities, capabilities_buffer, bytes, &needed)) {
-        error = GetLastError();
-        TOKEN_VERIFY_FAIL(L"TokenCapabilities_query", error, needed);
+    if (!size_query_succeeded && error != ERROR_INSUFFICIENT_BUFFER) {
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenCapabilities_size_query", error, needed);
+    } else if (needed > TOKEN_INFO_MAX_BYTES) {
+        TOKEN_VERIFY_RECORD_FAIL(L"TokenCapabilities_size", ERROR_BUFFER_OVERFLOW, needed);
+    } else {
+        if (needed < sizeof(TOKEN_GROUPS)) needed = sizeof(TOKEN_GROUPS);
+        capabilities_buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+        if (!capabilities_buffer) {
+            TOKEN_VERIFY_RECORD_FAIL(L"TokenCapabilities_allocate", ERROR_NOT_ENOUGH_MEMORY, needed);
+        } else {
+            bytes = needed;
+            if (!GetTokenInformation(token, TokenCapabilities, capabilities_buffer, bytes, &needed)) {
+                error = GetLastError();
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenCapabilities_query", error, needed);
+            } else if (needed < sizeof(DWORD) || needed > bytes) {
+                TOKEN_VERIFY_RECORD_FAIL(L"TokenCapabilities_return_length", ERROR_INVALID_DATA, needed);
+            } else {
+                verification->zero_capabilities = ((TOKEN_GROUPS *)capabilities_buffer)->GroupCount == 0;
+                if (!verification->zero_capabilities)
+                    TOKEN_VERIFY_RECORD_FAIL(L"capabilities_nonzero", ERROR_INVALID_DATA, needed);
+            }
+        }
     }
-    verification->return_length = needed;
-    if (needed < sizeof(DWORD))
-        TOKEN_VERIFY_FAIL(L"TokenCapabilities_return_length", ERROR_INVALID_DATA, needed);
-    verification->zero_capabilities = ((TOKEN_GROUPS *)capabilities_buffer)->GroupCount == 0;
-    if (!verification->zero_capabilities)
-        TOKEN_VERIFY_FAIL(L"capabilities_nonzero", ERROR_INVALID_DATA, needed);
 
-    verification->failure_stage = L"complete";
-    verification->api_error = ERROR_SUCCESS;
-    ok = TRUE;
-done:
+    if (all_checks_passed) {
+        verification->failure_stage = L"complete";
+        verification->api_error = ERROR_SUCCESS;
+        verification->return_length = sizeof(DWORD);
+    } else {
+        verification->failure_stage = first_failure_stage;
+        verification->api_error = first_failure_error;
+        verification->return_length = first_failure_return_length;
+    }
     if (capabilities_buffer) HeapFree(GetProcessHeap(), 0, capabilities_buffer);
     if (integrity_buffer) HeapFree(GetProcessHeap(), 0, integrity_buffer);
     if (buffer) HeapFree(GetProcessHeap(), 0, buffer);
-#undef TOKEN_VERIFY_FAIL
-    return ok;
+#undef TOKEN_VERIFY_RECORD_FAIL
+    return all_checks_passed;
 }
 
 static BOOL write_report(const wchar_t *path, const wchar_t *mode, BOOL token_ok,
@@ -707,6 +747,8 @@ typedef struct EnvironmentControlResult {
     DWORD main_environment_variant_id;
     BOOL merged_environment_block;
     BOOL merged_environment_builder_selftest_passed;
+    BOOL merged_custom_entries_verified;
+    BOOL merged_environment_selected_for_main;
     DWORD merged_environment_entry_count;
     BOOL attempted;
     DWORD setup_error;
@@ -721,12 +763,89 @@ typedef struct EnvironmentControlResult {
     DWORD token_verification_error;
     TokenVerification token_details;
     BOOL terminated;
+    BOOL termination_requested;
+    BOOL job_query_succeeded;
+    BOOL process_handle_closed;
+    BOOL thread_handle_closed;
+    BOOL job_handle_closed;
     DWORD job_active_processes;
     DWORD job_total_processes;
     BOOL job_empty;
     BOOL cleanup_confirmed;
     DWORD cleanup_error;
 } EnvironmentControlResult;
+
+typedef struct ProcessCleanupDiagnostic {
+    BOOL diagnostic_only;
+    BOOL attempted;
+    BOOL process_created;
+    BOOL resume_attempted;
+    BOOL resume_succeeded;
+    BOOL termination_requested;
+    BOOL process_signaled;
+    BOOL job_membership_verified;
+    BOOL job_query_succeeded;
+    DWORD job_active_processes;
+    DWORD job_total_processes;
+    BOOL job_empty;
+    BOOL process_handle_closed;
+    BOOL thread_handle_closed;
+    BOOL job_handle_closed;
+    DWORD cleanup_error;
+    BOOL cleanup_confirmed;
+} ProcessCleanupDiagnostic;
+
+static void report_cleanup_diagnostic(const ProcessCleanupDiagnostic *cleanup) {
+    if (!cleanup) return;
+    fwprintf(stderr,
+        L"lpac_cleanup_diagnostic: {\"version\":1,\"scope\":\"broker_only\","
+        L"\"diagnostic_only\":%ls,\"attempted\":%ls,\"process_created\":%ls,"
+        L"\"resume_attempted\":%ls,\"resume_succeeded\":%ls,\"termination_requested\":%ls,"
+        L"\"process_signaled\":%ls,\"job_membership_verified\":%ls,"
+        L"\"job_query_succeeded\":%ls,\"job_active_processes\":%lu,"
+        L"\"job_total_processes\":%lu,\"job_empty\":%ls,"
+        L"\"process_handle_closed\":%ls,\"thread_handle_closed\":%ls,"
+        L"\"job_handle_closed\":%ls,\"cleanup_error\":%lu,\"cleanup_confirmed\":%ls}\n",
+        cleanup->diagnostic_only ? L"true" : L"false",
+        cleanup->attempted ? L"true" : L"false",
+        cleanup->process_created ? L"true" : L"false",
+        cleanup->resume_attempted ? L"true" : L"false",
+        cleanup->resume_succeeded ? L"true" : L"false",
+        cleanup->termination_requested ? L"true" : L"false",
+        cleanup->process_signaled ? L"true" : L"false",
+        cleanup->job_membership_verified ? L"true" : L"false",
+        cleanup->job_query_succeeded ? L"true" : L"false",
+        (unsigned long)cleanup->job_active_processes,
+        (unsigned long)cleanup->job_total_processes,
+        cleanup->job_empty ? L"true" : L"false",
+        cleanup->process_handle_closed ? L"true" : L"false",
+        cleanup->thread_handle_closed ? L"true" : L"false",
+        cleanup->job_handle_closed ? L"true" : L"false",
+        (unsigned long)cleanup->cleanup_error,
+        cleanup->cleanup_confirmed ? L"true" : L"false");
+}
+
+static void report_control_cleanup_diagnostic(const EnvironmentControlResult *result) {
+    ProcessCleanupDiagnostic cleanup;
+    if (!result) return;
+    ZeroMemory(&cleanup, sizeof(cleanup));
+    cleanup.diagnostic_only = TRUE;
+    cleanup.attempted = result->attempted;
+    cleanup.process_created = result->create_succeeded;
+    cleanup.termination_requested = result->termination_requested;
+    cleanup.process_signaled = result->terminated;
+    cleanup.job_membership_verified = result->job_membership_verified;
+    cleanup.job_query_succeeded = result->job_query_succeeded;
+    cleanup.job_active_processes = result->job_active_processes;
+    cleanup.job_total_processes = result->job_total_processes;
+    cleanup.job_empty = result->job_empty;
+    cleanup.process_handle_closed = result->process_handle_closed;
+    cleanup.thread_handle_closed = result->thread_handle_closed;
+    cleanup.job_handle_closed = result->job_handle_closed;
+    cleanup.cleanup_error = result->cleanup_error;
+    cleanup.cleanup_confirmed = result->cleanup_confirmed;
+    report_cleanup_diagnostic(&cleanup);
+}
 
 static BOOL control_environment_block_is_filtered(const wchar_t *block, DWORD *entry_count_out) {
     static const wchar_t *safe_names[] = {
@@ -959,6 +1078,34 @@ static BOOL environment_block_has_value(const wchar_t *block,
     return FALSE;
 }
 
+static BOOL environment_block_preserves_custom_entries(
+    const wchar_t *merged_block, size_t merged_capacity,
+    const wchar_t *custom_block, size_t custom_capacity) {
+    EnvironmentEntryView merged_entries[MAX_MERGED_ENVIRONMENT_ENTRIES];
+    EnvironmentEntryView custom_entries[MAX_MERGED_ENVIRONMENT_ENTRIES];
+    DWORD merged_count = 0, custom_count = 0, i, j;
+    if (!environment_block_to_views(merged_block, merged_entries, &merged_count,
+                                    merged_capacity) ||
+        !environment_block_to_views(custom_block, custom_entries, &custom_count,
+                                    custom_capacity)) return FALSE;
+    for (i = 0; i < custom_count; ++i) {
+        BOOL exact_entry_found = FALSE;
+        for (j = 0; j < merged_count; ++j) {
+            int comparison = compare_environment_entry_names(&custom_entries[i], &merged_entries[j]);
+            if (!comparison) return FALSE;
+            if (comparison == CSTR_EQUAL) {
+                if (custom_entries[i].length != merged_entries[j].length ||
+                    wmemcmp(custom_entries[i].text, merged_entries[j].text,
+                            custom_entries[i].length) != 0) return FALSE;
+                exact_entry_found = TRUE;
+                break;
+            }
+        }
+        if (!exact_entry_found) return FALSE;
+    }
+    return custom_count != 0;
+}
+
 static BOOL merged_environment_builder_self_test(void) {
     static const wchar_t snapshot[] =
         L"=C:=old-drive\0path=old-path\0TEMP=old-temp\0TMP=old-tmp\0WINDIR=old-win\0\0";
@@ -977,6 +1124,8 @@ static BOOL merged_environment_builder_self_test(void) {
     if (!build_merged_environment_block(snapshot, _countof(snapshot), custom, _countof(custom),
                                         merged, _countof(merged), &count) ||
         count != 6 || !environment_block_is_sorted_unique(merged, count, _countof(merged)) ||
+        !environment_block_preserves_custom_entries(
+            merged, _countof(merged), custom, _countof(custom)) ||
         !environment_block_has_value(merged, _countof(merged), L"PATH", L"new-path") ||
         !environment_block_has_value(merged, _countof(merged), L"=C:", L"new-drive") ||
         !environment_block_has_value(merged, _countof(merged), L"SystemRoot", L"new-root")) return FALSE;
@@ -1020,13 +1169,12 @@ static BOOL build_environment_block_omitting_entry(
     return kept_count + 1 == source_index;
 }
 
-static BOOL control_environment_is_filtered(DWORD *entry_count_out) {
-    LPWCH block = GetEnvironmentStringsW();
-    BOOL safe;
+static BOOL control_environment_is_filtered(LPWCH *block_out, DWORD *entry_count_out) {
     if (entry_count_out) *entry_count_out = 0;
-    if (!block) return FALSE;
-    safe = control_environment_block_is_filtered(block, entry_count_out);
-    return FreeEnvironmentStringsW(block) && safe;
+    if (!block_out) return FALSE;
+    *block_out = GetEnvironmentStringsW();
+    if (!*block_out) return FALSE;
+    return control_environment_block_is_filtered(*block_out, entry_count_out);
 }
 
 static BOOL cleanup_control_attributes(LPPROC_THREAD_ATTRIBUTE_LIST *attrs,
@@ -1091,21 +1239,39 @@ static BOOL run_lp_environment_control(
     result->diagnostic_only = TRUE;
     result->lp_environment_null = lp_environment_null;
     result->main_environment_block = main_environment_block != NULL;
+    result->process_handle_closed = TRUE;
+    result->thread_handle_closed = TRUE;
+    result->job_handle_closed = TRUE;
+    result->job_empty = TRUE;
     result->token_details.failure_stage = L"not_run";
     {
         wchar_t marker[8];
         DWORD marker_length = GetEnvironmentVariableW(
             L"CYBERSENTINEL_TEST_ENV_SANITIZED", marker, (DWORD)_countof(marker));
-        result->parent_environment_filtered =
-            marker_length == 1 && marker[0] == L'1' &&
-            control_environment_is_filtered(&result->parent_environment_entry_count);
+        if (marker_length == 1 && marker[0] == L'1')
+            result->parent_environment_filtered = control_environment_is_filtered(
+                &explicit_environment, &result->parent_environment_entry_count);
     }
-    if (!result->parent_environment_filtered) {
-        result->setup_error = ERROR_ACCESS_DENIED;
+    if (explicit_environment) {
+        if (!FreeEnvironmentStringsW(explicit_environment)) {
+            if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = GetLastError();
+        } else {
+            explicit_environment = NULL;
+        }
+    }
+    if (!result->parent_environment_filtered || explicit_environment ||
+        result->cleanup_error != ERROR_SUCCESS) {
+        result->setup_error = result->parent_environment_filtered ?
+            ERROR_INVALID_DATA : ERROR_ACCESS_DENIED;
+        if (explicit_environment) goto control_setup_failed;
+        result->cleanup_confirmed = TRUE;
+        report_control_cleanup_diagnostic(result);
         return TRUE;
     }
     if (wcscpy_s(control_command, _countof(control_command), command) != 0) {
         result->setup_error = ERROR_INSUFFICIENT_BUFFER;
+        result->cleanup_confirmed = TRUE;
+        report_control_cleanup_diagnostic(result);
         return TRUE;
     }
     ZeroMemory(&job_limits, sizeof(job_limits));
@@ -1114,36 +1280,47 @@ static BOOL run_lp_environment_control(
     if (!control_job || !SetInformationJobObject(control_job, (JOBOBJECTINFOCLASS)9,
                                                   &job_limits, (DWORD)sizeof(job_limits))) {
         result->setup_error = GetLastError();
-        result->cleanup_confirmed = close_control_job_handle(
+        result->job_handle_closed = close_control_job_handle(
             &control_job, control_job_out, &result->cleanup_error);
+        result->cleanup_confirmed = result->job_handle_closed && result->cleanup_error == ERROR_SUCCESS;
+        report_control_cleanup_diagnostic(result);
         return result->cleanup_confirmed;
     }
+    result->job_handle_closed = FALSE;
     if (InitializeProcThreadAttributeList(NULL, 3, 0, &attr_size)) {
         result->setup_error = ERROR_INVALID_DATA;
-        result->cleanup_confirmed = close_control_job_handle(
+        result->job_handle_closed = close_control_job_handle(
             &control_job, control_job_out, &result->cleanup_error);
+        result->cleanup_confirmed = result->job_handle_closed && result->cleanup_error == ERROR_SUCCESS;
+        report_control_cleanup_diagnostic(result);
         return result->cleanup_confirmed;
     }
     attr_error = GetLastError();
     if (attr_error != ERROR_INSUFFICIENT_BUFFER || !attr_size) {
         result->setup_error = attr_error ? attr_error : ERROR_INVALID_DATA;
-        result->cleanup_confirmed = close_control_job_handle(
+        result->job_handle_closed = close_control_job_handle(
             &control_job, control_job_out, &result->cleanup_error);
+        result->cleanup_confirmed = result->job_handle_closed && result->cleanup_error == ERROR_SUCCESS;
+        report_control_cleanup_diagnostic(result);
         return result->cleanup_confirmed;
     }
     control_attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
     if (!control_attrs) {
         result->setup_error = ERROR_NOT_ENOUGH_MEMORY;
-        result->cleanup_confirmed = close_control_job_handle(
+        result->job_handle_closed = close_control_job_handle(
             &control_job, control_job_out, &result->cleanup_error);
+        result->cleanup_confirmed = result->job_handle_closed && result->cleanup_error == ERROR_SUCCESS;
+        report_control_cleanup_diagnostic(result);
         return result->cleanup_confirmed;
     }
     if (!InitializeProcThreadAttributeList(control_attrs, 3, 0, &attr_size)) {
         result->setup_error = GetLastError();
         cleanup_control_attributes(&control_attrs, &attrs_initialized, &result->cleanup_error);
-        result->cleanup_confirmed = close_control_job_handle(
-            &control_job, control_job_out, &result->cleanup_error) &&
-            result->cleanup_error == ERROR_SUCCESS;
+        result->job_handle_closed = close_control_job_handle(
+            &control_job, control_job_out, &result->cleanup_error);
+        result->cleanup_confirmed = result->job_handle_closed &&
+                                    result->cleanup_error == ERROR_SUCCESS;
+        report_control_cleanup_diagnostic(result);
         return result->cleanup_confirmed;
     }
     attrs_initialized = TRUE;
@@ -1199,20 +1376,33 @@ static BOOL run_lp_environment_control(
         explicit_environment = NULL;
     }
     if (!create_succeeded) {
-        BOOL attributes_closed, job_closed;
+        BOOL attributes_closed;
         result->create_ntstatus_available = last_nt_status != NULL;
         result->create_ntstatus = last_nt_status ? last_nt_status() : 0;
         result->create_win32_error = create_error;
+        if (QueryInformationJobObject(control_job, JobObjectBasicAccountingInformation,
+                                      &accounting, (DWORD)sizeof(accounting), NULL)) {
+            result->job_query_succeeded = TRUE;
+            result->job_active_processes = accounting.ActiveProcesses;
+            result->job_total_processes = accounting.TotalProcesses;
+            result->job_empty = accounting.ActiveProcesses == 0;
+        } else if (result->cleanup_error == ERROR_SUCCESS) {
+            result->cleanup_error = GetLastError();
+        }
         attributes_closed = cleanup_control_attributes(
             &control_attrs, &attrs_initialized, &result->cleanup_error);
-        job_closed = close_control_job_handle(
+        result->job_handle_closed = close_control_job_handle(
             &control_job, control_job_out, &result->cleanup_error);
-        result->cleanup_confirmed = attributes_closed && job_closed &&
+        result->cleanup_confirmed = attributes_closed && result->job_handle_closed &&
+                                    result->job_query_succeeded && result->job_empty &&
                                     result->cleanup_error == ERROR_SUCCESS;
+        report_control_cleanup_diagnostic(result);
         return result->cleanup_confirmed;
     }
     cleanup_control_attributes(&control_attrs, &attrs_initialized, &result->cleanup_error);
     result->create_succeeded = TRUE;
+    result->process_handle_closed = FALSE;
+    result->thread_handle_closed = FALSE;
     *control_job_out = control_job;
     *control_process_out = control_process;
     if (!IsProcessInJob(control_process.hProcess, control_job, &in_job))
@@ -1234,6 +1424,7 @@ static BOOL run_lp_environment_control(
         token_verification_fail(&result->token_details, L"OpenProcessToken", error, 0);
         result->token_verification_error = error;
     }
+    result->termination_requested = TRUE;
     if (!TerminateProcess(control_process.hProcess, 0xE5)) {
         DWORD terminate_error = GetLastError();
         if (WaitForSingleObject(control_process.hProcess, 0) != WAIT_OBJECT_0 &&
@@ -1253,8 +1444,10 @@ static BOOL run_lp_environment_control(
     result->terminated = wait_status == WAIT_OBJECT_0;
     if (!result->terminated && result->cleanup_error == ERROR_SUCCESS)
         result->cleanup_error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+    result->job_empty = FALSE;
     if (QueryInformationJobObject(control_job, JobObjectBasicAccountingInformation,
                                   &accounting, (DWORD)sizeof(accounting), NULL)) {
+        result->job_query_succeeded = TRUE;
         result->job_active_processes = accounting.ActiveProcesses;
         result->job_total_processes = accounting.TotalProcesses;
         result->job_empty = accounting.ActiveProcesses == 0;
@@ -1262,11 +1455,13 @@ static BOOL run_lp_environment_control(
         result->cleanup_error = GetLastError();
     }
     if (!result->job_empty) {
+        result->termination_requested = TRUE;
         if (!TerminateJobObject(control_job, 0xE5) && result->cleanup_error == ERROR_SUCCESS)
             result->cleanup_error = GetLastError();
         for (cleanup_attempt = 0; cleanup_attempt < 100; ++cleanup_attempt) {
             if (QueryInformationJobObject(control_job, JobObjectBasicAccountingInformation,
                                           &accounting, (DWORD)sizeof(accounting), NULL)) {
+                result->job_query_succeeded = TRUE;
                 result->job_active_processes = accounting.ActiveProcesses;
                 result->job_total_processes = accounting.TotalProcesses;
                 result->job_empty = accounting.ActiveProcesses == 0;
@@ -1279,29 +1474,39 @@ static BOOL run_lp_environment_control(
     }
     if (!(result->terminated && result->job_empty)) {
         if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = ERROR_INVALID_DATA;
+        report_control_cleanup_diagnostic(result);
         return FALSE; /* Keep process and Job handles for the caller's final retry. */
     }
     if (!CloseHandle(control_process.hThread)) {
         result->cleanup_error = GetLastError();
     } else {
         control_process_out->hThread = NULL;
+        result->thread_handle_closed = TRUE;
     }
     if (!CloseHandle(control_process.hProcess)) {
         if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = GetLastError();
     } else {
         control_process_out->hProcess = NULL;
+        result->process_handle_closed = TRUE;
     }
     if (!CloseHandle(control_job)) {
         if (result->cleanup_error == ERROR_SUCCESS) result->cleanup_error = GetLastError();
     } else {
         *control_job_out = NULL;
+        result->job_handle_closed = TRUE;
     }
-    result->cleanup_confirmed = result->terminated && result->job_empty &&
+    result->cleanup_confirmed = result->terminated && result->job_query_succeeded && result->job_empty &&
                                 result->cleanup_error == ERROR_SUCCESS &&
+                                result->process_handle_closed && result->thread_handle_closed &&
+                                result->job_handle_closed &&
                                 !control_process_out->hThread && !control_process_out->hProcess &&
                                 !*control_job_out;
-    if (!result->cleanup_confirmed) return FALSE;
+    if (!result->cleanup_confirmed) {
+        report_control_cleanup_diagnostic(result);
+        return FALSE;
+    }
     ZeroMemory(control_process_out, sizeof(*control_process_out));
+    report_control_cleanup_diagnostic(result);
     return TRUE;
 
 control_setup_failed:
@@ -1313,11 +1518,12 @@ control_setup_failed:
     {
         BOOL attributes_closed = cleanup_control_attributes(
             &control_attrs, &attrs_initialized, &result->cleanup_error);
-        BOOL job_closed = close_control_job_handle(
+        result->job_handle_closed = close_control_job_handle(
             &control_job, control_job_out, &result->cleanup_error);
-        result->cleanup_confirmed = attributes_closed && job_closed &&
+        result->cleanup_confirmed = attributes_closed && result->job_handle_closed &&
                                     result->cleanup_error == ERROR_SUCCESS;
     }
+    report_control_cleanup_diagnostic(result);
     return result->cleanup_confirmed;
 }
 
@@ -1342,6 +1548,8 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         result->token_details.failure_stage && wcscmp(result->token_details.failure_stage, L"complete") == 0 &&
         result->token_details.api_error == ERROR_SUCCESS &&
         result->terminated && result->job_empty && result->cleanup_confirmed &&
+        result->job_query_succeeded && result->process_handle_closed &&
+        result->thread_handle_closed && result->job_handle_closed &&
         result->setup_error == ERROR_SUCCESS && result->create_win32_error == ERROR_SUCCESS &&
         result->job_attribute_error == ERROR_SUCCESS && result->job_membership_error == ERROR_SUCCESS &&
         result->token_verification_error == ERROR_SUCCESS &&
@@ -1358,6 +1566,8 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         L"\"main_environment_variant_id\":%lu,"
         L"\"merged_environment_block\":%ls,"
         L"\"merged_environment_builder_selftest_passed\":%ls,"
+        L"\"merged_custom_entries_verified\":%ls,"
+        L"\"merged_environment_selected_for_main\":%ls,"
         L"\"merged_environment_entry_count\":%lu,"
         L"\"attempted\":%ls,\"setup_error\":%lu,"
         L"\"create_succeeded\":%ls,\"create_win32_error\":%lu,"
@@ -1371,7 +1581,9 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         L"\"token_is_lpac_return_length\":%lu,\"token_is_lpac_api_error\":%lu,"
         L"\"token_failure_stage\":\"%ls\",\"token_api_error\":%lu,\"token_return_length\":%lu,"
         L"\"terminated\":%ls,\"job_active_processes\":%lu,\"job_total_processes\":%lu,"
-        L"\"job_empty\":%ls,\"cleanup_confirmed\":%ls,\"cleanup_error\":%lu}\n",
+        L"\"job_query_succeeded\":%ls,\"job_empty\":%ls,"
+        L"\"process_handle_closed\":%ls,\"thread_handle_closed\":%ls,\"job_handle_closed\":%ls,"
+        L"\"cleanup_confirmed\":%ls,\"cleanup_error\":%lu}\n",
         prefix,
         result->diagnostic_only ? L"true" : L"false",
         comparison_complete ? L"true" : L"false",
@@ -1387,6 +1599,8 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         (unsigned long)result->main_environment_variant_id,
         result->merged_environment_block ? L"true" : L"false",
         result->merged_environment_builder_selftest_passed ? L"true" : L"false",
+        result->merged_custom_entries_verified ? L"true" : L"false",
+        result->merged_environment_selected_for_main ? L"true" : L"false",
         (unsigned long)result->merged_environment_entry_count,
         result->attempted ? L"true" : L"false", (unsigned long)result->setup_error,
         result->create_succeeded ? L"true" : L"false", (unsigned long)result->create_win32_error,
@@ -1409,7 +1623,12 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         (unsigned long)result->token_details.api_error,
         (unsigned long)result->token_details.return_length,
         result->terminated ? L"true" : L"false", (unsigned long)result->job_active_processes,
-        (unsigned long)result->job_total_processes, result->job_empty ? L"true" : L"false",
+        (unsigned long)result->job_total_processes,
+        result->job_query_succeeded ? L"true" : L"false",
+        result->job_empty ? L"true" : L"false",
+        result->process_handle_closed ? L"true" : L"false",
+        result->thread_handle_closed ? L"true" : L"false",
+        result->job_handle_closed ? L"true" : L"false",
         result->cleanup_confirmed ? L"true" : L"false", (unsigned long)result->cleanup_error);
 }
 
@@ -1546,6 +1765,7 @@ static int launch_child(int argc, wchar_t **argv) {
     wchar_t path_env[MAX_PATH * 2], env_block[MAX_PATH * 6];
     wchar_t variant_env_block[MAX_PATH * 6];
     wchar_t merged_env_block[MAX_MERGED_ENVIRONMENT_CHARS];
+    LPVOID main_environment_to_use = NULL;
     LPWCH merged_snapshot = NULL;
     size_t env_used = 0;
     DWORD variant_index, variant_entry_count, merged_environment_entry_count = 0;
@@ -1556,6 +1776,7 @@ static int launch_child(int argc, wchar_t **argv) {
     EnvironmentControlResult main_environment_block_control;
     EnvironmentControlResult variant_control;
     EnvironmentControlResult merged_environment_control;
+    ProcessCleanupDiagnostic main_cleanup;
     ProbeJobExtendedLimitInformation job_limits;
     int status = 20;
     LastNtStatusFn last_nt_status = NULL;
@@ -1574,6 +1795,11 @@ static int launch_child(int argc, wchar_t **argv) {
     memset(&explicit_environment_control, 0, sizeof(explicit_environment_control));
     memset(&main_environment_block_control, 0, sizeof(main_environment_block_control));
     memset(&merged_environment_control, 0, sizeof(merged_environment_control));
+    memset(&main_cleanup, 0, sizeof(main_cleanup));
+    main_cleanup.process_handle_closed = TRUE;
+    main_cleanup.thread_handle_closed = TRUE;
+    main_cleanup.job_handle_closed = TRUE;
+    main_cleanup.job_empty = TRUE;
     memset(&caps, 0, sizeof(caps));
     memset(&parent_token_checks, 0, sizeof(parent_token_checks));
     parent_token_checks.failure_stage = L"not_run";
@@ -1628,6 +1854,7 @@ static int launch_child(int argc, wchar_t **argv) {
     }
     env_block[env_used] = L'\0';
 #undef APPEND_ENV
+    main_environment_to_use = env_block;
     if (!run_lp_environment_control(
             argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
@@ -1745,10 +1972,14 @@ static int launch_child(int argc, wchar_t **argv) {
                            merged_snapshot, MAX_MERGED_ENVIRONMENT_CHARS,
                            env_block, _countof(env_block),
                            merged_env_block, _countof(merged_env_block),
-                           &merged_environment_entry_count)) {
+                           &merged_environment_entry_count) ||
+                       !environment_block_preserves_custom_entries(
+                           merged_env_block, _countof(merged_env_block),
+                           env_block, _countof(env_block))) {
                 merged_environment_control.setup_error = ERROR_INVALID_DATA;
             } else {
                 merged_environment_control.main_environment_block_safe = TRUE;
+                merged_environment_control.merged_custom_entries_verified = TRUE;
                 merged_environment_control.merged_environment_entry_count =
                     merged_environment_entry_count;
             }
@@ -1765,12 +1996,14 @@ static int launch_child(int argc, wchar_t **argv) {
             merged_environment_control.cleanup_confirmed =
                 merged_snapshot == NULL && merged_environment_control.cleanup_error == ERROR_SUCCESS;
             report_environment_control(&merged_environment_control);
-            if (!merged_environment_control.cleanup_confirmed) {
-                status = fail(L"merged environment control cleanup unconfirmed",
-                              merged_environment_control.cleanup_error ?
-                              merged_environment_control.cleanup_error : ERROR_INVALID_DATA);
-                goto done;
-            }
+            status = fail(merged_environment_control.cleanup_confirmed ?
+                              L"validate merged environment block" :
+                              L"merged environment control cleanup unconfirmed",
+                          merged_environment_control.cleanup_error ?
+                              merged_environment_control.cleanup_error :
+                              (merged_environment_control.setup_error ?
+                               merged_environment_control.setup_error : ERROR_INVALID_DATA));
+            goto done;
         } else {
             if (!run_lp_environment_control(
                     argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
@@ -1781,6 +2014,7 @@ static int launch_child(int argc, wchar_t **argv) {
                 merged_environment_control.merged_environment_block = TRUE;
                 merged_environment_control.merged_environment_builder_selftest_passed =
                     merged_builder_selftest_passed;
+                merged_environment_control.merged_custom_entries_verified = TRUE;
                 merged_environment_control.merged_environment_entry_count =
                     merged_environment_entry_count;
                 report_environment_control(&merged_environment_control);
@@ -1792,15 +2026,40 @@ static int launch_child(int argc, wchar_t **argv) {
             merged_environment_control.merged_environment_block = TRUE;
             merged_environment_control.merged_environment_builder_selftest_passed =
                 merged_builder_selftest_passed;
+            merged_environment_control.merged_custom_entries_verified = TRUE;
             merged_environment_control.merged_environment_entry_count =
                 merged_environment_entry_count;
+            if (!merged_environment_control.create_succeeded ||
+                !merged_environment_control.parent_environment_filtered ||
+                !merged_environment_control.main_environment_block_safe ||
+                !merged_environment_control.merged_environment_builder_selftest_passed ||
+                !merged_environment_control.merged_custom_entries_verified ||
+                !merged_environment_control.job_membership_verified ||
+                !merged_environment_control.terminated ||
+                !merged_environment_control.job_query_succeeded ||
+                !merged_environment_control.job_empty ||
+                !merged_environment_control.cleanup_confirmed ||
+                !merged_environment_control.process_handle_closed ||
+                !merged_environment_control.thread_handle_closed ||
+                !merged_environment_control.job_handle_closed ||
+                merged_environment_control.cleanup_error != ERROR_SUCCESS) {
+                report_environment_control(&merged_environment_control);
+                status = fail(L"merged environment control cleanup unconfirmed", ERROR_INVALID_DATA);
+                goto done;
+            }
+            main_environment_to_use = merged_env_block;
+            merged_environment_control.merged_environment_selected_for_main = TRUE;
             report_environment_control(&merged_environment_control);
         }
     }
     ZeroMemory(&job_limits, sizeof(job_limits));
     job_limits.BasicLimitInformation.LimitFlags = 0x00002000; /* JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE */
     job = CreateJobObjectW(NULL, NULL);
-    if (!job || !SetInformationJobObject(job, (JOBOBJECTINFOCLASS)9, &job_limits, (DWORD)sizeof(job_limits))) {
+    if (!job) {
+        status = fail(L"create bounded child job", GetLastError()); goto done;
+    }
+    main_cleanup.job_handle_closed = FALSE;
+    if (!SetInformationJobObject(job, (JOBOBJECTINFOCLASS)9, &job_limits, (DWORD)sizeof(job_limits))) {
         status = fail(L"create bounded child job", GetLastError()); goto done;
     }
     job_list[0] = job;
@@ -1808,9 +2067,10 @@ static int launch_child(int argc, wchar_t **argv) {
                                    job_list, sizeof(HANDLE), NULL, NULL)) {
         status = fail(L"set LPAC child job attribute", GetLastError()); goto done;
     }
+    main_cleanup.attempted = TRUE;
     if (!CreateProcessW(argv[0], command, NULL, NULL, FALSE,
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                        env_block, argv[4], &startup.StartupInfo, &process)) {
+                        main_environment_to_use, argv[4], &startup.StartupInfo, &process)) {
         DWORD launch_error = GetLastError();
         LONG nt_status = last_nt_status ? last_nt_status() : 0;
         report_launch_failure(argv[0], argv[4], launch_error,
@@ -1818,26 +2078,36 @@ static int launch_child(int argc, wchar_t **argv) {
             last_nt_status != NULL, nt_status, drive_environment_present);
         status = fail(L"CreateProcessW LPAC", launch_error); goto done;
     }
+    main_cleanup.process_created = TRUE;
+    main_cleanup.process_handle_closed = FALSE;
+    main_cleanup.thread_handle_closed = FALSE;
     job_query_ok = IsProcessInJob(process.hProcess, job, &in_job);
     if (!job_query_ok || !in_job) {
         DWORD error = job_query_ok ? ERROR_INVALID_DATA : GetLastError();
-        TerminateJobObject(job, 28);
-        TerminateProcess(process.hProcess, 28); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"verify suspended LPAC child job membership", error); goto done;
     }
+    main_cleanup.job_membership_verified = TRUE;
     if (!OpenProcessToken(process.hProcess, TOKEN_QUERY, &process_token)) {
         parent_token_error = GetLastError();
         token_verification_fail(&parent_token_checks, L"OpenProcessToken", parent_token_error, 0);
     } else {
         parent_token_verified = verify_token(process_token, sid, &parent_token_checks);
         parent_token_error = parent_token_checks.api_error;
-        CloseHandle(process_token);
-        process_token = NULL;
+        if (!CloseHandle(process_token)) {
+            DWORD token_close_error = GetLastError();
+            if (!parent_token_error) parent_token_error = token_close_error;
+            if (parent_token_checks.failure_stage &&
+                wcscmp(parent_token_checks.failure_stage, L"complete") == 0)
+                token_verification_fail(&parent_token_checks,
+                    L"close suspended LPAC token handle", token_close_error, 0);
+            main_cleanup.cleanup_error = token_close_error;
+            parent_token_verified = FALSE;
+        } else {
+            process_token = NULL;
+        }
     }
     if (!parent_token_verified) {
         report_token_diagnostic(FALSE, &parent_token_checks);
-        TerminateJobObject(job, 26);
-        TerminateProcess(process.hProcess, 26); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"suspended LPAC child token verification",
                       parent_token_error ? parent_token_error : ERROR_INVALID_DATA); goto done;
     }
@@ -1846,12 +2116,16 @@ static int launch_child(int argc, wchar_t **argv) {
         L"\"is_appcontainer\":true,\"is_lpac\":true,\"low_integrity\":true,"
         L"\"expected_sid_match\":true,\"zero_capabilities\":true,"
         L"\"job_membership_verified\":true}\n");
-    if (ResumeThread(process.hThread) == (DWORD)-1) { status = fail(L"resume LPAC child", GetLastError()); TerminateJobObject(job, 26); TerminateProcess(process.hProcess, 26); WaitForSingleObject(process.hProcess, 5000); goto done; }
+    main_cleanup.resume_attempted = TRUE;
+    wait_status = ResumeThread(process.hThread);
+    if (wait_status == (DWORD)-1) {
+        status = fail(L"resume LPAC child", GetLastError());
+        goto done;
+    }
+    main_cleanup.resume_succeeded = TRUE;
     wait_status = WaitForSingleObject(process.hProcess, CHILD_TIMEOUT_MS);
     if (wait_status != WAIT_OBJECT_0) {
         DWORD error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
-        TerminateJobObject(job, 27);
-        TerminateProcess(process.hProcess, 27); WaitForSingleObject(process.hProcess, 5000);
         status = fail(L"bounded LPAC child wait", error); goto done;
     }
     if (!GetExitCodeProcess(process.hProcess, &child_exit)) { status = fail(L"read child exit code", GetLastError()); goto done; }
@@ -1870,7 +2144,6 @@ static int launch_child(int argc, wchar_t **argv) {
         }
     }
     status = child_exit == 0 ? 0 : (int)child_exit;
-    CloseHandle(process.hThread); CloseHandle(process.hProcess); process.hThread = NULL; process.hProcess = NULL;
 done:
     if (merged_snapshot) {
         if (!FreeEnvironmentStringsW(merged_snapshot)) {
@@ -1946,13 +2219,99 @@ done:
             status = fail(L"diagnostic cleanup unconfirmed", ERROR_INVALID_DATA);
         }
     }
-    if (process.hThread) CloseHandle(process.hThread);
-    if (process.hProcess) CloseHandle(process.hProcess);
+    {
+        DWORD cleanup_attempt;
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+        ZeroMemory(&accounting, sizeof(accounting));
+        if (process.hProcess) {
+            wait_status = WaitForSingleObject(process.hProcess, 0);
+            main_cleanup.process_signaled = wait_status == WAIT_OBJECT_0;
+            if (!main_cleanup.process_signaled) {
+                main_cleanup.termination_requested = TRUE;
+                if (job && !TerminateJobObject(job, 0xE7) &&
+                    main_cleanup.cleanup_error == ERROR_SUCCESS)
+                    main_cleanup.cleanup_error = GetLastError();
+                if (!TerminateProcess(process.hProcess, 0xE7) &&
+                    main_cleanup.cleanup_error == ERROR_SUCCESS)
+                    main_cleanup.cleanup_error = GetLastError();
+                wait_status = WaitForSingleObject(process.hProcess, 5000);
+                main_cleanup.process_signaled = wait_status == WAIT_OBJECT_0;
+                if (!main_cleanup.process_signaled && main_cleanup.cleanup_error == ERROR_SUCCESS)
+                    main_cleanup.cleanup_error = wait_status == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+            }
+        }
+        if (job) {
+            main_cleanup.job_empty = FALSE;
+            for (cleanup_attempt = 0; cleanup_attempt < 100; ++cleanup_attempt) {
+                if (QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                              &accounting, (DWORD)sizeof(accounting), NULL)) {
+                    main_cleanup.job_query_succeeded = TRUE;
+                    main_cleanup.job_active_processes = accounting.ActiveProcesses;
+                    main_cleanup.job_total_processes = accounting.TotalProcesses;
+                    main_cleanup.job_empty = accounting.ActiveProcesses == 0;
+                } else {
+                    main_cleanup.job_query_succeeded = FALSE;
+                    if (main_cleanup.cleanup_error == ERROR_SUCCESS)
+                        main_cleanup.cleanup_error = GetLastError();
+                }
+                if (main_cleanup.job_empty) break;
+                main_cleanup.termination_requested = TRUE;
+                if (!TerminateJobObject(job, 0xE7) &&
+                    main_cleanup.cleanup_error == ERROR_SUCCESS)
+                    main_cleanup.cleanup_error = GetLastError();
+                Sleep(50);
+            }
+        } else if (!main_cleanup.process_created) {
+            main_cleanup.job_empty = TRUE;
+        }
+        if (process.hProcess && WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0)
+            main_cleanup.process_signaled = TRUE;
+        if (process.hThread) {
+            if (CloseHandle(process.hThread)) {
+                process.hThread = NULL;
+                main_cleanup.thread_handle_closed = TRUE;
+            } else if (main_cleanup.cleanup_error == ERROR_SUCCESS) {
+                main_cleanup.cleanup_error = GetLastError();
+            }
+        }
+        if (process.hProcess) {
+            if (CloseHandle(process.hProcess)) {
+                process.hProcess = NULL;
+                main_cleanup.process_handle_closed = TRUE;
+            } else if (main_cleanup.cleanup_error == ERROR_SUCCESS) {
+                main_cleanup.cleanup_error = GetLastError();
+            }
+        }
+    }
     if (initialized) DeleteProcThreadAttributeList(attrs);
     if (attrs) HeapFree(GetProcessHeap(), 0, attrs);
-    /* An unconfirmed diagnostic Job handle is intentionally retained until process exit;
-     * JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE then provides the final kernel cleanup. */
-    if (job) CloseHandle(job); /* Kills any unexpected surviving child before the launcher exits. */
+    if (job) {
+        if (CloseHandle(job)) {
+            job = NULL;
+            main_cleanup.job_handle_closed = TRUE;
+        } else if (main_cleanup.cleanup_error == ERROR_SUCCESS) {
+            main_cleanup.cleanup_error = GetLastError();
+        }
+    }
+    if (!main_cleanup.process_created) {
+        main_cleanup.cleanup_confirmed = main_cleanup.process_handle_closed &&
+            main_cleanup.thread_handle_closed && main_cleanup.job_handle_closed &&
+            main_cleanup.cleanup_error == ERROR_SUCCESS &&
+            (!main_cleanup.attempted || (main_cleanup.job_query_succeeded &&
+             main_cleanup.job_empty && main_cleanup.job_active_processes == 0));
+    } else {
+        main_cleanup.cleanup_confirmed = main_cleanup.process_signaled &&
+            main_cleanup.job_query_succeeded && main_cleanup.job_empty &&
+            main_cleanup.job_active_processes == 0 &&
+            main_cleanup.process_handle_closed && main_cleanup.thread_handle_closed &&
+            main_cleanup.job_handle_closed && main_cleanup.cleanup_error == ERROR_SUCCESS &&
+            (!main_cleanup.resume_attempted ||
+             (main_cleanup.resume_succeeded && main_cleanup.job_membership_verified));
+    }
+    report_cleanup_diagnostic(&main_cleanup);
+    if (!main_cleanup.cleanup_confirmed)
+        status = fail(L"main LPAC process cleanup unconfirmed",
+                      main_cleanup.cleanup_error ? main_cleanup.cleanup_error : ERROR_INVALID_DATA);
     if (sid) LocalFree(sid);
     return status;
 }

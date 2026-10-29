@@ -26,7 +26,7 @@ def test_all_controls_preserve_lpac_capability_boundary_and_stop_before_resume()
         assert "caps.Capabilities = NULL; caps.CapabilityCount = 0" in text
         assert "PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT" in text
         assert "CREATE_SUSPENDED" in text
-        assert text.index("suspended_control:") < text.index("if (ResumeThread")
+        assert text.index("suspended_control:") < text.index("ResumeThread(process.hThread)")
         assert "status = 0; goto done;" in text
         assert "CreateAppContainerProfile(" not in text
 
@@ -36,7 +36,7 @@ def test_control_deltas_are_independent():
     baseline = controls["baseline_suspended"]
     assert controls["null_application_name"] == baseline.replace("if (!CreateProcessW(argv[0], command,", "if (!CreateProcessW(NULL, command,")
     assert controls["no_create_no_window"] == baseline.replace(" | CREATE_NO_WINDOW", "")
-    assert "env_block, control_dir," in controls["cwd_control_directory"]
+    assert "main_environment_to_use, control_dir," in controls["cwd_control_directory"]
     assert 'L"C:\\\\Windows\\\\System32\\\\whoami.exe"' in controls["system32_image"]
     assert controls["sorted_same_environment"] == baseline
     env = baseline.split("wchar_t windows_dir", 1)[1].split("env_block[env_used]", 1)[0]

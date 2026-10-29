@@ -32,6 +32,7 @@ LEGACY_NATIVE_CASES = [
 EXPECTED_NATIVE_CASES = [*LEGACY_NATIVE_CASES, NATIVE_CASE]
 TOKEN_FAILURE_STAGES = frozenset({
     "not_run", "invalid_token_or_expected_sid", "OpenProcessToken",
+    "close suspended LPAC token handle",
     "TokenIsAppContainer_query", "TokenIsAppContainer_return_length", "TokenIsAppContainer_false",
     "TokenIsLessPrivilegedAppContainer_query", "TokenIsLessPrivilegedAppContainer_return_length",
     "TokenIsLessPrivilegedAppContainer_false", "TokenAppContainerSid_size_query", "TokenAppContainerSid_size",
@@ -51,7 +52,9 @@ LEGACY_LAUNCH_FAILURE_STEPS = {
     "environment control cleanup unconfirmed", "explicit environment control cleanup unconfirmed",
     "main environment block control cleanup unconfirmed", "build main environment variant",
     "main environment variant control cleanup unconfirmed", "merged environment control cleanup unconfirmed",
+    "validate merged environment block",
     "verify suspended LPAC child job membership", "suspended LPAC child token verification",
+    "main LPAC process cleanup unconfirmed",
     "resume LPAC child", "bounded LPAC child wait", "read child exit code",
     "query completed LPAC job accounting", "LPAC job did not become empty",
 }
@@ -69,7 +72,9 @@ ENVIRONMENT_CONTROL_BOOL_FIELDS = (
     "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
     "explicit_environment_snapshot_safe", "main_environment_block", "main_environment_block_safe",
     "main_environment_variant", "merged_environment_block",
-    "merged_environment_builder_selftest_passed", "attempted", "create_succeeded", "create_ntstatus_available",
+    "merged_environment_builder_selftest_passed", "merged_custom_entries_verified",
+    "merged_environment_selected_for_main", "process_handle_closed", "thread_handle_closed",
+    "job_handle_closed", "job_query_succeeded", "attempted", "create_succeeded", "create_ntstatus_available",
     "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
     "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
     "token_is_lpac_query_succeeded", "terminated", "job_empty", "cleanup_confirmed",
@@ -89,6 +94,15 @@ TOKEN_DIAGNOSTIC_BOOL_FIELDS = (
 TOKEN_DIAGNOSTIC_INT_FIELDS = (
     "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
     "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
+)
+CLEANUP_DIAGNOSTIC_BOOL_FIELDS = (
+    "diagnostic_only", "attempted", "process_created", "resume_attempted",
+    "resume_succeeded", "termination_requested", "process_signaled",
+    "job_membership_verified", "job_query_succeeded", "job_empty",
+    "process_handle_closed", "thread_handle_closed", "job_handle_closed",
+)
+CLEANUP_DIAGNOSTIC_INT_FIELDS = (
+    "job_active_processes", "job_total_processes", "cleanup_error",
 )
 
 
@@ -130,7 +144,8 @@ def _sanitize_environment_control(
         "create_succeeded", "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac",
         "low_integrity", "expected_sid_match", "zero_capabilities",
         "token_is_appcontainer_query_succeeded", "token_is_lpac_query_succeeded",
-        "terminated", "job_empty", "cleanup_confirmed",
+        "terminated", "job_query_succeeded", "job_empty", "process_handle_closed",
+        "thread_handle_closed", "job_handle_closed", "cleanup_confirmed",
     )
     required_zero = (
         "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
@@ -167,6 +182,56 @@ def _sanitize_token_diagnostic(value: object) -> dict[str, object] | None:
     if isinstance(token_failure_stage, str) and token_failure_stage in TOKEN_FAILURE_STAGES:
         diagnostic["token_failure_stage"] = token_failure_stage
     return diagnostic if len(diagnostic) > 2 else None
+
+
+def _sanitize_cleanup_diagnostic(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value.get("version") != 1 or value.get("scope") != "broker_only":
+        return None
+    cleanup: dict[str, object] = {"version": 1, "scope": "broker_only"}
+    for field in CLEANUP_DIAGNOSTIC_BOOL_FIELDS:
+        if type(value.get(field)) is bool:
+            cleanup[field] = value[field]
+    for field in CLEANUP_DIAGNOSTIC_INT_FIELDS:
+        number = value.get(field)
+        if type(number) is int and 0 <= number <= 0xFFFFFFFF:
+            cleanup[field] = number
+    handles_closed = all(cleanup.get(field) is True for field in (
+        "process_handle_closed", "thread_handle_closed", "job_handle_closed",
+    ))
+    if cleanup.get("process_created") is True:
+        resume_safe = (
+            cleanup.get("diagnostic_only") is True
+            and cleanup.get("resume_attempted") is False
+            and cleanup.get("resume_succeeded") is False
+        ) or (
+            cleanup.get("diagnostic_only") is False
+            and (cleanup.get("resume_attempted") is False or (
+                cleanup.get("resume_attempted") is True
+                and cleanup.get("resume_succeeded") is True
+                and cleanup.get("job_membership_verified") is True
+            ))
+        )
+        cleanup["cleanup_confirmed"] = (
+            cleanup.get("attempted") is True
+            and cleanup.get("diagnostic_only") in (True, False)
+            and cleanup.get("process_signaled") is True
+            and cleanup.get("job_query_succeeded") is True
+            and cleanup.get("job_empty") is True
+            and cleanup.get("job_active_processes") == 0
+            and cleanup.get("cleanup_error") == 0
+            and handles_closed and resume_safe
+        )
+    else:
+        cleanup["cleanup_confirmed"] = (
+            cleanup.get("process_created") is False and handles_closed
+            and cleanup.get("cleanup_error") == 0
+            and (cleanup.get("attempted") is False or (
+                cleanup.get("job_query_succeeded") is True
+                and cleanup.get("job_empty") is True
+                and cleanup.get("job_active_processes") == 0
+            ))
+        )
+    return cleanup
 
 
 def _sanitize_environment_variant_controls(value: object) -> list[dict[str, object]] | None:
@@ -252,6 +317,15 @@ def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
     token_diagnostic = _sanitize_token_diagnostic(value.get("token_diagnostic"))
     if token_diagnostic is not None:
         safe["token_diagnostic"] = token_diagnostic
+    raw_cleanup_diagnostics = value.get("cleanup_diagnostics")
+    if isinstance(raw_cleanup_diagnostics, list):
+        cleanup_diagnostics = []
+        for item in raw_cleanup_diagnostics[:16]:
+            cleanup = _sanitize_cleanup_diagnostic(item)
+            if cleanup is not None:
+                cleanup_diagnostics.append(cleanup)
+        if cleanup_diagnostics:
+            safe["cleanup_diagnostics"] = cleanup_diagnostics
     return safe or None
 
 
