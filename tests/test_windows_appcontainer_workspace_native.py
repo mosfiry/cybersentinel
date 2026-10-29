@@ -469,6 +469,7 @@ _LAUNCH_FAILURE_STEPS = frozenset({
     "build child command line", "build restricted child environment", "child environment too large",
     "create bounded child job", "set LPAC child job attribute", "CreateProcessW LPAC",
     "environment control cleanup unconfirmed", "explicit environment control cleanup unconfirmed",
+    "main environment block control cleanup unconfirmed",
     "verify suspended LPAC child job membership", "suspended LPAC child token verification",
     "resume LPAC child", "bounded LPAC child wait", "read child exit code",
     "query completed LPAC job accounting", "LPAC job did not become empty",
@@ -485,14 +486,14 @@ _LAUNCH_DIAGNOSTIC_INT_FIELDS = (
 )
 _ENVIRONMENT_CONTROL_BOOL_FIELDS = (
     "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
-    "explicit_environment_snapshot_safe",
+    "explicit_environment_snapshot_safe", "main_environment_block", "main_environment_block_safe",
     "attempted", "create_succeeded", "create_ntstatus_available",
     "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
     "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
     "token_is_lpac_query_succeeded", "terminated", "job_empty", "cleanup_confirmed",
 )
 _ENVIRONMENT_CONTROL_INT_FIELDS = (
-    "parent_environment_entry_count", "explicit_environment_entry_count",
+    "parent_environment_entry_count", "explicit_environment_entry_count", "main_environment_entry_count",
     "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
     "token_verification_error", "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
     "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
@@ -528,6 +529,7 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
     token_prefix = "lpac_token_diagnostic: "
     environment_prefix = "lpac_environment_control: "
     snapshot_prefix = "lpac_environment_snapshot_control: "
+    main_block_prefix = "lpac_main_environment_block_control: "
     for line in stderr.splitlines():
         match = re.fullmatch(r"probe failure: ([A-Za-z0-9 _-]+) \(([0-9]{1,10})\)", line.strip())
         if match and match.group(1) in _LAUNCH_FAILURE_STEPS:
@@ -555,9 +557,12 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
                 if len(token_diagnostic) > 2:
                     result["token_diagnostic"] = token_diagnostic
                 continue
-            if line.startswith(environment_prefix) or line.startswith(snapshot_prefix):
+            if line.startswith(environment_prefix) or line.startswith(snapshot_prefix) or line.startswith(main_block_prefix):
                 is_snapshot = line.startswith(snapshot_prefix)
-                selected_prefix = snapshot_prefix if is_snapshot else environment_prefix
+                is_main_block = line.startswith(main_block_prefix)
+                selected_prefix = (
+                    snapshot_prefix if is_snapshot else main_block_prefix if is_main_block else environment_prefix
+                )
                 try:
                     value = json.loads(line[len(selected_prefix):])
                 except (TypeError, ValueError):
@@ -580,7 +585,7 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
                 ntstatus = value.get("create_ntstatus_advisory")
                 if isinstance(ntstatus, str) and re.fullmatch(r"0x[0-9A-Fa-f]{8}", ntstatus):
                     control["create_ntstatus_advisory"] = ntstatus
-                control["comparison_complete"] = (not is_snapshot) and (
+                control["comparison_complete"] = (not is_snapshot and not is_main_block) and (
                     all(control.get(field) is True for field in (
                         "diagnostic_only", "lp_environment_null", "parent_environment_filtered", "attempted",
                         "create_succeeded", "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac",
@@ -598,7 +603,10 @@ def _launch_failure_diagnostic(stderr: str) -> dict[str, Any] | None:
                     and control.get("token_is_lpac_return_length") == 4
                     and control.get("job_total_processes") == 1
                 )
-                key = "explicit_environment_control" if is_snapshot else "environment_control"
+                key = (
+                    "explicit_environment_control" if is_snapshot else
+                    "main_environment_block_control" if is_main_block else "environment_control"
+                )
                 result[key] = control
             continue
         try:
@@ -672,6 +680,17 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "job_empty": True, "cleanup_confirmed": True, "cleanup_error": 0,
         "raw_environment": "ACTION_TOKEN=sentinel-secret", "raw_variable_names": ["SECRET_KEY"],
     }
+    main_environment_block_control = {
+        "version": 1, "scope": "broker_only", "diagnostic_only": True,
+        "comparison_complete": True, "lp_environment_null": True,
+        "parent_environment_filtered": True, "parent_environment_entry_count": 29,
+        "main_environment_block": True, "main_environment_block_safe": True,
+        "main_environment_entry_count": 6, "attempted": True, "setup_error": 0,
+        "create_succeeded": False, "create_win32_error": 203,
+        "job_membership_verified": False, "terminated": False, "job_empty": False,
+        "cleanup_confirmed": True, "raw_environment": "private-value",
+        "raw_variable_names": ["PRIVATE_NAME"],
+    }
     token_diagnostic = {
         "version": 1, "scope": "broker_only", "token_verified": False,
         "is_appcontainer": True, "is_lpac": False, "low_integrity": False,
@@ -687,6 +706,7 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
         "probe failure: CreateProcessW LPAC (17)\n"
         "lpac_environment_control: " + json.dumps(environment_control) + "\n"
         "lpac_environment_snapshot_control: " + json.dumps(explicit_environment_control) + "\n"
+        "lpac_main_environment_block_control: " + json.dumps(main_environment_block_control) + "\n"
         "lpac_token_diagnostic: " + json.dumps(token_diagnostic) + "\n"
         "lpac_launch_diagnostic: " + json.dumps(diagnostic)
     )
@@ -705,6 +725,12 @@ def test_launch_failure_diagnostic_is_allowlisted() -> None:
     assert parsed["explicit_environment_control"]["explicit_environment_snapshot_safe"] is True
     assert parsed["explicit_environment_control"]["explicit_environment_entry_count"] == 23
     assert parsed["explicit_environment_control"]["comparison_complete"] is False
+    assert parsed["main_environment_block_control"]["main_environment_block"] is True
+    assert parsed["main_environment_block_control"]["main_environment_block_safe"] is True
+    assert parsed["main_environment_block_control"]["main_environment_entry_count"] == 6
+    assert parsed["main_environment_block_control"]["create_succeeded"] is False
+    assert parsed["main_environment_block_control"]["create_win32_error"] == 203
+    assert parsed["main_environment_block_control"]["comparison_complete"] is False
     assert parsed["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query"
     assert parsed["token_diagnostic"]["token_api_error"] == 87
     assert parsed["token_diagnostic"]["token_is_lpac_query_succeeded"] is False

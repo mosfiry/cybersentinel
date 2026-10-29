@@ -49,6 +49,7 @@ LEGACY_LAUNCH_FAILURE_STEPS = {
     "build child command line", "build restricted child environment", "child environment too large",
     "create bounded child job", "set LPAC child job attribute", "CreateProcessW LPAC",
     "environment control cleanup unconfirmed", "explicit environment control cleanup unconfirmed",
+    "main environment block control cleanup unconfirmed",
     "verify suspended LPAC child job membership", "suspended LPAC child token verification",
     "resume LPAC child", "bounded LPAC child wait", "read child exit code",
     "query completed LPAC job accounting", "LPAC job did not become empty",
@@ -65,14 +66,14 @@ LAUNCH_DIAGNOSTIC_INT_FIELDS = (
 )
 ENVIRONMENT_CONTROL_BOOL_FIELDS = (
     "diagnostic_only", "comparison_complete", "lp_environment_null", "parent_environment_filtered",
-    "explicit_environment_snapshot_safe",
+    "explicit_environment_snapshot_safe", "main_environment_block", "main_environment_block_safe",
     "attempted", "create_succeeded", "create_ntstatus_available",
     "job_membership_verified", "token_verified", "is_appcontainer", "is_lpac", "low_integrity",
     "expected_sid_match", "zero_capabilities", "token_is_appcontainer_query_succeeded",
     "token_is_lpac_query_succeeded", "terminated", "job_empty", "cleanup_confirmed",
 )
 ENVIRONMENT_CONTROL_INT_FIELDS = (
-    "parent_environment_entry_count", "explicit_environment_entry_count",
+    "parent_environment_entry_count", "explicit_environment_entry_count", "main_environment_entry_count",
     "setup_error", "create_win32_error", "job_attribute_error", "job_membership_error",
     "token_verification_error", "token_is_appcontainer_return_length", "token_is_appcontainer_api_error",
     "token_is_lpac_return_length", "token_is_lpac_api_error", "token_api_error", "token_return_length",
@@ -133,7 +134,11 @@ def _sanitize_environment_control(
         "token_verification_error", "token_is_appcontainer_api_error", "token_is_lpac_api_error",
         "token_api_error", "cleanup_error", "job_active_processes",
     )
-    control["comparison_complete"] = allow_comparison_complete and (
+    explicit_block_mode = (
+        value.get("explicit_environment_snapshot_safe") is True
+        or value.get("main_environment_block") is True
+    )
+    control["comparison_complete"] = allow_comparison_complete and not explicit_block_mode and (
         all(control.get(field) is True for field in required_true)
         and all(control.get(field) == 0 for field in required_zero)
         and control.get("token_failure_stage") == "complete"
@@ -191,6 +196,11 @@ def _sanitize_parent_launch_failure(value: object) -> dict[str, object] | None:
     )
     if explicit_environment_control is not None:
         safe["explicit_environment_control"] = explicit_environment_control
+    main_environment_block_control = _sanitize_environment_control(
+        value.get("main_environment_block_control"), allow_comparison_complete=False
+    )
+    if main_environment_block_control is not None:
+        safe["main_environment_block_control"] = main_environment_block_control
     token_diagnostic = _sanitize_token_diagnostic(value.get("token_diagnostic"))
     if token_diagnostic is not None:
         safe["token_diagnostic"] = token_diagnostic

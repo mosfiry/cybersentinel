@@ -85,7 +85,9 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     control_source = native_probe[control_start:control_end]
     assert "CreateProcessW(image, control_command" in control_source
     assert "GetEnvironmentStringsW" in control_source and "FreeEnvironmentStringsW" in control_source
-    assert "lp_environment_null ? NULL : explicit_environment" in control_source
+    assert "environment_to_use" in control_source
+    assert "if (main_environment_block)" in control_source
+    assert "control_environment_block_is_filtered" in control_source
     assert "UpdateProcThreadAttribute" in control_source and "PROC_THREAD_ATTRIBUTE_JOB_LIST" in control_source
     assert "AssignProcessToJobObject" not in control_source and "IsProcessInJob" in control_source
     assert "verify_token" in control_source and "TerminateProcess" in control_source
@@ -108,6 +110,7 @@ def test_exact_native_case_cannot_be_skipped_and_mission_stays_blocked():
     assert "ResumeThread" not in control_source
     assert 'L"lpac_environment_control"' in native_probe
     assert 'L"lpac_environment_snapshot_control"' in native_probe
+    assert 'L"lpac_main_environment_block_control"' in native_probe
     assert "diagnostic_only" in native_probe and "comparison_complete" in native_probe
     assert 'L"CYBERSENTINEL_TEST_ENV_SANITIZED"' in control_source
     assert "parent_environment_filtered" in native_probe
@@ -184,6 +187,17 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
             "job_empty": True, "cleanup_confirmed": True, "cleanup_error": 0,
             "raw_environment": "ACTION_TOKEN=sentinel-secret", "raw_variable_names": ["SECRET_KEY"],
         },
+        "main_environment_block_control": {
+            "version": 1, "scope": "broker_only", "diagnostic_only": True,
+            "comparison_complete": True, "lp_environment_null": True,
+            "parent_environment_filtered": True, "parent_environment_entry_count": 29,
+            "main_environment_block": True, "main_environment_block_safe": True,
+            "main_environment_entry_count": 6, "attempted": True, "setup_error": 0,
+            "create_succeeded": False, "create_win32_error": 203,
+            "job_membership_verified": False, "terminated": False, "job_empty": False,
+            "cleanup_confirmed": True, "private_value": "must be dropped",
+            "raw_environment": "private-value", "raw_variable_names": ["PRIVATE_NAME"],
+        },
         "token_diagnostic": {
             "version": 1, "scope": "broker_only", "token_verified": False,
             "is_appcontainer": True, "is_lpac": False, "low_integrity": False,
@@ -222,6 +236,11 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert all(item["launcher_failures"][0]["explicit_environment_control"]["lp_environment_null"] is False for item in attestations)
     assert all(item["launcher_failures"][0]["explicit_environment_control"]["comparison_complete"] is False for item in attestations)
     assert all(item["launcher_failures"][0]["explicit_environment_control"]["explicit_environment_entry_count"] == 23 for item in attestations)
+    assert all(item["launcher_failures"][0]["main_environment_block_control"]["main_environment_block"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["main_environment_block_control"]["main_environment_block_safe"] is True for item in attestations)
+    assert all(item["launcher_failures"][0]["main_environment_block_control"]["main_environment_entry_count"] == 6 for item in attestations)
+    assert all(item["launcher_failures"][0]["main_environment_block_control"]["create_win32_error"] == 203 for item in attestations)
+    assert all(item["launcher_failures"][0]["main_environment_block_control"]["comparison_complete"] is False for item in attestations)
     assert all(item["launcher_failures"][0]["token_diagnostic"]["token_failure_stage"] == "TokenIsLessPrivilegedAppContainer_query" for item in attestations)
     assert all(item["launcher_failures"][0]["token_diagnostic"]["token_api_error"] == 87 for item in attestations)
     assert all(item["environment_controls"][0]["comparison_complete"] is True for item in attestations)
@@ -239,6 +258,14 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert safe_failure is not None
     assert safe_failure["explicit_environment_control"]["lp_environment_null"] is True
     assert safe_failure["explicit_environment_control"]["comparison_complete"] is False
+    forged_snapshot_control = dict(
+        launcher_failure["explicit_environment_control"], lp_environment_null=True, comparison_complete=True
+    )
+    safe_snapshot_control = runner._sanitize_environment_control(forged_snapshot_control)
+    assert safe_snapshot_control is not None and safe_snapshot_control["comparison_complete"] is False
+    forged_main_block = dict(launcher_failure["main_environment_block_control"], lp_environment_null=True, comparison_complete=True)
+    safe_main_block = runner._sanitize_environment_control(forged_main_block)
+    assert safe_main_block is not None and safe_main_block["comparison_complete"] is False
     lpac_query_failed = dict(
         launcher_failure["environment_control"],
         token_is_lpac_query_succeeded=False,
@@ -265,6 +292,8 @@ def test_junit_sanitizer_keeps_only_case_results_and_allowlisted_attestations(tm
     assert "sensitive" not in serialized
     assert "C:\\\\sensitive" not in serialized
     assert "raw_environment" not in serialized and "sentinel-secret" not in serialized
+    assert "private-value" not in serialized and "PRIVATE_NAME" not in serialized
+    assert "must be dropped" not in serialized
     assert "token_raw" not in serialized and "sensitive-token-data" not in serialized
     assert "raw_sid" not in serialized and "private-sid" not in serialized
     assert "SECRET_KEY" not in serialized

@@ -699,6 +699,9 @@ typedef struct EnvironmentControlResult {
     DWORD parent_environment_entry_count;
     BOOL explicit_environment_snapshot_safe;
     DWORD explicit_environment_entry_count;
+    BOOL main_environment_block;
+    BOOL main_environment_block_safe;
+    DWORD main_environment_entry_count;
     BOOL attempted;
     DWORD setup_error;
     BOOL create_succeeded;
@@ -818,7 +821,8 @@ static BOOL close_control_job_handle(HANDLE *job, HANDLE *job_out, DWORD *cleanu
 static BOOL run_lp_environment_control(
     const wchar_t *image, const wchar_t *command, const wchar_t *cwd,
     const STARTUPINFOEXW *startup, const SECURITY_CAPABILITIES *caps,
-    const DWORD *all_packages_policy, DWORD launch_flags, BOOL lp_environment_null, PSID expected_sid,
+    const DWORD *all_packages_policy, DWORD launch_flags, BOOL lp_environment_null,
+    const wchar_t *main_environment_block, PSID expected_sid,
     LastNtStatusFn last_nt_status, EnvironmentControlResult *result,
     HANDLE *control_job_out, PROCESS_INFORMATION *control_process_out,
     HANDLE *control_token_out) {
@@ -826,6 +830,7 @@ static BOOL run_lp_environment_control(
     wchar_t control_command[32768];
     HANDLE control_job = NULL, process_token = NULL;
     LPWCH explicit_environment = NULL;
+    LPWCH environment_to_use = NULL;
     PROCESS_INFORMATION control_process;
     SIZE_T attr_size = 0;
     LPPROC_THREAD_ATTRIBUTE_LIST control_attrs = NULL;
@@ -844,6 +849,7 @@ static BOOL run_lp_environment_control(
     *control_token_out = NULL;
     result->diagnostic_only = TRUE;
     result->lp_environment_null = lp_environment_null;
+    result->main_environment_block = main_environment_block != NULL;
     result->token_details.failure_stage = L"not_run";
     {
         wchar_t marker[8];
@@ -917,21 +923,33 @@ static BOOL run_lp_environment_control(
     control_startup = *startup;
     control_startup.lpAttributeList = control_attrs;
     if (!lp_environment_null) {
-        explicit_environment = GetEnvironmentStringsW();
-        if (!explicit_environment) {
-            result->setup_error = GetLastError();
-            goto control_setup_failed;
+        if (main_environment_block) {
+            if (!control_environment_block_is_filtered(
+                    main_environment_block, &result->main_environment_entry_count) ||
+                result->main_environment_entry_count == 0) {
+                result->setup_error = ERROR_ACCESS_DENIED;
+                goto control_setup_failed;
+            }
+            result->main_environment_block_safe = TRUE;
+            environment_to_use = (LPWCH)main_environment_block;
+        } else {
+            explicit_environment = GetEnvironmentStringsW();
+            if (!explicit_environment) {
+                result->setup_error = GetLastError();
+                goto control_setup_failed;
+            }
+            if (!control_environment_block_is_filtered(
+                    explicit_environment, &result->explicit_environment_entry_count)) {
+                result->setup_error = ERROR_ACCESS_DENIED;
+                goto control_setup_failed;
+            }
+            result->explicit_environment_snapshot_safe = TRUE;
+            environment_to_use = explicit_environment;
         }
-        if (!control_environment_block_is_filtered(
-                explicit_environment, &result->explicit_environment_entry_count)) {
-            result->setup_error = ERROR_ACCESS_DENIED;
-            goto control_setup_failed;
-        }
-        result->explicit_environment_snapshot_safe = TRUE;
     }
     result->attempted = TRUE;
     create_succeeded = CreateProcessW(image, control_command, NULL, NULL, FALSE, launch_flags,
-                        lp_environment_null ? NULL : explicit_environment,
+                        environment_to_use,
                         cwd, &control_startup.StartupInfo, &control_process);
     create_error = create_succeeded ? ERROR_SUCCESS : GetLastError();
     if (explicit_environment) {
@@ -1064,7 +1082,8 @@ control_setup_failed:
 
 static void report_environment_control(const EnvironmentControlResult *result) {
     const wchar_t *prefix = result->lp_environment_null ?
-        L"lpac_environment_control" : L"lpac_environment_snapshot_control";
+        L"lpac_environment_control" : result->main_environment_block ?
+        L"lpac_main_environment_block_control" : L"lpac_environment_snapshot_control";
     BOOL comparison_complete = result->diagnostic_only && result->lp_environment_null &&
         result->parent_environment_filtered &&
         result->attempted && result->create_succeeded && result->job_membership_verified &&
@@ -1091,6 +1110,8 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         L"\"lp_environment_null\":%ls,\"parent_environment_filtered\":%ls,"
         L"\"parent_environment_entry_count\":%lu,"
         L"\"explicit_environment_snapshot_safe\":%ls,\"explicit_environment_entry_count\":%lu,"
+        L"\"main_environment_block\":%ls,\"main_environment_block_safe\":%ls,"
+        L"\"main_environment_entry_count\":%lu,"
         L"\"attempted\":%ls,\"setup_error\":%lu,"
         L"\"create_succeeded\":%ls,\"create_win32_error\":%lu,"
         L"\"create_ntstatus_available\":%ls,\"create_ntstatus_advisory\":\"0x%08lX\","
@@ -1112,6 +1133,9 @@ static void report_environment_control(const EnvironmentControlResult *result) {
         (unsigned long)result->parent_environment_entry_count,
         result->explicit_environment_snapshot_safe ? L"true" : L"false",
         (unsigned long)result->explicit_environment_entry_count,
+        result->main_environment_block ? L"true" : L"false",
+        result->main_environment_block_safe ? L"true" : L"false",
+        (unsigned long)result->main_environment_entry_count,
         result->attempted ? L"true" : L"false", (unsigned long)result->setup_error,
         result->create_succeeded ? L"true" : L"false", (unsigned long)result->create_win32_error,
         result->create_ntstatus_available ? L"true" : L"false", (unsigned long)result->create_ntstatus,
@@ -1272,6 +1296,7 @@ static int launch_child(int argc, wchar_t **argv) {
     BOOL drive_environment_present = FALSE;
     EnvironmentControlResult environment_control;
     EnvironmentControlResult explicit_environment_control;
+    EnvironmentControlResult main_environment_block_control;
     ProbeJobExtendedLimitInformation job_limits;
     int status = 20;
     LastNtStatusFn last_nt_status = NULL;
@@ -1288,6 +1313,7 @@ static int launch_child(int argc, wchar_t **argv) {
     memset(&control_process, 0, sizeof(control_process));
     memset(&environment_control, 0, sizeof(environment_control));
     memset(&explicit_environment_control, 0, sizeof(explicit_environment_control));
+    memset(&main_environment_block_control, 0, sizeof(main_environment_block_control));
     memset(&caps, 0, sizeof(caps));
     memset(&parent_token_checks, 0, sizeof(parent_token_checks));
     parent_token_checks.failure_stage = L"not_run";
@@ -1345,7 +1371,7 @@ static int launch_child(int argc, wchar_t **argv) {
     if (!run_lp_environment_control(
             argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            TRUE,
+            TRUE, NULL,
             sid, last_nt_status, &environment_control, &control_job, &control_process,
             &process_token)) {
         report_environment_control(&environment_control);
@@ -1357,7 +1383,7 @@ static int launch_child(int argc, wchar_t **argv) {
     if (!run_lp_environment_control(
             argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            FALSE,
+            FALSE, NULL,
             sid, last_nt_status, &explicit_environment_control, &control_job, &control_process,
             &process_token)) {
         report_environment_control(&explicit_environment_control);
@@ -1366,6 +1392,19 @@ static int launch_child(int argc, wchar_t **argv) {
         goto done;
     }
     report_environment_control(&explicit_environment_control);
+    if (!run_lp_environment_control(
+            argv[0], command, argv[4], &startup, &caps, &all_packages_policy,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            FALSE, env_block,
+            sid, last_nt_status, &main_environment_block_control, &control_job, &control_process,
+            &process_token)) {
+        report_environment_control(&main_environment_block_control);
+        status = fail(L"main environment block control cleanup unconfirmed",
+                      main_environment_block_control.cleanup_error ?
+                      main_environment_block_control.cleanup_error : ERROR_INVALID_DATA);
+        goto done;
+    }
+    report_environment_control(&main_environment_block_control);
     ZeroMemory(&job_limits, sizeof(job_limits));
     job_limits.BasicLimitInformation.LimitFlags = 0x00002000; /* JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE */
     job = CreateJobObjectW(NULL, NULL);
