@@ -95,16 +95,12 @@ def test_banner_is_returned_as_observed_data_with_sha256(port_seam):
     assert result["banner_printable"] == "HTTP/1.1 200 OKServer: fake"
 
 
-def test_banner_sha256_is_over_raw_bytes_not_printable(port_seam):
+def test_banner_sha256_is_over_raw_bytes_not_printable(monkeypatch):
     seam_banner = b"prompt\x00\x01> "
-    import tools.registry as registry_module
 
-    monkeypatched = lambda *a, **k: seam_banner
-    registry_module._port_observe = monkeypatched  # direct, restored by next monkeypatch test
-    try:
-        result = _scoped_port_observation("https://target.example/")
-    finally:
-        pass
+    monkeypatch.setattr(tools.registry, "_port_observe", lambda *a, **k: seam_banner)
+    result = _scoped_port_observation("https://target.example/")
+    assert result["ok"] is True
     assert result["banner_sha256"] == hashlib.sha256(seam_banner).hexdigest()
     # non-printable bytes are dropped from the printable rendering only
     assert "\x00" not in (result["banner_printable"] or "")
@@ -125,7 +121,8 @@ def test_banner_beyond_hard_cap_is_truncated(monkeypatch):
     result = _scoped_port_observation("https://target.example/")
     assert result["ok"] is True
     assert result["banner_truncated"] is True
-    assert len((result["banner_printable"] or "")) == 0
+    # the printable rendering covers exactly the capped banner
+    assert result["banner_printable"] == "x" * SCOPED_PORT_BANNER_MAX_BYTES
     assert len(result["banner_sha256"]) == 64  # sha256 over the capped banner
 
 
