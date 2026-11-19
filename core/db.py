@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS owner_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner ON owner_sessions(owner_id);
 CREATE INDEX IF NOT EXISTS idx_owner_sessions_status ON owner_sessions(status);
+
+CREATE TABLE IF NOT EXISTS owner_login_throttle (
+    username TEXT PRIMARY KEY,
+    failures INTEGER NOT NULL DEFAULT 0,
+    last_failure_at TEXT NOT NULL
+);
 """
 
 def connect():

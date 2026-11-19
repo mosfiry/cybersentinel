@@ -321,13 +321,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, {"ok": False, "error": "invalid_credentials"})
             return self._send(200, {"ok": True, "session": session})
         if self.path == "/api/auth/logout":
-            # Revoke the server-side session; idempotent and unauthenticated by design.
-            try:
-                payload = self._read_json()
-            except Exception:
-                payload = {}
-            session_id = str(payload.get("session_id", "")) if isinstance(payload, dict) else ""
-            owner_password_logout(session_id)
+            # Authenticated logout: revocation requires proof of possession of
+            # the session token itself (the X-CyberSentinel-Owner-Session
+            # header). A body-supplied session_id is never consulted, so no
+            # unauthenticated caller can revoke an Owner session (the
+            # revocation-DoS is closed; without a live session this fails
+            # closed with 403).
+            owner_session = self._owner_session()
+            if owner_session is None:
+                return self._send(403, {"ok": False, "error": "owner authentication required"})
+            owner_password_logout(owner_session["session_id"])
             return self._send(200, {"ok": True})
         if self.path == "/api/chat":
             try:

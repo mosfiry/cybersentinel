@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import core.db as core_db
@@ -31,6 +32,8 @@ KDF_DKLEN = 32
 SALT_BYTES = 16
 SESSION_TTL_SECONDS = 8 * 3600
 AUTH_METHOD = "username_password"
+LOGIN_FAILURE_THRESHOLD = 5
+LOGIN_LOCKOUT_SECONDS = 300
 
 
 def _now() -> datetime:
@@ -100,22 +103,33 @@ def owner_account_exists() -> bool:
 
 
 def create_owner_account(username: str, password: str) -> int:
-    """Create the single canonical Owner account (bootstrap only)."""
+    """Create the single canonical Owner account (bootstrap only).
+
+    Atomicity: the UNIQUE constraint on owner_accounts.username is the
+    authoritative guard. Even if the existence pre-check races with a
+    concurrent bootstrap, the INSERT itself fails closed with
+    IntegrityError, which is converted to the same generic PermissionError.
+    No duplicate Owner row can ever exist.
+    """
     if username != OWNER_USERNAME:
         raise PermissionError("owner_username_mismatch")
+    verifier = hash_password(password)
     with core_db.connect() as con:
         row = con.execute(
             "SELECT owner_id FROM owner_accounts WHERE username = ?", (username,)
         ).fetchone()
         if row is not None:
             raise PermissionError("owner_account_already_exists")
-        verifier = hash_password(password)
-        cur = con.execute(
-            "INSERT INTO owner_accounts (username, password_hash, kdf_algorithm, kdf_params_json, status)"
-            " VALUES (?, ?, ?, ?, 'active')",
-            (username, verifier["password_hash"], verifier["kdf_algorithm"], verifier["kdf_params_json"]),
-        )
-        con.commit()
+        try:
+            cur = con.execute(
+                "INSERT INTO owner_accounts (username, password_hash, kdf_algorithm, kdf_params_json, status)"
+                " VALUES (?, ?, ?, ?, 'active')",
+                (username, verifier["password_hash"], verifier["kdf_algorithm"], verifier["kdf_params_json"]),
+            )
+            con.commit()
+        except sqlite3.IntegrityError:
+            con.rollback()
+            raise PermissionError("owner_account_already_exists")
         return int(cur.lastrowid)
 
 
@@ -139,14 +153,101 @@ def _create_session(owner_id: int) -> dict:
     }
 
 
+# --- Login throttling (fail-closed, DB-backed) --------------------------------
+#
+# Bounds a local brute-force amplifier: after LOGIN_FAILURE_THRESHOLD
+# consecutive failures for the canonical username, further attempts are
+# rejected (even with CORRECT credentials) until the lockout window
+# elapses. The lockout is deterministic, stored server-side, keyed ONLY
+# to the canonical username (unknown-username attempts never create
+# rows, so the table cannot be flooded), and can only ever REJECT -- it
+# never widens authorization and never mints a session.
+#
+# Each attempt consumes its failure slot ATOMICALLY, BEFORE any KDF work:
+# the lockout check and the counter update run inside one BEGIN IMMEDIATE
+# transaction, so a concurrent burst can never overshoot the threshold
+# (the attempt that would exceed it is rejected before a verifier runs).
+
+
+def _reserve_login_attempt(username: str) -> bool:
+    """Atomically consume one login-attempt slot for this attempt.
+
+    Returns True when the attempt may proceed (its failure slot has been
+    counted), False when the canonical account is locked. The lockout
+    check and the counter update share ONE BEGIN IMMEDIATE transaction,
+    so concurrent attempts can never overshoot the failure threshold.
+    Only the canonical username is ever recorded; arbitrary client-
+    supplied usernames never create rows, and attempts made DURING a
+    lockout never extend the window.
+    """
+    if username != OWNER_USERNAME:
+        # Only attempts against the canonical account can move the lockout;
+        # arbitrary client-supplied usernames must not create rows.
+        return True
+    now = _now()
+    with core_db.connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            row = con.execute(
+                "SELECT failures, last_failure_at FROM owner_login_throttle WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if row is not None and int(row["failures"]) >= LOGIN_FAILURE_THRESHOLD:
+                try:
+                    last = datetime.fromisoformat(row["last_failure_at"])
+                except (TypeError, ValueError):
+                    # Unreadable timestamp: fail closed, never extend.
+                    con.rollback()
+                    return False
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if last + timedelta(seconds=LOGIN_LOCKOUT_SECONDS) > now:
+                    # Locked: this attempt is rejected and the recorded
+                    # window is NOT extended by attempts during lockout.
+                    con.rollback()
+                    return False
+                # Window elapsed: this attempt starts a fresh window.
+                con.execute(
+                    "UPDATE owner_login_throttle SET failures = 1, last_failure_at = ?"
+                    " WHERE username = ?",
+                    (_iso(now), username),
+                )
+                con.commit()
+                return True
+            con.execute(
+                "INSERT INTO owner_login_throttle (username, failures, last_failure_at)"
+                " VALUES (?, 1, ?)"
+                " ON CONFLICT(username) DO UPDATE SET"
+                " failures = owner_login_throttle.failures + 1,"
+                " last_failure_at = excluded.last_failure_at",
+                (username, _iso(now)),
+            )
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
+
+
+def _clear_login_failures(username: str) -> None:
+    with core_db.connect() as con:
+        con.execute("DELETE FROM owner_login_throttle WHERE username = ?", (username,))
+        con.commit()
+
+
 def login(username: str, password: str) -> dict:
     """The single human Owner authentication entry point.
 
     Returns a server-side session dict on success; raises PermissionError
     with a generic message on ANY failure (unknown username, wrong
-    password, disabled account, malformed input).
+    password, disabled account, malformed input, active lockout).
     """
     if not isinstance(username, str) or not isinstance(password, str):
+        raise PermissionError("invalid_credentials")
+    if not _reserve_login_attempt(username):
+        # Timing-equalized rejection: no real verifier is consulted during
+        # lockout, so repeated attempts cannot mount a KDF oracle.
+        _dummy_verify(password)
         raise PermissionError("invalid_credentials")
     with core_db.connect() as con:
         row = con.execute(
@@ -159,6 +260,7 @@ def login(username: str, password: str) -> dict:
         raise PermissionError("invalid_credentials")
     if not _verify(password, row["password_hash"], row["kdf_algorithm"], row["kdf_params_json"]):
         raise PermissionError("invalid_credentials")
+    _clear_login_failures(username)
     return _create_session(int(row["owner_id"]))
 
 
@@ -237,6 +339,11 @@ def reset_password(username: str, current_password: str, new_password: str) -> N
     """Rotate the Owner password; requires the CURRENT password (never a login bypass)."""
     if username != OWNER_USERNAME:
         raise PermissionError("invalid_credentials")
+    if not _reserve_login_attempt(username):
+        # The current-password check is a KDF oracle exactly like login;
+        # it shares the same fail-closed lockout.
+        _dummy_verify(current_password)
+        raise PermissionError("invalid_credentials")
     with core_db.connect() as con:
         row = con.execute(
             "SELECT owner_id, password_hash, kdf_algorithm, kdf_params_json FROM owner_accounts WHERE username = ?",
@@ -255,6 +362,7 @@ def reset_password(username: str, current_password: str, new_password: str) -> N
             (verifier["password_hash"], verifier["kdf_algorithm"], verifier["kdf_params_json"], row["owner_id"]),
         )
         con.commit()
+    _clear_login_failures(username)
     revoke_owner_sessions(int(row["owner_id"]))
 
 
