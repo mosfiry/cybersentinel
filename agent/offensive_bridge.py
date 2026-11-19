@@ -89,6 +89,7 @@ __all__ = [
     "ScopedHttpProbeAdapter",
     "ScopedDnsLookupAdapter",
     "ScopedTlsObservationAdapter",
+    "ScopedPortObservationAdapter",
 ]
 
 # Target kinds: "local" = local read-only analysis (no network surface, the
@@ -276,6 +277,25 @@ class ScopedTlsObservationAdapter(ScopedHttpProbeAdapter):
     tool_name = "scoped_tls_observation"
     timeout_seconds = 10
 
+
+
+class ScopedPortObservationAdapter(ScopedHttpProbeAdapter):
+    """Adapter for the registered scoped_port_observation tool (P1-D).
+
+    Same contract as the probe/dns/tls adapters: the typed Owner
+    AuthorizationDecision and the typed owner-side scope context are bound
+    BEFORE execution, and the tool executes ONLY through
+    tools.registry.execute, which re-resolves the persisted scope snapshot
+    (including the explicit canonical port against the scope asset's ports)
+    and re-verifies the decision binding (INV-OFF-3/INV-OFF-4). The observed
+    port is always the canonical url's (explicit or scheme-default) port:
+    a caller can never point the observation at a different port. Banner
+    bytes are OBSERVED data — they can never widen scope (INV-OFF-2), and
+    the observation sends NO payload (passive banner read only).
+    """
+
+    tool_name = "scoped_port_observation"
+    timeout_seconds = 10
 
 LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()
 

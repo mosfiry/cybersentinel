@@ -505,6 +505,106 @@ def _tls_observation(url, *, timeout=SCOPED_TLS_TIMEOUT_SECONDS, max_sans=SCOPED
     }
 
 
+def _scoped_port_observation(argument):
+    """Real bounded port & service observation behind the Scope Firewall and
+    proof chain (P1-D).
+
+    The registry invokes this handler ONLY after the same gate sequence as
+    the probe/dns/tls tools: typed Owner AuthorizationDecision matched to
+    tool + argument fingerprint + request identity, ExecutionAuthorizationProof
+    verified, and the scope resolver re-resolved the request (including the
+    explicit canonical port) against the persisted typed snapshot. The
+    executed argument is the ScopeGuard's CANONICAL url: the observed host
+    and port are derived from that url and NOTHING else, so a caller can
+    never point the observation at a different host or port. This performs
+    exactly ONE plain TCP connect and ONE passive banner read — NO payload
+    is ever written to the wire. Banner bytes are OBSERVED data only; they
+    can never widen scope (INV-OFF-2).
+    """
+    url = argument if isinstance(argument, str) else ""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return {"ok": False, "operation": "scoped_port_observation", "error": "PORT_ARGUMENT_INVALID", "reason": "the port observation accepts exactly one canonical http(s) url"}
+    return _port_observation(url)
+
+
+SCOPED_PORT_TIMEOUT_SECONDS = 10  # enforced by the registry executor (spec/adapter timeout)
+SCOPED_PORT_BANNER_MAX_BYTES = 128
+
+
+def _port_observe(host, port, timeout):
+    """The single network/port seam: one TCP connect + one passive read.
+
+    Returns the banner bytes read from the socket (possibly empty: many
+    services stay silent until spoken to — silence is data, not failure).
+    No shell, no other socket surface, nothing sent.
+    """
+    import socket
+
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        try:
+            sock.settimeout(min(float(timeout), 2.0))
+            banner = sock.recv(SCOPED_PORT_BANNER_MAX_BYTES)
+        except socket.timeout:
+            banner = b""
+        except OSError:
+            banner = b""
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return banner
+
+
+def _port_observation(url, *, timeout=SCOPED_PORT_TIMEOUT_SECONDS, max_banner=SCOPED_PORT_BANNER_MAX_BYTES):
+    import hashlib
+    import socket
+    import time
+    from datetime import datetime, timezone
+    from urllib.parse import urlsplit
+
+    started = time.monotonic()
+    elapsed = lambda: int((time.monotonic() - started) * 1000)
+    try:
+        parts = urlsplit(url)
+        host = str(parts.hostname or "")
+        port = parts.port
+        scheme = str(parts.scheme or "")
+    except ValueError:
+        host, port, scheme = "", None, ""
+    if not host:
+        return {"ok": False, "operation": "scoped_port_observation", "url": url, "error": "PORT_ARGUMENT_INVALID", "reason": "the url carries no observable host", "elapsed_ms": elapsed()}
+    if port is None:
+        # the scheme-default port; an explicit canonical port is kept as-is
+        port = 443 if scheme == "https" else 80
+    common = {"operation": "scoped_port_observation", "url": url, "host": host, "port": port}
+    try:
+        banner = _port_observe(host, port, timeout)
+    except TimeoutError as exc:
+        return dict(common, ok=False, error="PORT_TIMEOUT", connect_success=False, reason=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except (socket.gaierror, ConnectionError, OSError, ValueError) as exc:
+        return dict(common, ok=False, error="PORT_CONNECT_FAILED", connect_success=False, reason=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except Exception as exc:
+        return dict(common, ok=False, error="PORT_RUNTIME_ERROR", connect_success=False, reason=str(exc)[:SCOPED_TLS_FIELD_MAX], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    banner = bytes(banner)
+    truncated = len(banner) > max_banner
+    if truncated:
+        banner = banner[:max_banner]
+    printable = "".join(chr(b) for b in banner if 32 <= b < 127)
+    return {
+        "ok": True,
+        **common,
+        "connect_success": True,
+        "sends_payload": False,  # the observation never writes to the wire
+        "banner_sha256": hashlib.sha256(banner).hexdigest() if banner else None,
+        "banner_printable": printable if (printable or banner) else None,
+        "banner_truncated": truncated,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_ms": elapsed(),
+    }
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -535,6 +635,7 @@ REGISTRY = build_registry([
     ToolSpec("scoped_http_probe", "ÙØ±Ø§ÙØ¨Ø© HTTP ÙØ­Ø¯ÙØ¯Ø© ÙØ§ ØªØ¹ÙÙ Ø¥ÙØ§ ÙØ¹ Scope Snapshot ÙTarget ÙØµØ§Ø¯Ù Ø¹ÙÙÙ", "network-read", True, str, _scoped_http_probe, False, True),
     ToolSpec("scoped_dns_lookup", "مراقبة DNS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_dns_lookup, False, True),
     ToolSpec("scoped_tls_observation", "مراقبة TLS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tls_observation, False, True),
+    ToolSpec("scoped_port_observation", "مراقبة المنافذ والخدمات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_port_observation, False, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
