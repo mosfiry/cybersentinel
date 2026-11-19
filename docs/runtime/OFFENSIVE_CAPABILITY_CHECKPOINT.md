@@ -2,9 +2,9 @@
 
 BRANCH: security/b3-four-layer-intent
 
-LAST VERIFIED CI: diagnostics/ci-45fefef721ae.md — result SUCCESS — 1278 passed / 1 skipped / 0 failed
+LAST VERIFIED CI: diagnostics/ci-1d7590a9434d.md — result SUCCESS — 1342 passed / 1 skipped / 0 failed
 
-STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0); port & service / technology fingerprinting observation families NOT STARTED
+STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation); technology fingerprinting observation family NOT STARTED
 
 ---
 
@@ -53,7 +53,7 @@ The local workspace had been reset between sessions. tools/registry.py (20-commi
 - The DNS observation's time bound is enforced by the registry executor (spec timeout / adapter timeout_seconds = 10); the single seam (socket.getaddrinfo) has no per-call timeout parameter — the executor bound is the bound. The TLS observation's connect+handshake bound is likewise the executor timeout (the seam passes it to socket.create_connection; the TLS handshake inherits the socket timeout).
 - The TLS observation targets the default TLS port (443) unless the canonical url carries an explicit port; an explicit port is executed ONLY if the scope asset's `ports` set authorizes it (otherwise the registry scope resolver rejects pre-network). IP-literal targets require the IP to be an in-scope asset — a DNS-resolved address is never authorization.
 - Credential access is deliberately NOT implemented; secrets are never recorded in evidence plaintext (recorded safety decision pending explicit Owner override).
-- Port & service enumeration, technology fingerprinting, filesystem artifact metadata, binary static analysis families are NOT STARTED; nothing beyond the matrix is claimed.
+- Technology fingerprinting, filesystem artifact metadata, binary static analysis families are NOT STARTED; port & service observation is LIVE as scoped_port_observation (single-port banner read only — no multi-port enumeration, no scanning); nothing beyond the matrix is claimed.
 
 ## MILESTONE P1-B (COMPLETE): real scoped_tls_observation — bounded verifying TLS observation
 
@@ -79,10 +79,30 @@ LAST VERIFIED CI: diagnostics/ci-3a41b43ea7ff.md — result SUCCESS — 1303 pas
 
 The workspace had been reset between sessions again; tools/registry.py (21-commit chain, blob bc1e731455...), agent/offensive_bridge.py (5-commit chain, blob 3dbee8a4cd...), and both docs files were rebuilt byte-exact from commit patches with EVERY intermediate blob SHA verified before any edit.
 
+## MILESTONE P1-D (COMPLETE): real scoped_port_observation — bounded port & service observation
+
+STARTING HEAD (this milestone): 126266992ce3 (session resumed after Mission 1 closure: PR #20 merged, main at fe1820947b7290284a3b8e972e46d1271f216a99; the pending production push from the prior session was verified ABSENT at the branch tip, so P1-D was implemented fresh).
+
+FINAL HEAD: 1d7590a9434d (plus the CHECKPOINT.md session record at c855f9df819b and this docs commit)
+
+LAST VERIFIED CI: diagnostics/ci-1d7590a9434d.md — result SUCCESS — 1342 passed / 1 skipped / 0 failed (feat commit a9a3e7bd0db4 green at 1315/1).
+
+### Commits (this milestone)
+
+1. a9a3e7bd0db4 — feat(tools): scoped_port_observation real handler (_scoped_port_observation: ONE plain TCP connect + ONE passive recv banner read, cap SCOPED_PORT_BANNER_MAX_BYTES=128, settimeout min(timeout,2.0), sends_payload: False — nothing is ever written to the wire; host and port derived ONLY from the ScopeGuard's canonical url; banner bytes are observed data — sha256 over raw bytes + printable-filtered rendering with an explicit truncated flag; silent service is data, not failure; deterministic fail-closed classifications PORT_ARGUMENT_INVALID / PORT_TIMEOUT / PORT_CONNECT_FAILED / PORT_RUNTIME_ERROR; single TCP seam _port_observe; registered as a scope_required, owner+decision-bound network-read tool) + ScopedPortObservationAdapter in agent/offensive_bridge.py. CI 1315/1 green.
+2. c9dff24ec7ee — test(tools): adversarial + live-bridge battery (27 tests; no real network — the single TCP seam is faked).
+3. 1d7590a9434d — fix(tests): battery self-review (second-pass attacker review folded in): seam restored via monkeypatch instead of a leaky direct module assignment (cross-test mutation risk), banner-cap printable assertion corrected. CI 1342/1 green.
+
+### Observation semantics (documented, fixed)
+
+- Exactly one connect and one passive read: an observation, never a scan. No multi-port enumeration exists anywhere in the runtime.
+- The executed argument is the ScopeGuard's canonical url; explicit ports execute ONLY inside the scope asset's 'ports' set (registry scope resolver rejects pre-network otherwise); observed banner content (including any hostnames) can never widen scope.
+- Everything the service sends is OBSERVED data: hashed, size-capped, printable-rendered, never authority (INV-OFF-2/5 retested for this family).
+
 ## NEXT_ACTION
 
-1. P1-C status: HTTP observation is ALREADY LIVE as scoped_http_probe (real bounded HTTP observation since P0; 9-test battery; live bridge test). It is NOT rebuilt. The next NEW capability is P1-D: port & service observation — bounded, owner-authorized, scope-bound (single seam fakeable in tests, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update). Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime.
+1. P1-E (next NEW capability): technology fingerprinting, if designed as a bounded, owner-authorized, scope-bound observation derived ONLY from already-observed data (banner/response headers), with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update — or the next item per this checkpoint. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime.
 
 ## EXACT RESUME POINT
 
-HEAD 3a41b43ea7ff5fdc06c36112722f05945cdc17e7 (plus this docs commit), CI green (1303/1). Resume at NEXT_ACTION step 1 (port & service observation family). Do not touch main; no reset/rebase/squash/force-push.
+HEAD c855f9df819b (CHECKPOINT.md P1-D session record) plus this docs commit, CI green 1342/1 at 1d7590a9434d (verify diagnostics/ci-c855f9df819b.md lands green too — docs-only commit). Resume at NEXT_ACTION step 1 (technology fingerprinting family). Do not touch main; no reset/rebase/squash/force-push.
