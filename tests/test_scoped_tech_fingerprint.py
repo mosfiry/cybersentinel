@@ -250,13 +250,17 @@ def test_read_failure_classifies_deterministically(monkeypatch):
 
 
 def test_generic_runtime_failure_classifies_deterministically(monkeypatch):
+    """A generic handler error is classified FP_RUNTIME_ERROR deterministically
+    (parity with the port family) — never an escaped crash, never a partial result."""
     def failing(request, timeout):
         raise RuntimeError("unexpected")
 
     monkeypatch.setattr(tools.registry, "_fingerprint_fetch", failing)
     result = _scoped_tech_fingerprint("https://target.example/")
     assert result["ok"] is False
-    assert result["error"] == "FP_FAILED"
+    assert result["error"] == "FP_RUNTIME_ERROR"
+    assert result["reason"] == "unexpected"
+    assert isinstance(result["elapsed_ms"], int)
 
 
 def test_non_url_argument_rejected_before_seam(monkeypatch):
