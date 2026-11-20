@@ -636,7 +636,16 @@ def _scoped_tech_fingerprint(argument):
     url = argument if isinstance(argument, str) else ""
     if not (url.startswith("http://") or url.startswith("https://")):
         return {"ok": False, "operation": "scoped_tech_fingerprint", "error": "FP_ARGUMENT_INVALID", "reason": "the technology fingerprint accepts exactly one canonical http(s) url"}
-    return _tech_fingerprint(url)
+    from datetime import datetime, timezone
+    import time
+    started = time.monotonic()
+    try:
+        return _tech_fingerprint(url)
+    except Exception as exc:
+        # Deterministic fail-closed classification (parity with the port
+        # family): an unexpected handler error is a classified observation
+        # failure, NEVER a crash out of the registry or a partial result.
+        return {"ok": False, "operation": "scoped_tech_fingerprint", "url": url, "error": "FP_RUNTIME_ERROR", "reason": str(exc)[:SCOPED_FP_FIELD_MAX], "observed_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
 
 SCOPED_FP_TIMEOUT_SECONDS = 10  # enforced by the registry executor (spec/adapter timeout)

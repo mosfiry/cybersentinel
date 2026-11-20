@@ -65,12 +65,22 @@ from tools.registry import (
 # ---------------------------------------------------------------------------
 
 
+class _CIHeaders(dict):
+    """Case-insensitive header map, matching http.client.HTTPMessage semantics."""
+
+    def get(self, key, default=None):
+        try:
+            return super().__getitem__(key.lower())
+        except KeyError:
+            return default
+
+
 class _FakeResponse:
     """Minimal urllib-like response consumed through the real seam contract."""
 
     def __init__(self, status=200, headers=None, body=b""):
         self.status = status
-        self.headers = dict(headers or {})
+        self.headers = _CIHeaders({str(k).lower(): v for k, v in (headers or {}).items()})
         self._body = body
 
     def geturl(self):
