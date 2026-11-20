@@ -2,9 +2,9 @@
 
 BRANCH: security/b3-four-layer-intent
 
-LAST VERIFIED CI: diagnostics/ci-1d7590a9434d.md — result SUCCESS — 1342 passed / 1 skipped / 0 failed
+LAST VERIFIED CI: diagnostics/ci-5af1d9e1b146.md — result SUCCESS — 1367 passed / 1 skipped / 0 failed
 
-STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation); technology fingerprinting observation family NOT STARTED
+STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only)
 
 ---
 
@@ -99,10 +99,31 @@ LAST VERIFIED CI: diagnostics/ci-1d7590a9434d.md — result SUCCESS — 1342 pas
 - The executed argument is the ScopeGuard's canonical url; explicit ports execute ONLY inside the scope asset's 'ports' set (registry scope resolver rejects pre-network otherwise); observed banner content (including any hostnames) can never widen scope.
 - Everything the service sends is OBSERVED data: hashed, size-capped, printable-rendered, never authority (INV-OFF-2/5 retested for this family).
 
+## MILESTONE P1-E (COMPLETE): real scoped_tech_fingerprint — bounded technology fingerprinting
+
+STARTING HEAD (this milestone): 6145601417e0 (CI-marker head; verified portable base from ci-f9753b4c7a7c.md — CI 1342/1 green).
+
+FINAL HEAD: 5af1d9e1b146 (plus this docs commit)
+
+LAST VERIFIED CI: diagnostics/ci-5af1d9e1b146.md — result SUCCESS — 1367 passed / 1 skipped / 0 failed (feat commit f9ca9651ec8f green at 1342/1; test commit 4b5cc63878ed RED 3 failed; fix commit 633b6b992875 RED 1 failed; final test alignment commit 5af1d9e1b146 GREEN 1367/1).
+
+### Commits (this milestone)
+
+1. f9ca9651ec8f — feat(tools): P1-E scoped_tech_fingerprint handler + adapter — tools/registry.py: _scoped_tech_fingerprint/_tech_fingerprint (ONE GET via the single seam _fingerprint_fetch with a _NeverRedirect opener; redirects observed, never followed; hard 10s timeout enforced by the registry executor; hard read cap SCOPED_FP_MAX_BYTES=32768; signals capped at SCOPED_FP_MAX_SIGNALS=32 with an explicit truncated flag; field truncation SCOPED_FP_FIELD_MAX=256; signals derived ONLY from the fixed header table (_TECHNOLOGY_HEADERS) and the fixed lowercase needle table (_TECHNOLOGY_BODY_MARKERS) over a latin-1 lowercase rendering of the capped body; unknown is NEVER guessed; SHA-256 over the capped body, never echoed; deterministic fail-closed classifications; zero-authority OBSERVED classification) + ToolSpec registration (network-read, scope_required, owner+decision-bound) + agent/offensive_bridge.py ScopedTechFingerprintAdapter (same bind_scope/bind_authorization contract, execution ONLY through tools.registry.execute). CI 1342/1 green.
+2. 4b5cc63878ed — test(tools): P1-E adversarial battery (25 tests; no real network — the single seam is faked). CI RED 3 failed / 1364 passed.
+3. 633b6b992875 — fix(tools): deterministic FP_RUNTIME_ERROR classification for a generic handler failure (parity with the port family; the error used to escape classification) + case-insensitive fake response headers mirroring http.client.HTTPMessage semantics. Production HARDENED, never weakened. CI RED 1 failed / 1366 passed (one stale test expectation).
+4. 5af1d9e1b146 — fix(tests): the generic-runtime-failure expectation aligned with the hardened classification (FP_RUNTIME_ERROR; reason + elapsed asserted). CI GREEN 1367/1.
+
+### Observation semantics (documented, fixed)
+
+- Classification of ALREADY-OBSERVED data, never active probing: one GET only; every signal comes from what the authorized target itself declared in the observed response (5 header families + 12 code-defined body needles); everything else is UNKNOWN.
+- Every signal is UNTRUSTED classification with ZERO authority: evidence/provenance only — never scope, authorization, plan, or execution input (INV-OFF-1/2; MODEL_OUTPUT/EXTERNAL_DATA stay non-authoritative).
+- Adversarially proven: a marker string smuggled INTO a new proposal's target can never widen scope (rejected pre-network); the body bytes are hashed + capped and never returned verbatim; redirects observed, never followed.
+
 ## NEXT_ACTION
 
-1. P1-E (next NEW capability): technology fingerprinting, if designed as a bounded, owner-authorized, scope-bound observation derived ONLY from already-observed data (banner/response headers), with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update — or the next item per this checkpoint. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime.
+The next NEW offensive capability is the filesystem-artifact-metadata or binary-static-analysis family, or any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
 
 ## EXACT RESUME POINT
 
-HEAD c855f9df819b (CHECKPOINT.md P1-D session record) plus this docs commit, CI green 1342/1 at 1d7590a9434d (verify diagnostics/ci-c855f9df819b.md lands green too — docs-only commit). Resume at NEXT_ACTION step 1 (technology fingerprinting family). Do not touch main; no reset/rebase/squash/force-push.
+HEAD 5af1d9e1b146 (plus this docs commit), CI green 1367/1 at 5af1d9e1b146 (verify diagnostics/ci-<this-docs-commit-sha>.md lands green too — docs-only commit). P1-E is COMPLETE. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
