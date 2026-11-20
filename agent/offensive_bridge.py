@@ -90,6 +90,7 @@ __all__ = [
     "ScopedDnsLookupAdapter",
     "ScopedTlsObservationAdapter",
     "ScopedPortObservationAdapter",
+    "ScopedTechFingerprintAdapter",
 ]
 
 # Target kinds: "local" = local read-only analysis (no network surface, the
@@ -295,6 +296,25 @@ class ScopedPortObservationAdapter(ScopedHttpProbeAdapter):
     """
 
     tool_name = "scoped_port_observation"
+    timeout_seconds = 10
+
+
+class ScopedTechFingerprintAdapter(ScopedHttpProbeAdapter):
+    """Adapter for the registered scoped_tech_fingerprint tool (P1-E).
+
+    Same contract as the probe/dns/tls/port adapters: the typed Owner
+    AuthorizationDecision and the typed owner-side scope context are bound
+    BEFORE execution, and the tool executes ONLY through
+    tools.registry.execute, which re-resolves the persisted scope snapshot
+    and re-verifies the decision binding (INV-OFF-3/INV-OFF-4). The
+    fingerprint classifies ONLY data the authorized target itself declared
+    in the observed response (headers + deterministic code-defined body
+    markers): every signal is OBSERVED data with zero authority — evidence/
+    provenance only; it can never widen scope, mutate the plan, or mint
+    authorization (INV-OFF-1/2). Redirects are observed, never followed.
+    """
+
+    tool_name = "scoped_tech_fingerprint"
     timeout_seconds = 10
 
 LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()

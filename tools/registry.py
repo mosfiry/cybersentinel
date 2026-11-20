@@ -605,6 +605,148 @@ def _port_observation(url, *, timeout=SCOPED_PORT_TIMEOUT_SECONDS, max_banner=SC
     }
 
 
+def _scoped_tech_fingerprint(argument):
+    """Real bounded technology fingerprinting behind the Scope Firewall and
+    proof chain (P1-E).
+
+    The registry invokes this handler ONLY after the same gate sequence as
+    the probe/dns/tls/port tools: typed Owner AuthorizationDecision matched
+    to tool + argument fingerprint + request identity, ExecutionAuthorizationProof
+    verified, and the scope resolver re-resolved the request against the
+    persisted typed snapshot. The executed argument is the ScopeGuard's
+    CANONICAL url.
+
+    The fingerprint is CLASSIFICATION OF ALREADY-OBSERVED DATA, never active
+    probing:
+
+    - ONE GET; redirects are NEVER followed (a redirect Location is OBSERVED
+      data only — observation never widens scope)
+    - hard timeout and hard read cap (the body prefix is hashed, size-capped,
+      and never returned verbatim)
+    - every signal is derived ONLY from what the target itself declares in
+      the observed response (response headers + deterministic code-defined
+      body markers); everything else is UNKNOWN, never guessed
+    - every signal is OBSERVED data: UNTRUSTED classification with zero
+      authority — evidence/provenance only, never scope, authorization, or
+      plan input (INV-OFF-1/2, MODEL_OUTPUT/EXTERNAL_DATA stay
+      non-authoritative)
+    - the single network seam is _fingerprint_fetch; no other socket
+      surface, no shell, nothing written to the wire beyond the GET itself
+    """
+    url = argument if isinstance(argument, str) else ""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return {"ok": False, "operation": "scoped_tech_fingerprint", "error": "FP_ARGUMENT_INVALID", "reason": "the technology fingerprint accepts exactly one canonical http(s) url"}
+    return _tech_fingerprint(url)
+
+
+SCOPED_FP_TIMEOUT_SECONDS = 10  # enforced by the registry executor (spec/adapter timeout)
+SCOPED_FP_MAX_BYTES = 32768
+SCOPED_FP_MAX_SIGNALS = 32
+SCOPED_FP_FIELD_MAX = 256
+
+# Code-defined, deterministic, lowercase body markers. Classification only:
+# a marker match is an observed-signal fact about the response bytes, never
+# an authority claim about the target.
+_TECHNOLOGY_BODY_MARKERS = (
+    ("angular", "ng-version"),
+    ("django", "csrfmiddlewaretoken"),
+    ("drupal", "drupal"),
+    ("joomla", "/media/jui/"),
+    ("jquery", "jquery"),
+    ("laravel", "laravel_session"),
+    ("nextjs", "_next/static"),
+    ("nuxt", "__nuxt"),
+    ("react", "data-reactroot"),
+    ("svelte", "svelte-"),
+    ("vue", "data-v-app"),
+    ("wordpress", "wp-content/"),
+)
+
+# Header-name -> signal family (values are recorded as observed, truncated).
+_TECHNOLOGY_HEADERS = (
+    ("server", "web_server"),
+    ("x-powered-by", "powered_by"),
+    ("x-generator", "generator"),
+    ("x-aspnet-version", "aspnet"),
+    ("via", "proxy_via"),
+)
+
+
+def _fingerprint_fetch(request, timeout):
+    """The single network seam of the fingerprint observation: no shell, no
+    sockets elsewhere. Redirects are observed, never followed."""
+    import urllib.request
+
+    class _NeverRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None  # redirects are observed, never followed
+
+    return urllib.request.build_opener(_NeverRedirect).open(request, timeout=timeout)
+
+
+def _tech_fingerprint(url, *, timeout=SCOPED_FP_TIMEOUT_SECONDS, max_bytes=SCOPED_FP_MAX_BYTES, max_signals=SCOPED_FP_MAX_SIGNALS):
+    import hashlib
+    import time
+    from datetime import datetime, timezone
+    from urllib.error import URLError
+    from urllib.request import Request
+
+    started = time.monotonic()
+    elapsed = lambda: int((time.monotonic() - started) * 1000)
+    try:
+        request = Request(url, method="GET", headers={"User-Agent": "CyberSentinel-X-ScopedFingerprint/1.0", "Accept": "*/*"})
+        response = _fingerprint_fetch(request, timeout)
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        return {"ok": False, "operation": "scoped_tech_fingerprint", "url": url, "error": "FP_FAILED", "reason": str(exc)[:SCOPED_FP_FIELD_MAX], "observed_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": elapsed()}
+    try:
+        body = response.read(max_bytes + 1)
+    except (TimeoutError, OSError, ValueError) as exc:
+        return {"ok": False, "operation": "scoped_tech_fingerprint", "url": url, "error": "FP_READ_FAILED", "reason": str(exc)[:SCOPED_FP_FIELD_MAX], "observed_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": elapsed()}
+    try:
+        status_code = int(getattr(response, "status", 0) or 0)
+        header_values: dict[str, str] = {}
+        for key, _family in _TECHNOLOGY_HEADERS:
+            try:
+                value = response.headers.get(key) if response.headers is not None else None
+            except Exception:
+                value = None
+            if value:
+                header_values[key] = str(value)[:SCOPED_FP_FIELD_MAX]
+    except Exception as exc:
+        return {"ok": False, "operation": "scoped_tech_fingerprint", "url": url, "error": "FP_RUNTIME_ERROR", "reason": str(exc)[:SCOPED_FP_FIELD_MAX], "observed_at": datetime.now(timezone.utc).isoformat(), "elapsed_ms": elapsed()}
+    truncated = len(body) > max_bytes
+    if truncated:
+        body = body[:max_bytes]
+    observed_text = body.decode("latin-1", errors="replace").lower()
+    signals: list[dict[str, str]] = []
+    for key, family in _TECHNOLOGY_HEADERS:
+        if key in header_values:
+            signals.append({"family": family, "source": "header", "detail": header_values[key]})
+    for family, needle in _TECHNOLOGY_BODY_MARKERS:
+        if needle in observed_text:
+            signals.append({"family": family, "source": "body_marker", "detail": needle})
+    signals.sort(key=lambda s: (s["family"], s["source"], s["detail"]))
+    signals_truncated = len(signals) > max_signals
+    if signals_truncated:
+        signals = signals[:max_signals]
+    return {
+        "ok": True,
+        "operation": "scoped_tech_fingerprint",
+        "url": url,
+        "status_code": status_code,
+        "sends_payload": False,  # the GET itself is the only wire traffic
+        "signal_count": len(signals),
+        "signals": signals,  # OBSERVED classification only — zero authority
+        "signals_truncated": signals_truncated,
+        "header_evidence": header_values or None,
+        "body_size": len(body),
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+        "body_truncated": truncated,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_ms": elapsed(),
+    }
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -636,6 +778,7 @@ REGISTRY = build_registry([
     ToolSpec("scoped_dns_lookup", "مراقبة DNS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_dns_lookup, False, True),
     ToolSpec("scoped_tls_observation", "مراقبة TLS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tls_observation, False, True),
     ToolSpec("scoped_port_observation", "مراقبة المنافذ والخدمات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_port_observation, False, True),
+    ToolSpec("scoped_tech_fingerprint", "بصمة التقنيات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tech_fingerprint, False, True),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
