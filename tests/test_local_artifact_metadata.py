@@ -339,7 +339,8 @@ def test_live_missing_artifact_is_classified_observation(tmp_path, execute_spy, 
     assert execute_spy == ["local_artifact_metadata"]  # reached the registry boundary
     assert record.result.normalized_output["ok"] is False
     assert record.result.normalized_output["error"] == "META_NOT_FOUND"
-    assert record.result.normalized_output["content"] is None
+    # failure envelopes never carry a content key at all: bytes are never echoed
+    assert record.result.normalized_output.get("content") is None
 
 
 # ---------------------------------------------------------------------------
