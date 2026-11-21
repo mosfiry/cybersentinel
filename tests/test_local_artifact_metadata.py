@@ -55,6 +55,7 @@ def _proposal(mission, tool="local_artifact_metadata", **overrides):
         plan_hash=mission.plan.fingerprint,
         target_kind="local",
         risk_class="read_only",
+        argument="probe.bin",
         hypothesis_id="h-1",
         required_evidence=("artifact metadata",),
         source_step_id="s-01",
@@ -282,7 +283,7 @@ def test_registry_catalog_properties():
 
 
 def test_tool_is_not_in_default_security_inventory():
-    from cyber.offensive import DEFAULT_SECURITY_TOOL_INVENTORY
+    from security.tool_inventory import DEFAULT_SECURITY_TOOL_INVENTORY
 
     assert "local_artifact_metadata" not in DEFAULT_SECURITY_TOOL_INVENTORY.tool_ids()
 
@@ -332,7 +333,7 @@ def test_live_missing_artifact_is_classified_observation(tmp_path, execute_spy, 
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="local_artifact_metadata")
     mission.progress["model_run_id"] = "run-1"
-    proposal = _proposal(mission, execution_run_id="run-1")
+    proposal = _proposal(mission, execution_run_id="run-1", argument="missing.bin")
     record = OffensiveActionBridge().run(proposal, mission=mission, adapter=LocalArtifactMetadataAdapter())
     assert record.status == "EXECUTED", record.result.error_state
     assert execute_spy == ["local_artifact_metadata"]  # reached the registry boundary
