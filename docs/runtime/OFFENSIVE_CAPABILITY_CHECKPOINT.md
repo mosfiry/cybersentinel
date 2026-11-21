@@ -2,9 +2,9 @@
 
 BRANCH: security/b3-four-layer-intent
 
-LAST VERIFIED CI: diagnostics/ci-5af1d9e1b146.md — result SUCCESS — 1367 passed / 1 skipped / 0 failed
+LAST VERIFIED CI: diagnostics/ci-d38ce2ece6a0.md — result SUCCESS — 1404 passed / 1 skipped / 0 failed
 
-STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only)
+STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata)
 
 ---
 
@@ -120,10 +120,31 @@ LAST VERIFIED CI: diagnostics/ci-5af1d9e1b146.md — result SUCCESS — 1367 pas
 - Every signal is UNTRUSTED classification with ZERO authority: evidence/provenance only — never scope, authorization, plan, or execution input (INV-OFF-1/2; MODEL_OUTPUT/EXTERNAL_DATA stay non-authoritative).
 - Adversarially proven: a marker string smuggled INTO a new proposal's target can never widen scope (rejected pre-network); the body bytes are hashed + capped and never returned verbatim; redirects observed, never followed.
 
+## MILESTONE P1-F (COMPLETE): real local_artifact_metadata — bounded scoped local filesystem artifact metadata
+
+STARTING HEAD (this milestone): 5af1d9e1b146 (portable base: CI 1367/1 green at ci-5af1d9e1b146.md).
+FINAL HEAD: d38ce2ece6a06a4aad11dad0191eb12d5d9c9987 (plus this docs commit)
+LAST VERIFIED CI: diagnostics/ci-d38ce2ece6a0.md — result SUCCESS — 1404 passed / 1 skipped / 0 failed (+37 tests over the 1367 baseline; compileall clean, zero SyntaxWarning).
+
+### Commits (this milestone)
+
+1. 8a9773b5 — feat(tools): local_artifact_metadata real handler (three fakeable seams _artifact_root/_artifact_stat/_artifact_open; FORMAT_MAGIC_TABLE + _classify_artifact_prefix — prefix classification never trusted over stat; 65536-byte read cap with SHA-256 over the capped slice; content never echoed; relative-path containment re-verified post-stat; deterministic META_ARGUMENT_INVALID / META_NOT_FOUND / META_READ_FAILED / META_RUNTIME_ERROR; argument validation BEFORE the seams; no authority/secret keys) + ToolSpec row (read class, requires_owner=True, local tool after scoped_tech_fingerprint) + LocalArtifactMetadataAdapter in agent/offensive_bridge.py. CI GREEN 1367/1.
+2. fb721a66 — test(tools): adversarial + live-bridge battery (~35 tests; seams faked, no real filesystem/network).
+3. a33b16a6 — fix(bridge): pre-exec rejections asserted as classified ERROR envelopes — ToolAdapter.run never raises (VALIDATE_INPUT/INPUT_INVALID).
+4. ddd9a3df — fix(bridge): META_NOT_FOUND reclassified as an EXECUTED bridge observation (handler classification != authorization rejection); rejection tests assert REJECTED records with phase VALIDATE_INPUT.
+5. 740561f9 — fix(tests): mach-o 64/32-bit magic as bytes([]) literals (invalid \ed escape SyntaxWarning caught by CI and eliminated), catalog import corrected, battery defaults fixed.
+6. d38ce2ec — fix(bridge): failure envelopes carry no content key (assertion .get("content") is None). CI GREEN 1404/1.
+
+### Semantics (documented, fixed)
+
+- Bounded read-only local artifact observation: one path argument, one stat + one capped read per execution, resolution confined to the scoped artifact root, containment re-verified after stat; file content never echoed (metadata + digest only).
+- META_* is handler failure classification, distinct from authorization rejection: only the bridge/proof layer rejects (phase VALIDATE_INPUT, code INPUT_INVALID); an observation such as a missing path is data, not a rejection.
+- Adversarially proven: "..", absolute paths, and symlink-escaping forms are rejected PRE-SEAM as INPUT_INVALID envelopes; the argument can never widen the scoped root; magic-prefix classification cannot override containment.
+
 ## NEXT_ACTION
 
-The next NEW offensive capability is the filesystem-artifact-metadata or binary-static-analysis family, or any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
+The next NEW offensive capability is the binary-static-analysis family, or any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
 
 ## EXACT RESUME POINT
 
-HEAD 5af1d9e1b146 (plus this docs commit), CI green 1367/1 at 5af1d9e1b146 (verify diagnostics/ci-<this-docs-commit-sha>.md lands green too — docs-only commit). P1-E is COMPLETE. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
+HEAD d38ce2ece6a06a4aad11dad0191eb12d5d9c9987 (plus this docs commit), CI green 1404/1 at d38ce2ec (verify diagnostics/ci-<this-docs-commit-sha>.md lands green too — docs-only commit). P1-F is COMPLETE. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
