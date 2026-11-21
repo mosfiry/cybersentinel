@@ -954,7 +954,7 @@ def _parse_macho_header(prefix):
 
 def _parse_universal_header(prefix):
     fields: dict[str, Any] = {}
-    fields["universal_fat_arch_count"] = _u(prefix, 4, 4)
+    fields["universal_fat_arch_count"] = _u(prefix, 4, 4, little=False)  # fat headers are big-endian
     return fields
 
 

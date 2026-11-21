@@ -340,8 +340,10 @@ def test_handler_runtime_error_is_classified(artifact_store, monkeypatch):
 
 def test_handler_parser_failure_is_classified(artifact_store, monkeypatch):
     _make_elf64(artifact_store)
-    real = tools.registry._parse_elf_header
-    monkeypatch.setattr(tools.registry, "_parse_elf_header", lambda p: real(p).no_such_key())  # type: ignore[attr-defined]
+    def boom(prefix):
+        raise ValueError("parser exploded")
+
+    monkeypatch.setitem(tools.registry._BINARY_HEADER_PARSERS, "elf", boom)
     result = tools.registry._binary_header_analysis("probe.bin")
     assert result["ok"] is False
     assert result["error"] == "BIN_RUNTIME_ERROR"
