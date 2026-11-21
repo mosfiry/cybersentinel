@@ -29,7 +29,6 @@ from agent.offensive_bridge import (
     OffensiveActionRejected,
 )
 from agent.planning import Plan, PlanStep
-from security.tool_adapter import ToolAdapterError
 from tools.registry import MAX_ARG_LENGTH
 
 
@@ -397,13 +396,18 @@ def test_traversal_argument_through_bridge_fails_closed(tmp_path, execute_spy, a
     mission = _mission(runtime, action="local_artifact_metadata")
     mission.progress["model_run_id"] = "run-1"
     proposal = _proposal(mission, execution_run_id="run-1", argument=bad)
-    with pytest.raises((ToolAdapterError, OffensiveActionRejected)):
-        OffensiveActionBridge().run(proposal, mission=mission, adapter=LocalArtifactMetadataAdapter())
+    record = OffensiveActionBridge().run(proposal, mission=mission, adapter=LocalArtifactMetadataAdapter())
+    assert record.status == "REJECTED"
+    assert record.executed is False
+    assert record.result.error_state.get("phase") == "VALIDATE_INPUT"
+    assert record.result.error_state.get("code") == "INPUT_INVALID"
     assert execute_spy == []
 
 
 def test_adapter_validate_rejects_non_string_and_empty():
-    from security.tool_adapter import AdapterErrorCode, AdapterPhase, ToolAdapterRequest
+    # ToolAdapter.run NEVER raises: pre-execution rejection is a classified
+    # ERROR envelope with the exact failing (phase, code) pair (INV-ADP-3/8).
+    from security.tool_adapter import ToolAdapterRequest, AdapterErrorCode, AdapterPhase
 
     adapter = LocalArtifactMetadataAdapter()
     for bad in ("", None, 5, b"bytes"):
@@ -417,7 +421,8 @@ def test_adapter_validate_rejects_non_string_and_empty():
             request_id="req-1",
             run_id="run-1",
         )
-        with pytest.raises(ToolAdapterError) as excinfo:
-            adapter.run(request, dry_run=True)
-        assert excinfo.value.code == AdapterErrorCode.INPUT_INVALID
-        assert excinfo.value.phase == AdapterPhase.VALIDATE_INPUT
+        result = adapter.run(request, dry_run=True)
+        assert result.status == "ERROR"
+        assert result.executed is False
+        assert result.error_state.get("phase") == AdapterPhase.VALIDATE_INPUT.value
+        assert result.error_state.get("code") == AdapterErrorCode.INPUT_INVALID.value
