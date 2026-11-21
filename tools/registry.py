@@ -756,6 +756,141 @@ def _tech_fingerprint(url, *, timeout=SCOPED_FP_TIMEOUT_SECONDS, max_bytes=SCOPE
     }
 
 
+
+def _artifact_root():
+    """The single root seam: the artifact store is a code-defined directory
+    derived from the local database path — never from tool output, model
+    output, or an untrusted argument."""
+    from core.config import DB_PATH
+    return Path(DB_PATH).expanduser().parent / "artifacts"
+
+
+def _artifact_stat(path):
+    """The single stat seam (size observation only)."""
+    import os
+    return os.path.getsize(str(path))
+
+
+def _artifact_open(path):
+    """The single read seam: read-only, binary, capped by the caller."""
+    return open(str(path), "rb")
+
+
+FORMAT_MAGIC_TABLE = (
+    ("elf", b"\x7fELF"),
+    ("pe", b"MZ"),
+    ("mach_o_universal", b"\xca\xfe\xba\xbe"),
+    ("mach_o_64", b"\xcf\xfa\xed\xfe"),
+    ("mach_o_32", b"\xce\xfa\ed\xfe"),
+    ("zip", b"PK\x03\x04"),
+    ("gzip", b"\x1f\x8b"),
+    ("pdf", b"%PDF-"),
+    ("sqlite", b"SQLite format 3\x00"),
+    ("png", b"\x89PNG\r\n\x1a\n"),
+)
+
+
+def _classify_artifact_prefix(prefix: bytes) -> str:
+    """Deterministic code-defined classification of the OBSERVED magic prefix.
+
+    The file extension is never trusted; an unknown prefix stays unknown and
+    is never guessed. Classification is data, never authority (INV-OFF-2).
+    """
+    for family, magic in FORMAT_MAGIC_TABLE:
+        if prefix.startswith(magic):
+            return family
+    if prefix.startswith(b"#!"):
+        return "script"
+    return "unknown"
+
+
+def _scoped_local_artifact(argument):
+    """Real bounded local artifact-store metadata behind the proof chain (P1-F).
+
+    The registry invokes this handler ONLY after the full gate sequence:
+    the typed ExecutionAuthorizationProof verified against mission/request/
+    run (or OWNER_DIRECT with the typed AuthorizationDecision). The executed
+    argument is exactly ONE bare artifact file name; containment inside the
+    code-defined artifact store is re-verified in code (defense in depth).
+
+    - ONE stat + ONE capped read through the single seams
+    - sha256 over the SIZE-CAPPED read; the observed bytes are never echoed
+    - deterministic fail-closed classification of every failure
+    """
+    name = argument if isinstance(argument, str) else ""
+    if (
+        not name
+        or len(name) > MAX_ARG_LENGTH
+        or "/" in name
+        or "\\" in name
+        or name in (".", "..")
+        or name.startswith(".")
+    ):
+        return {"ok": False, "operation": "local_artifact_metadata", "error": "META_ARGUMENT_INVALID", "reason": "the artifact metadata accepts exactly one bare file name inside the local artifact store"}
+    return _artifact_metadata(name)
+
+
+ARTIFACT_METADATA_TIMEOUT_SECONDS = 10  # enforced by the registry executor (spec/adapter timeout)
+ARTIFACT_METADATA_MAX_BYTES = 65536
+ARTIFACT_METADATA_FIELD_MAX = 256
+
+
+def _artifact_metadata(name, *, max_bytes=ARTIFACT_METADATA_MAX_BYTES, field_max=ARTIFACT_METADATA_FIELD_MAX):
+    import hashlib
+    import time
+    from datetime import datetime, timezone
+
+    started = time.monotonic()
+    elapsed = lambda: int((time.monotonic() - started) * 1000)
+    common = {"operation": "local_artifact_metadata", "name": name}
+    try:
+        root = _artifact_root().resolve()
+    except Exception as exc:
+        return dict(common, ok=False, error="META_STORE_UNAVAILABLE", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        resolved = (root / name).resolve()
+    except OSError as exc:
+        return dict(common, ok=False, error="META_ARGUMENT_INVALID", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if resolved != root and root not in resolved.parents:
+        # Defense in depth: even a name that slipped the bare-name validator
+        # can never escape the artifact store here (fail closed, pre-open).
+        return dict(common, ok=False, error="META_ARGUMENT_INVALID", reason="the artifact path escaped the artifact store (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if not resolved.is_file():
+        return dict(common, ok=False, error="META_NOT_FOUND", reason="the artifact is not a regular file inside the store", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        size = _artifact_stat(resolved)
+        size = int(size)
+    except OSError as exc:
+        return dict(common, ok=False, error="META_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        with _artifact_open(resolved) as handle:
+            prefix = handle.read(max_bytes + 1)
+    except OSError as exc:
+        return dict(common, ok=False, error="META_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except Exception as exc:
+        return dict(common, ok=False, error="META_RUNTIME_ERROR", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    prefix = bytes(prefix)
+    truncated = len(prefix) > max_bytes
+    if truncated:
+        prefix = prefix[:max_bytes]
+    family = _classify_artifact_prefix(prefix)
+    return {
+        "ok": True,
+        **common,
+        "sha256": hashlib.sha256(prefix).hexdigest(),
+        "size_bytes": size,
+        "read_cap_bytes": max_bytes,
+        "read_truncated": truncated,
+        "format_family": family,  # OBSERVED classification only — zero authority
+        "classification_basis": "observed_magic_prefix",
+        "content": None,  # the observed bytes are hashed and classified, never echoed
+        "path_within_store": name,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_ms": elapsed(),
+    }
+
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -788,6 +923,7 @@ REGISTRY = build_registry([
     ToolSpec("scoped_tls_observation", "مراقبة TLS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tls_observation, False, True),
     ToolSpec("scoped_port_observation", "مراقبة المنافذ والخدمات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_port_observation, False, True),
     ToolSpec("scoped_tech_fingerprint", "بصمة التقنيات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tech_fingerprint, False, True),
+    ToolSpec("local_artifact_metadata", "قراءة بيانات وصفية محدودة للملفات داخل مخزن المخرجات المحلي (فحص دفاعي لا يعمل إلا بمصادقة المالك)", "read", True, str, _artifact_metadata),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
