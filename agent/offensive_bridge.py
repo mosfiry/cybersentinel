@@ -92,6 +92,7 @@ __all__ = [
     "ScopedPortObservationAdapter",
     "ScopedTechFingerprintAdapter",
     "LocalArtifactMetadataAdapter",
+    "LocalBinaryAnalysisAdapter",
 ]
 
 # Target kinds: "local" = local read-only analysis (no network surface, the
@@ -371,6 +372,66 @@ class LocalArtifactMetadataAdapter(ToolAdapter):
                 )
         return normalized
 
+
+
+class LocalBinaryAnalysisAdapter(ToolAdapter):
+    """Adapter for the registered local_binary_analysis static header tool (P1-G).
+
+    Local, read-only, non-destructive: the file is NEVER executed; ONE stat +
+    ONE capped read of a single artifact inside the code-defined artifact
+    store, reached ONLY through tools.registry.execute behind the full proof
+    chain. The argument is a bare file name — traversal is rejected at
+    VALIDATE_INPUT; the handler re-verifies containment fail-closed. Parsed
+    header fields and the magic classification are OBSERVED data with zero
+    authority (INV-OFF-1/2).
+    """
+
+    tool_name = "local_binary_analysis"
+    timeout_seconds = 10
+
+    def _validate_argument(self, request: ToolAdapterRequest) -> None:
+        name = request.argument if isinstance(request.argument, str) else ""
+        if (
+            not name
+            or len(name) > 256
+            or "/" in name
+            or "\\" in name
+            or name in (".", "..")
+            or name.startswith(".")
+        ):
+            raise ToolAdapterError(
+                AdapterPhase.VALIDATE_INPUT,
+                AdapterErrorCode.INPUT_INVALID,
+                "local_binary_analysis accepts exactly one bare file name inside the artifact store (traversal rejected)",
+                tool=request.tool,
+            )
+
+    def _normalize(self, raw: Any) -> dict[str, Any]:
+        normalized = super()._normalize(raw)
+        if normalized.get("ok") is True:
+            family = normalized.get("format_family")
+            if not isinstance(family, str) or not family:
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "binary analysis must carry a deterministic format classification",
+                    tool=self.tool_name,
+                )
+            if not isinstance(normalized.get("header_fields"), dict):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "binary analysis header fields must be a deterministic mapping",
+                    tool=self.tool_name,
+                )
+            if not isinstance(normalized.get("size_bytes"), int) or not isinstance(normalized.get("sha256"), str):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "binary analysis size/hash must be deterministic (int size, hex sha256)",
+                    tool=self.tool_name,
+                )
+        return normalized
 
 
 LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()

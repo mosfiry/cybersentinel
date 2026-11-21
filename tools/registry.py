@@ -891,6 +891,165 @@ def _artifact_metadata(name, *, max_bytes=ARTIFACT_METADATA_MAX_BYTES, field_max
 
 
 
+
+def _scoped_binary_analysis(argument):
+    """Argument gate for the bounded local binary static analysis (P1-G).
+
+    Exactly ONE bare file name inside the local artifact store; traversal,
+    separators, and hidden names are rejected BEFORE any filesystem seam is
+    touched (fail closed, pre-open).
+    """
+    name = argument if isinstance(argument, str) else ""
+    if (
+        not name
+        or len(name) > MAX_ARG_LENGTH
+        or "/" in name
+        or "\\" in name
+        or name in (".", "..")
+        or name.startswith(".")
+    ):
+        return {"ok": False, "operation": "local_binary_analysis", "error": "BIN_ARGUMENT_INVALID", "reason": "the binary analysis accepts exactly one bare file name inside the local artifact store"}
+    return _binary_header_analysis(name)
+
+
+BINARY_ANALYSIS_MAX_BYTES = 4096
+BINARY_ANALYSIS_FIELD_MAX = 256
+
+
+def _u(data, offset, size, *, signed=False, little=True):
+    """Bounded integer field read over the CAPPED prefix. Out of bounds is
+    never an error and never guessed: the field is simply not observable."""
+    if offset < 0 or offset + size > len(data):
+        return None
+    return int.from_bytes(data[offset:offset + size], "little" if little else "big", signed=signed)
+
+
+def _parse_elf_header(prefix):
+    fields: dict[str, Any] = {}
+    cls = prefix[4] if len(prefix) > 4 else None
+    endian = prefix[5] if len(prefix) > 5 else None
+    fields["elf_class"] = {1: "32-bit", 2: "64-bit"}.get(cls)
+    fields["elf_data"] = {1: "little_endian", 2: "big_endian"}.get(endian)
+    little = endian != 2
+    fields["elf_type"] = _u(prefix, 16, 2, little=little)
+    fields["elf_machine"] = _u(prefix, 18, 2, little=little)
+    if cls == 2:
+        fields["elf_entry_point"] = _u(prefix, 24, 8, little=little)
+        fields["elf_program_header_count"] = _u(prefix, 56, 2, little=little)
+        fields["elf_section_header_count"] = _u(prefix, 60, 2, little=little)
+    elif cls == 1:
+        fields["elf_entry_point"] = _u(prefix, 24, 4, little=little)
+        fields["elf_program_header_count"] = _u(prefix, 44, 2, little=little)
+        fields["elf_section_header_count"] = _u(prefix, 48, 2, little=little)
+    return fields
+
+
+def _parse_macho_header(prefix):
+    fields: dict[str, Any] = {}
+    fields["macho_cputype"] = _u(prefix, 4, 4, signed=True)
+    fields["macho_filetype"] = _u(prefix, 8, 4)
+    fields["macho_load_command_count"] = _u(prefix, 16, 4)
+    return fields
+
+
+def _parse_universal_header(prefix):
+    fields: dict[str, Any] = {}
+    fields["universal_fat_arch_count"] = _u(prefix, 4, 4)
+    return fields
+
+
+def _parse_pe_header(prefix):
+    fields: dict[str, Any] = {}
+    lfanew = _u(prefix, 0x3C, 4)
+    if lfanew is None or lfanew + 4 > len(prefix) or prefix[lfanew:lfanew + 4] != b"PE\x00\x00":
+        fields["pe_signature"] = "outside_capped_prefix"
+        return fields
+    fields["pe_signature"] = "present"
+    fields["pe_machine"] = _u(prefix, lfanew + 4, 2)
+    fields["pe_number_of_sections"] = _u(prefix, lfanew + 6, 2)
+    fields["pe_size_of_optional_header"] = _u(prefix, lfanew + 20, 2)
+    return fields
+
+
+_BINARY_HEADER_PARSERS = {
+    "elf": _parse_elf_header,
+    "mach_o_64": _parse_macho_header,
+    "mach_o_32": _parse_macho_header,
+    "mach_o_universal": _parse_universal_header,
+    "pe": _parse_pe_header,
+}
+
+
+def _binary_header_analysis(name, *, max_bytes=BINARY_ANALYSIS_MAX_BYTES, field_max=BINARY_ANALYSIS_FIELD_MAX):
+    """Bounded STATIC header analysis of one artifact-store binary (P1-G).
+
+    The file is NEVER executed: ONE stat + ONE capped read through the same
+    single filesystem seams as P1-F, then pure byte-offset arithmetic over
+    the capped prefix. Fields outside the capped prefix are observable data
+    (None), never guessed. Every parsed field is OBSERVED data with zero
+    authority (INV-OFF-1/2).
+
+    Deterministic fail-closed classification:
+    BIN_ARGUMENT_INVALID / BIN_NOT_FOUND / BIN_STORE_UNAVAILABLE /
+    BIN_OPEN_FAILED / BIN_RUNTIME_ERROR.
+    """
+    import hashlib
+    import time
+    from datetime import datetime, timezone
+
+    started = time.monotonic()
+    elapsed = lambda: int((time.monotonic() - started) * 1000)
+    common = {"operation": "local_binary_analysis", "name": name}
+    try:
+        root = _artifact_root().resolve()
+    except Exception as exc:
+        return dict(common, ok=False, error="BIN_STORE_UNAVAILABLE", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        resolved = (root / name).resolve()
+    except OSError as exc:
+        return dict(common, ok=False, error="BIN_ARGUMENT_INVALID", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if resolved != root and root not in resolved.parents:
+        return dict(common, ok=False, error="BIN_ARGUMENT_INVALID", reason="the artifact path escaped the artifact store (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if not resolved.is_file():
+        return dict(common, ok=False, error="BIN_NOT_FOUND", reason="the artifact is not a regular file inside the store", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        size = int(_artifact_stat(resolved))
+    except OSError as exc:
+        return dict(common, ok=False, error="BIN_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        with _artifact_open(resolved) as handle:
+            prefix = bytes(handle.read(max_bytes + 1))
+    except OSError as exc:
+        return dict(common, ok=False, error="BIN_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except Exception as exc:
+        return dict(common, ok=False, error="BIN_RUNTIME_ERROR", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    truncated = len(prefix) > max_bytes
+    if truncated:
+        prefix = prefix[:max_bytes]
+    family = _classify_artifact_prefix(prefix)
+    try:
+        parser = _BINARY_HEADER_PARSERS.get(family)
+        header_fields = dict(parser(prefix)) if parser is not None else {}
+    except Exception as exc:
+        return dict(common, ok=False, error="BIN_RUNTIME_ERROR", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    return {
+        "ok": True,
+        **common,
+        "sha256": hashlib.sha256(prefix).hexdigest(),
+        "size_bytes": size,
+        "read_cap_bytes": max_bytes,
+        "read_truncated": truncated,
+        "format_family": family,  # OBSERVED classification only — zero authority
+        "classification_basis": "observed_magic_prefix",
+        "header_fields": header_fields,  # static read-only observations — the file is never executed
+        "analysis_kind": "static_header_read",
+        "content": None,  # observed bytes are hashed and classified, never echoed
+        "path_within_store": name,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_ms": elapsed(),
+    }
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -924,6 +1083,7 @@ REGISTRY = build_registry([
     ToolSpec("scoped_port_observation", "مراقبة المنافذ والخدمات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_port_observation, False, True),
     ToolSpec("scoped_tech_fingerprint", "بصمة التقنيات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tech_fingerprint, False, True),
     ToolSpec("local_artifact_metadata", "قراءة بيانات وصفية محدودة للملفات داخل مخزن المخرجات المحلي (فحص دفاعي لا يعمل إلا بمصادقة المالك)", "read", True, str, _artifact_metadata),
+    ToolSpec("local_binary_analysis", "تحليل ساكن محدود لرأس الملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _binary_header_analysis),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
