@@ -325,15 +325,20 @@ def test_live_dry_run_never_executes(tmp_path, execute_spy, artifact_store):
     assert execute_spy == []
 
 
-def test_live_missing_artifact_is_recorded_rejected(tmp_path, execute_spy, artifact_store):
+def test_live_missing_artifact_is_classified_observation(tmp_path, execute_spy, artifact_store):
+    # A missing artifact is a deterministic handler classification (an
+    # OBSERVED fact), not an authorization failure: the registry boundary is
+    # reached and the handler's META_NOT_FOUND is carried as untrusted output.
     runtime = _runtime(tmp_path)
     mission = _mission(runtime, action="local_artifact_metadata")
     mission.progress["model_run_id"] = "run-1"
     proposal = _proposal(mission, execution_run_id="run-1")
     record = OffensiveActionBridge().run(proposal, mission=mission, adapter=LocalArtifactMetadataAdapter())
-    assert record.status == "REJECTED"
-    assert record.executed is False
+    assert record.status == "EXECUTED", record.result.error_state
     assert execute_spy == ["local_artifact_metadata"]  # reached the registry boundary
+    assert record.result.normalized_output["ok"] is False
+    assert record.result.normalized_output["error"] == "META_NOT_FOUND"
+    assert record.result.normalized_output["content"] is None
 
 
 # ---------------------------------------------------------------------------
