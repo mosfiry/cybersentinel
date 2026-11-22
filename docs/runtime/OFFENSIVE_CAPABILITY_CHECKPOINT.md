@@ -165,4 +165,4 @@ Continuing continuous engineering: session 47 applies the registry-level gate ha
 
 ## EXACT RESUME POINT
 
-HEAD 32c7116ef018 (plus the session-47 hardening commit and docs commits), CI green 1447/1 at 32c7116e (verify diagnostics/ci-<latest-commit-sha>.md lands green). P1-G is COMPLETE. Resume with: verify session-47 hardening CI green, then the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
+HEAD 2e1c61d5f9d2 (session 47), CI green 1456 passed / 1 skipped at 43b2f8509e01 (diagnostics/ci-43b2f8509e01.md, read directly; docs commits above it are docs-only and share the tree). P1-G is COMPLETE including the session-47 registry-gate hardening. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
