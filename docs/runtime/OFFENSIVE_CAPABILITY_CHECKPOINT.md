@@ -2,9 +2,9 @@
 
 BRANCH: security/b3-four-layer-intent
 
-LAST VERIFIED CI: diagnostics/ci-d38ce2ece6a0.md — result SUCCESS — 1404 passed / 1 skipped / 0 failed
+LAST VERIFIED CI: diagnostics/ci-32c7116ef018.md — result SUCCESS — 1447 passed / 1 skipped / 0 failed
 
-STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata)
+STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata), P1-G COMPLETE (real local_binary_analysis — bounded static header analysis of artifact-store binaries)
 
 ---
 
@@ -141,10 +141,28 @@ LAST VERIFIED CI: diagnostics/ci-d38ce2ece6a0.md — result SUCCESS — 1404 pas
 - META_* is handler failure classification, distinct from authorization rejection: only the bridge/proof layer rejects (phase VALIDATE_INPUT, code INPUT_INVALID); an observation such as a missing path is data, not a rejection.
 - Adversarially proven: "..", absolute paths, and symlink-escaping forms are rejected PRE-SEAM as INPUT_INVALID envelopes; the argument can never widen the scoped root; magic-prefix classification cannot override containment.
 
+## MILESTONE P1-G (COMPLETE): real local_binary_analysis — bounded static header analysis of artifact-store binaries
+
+STARTING HEAD (this milestone): d38ce2ece6a0 (portable base: CI 1404/1 green at ci-d38ce2ece6a0.md).
+FINAL HEAD: 32c7116ef018 (plus docs commits after it)
+LAST VERIFIED CI: diagnostics/ci-32c7116ef018.md — result SUCCESS — 1447 passed / 1 skipped / 0 failed (feat commit 8026ea553522 green at 1404/1; test commit 0e67b41dabcd RED 2 failed — one real production defect fixed and one test defect fixed; fix commit 32c7116ef018 GREEN 1447/1).
+
+### Commits (this milestone)
+
+1. 8026ea553522 — feat(tools): P1-G local_binary_analysis real handler — tools/registry.py: _binary_header_analysis (the file is NEVER executed; ONE stat + ONE capped read BINARY_ANALYSIS_MAX_BYTES=4096 through the same single filesystem seams as P1-F (_artifact_root/_artifact_stat/_artifact_open); pure fixed-offset byte arithmetic over the capped prefix via bounded _u() — out-of-prefix fields are None, never guessed; format family from _classify_artifact_prefix (FORMAT_MAGIC_TABLE, no extension trust); deterministic fail-closed classifications BIN_ARGUMENT_INVALID / BIN_NOT_FOUND / BIN_STORE_UNAVAILABLE / BIN_OPEN_FAILED / BIN_RUNTIME_ERROR; byte content never echoed) + _parse_elf_header/_parse_macho_header/_parse_universal_header/_parse_pe_header + ToolSpec row (analysis class, requires_owner=True) + LocalBinaryAnalysisAdapter in agent/offensive_bridge.py (same bind contract, execution ONLY through tools.registry.execute). CI GREEN 1404/1.
+2. 0e67b41dabcd — test(tools): P1-G adversarial + live-bridge battery for local_binary_analysis (~35 tests, no real network). CI RED 2 failed / 1445 passed: (a) universal nfat_arch was parsed little-endian and read 33554432 instead of 2 — real production defect; (b) the parser-failure test monkeypatched _parse_elf_header, which the handler does not call (it dispatches through _BINARY_HEADER_PARSERS).
+3. 32c7116ef018 — fix(tools): universal (fat) header nfat_arch parsed big-endian (production hardened); parser-failure test patches the _BINARY_HEADER_PARSERS dispatch table the handler actually uses. CI GREEN 1447/1.
+
+### Analysis semantics (documented, fixed)
+
+- Static analysis ONLY: one stat + one capped read per execution; the analyzed bytes are never treated as code and never executed; determinism is total (fixed offsets, bounded integer reads, no guessing; fields outside the capped prefix are observable None, never invented).
+- Every parsed header field and the magic-prefix classification are OBSERVED data with ZERO authority — never scope, authorization, plan, or execution input (INV-OFF-1/2).
+- Adversarially proven: traversal/subdirectory/backslash/dot/hidden names rejected PRE-SEAM; forged/tampered/cross-mission/cross-run proposals rejected before any seam (seam-spy counters stay at zero); classification cannot widen scope or mutate the plan.
+
 ## NEXT_ACTION
 
-The next NEW offensive capability is the binary-static-analysis family, or any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
+Continuing continuous engineering: session 47 applies the registry-level gate hardening for the local artifact tool family (registration of _scoped_local_artifact/_scoped_binary_analysis as the canonical registry handlers, with registry-layer adversarial tests) and closes the P1-G docs. The next NEW offensive capability is any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
 
 ## EXACT RESUME POINT
 
-HEAD d38ce2ece6a06a4aad11dad0191eb12d5d9c9987 (plus this docs commit), CI green 1404/1 at d38ce2ec (verify diagnostics/ci-<this-docs-commit-sha>.md lands green too — docs-only commit). P1-F is COMPLETE. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
+HEAD 32c7116ef018 (plus the session-47 hardening commit and docs commits), CI green 1447/1 at 32c7116e (verify diagnostics/ci-<latest-commit-sha>.md lands green). P1-G is COMPLETE. Resume with: verify session-47 hardening CI green, then the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
