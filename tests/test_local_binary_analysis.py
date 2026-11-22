@@ -560,24 +560,44 @@ def test_registered_handlers_are_the_gated_wrappers():
     assert spec_art.handler.__name__ == "_scoped_local_artifact"
 
 
+@pytest.fixture
+def list_seam_spies(monkeypatch):
+    stat_calls: list = []
+    open_calls: list = []
+    real_stat = tools.registry._artifact_stat
+    real_open = tools.registry._artifact_open
+
+    def spy_stat(path):
+        stat_calls.append(str(path))
+        return real_stat(path)
+
+    def spy_open(path):
+        open_calls.append(str(path))
+        return real_open(path)
+
+    monkeypatch.setattr(tools.registry, "_artifact_stat", spy_stat)
+    monkeypatch.setattr(tools.registry, "_artifact_open", spy_open)
+    return {"stat": stat_calls, "open": open_calls}
+
+
 @pytest.mark.parametrize("bad", ["sub/probe.bin", "../probe.bin", "a\\b.bin", "..", ".", ".hidden", ""])
-def test_registry_gate_rejects_non_bare_names_pre_seam(artifact_store, seam_spies, bad):
+def test_registry_gate_rejects_non_bare_names_pre_seam(artifact_store, list_seam_spies, bad):
     _make_elf64(artifact_store)
     result = tools.registry.get_tool("local_binary_analysis").handler(bad)
     assert result["ok"] is False
     assert result["error"] == "BIN_ARGUMENT_INVALID"
     assert result["operation"] == "local_binary_analysis"
     # rejected BEFORE any filesystem seam is touched
-    assert len(seam_spies["stat"]) == 0
-    assert len(seam_spies["open"]) == 0
+    assert list_seam_spies["stat"] == []
+    assert list_seam_spies["open"] == []
 
 
-def test_registry_gate_then_valid_name_executes_bounded(artifact_store, seam_spies):
+def test_registry_gate_then_valid_name_executes_bounded(artifact_store, list_seam_spies):
     _make_elf64(artifact_store)
     spec = tools.registry.get_tool("local_binary_analysis")
     ok = spec.handler("probe.bin")
     assert ok["ok"] is True
     assert ok["header_fields"]["elf_machine"] == 62
     # exactly ONE stat + ONE capped read
-    assert len(seam_spies["stat"]) == 1
-    assert len(seam_spies["open"]) == 1
+    assert len(list_seam_spies["stat"]) == 1
+    assert len(list_seam_spies["open"]) == 1
