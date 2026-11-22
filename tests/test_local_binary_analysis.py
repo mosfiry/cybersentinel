@@ -537,3 +537,47 @@ def test_adapter_validate_rejects_non_string_and_empty():
         assert result.executed is False
         assert result.error_state.get("phase") == AdapterPhase.VALIDATE_INPUT.value
         assert result.error_state.get("code") == AdapterErrorCode.INPUT_INVALID.value
+
+
+
+# ---------------------------------------------------------------------------
+# REGISTRY-LAYER GATE (second-pass attacker review, session 47)
+#
+# The attacker model: a caller that reaches the registry handler directly
+# (e.g. an OWNER_DIRECT proof for this tool along a path that bypasses the
+# bridge adapter). The documented contract is "exactly ONE bare file name",
+# so the PRE-SEAM bare-name gate must be enforced by the REGISTERED handler
+# itself — registration of the raw parser handler would make the gate dead
+# code at the registry layer.
+# ---------------------------------------------------------------------------
+
+
+def test_registered_handlers_are_the_gated_wrappers():
+    spec_bin = tools.registry.get_tool("local_binary_analysis")
+    spec_art = tools.registry.get_tool("local_artifact_metadata")
+    assert spec_bin is not None and spec_art is not None
+    assert spec_bin.handler.__name__ == "_scoped_binary_analysis"
+    assert spec_art.handler.__name__ == "_scoped_local_artifact"
+
+
+@pytest.mark.parametrize("bad", ["sub/probe.bin", "../probe.bin", "a\\b.bin", "..", ".", ".hidden", ""])
+def test_registry_gate_rejects_non_bare_names_pre_seam(artifact_store, seam_spies, bad):
+    _make_elf64(artifact_store)
+    result = tools.registry.get_tool("local_binary_analysis").handler(bad)
+    assert result["ok"] is False
+    assert result["error"] == "BIN_ARGUMENT_INVALID"
+    assert result["operation"] == "local_binary_analysis"
+    # rejected BEFORE any filesystem seam is touched
+    assert len(seam_spies["stat"]) == 0
+    assert len(seam_spies["open"]) == 0
+
+
+def test_registry_gate_then_valid_name_executes_bounded(artifact_store, seam_spies):
+    _make_elf64(artifact_store)
+    spec = tools.registry.get_tool("local_binary_analysis")
+    ok = spec.handler("probe.bin")
+    assert ok["ok"] is True
+    assert ok["header_fields"]["elf_machine"] == 62
+    # exactly ONE stat + ONE capped read
+    assert len(seam_spies["stat"]) == 1
+    assert len(seam_spies["open"]) == 1

@@ -1082,8 +1082,8 @@ REGISTRY = build_registry([
     ToolSpec("scoped_tls_observation", "مراقبة TLS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tls_observation, False, True),
     ToolSpec("scoped_port_observation", "مراقبة المنافذ والخدمات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_port_observation, False, True),
     ToolSpec("scoped_tech_fingerprint", "بصمة التقنيات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tech_fingerprint, False, True),
-    ToolSpec("local_artifact_metadata", "قراءة بيانات وصفية محدودة للملفات داخل مخزن المخرجات المحلي (فحص دفاعي لا يعمل إلا بمصادقة المالك)", "read", True, str, _artifact_metadata),
-    ToolSpec("local_binary_analysis", "تحليل ساكن محدود لرأس الملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _binary_header_analysis),
+    ToolSpec("local_artifact_metadata", "قراءة بيانات وصفية محدودة للملفات داخل مخزن المخرجات المحلي (فحص دفاعي لا يعمل إلا بمصادقة المالك)", "read", True, str, _scoped_local_artifact),
+    ToolSpec("local_binary_analysis", "تحليل ساكن محدود لرأس الملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_binary_analysis),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -1215,3 +1215,4 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
         raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+
