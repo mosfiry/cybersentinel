@@ -93,6 +93,7 @@ __all__ = [
     "ScopedTechFingerprintAdapter",
     "LocalArtifactMetadataAdapter",
     "LocalBinaryAnalysisAdapter",
+    "LocalStringExtractionAdapter",
 ]
 
 # Target kinds: "local" = local read-only analysis (no network surface, the
@@ -434,6 +435,71 @@ class LocalBinaryAnalysisAdapter(ToolAdapter):
         return normalized
 
 
+class LocalStringExtractionAdapter(ToolAdapter):
+    """Adapter for the registered local_string_extraction static tool (P1-H).
+
+    Local, read-only, non-destructive: the file is NEVER executed; ONE stat +
+    ONE capped read of a single artifact inside the code-defined artifact
+    store, reached ONLY through tools.registry.execute behind the full proof
+    chain. The argument is a bare file name — traversal is rejected at
+    VALIDATE_INPUT; the handler re-verifies containment fail-closed. Extracted
+    printable runs and their offsets are OBSERVED data with zero authority
+    (INV-OFF-1/2); secret-like values are fingerprint-redacted by the fixed
+    code-defined table, never echoed.
+    """
+
+    tool_name = "local_string_extraction"
+    timeout_seconds = 10
+
+    def _validate_argument(self, request: ToolAdapterRequest) -> None:
+        name = request.argument if isinstance(request.argument, str) else ""
+        if (
+            not name
+            or len(name) > 256
+            or "/" in name
+            or "\\" in name
+            or name in (".", "..")
+            or name.startswith(".")
+        ):
+            raise ToolAdapterError(
+                AdapterPhase.VALIDATE_INPUT,
+                AdapterErrorCode.INPUT_INVALID,
+                "local_string_extraction accepts exactly one bare file name inside the artifact store (traversal rejected)",
+                tool=request.tool,
+            )
+
+    def _normalize(self, raw: Any) -> dict[str, Any]:
+        normalized = super()._normalize(raw)
+        if normalized.get("ok") is True:
+            runs = normalized.get("strings")
+            if not isinstance(runs, list) or not all(
+                isinstance(record, dict)
+                and isinstance(record.get("offset"), int)
+                and isinstance(record.get("value"), str)
+                and isinstance(record.get("value_sha256"), str)
+                for record in runs
+            ):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "string extraction must be a deterministic list of run records (offset, value, value_sha256)",
+                    tool=self.tool_name,
+                )
+            if normalized.get("strings_returned") != len(runs):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "string extraction count is inconsistent with the record list",
+                    tool=self.tool_name,
+                )
+            if not isinstance(normalized.get("size_bytes"), int) or not isinstance(normalized.get("sha256"), str):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "string extraction size/hash must be deterministic (int size, hex sha256)",
+                    tool=self.tool_name,
+                )
+        return normalized
 LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()
 
 
@@ -606,3 +672,4 @@ class OffensiveActionBridge:
         if note:
             event["observation"] = note
         return event
+

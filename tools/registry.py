@@ -5,6 +5,7 @@ from typing import Any, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import os
+import re
 import sys
 
 MAX_ARG_LENGTH = 256
@@ -1050,6 +1051,166 @@ def _binary_header_analysis(name, *, max_bytes=BINARY_ANALYSIS_MAX_BYTES, field_
     }
 
 
+def _scoped_string_extraction(argument):
+    """Argument gate for the bounded local printable-string analysis (P1-H).
+
+    Exactly ONE bare file name inside the local artifact store; traversal,
+    separators, and hidden names are rejected BEFORE any filesystem seam is
+    touched (fail closed, pre-open).
+    """
+    name = argument if isinstance(argument, str) else ""
+    if (
+        not name
+        or len(name) > MAX_ARG_LENGTH
+        or "/" in name
+        or "\\" in name
+        or name in (".", "..")
+        or name.startswith(".")
+    ):
+        return {"ok": False, "operation": "local_string_extraction", "error": "STR_ARGUMENT_INVALID", "reason": "the string extraction accepts exactly one bare file name inside the local artifact store"}
+    return _printable_string_analysis(name)
+
+
+STRING_EXTRACTION_MAX_BYTES = 65536
+STRING_EXTRACTION_FIELD_MAX = 256
+STRING_EXTRACTION_MIN_RUN = 4
+STRING_EXTRACTION_MAX_RUNS = 64
+
+# Deterministic redaction of secret-like key/value strings that may occur
+# inside captured artifacts: the VALUE after a code-defined key anchor is
+# never recorded in evidence plaintext (fingerprints/redaction only). The
+# table is fixed at code definition; a false positive loses nothing because
+# redaction is the safe direction. Redaction is DATA hygiene, never
+# classification of the file (an unredacted string is not "malicious").
+_SECRET_VALUE_PATTERN = re.compile(
+    r"(?i)\b((?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|password|passwd|pwd|secret|credential|client[_-]?secret|bearer)\s*[:=]\s*)([!-~]{1,128})"
+)
+
+
+def _redact_secret_value(value: str):
+    """Redact a secret-like value with its own sha256 fingerprint prefix."""
+    import hashlib
+
+    def _repl(match):
+        return match.group(1) + "REDACTED:" + hashlib.sha256(match.group(2).encode("utf-8")).hexdigest()[:12]
+
+    return _SECRET_VALUE_PATTERN.subn(_repl, value)
+
+
+def _printable_string_analysis(name, *, max_bytes=STRING_EXTRACTION_MAX_BYTES, field_max=STRING_EXTRACTION_FIELD_MAX, min_run=STRING_EXTRACTION_MIN_RUN, max_runs=STRING_EXTRACTION_MAX_RUNS):
+    """Bounded STATIC printable-string extraction of one artifact (P1-H).
+
+    The file is NEVER executed: ONE stat + ONE capped read through the same
+    single filesystem seams as P1-F/P1-G, then ONE deterministic linear scan
+    over the capped prefix. A run is a maximal sequence of printable ASCII
+    bytes (0x20..0x7E) of at least STRING_EXTRACTION_MIN_RUN; the argument
+    list never widens or filters the scan. Every extracted run is OBSERVED
+    data with zero authority (INV-OFF-1/2). Secret-like values discovered by
+    the fixed redaction table are fingerprint-redacted, never echoed.
+
+    Deterministic fail-closed classification:
+    STR_ARGUMENT_INVALID / STR_NOT_FOUND / STR_STORE_UNAVAILABLE /
+    STR_OPEN_FAILED / STR_RUNTIME_ERROR.
+    """
+    import hashlib
+    import time
+    from datetime import datetime, timezone
+
+    started = time.monotonic()
+    elapsed = lambda: int((time.monotonic() - started) * 1000)
+    common = {"operation": "local_string_extraction", "name": name}
+    try:
+        root = _artifact_root().resolve()
+    except Exception as exc:
+        return dict(common, ok=False, error="STR_STORE_UNAVAILABLE", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        resolved = (root / name).resolve()
+    except OSError as exc:
+        return dict(common, ok=False, error="STR_ARGUMENT_INVALID", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if resolved != root and root not in resolved.parents:
+        return dict(common, ok=False, error="STR_ARGUMENT_INVALID", reason="the artifact path escaped the artifact store (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if not resolved.is_file():
+        return dict(common, ok=False, error="STR_NOT_FOUND", reason="the artifact is not a regular file inside the store", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        size = int(_artifact_stat(resolved))
+    except OSError as exc:
+        return dict(common, ok=False, error="STR_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        with _artifact_open(resolved) as handle:
+            prefix = bytes(handle.read(max_bytes + 1))
+    except OSError as exc:
+        return dict(common, ok=False, error="STR_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except Exception as exc:
+        return dict(common, ok=False, error="STR_RUNTIME_ERROR", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    truncated = len(prefix) > max_bytes
+    if truncated:
+        prefix = prefix[:max_bytes]
+    family = _classify_artifact_prefix(prefix)
+
+    def _record(run_start, run_end):
+        text = prefix[run_start:run_end].decode("ascii")
+        kept, redactions = _redact_secret_value(text[:field_max])
+        return {
+            "offset": run_start,
+            "length": run_end - run_start,
+            "value": kept,
+            "value_truncated": len(text) > field_max,
+            "value_redacted": bool(redactions),
+            "value_sha256": hashlib.sha256(text.encode("ascii")).hexdigest(),
+        }
+
+    try:
+        runs: list[dict[str, Any]] = []
+        total_runs = 0
+        qualifying_runs = 0
+        run_start: int | None = None
+
+        def _close(run_start_value, run_end):
+            nonlocal total_runs, qualifying_runs
+            total_runs += 1
+            if (run_end - run_start_value) >= min_run:
+                qualifying_runs += 1
+                if len(runs) < max_runs:
+                    runs.append(_record(run_start_value, run_end))
+
+        for index, byte in enumerate(prefix):
+            if 0x20 <= byte <= 0x7E:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is not None:
+                _close(run_start, index)
+                run_start = None
+        if run_start is not None:
+            _close(run_start, len(prefix))
+        strings_truncated = qualifying_runs > len(runs)
+    except Exception as exc:
+        return dict(common, ok=False, error="STR_RUNTIME_ERROR", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    return {
+        "ok": True,
+        **common,
+        "sha256": hashlib.sha256(prefix).hexdigest(),
+        "size_bytes": size,
+        "read_cap_bytes": max_bytes,
+        "read_truncated": truncated,
+        "format_family": family,  # OBSERVED classification only — zero authority
+        "classification_basis": "observed_magic_prefix",
+        "strings": runs,  # static read-only observations — the file is never executed
+        "total_printable_runs": total_runs,
+        "qualifying_printable_runs": qualifying_runs,
+        "strings_returned": len(runs),
+        "strings_truncated": strings_truncated,
+        "min_run_length": min_run,
+        "redaction_basis": "code_defined_secret_value_table",
+        "redacted_values": sum(1 for record in runs if record["value_redacted"]),
+        "analysis_kind": "static_string_read",
+        "content": None,  # the observed bytes themselves are hashed, never echoed
+        "path_within_store": name,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_ms": elapsed(),
+    }
+
+
 def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     registry: dict[str, ToolSpec] = {}
     for spec in specs:
@@ -1084,6 +1245,7 @@ REGISTRY = build_registry([
     ToolSpec("scoped_tech_fingerprint", "بصمة التقنيات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tech_fingerprint, False, True),
     ToolSpec("local_artifact_metadata", "قراءة بيانات وصفية محدودة للملفات داخل مخزن المخرجات المحلي (فحص دفاعي لا يعمل إلا بمصادقة المالك)", "read", True, str, _scoped_local_artifact),
     ToolSpec("local_binary_analysis", "تحليل ساكن محدود لرأس الملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_binary_analysis),
+    ToolSpec("local_string_extraction", "استخراج سلاسل نصية ساكن محدود لملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_string_extraction),
 ])
 
 KNOWN_TOOLS = frozenset(REGISTRY)
@@ -1169,50 +1331,3 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             raise PermissionError("scope context required")
         required = {"program_id", "target_id", "scope_snapshot_id", "url"}
         if not required.issubset(scope_context):
-            raise PermissionError("incomplete scope context")
-        from security.scope_resolver import resolve
-        requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
-        urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
-        for checked_url in urls:
-            decision = resolve(
-                scope_context["scope_snapshot_id"],
-                scope_context["target_id"],
-                checked_url,
-                method=scope_context.get("method", "GET"),
-                expected_program_id=scope_context["program_id"],
-                redirect_chain=scope_context.get("redirect_chain", []),
-            )
-            if not decision.allowed:
-                raise PermissionError("scope denied: " + decision.reason)
-    if mission_authorization is not None:
-        from security.mission_authorization import MissionAuthorizationSnapshot
-        snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
-        if str(snapshot.authorization_hash) != str(getattr(execution_proof, "snapshot_hash", "")):
-            raise PermissionError(f"{RejectionCode.SNAPSHOT_MISMATCH.value}: live mission authorization snapshot differs from the proof-bound snapshot")
-        allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
-        if not allowed:
-            raise PermissionError("mission authorization blocked: " + reason)
-    valid, reason = spec.validate(argument)
-    if not valid:
-        raise ValueError(reason)
-    limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
-    if name == "run_project_tests":
-        # Legacy compatibility snapshot minting was removed: the registry must
-        # never create authorization from a decision field. A governed
-        # workspace and a real mission authorization snapshot are required
-        # from the caller.
-        if workspace is None or mission_authorization is None:
-            raise PermissionError("run_project_tests requires a governed workspace and a mission authorization snapshot")
-        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=mission_authorization, evidence_store=evidence_store)
-        future = executor.submit(spec.handler, argument, workspace=workspace)
-    else:
-        future = executor.submit(spec.handler, argument)
-    try:
-        return future.result(timeout=limit)
-    except FutureTimeout as exc:
-        future.cancel()
-        raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
