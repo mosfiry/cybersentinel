@@ -1331,3 +1331,50 @@ def execute(name: str, argument: str | None = None, *, timeout: int | None = Non
             raise PermissionError("scope context required")
         required = {"program_id", "target_id", "scope_snapshot_id", "url"}
         if not required.issubset(scope_context):
+            raise PermissionError("incomplete scope context")
+        from security.scope_resolver import resolve
+        requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
+        urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
+        for checked_url in urls:
+            decision = resolve(
+                scope_context["scope_snapshot_id"],
+                scope_context["target_id"],
+                checked_url,
+                method=scope_context.get("method", "GET"),
+                expected_program_id=scope_context["program_id"],
+                redirect_chain=scope_context.get("redirect_chain", []),
+            )
+            if not decision.allowed:
+                raise PermissionError("scope denied: " + decision.reason)
+    if mission_authorization is not None:
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
+        if str(snapshot.authorization_hash) != str(getattr(execution_proof, "snapshot_hash", "")):
+            raise PermissionError(f"{RejectionCode.SNAPSHOT_MISMATCH.value}: live mission authorization snapshot differs from the proof-bound snapshot")
+        allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
+        if not allowed:
+            raise PermissionError("mission authorization blocked: " + reason)
+    valid, reason = spec.validate(argument)
+    if not valid:
+        raise ValueError(reason)
+    limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
+    if name == "run_project_tests":
+        # Legacy compatibility snapshot minting was removed: the registry must
+        # never create authorization from a decision field. A governed
+        # workspace and a real mission authorization snapshot are required
+        # from the caller.
+        if workspace is None or mission_authorization is None:
+            raise PermissionError("run_project_tests requires a governed workspace and a mission authorization snapshot")
+        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=mission_authorization, evidence_store=evidence_store)
+        future = executor.submit(spec.handler, argument, workspace=workspace)
+    else:
+        future = executor.submit(spec.handler, argument)
+    try:
+        return future.result(timeout=limit)
+    except FutureTimeout as exc:
+        future.cancel()
+        raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
