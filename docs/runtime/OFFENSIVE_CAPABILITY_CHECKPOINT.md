@@ -2,9 +2,9 @@
 
 BRANCH: security/b3-four-layer-intent
 
-LAST VERIFIED CI: diagnostics/ci-32c7116ef018.md — result SUCCESS — 1447 passed / 1 skipped / 0 failed
+LAST VERIFIED CI: diagnostics/ci-134a2ebe4385.md — result SUCCESS — 1508 passed / 1 skipped / 0 failed
 
-STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata), P1-G COMPLETE (real local_binary_analysis — bounded static header analysis of artifact-store binaries)
+STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata), P1-G COMPLETE (real local_binary_analysis — bounded static header analysis of artifact-store binaries), P1-H COMPLETE (real local_string_extraction — bounded static printable-string analysis with secret-value fingerprint redaction)
 
 ---
 
@@ -159,10 +159,18 @@ LAST VERIFIED CI: diagnostics/ci-32c7116ef018.md — result SUCCESS — 1447 pas
 - Every parsed header field and the magic-prefix classification are OBSERVED data with ZERO authority — never scope, authorization, plan, or execution input (INV-OFF-1/2).
 - Adversarially proven: traversal/subdirectory/backslash/dot/hidden names rejected PRE-SEAM; forged/tampered/cross-mission/cross-run proposals rejected before any seam (seam-spy counters stay at zero); classification cannot widen scope or mutate the plan.
 
+## MILESTONE P1-H (COMPLETE — local_string_extraction)
+
+Commits: dee3561a8251 (feat(tools): _scoped_string_extraction gateway + _printable_string_analysis over the SAME single filesystem seams as P1-F/P1-G — ONE stat + ONE capped read, ONE deterministic linear scan for printable ASCII runs >= 4, 65,536-byte cap, 64-run cap, secret-like values REDACTED via the fixed code-defined table (the value is never echoed, a sha256 fingerprint is recorded), bytes never echoed, deterministic fail-closed STR_* classifications; ToolSpec local_string_extraction registered) + agent/offensive_bridge.py LocalStringExtractionAdapter; 1146a29d445c (test: 33-test adversarial + live-bridge battery, no real network); 134a2ebe4385 (fix(tools): restored the execute() proof-gate tail that the interrupted 2026-11-23 P1-H push had truncated — compileall IndentationError at registry.py:1333; verified by prefix-equality of the committed truncated file against the reconstructed full file BEFORE pushing; no handler or gate semantics changed). CI GREEN 1508 passed / 1 skipped at 134a2ebe4385 (diagnostics/ci-134a2ebe4385.md, read directly).
+
+### Incident and lesson (recorded 2026-11-24)
+
+The scheduled 2026-11-23 session crashed mid-unit and its push to tools/registry.py was recorded TRUNCATED (the last 47 lines of execute() were lost). Its CI marker files (ci-dee3561a8251.md, ci-1146a29d445c.md) carried "result: SUCCESS" while their own compileall section displayed the IndentationError — such markers are INVALID. RULE: a marker whose compileall section contains a traceback is RED even if its result line says SUCCESS; never treat a self-contradictory marker as green.
+
 ## NEXT_ACTION
 
-Continuing continuous engineering: session 47 applies the registry-level gate hardening for the local artifact tool family (registration of _scoped_local_artifact/_scoped_binary_analysis as the canonical registry handlers, with registry-layer adversarial tests) and closes the P1-G docs. The next NEW offensive capability is any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
+Session 48 completed P1-H (bounded static printable-string extraction with secret-value fingerprint redaction) and repaired the interrupted 2026-11-23 truncated-push incident. The next NEW offensive capability is any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
 
 ## EXACT RESUME POINT
 
-HEAD 2e1c61d5f9d2 (session 47), CI green 1456 passed / 1 skipped at 43b2f8509e01 (diagnostics/ci-43b2f8509e01.md, read directly; docs commits above it are docs-only and share the tree). P1-G is COMPLETE including the session-47 registry-gate hardening. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
+HEAD 134a2ebe4385 (session 48 fix commit; the ci-skip-marker commit 5aa7a8118971 above it is diagnostics-only and shares the tree), CI green 1508 passed / 1 skipped at 134a2ebe4385 (diagnostics/ci-134a2ebe4385.md, read directly). P1-G and P1-H are COMPLETE. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
