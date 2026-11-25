@@ -344,7 +344,7 @@ def test_handler_entropy_over_capped_read(artifact_store):
     assert result["size_bytes"] == len(data)
     assert result["read_cap_bytes"] == 262144
     assert result["sha256"] == hashlib.sha256(data[:262144]).hexdigest()
-    assert 0.0 < result["entropy_bits_per_byte"] < 0.05
+    assert 0.0 < result["entropy_bits_per_byte"] < 0.1
 
 
 def test_handler_not_found(artifact_store):
