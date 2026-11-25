@@ -1456,3 +1456,288 @@ def _parse_elf_imports(prefix, field_max):
     return "ok", imports, len(needed) > IMPORT_ANALYSIS_MAX_IMPORTS
 
 
+def _parse_macho_imports(prefix, field_max):
+    """Static Mach-O dylib load-command extraction over the CAPPED prefix."""
+    imports: list[dict[str, Any]] = []
+    ncmds = _u(prefix, 16, 4)
+    if ncmds is None:
+        return "load_commands_outside_capped_prefix", imports, False
+    offset = 32
+    for _index in range(min(ncmds, IMPORT_ANALYSIS_MAX_ENTRIES_SCANNED)):
+        cmd = _u(prefix, offset, 4)
+        size = _u(prefix, offset + 4, 4)
+        if cmd is None or size in (None, 0) or offset + size > len(prefix):
+            return "ok", imports, True
+        if cmd in _MACHO_DYLIB_LOAD_COMMANDS:
+            name_offset = _u(prefix, offset + 8, 4)
+            library = _cstr(prefix, offset + name_offset if name_offset is not None else None, field_max)[0]
+            imports.append({"command": _MACHO_DYLIB_LOAD_COMMANDS[cmd], "library": library, "functions": [], "functions_truncated": False})
+        offset += size
+    return "ok", imports, False
+
+
+def _parse_universal_imports(prefix, field_max):
+    """Static observation of the fat-binary archive table; entry binaries
+    themselves are not observable from the capped prefix (never guessed)."""
+    count = _u(prefix, 4, 4, little=False)
+    if count is None:
+        return "load_commands_outside_capped_prefix", [], False
+    return "ok", [], count > IMPORT_ANALYSIS_MAX_IMPORTS
+
+
+_IMPORT_HEADER_PARSERS = {
+    "pe": _parse_pe_imports,
+    "elf": _parse_elf_imports,
+    "mach_o_64": _parse_macho_imports,
+    "mach_o_32": _parse_macho_imports,
+    "mach_o_universal": _parse_universal_imports,
+}
+
+
+def _import_analysis(name, *, max_bytes=IMPORT_ANALYSIS_MAX_BYTES, field_max=IMPORT_ANALYSIS_FIELD_MAX):
+    """Bounded STATIC import-table + entropy analysis of one artifact (P1-I).
+
+    The file is NEVER executed: ONE stat + ONE capped read through the same
+    single filesystem seams as P1-F/P1-G/P1-H, then deterministic fixed-offset
+    arithmetic over the capped prefix. Libraries and imported names are
+    OBSERVED data with zero authority (INV-OFF-1/2); imports beyond the caps
+    are never invented (explicit truncated flags). An unknown/capped-out
+    offset is an observable None. Every failure is classified fail-closed:
+    IMP_ARGUMENT_INVALID / IMP_NOT_FOUND / IMP_STORE_UNAVAILABLE /
+    IMP_OPEN_FAILED / IMP_RUNTIME_ERROR.
+    """
+    import hashlib
+    import time
+    from datetime import datetime, timezone
+
+    started = time.monotonic()
+    elapsed = lambda: int((time.monotonic() - started) * 1000)
+    common = {"operation": "local_import_analysis", "name": name}
+    try:
+        root = _artifact_root().resolve()
+    except Exception as exc:
+        return dict(common, ok=False, error="IMP_STORE_UNAVAILABLE", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        resolved = (root / name).resolve()
+    except OSError as exc:
+        return dict(common, ok=False, error="IMP_ARGUMENT_INVALID", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if resolved != root and root not in resolved.parents:
+        return dict(common, ok=False, error="IMP_ARGUMENT_INVALID", reason="the artifact path escaped the artifact store (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    if not resolved.is_file():
+        return dict(common, ok=False, error="IMP_NOT_FOUND", reason="the artifact is not a regular file inside the store", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        size = int(_artifact_stat(resolved))
+    except OSError as exc:
+        return dict(common, ok=False, error="IMP_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    try:
+        with _artifact_open(resolved) as handle:
+            prefix = bytes(handle.read(max_bytes + 1))
+    except OSError as exc:
+        return dict(common, ok=False, error="IMP_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    except Exception as exc:
+        return dict(common, ok=False, error="IMP_RUNTIME_ERROR", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    truncated = len(prefix) > max_bytes
+    if truncated:
+        prefix = prefix[:max_bytes]
+    family = _classify_artifact_prefix(prefix)
+    entropy = _shannon_entropy(prefix)
+    try:
+        parser = _IMPORT_HEADER_PARSERS.get(family)
+        if parser is None:
+            parse_status, imports, imports_truncated = "unsupported_format_for_imports", [], False
+        else:
+            parse_status, imports, imports_truncated = parser(prefix, field_max)
+    except Exception as exc:
+        return dict(common, ok=False, error="IMP_RUNTIME_ERROR", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+    return {
+        "ok": True,
+        **common,
+        "sha256": hashlib.sha256(prefix).hexdigest(),
+        "size_bytes": size,
+        "read_cap_bytes": max_bytes,
+        "read_truncated": truncated,
+        "format_family": family,  # OBSERVED classification only — zero authority
+        "classification_basis": "observed_magic_prefix",
+        "parse_status": parse_status,  # OBSERVED: why imports may be absent (data, never guessed)
+        "imports": imports,  # static read-only observations — the file is never executed
+        "imports_returned": len(imports),
+        "imports_truncated": imports_truncated,
+        "max_imports": IMPORT_ANALYSIS_MAX_IMPORTS,
+        "entropy_bits_per_byte": entropy,  # OBSERVED statistic over the capped prefix
+        "redaction_basis": "code_defined_secret_value_table",
+        "analysis_kind": "static_import_read",
+        "content": None,  # the observed bytes themselves are hashed, never echoed
+        "path_within_store": name,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_ms": elapsed(),
+    }
+
+
+def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
+    registry: dict[str, ToolSpec] = {}
+    for spec in specs:
+        if not isinstance(spec, ToolSpec) or not spec.name or spec.name in registry:
+            raise ValueError("duplicate or invalid tool specification")
+        scope_namespace = spec.name.split(".", 1)[0]
+        scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "report"}
+        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner) or (scope_namespace in scope_namespaces and not spec.scope_required):
+            raise ValueError(f"invalid registry metadata for {spec.name}")
+        if spec.argument_type not in (None, str):
+            raise ValueError(f"unsupported argument schema for {spec.name}")
+        registry[spec.name] = spec
+    return registry
+
+
+REGISTRY = build_registry([
+    ToolSpec("status", "ÙØ±Ø§Ø¡Ø© Ø­Ø§ÙØ© Ø§ÙØ®Ø¯ÙØ© ÙØ§ÙØ£Ø­Ø¯Ø§Ø« Ø§ÙØªØ¯ÙÙÙÙØ© Ø§ÙØ£Ø®ÙØ±Ø©", "read", True, None, _status),
+    ToolSpec("latest_intel", "ÙØ±Ø§Ø¡Ø© Ø§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø§ÙØªÙØ¯ÙØ¯Ø§Øª Ø§ÙÙØ¬ÙØ¹Ø©", "read", True, None, _latest_intel),
+    ToolSpec("refresh_intel", "Ø¬ÙØ¹ Ø§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø¯ÙØ§Ø¹ÙØ© Ø¶Ø¯ Ø§ÙØªÙØ¯ÙØ¯Ø§Øª", "network-read", True, None, _refresh_intel),
+    ToolSpec("local_security_check", "ÙØ­Øµ ÙØ³ØªÙØ¹Ù TCP Ø§ÙÙØ­ÙÙØ©", "read", True, None, _local_security),
+    ToolSpec("local_system_info", "ÙØ±Ø§Ø¡Ø© ÙØ¹ÙÙÙØ§Øª Ø§ÙÙØ¸Ø§Ù Ø§ÙÙØ­ÙÙ", "read", True, None, _system_info),
+    ToolSpec("local_process_info", "قراءة قائمة العمليات المحلية الجارية (فحص دفاعي محلي)", "read", True, None, _process_info),
+    ToolSpec("search", "Ø¨Ø­Ø« ÙÙ Ø§ÙØ£Ø­Ø¯Ø§Ø« ÙØ§ÙØ§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø§ÙÙØ­ÙÙØ©", "read", True, str, _search),
+    ToolSpec("watch", "Ø¥Ø¶Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _watch),
+    ToolSpec("unwatch", "Ø¥Ø²Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _unwatch),
+    ToolSpec("run_project_tests", "ØªØ´ØºÙÙ pytest -q Ø¯Ø§Ø®Ù Ø¬Ø°Ø± Ø§Ø®ØªØ¨Ø§Ø± Ø§ÙÙØ´Ø±ÙØ¹ Ø§ÙÙØ­Ø¯Ø¯", "bounded-exec", True, str, _run_project_tests),
+    ToolSpec("red_team_assess", "ØªÙÙÙÙ ÙØ¬ÙÙÙ Ø¯ÙØ§Ø¹Ù ÙÙÙØ§ÙÙ ÙÙØ·; ÙØ§ ÙÙÙØ° Ø§Ø³ØªØºÙØ§ÙØ§Ù Ø£Ù Ø£ÙØ±Ø© ÙØ¸Ø§Ù", "analysis", True, str, _red_team_assess, True),
+    ToolSpec("scoped_http_probe", "ÙØ±Ø§ÙØ¨Ø© HTTP ÙØ­Ø¯ÙØ¯Ø© ÙØ§ ØªØ¹ÙÙ Ø¥ÙØ§ ÙØ¹ Scope Snapshot ÙTarget ÙØµØ§Ø¯Ù Ø¹ÙÙÙ", "network-read", True, str, _scoped_http_probe, False, True),
+    ToolSpec("scoped_dns_lookup", "مراقبة DNS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_dns_lookup, False, True),
+    ToolSpec("scoped_tls_observation", "مراقبة TLS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tls_observation, False, True),
+    ToolSpec("scoped_port_observation", "مراقبة المنافذ والخدمات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_port_observation, False, True),
+    ToolSpec("scoped_tech_fingerprint", "بصمة التقنيات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tech_fingerprint, False, True),
+    ToolSpec("local_artifact_metadata", "قراءة بيانات وصفية محدودة للملفات داخل مخزن المخرجات المحلي (فحص دفاعي لا يعمل إلا بمصادقة المالك)", "read", True, str, _scoped_local_artifact),
+    ToolSpec("local_binary_analysis", "تحليل ساكن محدود لرأس الملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_binary_analysis),
+    ToolSpec("local_string_extraction", "استخراج سلاسل نصية ساكن محدود لملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_string_extraction),
+    ToolSpec("local_import_analysis", "تحليل ساكن محدود لجدول الاستيراد والإنتروبيا لملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_import_analysis),
+])
+
+KNOWN_TOOLS = frozenset(REGISTRY)
+
+
+def tool_definitions() -> list[dict[str, Any]]:
+    """Build provider-neutral tool metadata from the canonical registry."""
+    definitions: list[dict[str, Any]] = []
+    for spec in REGISTRY.values():
+        parameters: dict[str, Any] = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        if spec.argument_type is str:
+            parameters["properties"]["query"] = {
+                "type": "string",
+                "maxLength": MAX_ARG_LENGTH,
+            }
+            parameters["required"] = ["query"]
+        definitions.append({
+            "name": spec.name,
+            "description": spec.description[:512],
+            "risk_class": spec.risk_class,
+            "owner_required": spec.requires_owner,
+            "parameters": parameters,
+            **spec.metadata(),
+        })
+    return definitions
+
+
+def get_tool(name: str) -> ToolSpec | None:
+    return REGISTRY.get(name)
+
+
+def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None, execution_class: str | None = None, execution_run_id: str | None = None):
+    spec = get_tool(name)
+    if spec is None:
+        raise ValueError("unknown tool")
+    # The registry is the last line of defense, not a policy creator. There is
+    # no implicit "not mission-bound" escape hatch: a caller cannot opt out of
+    # the proof boundary by omitting mission_id. Every governed execution is
+    # classified (MISSION_BOUND when mission governance kwargs are present,
+    # OWNER_DIRECT otherwise) and must carry an ExecutionAuthorizationProof of
+    # exactly that class, derived from authorization that already exists.
+    from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, RejectionCode
+    mission_bound = mission_authorization is not None or workspace is not None or evidence_store is not None or bool(mission_id)
+    resolved_class = str(execution_class or (ExecutionClass.MISSION_BOUND.value if mission_bound else ExecutionClass.OWNER_DIRECT.value))
+    if execution_proof is None:
+        raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: {resolved_class} execution requires an ExecutionAuthorizationProof")
+    proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id, run_id=execution_run_id)
+    if not proof_ok:
+        raise PermissionError(f"{proof_code}: {proof_reason}")
+    if str(getattr(execution_proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != resolved_class:
+        raise PermissionError(f"{RejectionCode.EXECUTION_CLASS_MISMATCH.value}: proof execution class {getattr(execution_proof, 'execution_class', '')} does not match {resolved_class} execution")
+    if resolved_class == ExecutionClass.OWNER_DIRECT.value and authorization_decision is None:
+        # B3-C5 second-pass attacker review: an OWNER_DIRECT execution must
+        # carry the typed AuthorizationDecision that authorized it. Before
+        # this check a captured owner-direct proof for a tool that is not
+        # owner_only/scope_required could be replayed at the registry with
+        # no decision at all, contradicting the documented OWNER_DIRECT
+        # contract. Fail closed before any handler runs.
+        raise PermissionError(f"{RejectionCode.PROOF_INCOMPLETE.value}: OWNER_DIRECT execution requires the typed AuthorizationDecision that authorized it")
+    decision_valid = False
+    if authorization_decision is not None:
+        from security.authorization_context import AuthorizationDecision
+        decision_valid = bool(request_id) and isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.is_valid_for(name, argument, request_id)
+        if not decision_valid:
+            raise PermissionError("invalid or argument-mismatched AuthorizationDecision")
+        # Decision binding: the proof must be bound to exactly this decision
+        # (canonical signature) and its policy fingerprint. A proof derived
+        # from a different decision can never authorize this execution.
+        if str(getattr(authorization_decision, "decision_signature", "")) != str(getattr(execution_proof, "decision_fingerprint", "")):
+            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: execution proof is not bound to the supplied AuthorizationDecision")
+        if str(getattr(authorization_decision, "policy_fingerprint", "")) != str(getattr(execution_proof, "policy_fingerprint", "")):
+            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: execution proof policy binding does not match the authorization decision policy")
+    if spec.owner_only and not decision_valid:
+        raise PermissionError("AuthorizationDecision required for this tool")
+    if spec.scope_required and not decision_valid:
+        raise PermissionError("scope-bound AuthorizationDecision required")
+    if spec.scope_required:
+        if not isinstance(scope_context, dict):
+            raise PermissionError("scope context required")
+        required = {"program_id", "target_id", "scope_snapshot_id", "url"}
+        if not required.issubset(scope_context):
+            raise PermissionError("incomplete scope context")
+        from security.scope_resolver import resolve
+        requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
+        urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
+        for checked_url in urls:
+            decision = resolve(
+                scope_context["scope_snapshot_id"],
+                scope_context["target_id"],
+                checked_url,
+                method=scope_context.get("method", "GET"),
+                expected_program_id=scope_context["program_id"],
+                redirect_chain=scope_context.get("redirect_chain", []),
+            )
+            if not decision.allowed:
+                raise PermissionError("scope denied: " + decision.reason)
+    if mission_authorization is not None:
+        from security.mission_authorization import MissionAuthorizationSnapshot
+        snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
+        if str(snapshot.authorization_hash) != str(getattr(execution_proof, "snapshot_hash", "")):
+            raise PermissionError(f"{RejectionCode.SNAPSHOT_MISMATCH.value}: live mission authorization snapshot differs from the proof-bound snapshot")
+        allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
+        if not allowed:
+            raise PermissionError("mission authorization blocked: " + reason)
+    valid, reason = spec.validate(argument)
+    if not valid:
+        raise ValueError(reason)
+    limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
+    if name == "run_project_tests":
+        # Legacy compatibility snapshot minting was removed: the registry must
+        # never create authorization from a decision field. A governed
+        # workspace and a real mission authorization snapshot are required
+        # from the caller.
+        if workspace is None or mission_authorization is None:
+            raise PermissionError("run_project_tests requires a governed workspace and a mission authorization snapshot")
+        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=mission_authorization, evidence_store=evidence_store)
+        future = executor.submit(spec.handler, argument, workspace=workspace)
+    else:
+        future = executor.submit(spec.handler, argument)
+    try:
+        return future.result(timeout=limit)
+    except FutureTimeout as exc:
+        future.cancel()
+        raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
