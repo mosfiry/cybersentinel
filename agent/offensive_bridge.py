@@ -1,3 +1,4 @@
+
 """Offensive Capability Layer: the live typed reasoning-to-execution bridge.
 
 P0 of the Offensive Capability Activation mission. This module is the
@@ -500,6 +501,89 @@ class LocalStringExtractionAdapter(ToolAdapter):
                     tool=self.tool_name,
                 )
         return normalized
+
+
+class LocalImportAnalysisAdapter(ToolAdapter):
+    """Adapter for the registered local_import_analysis static tool (P1-I).
+
+    Local, read-only, non-destructive: the file is NEVER executed; ONE stat +
+    ONE capped read of a single artifact inside the code-defined artifact
+    store, reached ONLY through tools.registry.execute behind the full proof
+    chain. The argument is a bare file name — traversal is rejected at
+    VALIDATE_INPUT; the handler re-verifies containment fail-closed. Parsed
+    import libraries, imported names, and the entropy statistic are OBSERVED
+    data with zero authority (INV-OFF-1/2); anything outside the capped
+    prefix is an observable None, never invented.
+    """
+
+    tool_name = "local_import_analysis"
+    timeout_seconds = 10
+
+    def _validate_argument(self, request: ToolAdapterRequest) -> None:
+        name = request.argument if isinstance(request.argument, str) else ""
+        if (
+            not name
+            or len(name) > 256
+            or "/" in name
+            or "\\" in name
+            or name in (".", "..")
+            or name.startswith(".")
+        ):
+            raise ToolAdapterError(
+                AdapterPhase.VALIDATE_INPUT,
+                AdapterErrorCode.INPUT_INVALID,
+                "local_import_analysis accepts exactly one bare file name inside the artifact store (traversal rejected)",
+                tool=request.tool,
+            )
+
+    def _normalize(self, raw: Any) -> dict[str, Any]:
+        normalized = super()._normalize(raw)
+        if normalized.get("ok") is True:
+            imports = normalized.get("imports")
+            if not isinstance(imports, list) or not all(
+                isinstance(record, dict)
+                and (record.get("library") is None or isinstance(record.get("library"), str))
+                and isinstance(record.get("functions"), list)
+                for record in imports
+            ):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "import analysis must be a deterministic list of import records (library, functions)",
+                    tool=self.tool_name,
+                )
+            if normalized.get("imports_returned") != len(imports):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "import analysis count is inconsistent with the record list",
+                    tool=self.tool_name,
+                )
+            if not isinstance(normalized.get("parse_status"), str):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "import analysis must carry a deterministic parse status",
+                    tool=self.tool_name,
+                )
+            if not isinstance(normalized.get("size_bytes"), int) or not isinstance(normalized.get("sha256"), str):
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "import analysis size/hash must be deterministic (int size, hex sha256)",
+                    tool=self.tool_name,
+                )
+            entropy = normalized.get("entropy_bits_per_byte")
+            if not isinstance(entropy, (int, float)) or isinstance(entropy, bool) or entropy < 0 or entropy > 8:
+                raise ToolAdapterError(
+                    AdapterPhase.NORMALIZE_OUTPUT,
+                    AdapterErrorCode.NORMALIZATION_FAILED,
+                    "entropy statistic must be a bounded number in [0, 8] bits per byte",
+                    tool=self.tool_name,
+                )
+        return normalized
+
+
 LOCAL_PROCESS_INFO_ADAPTER = LocalProcessInfoAdapter()
 
 

@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -1211,170 +1212,247 @@ def _printable_string_analysis(name, *, max_bytes=STRING_EXTRACTION_MAX_BYTES, f
     }
 
 
-def build_registry(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
-    registry: dict[str, ToolSpec] = {}
-    for spec in specs:
-        if not isinstance(spec, ToolSpec) or not spec.name or spec.name in registry:
-            raise ValueError("duplicate or invalid tool specification")
-        scope_namespace = spec.name.split(".", 1)[0]
-        scope_namespaces = {"bugbounty", "recon", "research", "evidence", "browser", "report"}
-        if not spec.description or spec.risk_class not in VALID_RISK_CLASSES or not callable(spec.handler) or (spec.owner_only and not spec.requires_owner) or (scope_namespace in scope_namespaces and not spec.scope_required):
-            raise ValueError(f"invalid registry metadata for {spec.name}")
-        if spec.argument_type not in (None, str):
-            raise ValueError(f"unsupported argument schema for {spec.name}")
-        registry[spec.name] = spec
-    return registry
+def _scoped_import_analysis(argument):
+    """Argument gate for the bounded local import-table analysis (P1-I).
+
+    Exactly ONE bare file name inside the local artifact store; traversal,
+    separators, and hidden names are rejected BEFORE any filesystem seam is
+    touched (fail closed, pre-open).
+    """
+    name = argument if isinstance(argument, str) else ""
+    if (
+        not name
+        or len(name) > MAX_ARG_LENGTH
+        or "/" in name
+        or "\\" in name
+        or name in (".", "..")
+        or name.startswith(".")
+    ):
+        return {"ok": False, "operation": "local_import_analysis", "error": "IMP_ARGUMENT_INVALID", "reason": "the import analysis accepts exactly one bare file name inside the local artifact store"}
+    return _import_analysis(name)
 
 
-REGISTRY = build_registry([
-    ToolSpec("status", "ÙØ±Ø§Ø¡Ø© Ø­Ø§ÙØ© Ø§ÙØ®Ø¯ÙØ© ÙØ§ÙØ£Ø­Ø¯Ø§Ø« Ø§ÙØªØ¯ÙÙÙÙØ© Ø§ÙØ£Ø®ÙØ±Ø©", "read", True, None, _status),
-    ToolSpec("latest_intel", "ÙØ±Ø§Ø¡Ø© Ø§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø§ÙØªÙØ¯ÙØ¯Ø§Øª Ø§ÙÙØ¬ÙØ¹Ø©", "read", True, None, _latest_intel),
-    ToolSpec("refresh_intel", "Ø¬ÙØ¹ Ø§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø¯ÙØ§Ø¹ÙØ© Ø¶Ø¯ Ø§ÙØªÙØ¯ÙØ¯Ø§Øª", "network-read", True, None, _refresh_intel),
-    ToolSpec("local_security_check", "ÙØ­Øµ ÙØ³ØªÙØ¹Ù TCP Ø§ÙÙØ­ÙÙØ©", "read", True, None, _local_security),
-    ToolSpec("local_system_info", "ÙØ±Ø§Ø¡Ø© ÙØ¹ÙÙÙØ§Øª Ø§ÙÙØ¸Ø§Ù Ø§ÙÙØ­ÙÙ", "read", True, None, _system_info),
-    ToolSpec("local_process_info", "قراءة قائمة العمليات المحلية الجارية (فحص دفاعي محلي)", "read", True, None, _process_info),
-    ToolSpec("search", "Ø¨Ø­Ø« ÙÙ Ø§ÙØ£Ø­Ø¯Ø§Ø« ÙØ§ÙØ§Ø³ØªØ®Ø¨Ø§Ø±Ø§Øª Ø§ÙÙØ­ÙÙØ©", "read", True, str, _search),
-    ToolSpec("watch", "Ø¥Ø¶Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _watch),
-    ToolSpec("unwatch", "Ø¥Ø²Ø§ÙØ© ÙÙÙØ© ÙØ±Ø§ÙØ¨ Ø¯ÙØ§Ø¹ÙØ© ÙØ­ÙÙØ©", "state-write", True, str, _unwatch),
-    ToolSpec("run_project_tests", "ØªØ´ØºÙÙ pytest -q Ø¯Ø§Ø®Ù Ø¬Ø°Ø± Ø§Ø®ØªØ¨Ø§Ø± Ø§ÙÙØ´Ø±ÙØ¹ Ø§ÙÙØ­Ø¯Ø¯", "bounded-exec", True, str, _run_project_tests),
-    ToolSpec("red_team_assess", "ØªÙÙÙÙ ÙØ¬ÙÙÙ Ø¯ÙØ§Ø¹Ù ÙÙÙØ§ÙÙ ÙÙØ·; ÙØ§ ÙÙÙØ° Ø§Ø³ØªØºÙØ§ÙØ§Ù Ø£Ù Ø£ÙØ±Ø© ÙØ¸Ø§Ù", "analysis", True, str, _red_team_assess, True),
-    ToolSpec("scoped_http_probe", "ÙØ±Ø§ÙØ¨Ø© HTTP ÙØ­Ø¯ÙØ¯Ø© ÙØ§ ØªØ¹ÙÙ Ø¥ÙØ§ ÙØ¹ Scope Snapshot ÙTarget ÙØµØ§Ø¯Ù Ø¹ÙÙÙ", "network-read", True, str, _scoped_http_probe, False, True),
-    ToolSpec("scoped_dns_lookup", "مراقبة DNS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_dns_lookup, False, True),
-    ToolSpec("scoped_tls_observation", "مراقبة TLS محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tls_observation, False, True),
-    ToolSpec("scoped_port_observation", "مراقبة المنافذ والخدمات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_port_observation, False, True),
-    ToolSpec("scoped_tech_fingerprint", "بصمة التقنيات محدودة لا تعمل إلا مع Scope Snapshot وTarget مصادق عليه", "network-read", True, str, _scoped_tech_fingerprint, False, True),
-    ToolSpec("local_artifact_metadata", "قراءة بيانات وصفية محدودة للملفات داخل مخزن المخرجات المحلي (فحص دفاعي لا يعمل إلا بمصادقة المالك)", "read", True, str, _scoped_local_artifact),
-    ToolSpec("local_binary_analysis", "تحليل ساكن محدود لرأس الملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_binary_analysis),
-    ToolSpec("local_string_extraction", "استخراج سلاسل نصية ساكن محدود لملف داخل مخزن المخرجات (قراءة فقط، لا ينفذ الملف، لا يعمل إلا بمصادقة المالك)", "analysis", True, str, _scoped_string_extraction),
-])
-
-KNOWN_TOOLS = frozenset(REGISTRY)
+IMPORT_ANALYSIS_MAX_BYTES = 262144
+IMPORT_ANALYSIS_FIELD_MAX = 256
+IMPORT_ANALYSIS_MAX_IMPORTS = 64
+IMPORT_ANALYSIS_MAX_FUNCTIONS_PER_IMPORT = 32
+IMPORT_ANALYSIS_MAX_ENTRIES_SCANNED = 1024
 
 
-def tool_definitions() -> list[dict[str, Any]]:
-    """Build provider-neutral tool metadata from the canonical registry."""
-    definitions: list[dict[str, Any]] = []
-    for spec in REGISTRY.values():
-        parameters: dict[str, Any] = {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        }
-        if spec.argument_type is str:
-            parameters["properties"]["query"] = {
-                "type": "string",
-                "maxLength": MAX_ARG_LENGTH,
-            }
-            parameters["required"] = ["query"]
-        definitions.append({
-            "name": spec.name,
-            "description": spec.description[:512],
-            "risk_class": spec.risk_class,
-            "owner_required": spec.requires_owner,
-            "parameters": parameters,
-            **spec.metadata(),
-        })
-    return definitions
+_MACHO_DYLIB_LOAD_COMMANDS = {
+    0x0C: "LC_LOAD_DYLIB",
+    0x18: "LC_LOAD_WEAK_DYLIB",
+    0x1F: "LC_REEXPORT_DYLIB",
+    0x20: "LC_LAZY_LOAD_DYLIB",
+}
 
 
-def get_tool(name: str) -> ToolSpec | None:
-    return REGISTRY.get(name)
+def _cstr(data, offset, max_len):
+    """Bounded NUL-terminated ASCII read over the CAPPED prefix.
+
+    Returns (value, unterminated_flag). Out-of-prefix offsets are observable
+    data (None), never guessed and never an error.
+    """
+    if offset is None or offset < 0 or offset >= len(data):
+        return None, False
+    end = data.find(b"\x00", offset, min(len(data), offset + max_len))
+    if end == -1:
+        if offset + max_len <= len(data):
+            return None, True  # unterminated inside the bound: not observable
+        return None, True  # ran out of capped prefix: not observable
+    return data[offset:end].decode("ascii"), False
 
 
-def execute(name: str, argument: str | None = None, *, timeout: int | None = None, authorization_decision: Any = None, scope_context: dict[str, Any] | None = None, request_id: str | None = None, mission_authorization: Any = None, workspace: Any = None, evidence_store: Any = None, mission_id: str | None = None, target_identity: str | None = None, execution_proof: Any = None, execution_class: str | None = None, execution_run_id: str | None = None):
-    spec = get_tool(name)
-    if spec is None:
-        raise ValueError("unknown tool")
-    # The registry is the last line of defense, not a policy creator. There is
-    # no implicit "not mission-bound" escape hatch: a caller cannot opt out of
-    # the proof boundary by omitting mission_id. Every governed execution is
-    # classified (MISSION_BOUND when mission governance kwargs are present,
-    # OWNER_DIRECT otherwise) and must carry an ExecutionAuthorizationProof of
-    # exactly that class, derived from authorization that already exists.
-    from security.execution_proof import ExecutionAuthorizationProof, ExecutionClass, RejectionCode
-    mission_bound = mission_authorization is not None or workspace is not None or evidence_store is not None or bool(mission_id)
-    resolved_class = str(execution_class or (ExecutionClass.MISSION_BOUND.value if mission_bound else ExecutionClass.OWNER_DIRECT.value))
-    if execution_proof is None:
-        raise PermissionError(f"{RejectionCode.PROOF_REQUIRED.value}: {resolved_class} execution requires an ExecutionAuthorizationProof")
-    proof_ok, proof_reason, proof_code = ExecutionAuthorizationProof.verify(execution_proof, name=name, argument=argument, mission_id=mission_id, request_id=request_id, run_id=execution_run_id)
-    if not proof_ok:
-        raise PermissionError(f"{proof_code}: {proof_reason}")
-    if str(getattr(execution_proof, "execution_class", ExecutionClass.MISSION_BOUND.value)) != resolved_class:
-        raise PermissionError(f"{RejectionCode.EXECUTION_CLASS_MISMATCH.value}: proof execution class {getattr(execution_proof, 'execution_class', '')} does not match {resolved_class} execution")
-    if resolved_class == ExecutionClass.OWNER_DIRECT.value and authorization_decision is None:
-        # B3-C5 second-pass attacker review: an OWNER_DIRECT execution must
-        # carry the typed AuthorizationDecision that authorized it. Before
-        # this check a captured owner-direct proof for a tool that is not
-        # owner_only/scope_required could be replayed at the registry with
-        # no decision at all, contradicting the documented OWNER_DIRECT
-        # contract. Fail closed before any handler runs.
-        raise PermissionError(f"{RejectionCode.PROOF_INCOMPLETE.value}: OWNER_DIRECT execution requires the typed AuthorizationDecision that authorized it")
-    decision_valid = False
-    if authorization_decision is not None:
-        from security.authorization_context import AuthorizationDecision
-        decision_valid = bool(request_id) and isinstance(authorization_decision, AuthorizationDecision) and authorization_decision.is_valid_for(name, argument, request_id)
-        if not decision_valid:
-            raise PermissionError("invalid or argument-mismatched AuthorizationDecision")
-        # Decision binding: the proof must be bound to exactly this decision
-        # (canonical signature) and its policy fingerprint. A proof derived
-        # from a different decision can never authorize this execution.
-        if str(getattr(authorization_decision, "decision_signature", "")) != str(getattr(execution_proof, "decision_fingerprint", "")):
-            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: execution proof is not bound to the supplied AuthorizationDecision")
-        if str(getattr(authorization_decision, "policy_fingerprint", "")) != str(getattr(execution_proof, "policy_fingerprint", "")):
-            raise PermissionError(f"{RejectionCode.PROOF_BINDING_MISMATCH.value}: execution proof policy binding does not match the authorization decision policy")
-    if spec.owner_only and not decision_valid:
-        raise PermissionError("AuthorizationDecision required for this tool")
-    if spec.scope_required and not decision_valid:
-        raise PermissionError("scope-bound AuthorizationDecision required")
-    if spec.scope_required:
-        if not isinstance(scope_context, dict):
-            raise PermissionError("scope context required")
-        required = {"program_id", "target_id", "scope_snapshot_id", "url"}
-        if not required.issubset(scope_context):
-            raise PermissionError("incomplete scope context")
-        from security.scope_resolver import resolve
-        requested_url = argument if isinstance(argument, str) and "://" in argument else scope_context["url"]
-        urls = [scope_context["url"]] if requested_url == scope_context["url"] else [scope_context["url"], requested_url]
-        for checked_url in urls:
-            decision = resolve(
-                scope_context["scope_snapshot_id"],
-                scope_context["target_id"],
-                checked_url,
-                method=scope_context.get("method", "GET"),
-                expected_program_id=scope_context["program_id"],
-                redirect_chain=scope_context.get("redirect_chain", []),
-            )
-            if not decision.allowed:
-                raise PermissionError("scope denied: " + decision.reason)
-    if mission_authorization is not None:
-        from security.mission_authorization import MissionAuthorizationSnapshot
-        snapshot = mission_authorization if isinstance(mission_authorization, MissionAuthorizationSnapshot) else MissionAuthorizationSnapshot.from_dict(dict(mission_authorization))
-        if str(snapshot.authorization_hash) != str(getattr(execution_proof, "snapshot_hash", "")):
-            raise PermissionError(f"{RejectionCode.SNAPSHOT_MISMATCH.value}: live mission authorization snapshot differs from the proof-bound snapshot")
-        allowed, reason = snapshot.check(action=name, tool_id=name, target_identity=target_identity or snapshot.target_identity, at=None)
-        if not allowed:
-            raise PermissionError("mission authorization blocked: " + reason)
-    valid, reason = spec.validate(argument)
-    if not valid:
-        raise ValueError(reason)
-    limit = timeout or TOOL_TIMEOUTS.get(name, spec.timeout)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cybersentinel-{name}")
-    if name == "run_project_tests":
-        # Legacy compatibility snapshot minting was removed: the registry must
-        # never create authorization from a decision field. A governed
-        # workspace and a real mission authorization snapshot are required
-        # from the caller.
-        if workspace is None or mission_authorization is None:
-            raise PermissionError("run_project_tests requires a governed workspace and a mission authorization snapshot")
-        workspace.bind(mission_id=str(mission_id or ""), request_id=str(request_id or ""), tool_id=name, authorization_snapshot=mission_authorization, evidence_store=evidence_store)
-        future = executor.submit(spec.handler, argument, workspace=workspace)
+def _shannon_entropy(data: bytes, precision: int = 4):
+    """Deterministic Shannon entropy (bits/byte) over the CAPPED prefix."""
+    import math
+
+    total = len(data)
+    if total == 0:
+        return 0.0
+    counts = sorted((byte, data.count(byte)) for byte in set(data))
+    ent = 0.0
+    for _byte, count in counts:
+        p = count / total
+        ent -= p * math.log2(p)
+    return round(ent, precision)
+
+
+def _pe_rva_to_offset(prefix, rva, section_dir_offset, section_count):
+    """Deterministic RVA -> file offset mapping over the section headers
+    observable inside the CAPPED prefix. Unmapped is None, never guessed."""
+    if rva is None or section_dir_offset is None:
+        return None
+    for index in range(min(section_count, IMPORT_ANALYSIS_MAX_ENTRIES_SCANNED)):
+        base = section_dir_offset + index * 40
+        virtual_size = _u(prefix, base + 8, 4)
+        virtual_address = _u(prefix, base + 12, 4)
+        raw_size = _u(prefix, base + 16, 4)
+        raw_pointer = _u(prefix, base + 20, 4)
+        if virtual_address is None:
+            continue  # section header outside the capped prefix
+        bound = max(virtual_size or 0, raw_size or 0)
+        if virtual_address <= rva < virtual_address + bound:
+            if raw_pointer is None:
+                return None
+            return raw_pointer + (rva - virtual_address)
+    return None
+
+
+def _parse_pe_imports(prefix, field_max):
+    """Static PE import-directory extraction over the CAPPED prefix."""
+    imports: list[dict[str, Any]] = []
+    lfanew = _u(prefix, 0x3C, 4)
+    if lfanew is None or lfanew + 4 > len(prefix) or prefix[lfanew:lfanew + 4] != b"PE\x00\x00":
+        return "pe_signature_outside_capped_prefix", imports, False
+    optional_header = lfanew + 24
+    magic = _u(prefix, optional_header, 2)
+    if magic == 0x10B:
+        data_dir_base = optional_header + 96
+        thunk_size = 4
+        ordinal_flag = 1 << 31
+    elif magic == 0x20B:
+        data_dir_base = optional_header + 112
+        thunk_size = 8
+        ordinal_flag = 1 << 63
     else:
-        future = executor.submit(spec.handler, argument)
-    try:
-        return future.result(timeout=limit)
-    except FutureTimeout as exc:
-        future.cancel()
-        raise ToolTimeout(f"tool {name} timed out after {limit}s") from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        return "pe_optional_header_unknown", imports, False
+    section_count = _u(prefix, lfanew + 6, 2) or 0
+    size_of_optional = _u(prefix, lfanew + 20, 2) or 0
+    section_dir = optional_header + size_of_optional
+    number_of_rvas = _u(prefix, optional_header + (108 if magic == 0x20B else 92), 4)
+    import_rva = _u(prefix, data_dir_base + 8, 4)
+    if not number_of_rvas or number_of_rvas < 2 or import_rva in (None, 0):
+        return "no_import_directory", imports, False
+    import_table = _pe_rva_to_offset(prefix, import_rva, section_dir, section_count)
+    if import_table is None:
+        return "import_directory_outside_capped_prefix", imports, True
+    imports_truncated = False
+    for index in range(IMPORT_ANALYSIS_MAX_IMPORTS + 1):
+        entry = import_table + index * 20
+        original_first_thunk = _u(prefix, entry, 4)
+        name_rva = _u(prefix, entry + 12, 4)
+        first_thunk = _u(prefix, entry + 16, 4)
+        if original_first_thunk in (None, 0) and name_rva in (None, 0) and first_thunk in (None, 0):
+            break  # deterministic terminating descriptor
+        if index == IMPORT_ANALYSIS_MAX_IMPORTS:
+            imports_truncated = True
+            break
+        dll, _unterminated = _cstr(prefix, _pe_rva_to_offset(prefix, name_rva, section_dir, section_count), field_max)
+        functions: list[dict[str, Any]] = []
+        functions_truncated = False
+        thunk_rva = original_first_thunk or first_thunk
+        if thunk_rva:
+            thunk_table = _pe_rva_to_offset(prefix, thunk_rva, section_dir, section_count)
+            if thunk_table is None:
+                functions_truncated = True
+            else:
+                for slot in range(IMPORT_ANALYSIS_MAX_FUNCTIONS_PER_IMPORT + 1):
+                    thunk = _u(prefix, thunk_table + slot * thunk_size, thunk_size)
+                    if thunk in (None, 0):
+                        break
+                    if slot == IMPORT_ANALYSIS_MAX_FUNCTIONS_PER_IMPORT:
+                        functions_truncated = True
+                        break
+                    if thunk & ordinal_flag:
+                        functions.append({"import_type": "ordinal", "ordinal": thunk & (ordinal_flag - 1)})
+                    else:
+                        function_offset = _pe_rva_to_offset(prefix, thunk, section_dir, section_count)
+                        if function_offset is not None:
+                            function_name = _cstr(prefix, function_offset + 2, field_max)[0]
+                            if function_name:
+                                functions.append({"import_type": "name", "name": function_name})
+        imports.append({
+            "library": dll,  # None when the name lies outside the capped prefix: observed, never guessed
+            "functions": functions,
+            "functions_truncated": functions_truncated,
+        })
+    return "ok", imports, imports_truncated
+
+
+def _parse_elf_imports(prefix, field_max):
+    """Static ELF DT_NEEDED shared-library extraction over the CAPPED prefix."""
+    cls = prefix[4] if len(prefix) > 4 else None
+    endian = prefix[5] if len(prefix) > 5 else None
+    little = endian != 2
+    if cls not in (1, 2):
+        return "elf_class_not_observable", [], False
+    if cls == 2:
+        phoff = _u(prefix, 32, 8, little=little)
+        phentsize = _u(prefix, 54, 2, little=little)
+        phnum = _u(prefix, 56, 2, little=little)
+    else:
+        phoff = _u(prefix, 28, 4, little=little)
+        phentsize = _u(prefix, 42, 2, little=little)
+        phnum = _u(prefix, 44, 2, little=little)
+    if not phoff or not phentsize or phnum in (None, 0):
+        return "no_program_headers", [], False
+    loads: list[tuple[int, int, int]] = []  # (vaddr, offset, filesz)
+    dynamic = None
+    for index in range(min(phnum, IMPORT_ANALYSIS_MAX_ENTRIES_SCANNED)):
+        base = phoff + index * phentsize
+        p_type = _u(prefix, base, 4, little=little)
+        if p_type is None:
+            break
+        if p_type == 1:  # PT_LOAD
+            if cls == 2:
+                p_offset = _u(prefix, base + 8, 8, little=little)
+                p_vaddr = _u(prefix, base + 16, 8, little=little)
+                p_filesz = _u(prefix, base + 32, 8, little=little)
+            else:
+                p_offset = _u(prefix, base + 4, 4, little=little)
+                p_vaddr = _u(prefix, base + 8, 4, little=little)
+                p_filesz = _u(prefix, base + 16, 4, little=little)
+            if None not in (p_offset, p_vaddr, p_filesz):
+                loads.append((p_vaddr, p_offset, p_filesz))
+        elif p_type == 2:  # PT_DYNAMIC
+            if cls == 2:
+                d_offset = _u(prefix, base + 8, 8, little=little)
+                d_filesz = _u(prefix, base + 32, 8, little=little)
+                d_vaddr = _u(prefix, base + 16, 8, little=little)
+            else:
+                d_offset = _u(prefix, base + 4, 4, little=little)
+                d_filesz = _u(prefix, base + 16, 4, little=little)
+                d_vaddr = _u(prefix, base + 8, 4, little=little)
+            if d_offset is not None:
+                dynamic = (d_offset, d_filesz or 0, d_vaddr or 0)
+    if dynamic is None:
+        return "no_dynamic_segment", [], False
+    dyn_offset, dyn_size, dyn_vaddr = dynamic
+    entry_size = 16 if cls == 2 else 8
+    entries = min(dyn_size // entry_size, IMPORT_ANALYSIS_MAX_ENTRIES_SCANNED) if dyn_size else IMPORT_ANALYSIS_MAX_ENTRIES_SCANNED
+    needed: list[int] = []
+    strtab_vaddr = None
+    for index in range(entries):
+        base = dyn_offset + index * entry_size
+        if cls == 2:
+            d_tag = _u(prefix, base, 8, little=little, signed=True)
+            d_val = _u(prefix, base + 8, 8, little=little)
+        else:
+            d_tag = _u(prefix, base, 4, little=little, signed=True)
+            d_val = _u(prefix, base + 4, 4, little=little)
+        if d_tag is None:
+            break
+        if d_tag == 0:
+            break  # DT_NULL terminator
+        if d_tag == 1:
+            needed.append(d_val)
+        elif d_tag == 5:
+            strtab_vaddr = d_val
+    if not needed:
+        return "ok", [], False
+    strtab = None
+    if strtab_vaddr is not None:
+        for load_vaddr, load_offset, load_filesz in loads:
+            if load_vaddr <= strtab_vaddr < load_vaddr + load_filesz:
+                strtab = load_offset + (strtab_vaddr - load_vaddr)
+                break
+    imports: list[dict[str, Any]] = []
+    for offset in needed[:IMPORT_ANALYSIS_MAX_IMPORTS]:
+        library = None
+        if strtab is not None:
+            library = _cstr(prefix, strtab + offset, field_max)[0]
+        imports.append({"library": library, "functions": [], "functions_truncated": False})
+    return "ok", imports, len(needed) > IMPORT_ANALYSIS_MAX_IMPORTS
+
 
