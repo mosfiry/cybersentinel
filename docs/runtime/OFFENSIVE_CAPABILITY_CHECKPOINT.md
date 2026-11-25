@@ -3,7 +3,7 @@
 
 BRANCH: security/b3-four-layer-intent
 
-LAST VERIFIED CI: diagnostics/ci-f8216c9279b9.md — result SUCCESS — 1508 passed / 1 skipped / 0 failed (P1-I feat tree; compileall clean). Battery commit f5782b82cf0c marker verification is the recorded next-session first action.
+LAST VERIFIED CI: diagnostics/ci-d5fcd245a35e.md — result SUCCESS — 1560 passed / 1 skipped / 0 failed (P1-I tree incl. the 34-test battery; compileall clean). Read directly at branch head 010a55d7bd92 (marker commits 313c6c07ac0b + 010a55d7bd92, 2026-11-25T23:24Z).
 
 STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata), P1-G COMPLETE (real local_binary_analysis — bounded static header analysis of artifact-store binaries), P1-H COMPLETE (real local_string_extraction — bounded static printable-string analysis with secret-value fingerprint redaction), P1-I COMPLETE (real local_import_analysis — bounded static import-table extraction PE/ELF/Mach-O + Shannon entropy over the capped prefix; universal fat binaries observed, entries never guessed)
 
@@ -187,4 +187,4 @@ Session 49 completed P1-I (local_import_analysis: static import tables + entropy
 
 ## EXACT RESUME POINT
 
-HEAD f5782b82cf0c (session 49 test-fix commit), CI green 1508 passed / 1 skipped at f8216c9279b9 (P1-I feat tree; diagnostics/ci-f8216c9279b9.md read directly, compileall clean). FIRST ACTION next session: read diagnostics/ci-f5782b82cf0c.md at the branch head and confirm it is green (expect 1542 passed / 1 skipped = 1508 baseline + 34 battery tests); treat a self-contradictory marker as RED per the session-48 rule. P1-G, P1-H, and P1-I are COMPLETE. Do not touch main; no reset/rebase/squash/force-push.
+HEAD d5fcd245a35e (session 49 final test-fix), CI green 1560 passed / 1 skipped / 0 failed at d5fcd245a35e (diagnostics/ci-d5fcd245a35e.md read directly, compileall clean; 1508 baseline + 34 battery tests − 2 test-side defects fixed in d5fcd245a35e). NEXT ACTION next session: continue per the P1-I milestone note above — either in-scope hardening or a NEW offensive capability only with explicit Owner-scoped design (vulnerability validation / dynamic analysis touch execution surfaces). P1-G, P1-H, and P1-I are COMPLETE. Do not touch main; no reset/rebase/squash/force-push.
