@@ -258,7 +258,7 @@ def _make_universal_blob(store: Path, name: str = "imports.bin") -> Path:
 
 
 def test_handler_pe_imports_success(artifact_store):
-    _make_pe_blob(artifact_store)
+    blob_path = _make_pe_blob(artifact_store)
     result = tools.registry._import_analysis("imports.bin")
     assert result["ok"] is True, result
     assert result["operation"] == "local_import_analysis"
@@ -275,7 +275,7 @@ def test_handler_pe_imports_success(artifact_store):
     assert result["analysis_kind"] == "static_import_read"
     assert result["content"] is None
     assert result["read_truncated"] is False
-    assert result["sha256"] == hashlib.sha256(bytes(bytearray(0x1400))).hexdigest()
+    assert result["sha256"] == hashlib.sha256(blob_path.read_bytes()).hexdigest()
 
 
 def test_handler_pe_extension_is_never_trusted(artifact_store):
@@ -330,7 +330,7 @@ def test_handler_entropy_statistic_is_deterministic(artifact_store):
     (artifact_store / "uniform.bin").write_bytes(b"\x00" * 4096)
     result = tools.registry._import_analysis("uniform.bin")
     assert result["entropy_bits_per_byte"] == 0.0
-    (artifact_store / "half.bin").write_bytes(bytes((b"\x00" if index % 2 else b"\x01") for index in range(4096)))
+    (artifact_store / "half.bin").write_bytes(bytes(1 if index % 2 == 0 else 0 for index in range(4096)))
     result = tools.registry._import_analysis("half.bin")
     assert result["entropy_bits_per_byte"] == 1.0
 
