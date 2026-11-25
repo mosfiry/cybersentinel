@@ -1,10 +1,11 @@
+
 # Offensive Capability Checkpoint — CyberSentinel X
 
 BRANCH: security/b3-four-layer-intent
 
-LAST VERIFIED CI: diagnostics/ci-134a2ebe4385.md — result SUCCESS — 1508 passed / 1 skipped / 0 failed
+LAST VERIFIED CI: diagnostics/ci-f8216c9279b9.md — result SUCCESS — 1508 passed / 1 skipped / 0 failed (P1-I feat tree; compileall clean). Battery commit f5782b82cf0c marker verification is the recorded next-session first action.
 
-STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata), P1-G COMPLETE (real local_binary_analysis — bounded static header analysis of artifact-store binaries), P1-H COMPLETE (real local_string_extraction — bounded static printable-string analysis with secret-value fingerprint redaction)
+STAGE: Offensive Capability Activation — P0 COMPLETE (live bridge + real scoped_http_probe), P1 COMPLETE (real scoped_dns_lookup + real scoped_tls_observation; HTTP observation is the LIVE scoped_http_probe from P0), P1-D COMPLETE (real scoped_port_observation), P1-E COMPLETE (real scoped_tech_fingerprint — classification of observed response data only), P1-F COMPLETE (real local_artifact_metadata — bounded scoped local filesystem artifact metadata), P1-G COMPLETE (real local_binary_analysis — bounded static header analysis of artifact-store binaries), P1-H COMPLETE (real local_string_extraction — bounded static printable-string analysis with secret-value fingerprint redaction), P1-I COMPLETE (real local_import_analysis — bounded static import-table extraction PE/ELF/Mach-O + Shannon entropy over the capped prefix; universal fat binaries observed, entries never guessed)
 
 ---
 
@@ -167,10 +168,23 @@ Commits: dee3561a8251 (feat(tools): _scoped_string_extraction gateway + _printab
 
 The scheduled 2026-11-23 session crashed mid-unit and its push to tools/registry.py was recorded TRUNCATED (the last 47 lines of execute() were lost). Its CI marker files (ci-dee3561a8251.md, ci-1146a29d445c.md) carried "result: SUCCESS" while their own compileall section displayed the IndentationError — such markers are INVALID. RULE: a marker whose compileall section contains a traceback is RED even if its result line says SUCCESS; never treat a self-contradictory marker as green.
 
-## NEXT_ACTION
+## MILESTONE P1-I (COMPLETE — local_import_analysis)
 
-Session 48 completed P1-H (bounded static printable-string extraction with secret-value fingerprint redaction) and repaired the interrupted 2026-11-23 truncated-push incident. The next NEW offensive capability is any remaining item per this checkpoint, ONLY if designed as a bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
+Commits: dcafbd3202ab (feat(tools): _scoped_import_analysis bare-name gate + _import_analysis over the SAME single filesystem seams as P1-F/G/H — ONE stat + ONE capped read (262,144 bytes), deterministic fixed-offset import extraction: PE import directory (PE32/PE32+ data-directory offsets 96/112, NumberOfRvaAndSizes at optional_header+92/108, section-table RVA→file-offset mapping, OriginalFirstThunk preferred over FirstThunk, named and ordinal imports), ELF 32/64 DT_NEEDED via PT_DYNAMIC + PT_LOAD vaddr mapping + DT_STRTAB, Mach-O LC_LOAD_DYLIB/LC_LOAD_WEAK_DYLIB/LC_REEXPORT_DYLIB/LC_LAZY_LOAD_DYLIB, universal fat binaries OBSERVED (arch count only, entry binaries never guessed from the capped prefix — parse status carries the reason), Shannon entropy (rounded, 4 decimals) over the capped prefix; caps 64 imports / 32 functions per import / 1024 scanned entries all with explicit truncated flags; parse_status records WHY imports may be absent — data, never guessed; deterministic fail-closed IMP_ARGUMENT_INVALID / IMP_NOT_FOUND / IMP_STORE_UNAVAILABLE / IMP_OPEN_FAILED / IMP_RUNTIME_ERROR incl. dispatch-table failures; bytes never echoed, sha256 over the capped slice; ToolSpec local_import_analysis registered after local_string_analysis rows) + agent/offensive_bridge.py LocalImportAnalysisAdapter (same bare-name gate at VALIDATE_INPUT; deterministic-normalization contract: import record list shape, imports_returned == len(imports), bounded entropy in [0,8]); f8216c9279b9 (fix(tools): the P1-I feat push dcafbd3202ab was TRUNCATED at ~64K chars by the sandbox read path and committed an incomplete registry.py — repaired in-session BEFORE any CI marker existed, full file restored and verified end-to-end; no gate semantics changed); 066034ee96b6 (test(tools): 34-test adversarial + live-bridge battery, no real network); f5782b82cf0c (fix(tests): entropy bound corrected for the capped 262,144-byte prefix — test defect caught in the second-pass review BEFORE CI).
+
+CI GREEN 1508 passed / 1 skipped at f8216c9279b9 (diagnostics/ci-f8216c9279b9.md, read directly, compileall clean).
+
+### Analysis semantics (documented, fixed)
+
+- Static analysis ONLY: one stat + one capped read per execution; the analyzed file is NEVER executed (no sample execution anywhere; dynamic malware analysis remains PLANNED by design).
+- Every parsed library/import/ordinal/entropy value is OBSERVED data with ZERO authority — never scope, authorization, plan, or execution input (INV-OFF-1/2).
+- Out-of-prefix offsets resolve to an observable None via parse_status, never a guessed value; caps are deterministic with explicit truncation flags.
+- Adversarially proven: traversal/subdir/backslash/dot/hidden names rejected PRE-SEAM at BOTH the adapter and the registered registry handler (seam-spy counters zero); forged/tampered/cross-mission/cross-run proposals rejected before any seam; the extension is never trusted (family from the magic prefix only).
+
+## NEXT_ACTION (updated 2026-11-25, session 49)
+
+Session 49 completed P1-I (local_import_analysis: static import tables + entropy) and repaired a same-session truncated push (f8216c9279b9). The reverse-engineering matrix row is now fully LIVE (header + strings + imports + entropy). The next NEW offensive capability is the remaining PLANNED items (vulnerability validation, dynamic malware sandbox interface) ONLY if designed as bounded, owner-authorized, scope-bound observation/analysis with a single fakeable seam, adapter reuse, adversarial + live bridge battery, CI green, checkpoint update — both touch EXECUTION surfaces and need explicit Owner-scoped design before implementation; otherwise continue with hardening within scope. Keep catalog/registry disjoint; do NOT touch main; no reset/rebase/squash/force-push; no scheduler/DAG/worker runtime; do NOT start B3-C6, Phase A, or R2.
 
 ## EXACT RESUME POINT
 
-HEAD 134a2ebe4385 (session 48 fix commit; the ci-skip-marker commit 5aa7a8118971 above it is diagnostics-only and shares the tree), CI green 1508 passed / 1 skipped at 134a2ebe4385 (diagnostics/ci-134a2ebe4385.md, read directly). P1-G and P1-H are COMPLETE. Resume with the next bounded capability family per NEXT_ACTION, or hardening within scope. Do not touch main; no reset/rebase/squash/force-push.
+HEAD f5782b82cf0c (session 49 test-fix commit), CI green 1508 passed / 1 skipped at f8216c9279b9 (P1-I feat tree; diagnostics/ci-f8216c9279b9.md read directly, compileall clean). FIRST ACTION next session: read diagnostics/ci-f5782b82cf0c.md at the branch head and confirm it is green (expect 1542 passed / 1 skipped = 1508 baseline + 34 battery tests); treat a self-contradictory marker as RED per the session-48 rule. P1-G, P1-H, and P1-I are COMPLETE. Do not touch main; no reset/rebase/squash/force-push.
