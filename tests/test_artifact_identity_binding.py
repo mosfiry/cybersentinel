@@ -139,7 +139,8 @@ def test_identity_binding_does_not_change_success_shape(store):
 
 
 def test_no_authority_or_secret_keys_in_failure_records(store, tmp_path, monkeypatch):
-    _write(store, "x_sample.bin", b"MZ" + b"G" * 16)
+    for _name, file_name, _handler, _code in HANDLERS:
+        _write(store, file_name, b"MZ" + b"H" * 16)
     _outside_secret(tmp_path)
     _swap_to(tmp_path, monkeypatch, tmp_path / "outside.txt")
     for _name, file_name, handler, code in HANDLERS:
