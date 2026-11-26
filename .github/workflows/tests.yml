@@ -33,11 +33,11 @@ jobs:
       - name: compileall
         run: |
           set -o pipefail
-          python -m compileall -q . 2>&1 | tee compile_out.txt
+          python -m compileall -q . 2>&1 | tee compile_out.txt || { { echo "## compileall failed"; tail -n 100 compile_out.txt; } >> diag.txt; exit 1; }
       - name: pytest
         run: |
           set -o pipefail
-          python -m pytest -q 2>&1 | tee pytest_out.txt
+          python -m pytest -q 2>&1 | tee pytest_out.txt || { { echo "## pytest failed"; tail -n 400 pytest_out.txt; } >> diag.txt; exit 1; }
       - name: git diff check
         run: |
           set +e
