@@ -36,7 +36,7 @@ def store(tmp_path, monkeypatch):
 def test_identity_seam_has_exactly_one_call_site():
     source = inspect.getsource(registry)
     assert source.count("_artifact_fstat(") == 2  # the def + the shared helper
-    assert source.count("_artifact_identity_error(stat_before, handle") == 4
+    assert source.count("_artifact_identity_error(stat_before, handle") == 5  # 4 call sites + the def line
 
 
 @pytest.mark.parametrize("handler,_name,_code", [(h, n, c) for h, n, c in HANDLERS], ids=[n for _h, n, _c in HANDLERS])
