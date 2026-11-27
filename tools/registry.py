@@ -789,6 +789,32 @@ def _artifact_fstat(handle):
     return os.fstat(handle.fileno())
 
 
+def _artifact_identity_error(stat_before, handle, field_max: int = 256):
+    """THE single post-open identity binding shared by every artifact-store
+    analysis handler (P1-F/G/H/I convergence; session 51).
+
+    Returns None when the OPEN descriptor is the exact regular-file inode
+    observed at the pre-open stat; otherwise returns the fail-closed reason
+    string (data only - the caller maps it to its own *_OPEN_FAILED
+    classification). Raises nothing by contract: an identity-seam OSError is
+    converted INTO a reason string, so a broken binding can never degrade
+    into a permissive read. The binding engages only when the pre-open stat
+    carries real identity metadata (production os.stat always does; the
+    legacy plain-int test-fake shape carries none and skips the binding).
+    """
+    if not hasattr(stat_before, "st_ino"):
+        return None
+    try:
+        stat_open = _artifact_fstat(handle)
+    except OSError as exc:
+        return "the opened artifact could not be identity-verified: " + str(exc)[:max(0, int(field_max) - 46)]
+    import stat as _stat_mod
+    if not _stat_mod.S_ISREG(stat_open.st_mode):
+        return "the opened artifact is no longer a regular file (fail closed)"
+    if (stat_open.st_dev, stat_open.st_ino) != (stat_before.st_dev, stat_before.st_ino):
+        return "artifact identity changed between stat and open (fail closed)"
+    return None
+
 FORMAT_MAGIC_TABLE = (
     ("elf", b"\x7fELF"),
     ("pe", b"MZ"),
@@ -884,16 +910,9 @@ def _artifact_metadata(name, *, max_bytes=ARTIFACT_METADATA_MAX_BYTES, field_max
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-            if hasattr(stat_before, "st_ino"):
-                try:
-                    stat_open = _artifact_fstat(handle)
-                except OSError as exc:
-                    return dict(common, ok=False, error="META_OPEN_FAILED", reason="the opened artifact could not be identity-verified: " + str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                import stat as _stat_mod
-                if not _stat_mod.S_ISREG(stat_open.st_mode):
-                    return dict(common, ok=False, error="META_OPEN_FAILED", reason="the opened artifact is no longer a regular file (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                if (stat_open.st_dev, stat_open.st_ino) != (stat_before.st_dev, stat_before.st_ino):
-                    return dict(common, ok=False, error="META_OPEN_FAILED", reason="artifact identity changed between stat and open (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            if binding_error is not None:
+                return dict(common, ok=False, error="META_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = handle.read(max_bytes + 1)
     except OSError as exc:
         return dict(common, ok=False, error="META_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
@@ -1056,16 +1075,9 @@ def _binary_header_analysis(name, *, max_bytes=BINARY_ANALYSIS_MAX_BYTES, field_
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-            if hasattr(stat_before, "st_ino"):
-                try:
-                    stat_open = _artifact_fstat(handle)
-                except OSError as exc:
-                    return dict(common, ok=False, error="BIN_OPEN_FAILED", reason="the opened artifact could not be identity-verified: " + str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                import stat as _stat_mod
-                if not _stat_mod.S_ISREG(stat_open.st_mode):
-                    return dict(common, ok=False, error="BIN_OPEN_FAILED", reason="the opened artifact is no longer a regular file (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                if (stat_open.st_dev, stat_open.st_ino) != (stat_before.st_dev, stat_before.st_ino):
-                    return dict(common, ok=False, error="BIN_OPEN_FAILED", reason="artifact identity changed between stat and open (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            if binding_error is not None:
+                return dict(common, ok=False, error="BIN_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = bytes(handle.read(max_bytes + 1))
     except OSError as exc:
         return dict(common, ok=False, error="BIN_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
@@ -1192,16 +1204,9 @@ def _printable_string_analysis(name, *, max_bytes=STRING_EXTRACTION_MAX_BYTES, f
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-            if hasattr(stat_before, "st_ino"):
-                try:
-                    stat_open = _artifact_fstat(handle)
-                except OSError as exc:
-                    return dict(common, ok=False, error="STR_OPEN_FAILED", reason="the opened artifact could not be identity-verified: " + str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                import stat as _stat_mod
-                if not _stat_mod.S_ISREG(stat_open.st_mode):
-                    return dict(common, ok=False, error="STR_OPEN_FAILED", reason="the opened artifact is no longer a regular file (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                if (stat_open.st_dev, stat_open.st_ino) != (stat_before.st_dev, stat_before.st_ino):
-                    return dict(common, ok=False, error="STR_OPEN_FAILED", reason="artifact identity changed between stat and open (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            if binding_error is not None:
+                return dict(common, ok=False, error="STR_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = bytes(handle.read(max_bytes + 1))
     except OSError as exc:
         return dict(common, ok=False, error="STR_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
@@ -1603,16 +1608,9 @@ def _import_analysis(name, *, max_bytes=IMPORT_ANALYSIS_MAX_BYTES, field_max=IMP
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-            if hasattr(stat_before, "st_ino"):
-                try:
-                    stat_open = _artifact_fstat(handle)
-                except OSError as exc:
-                    return dict(common, ok=False, error="IMP_OPEN_FAILED", reason="the opened artifact could not be identity-verified: " + str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                import stat as _stat_mod
-                if not _stat_mod.S_ISREG(stat_open.st_mode):
-                    return dict(common, ok=False, error="IMP_OPEN_FAILED", reason="the opened artifact is no longer a regular file (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
-                if (stat_open.st_dev, stat_open.st_ino) != (stat_before.st_dev, stat_before.st_ino):
-                    return dict(common, ok=False, error="IMP_OPEN_FAILED", reason="artifact identity changed between stat and open (fail closed)", observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
+                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            if binding_error is not None:
+                return dict(common, ok=False, error="IMP_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = bytes(handle.read(max_bytes + 1))
     except OSError as exc:
         return dict(common, ok=False, error="IMP_OPEN_FAILED", reason=str(exc)[:field_max], observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
