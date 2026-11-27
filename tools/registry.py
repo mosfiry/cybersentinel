@@ -910,7 +910,7 @@ def _artifact_metadata(name, *, max_bytes=ARTIFACT_METADATA_MAX_BYTES, field_max
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            binding_error = _artifact_identity_error(stat_before, handle, field_max)
             if binding_error is not None:
                 return dict(common, ok=False, error="META_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = handle.read(max_bytes + 1)
@@ -1075,7 +1075,7 @@ def _binary_header_analysis(name, *, max_bytes=BINARY_ANALYSIS_MAX_BYTES, field_
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            binding_error = _artifact_identity_error(stat_before, handle, field_max)
             if binding_error is not None:
                 return dict(common, ok=False, error="BIN_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = bytes(handle.read(max_bytes + 1))
@@ -1204,7 +1204,7 @@ def _printable_string_analysis(name, *, max_bytes=STRING_EXTRACTION_MAX_BYTES, f
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            binding_error = _artifact_identity_error(stat_before, handle, field_max)
             if binding_error is not None:
                 return dict(common, ok=False, error="STR_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = bytes(handle.read(max_bytes + 1))
@@ -1608,7 +1608,7 @@ def _import_analysis(name, *, max_bytes=IMPORT_ANALYSIS_MAX_BYTES, field_max=IMP
             # binding engages whenever the pre-open stat carries real
             # identity metadata (production always does); a legacy faked
             # plain-int stat carries none and skips the binding.
-                        binding_error = _artifact_identity_error(stat_before, handle, field_max)
+            binding_error = _artifact_identity_error(stat_before, handle, field_max)
             if binding_error is not None:
                 return dict(common, ok=False, error="IMP_OPEN_FAILED", reason=binding_error, observed_at=datetime.now(timezone.utc).isoformat(), elapsed_ms=elapsed())
             prefix = bytes(handle.read(max_bytes + 1))
